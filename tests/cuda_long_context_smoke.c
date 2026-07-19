@@ -211,7 +211,7 @@ static int check_dspark_non_causal_attention(void) {
                                                                     n_tokens, 0,
                                                                     n_raw, raw_cap, 0,
                                                                     0, n_head, head_dim, 0, 0,
-                                                                    NULL, NULL, 0, 1);
+                                                                    NULL, NULL, NULL, NULL, 0, 1);
         int ok_nc = ds4_gpu_attention_decode_raw_batch_heads_tensor(heads_nc,
                                                                      sinks,
                                                                      n_head * sizeof(float),
@@ -221,7 +221,7 @@ static int check_dspark_non_causal_attention(void) {
                                                                      n_tokens, 0,
                                                                      n_raw, raw_cap, 0,
                                                                      0, n_head, head_dim, 1, 0,
-                                                                     NULL, NULL, 0, 1);
+                                                                     NULL, NULL, NULL, NULL, 0, 1);
         if (ok_c && ok_nc && ds4_gpu_synchronize() &&
             ds4_gpu_tensor_read(heads_c, 0, heads_causal, heads_count * sizeof(float)) &&
             ds4_gpu_tensor_read(heads_nc, 0, heads_non_causal, heads_count * sizeof(float))) {
@@ -732,14 +732,14 @@ static int mb_run_case(const char *label,
                     q, raw_slab, comp_slab, 0, 0, 0, topk,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, top_k, window, ratio, n_head, head_dim, 0,
-                    positions, seq_id, comp_cap, n_banks);
+                    positions, seq_id, NULL, NULL, comp_cap, n_banks);
         } else {
             ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                     heads, sinks, (uint64_t)n_head * sizeof(float), 0,
                     q, raw_slab, n_comp_superset ? comp_slab : NULL, 0, 0, 0,
                     NULL, 0, n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, window, ratio, n_head, head_dim, 0, 0,
-                    positions, seq_id, comp_cap, n_banks);
+                    positions, seq_id, NULL, NULL, comp_cap, n_banks);
         }
         if (!ok || !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(heads, 0, out_batch, q_count * sizeof(float))) {
@@ -808,7 +808,7 @@ static int mb_run_case(const char *label,
                         q_ref, raw_view, comp_view, 0, 0, 0, tk_ref,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, top_k, window, ratio, n_head, head_dim, 0,
-                        NULL, NULL, 0, 1);
+                        NULL, NULL, NULL, NULL, 0, 1);
             } else {
                 ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                         h_ref, sinks, (uint64_t)n_head * sizeof(float), 0,
@@ -816,7 +816,7 @@ static int mb_run_case(const char *label,
                         0, 0, 0, NULL, 0,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, window, ratio, n_head, head_dim, 0, 0,
-                        NULL, NULL, 0, 1);
+                        NULL, NULL, NULL, NULL, 0, 1);
             }
         }
         ok = ok && ds4_gpu_synchronize() &&
@@ -987,7 +987,7 @@ static int check_multibank_decode_attention(void) {
                         q2, raw_slab, comp_slab, 0, 0, 0, NULL, 0,
                         2, 0, window, raw_cap, 0,
                         25, window, ratio, n_head, head_dim, 0, 0,
-                        p2, s2, comp_cap, n_banks) &&
+                        p2, s2, NULL, NULL, comp_cap, n_banks) &&
                 ds4_gpu_synchronize() &&
                 ds4_gpu_tensor_read(h2, 0, out2, 2 * row_f32 * sizeof(float))) {
                 dead_rc = 0;

@@ -865,6 +865,25 @@ typedef struct {
     ds4_gpu_tensor *assc[DS4_MAX_LAYER];
     ds4_gpu_tensor *iskv[DS4_MAX_LAYER];
     ds4_gpu_tensor *issc[DS4_MAX_LAYER];
+    /* Tier-2 Option B-full — per-bank descriptor tables (increment 1).  Device
+     * uint32 arrays, length n_banks, indexed by TRUE bank id (seq_id[t]).  They
+     * REPLACE the uniform `seq_id * cap` addressing the batched-decode kernels
+     * used: a kernel reads bank b's raw ring at base raw_base_b[b] with wrap
+     * modulus raw_cap_b[b], instead of computing b * raw_cap on the fly.  In
+     * this increment the pool is still allocated at ONE uniform cap, so the
+     * tables hold the degenerate values raw_base_b[b] = b * raw_cap,
+     * raw_cap_b[b] = raw_cap (a prefix-sum of EQUAL caps) — byte-identical to
+     * Option A.  Heterogeneous caps (large primary + small subagents) arrive in
+     * a later increment together with prefix-sum slab sizing; the kernel ABI is
+     * table-driven NOW so that increment only changes the VALUES, not the ABI.
+     *
+     * comp_base_b/comp_cap_b are reserved for the comp-slab conversion (the
+     * attention-comp + indexer + compressor-emit crux): NULL in increment 1,
+     * which still addresses the comp slab with the uniform scalar comp_cap. */
+    ds4_gpu_tensor *raw_base_b;                 /* [n_banks] u32: row base into raw slab */
+    ds4_gpu_tensor *raw_cap_b;                  /* [n_banks] u32: per-bank raw ring capacity */
+    ds4_gpu_tensor *comp_base_b[DS4_MAX_LAYER]; /* reserved (comp-slab increment): NULL */
+    ds4_gpu_tensor *comp_cap_b[DS4_MAX_LAYER];  /* reserved (comp-slab increment): NULL */
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the

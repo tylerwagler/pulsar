@@ -588,6 +588,27 @@ static bool gpu_graph_bank_slabs_alloc(
                                      (uint64_t)n_banks * index_width * index_rows);
         }
     }
+    /* Option B-full increment 1: build the per-bank raw-ring descriptor tables
+     * (see ds4_bank_slabs).  Uniform allocation this increment, so the base is
+     * a prefix-sum of EQUAL caps (b * raw_cap) and every cap entry is raw_cap —
+     * the degenerate case the batched kernels reduce to Option A on.  The comp
+     * tables stay NULL (comp is still uniform-scalar addressed).  Built once
+     * here because the pool geometry is fixed for the graph's lifetime. */
+    if (ok) {
+        uint32_t base_h[DS4_MSEQ_MAX];
+        uint32_t cap_h[DS4_MSEQ_MAX];
+        for (uint32_t bk = 0; bk < n_banks && bk < DS4_MSEQ_MAX; bk++) {
+            base_h[bk] = bk * dz->raw_cap;   /* n_banks*raw_cap < 2^32 audited above */
+            cap_h[bk]  = dz->raw_cap;
+        }
+        b->raw_base_b = ds4_gpu_tensor_alloc((uint64_t)n_banks * sizeof(uint32_t));
+        b->raw_cap_b  = ds4_gpu_tensor_alloc((uint64_t)n_banks * sizeof(uint32_t));
+        ok = b->raw_base_b && b->raw_cap_b &&
+             ds4_gpu_tensor_write(b->raw_base_b, 0, base_h,
+                                  (uint64_t)n_banks * sizeof(uint32_t)) &&
+             ds4_gpu_tensor_write(b->raw_cap_b, 0, cap_h,
+                                  (uint64_t)n_banks * sizeof(uint32_t));
+    }
     return ok;
 }
 

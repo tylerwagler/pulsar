@@ -445,6 +445,8 @@ __global__ static void attention_decode_mixed_kernel(
         int raw_f16,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
+        const uint32_t * __restrict__ raw_base_b,
+        const uint32_t * __restrict__ raw_cap_b,
         uint32_t comp_cap,
         uint32_t n_banks) {
     uint32_t t = blockIdx.x;
@@ -459,6 +461,12 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) oh[d] = 0.0f;
         return;
     }
+    /* Option B-full: per-bank raw ring geometry.  raw_base_b/raw_cap_b are the
+     * descriptor tables (NULL on the non-descriptor path → scalar fallback,
+     * bit-identical).  Under the uniform pool the tables hold b*raw_cap /
+     * raw_cap, so raw_base == seq_id*raw_cap and raw_cap_eff == raw_cap. */
+    const uint32_t sid = seq_id ? (uint32_t)seq_id[t] : 0u;
+    const uint32_t raw_cap_eff = raw_cap_b ? raw_cap_b[sid] : raw_cap;
     const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
     uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
     uint32_t eff_n_raw = n_raw;
@@ -466,14 +474,15 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t first_raw_pos;
     if (positions) {
         eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        if (eff_n_raw > raw_cap_eff) eff_n_raw = raw_cap_eff;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap_eff;
         first_raw_pos = qpos + 1u - eff_n_raw;
     } else {
         first_raw_pos = pos0 + n_tokens - n_raw;
     }
-    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
-    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
+    const uint32_t raw_base = raw_base_b ? raw_base_b[sid]
+                                         : (seq_id ? sid * raw_cap : 0u);
+    const uint64_t comp_base = seq_id ? (uint64_t)sid * comp_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -511,7 +520,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap_eff;
     }
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
@@ -686,6 +695,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t comp_kv_pack,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
+        const uint32_t * __restrict__ raw_base_b,
+        const uint32_t * __restrict__ raw_cap_b,
         uint32_t comp_cap,
         uint32_t n_banks) {
     uint32_t t = blockIdx.x;
@@ -699,21 +710,26 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     /* Descriptor preamble: see attention_decode_mixed_kernel.  comp_rows[]
      * keeps bank-LOCAL compressed ids (top-k ids are per-bank); the bank
-     * offset is applied at read time via comp_base. */
+     * offset is applied at read time via comp_base.  Per-bank raw ring
+     * geometry from raw_base_b/raw_cap_b (Option B-full; scalar fallback when
+     * NULL). */
+    const uint32_t sid = seq_id ? (uint32_t)seq_id[t] : 0u;
+    const uint32_t raw_cap_eff = raw_cap_b ? raw_cap_b[sid] : raw_cap;
     uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
     uint32_t eff_n_raw = n_raw;
     uint32_t eff_raw_start = raw_start;
     uint32_t first_raw_pos;
     if (positions) {
         eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        if (eff_n_raw > raw_cap_eff) eff_n_raw = raw_cap_eff;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap_eff;
         first_raw_pos = qpos + 1u - eff_n_raw;
     } else {
         first_raw_pos = pos0 + n_tokens - n_raw;
     }
-    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
-    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
+    const uint32_t raw_base = raw_base_b ? raw_base_b[sid]
+                                         : (seq_id ? sid * raw_cap : 0u);
+    const uint64_t comp_base = seq_id ? (uint64_t)sid * comp_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
@@ -753,7 +769,7 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap_eff;
     }
     /* Deterministic ordered compaction (was an atomicAdd slot race): the
      * ORDER of comp_rows fixes the float accumulation order of the indexed
@@ -1382,6 +1398,8 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         int raw_f16,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
+        const uint32_t * __restrict__ raw_base_b,
+        const uint32_t * __restrict__ raw_cap_b,
         uint32_t comp_cap,
         uint32_t n_banks) {
     uint32_t t = blockIdx.x;
@@ -1406,21 +1424,26 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_first_idx_s;
     __shared__ float4 kv_shared[4 * 128];
 
-    /* Descriptor preamble: see attention_decode_mixed_kernel. */
+    /* Descriptor preamble: see attention_decode_mixed_kernel.  Per-bank raw
+     * ring geometry from raw_base_b/raw_cap_b (Option B-full; scalar fallback
+     * when NULL). */
+    const uint32_t sid = seq_id ? (uint32_t)seq_id[t] : 0u;
+    const uint32_t raw_cap_eff = raw_cap_b ? raw_cap_b[sid] : raw_cap;
     const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
     uint32_t eff_n_raw = n_raw;
     uint32_t eff_raw_start = raw_start;
     uint32_t first_raw_pos;
     if (positions) {
         eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+        if (eff_n_raw > raw_cap_eff) eff_n_raw = raw_cap_eff;
+        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap_eff;
         first_raw_pos = qpos + 1u - eff_n_raw;
     } else {
         first_raw_pos = pos0 + n_tokens - n_raw;
     }
-    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
-    const uint64_t comp_base = seq_id ? (uint64_t)(uint32_t)seq_id[t] * comp_cap : 0u;
+    const uint32_t raw_base = raw_base_b ? raw_base_b[sid]
+                                         : (seq_id ? sid * raw_cap : 0u);
+    const uint64_t comp_base = seq_id ? (uint64_t)sid * comp_cap : 0u;
     uint32_t comp_count = 0;
     if (n_comp != 0u) {
         if (n_tokens == 1u && ratio == 0u && positions == NULL) {
@@ -1456,7 +1479,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t raw_count = raw_count_s;
     const uint32_t raw_first_idx = raw_first_idx_s;
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap_eff;
     }
     __syncthreads();
 
@@ -1689,7 +1712,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               n_head,
                                                                               head_dim,
                                                                               raw_f16,
-                                                                              NULL, NULL, 0, 1);
+                                                                              NULL, NULL, NULL, NULL, 0, 1);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -1706,7 +1729,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, comp_kv_fp8, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim, raw_f16,
-                                                 NULL, NULL, 0, 1);
+                                                 NULL, NULL, NULL, NULL, 0, 1);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
@@ -1858,6 +1881,8 @@ static int attention_decode_batch_launch(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     /* Descriptor (banked) mode: both per-row arrays or neither; the KV
@@ -1914,6 +1939,10 @@ static int attention_decode_batch_launch(
     if (n_comp != 0 && ratio == 0) return 0;
     const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
+    /* Option B-full per-bank raw-ring tables (present only in descriptor mode;
+     * NULL → kernel scalar fallback, bit-identical to the uniform pool). */
+    const uint32_t *raw_base_b_ptr = (descr && raw_base_b) ? (const uint32_t *)raw_base_b->ptr : NULL;
+    const uint32_t *raw_cap_b_ptr  = (descr && raw_cap_b)  ? (const uint32_t *)raw_cap_b->ptr  : NULL;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -1941,6 +1970,8 @@ static int attention_decode_batch_launch(
                                                                               raw_f16,
                                                                               positions_ptr,
                                                                               seq_id_ptr,
+                                                                              raw_base_b_ptr,
+                                                                              raw_cap_b_ptr,
                                                                               comp_cap,
                                                                               kernel_n_banks);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
@@ -1973,6 +2004,8 @@ static int attention_decode_batch_launch(
                                                                    raw_f16,
                                                                    positions_ptr,
                                                                    seq_id_ptr,
+                                                                   raw_base_b_ptr,
+                                                                   raw_cap_b_ptr,
                                                                    comp_cap,
                                                                    kernel_n_banks);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
@@ -1986,7 +2019,8 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
-                                                 positions_ptr, seq_id_ptr, comp_cap, kernel_n_banks);
+                                                 positions_ptr, seq_id_ptr, raw_base_b_ptr, raw_cap_b_ptr,
+                                                 comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -2011,13 +2045,15 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, 0, 0, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim, raw_f16,
-                                      positions, seq_id, comp_cap, n_banks);
+                                      positions, seq_id, raw_base_b, raw_cap_b, comp_cap, n_banks);
 }
 
 
@@ -2049,6 +2085,8 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     if (comp_kv_f16) return 0;
@@ -2056,7 +2094,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_kv_fp8, comp_kv_pack, comp_mask, use_comp_mask, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim, raw_f16,
-                                      positions, seq_id, comp_cap, n_banks);
+                                      positions, seq_id, raw_base_b, raw_cap_b, comp_cap, n_banks);
 }
 
 
@@ -2087,6 +2125,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
@@ -2136,6 +2176,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!sinks) return 0;
     const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
+    /* Option B-full per-bank raw-ring tables (descriptor mode only). */
+    const uint32_t *raw_base_b_ptr = (descr && raw_base_b) ? (const uint32_t *)raw_base_b->ptr : NULL;
+    const uint32_t *raw_cap_b_ptr  = (descr && raw_cap_b)  ? (const uint32_t *)raw_cap_b->ptr  : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
@@ -2213,6 +2256,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   comp_kv_pack,
                                                   positions_ptr,
                                                   seq_id_ptr,
+                                                  raw_base_b_ptr,
+                                                  raw_cap_b_ptr,
                                                   comp_cap,
                                                   descr ? n_banks : 1u);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");

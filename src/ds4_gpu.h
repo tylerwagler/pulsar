@@ -714,6 +714,8 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -744,6 +746,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
@@ -773,6 +777,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_f16,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *raw_base_b,
+        const ds4_gpu_tensor *raw_cap_b,
         uint32_t                comp_cap,
         uint32_t                n_banks);
 

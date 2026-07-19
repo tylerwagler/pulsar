@@ -145,7 +145,13 @@ void gpu_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->banks.assc[il]);
         ds4_gpu_tensor_free(g->banks.iskv[il]);
         ds4_gpu_tensor_free(g->banks.issc[il]);
+        /* Option B-full reserved comp tables (NULL in increment 1). */
+        ds4_gpu_tensor_free(g->banks.comp_base_b[il]);
+        ds4_gpu_tensor_free(g->banks.comp_cap_b[il]);
     }
+    /* Option B-full per-bank raw-ring descriptor tables. */
+    ds4_gpu_tensor_free(g->banks.raw_base_b);
+    ds4_gpu_tensor_free(g->banks.raw_cap_b);
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
     for (int i = 0; i < 3; i++) {

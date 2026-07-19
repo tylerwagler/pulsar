@@ -1212,6 +1212,7 @@ bool gpu_graph_encode_decode_layer(
                     raw_f16,
                     descr_diag ? g->descr_diag_pos : NULL,
                     descr_diag ? g->descr_diag_seq : NULL,
+                    NULL, NULL,   /* Option B raw tables: scalar fallback for the diag path */
                     descr_diag ? g->layer_comp_cap[il] : 0,
                     1) != 0;
             if (ok && decode_index_stage_profile) {
@@ -1241,6 +1242,7 @@ bool gpu_graph_encode_decode_layer(
                     DS4_N_HEAD, DS4_N_HEAD_DIM,
                     0, raw_f16,
                     g->descr_diag_pos, g->descr_diag_seq,
+                    NULL, NULL,   /* Option B raw tables: scalar fallback for the diag path */
                     g->layer_comp_cap[il], 1) != 0;
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
@@ -1827,7 +1829,7 @@ bool gpu_graph_dspark_draft_forward(
             DS4_N_HEAD, DS4_N_HEAD_DIM,
             1,
             0 /* drafter ring is always f32 */,
-            NULL, NULL, 0, 1) != 0;
+            NULL, NULL, NULL, NULL, 0, 1) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
                                              (uint64_t)n_draft * DS4_N_HEAD * DS4_N_HEAD_DIM, li, pos0);
