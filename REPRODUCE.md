@@ -77,8 +77,12 @@ python3 gguf-tools/reap/trim_reap.py \
 # --survivors defaults to the vendored gguf-tools/reap/reap25-lcb50-survivors.json
 ```
 
-`oracle-reap25-compact.gguf` is both the REAP-25 base **and** the template for
-stage (f): it carries the compacted 192-expert shapes and the `reap.*` KV.
+`oracle-reap25-compact.gguf` is the REAP-25 base: it carries the compacted
+192-expert shapes and the `reap.*` KV, and it is what stage (d) runs on. It is
+**not** usable as the stage-(f) quantize template: `deepseek4-quantize` has no
+survivor gather, so it always generates all 256 source experts and errors with
+a 4/3 size mismatch against 192-expert template shapes — stage (f) quantizes at
+full shapes and trims again (verified 2026-07-29 on the v5mx2 rebuild).
 
 ### (d) Imatrix — routed-MoE activation importance
 
@@ -108,18 +112,30 @@ re-run this stage to reproduce the shipped build; use the committed map.
 
 ### (f) Mixed-quant GGUF — apply the format map
 
-Quantize once more, this time with the compacted base as the template and the
-committed format map selecting each tensor's precision. Rich (CUTLASS_MXFP4)
-expert layers stay byte-lossless; the floor layers drop to IQ2_XXS with the
-imatrix; non-experts re-encode to the MXFP8_LT (type-41) swizzle.
+Quantize once more with the format map selecting each tensor's precision, then
+re-run the REAP trim on the result. The quantize template must be a
+**full-shape** (256-expert) GGUF — `main-template.gguf` from stage (a) or any
+full donor — because `deepseek4-quantize` reads every source expert from HF and
+has no survivor gather; trimming to the 192 survivors is `trim_reap.py`'s job,
+same as stage (c). Rich (CUTLASS_MXFP4) expert layers stay byte-lossless; the
+floor layers drop to IQ2_XXS with the imatrix; non-experts re-encode to the
+MXFP8_LT (type-41) swizzle.
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf "$HF" --template oracle-reap25-compact.gguf \
+  --hf "$HF" --template main-template.gguf \
   --imatrix routed-moe.dat \
   --format-map gguf-tools/prisma/v5mx-format-map.json \
-  --out v5mx-mixed.gguf
+  --out v5mx-mixed-full.gguf
+python3 gguf-tools/reap/trim_reap.py \
+  --oracle v5mx-mixed-full.gguf \
+  --out    v5mx-mixed.gguf
+rm v5mx-mixed-full.gguf   # ~101 GB intermediate
 ```
+
+(`trim_reap.py` sizes every tensor it walks, so its `BLK` table must know each
+type present — type 41 / MXFP8_LT, 32 elems per 33 bytes, was added for
+exactly this path.)
 
 > **type-41 native emit — cross-reference.** The MXFP8_LT (type-41) tensors are
 > being moved to native emit inside `deepseek4-quantize` by a parallel change
