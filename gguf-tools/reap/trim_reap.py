@@ -30,7 +30,7 @@ ALIGN = 32
 NEXP = 256
 BIAS_PAD = np.float32(-1e30)
 # gguf tensor type -> (block_elems, block_bytes)
-BLK = {0:(1,4),1:(1,2),8:(32,34),10:(256,84),16:(256,66),38:(32,33),39:(32,17),40:(32,17),26:(1,4),6:(1,4),5:(1,4),30:(1,2)}
+BLK = {0:(1,4),1:(1,2),8:(32,34),10:(256,84),16:(256,66),38:(32,33),39:(32,17),40:(32,17),41:(32,33),26:(1,4),6:(1,4),5:(1,4),30:(1,2)}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SURV = os.path.join(HERE, "reap25-lcb50-survivors.json")
