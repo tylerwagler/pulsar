@@ -120,9 +120,9 @@ def main():
     for want in MERGE_KEYS:
         raw = next((raw for k, raw in d.kv if k == want), None)
         if raw is None:
-            if want == "deepseek_v4_dspark.embedding_length":
-                sys.exit(f"{dspark_path}: missing required kv {want}")
-            continue  # target_layer_ids have an engine-side fallback
+            # No silent skip: a merged artifact missing target_layer_ids fails
+            # dspark_weights_bind() at load. build_dspark_template emits them.
+            sys.exit(f"{dspark_path}: missing required kv {want}")
         if want in have:
             sys.exit(f"{main_path} already has kv {want}")
         kv_add.append(raw)
