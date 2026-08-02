@@ -62,7 +62,15 @@ typedef enum {
                                 * (de-interleaved [in,out] col-major E4M3 data +
                                 * mx_sfoff-swizzled E8M0 scale). Wire-matches the
                                 * engine's DS4_TENSOR_MXFP8_LT. */
-    DS4Q_TYPE_COUNT   = 42,
+    DS4Q_TYPE_IQ2_XXS_SOA = 42, /* pre-stored SoA twin of IQ2_XXS (16): the same
+                                 * 66 B/block content with the two planes split
+                                 * so the weight stream is load-aligned.  See
+                                 * ds4q_iq2_xxs_soa_repack() for the byte spec.
+                                 * SAME total bytes as type 16 (64 + 2 == 66),
+                                 * so dims and byte accounting are unchanged --
+                                 * this is a pure permutation, exactly as
+                                 * MXFP8_LT (41) is to FP8_E4M3 (38). */
+    DS4Q_TYPE_COUNT   = 43,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {
@@ -75,6 +83,27 @@ int64_t ds4q_block_size(ds4q_type type);
 size_t ds4q_row_size(ds4q_type type, int64_t ne);
 bool ds4q_requires_imatrix(ds4q_type type);
 void ds4q_dequantize_iq2_xxs(const void *blocks, float *out, int64_t n);
+
+/* ---- IQ2_XXS_SOA (type 42) -------------------------------------------------
+ * WHY: block_iq2_xxs is 66 bytes with qs[] at offset 2, so a block's code
+ * stream is only 2-byte aligned and nvcc must emit LDG.E.U16 -- two 16-bit
+ * loads per 32-bit weight word (verified in SASS on the shipped object: the
+ * gate/up kernel has NO 64/128-bit global loads at all).  Splitting the block
+ * into two planes makes qs 64 B-aligned per block and uint2/uint4-loadable at
+ * the SAME byte count.  Measured +7.6% on the gate/up kernel at the production
+ * shape, bit-identical output (tests/iq2_soa_bench.cu).
+ *
+ * LAYOUT, for a tensor of nblk = ne/256 blocks:
+ *     [0,            nblk*64) : q plane  -- block b at b*64, the 32 uint16 qs
+ *     [nblk*64, nblk*64+nblk*2): d plane -- block b at nblk*64 + b*2, uint16 d
+ * Total nblk*66 bytes, identical to type 16.  The q plane leads so that its
+ * per-block stride is a power of two from offset 0.
+ *
+ * Both directions are byte-exact and self-inverse; the engine's device loader
+ * and any host consumer must agree with these two functions. */
+size_t ds4q_iq2_xxs_soa_qplane_bytes(int64_t ne);
+void ds4q_iq2_xxs_soa_repack(const void *packed, void *soa, int64_t ne);
+void ds4q_iq2_xxs_soa_unpack(const void *soa, void *packed, int64_t ne);
 void ds4q_dequantize_q2_k(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_fp8_e4m3(const void *blocks, float *out, int64_t n);
 void ds4q_dequantize_mxfp4(const void *blocks, float *out, int64_t n);

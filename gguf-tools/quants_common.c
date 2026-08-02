@@ -31,6 +31,11 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
     [DS4Q_TYPE_FP8_E4M3]= { "fp8_e4m3", 32,  33, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
+    /* Same block size and type size as type 16 -- SoA is a pure permutation of
+     * the same 66 B/block, so ds4q_row_size() and every byte accounting path
+     * work unchanged.  Not a quantizer target itself: produced by repacking a
+     * type-16 tensor, so requires_imatrix is inherited at the source step. */
+    [DS4Q_TYPE_IQ2_XXS_SOA] = { "iq2_xxs_soa", QK_K, 66, true, false },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
     [DS4Q_TYPE_IQ1_S]   = { "iq1_s",   QK_K,  50, false, true  },
@@ -409,5 +414,45 @@ void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n) {
         } else {
             dst[i] = (uint16_t)((bits + (UINT32_C(0x7fff) + ((bits >> 16) & 1))) >> 16);
         }
+    }
+}
+
+
+/* ---- IQ2_XXS_SOA (type 42) repack ------------------------------------------
+ * Byte spec lives in quants.h.  q plane first (block b at b*64), then the d
+ * plane (block b at nblk*64 + b*2).  Total nblk*66 == the packed size.
+ *
+ * The two directions are exact inverses and MUST stay so: the engine loads the
+ * SoA artifact directly, and any host-side dequant/diff path round-trips
+ * through unpack.  block_iq2_xxs is { uint16 d; uint16 qs[32]; } == 66 B, and
+ * that 2-byte lead is precisely what forces the misaligned code stream. */
+size_t ds4q_iq2_xxs_soa_qplane_bytes(int64_t ne) {
+    if (ne <= 0 || ne % QK_K != 0) return 0;
+    return (size_t)(ne / QK_K) * 64u;
+}
+
+void ds4q_iq2_xxs_soa_repack(const void *packed, void *soa, int64_t ne) {
+    if (ne <= 0 || ne % QK_K != 0) return;
+    const int64_t nblk = ne / QK_K;
+    const uint8_t *src = (const uint8_t *)packed;
+    uint8_t *q = (uint8_t *)soa;                     /* [0, nblk*64) */
+    uint8_t *d = (uint8_t *)soa + (size_t)nblk * 64u; /* [nblk*64, +nblk*2) */
+    for (int64_t b = 0; b < nblk; b++) {
+        const uint8_t *sb = src + (size_t)b * 66u;
+        memcpy(d + (size_t)b * 2u, sb, 2u);          /* uint16 d */
+        memcpy(q + (size_t)b * 64u, sb + 2u, 64u);   /* uint16 qs[32] */
+    }
+}
+
+void ds4q_iq2_xxs_soa_unpack(const void *soa, void *packed, int64_t ne) {
+    if (ne <= 0 || ne % QK_K != 0) return;
+    const int64_t nblk = ne / QK_K;
+    const uint8_t *q = (const uint8_t *)soa;
+    const uint8_t *d = (const uint8_t *)soa + (size_t)nblk * 64u;
+    uint8_t *dst = (uint8_t *)packed;
+    for (int64_t b = 0; b < nblk; b++) {
+        uint8_t *db = dst + (size_t)b * 66u;
+        memcpy(db, d + (size_t)b * 2u, 2u);
+        memcpy(db + 2u, q + (size_t)b * 64u, 64u);
     }
 }
