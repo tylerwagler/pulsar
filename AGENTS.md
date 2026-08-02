@@ -5,8 +5,8 @@ generic GGUF runner. This tree is the **CUDA-only fork** of antirez's upstream
 project, targeting the NVIDIA DGX Spark (GB10, `sm_121`, ~121 GB usable
 unified memory). The Metal, ROCm, and CPU inference backends were fully
 removed; `cuda` is the only backend. The engine still contains shared
-host-side C math (`attention.c`, `hc.c`, `layers.c`, `moe.c`, `experts.c`)
-that the live GPU path calls — it is not dead CPU-backend code.
+host-side math (`attention.cpp`, `hc.cpp`, `layers.cpp`, `moe.cpp`,
+`experts.cpp`) that the live GPU path calls — it is not dead CPU-backend code.
 
 ## Goals
 
@@ -29,19 +29,24 @@ that the live GPU path calls — it is not dead CPU-backend code.
 - Keep public APIs narrow. CLI/server code should not know tensor internals.
 - Do not add permanent semantic variants behind flags. Diagnostic switches are
   fine when they validate the one release path.
-- C++ is confined to the single CUTLASS TU (`src/cuda/pulsar_mxfp4_cutlass.cu`).
-  Everything else is C (or CUDA C).
+- The tree is C++ (`src/**/*.cpp`, `src/cuda/*.cu`); there are no `.c` TUs
+  left. C++ is no longer confined to the CUTLASS TU — templates, RAII and
+  headers-with-inline are fair game anywhere. The small/sharp rule above still
+  governs: use C++ where it removes duplication or makes an invariant
+  checkable at compile time (the MoE kernels' `Dot8`/`STAGED`-style template
+  dispatch is the house pattern), not for abstraction on principle.
 
 ## Layout
 
 Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph API).
 
-- `src/engine/` — 21 TUs + `pulsar_engine_internal.h`: GGUF parsing, tokenizer,
-  weight binder (`weights.c`), quant format/kernel tables, GPU graph
-  orchestration (`gpu_graph_alloc.c`, `gpu_graph_state.c`, `gpu_prefill.c`,
-  `gpu_decode.c`, `gpu_diag.c`), sessions + KV payload serialization, imatrix
+- `src/engine/` — 30 TUs + `pulsar_engine_internal.h`: GGUF parsing, tokenizer,
+  weight binder (`weights.cpp`), quant format/kernel tables, GPU graph
+  orchestration (`gpu_graph_alloc.cpp`, `gpu_graph_state.cpp`,
+  `gpu_prefill.cpp`, `gpu_decode.cpp`, `gpu_diag.cpp`), sessions + KV payload
+  serialization, imatrix
   collection, steering, and the shared host math TUs.
-- `src/cuda/` — 7 kernel TUs + `pulsar_cuda_internal.h`: runtime/memory
+- `src/cuda/` — 9 kernel TUs + `pulsar_cuda_internal.h`: runtime/memory
   (`pulsar_cuda_runtime.cu`), matmuls incl. the cuBLASLt MXFP8 path
   (`pulsar_cuda_matmul.cu`), attention, MoE, indexer, norm/KV, HC router; plus
   `pulsar_mxfp4_cutlass.cu` (CUTLASS grouped GEMM for MXFP4 experts) and
@@ -51,10 +56,10 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
   KV cache, exact-DSML tool replay.
 - `src/agent/` — 20 TUs + `pulsar_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
-- `src/cli/` — `pulsar_cli.c`, `pulsar_bench.c`, `pulsar_eval.c` entry points.
+- `src/cli/` — `pulsar_cli.cpp`, `pulsar_bench.cpp`, `pulsar_eval.cpp` entry points.
 - `src/lib/` — shared pieces: help text, kvstore.
 - `src/vendor/` — linenoise, rax.
-- `tests/` — C runners; `pulsar_test.c` and `pulsar_agent_test.c` are unity builds
+- `tests/` — test runners; `pulsar_test.cpp` and `pulsar_agent_test.cpp` are unity builds
   that `#include` the server/agent source lists.
 - `cutlass/` — git submodule (v4.5.2), **required** for the MXFP4 expert path.
 - `gguf-tools/` — offline quantization/imatrix tooling that produces the GGUFs
@@ -116,7 +121,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 
 Legacy `Q4_K`/`Q8_0` weights are rejected at load with one clear error
-(`weights_reject_unsupported_types` in `src/engine/weights.c`). `Q8_K` exists
+(`weights_reject_unsupported_types` in `src/engine/weights.cpp`). `Q8_K` exists
 only as *activation* quantization inside the routed-expert (MoE) kernels.
 
 ## Compute Paths
