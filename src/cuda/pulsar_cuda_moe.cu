@@ -691,6 +691,19 @@ __global__ static void moe_build_expert_tiles_kernel(
 
 
 
+/* STAGED is the activation-staging predicate LIFTED TO A TEMPLATE PARAMETER.
+ * It was a runtime branch (xq_blocks <= 16u / midq_blocks <= 8u), and because
+ * the staging repoint was conditional, nvcc could not prove the activation
+ * pointers' address space: every staged read compiled to a GENERIC LD.E that
+ * resolves its window at runtime instead of a native LDS.  cuobjdump on the
+ * shipped object: mxfp4 ntile 3850 LD.E / 0 LDS, iq2 down tile16 1856 / 0,
+ * iq2 gate/up 217 / 16.  The host knows the predicate at launch, so each site
+ * picks the instantiation; inside, the repoint is unconditional and the SASS
+ * gets LDS (bench: 160 LDS, bit-exact, regs 115 -> 63 on the iq2 gate/up
+ * shape; interleaved A/B 24/24 trials positive, mean 1.037x/1.032x on the
+ * stage).  Numerics untouched: same loads, same order, same math -- only the
+ * address space of the staged reads becomes provable. */
+template <int STAGED>
 __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         float *mid_out,
         const char *gate_base,
@@ -715,7 +728,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][16];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -741,7 +754,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
      * unconditionally -- this pair was the outlier, not the rule. */
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    if (xq_blocks <= 16u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
@@ -759,8 +772,15 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
      * stays clear of the occupancy cliff that made the NT=16 widen a regression
      * (see 21e992a).  Not measured end-to-end. */
     __syncthreads();
-    if (xq_blocks <= 16u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+    if (STAGED) {
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -796,7 +816,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
 
 
 
-template <uint32_t ROW_SPAN>
+template <uint32_t ROW_SPAN, int STAGED>
 __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         float *mid_out,
         const char *gate_base,
@@ -821,7 +841,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][16];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -842,7 +862,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
      * staging left xq_blocks > 16 reading uninitialised shared memory. */
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    if (xq_blocks <= 16u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
@@ -850,8 +870,15 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         }
     }
     __syncthreads();            /* one barrier on every path -- see the row32 note */
-    if (xq_blocks <= 16u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+    if (STAGED) {
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -925,12 +952,23 @@ __host__ __device__ __forceinline__ static uint32_t moe_mxfp4_gate_up_smem_bytes
  * 8 scalar parameters: it is the down kernel's dot, which this increment does
  * not touch -- down is already past its tile knee, measured 1.00x at NT=32.
  * Any change to the decode arithmetic here must be mirrored there.) */
-template <uint32_t NT>
+/* LDS: when 1, the activation blocks are read from the caller's DYNAMIC shared
+ * staging buffer, indexed as p * xq_stride + boff -- no pointer array at all.
+ * At NT=16 the 16-entry ys[]/yb[] pointer arrays spill to local memory, and a
+ * spilled pointer loses its address space: every activation read lowered to a
+ * generic LD.E even after the repoint became compile-time (the fate of the
+ * first STAGED cut of this kernel).  Indexing the extern-shared array directly
+ * keeps the space provable regardless of spill.  LDS=0 keeps the historical
+ * pre-offset-pointer contract byte-for-byte. */
+template <uint32_t NT, int LDS>
 __device__ static void dev_dot_mxfp4_q8_K_blockN(
         const unsigned char *x,
         const cuda_block_q8_K *const *ys,
+        uint32_t xq_stride,
+        uint32_t boff,
         uint32_t n,
         float acc[NT]) {
+    extern __shared__ cuda_block_q8_K s_mx_stage[];
     float facc[NT];
     #pragma unroll
     for (uint32_t p = 0; p < NT; p++) facc[p] = 0.0f;
@@ -952,7 +990,8 @@ __device__ static void dev_dot_mxfp4_q8_K_blockN(
         #pragma unroll
         for (uint32_t p = 0; p < NT; p++) {
             if (p >= n) break;
-            const int8_t *q8 = ys[p]->qs + sb * 32;
+            const int8_t *q8 = (LDS ? s_mx_stage[(size_t)p * xq_stride + boff].qs
+                                    : ys[p]->qs) + sb * 32;
             int32_t sumi = 0;
             #pragma unroll
             for (int g = 0; g < 8; g++)
@@ -961,7 +1000,11 @@ __device__ static void dev_dot_mxfp4_q8_K_blockN(
         }
     }
     #pragma unroll
-    for (uint32_t p = 0; p < NT; p++) { if (p >= n) break; acc[p] += 0.5f * ys[p]->d * facc[p]; }
+    for (uint32_t p = 0; p < NT; p++) {
+        if (p >= n) break;
+        const float yd = LDS ? s_mx_stage[(size_t)p * xq_stride + boff].d : ys[p]->d;
+        acc[p] += 0.5f * yd * facc[p];
+    }
 }
 
 
@@ -989,7 +1032,7 @@ __device__ static void dev_dot_mxfp4_q8_K_blockN(
  * NT=32 cannot stage at all (149,504 B > the 101,376 B opt-in cap) and unstaged
  * hits 255 registers + spill (1.43x, worse than NT=16 staged); NT=64 spills
  * 1536 B and is SLOWER than shipped.  16 is the peak, not a waypoint. */
-template <uint32_t ROW_SPAN, uint32_t NT>
+template <uint32_t ROW_SPAN, uint32_t NT, int STAGED>
 __global__ static void moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel(
         float *mid_out,
         const char *gate_base,
@@ -1036,15 +1079,16 @@ __global__ static void moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel(
         slot[i] = pair[i] - tok[i] * n_expert;
         xqb[i] = xq + (uint64_t)tok[i] * xq_blocks;
     }
-    if (moe_mxfp4_gate_up_smem_bytes(NT, xq_blocks)) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq_dyn[p * xq_blocks + b] = xqb[p][b];
         }
         __syncthreads();
-        #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; xqb[p] = sxq_dyn + p * xq_blocks; }
+        /* NO repoint: staged reads go through the dot's direct extern-shared
+         * indexing (see dev_dot_mxfp4_q8_K_blockN's LDS note) -- at NT=16 the
+         * pointer array spills and a repoint cannot survive the spill. */
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -1055,11 +1099,16 @@ __global__ static void moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel(
         #pragma unroll
         for (uint32_t p = 0; p < NT; p++) { gate[p] = 0.0f; up[p] = 0.0f; }
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            const cuda_block_q8_K *yb[NT];
-            #pragma unroll
-            for (uint32_t p = 0; p < NT; p++) { yb[p] = (p < np) ? xqb[p] + b : NULL; }
-            dev_dot_mxfp4_q8_K_blockN<NT>(gr + (uint64_t)b * 8u * 17u, yb, np, gate);
-            dev_dot_mxfp4_q8_K_blockN<NT>(ur + (uint64_t)b * 8u * 17u, yb, np, up);
+            if (STAGED) {
+                dev_dot_mxfp4_q8_K_blockN<NT, 1>(gr + (uint64_t)b * 8u * 17u, NULL, xq_blocks, b, np, gate);
+                dev_dot_mxfp4_q8_K_blockN<NT, 1>(ur + (uint64_t)b * 8u * 17u, NULL, xq_blocks, b, np, up);
+            } else {
+                const cuda_block_q8_K *yb[NT];
+                #pragma unroll
+                for (uint32_t p = 0; p < NT; p++) { yb[p] = (p < np) ? xqb[p] + b : NULL; }
+                dev_dot_mxfp4_q8_K_blockN<NT, 0>(gr + (uint64_t)b * 8u * 17u, yb, 0u, 0u, np, gate);
+                dev_dot_mxfp4_q8_K_blockN<NT, 0>(ur + (uint64_t)b * 8u * 17u, yb, 0u, 0u, np, up);
+            }
         }
         #pragma unroll
         for (uint32_t p = 0; p < NT; p++) {
@@ -1124,7 +1173,7 @@ static uint32_t moe_mxfp4_gate_up_resolve_tile_width(void) {
     }
     (void)cudaGetLastError();       /* clear: a stale error must not be misread as ours */
     const cudaError_t at = cudaFuncSetAttribute(
-        (const void *)moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<ROW_SPAN, 16u>,
+        (const void *)moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<ROW_SPAN, 16u, 1>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         (int)MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
     (void)cudaGetLastError();       /* clear: a FAILED setattr is sticky and would surface as the next launch's error */
@@ -1168,6 +1217,7 @@ uint32_t pulsar_gpu_moe_mxfp4_tile_width(void) {
  * cuda_block_q2_K rows). */
 
 
+template <int STAGED>
 __global__ static void moe_gate_up_mid_q2k_expert_tile8_row32_kernel(
         float *mid_out,
         const char *gate_base,
@@ -1192,7 +1242,7 @@ __global__ static void moe_gate_up_mid_q2k_expert_tile8_row32_kernel(
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][16];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1206,14 +1256,21 @@ __global__ static void moe_gate_up_mid_q2k_expert_tile8_row32_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
         __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
     const cuda_block_q2_K *gr = (const cuda_block_q2_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -1246,7 +1303,7 @@ __global__ static void moe_gate_up_mid_q2k_expert_tile8_row32_kernel(
 }
 
 
-template <uint32_t ROW_SPAN>
+template <uint32_t ROW_SPAN, int STAGED>
 __global__ static void moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel(
         float *mid_out,
         const char *gate_base,
@@ -1271,7 +1328,7 @@ __global__ static void moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel(
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][16];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1285,14 +1342,21 @@ __global__ static void moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
         __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
@@ -1403,6 +1467,7 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
 
 
 
+template <int STAGED>
 __global__ static void moe_down_expert_tile8_row32_kernel(
         float *down_out,
         const char *down_base,
@@ -1424,7 +1489,7 @@ __global__ static void moe_down_expert_tile8_row32_kernel(
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][8];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     uint32_t np = 0;
@@ -1434,14 +1499,21 @@ __global__ static void moe_down_expert_tile8_row32_kernel(
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
-    if (midq_blocks <= 8u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
             uint32_t b = i - p * midq_blocks;
             sxq[p][b] = xqb[p][b];
         }
         __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     if (row >= out_dim) return;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -1466,7 +1538,7 @@ __global__ static void moe_down_expert_tile8_row32_kernel(
  * differed only in the 8-wide row decode (Dot8 traits above). The iq2_xxs
  * variant stays separate: it uses the smem-LUT decoder and a restructured
  * midq staging order. Per-pair stores + fixed-order moe_sum, no atomicAdd. */
-template <class Dot8>
+template <class Dot8, int STAGED>
 __global__ static void moe_down_expert_tile16_row2048_kernel(
         float *down_out,
         const char *down_base,
@@ -1489,7 +1561,7 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 16 : 1][8];
     uint32_t pair[16] = {0};
     const cuda_block_q8_K *xqb[16] = {NULL};
     uint32_t np = 0;
@@ -1499,14 +1571,21 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
-    if (midq_blocks <= 8u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
             uint32_t b = i - p * midq_blocks;
             sxq[p][b] = xqb[p][b];
         }
         __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 16u; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
@@ -1591,6 +1670,7 @@ __global__ static void moe_down_iq2_sum6_qwarp32_kernel(
 
 
 
+template <int STAGED>
 __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
         float *down_out,
         const char *down_base,
@@ -1612,7 +1692,7 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 8 : 1][8];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1624,7 +1704,7 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
-    if (midq_blocks <= 8u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
             uint32_t b = i - p * midq_blocks;
@@ -1634,8 +1714,15 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
-    if (midq_blocks <= 8u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+    if (STAGED) {
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) xqb[p] = sxq[p];
     }
     if (row >= out_dim) return;
     const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -1657,6 +1744,7 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
 
 
 
+template <int STAGED>
 __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
         float *down_out,
         const char *down_base,
@@ -1679,7 +1767,7 @@ __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
+    __shared__ cuda_block_q8_K sxq[STAGED ? 16 : 1][8];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[16] = {0};
@@ -1691,7 +1779,7 @@ __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
-    if (midq_blocks <= 8u) {
+    if (STAGED) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
             uint32_t b = i - p * midq_blocks;
@@ -1701,8 +1789,15 @@ __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
-    if (midq_blocks <= 8u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+    if (STAGED) {
+        /* FULL compile-time-range repoint (not p < np): a runtime-bounded repoint
+         * leaves nvcc unable to prove every reaching definition of xqb[] is
+         * shared, and the staged reads fall back to generic LD.E.  Entries
+         * p >= np are never dereferenced (every consumer guards on p < np), so
+         * repointing them is free -- and it is what makes the LDS lowering
+         * provable. */
+        #pragma unroll
+        for (uint32_t p = 0; p < 16u; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
@@ -2640,9 +2735,14 @@ static int routed_moe_launch_mixed40(
         if (ok) {
             if (tiled_down) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, (uint32_t)tile16_cap, 1);
-                moe_down_iq2_expert_tile16_row2048_kernel<<<tgrid, 256>>>(down_flat, down_w, midq,
-                    sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
-                    down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                if (midq_blocks <= 8u)
+                    moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(down_flat, down_w, midq,
+                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                else
+                    moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(down_flat, down_w, midq,
+                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
             } else {
                 dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
                 if (down_type == 16u)
@@ -2665,10 +2765,16 @@ static int routed_moe_launch_mixed40(
         if (ok) {
             if (tiled_gateup) {
                 dim3 tgrid((expert_mid_dim + 1023u) / 1024u, (uint32_t)tile8_cap, 1);
-                moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(mid_flat,
-                    gate_w, up_w, xq, sorted_pairs, offsets, counts, t8_total, t8_experts, t8_starts,
-                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
-                    xq_blocks, expert_mid_dim, n_expert, clamp);
+                if (xq_blocks <= 16u)
+                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(mid_flat,
+                        gate_w, up_w, xq, sorted_pairs, offsets, counts, t8_total, t8_experts, t8_starts,
+                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                        xq_blocks, expert_mid_dim, n_expert, clamp);
+                else
+                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(mid_flat,
+                        gate_w, up_w, xq, sorted_pairs, offsets, counts, t8_total, t8_experts, t8_starts,
+                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                        xq_blocks, expert_mid_dim, n_expert, clamp);
             } else {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (gate_type == 10u)
@@ -2929,36 +3035,68 @@ static int routed_moe_launch(
                 if (use_big_batch) {
                     dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
                     if (gate_q2k) {
-                        moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (xq_blocks <= 16u)
+                            moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     } else {
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (xq_blocks <= 16u)
+                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     }
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
                     if (gate_q2k) {
-                        moe_gate_up_mid_q2k_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (xq_blocks <= 16u)
+                            moe_gate_up_mid_q2k_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_q2k_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     } else {
-                        moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (xq_blocks <= 16u)
+                            moe_gate_up_mid_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     }
                 }
             } else if (sorted_pairs && gate_mxfp4 && fp4_tiled && use_big_batch) {
@@ -2982,7 +3120,7 @@ static int routed_moe_launch(
                 const uint32_t smem = moe_mxfp4_gate_up_smem_bytes(nt, xq_blocks);
                 if (nt == 16u) {
                     dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile16_capacity, 1);
-                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 16u><<<tgrid, 256, smem>>>(
+                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 16u, 1><<<tgrid, 256, smem>>>(
                         (float *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile16_total, tile16_experts, tile16_starts, (const float *)weights->ptr,
@@ -2990,12 +3128,20 @@ static int routed_moe_launch(
                         clamp);
                 } else {
                     dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 8u><<<tgrid, 256, smem>>>(
-                        (float *)mid->ptr,
-                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                        clamp);
+                    if (smem != 0u)
+                        moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 8u, 1><<<tgrid, 256, smem>>>(
+                            (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            clamp);
+                    else
+                        moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 8u, 0><<<tgrid, 256, smem>>>(
+                            (float *)mid->ptr,
+                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            clamp);
                 }
             } else {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
@@ -3112,40 +3258,75 @@ static int routed_moe_launch(
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && down_mxfp4 && fp4_tiled && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
-                moe_down_expert_tile16_row2048_kernel<Dot8MXFP4><<<tgrid, 256>>>(
-                    (float *)down->ptr,
-                    down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                    tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                    midq_blocks, out_dim, n_expert);
+                if (midq_blocks <= 8u)
+                    moe_down_expert_tile16_row2048_kernel<Dot8MXFP4, 1><<<tgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                        midq_blocks, out_dim, n_expert);
+                else
+                    moe_down_expert_tile16_row2048_kernel<Dot8MXFP4, 0><<<tgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                        midq_blocks, out_dim, n_expert);
             } else if (sorted_pairs && !down_mxfp4 && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (midq_blocks <= 8u)
+                        moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 } else {
-                    moe_down_expert_tile16_row2048_kernel<Dot8Q2K><<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (midq_blocks <= 8u)
+                        moe_down_expert_tile16_row2048_kernel<Dot8Q2K, 1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_expert_tile16_row2048_kernel<Dot8Q2K, 0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 }
             } else if (sorted_pairs && !down_mxfp4) {
                 dim3 tgrid((out_dim + 31u) / 32u, tile_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (midq_blocks <= 8u)
+                        moe_down_iq2_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_iq2_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 } else {
-                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (midq_blocks <= 8u)
+                        moe_down_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 }
             } else {
                 if (down_mxfp4) {
