@@ -1510,13 +1510,7 @@ static double now_sec(void) {
 
 static double run_clock_sec(void) {
     struct timespec ts;
-#ifdef CLOCK_UPTIME_RAW
-    /* On Darwin this clock excludes system sleep, which is exactly what the TUI
-     * elapsed counter wants: benchmark runtime, not lid-closed wall time. */
-    clock_gettime(CLOCK_UPTIME_RAW, &ts);
-#else
     clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 

@@ -28,7 +28,6 @@
  * each column importance is sum(row[column]^2) over the dequantized weight.
  */
 
-#define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "quants.h"

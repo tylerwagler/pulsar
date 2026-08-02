@@ -87,8 +87,7 @@ void *xmalloc_zeroed(size_t n, size_t size) {
      * This is intentionally not calloc(). Large untouched calloc ranges may be
      * represented by the VM through shared zero-page bookkeeping. The CPU decode
      * KV cache grows one token at a time, so using calloc here can move thousands
-     * of first-touch faults into generation. On Darwin we have observed this end
-     * in a kernel cpt_mapcnt_inc overflow panic instead of a user-space error.
+     * of first-touch faults into generation.
      *
      * Explicitly writing the zeroes while the cache is allocated keeps those VM
      * faults out of the token loop and gives the cache private resident pages.

@@ -17,7 +17,7 @@
  * Loading is mmap based.  The loader parses only the GGUF header, metadata
  * table, and tensor directory.  Tensor data stays in the kernel page cache
  * until inference touches it, or until GPU wraps slices of the mapping as
- * no-copy MTLBuffers.
+ * no-copy GPU buffers.
  */
 
 #include <errno.h>

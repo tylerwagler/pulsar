@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two ds4-bench full-vocab frontier-logit dumps (the exact methodology
+"""Compare two pulsar-bench full-vocab frontier-logit dumps (the exact methodology
 that produced the MXFP4-attention 33% / MXFP8-head 1.87% / NVFP4-head 6.76%
 calibration points).
 

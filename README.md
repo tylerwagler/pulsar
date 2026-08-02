@@ -85,7 +85,7 @@ eliminate deep cold re-prefills for agentic clients that replay reasoning
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `pulsar-server --trace
-/tmp/ds4-trace.txt` to capture the session and open an issue with the full
+/tmp/pulsar-trace.txt` to capture the session and open an issue with the full
 trace.
 
 
@@ -182,12 +182,12 @@ A few things this fork's GGUFs do beyond upstream:
 has a single target:
 
 ```sh
-./download_model.sh v5mx   # measured-allocation release build, ~91 GB on disk
+./download_model.sh v3   # measured-allocation release build, ~92 GB on disk
 ```
 
-This downloads `ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf`
-(91,321,404,640 bytes, sha256
-`000974720296f2cad17ac0525796f4bb9ceaac9f4015ed61af3fba445dfb1039`) from
+This downloads `ds4flash-v3.gguf`
+(92,495,809,696 bytes, sha256
+`d866cd83f292b852d065651a1a62cecc93a7e9da0c88dc8829dc34f0bd978525`) from
 <https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
 stores it under `./gguf/`, and updates `./ds4flash.gguf` to point at it. The
 script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated
@@ -220,7 +220,7 @@ full flag list, and start serving with:
 ## Speed
 
 Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~91 GB REAP-pruned Flash build. The artifact unifies every
+running the ~92 GB REAP-pruned Flash build. The artifact unifies every
 MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
 (4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
 **type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
@@ -1051,7 +1051,7 @@ first answer. `pulsar-server --trace` is the one that works against the shipped
 binary; the `--dump-*` probes live on the `pulsar` development CLI (`make pulsar`):
 
 ```sh
-./pulsar-server --trace /tmp/ds4-trace.txt ...
+./pulsar-server --trace /tmp/pulsar-trace.txt ...
 ./pulsar --dump-tokens -p "..."
 ./pulsar --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./pulsar --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt

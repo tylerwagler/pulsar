@@ -6,7 +6,7 @@ set -e
 # attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
 # on load). The repo is public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
-V5MX_FILE="ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf"
+V3_FILE="ds4flash-v3.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${PULSAR_GGUF_DIR:-"$ROOT/gguf"}
@@ -21,16 +21,16 @@ usage() {
 DeepSeek V4 Flash GGUF downloader (ds4 / DwarfStar)
 
 Usage:
-  ./download_model.sh v5mx [--token TOKEN]
+  ./download_model.sh v3 [--token TOKEN]
 
 Targets:
 
-  v5mx   Measured-allocation release build, about 91 GB on disk. Routed
+  v3     Measured-allocation release build, about 92 GB on disk. Routed
          experts on an IQ2_XXS floor with byte-lossless MXFP4 promoted on the
          quality-sensitive layers (per-layer, per-role); MXFP8 attention,
          shared experts, and LM head; DSpark drafter merged in-file.
          Targets a single NVIDIA GB10 (~121 GB usable) with room for a 1M
-         token context. Requires a ds4 engine built with CUDA_ARCH=sm_120f.
+         token context. Requires a pulsar engine built with CUDA_ARCH=sm_120f.
 
 Options:
   --token TOKEN  Hugging Face token (optional; the repo is public). Otherwise
@@ -57,7 +57,7 @@ MODEL=$1
 shift
 
 case "$MODEL" in
-    v5mx) MODEL_FILE=$V5MX_FILE ;;
+    v3) MODEL_FILE=$V3_FILE ;;
     -h|--help|help)
         usage
         exit 0

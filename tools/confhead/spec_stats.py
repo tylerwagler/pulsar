@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate DSpark fused-step stats from a ds4-server log (PULSAR_DSPARK_STATS=1).
+"""Aggregate DSpark fused-step stats from a pulsar-server log (PULSAR_DSPARK_STATS=1).
 
 Reports, whole-log and per-request (requests delimited by the server's
 'completion ... prompt start' markers -- n_batch==1 is NOT a boundary, see
@@ -37,7 +37,7 @@ def parse_requests(path):
     across 48 requests."""
     segs, cur = [], None
     for line in open(path):
-        if "ds4-server: completion" in line and "prompt start" in line:
+        if "pulsar-server: completion" in line and "prompt start" in line:
             cur = []
             segs.append(cur)
             continue

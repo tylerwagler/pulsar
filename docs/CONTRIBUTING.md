@@ -128,5 +128,5 @@ python3 speed-bench/plot_speed.py /tmp/ds4-speed.csv --title "Machine t/s"
 For debugging a failing generation, keep the trace:
 
 ```sh
-./pulsar-server --trace /tmp/ds4-trace.txt ...
+./pulsar-server --trace /tmp/pulsar-trace.txt ...
 ```
