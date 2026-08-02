@@ -1763,7 +1763,20 @@ int pulsar_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    if (!cuda_attention_score_buffer_fits(n_comp)) {
+    /* Single-token decode routes to the heads8-online kernel by DEFAULT
+     * (2026-08-02), not only on score-buffer overflow.  The generic
+     * per-(row,head) kernel re-walks every raw+comp row once PER HEAD —
+     * 64 independent row scans per layer per token — and profiled at
+     * 10.9 ms/token @ctx2048 (~27x its byte roofline; 18% of decode).  The
+     * heads8-online kernel stages each row once for 8 heads, the same
+     * restructuring the indexed decode carve-out shipped earlier ("~5x over
+     * the generic per-(row,head) kernel").  NOT bit-exact vs the generic
+     * kernel (online-softmax fold order; reassociation class, same as that
+     * carve-out) — this is a perplexity/eval-gated numerics change, and
+     * PULSAR_CUDA_NO_DECODE_HEADS8 restores the generic route. */
+    static const int no_decode_heads8 = getenv("PULSAR_CUDA_NO_DECODE_HEADS8") != NULL;
+    if (!cuda_attention_score_buffer_fits(n_comp) ||
+        (!no_decode_heads8 && !use_mask && head_dim == 512u)) {
         if (!use_mask && head_dim == 512u) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
