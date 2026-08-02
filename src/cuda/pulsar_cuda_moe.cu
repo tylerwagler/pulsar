@@ -123,10 +123,10 @@ struct iq2_soa_planes {
     const uint16_t *d;   /* d plane base (tensor-global) */
 };
 
-__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t nblk_total) {
+__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t d_plane_off) {
     iq2_soa_planes p;
-    p.q = (const uint8_t *)tensor_base;
-    p.d = (const uint16_t *)(tensor_base + nblk_total * 64ull);
+    p.q = (const uint8_t *)tensor_base;                      /* q plane at +0 */
+    p.d = (const uint16_t *)(tensor_base + d_plane_off);     /* d plane = nblk_total*64 */
     return p;
 }
 
@@ -181,6 +181,52 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, 
 }
 
 
+
+/* SoA twin of dev_dot_iq2_xxs_q8_K_block8_deq_lut.  Identical LUT decode,
+ * identical dp4a order, identical fold -- only the two weight loads change
+ * (p.d[blk] for the scale, one aligned uint2 for each 4-uint16 group), so the
+ * output is bit-identical to the packed path. */
+__device__ static void dev_dot_iq2_soa_q8_K_block8_deq_lut(
+        const iq2_soa_planes p, uint64_t blk,
+        const cuda_block_q8_K *y0, const cuda_block_q8_K *y1,
+        const cuda_block_q8_K *y2, const cuda_block_q8_K *y3,
+        const cuda_block_q8_K *y4, const cuda_block_q8_K *y5,
+        const cuda_block_q8_K *y6, const cuda_block_q8_K *y7,
+        uint32_t n, float acc[8],
+        const uint64_t *grid, const uint8_t *signs) {
+    const float xd = dev_f16_to_f32(p.d[blk]);
+    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);
+    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int8_t *q8[8] = {
+        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
+        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint2 w = q2[ib32];
+        const uint32_t aux0 = w.x, aux1 = w.y;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t wv[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &wv[0], &wv[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &wv[2], &wv[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &wv[4], &wv[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &wv[6], &wv[7]);
+        for (uint32_t pi = 0; pi < n; pi++) {
+            const int8_t *q = q8[pi] + ib32 * 32;
+            int32_t sumi = 0;
+            sumi = __dp4a(wv[0], *(const int32_t *)(q + 0),  sumi);
+            sumi = __dp4a(wv[1], *(const int32_t *)(q + 4),  sumi);
+            sumi = __dp4a(wv[2], *(const int32_t *)(q + 8),  sumi);
+            sumi = __dp4a(wv[3], *(const int32_t *)(q + 12), sumi);
+            sumi = __dp4a(wv[4], *(const int32_t *)(q + 16), sumi);
+            sumi = __dp4a(wv[5], *(const int32_t *)(q + 20), sumi);
+            sumi = __dp4a(wv[6], *(const int32_t *)(q + 24), sumi);
+            sumi = __dp4a(wv[7], *(const int32_t *)(q + 28), sumi);
+            bsum[pi] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    for (uint32_t pi = 0; pi < n; pi++) acc[pi] += 0.125f * xd * ys[pi]->d * (float)bsum[pi];
+}
 
 __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         const cuda_block_iq2_xxs *x,
