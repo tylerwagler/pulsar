@@ -1750,6 +1750,10 @@ void server::gen_step_finish(session_slot *sl) {
         t->spec_drafts = spec_end.num_drafts - g->spec_start.num_drafts;
         t->spec_active = t->spec_gen > 0; /* the fused spec loop ran this request */
         t->valid = true;
+        /* Same numbers the response body already carries, folded into the
+         * /metrics histograms so TTFT and per-token latency are observable
+         * without scraping every response. */
+        s->observe_request_timings(t, finish_t - g->t0);
     }
 
     s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,

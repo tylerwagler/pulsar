@@ -302,6 +302,34 @@ typedef struct {
     uint64_t spec_gen;      /* tokens emitted by the spec loop (this request) */
 } req_timings;
 
+/* Fixed-bucket Prometheus histogram. The bucket bounds are shared per metric
+ * family rather than stored per instance, so an instance is just counters —
+ * cheap to keep under mu and to zero with the rest of the server struct.
+ * Buckets are non-cumulative here; send_metrics accumulates them on the way
+ * out, which is the form Prometheus wants. */
+#define PULSAR_HIST_BUCKETS 14
+typedef struct {
+    uint64_t bucket[PULSAR_HIST_BUCKETS];
+    uint64_t count;   /* also serves as the +Inf bucket */
+    double   sum;
+} pulsar_hist;
+
+/* Defined in http_server.cpp, next to the emitter that prints the le= labels
+ * so the bounds and their advertised values can never drift apart. */
+extern const double pulsar_hist_seconds_bounds[PULSAR_HIST_BUCKETS];
+extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS];
+
+/* Record one observation. Values above the last bound fall only into +Inf,
+ * which the emitter derives from count, so no bucket is touched for them. */
+static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, double v) {
+    if (!(v >= 0.0)) return; /* drops NaN as well as negatives */
+    int i = 0;
+    while (i < PULSAR_HIST_BUCKETS - 1 && v > bounds[i]) i++;
+    if (v <= bounds[i]) h->bucket[i]++;
+    h->count++;
+    h->sum += v;
+}
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -899,6 +927,8 @@ typedef enum {
                                       eviction does NOT promptly help */
     PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
                                       chain on (same physical pressure) */
+    PROVISION_REFUSAL_COUNT,       /* sentinel: array bound for the /metrics
+                                      per-reason counters, not a reason */
 } provision_refusal;
 
 struct server {
@@ -1024,6 +1054,27 @@ struct server {
     int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  /* tokens synced so far */
     int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP]; /* prefill target, 0 if not prefilling */
     pulsar_spec_metrics m_spec;               /* engine spec-decode counters */
+    /* Request-latency histograms. req_timings is already computed for every
+     * request (generate_job_end) and was previously only serialized into the
+     * response body; observe_request_timings folds it in here so /metrics can
+     * report TTFT and per-token latency. Worker thread writes, under mu. */
+    pulsar_hist m_h_ttft;        /* seconds to first emitted token */
+    pulsar_hist m_h_tpot;        /* seconds per output token (decode_s/decode_n) */
+    pulsar_hist m_h_e2e;         /* seconds, request start -> finish */
+    pulsar_hist m_h_prompt_tok;  /* prompt tokens per request */
+    pulsar_hist m_h_gen_tok;     /* completion tokens per request */
+    uint64_t m_requests_finished;
+    /* Slot-pool lifecycle. Eviction forces the next turn of that conversation
+     * to replay from a checkpoint, which is the dominant tail-latency source
+     * on a busy pool, and none of it was previously observable. */
+    uint64_t m_evictions;        /* slots evicted to make room */
+    uint64_t m_spills;           /* banks spilled to disk by the guard */
+    uint64_t m_restores;         /* spilled banks brought back */
+    uint64_t m_restore_failures; /* spilled bank could not be restored */
+    /* Why the queue is stuck. Counted once per job (job::refusal_counted) so a
+     * head that cannot bind for many quanta registers once, not once a tick. */
+    uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
+    int m_queue_block_reason;    /* provision_refusal + 1 of a stuck head; 0 = not blocked */
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -1115,6 +1166,9 @@ struct server {
     int guard_pick_victim(session_slot **dec, int n);
     void guard_maybe_evict(session_slot **dec, int n);
     void publish_metrics_snapshot();
+    void observe_request_timings(const req_timings *t, double e2e_s);
+    void note_provision_refusal(job *j, provision_refusal refusal);
+    void count_metric(uint64_t *counter);
     int n_slots_snapshot();
     void worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]);
     bool worker_eviction_could_help(const job *j, const bool *protect);
@@ -1145,6 +1199,12 @@ struct job {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
+    /* Which provisioning refusal this job has already been counted against, so
+     * the /metrics counter records jobs blocked rather than bind retries (the
+     * worker re-attempts the head every quantum). PROVISION_OK = not counted;
+     * jobs are memset to zero at creation, so that is the natural initial
+     * value. */
+    provision_refusal refusal_counted;
 };
 
 typedef enum {

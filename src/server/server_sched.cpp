@@ -798,6 +798,10 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
     const uint64_t committed_now = s->kv_committed_bytes;
+    /* The evicted conversation must replay from a checkpoint on its next turn,
+     * which is the dominant tail-latency source on a busy pool — worth a
+     * counter of its own rather than only a log line. */
+    s->m_evictions++;
     pthread_mutex_unlock(&s->mu);
     protect[vi] = true; /* freed hole; never a candidate again this round */
     server_log(PULSAR_LOG_DEFAULT,
@@ -897,6 +901,9 @@ bool server::worker_try_bind() {
     auto *s = this;
     pthread_mutex_lock(&s->mu);
     job *j = s->head; /* peek: only the worker pops */
+    /* Nothing queued means nothing is blocked; without this the gauge would
+     * keep reporting the last reason long after the queue drained. */
+    if (!j) s->m_queue_block_reason = 0;
     pthread_mutex_unlock(&s->mu);
     if (!j) return false;
 
@@ -954,9 +961,15 @@ bool server::worker_try_bind() {
         pthread_mutex_unlock(&j->mu);
         return true;
     }
-    if (!sl) return false;
+    if (!sl) {
+        /* Still queued. A no-op when the head is merely waiting on a busy
+         * owner slot (refusal stays PROVISION_OK there). */
+        s->note_provision_refusal(j, refusal);
+        return false;
+    }
 
     pthread_mutex_lock(&s->mu);
+    s->m_queue_block_reason = 0; /* the head bound — the queue is moving again */
     s->head = j->next;
     if (!s->head) s->tail = NULL;
     if (s->n_queued > 0) s->n_queued--;
@@ -998,6 +1011,63 @@ void server::publish_metrics_snapshot() {
         s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
     }
     s->m_spec = m;
+    pthread_mutex_unlock(&s->mu);
+}
+
+
+
+/* Fold one finished request's timings into the /metrics histograms. Called by
+ * the worker from generate_job_end, where req_timings has just been computed;
+ * this only reads that struct, so it adds no hot-path work. */
+void server::observe_request_timings(const req_timings *t, double e2e_s) {
+    auto *s = this;
+    if (!t->valid) return;
+    pthread_mutex_lock(&s->mu);
+    /* ttft_s is 0 when no token was ever emitted (an errored or empty
+     * request); recording that as a zero-latency success would flatter the
+     * histogram, so skip it. */
+    if (t->ttft_s > 0.0)
+        pulsar_hist_observe(&s->m_h_ttft, pulsar_hist_seconds_bounds, t->ttft_s);
+    if (t->decode_n > 0 && t->decode_s > 0.0)
+        pulsar_hist_observe(&s->m_h_tpot, pulsar_hist_seconds_bounds,
+                            t->decode_s / (double)t->decode_n);
+    if (e2e_s > 0.0)
+        pulsar_hist_observe(&s->m_h_e2e, pulsar_hist_seconds_bounds, e2e_s);
+    pulsar_hist_observe(&s->m_h_prompt_tok, pulsar_hist_tokens_bounds, (double)t->prompt_n);
+    pulsar_hist_observe(&s->m_h_gen_tok, pulsar_hist_tokens_bounds, (double)t->decode_n);
+    s->m_requests_finished++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+
+
+/* Bump a /metrics counter under mu. Worker-thread callers only; the lock is
+ * what keeps the value coherent for send_metrics reading on a client thread.
+ * Never called with mu already held — the mutex is not recursive. */
+void server::count_metric(uint64_t *counter) {
+    auto *s = this;
+    pthread_mutex_lock(&s->mu);
+    (*counter)++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+
+
+/* Record why the head job could not be bound. Counted once per job, not once
+ * per bind attempt: the worker retries the head every quantum, so counting
+ * each attempt would turn one stuck request into thousands of "refusals". The
+ * companion gauge reports the reason the queue is blocked right now. */
+void server::note_provision_refusal(job *j, provision_refusal refusal) {
+    auto *s = this;
+    const bool countable = refusal > PROVISION_OK && refusal < PROVISION_REFUSAL_COUNT;
+    pthread_mutex_lock(&s->mu);
+    /* Waiting on a busy owner slot is not an admission refusal, so report the
+     * queue as unblocked rather than leaving the previous reason standing. */
+    s->m_queue_block_reason = countable ? (int)refusal + 1 : 0;
+    if (countable && j->refusal_counted != refusal) {
+        j->refusal_counted = refusal;
+        s->m_refusals[refusal]++;
+    }
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1090,6 +1160,7 @@ bool server::bank_restore_spilled(int bank) {
     if (!fp) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: restore open %s failed: %s",
                    path, strerror(errno));
+        s->count_metric(&s->m_restore_failures);
         return false;
     }
     char err[128];
@@ -1098,10 +1169,12 @@ bool server::bank_restore_spilled(int bank) {
     fclose(fp);
     if (rc != 0) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_load bank %d failed: %s", bank, err);
+        s->count_metric(&s->m_restore_failures);
         return false;
     }
     s->slots[bank].spilled = false;
     remove(path);
+    s->count_metric(&s->m_restores);
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: guard RESTORED bank %d from disk (%.1f ms reload stall)",
                bank, (server_now_sec() - t0) * 1e3);
@@ -1219,6 +1292,7 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
         }
         if (!s->spill_bank(&s->slots[vi])) break;   /* spill failed — stop */
         spilled_this_quantum++;
+        s->count_metric(&s->m_spills);
     }
     if (spilled_this_quantum > 0) {
         server_log(PULSAR_LOG_DEFAULT,

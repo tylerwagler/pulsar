@@ -301,6 +301,43 @@ static int slot_phase_index(int phase_plus_one) {
     }
 }
 
+/* Histogram bucket bounds. Declared in pulsar_server_internal.h and defined
+ * here, beside the emitter that prints them as le= labels, so the bounds the
+ * observer uses and the ones the scrape advertises cannot drift apart.
+ * The `extern` is load-bearing: a bare `const` array at namespace scope has
+ * internal linkage in C++, which would give every TU its own copy. */
+extern const double pulsar_hist_seconds_bounds[PULSAR_HIST_BUCKETS] = {
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0,
+};
+extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS] = {
+    16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+};
+
+/* Emit one histogram in Prometheus text form. Buckets are stored
+ * non-cumulatively, so they are accumulated on the way out; +Inf is the total
+ * count, which also covers observations above the last bound. */
+static void emit_histogram(buf *b, const char *name, const char *help,
+                           const pulsar_hist *h, const double *bounds) {
+    buf_printf(b, "# HELP %s %s\n", name, help);
+    buf_printf(b, "# TYPE %s histogram\n", name);
+    uint64_t cum = 0;
+    for (int i = 0; i < PULSAR_HIST_BUCKETS; i++) {
+        cum += h->bucket[i];
+        buf_printf(b, "%s_bucket{le=\"%g\"} %llu\n", name, bounds[i],
+                   (unsigned long long)cum);
+    }
+    buf_printf(b, "%s_bucket{le=\"+Inf\"} %llu\n", name, (unsigned long long)h->count);
+    buf_printf(b, "%s_sum %.6f\n", name, h->sum);
+    buf_printf(b, "%s_count %llu\n", name, (unsigned long long)h->count);
+}
+
+/* Label for each provisioning refusal, indexed by provision_refusal. Only the
+ * first two are relieved by eviction; mem_floor means the box itself is tight,
+ * which is a different operator action entirely. */
+static const char *const refusal_names[PROVISION_REFUSAL_COUNT] = {
+    "none", "pool_full", "ledger_full", "mem_floor", "create_fail",
+};
+
 /* Prometheus /metrics — DSpark speculative-decode counters in vLLM naming, so
  * tool-eval-bench --spec-live (and any vLLM-oriented scraper) reads acceptance
  * rate, acceptance length, and the per-position waterfall unchanged. All
@@ -346,6 +383,21 @@ bool server::send_metrics(int fd) {
     unsigned long long prompt_toks = (unsigned long long)s->m_prompt_tokens;
     unsigned long long pfx_queries = (unsigned long long)s->m_prefix_queries;
     unsigned long long pfx_hits = (unsigned long long)s->m_prefix_hits;
+    const pulsar_hist h_ttft = s->m_h_ttft;
+    const pulsar_hist h_tpot = s->m_h_tpot;
+    const pulsar_hist h_e2e = s->m_h_e2e;
+    const pulsar_hist h_prompt_tok = s->m_h_prompt_tok;
+    const pulsar_hist h_gen_tok = s->m_h_gen_tok;
+    const unsigned long long reqs_finished = (unsigned long long)s->m_requests_finished;
+    const unsigned long long evictions = (unsigned long long)s->m_evictions;
+    const unsigned long long spills = (unsigned long long)s->m_spills;
+    const unsigned long long restores = (unsigned long long)s->m_restores;
+    const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
+    uint64_t refusals[PROVISION_REFUSAL_COUNT];
+    for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
+    const int block_reason = s->m_queue_block_reason;
+    const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes;
+    const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes;
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
@@ -450,6 +502,68 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase.\n");
     buf_puts(&b, "# TYPE pulsar:num_requests_prefilling gauge\n");
     buf_printf(&b, "pulsar:num_requests_prefilling %d\n", prefilling);
+
+    /* Request latency. These are the per-request numbers the response body
+     * already reports (req_timings); as histograms they answer "is the tail
+     * prefill or decode" without scraping every response. */
+    emit_histogram(&b, "vllm:time_to_first_token_seconds",
+                   "Time from request start to first emitted token.",
+                   &h_ttft, pulsar_hist_seconds_bounds);
+    emit_histogram(&b, "vllm:time_per_output_token_seconds",
+                   "Decode wall time divided by completion tokens.",
+                   &h_tpot, pulsar_hist_seconds_bounds);
+    emit_histogram(&b, "vllm:e2e_request_latency_seconds",
+                   "Wall time from request start to finish.",
+                   &h_e2e, pulsar_hist_seconds_bounds);
+    emit_histogram(&b, "vllm:request_prompt_tokens", "Prompt tokens per request.",
+                   &h_prompt_tok, pulsar_hist_tokens_bounds);
+    emit_histogram(&b, "vllm:request_generation_tokens", "Completion tokens per request.",
+                   &h_gen_tok, pulsar_hist_tokens_bounds);
+    buf_puts(&b, "# HELP pulsar:requests_finished_total Requests that reached the finish phase.\n");
+    buf_puts(&b, "# TYPE pulsar:requests_finished_total counter\n");
+    buf_printf(&b, "pulsar:requests_finished_total %llu\n", reqs_finished);
+
+    /* Slot-pool churn. An eviction forces that conversation to replay from a
+     * checkpoint on its next turn, so these counters are the explanation for
+     * an otherwise mysterious latency spike. */
+    buf_puts(&b, "# HELP pulsar:slot_evictions_total Slots evicted to make room for another conversation.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_evictions_total counter\n");
+    buf_printf(&b, "pulsar:slot_evictions_total %llu\n", evictions);
+    buf_puts(&b, "# HELP pulsar:bank_spills_total Banks spilled to disk by the proactive-eviction guard.\n");
+    buf_puts(&b, "# TYPE pulsar:bank_spills_total counter\n");
+    buf_printf(&b, "pulsar:bank_spills_total %llu\n", spills);
+    buf_puts(&b, "# HELP pulsar:bank_restores_total Spilled banks reloaded from disk.\n");
+    buf_puts(&b, "# TYPE pulsar:bank_restores_total counter\n");
+    buf_printf(&b, "pulsar:bank_restores_total %llu\n", restores);
+    buf_puts(&b, "# HELP pulsar:bank_restore_failures_total Spilled banks that could not be reloaded.\n");
+    buf_puts(&b, "# TYPE pulsar:bank_restore_failures_total counter\n");
+    buf_printf(&b, "pulsar:bank_restore_failures_total %llu\n", restore_failures);
+
+    /* Why requests queue. num_requests_waiting says that they do; this says
+     * whether evicting something would help or the box is simply out of room. */
+    buf_puts(&b, "# HELP pulsar:admission_refusals_total Jobs blocked from binding, by reason.\n");
+    buf_puts(&b, "# TYPE pulsar:admission_refusals_total counter\n");
+    for (int i = PROVISION_OK + 1; i < PROVISION_REFUSAL_COUNT; i++)
+        buf_printf(&b, "pulsar:admission_refusals_total{reason=\"%s\"} %llu\n",
+                   refusal_names[i], (unsigned long long)refusals[i]);
+    /* m_queue_block_reason holds provision_refusal + 1, so 0 means nothing is
+     * blocking and the "none" series carries the 1. */
+    const int blocked_by = block_reason > 0 ? block_reason - 1 : (int)PROVISION_OK;
+    buf_puts(&b, "# HELP pulsar:queue_blocked_reason Why the head job cannot bind right now (state set).\n");
+    buf_puts(&b, "# TYPE pulsar:queue_blocked_reason gauge\n");
+    for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++)
+        buf_printf(&b, "pulsar:queue_blocked_reason{reason=\"%s\"} %d\n",
+                   refusal_names[i], i == blocked_by ? 1 : 0);
+
+    /* Admission ledger. Distinct from kv_cache_usage_perc: a slot early in its
+     * context still holds its whole ledgered session cost, so the pool can be
+     * full while every slot reads near-empty. */
+    buf_puts(&b, "# HELP pulsar:kv_ledger_committed_bytes Session cost committed by the admission ledger.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_ledger_committed_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_ledger_committed_bytes %llu\n", ledger_committed);
+    buf_puts(&b, "# HELP pulsar:kv_ledger_budget_bytes Admission ceiling computed at startup.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
 
     bool ok = http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
