@@ -2314,14 +2314,8 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * sampled; top-10 reorders and a greedy stream diverges within a token or
      * two).  Each build stays perfectly deterministic run to run.  Prefill is
      * untouched — it already took this kernel. */
-    /* Packed multi-token CLASSIC prefill now routes here too (2026-08-02): the
-     * old scope guard sent it to the generic kernel, which is why the engine
-     * dequantized a 4x-size f32 shadow for prefill instead of passing the
-     * packed cache.  The online kernel's pack branch decodes the identical
-     * values in the identical fold order, so this is bit-exact vs the shadow
-     * path; the profile put this kernel at 17.8% of prefill GPU time @8192
-     * reading f32. */
     if ((n_tokens > 1 || !no_indexed_decode_heads8) && head_dim == 512 && top_k <= 512u &&
+        (descr || !comp_kv_pack || n_tokens == 1u) &&
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */

@@ -144,10 +144,15 @@ Also: `PULSAR_FP8_NO_MXCORE`, `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_G
 
 ## Deferred Work
 
-- Native packed-KV reads in the **prefill** attention kernels (indexed +
-  static): storage is already packed (see FP8 KV cache above), but prefill
-  consumers read a 4x-size f32 shadow. Profile 2026-08-02 (v5mx4-0731):
-  `attention_indexed_mixed_heads8_online` alone is 17.8% of prefill GPU time
-  @8192 and DRAM-bound (~8 flop/B on 2 KB f32 gathered rows), so inline E4M3
-  decode is worth up to ~10% prefill at depth, growing with context.
+- ~~Native packed-KV reads in the prefill attention kernels~~ — **MEASURED
+  NO-GO 2026-08-02** (tried and reverted the same day; see the PR #9 trail).
+  Routing the packed comp cache into the indexed prefill kernel (its pack
+  branch is bit-exact; gate PASSED) measured −1.6% @8k, −1.9% @16k and
+  −2.7% @131k vs the f32 shadow. The bandwidth thesis fails because DSA's
+  top-k keeps the attention working set L2-hot at any depth (512 gathered
+  rows/token, heavy overlap between neighbors), so the 4x byte saving buys
+  nothing while the per-(token,row) e4m3 decode tax is unconditional. The
+  shadow (decode once per chunk, share across tokens) is the measured-optimal
+  amortization — do not retry without a design that decodes at most once per
+  (chunk, row).
 - Move MoE decode off Q8_K activation quantization.
