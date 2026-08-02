@@ -104,6 +104,58 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
 
 
 
+/* ---- IQ2_XXS_SOA (type 42) device reader -----------------------------------
+ * The packed type-16 block is { uint16 d; uint16 qs[32] } = 66 B, so qs[] sits
+ * at offset 2 and the whole code stream is only 2-byte aligned: nvcc has to
+ * emit LDG.E.U16, two 16-bit loads per 32-bit weight word (confirmed in SASS
+ * -- the gate/up kernel has NO 64/128-bit global loads).  Type 42 stores the
+ * SAME bytes with the planes split, so qs is 64 B-aligned per block and one
+ * aligned uint2 replaces four U16 loads.
+ *
+ * Layout (must match ds4q_iq2_xxs_soa_repack() in gguf-tools/quants_common.c):
+ *     [0,        nblk*64) q plane : block b at b*64  (uint16 qs[32])
+ *     [nblk*64, +nblk*2)  d plane : block b at nblk*64 + b*2 (uint16 d)
+ * nblk is the WHOLE TENSOR's block count, so the planes are tensor-global and
+ * a per-expert/per-row base must be expressed as a block index, not a byte
+ * offset -- see iq2_soa_planes below. */
+struct iq2_soa_planes {
+    const uint8_t  *q;   /* q plane base (tensor-global) */
+    const uint16_t *d;   /* d plane base (tensor-global) */
+};
+
+__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t nblk_total) {
+    iq2_soa_planes p;
+    p.q = (const uint8_t *)tensor_base;
+    p.d = (const uint16_t *)(tensor_base + nblk_total * 64ull);
+    return p;
+}
+
+/* SoA twin of dev_dot_iq2_xxs_q8_K_block.  Identical arithmetic and identical
+ * accumulation order -- only the two loads change -- so results are
+ * bit-identical to the packed path. */
+__device__ static float dev_dot_iq2_soa_q8_K_block(const iq2_soa_planes p, uint64_t blk, const cuda_block_q8_K *y) {
+    const float d = dev_f16_to_f32(p.d[blk]) * y->d;
+    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);   /* 8-byte aligned */
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint2 w = q2[ib32];
+        const uint32_t aux0 = w.x, aux1 = w.y;
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
+        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
+        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
+        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
+        int32_t sumi = 0;
+        sumi += dev_dot_iq2_pair_16(a0, (aux1 >> 0) & 127u, a1, (aux1 >> 7) & 127u, q8);
+        q8 += 16;
+        sumi += dev_dot_iq2_pair_16(a2, (aux1 >> 14) & 127u, a3, (aux1 >> 21) & 127u, q8);
+        q8 += 16;
+        bsum += sumi * (int32_t)ls;
+    }
+    return 0.125f * d * (float)bsum;
+}
+
 __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, const cuda_block_q8_K *y) {
     const float d = dev_f16_to_f32(x->d) * y->d;
     const uint16_t *q2 = x->qs;

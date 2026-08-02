@@ -379,6 +379,13 @@ typedef struct {
     pulsar_str key;
     uint32_t type;
     uint64_t value_pos;
+    /* Pre-stored SoA twin of IQ2_XXS (16): identical 66 B/block content with
+     * the q and d planes split so the code stream is load-aligned (block_iq2_xxs
+     * puts qs[] at offset 2, forcing 2-byte LDG.E.U16 loads).  Byte size, dims
+     * and row size are UNCHANGED -- a pure permutation, exactly as MXFP8_LT (41)
+     * is to FP8_E4M3 (38).  Layout spec: ds4q_iq2_xxs_soa_repack() in
+     * gguf-tools/quants_common.c; device reader: dev_iq2_soa_planes(). */
+    PULSAR_TENSOR_IQ2_XXS_SOA = 42,
 } pulsar_kv;
 
 typedef struct {

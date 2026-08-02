@@ -56,9 +56,14 @@ static const gguf_type_info gguf_types[] = {
      * type-38 size (out*(in/32)*33), so it reuses the {32,33} accounting here
      * and loads/mmaps through the generic path. See PULSAR_TENSOR_MXFP8_LT. */
     /*41*/ {"mxfp8_lt", 32, 33},
+    /* IQ2_XXS_SOA (pre-stored IQ2_XXS): the same 66 B/block content with the
+     * q and d planes split so the code stream is load-aligned.  A pure
+     * permutation, so it shares type 16's {256, 66} accounting exactly and
+     * loads/mmaps through the generic path.  See PULSAR_TENSOR_IQ2_XXS_SOA. */
+    /*42*/ {"iq2_xxs_soa", 256, 66},
 };
 
-static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 42,
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 43,
               "gguf_types rows must line up with GGUF type ids");
 
 
