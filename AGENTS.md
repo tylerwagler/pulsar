@@ -129,11 +129,11 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
   except inside MoE (Q8_K).
 - **FP8 KV cache**: the compressed cache is packed E4M3+scale storage by
   default (`PULSAR_ATTN_PACK=1`); the raw window is F16 (`PULSAR_RAW_F16=1`).
-  Decode attention reads the packed cache natively. Prefill attention still
+  Decode attention reads the packed cache natively. Prefill attention
   consumes a per-chunk dequantized **f32 shadow**
-  (`gpu_graph_attn_comp_read_cache`) — 4x the read bytes of the packed rows;
-  teaching the prefill attention kernels to read packed natively is the
-  remaining (deferred) piece.
+  (`gpu_graph_attn_comp_read_cache`) — deliberately: native packed prefill
+  reads were tried 2026-08-02 and measured slower at every depth through
+  131k (see the Deferred Work NO-GO entry below for why).
 
 ## Environment Variables
 
