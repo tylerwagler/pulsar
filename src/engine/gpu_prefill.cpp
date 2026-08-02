@@ -1912,10 +1912,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                                        : g->layer_raw_cache[il],
                                                                                   mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                                       : gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                                       : g->layer_attn_comp_cache[il],
                                                                                   0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                                  mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                                       : 0 /* shadow is f32 */,
+                                                                                  gpu_graph_attn_comp_cache_is_pack(),
                                                                                   g->comp_selected,
                                                                                   sn,
                                                                                   spos0,
@@ -1958,10 +1957,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                               : g->layer_raw_cache[il],
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                              : gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              : g->layer_attn_comp_cache[il],
                                                                          0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                         mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                              : 0 /* shadow is f32 */,
+                                                                         gpu_graph_attn_comp_cache_is_pack(),
                                                                          NULL,
                                                                          0,
                                                                          n_tokens,
@@ -2078,9 +2076,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               sq_view,
                                                                               g->layer_raw_cache[il],
-                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              g->layer_attn_comp_cache[il],
                                                                               0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                              0 /* shadow is f32 */,
+                                                                              gpu_graph_attn_comp_cache_is_pack(),
                                                                               g->comp_selected,
                                                                               sn,
                                                                               spos0,
@@ -2225,9 +2223,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
-                                                                              gpu_graph_attn_comp_read_cache(g, il, cur_comp),
+                                                                              g->layer_attn_comp_cache[il],
                                                                               0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                              0 /* shadow is f32 */,
+                                                                              gpu_graph_attn_comp_cache_is_pack(),
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -2252,9 +2250,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
-                                                                 cur_comp ? gpu_graph_attn_comp_read_cache(g, il, cur_comp) : NULL,
+                                                                 cur_comp ? g->layer_attn_comp_cache[il] : NULL,
                                                                  0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                 0 /* shadow is f32 */,
+                                                                 gpu_graph_attn_comp_cache_is_pack(),
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,
