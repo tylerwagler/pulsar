@@ -277,21 +277,54 @@ bool server::send_root(int fd) {
     return ok;
 }
 
+/* The phase label set for pulsar:slot_phase. GEN_DECODE_INIT folds into
+ * "decode" (it is the transient re-init of a decode attempt, not a state an
+ * operator cares to see) and GEN_FINISH/GEN_DONE fold into "finish". Every
+ * slot reports all five series with a 0/1 value — the Prometheus state-set
+ * convention — so the series set is stable and label values never churn. */
+static const char *const slot_phase_names[] = {
+    "idle", "prefill_cold", "prefill_main", "decode", "finish",
+};
+enum { SLOT_PHASE_COUNT = 5 };
+
+/* Map a published m_slot_phase (gen_phase + 1; 0 = no bound job) onto that
+ * label set. */
+static int slot_phase_index(int phase_plus_one) {
+    switch (phase_plus_one - 1) {
+    case GEN_PREFILL_COLD: return 1;
+    case GEN_PREFILL_MAIN: return 2;
+    case GEN_DECODE_INIT:
+    case GEN_DECODE:       return 3;
+    case GEN_FINISH:
+    case GEN_DONE:         return 4;
+    default:               return 0; /* 0, or anything unrecognised, is idle */
+    }
+}
+
 /* Prometheus /metrics — DSpark speculative-decode counters in vLLM naming, so
  * tool-eval-bench --spec-live (and any vLLM-oriented scraper) reads acceptance
  * rate, acceptance length, and the per-position waterfall unchanged. All
- * counters are cumulative since engine open; gauges are point-in-time. */
+ * counters are cumulative since engine open; gauges are point-in-time.
+ *
+ * Series in the pulsar: namespace are additions with no vLLM equivalent; a
+ * vLLM-oriented scraper ignores them. */
 bool server::send_metrics(int fd) {
     auto *s = this;
     /* This runs on a client thread: it must not call into the engine
      * (CUDA-state audit, pulsar_server_internal.h). Everything below reads the
-     * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
-     * server_publish_metrics_snapshot — refreshed at bind time and once per
-     * quantum, so gauges lag live state by at most one quantum). */
+     * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx/
+     * m_slot_phase/m_slot_prefill_*, server_publish_metrics_snapshot —
+     * refreshed at bind time and once per quantum, so gauges lag live state by
+     * at most one quantum). */
     const char *model = server_served_model_id(s);
     pulsar_spec_metrics m;
     int n_slots;
     double slot_kv[PULSAR_SESSION_POOL_CAP];
+    int slot_pos[PULSAR_SESSION_POOL_CAP];
+    int slot_ctx[PULSAR_SESSION_POOL_CAP];
+    int slot_phase[PULSAR_SESSION_POOL_CAP];
+    int slot_pf_done[PULSAR_SESSION_POOL_CAP];
+    int slot_pf_total[PULSAR_SESSION_POOL_CAP];
     pthread_mutex_lock(&s->mu);
     m = s->m_spec;
     n_slots = s->n_slots;
@@ -300,6 +333,13 @@ bool server::send_metrics(int fd) {
         const int ctx = s->m_slot_ctx[i];
         double kv = (ctx > 0 && pos > 0) ? (double)pos / (double)ctx : 0.0;
         slot_kv[i] = kv > 1.0 ? 1.0 : kv;
+        slot_pos[i] = pos > 0 ? pos : 0;
+        slot_ctx[i] = ctx > 0 ? ctx : 0;
+        slot_phase[i] = s->m_slot_phase[i];
+        /* prefill_last_current is -1 until the first progress callback; report
+         * 0 tokens done rather than leaking the sentinel. */
+        slot_pf_done[i] = s->m_slot_prefill_done[i] > 0 ? s->m_slot_prefill_done[i] : 0;
+        slot_pf_total[i] = s->m_slot_prefill_total[i] > 0 ? s->m_slot_prefill_total[i] : 0;
     }
     int running = s->n_generating;
     int waiting = s->n_queued;
@@ -370,6 +410,46 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP vllm:num_requests_waiting Requests queued and not yet started.\n");
     buf_puts(&b, "# TYPE vllm:num_requests_waiting gauge\n");
     buf_printf(&b, "vllm:num_requests_waiting %d\n", waiting);
+
+    /* Per-slot phase. A scraper watching only kv_cache_usage_perc sees a slot's
+     * position advance identically whether it is prefilling a prompt or
+     * decoding tokens; this is what separates the two. */
+    int prefilling = 0;
+    for (int i = 0; i < n_slots; i++) {
+        const int idx = slot_phase_index(slot_phase[i]);
+        if (idx == 1 || idx == 2) prefilling++;
+    }
+    buf_puts(&b, "# HELP pulsar:slot_phase Generation phase per slot (state set; 1 = current).\n");
+    buf_puts(&b, "# TYPE pulsar:slot_phase gauge\n");
+    for (int i = 0; i < n_slots; i++) {
+        const int idx = slot_phase_index(slot_phase[i]);
+        for (int p = 0; p < SLOT_PHASE_COUNT; p++)
+            buf_printf(&b, "pulsar:slot_phase{slot=\"%d\",phase=\"%s\"} %d\n",
+                       i, slot_phase_names[p], p == idx ? 1 : 0);
+    }
+    /* Absolute token positions. kv_cache_usage_perc is the ratio only; these
+     * let a dashboard show "14203 / 32768" and size the remaining context. */
+    buf_puts(&b, "# HELP pulsar:slot_position_tokens KV frontier position per slot, in tokens.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_position_tokens gauge\n");
+    for (int i = 0; i < n_slots; i++)
+        buf_printf(&b, "pulsar:slot_position_tokens{slot=\"%d\"} %d\n", i, slot_pos[i]);
+    buf_puts(&b, "# HELP pulsar:slot_context_tokens Context size the slot was admitted for.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_context_tokens gauge\n");
+    for (int i = 0; i < n_slots; i++)
+        buf_printf(&b, "pulsar:slot_context_tokens{slot=\"%d\"} %d\n", i, slot_ctx[i]);
+    /* Prefill progress, so a long cold prompt shows a moving bar instead of a
+     * slot that merely looks busy. Both read 0 outside a prefill phase. */
+    buf_puts(&b, "# HELP pulsar:slot_prefill_done_tokens Prompt tokens synced so far on this slot.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_prefill_done_tokens gauge\n");
+    for (int i = 0; i < n_slots; i++)
+        buf_printf(&b, "pulsar:slot_prefill_done_tokens{slot=\"%d\"} %d\n", i, slot_pf_done[i]);
+    buf_puts(&b, "# HELP pulsar:slot_prefill_total_tokens Prefill target for this slot's prompt.\n");
+    buf_puts(&b, "# TYPE pulsar:slot_prefill_total_tokens gauge\n");
+    for (int i = 0; i < n_slots; i++)
+        buf_printf(&b, "pulsar:slot_prefill_total_tokens{slot=\"%d\"} %d\n", i, slot_pf_total[i]);
+    buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase.\n");
+    buf_puts(&b, "# TYPE pulsar:num_requests_prefilling gauge\n");
+    buf_printf(&b, "pulsar:num_requests_prefilling %d\n", prefilling);
 
     bool ok = http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);

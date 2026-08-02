@@ -986,6 +986,16 @@ void server::publish_metrics_snapshot() {
          * live cursor (server_slot_frontier_pos). Pure host read, no CUDA. */
         s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]);
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
+        /* Phase + prefill progress: pure host reads of the slot's gen_state,
+         * published here because send_metrics runs on a client thread and must
+         * not walk worker-owned structures. Phase is stored +1 so an unbound
+         * slot is 0 = idle; prefill_last_current stays -1 until the first
+         * progress callback fires, so clamp it here. */
+        const session_slot *sl = &s->slots[i];
+        const gen_state *g = sl->active_job ? sl->gen : NULL;
+        s->m_slot_phase[i]         = g ? (int)g->phase + 1 : 0;
+        s->m_slot_prefill_done[i]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
+        s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
     }
     s->m_spec = m;
     pthread_mutex_unlock(&s->mu);

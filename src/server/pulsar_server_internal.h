@@ -1014,6 +1014,15 @@ struct server {
      * send_metrics reads only these. */
     int m_slot_pos[PULSAR_SESSION_POOL_CAP];  /* pulsar_session_pos per provisioned slot */
     int m_slot_ctx[PULSAR_SESSION_POOL_CAP];  /* ctx_size per provisioned slot */
+    /* Per-slot generation phase and prefill progress. Without these a scraper
+     * cannot tell a slot that is prefilling from one that is decoding: both
+     * only show m_slot_pos advancing, and a prefill chunk and a decode quantum
+     * are indistinguishable once sampled at scrape cadence.
+     * Stored as gen_phase + 1, so 0 (a zeroed server, or a slot with no bound
+     * job) reads as idle rather than as GEN_PREFILL_COLD. */
+    int m_slot_phase[PULSAR_SESSION_POOL_CAP];
+    int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  /* tokens synced so far */
+    int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP]; /* prefill target, 0 if not prefilling */
     pulsar_spec_metrics m_spec;               /* engine spec-decode counters */
     uint64_t seq;
     FILE *trace;
