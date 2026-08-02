@@ -127,7 +127,13 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
   (GB10 / `sm_120f` family).
 - **Decode:** custom fused kernels, memory-bound; activations stay raw f32
   except inside MoE (Q8_K).
-- **FP8 KV cache** is currently fake-quant: E4M3 rounding with f32 storage.
+- **FP8 KV cache**: the compressed cache is packed E4M3+scale storage by
+  default (`PULSAR_ATTN_PACK=1`); the raw window is F16 (`PULSAR_RAW_F16=1`).
+  Decode attention reads the packed cache natively. Prefill attention still
+  consumes a per-chunk dequantized **f32 shadow**
+  (`gpu_graph_attn_comp_read_cache`) — 4x the read bytes of the packed rows;
+  teaching the prefill attention kernels to read packed natively is the
+  remaining (deferred) piece.
 
 ## Environment Variables
 
@@ -138,5 +144,10 @@ Also: `PULSAR_FP8_NO_MXCORE`, `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_G
 
 ## Deferred Work
 
-- Real packed FP8 KV-cache storage (replace the fake-quant f32 path).
+- Native packed-KV reads in the **prefill** attention kernels (indexed +
+  static): storage is already packed (see FP8 KV cache above), but prefill
+  consumers read a 4x-size f32 shadow. Profile 2026-08-02 (v5mx4-0731):
+  `attention_indexed_mixed_heads8_online` alone is 17.8% of prefill GPU time
+  @8192 and DRAM-bound (~8 flop/B on 2 KB f32 gathered rows), so inline E4M3
+  decode is worth up to ~10% prefill at depth, growing with context.
 - Move MoE decode off Q8_K activation quantization.
