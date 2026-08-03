@@ -1034,6 +1034,21 @@ struct server {
      * prefix-cache-hit metrics. */
     int n_queued;
     int n_generating;
+    /* Tokens actually emitted, counted at the shared emit path (gen_emit_token)
+     * rather than inside the DSpark fused verify loop. The engine's
+     * spec_gen_tokens only advances on the spec lane, so at spec_max_live decode
+     * banks or fewer it tracks generation and above that it stops dead — which
+     * made vllm:generation_tokens_total report zero throughput on a fully busy
+     * server. The worker thread is the only writer; publish_metrics_snapshot
+     * copies it under mu. */
+    uint64_t w_gen_tokens;        /* worker-owned, no lock */
+    uint64_t m_gen_tokens;        /* published copy, read by send_metrics */
+    /* Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
+     * spec-decode counters cannot advance on the batched lane (it never enters
+     * the fused loop), so a scraper needs this to tell "acceptance really is
+     * this" from "no speculative decoding ran at all". */
+    int w_decode_lane;
+    int m_decode_lane;
     uint64_t m_prompt_tokens;     /* cumulative prompt tokens prefilled */
     uint64_t m_prefix_queries;    /* cumulative prompt tokens seen (hit-rate denom) */
     uint64_t m_prefix_hits;       /* cumulative prompt tokens served from prefix cache */

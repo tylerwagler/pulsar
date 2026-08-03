@@ -1238,6 +1238,10 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     size_t piece_len = 0;
     char *piece = pulsar_token_text(s->engine, token, &piece_len);
     g->completion++;
+    /* Lane-independent generation counter: every decode lane funnels its
+     * accepted tokens through here, so this is the one place that sees them
+     * all. EOS returned above, so this counts emitted tokens only. */
+    s->w_gen_tokens++;
 
     s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);

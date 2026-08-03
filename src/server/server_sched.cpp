@@ -1011,6 +1011,8 @@ void server::publish_metrics_snapshot() {
         s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
     }
     s->m_spec = m;
+    s->m_gen_tokens = s->w_gen_tokens;
+    s->m_decode_lane = s->w_decode_lane;
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1731,6 +1733,11 @@ void *worker_main(void *arg) {
         const bool use_batched =
             s->pool_banks > 0 && n_dec >= 1 &&
             (n_dec > s->spec_max_live || n_batched > 0);
+
+        /* Record the lane for /metrics. Only the spec lane runs the fused verify
+         * loop, so this is what tells a scraper whether the spec_decode_*
+         * counters describe the present or some earlier single-request stretch. */
+        s->w_decode_lane = n_dec <= 0 ? 0 : (use_batched ? 2 : 1);
 
         if (use_batched) {
             /* plan-34 inc 5: when the fused lane is armed and a prefilling slot is

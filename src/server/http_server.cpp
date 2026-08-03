@@ -398,6 +398,9 @@ bool server::send_metrics(int fd) {
     const int block_reason = s->m_queue_block_reason;
     const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes;
     const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes;
+    const unsigned long long gen_tokens = (unsigned long long)s->m_gen_tokens;
+    const int decode_lane = s->m_decode_lane;
+    const int spec_max_live = s->spec_max_live;
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
@@ -436,9 +439,16 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP vllm:prompt_tokens_total Cumulative prompt tokens prefilled.\n");
     buf_puts(&b, "# TYPE vllm:prompt_tokens_total counter\n");
     buf_printf(&b, "vllm:prompt_tokens_total %llu\n", prompt_toks);
-    buf_puts(&b, "# HELP vllm:generation_tokens_total Cumulative tokens emitted.\n");
+    /* Counted at gen_emit_token, NOT from the engine's spec_gen_tokens: the
+     * latter only advances inside the DSpark fused verify loop, so it stops
+     * entirely once the scheduler batches (more than spec_max_live decode
+     * banks) and this metric read zero throughput on a busy server. */
+    buf_puts(&b, "# HELP vllm:generation_tokens_total Cumulative tokens emitted, all decode lanes.\n");
     buf_puts(&b, "# TYPE vllm:generation_tokens_total counter\n");
-    buf_printf(&b, "vllm:generation_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
+    buf_printf(&b, "vllm:generation_tokens_total %llu\n", gen_tokens);
+    buf_puts(&b, "# HELP pulsar:spec_decode_gen_tokens_total Tokens emitted by the fused spec loop only.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_decode_gen_tokens_total counter\n");
+    buf_printf(&b, "pulsar:spec_decode_gen_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
     /* Prefix-cache hit rate (scraper computes hits/queries). */
     buf_puts(&b, "# HELP vllm:prefix_cache_queries_total Cumulative prompt tokens looked up in the prefix cache.\n");
     buf_puts(&b, "# TYPE vllm:prefix_cache_queries_total counter\n");
@@ -502,6 +512,21 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase.\n");
     buf_puts(&b, "# TYPE pulsar:num_requests_prefilling gauge\n");
     buf_printf(&b, "pulsar:num_requests_prefilling %d\n", prefilling);
+
+    /* Decode lane. Speculative decoding only runs while at most spec_max_live
+     * decode banks are live (default 1 — batching wins above that), and only
+     * the spec lane feeds the spec_decode_* counters. Without this a scraper
+     * cannot tell a genuine acceptance rate from a stale one left over from
+     * the last single-request stretch. */
+    static const char *const lane_names[] = { "idle", "spec", "batched" };
+    const int lane = (decode_lane >= 0 && decode_lane <= 2) ? decode_lane : 0;
+    buf_puts(&b, "# HELP pulsar:decode_lane Active decode lane (state set; spec_decode_* only advance on \"spec\").\n");
+    buf_puts(&b, "# TYPE pulsar:decode_lane gauge\n");
+    for (int i = 0; i < 3; i++)
+        buf_printf(&b, "pulsar:decode_lane{lane=\"%s\"} %d\n", lane_names[i], i == lane ? 1 : 0);
+    buf_puts(&b, "# HELP pulsar:spec_max_live Decode-bank count at or below which the spec lane runs.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_max_live gauge\n");
+    buf_printf(&b, "pulsar:spec_max_live %d\n", spec_max_live);
 
     /* Request latency. These are the per-request numbers the response body
      * already reports (req_timings); as histograms they answer "is the tail
