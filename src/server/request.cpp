@@ -1094,7 +1094,8 @@ done:
  * already-direct schemas unchanged. Responses can additionally group tools in a
  * namespace item; those are flattened for DSML prompt rendering while preserving
  * their client-facing name and namespace for response output. */
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
+                       bool web_search_enabled, int *web_search_max_uses) {
     json_ws(p);
     if (json_lit(p, "null")) {
         *out = xstrdup("");
@@ -1107,7 +1108,26 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     json_ws(p);
     while (**p && **p != ']') {
         char *raw = NULL;
+        int ws_uses = 0;
         if (!json_raw_value(p, &raw)) goto bad;
+        if (web_search_tool_entry(raw, &ws_uses)) {
+            /* Anthropic web_search server tool: with a backend configured it
+             * becomes a synthesized internal tool the SERVER executes; without
+             * one it is dropped entirely so the model never emits a call
+             * nobody can run. */
+            if (web_search_enabled) {
+                append_raw_json_line(&schemas, web_search_schema_line());
+                tool_schema_orders_add_json(orders, web_search_schema_line());
+                if (orders && orders->len > 0)
+                    orders->v[orders->len - 1].server_web_search = true;
+                if (web_search_max_uses) *web_search_max_uses = ws_uses;
+            }
+            free(raw);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+            continue;
+        }
         char *function = openai_function_schema_from_tool(raw);
         if (function) {
             append_raw_json_line(&schemas, function);
@@ -1239,7 +1259,8 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+static bool parse_anthropic_content_block(const char **p, const char *role,
+                                          chat_msg *msg, chat_msgs *msgs) {
     (void)role;
     if (**p != '{') return false;
     (*p)++;
@@ -1249,7 +1270,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *id = NULL;
     char *name = NULL;
     char *input = NULL;
-    char *tool_result = NULL;
+    char *content_raw = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1298,8 +1319,11 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            free(tool_result);
-            if (!json_content(p, &tool_result)) {
+            /* Captured raw: "type" may not have been seen yet, and only the
+             * final classification knows whether this is collapsible text
+             * blocks (tool_result) or web_search_result objects. */
+            free(content_raw);
+            if (!json_raw_value(p, &content_raw)) {
                 free(key);
                 goto bad;
             }
@@ -1320,13 +1344,22 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
      * caller may not know the enclosing role yet while parsing content blocks.
      * Classify protocol blocks by their own "type" field; later rendering and
      * validation use the final message role. */
-    if (type && !strcmp(type, "tool_use")) {
+    if (type && (!strcmp(type, "tool_use") || !strcmp(type, "server_tool_use"))) {
+        /* server_tool_use replays a call the SERVER executed (web_search):
+         * structurally identical to tool_use, and carrying the remembered id
+         * lets exact-DSML tool memory restore the sampled bytes. */
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
         tc.name = name ? xstrdup(name) : xstrdup("");
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
+        char *tool_result = NULL;
+        const char *cp = content_raw ? content_raw : "";
+        if (content_raw && !json_content(&cp, &tool_result)) {
+            free(tool_result);
+            goto bad;
+        }
         chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
@@ -1335,6 +1368,31 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+        free(tool_result);
+    } else if (type && !strcmp(type, "web_search_tool_result")) {
+        /* An assistant message that searched maps to THREE template turns:
+         * the call turn (DSML + EOS), the result turn (<｜User｜><tool_result>)
+         * and the continuation turn.  Split here so rendering reproduces the
+         * live transcript byte-for-byte: the result text is rebuilt from the
+         * echoed encrypted_content chunks (web_search.cpp owns that format). */
+        chat_msg call_turn = *msg;
+        memset(msg, 0, sizeof(*msg));
+        if (!call_turn.role) call_turn.role = xstrdup("assistant");
+        chat_msgs_push(msgs, call_turn);
+
+        char *rebuilt = web_search_rebuild_result_text(content_raw);
+        chat_msg result_turn = {0};
+        result_turn.role = xstrdup("user");
+        buf rb = {0};
+        buf_puts(&rb, "<tool_result>");
+        append_tool_result_text(&rb, rebuilt);
+        buf_puts(&rb, "</tool_result>");
+        result_turn.content = buf_take(&rb);
+        chat_msg_add_tool_call_id(&result_turn, id);
+        chat_msgs_push(msgs, result_turn);
+        free(rebuilt);
+
+        msg->role = xstrdup("assistant");
     } else {
         if (text) {
             buf b = {0};
@@ -1358,7 +1416,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(id);
     free(name);
     free(input);
-    free(tool_result);
+    free(content_raw);
     return true;
 bad:
     free(type);
@@ -1367,13 +1425,13 @@ bad:
     free(id);
     free(name);
     free(input);
-    free(tool_result);
+    free(content_raw);
     return false;
 }
 
 
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content(const char **p, chat_msg *msg, chat_msgs *msgs) {
     json_ws(p);
     if (**p == '"') return json_string(p, &msg->content);
     if (json_lit(p, "null")) {
@@ -1394,7 +1452,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg, msgs)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -1439,7 +1497,7 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
+                if (!parse_anthropic_content(p, &msg, msgs)) {
                     free(key);
                     goto fail;
                 }

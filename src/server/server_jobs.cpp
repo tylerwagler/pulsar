@@ -129,6 +129,129 @@ bool server::continue_after_invalid_dsml(session_slot *sl,
 
 
 
+/* Execute one server-side web_search round: run the query against the
+ * configured SearXNG backend, surface the result to the client as
+ * server_tool_use/web_search_tool_result content, splice the result text into
+ * the live session as an ordinary tool_result turn, and re-enter decode within
+ * the same request.  Returns false when this call is not server-executed (or
+ * the splice failed) — the caller then finishes the turn as a normal
+ * client-visible tool_use. */
+bool server::gen_web_search_round(session_slot *sl, const tool_calls *calls,
+                                  const char *pre_content,
+                                  const char *pre_reasoning) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    if (!s->web_search_url || j->req.api != API_ANTHROPIC ||
+        j->req.web_search_max_uses <= 0 || !calls || calls->len != 1)
+    {
+        return false;
+    }
+    const tool_call *tc = &calls->v[0];
+    const tool_schema_order *ord = tool_schema_orders_find(&j->req.tool_orders, tc->name);
+    if (!ord || !ord->server_web_search) return false;
+
+    buf model_text = {0};
+    buf client_content = {0};
+    if (g->web_search_uses >= j->req.web_search_max_uses) {
+        web_search_run_exhausted(&model_text, &client_content);
+        server_log(PULSAR_LOG_TOOL,
+                   "pulsar-server: web_search ctx=%s max_uses=%d exhausted",
+                   g->ctx_span, j->req.web_search_max_uses);
+    } else {
+        char *query = web_search_query_from_arguments(tc->arguments);
+        char logerr[160] = {0};
+        double t0 = server_now_sec();
+        bool ok = web_search_run(s->web_search_url, query ? query : "",
+                                 &model_text, &client_content,
+                                 logerr, sizeof(logerr));
+        server_log(PULSAR_LOG_TOOL,
+                   "pulsar-server: web_search ctx=%s use=%d/%d q=\"%.80s\" -> %s%s%s (%.0f ms, %zu result bytes)",
+                   g->ctx_span, g->web_search_uses + 1, j->req.web_search_max_uses,
+                   query ? query : "",
+                   ok ? "ok" : "error",
+                   ok ? "" : ": ",
+                   ok ? "" : logerr,
+                   (server_now_sec() - t0) * 1000.0,
+                   model_text.len);
+        s->trace_event(g->trace_id, "web_search %s (%zu result bytes)",
+                       ok ? "ok" : "error", model_text.len);
+        free(query);
+    }
+    g->web_search_uses++;
+
+    if (j->req.stream) {
+        /* Flush any held projection of this attempt, then emit the result
+         * block; a dead client fails the normal finish path instead. */
+        if (!anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
+                                         &g->anthropic_live,
+                                         g->text.ptr ? g->text.ptr : "",
+                                         g->text.len, false) ||
+            !anthropic_sse_web_search_result_live(j->fd, &g->anthropic_live,
+                                                  tc->id, client_content.ptr))
+        {
+            buf_free(&model_text);
+            buf_free(&client_content);
+            return false;
+        }
+    } else {
+        buf *wb = &g->web_rounds_json;
+        if (pre_reasoning && pre_reasoning[0]) {
+            buf_puts(wb, "{\"type\":\"thinking\",\"thinking\":");
+            json_escape(wb, pre_reasoning);
+            buf_puts(wb, ",\"signature\":");
+            json_escape(wb, g->id);
+            buf_puts(wb, "},");
+        }
+        if (pre_content && pre_content[0]) {
+            buf_puts(wb, "{\"type\":\"text\",\"text\":");
+            json_escape(wb, pre_content);
+            buf_puts(wb, "},");
+        }
+        buf_puts(wb, "{\"type\":\"server_tool_use\",\"id\":");
+        json_escape(wb, tc->id ? tc->id : "");
+        buf_puts(wb, ",\"name\":");
+        json_escape(wb, tc->name ? tc->name : "web_search");
+        buf_puts(wb, ",\"input\":");
+        append_json_object_or_empty(wb, tc->arguments);
+        buf_puts(wb, "},{\"type\":\"web_search_tool_result\",\"tool_use_id\":");
+        json_escape(wb, tc->id ? tc->id : "");
+        buf_puts(wb, ",\"content\":");
+        buf_puts(wb, client_content.ptr && client_content.ptr[0] ? client_content.ptr : "[]");
+        buf_puts(wb, "},");
+    }
+
+    char suffix_err[160] = {0};
+    int appended = 0;
+    char *suffix = build_web_search_result_suffix(&j->req, &g->thinking,
+                                                  model_text.ptr ? model_text.ptr : "");
+    bool spliced = s->append_rendered_suffix_to_live_session(sl, suffix, &appended,
+                                                             suffix_err,
+                                                             sizeof(suffix_err));
+    free(suffix);
+    buf_free(&model_text);
+    buf_free(&client_content);
+    if (!spliced) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: web_search ctx=%s result splice failed: %s",
+                   g->ctx_span, suffix_err);
+        return false;
+    }
+    server_log(PULSAR_LOG_GENERATION,
+               "pulsar-server: web_search ctx=%s continuation appended %d tokens",
+               g->ctx_span, appended);
+    if (j->req.stream) {
+        anthropic_sse_round_reset(&g->anthropic_live,
+                                  pulsar_think_mode_enabled(j->req.think_mode));
+    }
+    g->completion_total += g->completion;
+    buf_free(&g->text);
+    g->phase = GEN_DECODE_INIT;
+    return true;
+}
+
+
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -1137,7 +1260,10 @@ void server::gen_decode_init(session_slot *sl) {
     g->stop_scan_from = 0;
     g->finish = "length";
     g->completion = 0;
-    g->max_tokens = j->req.max_tokens;
+    /* Continued attempts (tool-error recovery, server web_search rounds) spend
+     * the request's ONE max_tokens budget: completion_total holds what earlier
+     * attempts already generated. */
+    g->max_tokens = j->req.max_tokens - g->completion_total;
     int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
     g->saw_tool_start = false;
     g->saw_tool_end = false;
@@ -1584,6 +1710,7 @@ void server::gen_step_finish(session_slot *sl) {
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     buf_free(&repaired);
+                    g->completion_total += g->completion;
                     buf_free(&g->text);
                     g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
                     return;
@@ -1670,6 +1797,7 @@ void server::gen_step_finish(session_slot *sl) {
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
+                    g->completion_total += g->completion;
                     buf_free(&g->text);
                     g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
                     return;
@@ -1726,6 +1854,14 @@ void server::gen_step_finish(session_slot *sl) {
                 apply_anthropic_stream_tool_ids(&parsed_calls, &g->anthropic_live);
             s->assign_tool_call_ids(&parsed_calls, j->req.api);
             s->tool_memory_remember(&parsed_calls);
+            if (s->gen_web_search_round(sl, &parsed_calls,
+                                        parsed_content, parsed_reasoning))
+            {
+                free(parsed_content);
+                free(parsed_reasoning);
+                tool_calls_free(&parsed_calls);
+                return; /* result spliced; phase reset to GEN_DECODE_INIT */
+            }
             final_finish = "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
             s->responses_live_clear(sl);
@@ -1745,7 +1881,7 @@ void server::gen_step_finish(session_slot *sl) {
         t->decode_s = finish_t > g->decode_t0 ? finish_t - g->decode_t0 : 0.0;
         t->prompt_n = g->prompt_tokens;
         t->cached_n = j->req.cache_read_tokens;
-        t->decode_n = g->completion;
+        t->decode_n = g->completion_total + g->completion;
         pulsar_spec_metrics spec_end;
         pulsar_session_spec_metrics(s->sess, &spec_end);
         t->spec_gen = spec_end.gen_tokens - g->spec_start.gen_tokens;
@@ -1841,12 +1977,14 @@ void server::gen_step_finish(session_slot *sl) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
                                                     g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    &parsed_calls, final_finish, g->completion);
+                                                    &parsed_calls, final_finish,
+                                                    g->completion_total + g->completion);
         } else if (g->openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, g->id, &g->openai_live,
                                                  g->text.ptr ? g->text.ptr : "", g->text.len,
                                                  &parsed_calls, final_finish,
-                                                 g->prompt_tokens, g->completion);
+                                                 g->prompt_tokens,
+                                                 g->completion_total + g->completion);
         } else if (g->responses_live_chat) {
             /* If parse recovered a malformed tool call back to plain text,
              * pass parsed_content so the streaming tail can be flushed; in
@@ -1858,17 +1996,20 @@ void server::gen_step_finish(session_slot *sl) {
                                                     g->text.ptr ? g->text.ptr : "", g->text.len,
                                                     recover,
                                                     &parsed_calls, final_finish,
-                                                    g->prompt_tokens, g->completion,
+                                                    g->prompt_tokens,
+                                                    g->completion_total + g->completion,
                                                     g->responses_created_at);
         } else if (g->structured_stream) {
             response_ok = sse_chat_finish(j->fd, &j->req, g->id,
                                           parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                           parsed_reasoning,
                                           &parsed_calls, final_finish,
-                                          g->prompt_tokens, g->completion);
+                                          g->prompt_tokens,
+                                          g->completion_total + g->completion);
         } else {
             response_ok = sse_chunk(j->fd, &j->req, g->id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, g->id, g->prompt_tokens, g->completion);
+                          sse_done(j->fd, &j->req, g->id, g->prompt_tokens,
+                                   g->completion_total + g->completion);
         }
         if (!response_ok) {
             server_log(PULSAR_LOG_DEFAULT,
@@ -1883,19 +2024,23 @@ void server::gen_step_finish(session_slot *sl) {
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 g->prompt_tokens, g->completion);
+                                 g->prompt_tokens,
+                                 g->completion_total + g->completion,
+                                 g->web_rounds_json.ptr);
     } else if (j->req.api == API_RESPONSES) {
         responses_final_response(j->fd, s->enable_cors, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 g->prompt_tokens, g->completion);
+                                 g->prompt_tokens,
+                                 g->completion_total + g->completion);
     } else {
         final_response(j->fd, s->enable_cors, &j->req, g->id,
                        parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
-                       g->prompt_tokens, g->completion);
+                       g->prompt_tokens,
+                       g->completion_total + g->completion);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -1979,6 +2124,7 @@ void server::gen_state_free(session_slot *sl) {
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
+    buf_free(&g->web_rounds_json);
     pulsar_tokens_free(&g->effective_prompt);
     pulsar_tokens_free(&g->cold_prefix);
     pulsar_tokens_free(&g->batch_pending);

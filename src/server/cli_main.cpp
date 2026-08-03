@@ -639,6 +639,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
+        } else if (!strcmp(arg, "--web-search-url")) {
+            c.web_search_url = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -1171,6 +1173,19 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    /* One startup read (env fallback for the flag), no hot-path getenv: the
+     * resolved URL is consulted per request, never per token.  Set => the
+     * Anthropic web_search server tool is executed here against this
+     * SearXNG-compatible endpoint; unset => web_search tool entries are
+     * dropped at parse. */
+    s.web_search_url = cfg.web_search_url ? cfg.web_search_url
+                                          : getenv("PULSAR_WEB_SEARCH_URL");
+    if (s.web_search_url && !s.web_search_url[0]) s.web_search_url = NULL;
+    server_log(PULSAR_LOG_DEFAULT,
+               s.web_search_url
+                   ? "pulsar-server: web_search server tool ENABLED (backend %s)"
+                   : "pulsar-server: web_search server tool disabled (no --web-search-url)%s",
+               s.web_search_url ? s.web_search_url : "");
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir &&

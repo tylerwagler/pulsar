@@ -9,6 +9,7 @@
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"
 #include "../src/server/tool_memory.cpp"
+#include "../src/server/web_search.cpp"
 #include "../src/server/kv_cache.cpp"
 #include "../src/server/trace.cpp"
 #include "../src/server/generate.cpp"

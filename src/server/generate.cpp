@@ -67,6 +67,27 @@ static char *rendered_chat_system_region(const char *prompt_text) {
 
 
 
+/* The template turn appended to the live session after the server executed a
+ * web_search call: end the assistant call turn, present the results as an
+ * ordinary tool_result, and reopen the assistant.  Byte-shape must match what
+ * the replay path renders from the split web_search_tool_result message
+ * (request.cpp parse_anthropic_content_block) or next-turn prefix reuse dies. */
+char *build_web_search_result_suffix(const request *r,
+                                     const thinking_state *thinking,
+                                     const char *result_text) {
+    buf suffix = {0};
+    if (r && pulsar_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+    append_tool_result_text(&suffix, result_text ? result_text : "");
+    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
+    buf_puts(&suffix, r && pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    return buf_take(&suffix);
+}
+
+
+
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {

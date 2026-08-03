@@ -38,9 +38,13 @@ static void append_anthropic_thinking(buf *b, const char *reasoning, const char 
 
 void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,
-                                     const tool_schema_orders *orders) {
+                                     const tool_schema_orders *orders,
+                                     const char *prior_blocks_json) {
     buf_putc(b, '[');
     bool wrote = false;
+    /* Completed server-executed web_search rounds, prebuilt in emission order
+     * (each block ','-terminated) by gen_web_search_round. */
+    if (prior_blocks_json && prior_blocks_json[0]) buf_puts(b, prior_blocks_json);
     bool wrote_after_thinking = false;
     if (reasoning && reasoning[0]) {
         append_anthropic_thinking(b, reasoning, id_prefix);
@@ -90,12 +94,14 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens) {
+                                     int prompt_tokens, int completion_tokens,
+                                     const char *prior_blocks_json) {
     buf b = {0};
     buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"content\":");
-    append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
+    append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders,
+                             prior_blocks_json);
     buf_puts(&b, ",\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
@@ -141,6 +147,7 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
     memset(st, 0, sizeof(*st));
     st->active = ok;
+    st->orders = &r->tool_orders;
     st->mode = pulsar_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
     return ok;
 }
@@ -234,6 +241,13 @@ static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
 
 
 
+/* Server-executed tools stream as server_tool_use so no client mistakes them
+ * for calls it must run itself. */
+static bool anthropic_name_is_server_tool(const anthropic_stream *st, const char *name) {
+    const tool_schema_order *ord = tool_schema_orders_find(st->orders, name);
+    return ord && ord->server_web_search;
+}
+
 static bool anthropic_sse_open_tool_block(int fd, anthropic_stream *st,
                                           const char *tool_id,
                                           const char *name) {
@@ -243,8 +257,9 @@ static bool anthropic_sse_open_tool_block(int fd, anthropic_stream *st,
     buf b = {0};
     buf_printf(&b,
                "{\"type\":\"content_block_start\",\"index\":%d,"
-               "\"content_block\":{\"type\":\"tool_use\",\"id\":",
-               st->next_index);
+               "\"content_block\":{\"type\":\"%s\",\"id\":",
+               st->next_index,
+               anthropic_name_is_server_tool(st, name) ? "server_tool_use" : "tool_use");
     json_escape(&b, tool_id ? tool_id : "");
     buf_puts(&b, ",\"name\":");
     json_escape(&b, name ? name : "");
@@ -734,8 +749,10 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
         snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id, i);
         buf_printf(&b,
                    "{\"type\":\"content_block_start\",\"index\":%d,"
-                   "\"content_block\":{\"type\":\"tool_use\",\"id\":",
-                   st->next_index);
+                   "\"content_block\":{\"type\":\"%s\",\"id\":",
+                   st->next_index,
+                   anthropic_name_is_server_tool(st, tc->name) ? "server_tool_use"
+                                                               : "tool_use");
         json_escape(&b, tc->id && tc->id[0] ? tc->id : idbuf);
         buf_puts(&b, ",\"name\":");
         json_escape(&b, tc->name ? tc->name : "");
@@ -795,3 +812,44 @@ bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *
     return anthropic_sse_stop_live(fd, finish, completion_tokens);
 }
 
+
+
+
+bool anthropic_sse_web_search_result_live(int fd, anthropic_stream *st,
+                                          const char *tool_use_id,
+                                          const char *content_json) {
+    if (!st->active) return true;
+    buf b = {0};
+    buf_printf(&b,
+               "{\"type\":\"content_block_start\",\"index\":%d,"
+               "\"content_block\":{\"type\":\"web_search_tool_result\","
+               "\"tool_use_id\":",
+               st->next_index);
+    json_escape(&b, tool_use_id ? tool_use_id : "");
+    buf_puts(&b, ",\"content\":");
+    buf_puts(&b, content_json && content_json[0] ? content_json : "[]");
+    buf_puts(&b, "}}");
+    bool ok = sse_event(fd, "content_block_start", b.ptr);
+    buf_free(&b);
+    if (!ok) return false;
+    buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}", st->next_index);
+    ok = sse_event(fd, "content_block_stop", b.ptr);
+    buf_free(&b);
+    if (ok) st->next_index++;
+    return ok;
+}
+
+
+
+/* The continued decode attempt starts over with an empty g->text; rewind every
+ * text-relative projection field while keeping the stream identity (block
+ * index counter, emitted-id table, orders) intact.  Mirrors the mode choice in
+ * anthropic_sse_start_live: the continuation prompt suffix reopens the
+ * assistant with <think> (thinking mode) or </think> (non-thinking), so the
+ * model's next raw output is thinking content or text respectively. */
+void anthropic_sse_round_reset(anthropic_stream *st, bool thinking_enabled) {
+    st->emit_pos = 0;
+    st->checked_think_prefix = false;
+    st->open_block = ANTH_BLOCK_NONE;
+    st->mode = thinking_enabled ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+}

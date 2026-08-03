@@ -293,6 +293,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
     opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
+    opt(fp, c, "--web-search-url URL", "SearXNG endpoint for the Anthropic web_search server tool (env: PULSAR_WEB_SEARCH_URL). Unset drops web_search tool entries.");
     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
     fputc('\n', fp);
 }
