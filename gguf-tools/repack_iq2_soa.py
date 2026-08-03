@@ -20,8 +20,13 @@ ds4q_iq2_xxs_soa_repack() in gguf-tools/quants_common.c:
 Usage:
   repack_iq2_soa.py IN.gguf OUT.gguf [--match SUBSTR] [--dry-run]
 
---match limits which tensor names are converted (default: every IQ2_XXS
-tensor).  --dry-run reports what would change and exits without writing.
+--match limits which tensor names are converted, comma-separated (default:
+every IQ2_XXS tensor).  Converting a SUBSET is legitimate and useful: the
+engine binder accepts type 16 and 42 per tensor, so e.g. repacking only
+ffn_gate_exps,ffn_up_exps leaves every down-projection reader on the packed
+path untouched.  gate and up must be converted TOGETHER -- the fused gate+up
+kernels read one layout and the binder rejects a mismatched pair.
+--dry-run reports what would change and exits without writing.
 """
 import argparse
 import os
@@ -96,13 +101,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("dst")
-    ap.add_argument("--match", default="")
+    ap.add_argument("--match", default="",
+                    help="comma-separated substrings; a tensor converts if ANY matches")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
     tensors, alignment, data_start = scan(a.src)
+    pats = [x for x in a.match.split(",") if x]
     targets = [t for t in tensors
-               if t["type"] == IQ2_XXS and (not a.match or a.match in t["name"])]
+               if t["type"] == IQ2_XXS
+               and (not pats or any(pp in t["name"] for pp in pats))]
     total = sum(t["ne"] // QK_K * BLK_BYTES for t in targets)
     print(f"tensors={len(tensors)} alignment={alignment} data_start={data_start}")
     print(f"IQ2_XXS targets={len(targets)}  bytes={total/1e9:.2f} GB")
