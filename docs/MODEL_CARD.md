@@ -87,16 +87,18 @@ for MoE expert parameters and FP8 for most other parameters.
 
 ## Reasoning Modes
 
-The instruct models support three reasoning-effort modes:
+The instruct models support a non-thinking mode plus three reasoning-effort
+levels (restructured in the 0731 release):
 
 | Mode | Intended behavior | Output shape |
 |---|---|---|
 | Non-think | Fast, intuitive replies | `</think>` summary |
-| High | Deliberate reasoning for harder tasks | `<think>... </think>` summary |
-| Max | Largest reasoning budget | Special system prompt plus thinking and summary |
+| Low | Default thinking, no effort prefix | `<think>... </think>` summary |
+| High | Deliberate reasoning for harder tasks | Effort prompt prefix plus thinking and summary |
+| Max | Largest reasoning budget | Stronger effort prompt prefix plus thinking and summary |
 
-The model card recommends using at least a 384K-token context window for Think
-Max.
+The model card recommends a 384K-token output budget for the high and max
+levels.
 
 ## Important Flash Benchmarks
 
@@ -182,9 +184,11 @@ Completed assistant thinking turns are rendered as reasoning content inside
 
 By default, the Python renderer drops earlier assistant reasoning content before
 the last user message. If tools are present on any message, it disables that
-reasoning drop and keeps the full reasoning/tool context. `reasoning_effort=max`
-also prepends a special high-effort instruction prefix before the first rendered
-message in thinking mode.
+reasoning drop and keeps the full reasoning/tool context. In thinking mode the
+0731 renderer prepends a fixed instruction prefix for `reasoning_effort=high`
+or `max` before the first rendered message (`low`, the default, adds nothing;
+the `high` text is what the original release used for `max`, and 0731's `max`
+text is new and stronger).
 
 Tool definitions are passed in OpenAI-compatible function schema form, but the
 model is instructed to emit DSML. A tool call is rendered as a DSML
@@ -219,7 +223,7 @@ For local deployment, it recommends:
 
 - `temperature = 1.0`
 - `top_p = 1.0`
-- At least 384K context for Think Max
+- A 384K-token output budget for the high and max reasoning-effort levels
 
 These are deployment recommendations from the model card, not necessarily the
 same settings used for deterministic benchmarking. Pulsar keeps `top_p=1.0` but

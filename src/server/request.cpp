@@ -232,7 +232,7 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = PULSAR_DEFAULT_TEMPERATURE;
     r->top_p = PULSAR_DEFAULT_TOP_P;
     r->min_p = PULSAR_DEFAULT_MIN_P;
-    r->think_mode = PULSAR_THINK_HIGH;
+    r->think_mode = PULSAR_THINK_LOW;
 }
 
 
@@ -259,25 +259,27 @@ void request_free(request *r) {
 
 pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort) {
     if (!enabled || effort == PULSAR_THINK_NONE) return PULSAR_THINK_NONE;
-    return effort == PULSAR_THINK_MAX ? PULSAR_THINK_MAX : PULSAR_THINK_HIGH;
+    return effort;
 }
 
 
 
+/* DS4 exposes the 0731 levels low/high/max above zero. OpenAI-style names
+ * collapse onto them: "minimal"/"medium" join "low" (the prefix-free
+ * default), "xhigh" joins "max". Callers that need *no* reasoning must use
+ * "none" instead. */
 bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
     if (!s) return false;
-    if (!strcmp(s, "max")) {
+    if (!strcmp(s, "max") || !strcmp(s, "xhigh")) {
         *out = PULSAR_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
+    if (!strcmp(s, "high")) {
         *out = PULSAR_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
+        *out = PULSAR_THINK_LOW;
         return true;
     }
     if (!strcmp(s, "none")) {

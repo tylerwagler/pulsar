@@ -591,8 +591,9 @@ static void encode_chat_prompt(
         pulsar_think_mode   think_mode,
         token_vec       *out) {
     token_vec_push(out, vocab->bos_id);
-    if (think_mode == PULSAR_THINK_MAX) {
-        vocab->bpe_tokenize_text(PULSAR_REASONING_EFFORT_MAX_PREFIX, out);
+    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
+    if (effort_prefix[0]) {
+        vocab->bpe_tokenize_text(effort_prefix, out);
     }
     if (system && system[0]) {
         vocab->bpe_tokenize_text(system, out);
@@ -702,8 +703,9 @@ void pulsar_encode_chat_prompt(
 
 
 
-void pulsar_chat_append_max_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens) {
-    e->vocab.bpe_tokenize_text(PULSAR_REASONING_EFFORT_MAX_PREFIX, tokens);
+void pulsar_chat_append_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
+    if (effort_prefix[0]) e->vocab.bpe_tokenize_text(effort_prefix, tokens);
 }
 
 

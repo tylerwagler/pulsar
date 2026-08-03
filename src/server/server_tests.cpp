@@ -1229,7 +1229,7 @@ static void test_streaming_holds_partial_utf8(void) {
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == PULSAR_THINK_HIGH);
+    TEST_ASSERT(r.think_mode == PULSAR_THINK_LOW);
     TEST_ASSERT(r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == PULSAR_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
@@ -1340,15 +1340,27 @@ static void test_think_sampling_respects_explicit_params(void) {
 
 static void test_reasoning_effort_mapping(void) {
     pulsar_think_mode mode = PULSAR_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == PULSAR_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == PULSAR_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == PULSAR_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == PULSAR_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == PULSAR_THINK_LOW);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == PULSAR_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == PULSAR_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == PULSAR_THINK_MAX);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == PULSAR_THINK_MAX);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_MAX, 32768) == PULSAR_THINK_HIGH);
+    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_MAX, 32768) == PULSAR_THINK_LOW);
+    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_HIGH, 32768) == PULSAR_THINK_LOW);
+    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_LOW, 32768) == PULSAR_THINK_LOW);
     TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_MAX,
                                            (int)pulsar_think_max_min_context()) == PULSAR_THINK_MAX);
+    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_HIGH,
+                                           (int)pulsar_think_max_min_context()) == PULSAR_THINK_HIGH);
+    /* The three prefixes are distinct: low empty, high/max non-empty and
+     * different texts (0731 restructure). */
+    TEST_ASSERT(!pulsar_think_effort_prefix(PULSAR_THINK_LOW)[0]);
+    TEST_ASSERT(pulsar_think_effort_prefix(PULSAR_THINK_HIGH)[0]);
+    TEST_ASSERT(pulsar_think_effort_prefix(PULSAR_THINK_MAX)[0]);
+    TEST_ASSERT(strcmp(pulsar_think_effort_prefix(PULSAR_THINK_HIGH),
+                       pulsar_think_effort_prefix(PULSAR_THINK_MAX)) != 0);
 }
 
 
@@ -1370,7 +1382,12 @@ static void test_api_thinking_controls_parse(void) {
     const char *openai_effort = "\"xhigh\"";
     mode = PULSAR_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
-    TEST_ASSERT(mode == PULSAR_THINK_HIGH);
+    TEST_ASSERT(mode == PULSAR_THINK_MAX);
+
+    const char *low_effort = "\"low\"";
+    mode = PULSAR_THINK_HIGH;
+    TEST_ASSERT(parse_reasoning_effort_value(&low_effort, &mode));
+    TEST_ASSERT(mode == PULSAR_THINK_LOW);
 }
 
 
@@ -1393,6 +1410,32 @@ static void test_render_think_max_prompt_prefix(void) {
     TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
 
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+
+
+/* 0731 effort levels: HIGH renders its own (distinct) prefix, LOW renders
+ * none — a LOW prompt is byte-identical to the pre-0731 default rendering. */
+static void test_render_think_effort_prefixes(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, pulsar_think_effort_prefix(PULSAR_THINK_HIGH)) != NULL);
+    TEST_ASSERT(strstr(prompt, pulsar_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_LOW);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
 }
@@ -4900,6 +4943,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
+    test_render_think_effort_prefixes();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

@@ -776,11 +776,14 @@ processing the whole prompt again.
 
 ## Thinking Modes
 
-DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+DeepSeek V4 Flash has a non-thinking mode plus the three 0731 reasoning-effort
+levels: `low` (the default — plain thinking, no effort prefix), `high`, and
+`max`, each realized as a fixed instruction prefix rendered before the system
+message. The server defaults to `low`. `reasoning_effort=high` and
+`reasoning_effort=max` request their prefixes, but only when the context size
+is large enough for the model card recommendation; smaller contexts fall back
+to `low`. OpenAI `reasoning_effort=xhigh` maps to `max`, and
+`minimal`/`medium` map to `low`.
 
 For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
 non-thinking model alias such as `deepseek-chat`.

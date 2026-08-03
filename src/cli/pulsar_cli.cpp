@@ -139,13 +139,13 @@ static pulsar_think_mode cli_effective_think_mode(const cli_generation_options *
     return pulsar_think_mode_for_context(gen->think_mode, gen->ctx_size);
 }
 
-static bool cli_think_max_downgraded(const cli_generation_options *gen) {
-    return gen->think_mode == PULSAR_THINK_MAX &&
-           cli_effective_think_mode(gen) != PULSAR_THINK_MAX;
+static bool cli_think_effort_downgraded(const cli_generation_options *gen) {
+    return pulsar_think_effort_prefix(gen->think_mode)[0] &&
+           cli_effective_think_mode(gen) != gen->think_mode;
 }
 
-static void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char *name) {
-    if (!cli_think_max_downgraded(gen)) return;
+static void cli_warn_think_effort_downgraded(const cli_generation_options *gen, const char *name) {
+    if (!cli_think_effort_downgraded(gen)) return;
     pulsar_log(stderr,
         PULSAR_LOG_WARNING,
         "pulsar: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
@@ -1089,7 +1089,8 @@ typedef struct {
     pulsar_session *session;
     pulsar_tokens transcript;
     int ctx_size;
-    int max_prefix_tokens;
+    int effort_prefix_tokens;
+    pulsar_think_mode effort_prefix_mode; /* mode whose prefix is in the transcript */
 } repl_chat;
 
 static void tokens_insert(pulsar_tokens *dst, int pos, const pulsar_tokens *src) {
@@ -1119,23 +1120,26 @@ static void tokens_remove(pulsar_tokens *dst, int pos, int n) {
     dst->len -= n;
 }
 
-/* Insert/remove the Think Max prefix inside the existing transcript.  The
- * prefix lives after BOS, before any system/developer text, which mirrors the
- * API rendering path.  Changing it invalidates the session because every later
- * token position would otherwise refer to the wrong prefix. */
-static void repl_chat_apply_max_prefix(pulsar_engine *engine, repl_chat *chat, bool enable) {
-    if (enable && chat->max_prefix_tokens == 0) {
-        pulsar_tokens prefix = {0};
-        pulsar_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
-        chat->max_prefix_tokens = prefix.len;
-        pulsar_tokens_free(&prefix);
-        if (chat->session) pulsar_session_invalidate(chat->session);
-    } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
-        chat->max_prefix_tokens = 0;
-        if (chat->session) pulsar_session_invalidate(chat->session);
+/* Insert/remove/swap the reasoning-effort prefix inside the existing
+ * transcript.  The prefix lives after BOS, before any system/developer text,
+ * which mirrors the API rendering path.  Changing it invalidates the session
+ * because every later token position would otherwise refer to the wrong
+ * prefix. */
+static void repl_chat_apply_effort_prefix(pulsar_engine *engine, repl_chat *chat,
+                                          pulsar_think_mode mode) {
+    if (!pulsar_think_effort_prefix(mode)[0]) mode = PULSAR_THINK_LOW;
+    if (mode == chat->effort_prefix_mode) return;
+    if (chat->effort_prefix_tokens > 0) {
+        tokens_remove(&chat->transcript, 1, chat->effort_prefix_tokens);
+        chat->effort_prefix_tokens = 0;
     }
+    pulsar_tokens prefix = {0};
+    pulsar_chat_append_effort_prefix(engine, &prefix, mode);
+    tokens_insert(&chat->transcript, 1, &prefix);
+    chat->effort_prefix_tokens = prefix.len;
+    chat->effort_prefix_mode = mode;
+    pulsar_tokens_free(&prefix);
+    if (chat->session) pulsar_session_invalidate(chat->session);
 }
 
 static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int ctx_size) {
@@ -1153,8 +1157,7 @@ static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int 
 static int repl_chat_init(pulsar_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
     pulsar_chat_begin(engine, &chat->transcript);
-    repl_chat_apply_max_prefix(engine, chat,
-                               cli_effective_think_mode(&cfg->gen) == PULSAR_THINK_MAX);
+    repl_chat_apply_effort_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
     if (cfg->gen.system && cfg->gen.system[0]) {
         pulsar_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
@@ -1187,7 +1190,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
 
     pulsar_think_mode think_mode = pulsar_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
-    repl_chat_apply_max_prefix(engine, chat, think_mode == PULSAR_THINK_MAX);
+    repl_chat_apply_effort_prefix(engine, chat, think_mode);
     const int rollback_len = chat->transcript.len;
     pulsar_chat_append_message(engine, &chat->transcript, "user", user_text);
     pulsar_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
@@ -1353,19 +1356,21 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
         } else if (!strcmp(cmd, "/think")) {
-            cfg->gen.think_mode = PULSAR_THINK_HIGH;
-            repl_chat_apply_max_prefix(engine, &chat, false);
-            puts("Thinking mode: high.");
-        } else if (!strcmp(cmd, "/think-max")) {
-            cfg->gen.think_mode = PULSAR_THINK_MAX;
-            bool active = pulsar_think_mode_for_context(cfg->gen.think_mode,
-                                                     chat.ctx_size) == PULSAR_THINK_MAX;
-            repl_chat_apply_max_prefix(engine, &chat, active);
-            cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
-            printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+            cfg->gen.think_mode = PULSAR_THINK_LOW;
+            repl_chat_apply_effort_prefix(engine, &chat, PULSAR_THINK_LOW);
+            puts("Thinking mode: low.");
+        } else if (!strcmp(cmd, "/think-high") || !strcmp(cmd, "/think-max")) {
+            cfg->gen.think_mode = !strcmp(cmd, "/think-max") ? PULSAR_THINK_MAX
+                                                             : PULSAR_THINK_HIGH;
+            pulsar_think_mode active = pulsar_think_mode_for_context(cfg->gen.think_mode,
+                                                                     chat.ctx_size);
+            repl_chat_apply_effort_prefix(engine, &chat, active);
+            cli_warn_think_effort_downgraded(&cfg->gen, cmd);
+            printf("Thinking mode: %s%s.\n", pulsar_think_mode_name(active),
+                   active != cfg->gen.think_mode ? " (ctx below 393216)" : "");
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = PULSAR_THINK_NONE;
-            repl_chat_apply_max_prefix(engine, &chat, false);
+            repl_chat_apply_effort_prefix(engine, &chat, PULSAR_THINK_NONE);
             puts("Thinking mode: none.");
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
@@ -1381,10 +1386,9 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                     linenoiseFree(line);
                     break;
                 }
-                bool active = pulsar_think_mode_for_context(cfg->gen.think_mode,
-                                                         chat.ctx_size) == PULSAR_THINK_MAX;
-                repl_chat_apply_max_prefix(engine, &chat, active);
-                cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
+                repl_chat_apply_effort_prefix(engine, &chat,
+                    pulsar_think_mode_for_context(cfg->gen.think_mode, chat.ctx_size));
+                cli_warn_think_effort_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
@@ -1483,7 +1487,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = PULSAR_DEFAULT_TOP_P,
             .min_p = PULSAR_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = PULSAR_THINK_HIGH,
+            .think_mode = PULSAR_THINK_LOW,
         },
     };
 
@@ -1580,6 +1584,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            c.gen.think_mode = PULSAR_THINK_LOW;
+        } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;
@@ -1646,7 +1652,8 @@ int main(int argc, char **argv) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
                            cfg.engine.prefill_chunk);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
+        cli_warn_think_effort_downgraded(&cfg.gen,
+            cfg.gen.think_mode == PULSAR_THINK_MAX ? "--think-max" : "--think-high");
     }
     int rc = 0;
     if (cfg.inspect) {

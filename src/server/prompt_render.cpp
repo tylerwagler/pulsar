@@ -349,7 +349,7 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
 
     buf out = {0};
     buf_puts(&out, PULSAR_SERVER_RENDER_BOS);
-    if (think_mode == PULSAR_THINK_MAX) buf_puts(&out, pulsar_think_max_prefix());
+    buf_puts(&out, pulsar_think_effort_prefix(think_mode));
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;

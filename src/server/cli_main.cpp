@@ -1140,28 +1140,34 @@ int main(int argc, char **argv) {
      * depth at which a shared prefix stops meaning "same rendered template
      * header" and starts meaning "same conversation". Derived once per model
      * rather than hardcoded: tokenize the largest template-injected text two
-     * UNRELATED conversations can share — BOS plus the fixed think-max
-     * preamble (prompt_render.c renders both before any client content; the
-     * preamble only appears at PULSAR_THINK_MAX, unreachable below a 384K
-     * context, but a threshold sized for it stays correct on boxes where it
-     * IS reachable and costs nothing here) — then allow
-     * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS of incidental prologue
-     * overlap on top (see the constant's comment for the sizing evidence). */
+     * UNRELATED conversations can share — BOS plus the longest fixed
+     * reasoning-effort preamble (prompt_render.cpp renders both before any
+     * client content; the preambles only appear at PULSAR_THINK_HIGH/MAX,
+     * unreachable below a 384K context, but a threshold sized for them stays
+     * correct on boxes where they ARE reachable and costs nothing here) —
+     * then allow PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS of incidental
+     * prologue overlap on top (see the constant's comment for the sizing
+     * evidence). */
     {
-        buf hdr = {0};
-        buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
-        buf_puts(&hdr, pulsar_think_max_prefix());
-        pulsar_tokens hdr_tokens = {0};
-        pulsar_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
+        const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_HIGH, PULSAR_THINK_MAX};
+        int hdr_len = 0;
+        for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
+            buf hdr = {0};
+            buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
+            buf_puts(&hdr, pulsar_think_effort_prefix(prefixed_modes[i]));
+            pulsar_tokens hdr_tokens = {0};
+            pulsar_tokenize_rendered_chat(engine, hdr.ptr, &hdr_tokens);
+            if (hdr_tokens.len > hdr_len) hdr_len = hdr_tokens.len;
+            pulsar_tokens_free(&hdr_tokens);
+            buf_free(&hdr);
+        }
         s.slot_trivial_common_tokens =
-            hdr_tokens.len + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+            hdr_len + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: slot routing: trivial-match threshold %d tokens "
                    "(template header %d + incidental allowance %d)",
-                   s.slot_trivial_common_tokens, hdr_tokens.len,
+                   s.slot_trivial_common_tokens, hdr_len,
                    PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
-        pulsar_tokens_free(&hdr_tokens);
-        buf_free(&hdr);
     }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;

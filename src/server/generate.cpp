@@ -44,10 +44,14 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     const char *bos = PULSAR_SERVER_RENDER_BOS;
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = pulsar_think_max_prefix();
-    const size_t max_prefix_len = strlen(max_prefix);
-    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
-        p += max_prefix_len;
+    const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_MAX, PULSAR_THINK_HIGH};
+    for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
+        const char *effort_prefix = pulsar_think_effort_prefix(prefixed_modes[i]);
+        const size_t effort_prefix_len = strlen(effort_prefix);
+        if (effort_prefix_len && !strncmp(p, effort_prefix, effort_prefix_len)) {
+            p += effort_prefix_len;
+            break;
+        }
     }
     while (*p && isspace((unsigned char)*p)) p++;
 

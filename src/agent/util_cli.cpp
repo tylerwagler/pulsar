@@ -214,7 +214,7 @@ agent_config parse_options(int argc, char **argv) {
             .temperature = PULSAR_DEFAULT_TEMPERATURE,
             .top_p = PULSAR_DEFAULT_TOP_P,
             .min_p = PULSAR_DEFAULT_MIN_P,
-            .think_mode = PULSAR_THINK_HIGH,
+            .think_mode = PULSAR_THINK_LOW,
         },
     };
 
@@ -250,6 +250,8 @@ agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            c.gen.think_mode = PULSAR_THINK_LOW;
+        } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;

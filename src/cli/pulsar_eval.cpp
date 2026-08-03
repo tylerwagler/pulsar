@@ -1578,7 +1578,7 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
-        .think_mode = PULSAR_THINK_HIGH,
+        .think_mode = PULSAR_THINK_LOW,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -1637,6 +1637,8 @@ static eval_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
+            c.think_mode = PULSAR_THINK_LOW;
+        } else if (!strcmp(arg, "--think-high")) {
             c.think_mode = PULSAR_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.think_mode = PULSAR_THINK_MAX;
@@ -2435,10 +2437,10 @@ static int eval_auto_context_size(pulsar_engine *engine,
     int ctx = EVAL_MAX_CONTEXT;
     int max_prompt = 0;
     int max_case = -1;
-    const int min_ctx = cfg->think_mode == PULSAR_THINK_MAX ?
+    const int min_ctx = pulsar_think_effort_prefix(cfg->think_mode)[0] ?
                         (int)pulsar_think_max_min_context() : 1;
 
-    /* Think Max downgrades to normal thinking under its minimum context.  Size
+    /* High/max effort downgrades to normal thinking under its minimum context.  Size
      * the prompts iteratively so the prompt tokenizer sees the same effective
      * thinking mode that the actual run will use. */
     for (int iter = 0; iter < 3; iter++) {
@@ -2460,13 +2462,14 @@ static int eval_auto_context_size(pulsar_engine *engine,
     return ctx;
 }
 
-static void eval_warn_think_max_downgraded(const eval_config *cfg) {
-    if (cfg->think_mode != PULSAR_THINK_MAX ||
-        pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == PULSAR_THINK_MAX) {
+static void eval_warn_think_effort_downgraded(const eval_config *cfg) {
+    if (!pulsar_think_effort_prefix(cfg->think_mode)[0] ||
+        pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == cfg->think_mode) {
         return;
     }
     fprintf(stderr,
-            "pulsar-eval: warning: --think-max needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+            "pulsar-eval: warning: --think-%s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+            pulsar_think_mode_name(cfg->think_mode),
             pulsar_think_max_min_context(),
             cfg->ctx_size);
 }
@@ -4140,7 +4143,7 @@ int main(int argc, char **argv) {
         eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case);
     }
     fprintf(stderr, "pulsar-eval: model shape %s\n", pulsar_engine_model_name(engine));
-    eval_warn_think_max_downgraded(&cfg);
+    eval_warn_think_effort_downgraded(&cfg);
     trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases, max_prompt_tokens);
     log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
 

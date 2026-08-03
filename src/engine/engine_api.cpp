@@ -48,7 +48,7 @@ void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend) {
 
 
 bool pulsar_think_mode_enabled(pulsar_think_mode mode) {
-    return mode == PULSAR_THINK_HIGH || mode == PULSAR_THINK_MAX;
+    return mode != PULSAR_THINK_NONE;
 }
 
 
@@ -56,10 +56,21 @@ bool pulsar_think_mode_enabled(pulsar_think_mode mode) {
 const char *pulsar_think_mode_name(pulsar_think_mode mode) {
     switch (mode) {
     case PULSAR_THINK_NONE: return "none";
+    case PULSAR_THINK_LOW:  return "low";
     case PULSAR_THINK_HIGH: return "high";
     case PULSAR_THINK_MAX:  return "max";
     }
     return "unknown";
+}
+
+
+
+const char *pulsar_think_effort_prefix(pulsar_think_mode mode) {
+    switch (mode) {
+    case PULSAR_THINK_HIGH: return PULSAR_REASONING_EFFORT_HIGH_PREFIX;
+    case PULSAR_THINK_MAX:  return PULSAR_REASONING_EFFORT_MAX_PREFIX;
+    default:                return "";
+    }
 }
 
 
@@ -77,8 +88,10 @@ uint32_t pulsar_think_max_min_context(void) {
 
 
 pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size) {
-    if (mode == PULSAR_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < PULSAR_THINK_MAX_MIN_CONTEXT) {
-        return PULSAR_THINK_HIGH;
+    if (pulsar_think_effort_prefix(mode)[0] &&
+        (uint32_t)(ctx_size > 0 ? ctx_size : 0) < PULSAR_THINK_MAX_MIN_CONTEXT)
+    {
+        return PULSAR_THINK_LOW;
     }
     return mode;
 }

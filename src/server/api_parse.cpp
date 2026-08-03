@@ -15,7 +15,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     bool tool_choice_required = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -220,7 +220,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     bool tool_choice_forced = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -1141,7 +1141,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -1444,7 +1444,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_HIGH;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1577,7 +1577,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     buf rendered;
     rendered = {};
     buf_puts(&rendered, PULSAR_SERVER_RENDER_BOS);
-    if (r->think_mode == PULSAR_THINK_MAX) buf_puts(&rendered, pulsar_think_max_prefix());
+    buf_puts(&rendered, pulsar_think_effort_prefix(r->think_mode));
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
     buf_puts(&rendered, prompt);
     buf_puts(&rendered, "<｜Assistant｜>");

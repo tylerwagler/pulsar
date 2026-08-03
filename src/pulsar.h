@@ -21,8 +21,9 @@ typedef enum {
 
 typedef enum {
     PULSAR_THINK_NONE,
-    PULSAR_THINK_HIGH,
-    PULSAR_THINK_MAX,
+    PULSAR_THINK_LOW,   /* thinking on, no effort prefix (DeepSeek's default) */
+    PULSAR_THINK_HIGH,  /* thinking on, "Absolute maximum" effort prefix */
+    PULSAR_THINK_MAX,   /* thinking on, "Beyond maximum" effort prefix */
 } pulsar_think_mode;
 
 typedef enum {
@@ -153,6 +154,9 @@ bool pulsar_engine_is_pruned(pulsar_engine *e);
 const char *pulsar_backend_name(pulsar_backend backend);
 bool pulsar_think_mode_enabled(pulsar_think_mode mode);
 const char *pulsar_think_mode_name(pulsar_think_mode mode);
+/* The reasoning-effort prompt prefix rendered before the system message for
+ * this mode ("" for NONE/LOW). Texts match the 0731 reference encoder. */
+const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
 const char *pulsar_think_max_prefix(void);
 uint32_t pulsar_think_max_min_context(void);
 pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size);
@@ -282,7 +286,7 @@ void pulsar_encode_chat_prompt(
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out);
-void pulsar_chat_append_max_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens);
+void pulsar_chat_append_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
 void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content);
 void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
 
