@@ -313,29 +313,6 @@ void model_close(pulsar_model *m) {
 
 
 
-static void model_prefetch_cpu_mapping(const pulsar_model *m) {
-    if (!m || !m->map || m->size == 0) return;
-
-    /*
-     * CPU generation touches expert weights according to router decisions, so a
-     * long decode can fault in model pages that the prompt never touched. On
-     * current Darwin kernels we have seen those late file-backed faults trigger
-     * an OS-level VM panic in map-count accounting. This hint does not copy or
-     * pin the GGUF; it just asks the kernel to start bringing the read-only
-     * mapping into the page cache before token generation reaches it.
-     */
-#if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
-    if (rc != 0) {
-        pulsar_log(stderr,
-                PULSAR_LOG_WARNING,
-                "pulsar: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
-                strerror(rc));
-    }
-#else
-    (void)m;
-#endif
-}
 
 
 
@@ -435,12 +412,10 @@ static void parse_tensors(pulsar_model *m, pulsar_cursor *c) {
 
 
 
-/* Open and map the GGUF once.  GPU needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
- * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
-void model_open(pulsar_model *m, const char *path, bool gpu_mapping,
-                       bool prefetch_cpu) {
+/* Open and map the GGUF once.  The GPU path needs a shared mapping for
+ * no-copy GPU buffers; tokenizer/inspection opens use a private read-only
+ * mapping instead. */
+void model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -452,16 +427,15 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping,
     if (st.st_size < 32) pulsar_die("model file is too small to be GGUF");
 
     /*
-     * GPU wraps slices of this mapping as no-copy MTLBuffers, so the GPU
-     * path keeps the file-backed shared mapping. The CPU path only reads the
-     * weights through normal pointers and should not inherit GPU's VM policy:
-     * use a private read-only mapping there.
+     * GPU wraps slices of this mapping as no-copy GPU buffers, so the GPU
+     * path keeps the file-backed shared mapping. Tokenizer/inspection opens
+     * only read the weights through normal pointers and use a private
+     * read-only mapping instead.
      *
-     * This is deliberately defensive against an OS-level Darwin VM bug observed
-     * while the CPU backend streams the very large GGUF through a shared mmap:
-     * the kernel can panic in VM map-count accounting instead of returning a
-     * normal user-space failure. Keeping CPU inference off the shared mapping
-     * avoids that VM accounting path while preserving normal file-backed reads.
+     * This is deliberately defensive: streaming the very large GGUF through a
+     * shared mmap has been observed to stress kernel VM map-count accounting.
+     * Keeping the private-mapping opens off the shared mapping avoids that
+     * accounting path while preserving normal file-backed reads.
      */
     const int mmap_flags = gpu_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = (void *)mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
@@ -491,7 +465,6 @@ void model_open(pulsar_model *m, const char *path, bool gpu_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (!gpu_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
 
 

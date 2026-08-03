@@ -8,7 +8,7 @@ Formats (OCP Microscaling / MX spec v1.0):
             | E3M2 (bias 3, max 28,   min normal 0.25, min subnormal 0.0625)
   MXFP6 has no inf/NaN encodings; RNE rounding.
 
-The ds4 engine's raw MXFP8 tensor layout (type 38) is the 33-byte interleaved
+The pulsar engine's raw MXFP8 tensor layout (type 38) is the 33-byte interleaved
 block: per row, per 32-elem group -> [E8M0 scale byte, 32 x E4M3 bytes]
 (precedent: temp/splice_mxfp8_head.py, dequant = e4m3 * 2^(scale-127)).
 

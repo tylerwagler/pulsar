@@ -15,9 +15,9 @@
  *   - No code outside src/cuda/ may include a CUDA header, name a CUDA
  *     runtime/driver/cuBLAS symbol, or use kernel-launch syntax. The engine
  *     talks exclusively in pulsar_gpu_* calls and pulsar_gpu_tensor handles.
- *   - A future backend (Metal and ROCm were stripped in the CUDA-only fork;
- *     re-adding one means a new src/<backend>/ implementing these functions)
- *     must be selectable via pulsar_backend without engine changes.
+ *   - A future backend (re-adding one means a new src/<backend>/ implementing
+ *     these functions) must be selectable via pulsar_backend without engine
+ *     changes.
  *   - Engine files may read backend TUNING knobs from the environment under
  *     the PULSAR_CUDA_* env NAMES (ops scripts use them), but the questions
  *     they answer in engine code must stay backend-neutral ("is fusion

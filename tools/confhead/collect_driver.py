@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Confidence-head retrain, stage 1 driver: the labeled-position request suite.
 
-Runs a temp x workload x depth mixture against a live ds4-server whose fused
+Runs a temp x workload x depth mixture against a live pulsar-server whose fused
 DSpark loop is dumping lean confidence records (PULSAR_DSPARK_DUMP_LEAN=1) with
 conf-sched OFF (unbiased, fully-verified labels).  The dump supplies features;
 the fused stats log supplies labels (committed counts = the engine's actual
@@ -87,7 +87,7 @@ def structured_prompt(depth_tok, variant):
 BUILDERS = {"prose": prose_prompt, "code": code_prompt, "structured": structured_prompt}
 
 def request(port, prompt, temperature, max_tokens, timeout, think):
-    # ds4-server's /v1/completions renders a chat wrapper and defaults
+    # pulsar-server's /v1/completions renders a chat wrapper and defaults
     # thinking ON; with thinking enabled the server FORCES temp>0 requests to
     # the thinking defaults (temp 1.0, top_p 1.0 -- generate.c). "think":
     # false makes the requested temperature real.

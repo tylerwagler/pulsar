@@ -17,7 +17,7 @@
  * Loading is mmap based.  The loader parses only the GGUF header, metadata
  * table, and tensor directory.  Tensor data stays in the kernel page cache
  * until inference touches it, or until GPU wraps slices of the mapping as
- * no-copy MTLBuffers.
+ * no-copy GPU buffers.
  */
 
 #include <errno.h>
@@ -774,13 +774,12 @@ typedef struct {
 } layer_ffn_tokens_ctx;
 
 /* =========================================================================
- * KV Cache, Compressors, and CPU Layer Execution.
+ * KV Cache and Compressors.
  * =========================================================================
  *
- * The CPU path is the correctness reference.  It maintains raw SWA KV rows,
- * optional compressed KV rows, the indexer mask for ratio-4 layers, and a
- * reusable decode scratch arena so token generation does not allocate in the
- * hot loop.
+ * Maintains raw SWA KV rows, optional compressed KV rows, the indexer mask
+ * for ratio-4 layers, and a reusable decode scratch arena so token
+ * generation does not allocate in the hot loop.
  */
 
 /* =========================================================================
@@ -1742,8 +1741,7 @@ bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out);
 bool model_get_bool(const pulsar_model *m, const char *key, bool *out);
 bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *out);
 void model_close(pulsar_model *m);
-void model_open(pulsar_model *m, const char *path, bool gpu_mapping,
-                       bool prefetch_cpu);
+void model_open(pulsar_model *m, const char *path, bool gpu_mapping);
 void model_summary(const pulsar_model *m);
 pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name);
 bool accelerator_cache_model_tensors(pulsar_backend backend,
@@ -2156,14 +2154,6 @@ void layer_ffn_tokens_parallel(
 uint32_t pulsar_default_raw_cap(uint32_t ctx_size);
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-void layer_forward_self_one(
-        float                   * out_hc,
-        const pulsar_model         * model,
-        const pulsar_layer_weights * layer,
-        const float             * inp_hc,
-        uint32_t                  il,
-        uint32_t                  pos,
-        int                       token);
 void output_logits_one(
         float             * logits,
         const pulsar_model   * model,

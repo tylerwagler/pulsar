@@ -86,7 +86,7 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+    model_open(&model, model_path, false);
     vocab.vocab_load(&model);
     vocab.tokenize_rendered_chat_vocab(text ? text : "", &tokens);
 
@@ -472,7 +472,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    model_open(&e->model, opt->model_path, graph_backend);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
     config_validate_model(&e->model);
@@ -494,7 +494,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
         memcpy(overlay_path, opt->expert_overlay, path_len);
         overlay_path[path_len] = '\0';
-        model_open(&e->overlay_model, overlay_path, graph_backend, false);
+        model_open(&e->overlay_model, overlay_path, graph_backend);
         e->overlay_ready = true;
         /* PREFIX is a comma-separated list so several layers can be swapped
          * in one run (e.g. compose "anchor + candidate" from a cheap base
@@ -541,7 +541,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 e->dspark_draft_tokens,
                 (double)e->dspark_confidence);
     } else if (!opt->dspark_disable && opt->dspark_path && opt->dspark_path[0]) {
-        model_open(&e->dspark_model, opt->dspark_path, graph_backend, true);
+        model_open(&e->dspark_model, opt->dspark_path, graph_backend);
         dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
         e->dspark_external = true;
         e->dspark_ready = true;

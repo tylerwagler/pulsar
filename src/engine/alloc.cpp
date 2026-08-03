@@ -1,8 +1,8 @@
 #include "pulsar_engine_internal.h"
 
-/* Checked allocators and the CPU-decode allocation guard. Split out of
+/* Checked allocators and the decode-phase allocation guard. Split out of
  * util.c in the C++ port. The guard is process-wide state armed around
- * phases that must not allocate (CPU decode reuses preallocated scratch). */
+ * phases that must not allocate (decode reuses preallocated scratch). */
 
 namespace pulsar {
 
@@ -22,7 +22,7 @@ public:
         if (!enabled_) return;
         fprintf(stderr,
                 "pulsar: internal allocation during %s: %s(%zu). "
-                "CPU decode is expected to reuse preallocated scratch buffers.\n",
+                "decode is expected to reuse preallocated scratch buffers.\n",
                 phase_ ? phase_ : "guarded phase",
                 op,
                 size);
@@ -85,10 +85,9 @@ void *xmalloc_zeroed(size_t n, size_t size) {
     void *p = xmalloc(total ? total : 1);
     /*
      * This is intentionally not calloc(). Large untouched calloc ranges may be
-     * represented by the VM through shared zero-page bookkeeping. The CPU decode
+     * represented by the VM through shared zero-page bookkeeping. The decode
      * KV cache grows one token at a time, so using calloc here can move thousands
-     * of first-touch faults into generation. On Darwin we have observed this end
-     * in a kernel cpt_mapcnt_inc overflow panic instead of a user-space error.
+     * of first-touch faults into generation.
      *
      * Explicitly writing the zeroes while the cache is allocated keeps those VM
      * faults out of the token loop and gives the cache private resident pages.

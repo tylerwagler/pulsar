@@ -25,13 +25,13 @@ Running the fetcher without `--only` also regenerates `official.vec`.
 The C runner consumes `official.vec` directly:
 
 ```sh
-./ds4_test --logprob-vectors
+./pulsar_test --logprob-vectors
 ```
 
 It also consumes the local golden fixture:
 
 ```sh
-./ds4_test --local-golden-vectors
+./pulsar_test --local-golden-vectors
 ```
 
 The `--logprob-vectors` runner opens the normal non-quality path with
