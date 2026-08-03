@@ -179,6 +179,12 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    /* IQ2_XXS_SOA (42) is a pure permutation of type 16: the same 66 B/block,
+     * planes split.  Byte accounting -- row bytes, expert stride, tensor size
+     * -- is therefore IDENTICAL, which is exactly why the SoA artifact drops
+     * into the existing offset machinery unchanged.  Only the KERNEL's read
+     * pattern differs (see dev_iq2_soa_planes). */
+    case PULSAR_TENSOR_IQ2_XXS_SOA: return sizeof(block_iq2_xxs);
     case PULSAR_TENSOR_Q2_K:    return sizeof(block_q2_K);
     /* MXFP4: 17 bytes / 32 vals = [1 E8M0 scale][16 bytes = 32x E2M1]. Per-QK_K
      * (256 vals) = 8 sub-blocks * 17 = 136 bytes, matching the other per-QK_K sizes. */
@@ -276,10 +282,17 @@ static void tensor_expect_routed_expert_combo(
     const bool gate_up_pair = gate->type == up->type;
     const bool gate_cut = gate->type == PULSAR_TENSOR_CUTLASS_MXFP4;
     const bool down_cut = down->type == PULSAR_TENSOR_CUTLASS_MXFP4;
+    /* IQ2_XXS_SOA (42) is accepted anywhere IQ2_XXS (16) is: same values, same
+     * byte accounting, different load alignment.  gate/up must still MATCH each
+     * other, so a half-repacked pair (16 on one side, 42 on the other) is
+     * rejected by gate_up_pair below -- which is the intended fail-closed
+     * behaviour, since the fused gate+up kernels read one layout. */
     const bool gate_dp4a = gate->type == PULSAR_TENSOR_IQ2_XXS ||
+                           gate->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
                            gate->type == PULSAR_TENSOR_Q2_K ||
                            gate->type == PULSAR_TENSOR_FP4_E2M1;
     const bool down_dp4a = down->type == PULSAR_TENSOR_IQ2_XXS ||
+                           down->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
                            down->type == PULSAR_TENSOR_Q2_K ||
                            down->type == PULSAR_TENSOR_FP4_E2M1;
     const bool gate_ok = gate_dp4a || gate_cut;

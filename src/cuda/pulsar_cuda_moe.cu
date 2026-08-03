@@ -894,11 +894,20 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
 
 
 
-template <uint32_t ROW_SPAN>
+/* SOA: the gate/up tensors are IQ2_XXS_SOA (type 42) rather than IQ2_XXS (16).
+ * Pure permutation of the same bytes, so gate_expert_bytes / gate_row_bytes
+ * still describe the tensor exactly -- but the SoA planes are TENSOR-GLOBAL, so
+ * an (expert,row) base must be a BLOCK INDEX, not a byte offset.  Both strides
+ * are exact multiples of the 66 B block, so the kernel derives the index by
+ * dividing; the host passes each tensor's d-plane byte offset (nblk_total*64).
+ * Packed and SoA are bit-identical -- same values, same order, different loads. */
+template <uint32_t ROW_SPAN, int SOA>
 __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
+        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
+        uint64_t up_d_off,
         const cuda_block_q8_K *xq,
         const uint32_t *sorted_pairs,
         const uint32_t *offsets,
@@ -954,11 +963,31 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const uint64_t rowbase = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+        /* packed: byte base into the AoS blocks.  SoA: block index into the
+         * tensor-global planes (rowbase is an exact multiple of 66). */
+        const cuda_block_iq2_xxs *gr = SOA ? NULL : (const cuda_block_iq2_xxs *)(gate_base + rowbase);
+        const cuda_block_iq2_xxs *ur = SOA ? NULL : (const cuda_block_iq2_xxs *)(up_base + rowbase);
+        const uint64_t blk0 = SOA ? rowbase / 66ull : 0ull;
+        const iq2_soa_planes gp   = dev_iq2_soa_planes(gate_base, gate_d_off);
+        const iq2_soa_planes up_p = dev_iq2_soa_planes(up_base, up_d_off);
         float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            if (SOA) {
+                dev_dot_iq2_soa_q8_K_block8_deq_lut(gp, blk0 + b,
+                                                xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
+                                                s_iq2_grid, s_iq2_signs);
+                dev_dot_iq2_soa_q8_K_block8_deq_lut(up_p, blk0 + b,
+                                                xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
+                                                s_iq2_grid, s_iq2_signs);
+            } else {
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
@@ -969,6 +998,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
                                                 s_iq2_grid, s_iq2_signs);
+            }
         }
         for (uint32_t p = 0; p < np; p++) {
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -2668,7 +2698,14 @@ static int routed_moe_launch_mixed40(
     /* dp4a-side sorted tile lists (big-batch prefill): tile8 for gate/up (caseB), tile16 for down (caseA). */
     uint32_t *t8_total = NULL, *t8_experts = NULL, *t8_starts = NULL;
     uint32_t *t16_total = NULL, *t16_experts = NULL, *t16_starts = NULL;
-    const int tiled_gateup = use_tiled && caseB && gate_type == 16u;   /* iq2 gate/up tiled kernel */
+    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) share this
+     * kernel; the layout is a template parameter, chosen at the launch below. */
+    const int gate_soa     = (gate_type == 42u);
+    const int tiled_gateup = use_tiled && caseB && (gate_type == 16u || gate_soa);
+    /* d plane starts after the whole tensor's q plane: nblk_total * 64.
+     * nblk_total = n_total_expert * (expert_bytes / 66); the stride is an exact
+     * multiple of the 66 B block for both layouts. */
+    const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
     const int tiled_down   = use_tiled && caseA && down_type == 16u;   /* iq2 down tiled kernel */
     if (tiled_gateup) {
         uint32_t *t8_off = (uint32_t *)(scratch + t8off_o);
@@ -2763,10 +2800,18 @@ static int routed_moe_launch_mixed40(
         if (ok) {
             if (tiled_gateup) {
                 dim3 tgrid((expert_mid_dim + 1023u) / 1024u, (uint32_t)tile8_cap, 1);
-                moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(mid_flat,
-                    gate_w, up_w, xq, sorted_pairs, offsets, counts, t8_total, t8_experts, t8_starts,
-                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
-                    xq_blocks, expert_mid_dim, n_expert, clamp);
+                if (gate_soa)
+                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(mid_flat,
+                        gate_w, up_w, gate_d_off, gate_d_off, xq, sorted_pairs, offsets, counts,
+                        t8_total, t8_experts, t8_starts,
+                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                        xq_blocks, expert_mid_dim, n_expert, clamp);
+                else
+                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(mid_flat,
+                        gate_w, up_w, 0ull, 0ull, xq, sorted_pairs, offsets, counts,
+                        t8_total, t8_experts, t8_starts,
+                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                        xq_blocks, expert_mid_dim, n_expert, clamp);
             } else {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (gate_type == 10u)
@@ -2861,11 +2906,18 @@ static int routed_moe_launch(
     const int gate_q2k = gate_type == 10u;
     const int down_mxfp4 = down_type == 39u;
     const int down_iq2 = down_type == 16u;
+    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) share the tiled
+     * gate/up kernel; the layout is a template parameter picked at the launch.
+     * d plane starts after the whole tensor's q plane: nblk_total * 64, with
+     * nblk_total = n_total_expert * (expert_bytes / 66) -- the stride is an
+     * exact multiple of the 66 B block in both layouts. */
+    const int gate_soa = (gate_type == 42u);
+    const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
     /* MXFP4 (type-39) big-batch expert-tiled prefill path (PULSAR_MOE_FP4_TILED, default on;
      * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
     static int fp4_tiled = -1;
     if (fp4_tiled < 0) { const char *e = getenv("PULSAR_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
-    if (gate_type != 16u && !gate_q2k && !gate_mxfp4) return 0;
+    if (gate_type != 16u && !gate_soa && !gate_q2k && !gate_mxfp4) return 0;
     if (down_type != 10u && !down_iq2 && !down_mxfp4) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
@@ -3022,6 +3074,22 @@ static int routed_moe_launch(
             }
         }
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
+        /* FAIL CLOSED until every IQ2 reader is SoA-aware.  Only the tiled
+         * gate/up ROWSPAN kernel reads type 42 today; the row32, qwarp32 and
+         * decode-LUT gate/up paths and ALL the down paths still assume the
+         * packed 66 B AoS block.  Handing them SoA bytes would not fault --
+         * it would silently decode garbage, which is far worse than refusing.
+         * The rowspan kernel is reached only on this exact conjunction, so
+         * anything else with a SoA gate/up is rejected loudly.  Lift a clause
+         * as each kernel is converted. */
+        if (ok && gate_soa && !(sorted_pairs && !gate_mxfp4 && use_big_batch && !gate_q2k)) {
+            fprintf(stderr,
+                    "pulsar: IQ2_XXS_SOA (type 42) gate/up reached a path that still reads "
+                    "the packed layout (n_tokens=%u, sorted=%d, big_batch=%u). Only the tiled "
+                    "gate/up rowspan kernel is SoA-aware so far.\n",
+                    n_tokens, sorted_pairs != NULL, use_big_batch);
+            ok = 0;
+        }
         if (ok) {
             if (sorted_pairs && !gate_mxfp4) {
                 if (use_big_batch) {
@@ -3034,12 +3102,22 @@ static int routed_moe_launch(
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             clamp);
                     } else {
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (gate_soa)
+                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, gate_d_off, gate_d_off,
+                                xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, 0ull, 0ull,
+                                xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     }
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
