@@ -949,7 +949,21 @@ static bool weights_tensor_type_supported(uint32_t type) {
      * -- it was DISPATCH.  routed_moe_launch_mixed40 had no gate_soa/down_soa
      * arm on its non-tiled (n_tokens < 128) qwarp32 launches, so a short
      * prefill chunk read SoA planes with the PACKED reader.  See the comment
-     * at that launch site. */
+     * at that launch site.
+     *
+     * VALIDATED 2026-08-03 on the full 91-tensor SoA model vs the packed one,
+     * same binary (so the delta is layout, not code):
+     *   prefill_bitexact_gate --check: PASS, all 5 depths (512/2048/4096/4102
+     *     /6144) 129280 full-vocab logits BYTE-IDENTICAL.  4102 is the depth
+     *     that used to fail.
+     *   PULSAR_CUDA_PREFILL_CHUNK=8192 (the other pre-fix failure mode): the
+     *     gate refuses that knob by design, so it was checked directly with
+     *     pulsar-bench --dump-frontier-logits-dir -- frontiers 4096 and 8192
+     *     identical, no nan/inf.
+     *   pulsar-eval q1..q4 traces byte-identical (same text, same verdicts).
+     *   prefill A/B, median of 3, 6/6 paired runs positive:
+     *     @2048  483.39 -> 494.30 tok/s  (+2.3%)
+     *     @8192  460.00 -> 468.76 tok/s  (+1.9%) */
     case PULSAR_TENSOR_IQ2_XXS_SOA:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
