@@ -17,6 +17,9 @@ void matvec_experts_mid_prequant(
         matvec_iq2_xxs_experts_mid_prequant(mid, m, gate_w, up_w, xq,
                                             selected, expert_weight, n_expert, clamp);
     } else {
+        /* NOTE: IQ2_XXS_SOA (42) lands here deliberately.  These HOST matvec
+         * paths read the packed 66 B AoS block directly and have no SoA
+         * reader; the GPU kernels do.  Dying loudly beats mis-decoding. */
         pulsar_die("unsupported gate/up expert tensor type");
     }
 }
