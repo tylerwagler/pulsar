@@ -6,7 +6,12 @@ set -e
 # attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
 # on load). The repo is public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
-V3_FILE="ds4flash-v3.gguf"
+# v3 is the IQ2_XXS_SOA (type-42) build as of v0.4.0 -- same values as the
+# packed artifact, byte-identical logits, ~+2% prefill.  It requires a pulsar
+# at or after v0.4.0; older engines reject type 42 at load, so the previous
+# packed layout stays available as `v3-packed`.
+V3_FILE="ds4flash-v3-soa.gguf"
+V3_PACKED_FILE="ds4flash-v3.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${PULSAR_GGUF_DIR:-"$ROOT/gguf"}
@@ -22,6 +27,7 @@ DeepSeek V4 Flash GGUF downloader (ds4 / DwarfStar)
 
 Usage:
   ./download_model.sh v3 [--token TOKEN]
+  ./download_model.sh v3-packed [--token TOKEN]
 
 Targets:
 
@@ -31,6 +37,13 @@ Targets:
          shared experts, and LM head; DSpark drafter merged in-file.
          Targets a single NVIDIA GB10 (~121 GB usable) with room for a 1M
          token context. Requires a pulsar engine built with CUDA_ARCH=sm_120f.
+         Since v0.4.0 the 2-bit experts ship in the type-42 IQ2_XXS_SOA
+         layout: identical values and byte-identical logits, ~+2% prefill.
+         NEEDS PULSAR v0.4.0 OR NEWER -- older engines reject type 42.
+
+  v3-packed
+         The same build in the original type-16 IQ2_XXS layout. Use this if
+         you are running a pulsar older than v0.4.0.
 
 Options:
   --token TOKEN  Hugging Face token (optional; the repo is public). Otherwise
@@ -58,6 +71,7 @@ shift
 
 case "$MODEL" in
     v3) MODEL_FILE=$V3_FILE ;;
+    v3-packed) MODEL_FILE=$V3_PACKED_FILE ;;
     -h|--help|help)
         usage
         exit 0

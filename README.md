@@ -178,18 +178,29 @@ A few things this fork's GGUFs do beyond upstream:
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
 
-`download_model.sh` fetches this fork's shipped GGUF from our release repo. It
-has a single target:
+`download_model.sh` fetches this fork's shipped GGUF from our release repo:
 
 ```sh
-./download_model.sh v3   # measured-allocation release build, ~92 GB on disk
+./download_model.sh v3          # measured-allocation release build, ~92 GB on disk
+./download_model.sh v3-packed   # same build, pre-v0.4.0 IQ2_XXS layout
 ```
 
-This downloads `ds4flash-v3.gguf`
+`v3` downloads `ds4flash-v3-soa.gguf`
 (92,495,809,696 bytes, sha256
-`d866cd83f292b852d065651a1a62cecc93a7e9da0c88dc8829dc34f0bd978525`) from
+`fb220dcb75a60dc81dddc4d6bc1358147b003b9bff6acd3810049d05f9d9efce`), the
+type-42 `IQ2_XXS_SOA` build — identical values and byte-identical logits to the
+packed artifact, ~+2% prefill. **It requires pulsar v0.4.0 or newer**; older
+engines reject type 42 at load.
+
+`v3-packed` downloads the original `ds4flash-v3.gguf`
+(92,495,809,696 bytes, sha256
+`d866cd83f292b852d065651a1a62cecc93a7e9da0c88dc8829dc34f0bd978525`) in the
+type-16 `IQ2_XXS` layout, for engines older than v0.4.0.
+
+Both come from
 <https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
-stores it under `./gguf/`, and updates `./ds4flash.gguf` to point at it. The
+are stored under `./gguf/`, and update `./ds4flash.gguf` to point at the
+selected file. The
 script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated
 and resumable) when present and falls back to `curl -C -` otherwise. The repo is
 public, so authentication is optional; `--token TOKEN`, `HF_TOKEN`, or the local
