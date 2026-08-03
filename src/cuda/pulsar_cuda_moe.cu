@@ -878,6 +878,17 @@ __global__ static void moe_build_expert_tiles_kernel(
 
 
 
+/* KNOWN-BROKEN SoA ARM (2026-08-03).  This kernel's SOA=1 path produces
+ * non-finite logits; the rowspan sibling's does not.  Localised by forcing
+ * use_big_batch true so every chunk takes rowspan instead: the same
+ * gate/up-only SoA model then passes all 5 gate depths, and fails only at
+ * depth 4102 -- the one depth with a small trailing chunk (4096+6), i.e. the
+ * only depth that reaches THIS kernel.  The d-offset argument bug that also
+ * affected this site is fixed; something else here is still wrong.  The
+ * kernel body, its launch argument order and the dot it calls have all been
+ * compared line-by-line against the working rowspan kernel without finding
+ * the difference -- next step is a standalone packed-vs-SoA harness for this
+ * kernel specifically (the pattern in tests/iq2_soa_bench.cu). */
 /* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
  * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
  * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
@@ -3303,7 +3314,7 @@ static int routed_moe_launch(
                         if (gate_soa)
                             moe_gate_up_mid_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
                                 (float *)mid->ptr,
-                                gate_w, up_w, gate_d_off, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
                                 tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                                 gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                                 clamp);
@@ -3375,7 +3386,7 @@ static int routed_moe_launch(
                         moe_gate_up_mid_decode_lut_qwarp32_kernel<1><<<qgrid, 256>>>(
                             (float *)mid->ptr,
                             gate_w,
-                            up_w, gate_d_off, 0ull /*up_d_off*/,
+                            up_w, gate_d_off, gate_d_off /*up: same shape as gate*/,
                             xq,
                             selected_ptr,
                             (const float *)weights->ptr,
@@ -3422,7 +3433,7 @@ static int routed_moe_launch(
                             (float *)up->ptr,
                             (float *)mid->ptr,
                             gate_w,
-                            up_w, gate_d_off, 0ull /*up_d_off*/,
+                            up_w, gate_d_off, gate_d_off /*up: same shape as gate*/,
                             xq,
                             selected_ptr,
                             (const float *)weights->ptr,
