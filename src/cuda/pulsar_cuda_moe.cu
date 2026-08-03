@@ -3082,14 +3082,18 @@ static int routed_moe_launch(
     const int gate_mxfp4 = gate_type == 39u;
     const int gate_q2k = gate_type == 10u;
     const int down_mxfp4 = down_type == 39u;
-    const int down_iq2 = down_type == 16u;
+    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) take the same
+     * down kernels; the layout is a template/trait choice at each launch. */
+    const int down_iq2 = (down_type == 16u) || (down_type == 42u);
     /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) share the tiled
      * gate/up kernel; the layout is a template parameter picked at the launch.
      * d plane starts after the whole tensor's q plane: nblk_total * 64, with
      * nblk_total = n_total_expert * (expert_bytes / 66) -- the stride is an
      * exact multiple of the 66 B block in both layouts. */
     const int gate_soa = (gate_type == 42u);
+    const int down_soa = (down_type == 42u);
     const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
+    const uint64_t down_d_off = (uint64_t)n_total_expert * (down_expert_bytes / 66ull) * 64ull;
     /* MXFP4 (type-39) big-batch expert-tiled prefill path (PULSAR_MOE_FP4_TILED, default on;
      * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
     static int fp4_tiled = -1;
@@ -3251,22 +3255,12 @@ static int routed_moe_launch(
             }
         }
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
-        /* FAIL CLOSED until every IQ2 reader is SoA-aware.  Only the tiled
-         * gate/up ROWSPAN kernel reads type 42 today; the row32, qwarp32 and
-         * decode-LUT gate/up paths and ALL the down paths still assume the
-         * packed 66 B AoS block.  Handing them SoA bytes would not fault --
-         * it would silently decode garbage, which is far worse than refusing.
-         * The rowspan kernel is reached only on this exact conjunction, so
-         * anything else with a SoA gate/up is rejected loudly.  Lift a clause
-         * as each kernel is converted. */
-        if (ok && gate_soa && !(sorted_pairs && !gate_mxfp4 && use_big_batch && !gate_q2k)) {
-            fprintf(stderr,
-                    "pulsar: IQ2_XXS_SOA (type 42) gate/up reached a path that still reads "
-                    "the packed layout (n_tokens=%u, sorted=%d, big_batch=%u). Only the tiled "
-                    "gate/up rowspan kernel is SoA-aware so far.\n",
-                    n_tokens, sorted_pairs != NULL, use_big_batch);
-            ok = 0;
-        }
+        /* Every IQ2 reader now has a layout arm (rowspan, row32, decode-LUT and
+         * the qwarp32 trait on gate/up; tile16, tile8, sum6 and the qwarp32
+         * trait on down), so the earlier fail-closed guard is retired.  What
+         * remains enforced is the binder's rule that gate and up share a type:
+         * the fused gate+up kernels read ONE layout, so a half-repacked pair is
+         * rejected at load rather than here. */
         if (ok) {
             if (sorted_pairs && !gate_mxfp4) {
                 if (use_big_batch) {
@@ -3306,12 +3300,20 @@ static int routed_moe_launch(
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             clamp);
                     } else {
-                        moe_gate_up_mid_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
+                        if (gate_soa)
+                            moe_gate_up_mid_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, gate_d_off, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
+                        else
+                            moe_gate_up_mid_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                                (float *)mid->ptr,
+                                gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                clamp);
                     }
                 }
             } else if (sorted_pairs && gate_mxfp4 && fp4_tiled && use_big_batch) {
@@ -3369,19 +3371,34 @@ static int routed_moe_launch(
                         n_expert,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<0><<<qgrid, 256>>>(
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                        xq,
-                        selected_ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        clamp);
+                    if (gate_soa)
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<1><<<qgrid, 256>>>(
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w, gate_d_off, 0ull /*up_d_off*/,
+                            xq,
+                            selected_ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            clamp);
+                    else
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<0><<<qgrid, 256>>>(
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
+                            xq,
+                            selected_ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            clamp);
                 } else if (gate_q2k) {
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K><<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -3399,21 +3416,38 @@ static int routed_moe_launch(
                         n_expert,
                         clamp);
                 } else {
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                        xq,
-                        selected_ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        clamp);
+                    if (gate_soa)
+                        moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w, gate_d_off, 0ull /*up_d_off*/,
+                            xq,
+                            selected_ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            clamp);
+                    else
+                        moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
+                            xq,
+                            selected_ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert,
+                            clamp);
                 }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
@@ -3440,15 +3474,26 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 } else if (down_iq2) {
-                    moe_down_iq2_sum6_qwarp32_kernel<0><<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim);
+                    if (down_soa)
+                        moe_down_iq2_sum6_qwarp32_kernel<1><<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_w, down_d_off,
+                            midq,
+                            selected_ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim);
+                    else
+                        moe_down_iq2_sum6_qwarp32_kernel<0><<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_w, 0ull /*down_d_off*/,
+                            midq,
+                            selected_ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim);
                 } else {
                     moe_down_sum6_qwarp32_kernel<GateUpDotQ2K><<<sgrid, 256>>>(
                         (float *)out->ptr,
@@ -3473,11 +3518,18 @@ static int routed_moe_launch(
             } else if (sorted_pairs && !down_mxfp4 && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (down_soa)
+                        moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, down_d_off, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 } else {
                     moe_down_expert_tile16_row2048_kernel<Dot8Q2K><<<tgrid, 256>>>(
                         (float *)down->ptr,
@@ -3488,11 +3540,18 @@ static int routed_moe_launch(
             } else if (sorted_pairs && !down_mxfp4) {
                 dim3 tgrid((out_dim + 31u) / 32u, tile_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    if (down_soa)
+                        moe_down_iq2_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, down_d_off, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
+                    else
+                        moe_down_iq2_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
+                            midq_blocks, out_dim, n_expert);
                 } else {
                     moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
                         (float *)down->ptr,
@@ -3513,16 +3572,28 @@ static int routed_moe_launch(
                         out_dim,
                         n_expert);
                 } else if (down_iq2) {
-                    moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert);
+                    if (down_soa)
+                        moe_down_qwarp32_kernel<GateUpDotIQ2SoA><<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, down_d_off,
+                            midq,
+                            selected_ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    else
+                        moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            down_w, 0ull /*down_d_off*/,
+                            midq,
+                            selected_ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
                 } else {
                     moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(
                         (float *)down->ptr,
