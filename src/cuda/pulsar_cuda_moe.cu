@@ -878,17 +878,15 @@ __global__ static void moe_build_expert_tiles_kernel(
 
 
 
-/* KNOWN-BROKEN SoA ARM (2026-08-03).  This kernel's SOA=1 path produces
- * non-finite logits; the rowspan sibling's does not.  Localised by forcing
- * use_big_batch true so every chunk takes rowspan instead: the same
- * gate/up-only SoA model then passes all 5 gate depths, and fails only at
- * depth 4102 -- the one depth with a small trailing chunk (4096+6), i.e. the
- * only depth that reaches THIS kernel.  The d-offset argument bug that also
- * affected this site is fixed; something else here is still wrong.  The
- * kernel body, its launch argument order and the dot it calls have all been
- * compared line-by-line against the working rowspan kernel without finding
- * the difference -- next step is a standalone packed-vs-SoA harness for this
- * kernel specifically (the pattern in tests/iq2_soa_bench.cu). */
+/* CLEARED (2026-08-03).  This kernel was suspected of the non-finite-logit
+ * failure because forcing use_big_batch true -- which routes every chunk to
+ * the rowspan sibling instead -- made a gate/up-only SoA model pass all 5 gate
+ * depths.  That inference was wrong: the same switch ALSO flips use_tiled in
+ * routed_moe_launch_mixed40, and the real defect was there (a missing gate_soa
+ * arm on its non-tiled qwarp32 launch).  tests/iq2_row32_soa_diff.cu drives
+ * this kernel's SOA=1 and SOA=0 arms on identical data at the shipped
+ * 192-expert/2048-row shape and they are bit-exact, as is the rowspan control.
+ * Keep that harness green when touching either arm. */
 /* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
  * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
  * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
@@ -2894,7 +2892,9 @@ static int routed_moe_launch_mixed40(
      * nblk_total = n_total_expert * (expert_bytes / 66); the stride is an exact
      * multiple of the 66 B block for both layouts. */
     const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
-    const int tiled_down   = use_tiled && caseA && down_type == 16u;   /* iq2 down tiled kernel */
+    const int down_soa     = (down_type == 42u);
+    const uint64_t down_d_off = (uint64_t)n_total_expert * (down_expert_bytes / 66ull) * 64ull;
+    const int tiled_down   = use_tiled && caseA && (down_type == 16u || down_soa);  /* iq2 down tiled kernel */
     if (tiled_gateup) {
         uint32_t *t8_off = (uint32_t *)(scratch + t8off_o);
         t8_total = (uint32_t *)(scratch + t8tot_o);
@@ -2963,12 +2963,20 @@ static int routed_moe_launch_mixed40(
         if (ok) {
             if (tiled_down) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, (uint32_t)tile16_cap, 1);
-                moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq,
-                    sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
-                    down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                if (down_soa)
+                    moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(down_flat, down_w, down_d_off, midq,
+                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                else
+                    moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq,
+                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
             } else {
                 dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
-                if (down_type == 16u)
+                if (down_soa)
+                    moe_down_qwarp32_kernel<GateUpDotIQ2SoA><<<dgrid, 256>>>(down_flat, down_w, down_d_off, midq, selected_ptr,
+                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                else if (down_type == 16u)
                     moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
                         down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
                 else
@@ -3002,7 +3010,18 @@ static int routed_moe_launch_mixed40(
                         xq_blocks, expert_mid_dim, n_expert, clamp);
             } else {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-                if (gate_type == 10u)
+                /* gate_soa MUST be tested before the packed IQ2 fallback.  Until
+                 * this commit a type-42 layer whose chunk was too short for the
+                 * tiled path (n_tokens < 128 -- e.g. the 6-token trailing chunk
+                 * of a 4102-token prefill) fell through to <GateUpDotIQ2> with
+                 * 0 d-offsets, i.e. the PACKED reader pointed at SoA planes: the
+                 * fp16 scale came out of quantised weight bytes, so every logit
+                 * went non-finite.  That is the depth-4102 prefill-gate failure. */
+                if (gate_soa)
+                    moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
+                        gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, selected_ptr, (const float *)weights->ptr,
+                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                else if (gate_type == 10u)
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
                         gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);

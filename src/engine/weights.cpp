@@ -941,17 +941,16 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_Q2_K:
     case PULSAR_TENSOR_IQ2_XXS:
-    /* IQ2_XXS_SOA (42) is DELIBERATELY NOT ACCEPTED AT LOAD.  The layout, the
-     * repack tool and every device reader are implemented and the prefill A/B
-     * is positive (+1.7% @2048, +1.6% @8192, 6/6 runs, 2026-08-02), but the
-     * prefill bit-exactness gate FAILS on a repacked model: all 129280 logits
-     * are non-finite at depths 4102 and 6144 with the default prefill chunk,
-     * and at EVERY depth with PULSAR_CUDA_PREFILL_CHUNK=8192.  Values in the
-     * artifact are provably intact (gguf-tools/verify_iq2_soa.py unpacks them
-     * back to AoS byte-exactly), so the defect is in a device reader or its
-     * addressing, not the file.  Until it is found, refuse the type at load --
-     * a NaN-producing model must not be runnable by accident.  Re-enable by
-     * restoring this case; everything downstream is already wired. */
+    /* IQ2_XXS_SOA (42): a pure permutation of type 16, accepted since the
+     * non-finite-logit defect was fixed.  Cause was NOT the kernels or the
+     * artifact (both proved correct: tests/iq2_row32_soa_diff.cu shows the
+     * row32/rowspan SoA arms bit-exact against packed at the shipped shape,
+     * and gguf-tools/verify_iq2_soa.py unpacks the file back to AoS exactly)
+     * -- it was DISPATCH.  routed_moe_launch_mixed40 had no gate_soa/down_soa
+     * arm on its non-tiled (n_tokens < 128) qwarp32 launches, so a short
+     * prefill chunk read SoA planes with the PACKED reader.  See the comment
+     * at that launch site. */
+    case PULSAR_TENSOR_IQ2_XXS_SOA:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
     case PULSAR_TENSOR_FP8_E4M3:
