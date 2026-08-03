@@ -116,7 +116,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 | Tensor group | Accepted formats |
 | --- | --- |
 | Attention projections, shared experts | MXFP8 (FP8 E4M3 + per-32 E8M0 scales) |
-| Routed experts gate/up/down | exactly `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4` |
+| Routed experts gate/up/down | exactly `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4`; `IQ2_XXS_SOA` (42) is accepted anywhere `IQ2_XXS` (16) is |
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 

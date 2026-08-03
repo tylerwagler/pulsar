@@ -130,7 +130,7 @@ binder is stricter than upstream's.** It accepts exactly:
 | Tensor group | Accepted formats |
 | --- | --- |
 | Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales), run on the FP8 tensor-core GEMM path |
-| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
+| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`IQ2_XXS_SOA`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`IQ2_XXS_SOA`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 
@@ -224,7 +224,12 @@ running the ~92 GB REAP-pruned Flash build. The artifact unifies every
 MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
 (4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
 **type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
-Numbers below are the **v0.3.1** build. Prefill is measured
+Since v0.4.0 the 2-bit routed experts may also be stored in the **type-42
+`IQ2_XXS_SOA`** pre-store: the same 66 B/block content as `IQ2_XXS`, with the
+per-block scale and the quantised bytes split into separate planes so the weight
+stream is 16-byte aligned instead of 2-byte aligned. It is a pure permutation —
+identical bit count, byte-identical logits — and buys **+2.3% prefill @2048 and
++1.9% @8192**. Numbers below are the **v0.3.1** build. Prefill is measured
 **cold** (`cache_prompt` off, unique-prefix probe — a warm cache reports
 arbitrarily high prompt-processing rates and is not a real prefill number);
 decode is measured with the merged DSpark speculative drafter, single stream, on

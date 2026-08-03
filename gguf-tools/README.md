@@ -56,6 +56,30 @@ are available in the antirez Hugging Face repository:
 https://huggingface.co/antirez/deepseek-v4-gguf/tree/main
 ```
 
+## Repack IQ2_XXS To IQ2_XXS_SOA (type 42)
+
+`IQ2_XXS_SOA` is a load-aligned twin of `IQ2_XXS`: the same 66 B/block content,
+but the per-block `d` scale and the quantised `qs` bytes live in separate planes
+(`q` plane at offset 0, 64 B/block and 16-byte aligned; `d` plane immediately
+after it, 2 B/block).  Identical bit count, byte-identical logits — the only
+thing that changes is that the weight stream can be read with full-width aligned
+loads instead of `LDG.E.U16` pairs.  Worth about +2% prefill on GB10.
+
+```sh
+python3 gguf-tools/repack_iq2_soa.py in.gguf out.gguf \
+    --match ffn_gate_exps,ffn_up_exps,ffn_down_exps
+python3 gguf-tools/verify_iq2_soa.py in.gguf out.gguf   # unpacks back to AoS
+```
+
+`--match` takes a comma-separated list of tensor-name substrings; omit it to
+repack every `IQ2_XXS` tensor.  The verifier unpacks the SoA planes back to the
+original layout and byte-compares, so a clean run proves the values survived.
+Any engine at or after v0.4.0 loads either layout; older builds reject type 42.
+
+**Gate and up must share a layout.**  The fused gate+up kernels read ONE layout,
+so repacking `ffn_gate_exps` without `ffn_up_exps` produces a GGUF the binder
+rejects at load.  Repack the pair together or not at all; `down` is independent.
+
 ## Generate Q2 And Q4 GGUFs
 
 The template GGUF supplies metadata, tokenizer, tensor order, and logical
