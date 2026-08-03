@@ -69,6 +69,68 @@ __device__ __forceinline__ static void dev_iq2_i8x8_lut(
 
 
 
+/* ---- IQ2_XXS_SOA (type 42) device reader -----------------------------------
+ * The packed type-16 block is { uint16 d; uint16 qs[32] } = 66 B, so qs[] sits
+ * at offset 2 and the whole code stream is only 2-byte aligned: nvcc has to
+ * emit LDG.E.U16, two 16-bit loads per 32-bit weight word (confirmed in SASS
+ * -- the gate/up kernel has NO 64/128-bit global loads).  Type 42 stores the
+ * SAME bytes with the planes split, so qs is 64 B-aligned per block and one
+ * aligned uint2 replaces four U16 loads.
+ *
+ * Layout (must match ds4q_iq2_xxs_soa_repack() in gguf-tools/quants_common.c):
+ *     [0,        nblk*64) q plane : block b at b*64  (uint16 qs[32])
+ *     [nblk*64, +nblk*2)  d plane : block b at nblk*64 + b*2 (uint16 d)
+ * nblk is the WHOLE TENSOR's block count, so the planes are tensor-global and
+ * a per-expert/per-row base must be expressed as a block index, not a byte
+ * offset -- see iq2_soa_planes below. */
+struct iq2_soa_planes {
+    const uint8_t  *q;   /* q plane base (tensor-global) */
+    const uint16_t *d;   /* d plane base (tensor-global) */
+};
+
+__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t d_plane_off) {
+    iq2_soa_planes p;
+    p.q = (const uint8_t *)tensor_base;                      /* q plane at +0 */
+    p.d = (const uint16_t *)(tensor_base + d_plane_off);     /* d plane = nblk_total*64 */
+    return p;
+}
+
+/* SoA twin of dev_dot_iq2_xxs_q8_K_block_lut: same smem-LUT decode, same
+ * accumulation order, only the two weight loads change. */
+__device__ static float dev_dot_iq2_soa_q8_K_block_lut(
+        const iq2_soa_planes p,
+        uint64_t blk,
+        const cuda_block_q8_K *y,
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    const float d = dev_f16_to_f32(p.d[blk]) * y->d;
+    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint2 wpair = q2[ib32];
+        const uint32_t aux0 = wpair.x, aux1 = wpair.y;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        int32_t sumi = 0;
+        sumi = __dp4a(w[0], *(const int32_t *)(q8 + 0),  sumi);
+        sumi = __dp4a(w[1], *(const int32_t *)(q8 + 4),  sumi);
+        sumi = __dp4a(w[2], *(const int32_t *)(q8 + 8),  sumi);
+        sumi = __dp4a(w[3], *(const int32_t *)(q8 + 12), sumi);
+        sumi = __dp4a(w[4], *(const int32_t *)(q8 + 16), sumi);
+        sumi = __dp4a(w[5], *(const int32_t *)(q8 + 20), sumi);
+        sumi = __dp4a(w[6], *(const int32_t *)(q8 + 24), sumi);
+        sumi = __dp4a(w[7], *(const int32_t *)(q8 + 28), sumi);
+        q8 += 32;
+        bsum += sumi * ls;
+    }
+    return 0.125f * d * (float)bsum;
+}
+
 __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y,
@@ -104,31 +166,6 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
 
 
 
-/* ---- IQ2_XXS_SOA (type 42) device reader -----------------------------------
- * The packed type-16 block is { uint16 d; uint16 qs[32] } = 66 B, so qs[] sits
- * at offset 2 and the whole code stream is only 2-byte aligned: nvcc has to
- * emit LDG.E.U16, two 16-bit loads per 32-bit weight word (confirmed in SASS
- * -- the gate/up kernel has NO 64/128-bit global loads).  Type 42 stores the
- * SAME bytes with the planes split, so qs is 64 B-aligned per block and one
- * aligned uint2 replaces four U16 loads.
- *
- * Layout (must match ds4q_iq2_xxs_soa_repack() in gguf-tools/quants_common.c):
- *     [0,        nblk*64) q plane : block b at b*64  (uint16 qs[32])
- *     [nblk*64, +nblk*2)  d plane : block b at nblk*64 + b*2 (uint16 d)
- * nblk is the WHOLE TENSOR's block count, so the planes are tensor-global and
- * a per-expert/per-row base must be expressed as a block index, not a byte
- * offset -- see iq2_soa_planes below. */
-struct iq2_soa_planes {
-    const uint8_t  *q;   /* q plane base (tensor-global) */
-    const uint16_t *d;   /* d plane base (tensor-global) */
-};
-
-__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t d_plane_off) {
-    iq2_soa_planes p;
-    p.q = (const uint8_t *)tensor_base;                      /* q plane at +0 */
-    p.d = (const uint16_t *)(tensor_base + d_plane_off);     /* d plane = nblk_total*64 */
-    return p;
-}
 
 /* SoA twin of dev_dot_iq2_xxs_q8_K_block.  Identical arithmetic and identical
  * accumulation order -- only the two loads change -- so results are
@@ -684,10 +721,16 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
 
 
 
+/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
+ * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
+ * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
+template <int SOA>
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
+        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
+        uint64_t up_d_off,
         const cuda_block_q8_K *xq,
         const int32_t *selected,
         const float *weights,
@@ -719,13 +762,21 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const uint64_t rowbase_gr = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + rowbase_gr);
+        const uint64_t rowbase_ur = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + rowbase_ur);
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            if (SOA) {
+                const uint64_t blk = rowbase_gr / 66ull + b;
+                gate += dev_dot_iq2_soa_q8_K_block_lut(dev_iq2_soa_planes(gate_base, gate_d_off), blk, xqb + b, s_iq2_grid, s_iq2_signs);
+                up   += dev_dot_iq2_soa_q8_K_block_lut(dev_iq2_soa_planes(up_base, up_d_off), blk, xqb + b, s_iq2_grid, s_iq2_signs);
+            } else {
             gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
             up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            }
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -827,10 +878,16 @@ __global__ static void moe_build_expert_tiles_kernel(
 
 
 
+/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
+ * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
+ * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
+template <int SOA>
 __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
+        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
+        uint64_t up_d_off,
         const cuda_block_q8_K *xq,
         const uint32_t *sorted_pairs,
         const uint32_t *offsets,
@@ -899,11 +956,26 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
-    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+    const uint64_t rowbase_gr = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + rowbase_gr);
+    const uint64_t rowbase_ur = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + rowbase_ur);
     float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        if (SOA) {
+            const uint64_t blk = rowbase_gr / 66ull + b;
+            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(gate_base, gate_d_off), blk,
+                    xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                    xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                    xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(up_base, up_d_off), blk,
+                    xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                    xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                    xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up, s_iq2_grid, s_iq2_signs);
+        } else {
         dev_dot_iq2_xxs_q8_K_block8_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
@@ -914,6 +986,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
                                             s_iq2_grid, s_iq2_signs);
+        }
     }
     for (uint32_t p = 0; p < np; p++) {
         gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -1741,9 +1814,14 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
  * projections summed straight into the final output row (skips the separate
  * down buffer + moe_sum pass). n_expert==6. Uses the smem-LUT iq2 dot like
  * the decode gate kernel. */
+/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
+ * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
+ * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
+template <int SOA>
 __global__ static void moe_down_iq2_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
+        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
         const cuda_block_q8_K *midq,
         const int32_t *selected,
         uint64_t down_expert_bytes,
@@ -1763,10 +1841,17 @@ __global__ static void moe_down_iq2_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
-        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const uint64_t rowbase_wr = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xq + b, s_iq2_grid, s_iq2_signs);
+        if (SOA) {
+            const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
+            const uint64_t blk0 = rowbase_wr / 66ull;
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_soa_q8_K_block_lut(p, blk0 + b, xq + b, s_iq2_grid, s_iq2_signs);
+        } else {
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xq + b, s_iq2_grid, s_iq2_signs);
+        }
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0) total += acc;
     }
@@ -1775,9 +1860,14 @@ __global__ static void moe_down_iq2_sum6_qwarp32_kernel(
 
 
 
+/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
+ * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
+ * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
+template <int SOA>
 __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
         float *down_out,
         const char *down_base,
+        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
         const cuda_block_q8_K *midq,
         const uint32_t *sorted_pairs,
         const uint32_t *offsets,
@@ -1822,14 +1912,23 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     if (row >= out_dim) return;
-    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const uint64_t rowbase_wr = (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        if (SOA) {
+            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc,
+                                            s_iq2_grid, s_iq2_signs);
+        } else {
         dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc,
                                             s_iq2_grid, s_iq2_signs);
+        }
     }
     for (uint32_t p = 0; p < np; p++) {
         acc[p] = quarter_warp_sum_f32(acc[p], lane);
@@ -1841,9 +1940,14 @@ __global__ static void moe_down_iq2_expert_tile8_row32_kernel(
 
 
 
+/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
+ * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
+ * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
+template <int SOA>
 __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
         float *down_out,
         const char *down_base,
+        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
         const cuda_block_q8_K *midq,
         const uint32_t *sorted_pairs,
         const uint32_t *offsets,
@@ -1891,20 +1995,37 @@ __global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
     for (uint32_t rr = 0; rr < 64u; rr++) {
         uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
         if (row >= out_dim) continue;
-        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const uint64_t rowbase_wr = (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
         float acc[16] = {0.0f};
         for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            if (SOA) {
+                dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc,
+                                                s_iq2_grid, s_iq2_signs);
+            } else {
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc,
                                                 s_iq2_grid, s_iq2_signs);
+            }
             if (np > 8u) {
+                if (SOA) {
+                    dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
+                                                    xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
+                                                    xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
+                                                    xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8,
+                                                    s_iq2_grid, s_iq2_signs);
+                } else {
                 dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
                                                     xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
                                                     xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
                                                     xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8,
                                                     s_iq2_grid, s_iq2_signs);
+                }
             }
         }
         for (uint32_t p = 0; p < np; p++) {
@@ -2831,7 +2952,7 @@ static int routed_moe_launch_mixed40(
         if (ok) {
             if (tiled_down) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, (uint32_t)tile16_cap, 1);
-                moe_down_iq2_expert_tile16_row2048_kernel<<<tgrid, 256>>>(down_flat, down_w, midq,
+                moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq,
                     sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
                     down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
             } else {
@@ -3185,9 +3306,9 @@ static int routed_moe_launch(
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             clamp);
                     } else {
-                        moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
                             (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                            gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             clamp);
@@ -3248,10 +3369,10 @@ static int routed_moe_launch(
                         n_expert,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_lut_qwarp32_kernel<0><<<qgrid, 256>>>(
                         (float *)mid->ptr,
                         gate_w,
-                        up_w,
+                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
                         xq,
                         selected_ptr,
                         (const float *)weights->ptr,
@@ -3319,9 +3440,9 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 } else if (down_iq2) {
-                    moe_down_iq2_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_iq2_sum6_qwarp32_kernel<0><<<sgrid, 256>>>(
                         (float *)out->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
@@ -3352,9 +3473,9 @@ static int routed_moe_launch(
             } else if (sorted_pairs && !down_mxfp4 && use_big_batch) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                    moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(
                         (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                        down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert);
                 } else {
@@ -3367,9 +3488,9 @@ static int routed_moe_launch(
             } else if (sorted_pairs && !down_mxfp4) {
                 dim3 tgrid((out_dim + 31u) / 32u, tile_capacity, 1);
                 if (down_iq2) {
-                    moe_down_iq2_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_iq2_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
                         (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                        down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert);
                 } else {
