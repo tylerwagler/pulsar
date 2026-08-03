@@ -543,17 +543,43 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
  * instantiation inlines to the EXACT body of its original clone, so the SASS —
  * and the output — is byte-identical (verified by the dump-logits gate). This
  * removes ~100 lines of hand-cloned duplication. */
+/* SoA-layout traits.  The packed traits address a ROW BASE in bytes; the SoA
+ * planes are tensor-global, so these address a BLOCK INDEX instead.  `soa` lets
+ * the kernels pick the addressing with `if constexpr` and keeps the packed
+ * instantiations byte-identical to before. */
+struct GateUpDotIQ2SoA {
+    static constexpr bool soa = true;
+    __device__ static inline float dot(const iq2_soa_planes p, uint64_t blk, const cuda_block_q8_K *x) {
+        return dev_dot_iq2_soa_q8_K_block(p, blk, x);
+    }
+};
+struct Dot8IQ2SoA {
+    static constexpr bool soa = true;
+    __device__ static inline void dot8(const iq2_soa_planes p, uint64_t blk,
+            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
+            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
+            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
+            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
+            uint32_t np, float *acc, const uint64_t *grid, const uint8_t *signs) {
+        dev_dot_iq2_soa_q8_K_block8_deq_lut(p, blk, x0, x1, x2, x3, x4, x5, x6, x7,
+                                            np, acc, grid, signs);
+    }
+};
+
 struct GateUpDotIQ2 {
+    static constexpr bool soa = false;
     __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
         return dev_dot_iq2_xxs_q8_K_block((const cuda_block_iq2_xxs *)rowbase + b, x);
     }
 };
 struct GateUpDotMXFP4 {
+    static constexpr bool soa = false;
     __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
         return dev_dot_mxfp4_q8_K_block((const unsigned char *)rowbase + (uint64_t)b * 8u * 17u, x);
     }
 };
 struct GateUpDotQ2K {
+    static constexpr bool soa = false;
     __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
         return dev_dot_q2_K_q8_K_block((const cuda_block_q2_K *)rowbase + b, x);
     }
@@ -563,6 +589,7 @@ struct GateUpDotQ2K {
  * prefill kernels (tile16 collapse below). Same addressing rules as the
  * single-block traits above. */
 struct Dot8Q2K {
+    static constexpr bool soa = false;
     __device__ static inline void dot8(const char *rowbase, uint32_t b,
             const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
             const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
@@ -574,6 +601,7 @@ struct Dot8Q2K {
     }
 };
 struct Dot8MXFP4 {
+    static constexpr bool soa = false;
     __device__ static inline void dot8(const char *rowbase, uint32_t b,
             const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
             const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
@@ -592,6 +620,8 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
+        uint64_t gate_d_off,        /* SoA traits only: byte offset to the d plane */
+        uint64_t up_d_off,
         const cuda_block_q8_K *xq,
         const int32_t *selected,
         const float *weights,
@@ -613,13 +643,21 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const char *gr = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-        const char *ur = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+        const uint64_t rowbase = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+        const char *gr = gate_base + rowbase;
+        const char *ur = up_base + rowbase;
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            if constexpr (Dot::soa) {
+                /* SoA planes are tensor-global: address by block index. */
+                const uint64_t blk0 = rowbase / 66ull;
+                gate += Dot::dot(dev_iq2_soa_planes(gate_base, gate_d_off), blk0 + b, xqb + b);
+                up   += Dot::dot(dev_iq2_soa_planes(up_base, up_d_off), blk0 + b, xqb + b);
+            } else {
             gate += Dot::dot(gr, b, xqb + b);
             up += Dot::dot(ur, b, xqb + b);
+            }
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -1465,6 +1503,7 @@ template <class Dot>
 __global__ static void moe_down_qwarp32_kernel(
         float *down_out,
         const char *down_base,
+        uint64_t down_d_off,        /* SoA traits only: byte offset to the d plane */
         const cuda_block_q8_K *midq,
         const int32_t *selected,
         uint64_t down_expert_bytes,
@@ -1480,10 +1519,18 @@ __global__ static void moe_down_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    const char *wr = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+    const uint64_t rowbase = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+    const char *wr = down_base + rowbase;
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
+    if constexpr (Dot::soa) {
+        /* SoA planes are tensor-global: address by block index. */
+        const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
+        const uint64_t blk0 = rowbase / 66ull;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(p, blk0 + b, xq + b);
+    } else {
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
+    }
     acc = quarter_warp_sum_f32(acc, lane);
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
@@ -1505,6 +1552,7 @@ template <class Dot>
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
+        uint64_t down_d_off,        /* SoA traits only: byte offset to the d plane */
         const cuda_block_q8_K *midq,
         const int32_t *selected,
         uint64_t down_expert_bytes,
@@ -1519,10 +1567,18 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
-        const char *wr = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const uint64_t rowbase = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        const char *wr = down_base + rowbase;
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
+        if constexpr (Dot::soa) {
+            /* SoA planes are tensor-global: address by block index. */
+            const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
+            const uint64_t blk0 = rowbase / 66ull;
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(p, blk0 + b, xq + b);
+        } else {
+            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
+        }
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0) total += acc;
     }
@@ -2781,10 +2837,10 @@ static int routed_moe_launch_mixed40(
             } else {
                 dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
                 if (down_type == 16u)
-                    moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(down_flat, down_w, midq, selected_ptr,
+                    moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
                         down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
                 else
-                    moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(down_flat, down_w, midq, selected_ptr,
+                    moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
                         down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
             }
             ok = cuda_ok(cudaGetLastError(), "mixed40A down");
@@ -2816,11 +2872,11 @@ static int routed_moe_launch_mixed40(
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (gate_type == 10u)
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
-                        gate_w, up_w, xq, selected_ptr, (const float *)weights->ptr,
+                        gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
                 else
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
-                        gate_w, up_w, xq, selected_ptr, (const float *)weights->ptr,
+                        gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
             }
             ok = cuda_ok(cudaGetLastError(), "mixed40B gate/up");
@@ -3181,7 +3237,7 @@ static int routed_moe_launch(
                         (float *)up->ptr,
                         (float *)mid->ptr,
                         gate_w,
-                        up_w,
+                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
                         xq,
                         selected_ptr,
                         (const float *)weights->ptr,
@@ -3211,7 +3267,7 @@ static int routed_moe_launch(
                         (float *)up->ptr,
                         (float *)mid->ptr,
                         gate_w,
-                        up_w,
+                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
                         xq,
                         selected_ptr,
                         (const float *)weights->ptr,
@@ -3227,7 +3283,7 @@ static int routed_moe_launch(
                         (float *)up->ptr,
                         (float *)mid->ptr,
                         gate_w,
-                        up_w,
+                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
                         xq,
                         selected_ptr,
                         (const float *)weights->ptr,
@@ -3255,7 +3311,7 @@ static int routed_moe_launch(
                 if (down_mxfp4) {
                     moe_down_sum6_qwarp32_kernel<GateUpDotMXFP4><<<sgrid, 256>>>(
                         (float *)out->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
@@ -3275,7 +3331,7 @@ static int routed_moe_launch(
                 } else {
                     moe_down_sum6_qwarp32_kernel<GateUpDotQ2K><<<sgrid, 256>>>(
                         (float *)out->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
@@ -3327,7 +3383,7 @@ static int routed_moe_launch(
                 if (down_mxfp4) {
                     moe_down_qwarp32_kernel<GateUpDotMXFP4><<<dgrid, 256>>>(
                         (float *)down->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
@@ -3338,7 +3394,7 @@ static int routed_moe_launch(
                 } else if (down_iq2) {
                     moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(
                         (float *)down->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
@@ -3349,7 +3405,7 @@ static int routed_moe_launch(
                 } else {
                     moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(
                         (float *)down->ptr,
-                        down_w,
+                        down_w, 0ull /*down_d_off*/,
                         midq,
                         selected_ptr,
                         down_expert_bytes,
