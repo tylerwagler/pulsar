@@ -1310,6 +1310,69 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
 
 
 
+/* ---- Attention numeric emulation (plan 90 B1 variant pricing) -------------
+ *
+ * Rounds exactly the values a tensor-core attention path WOULD round, inside
+ * our exact SIMT kernel, so each B1 variant's fidelity cost can be MEASURED
+ * against the work-rig reference before anyone spends weeks porting a kernel.
+ * This is the method that priced the fp16-HMMA question in task #65; that
+ * apparatus was never committed and is lost, so this is a rebuild — but now
+ * aimed at divergence-from-SOURCE rather than divergence-from-ourselves.
+ *
+ * Q and P are the only NEW roundings a TC path adds on our stack: the raw ring
+ * is already __float2half-rounded and the comp cache is e4m3 (ATTN_PACK), so
+ * K/V precision is not ours to lose a second time here. In this kernel k0..k3
+ * carry BOTH K and V (MLA shares the latent), which is why only Q and P are
+ * touched below.
+ *
+ * What this deliberately does NOT model (same caveat the #65 measurement
+ * carried, and the reason its numbers were a FLOOR): a real port also changes
+ * k-dim reassociation and online-softmax rescale ordering. Treat any result
+ * here as a lower bound on the true divergence.
+ *
+ * Modes (PULSAR_ATTN_EMUL, read once at launch dispatch per no-hot-path-flags):
+ *   0 OFF   byte-identical -- the template collapses to the shipped code
+ *   1 FP16  Q,P -> __half            (the fp16-HMMA variant)
+ *   2 BF16  Q,P -> __nv_bfloat16     (bf16 QK/PV, expected cheapest divergence)
+ *   3 QONLY Q -> bf16, P left f32    (isolates the Q-side cost alone)
+ *   4 CTRL  no rounding at all       (must come back byte-identical to OFF;
+ *                                     proves the apparatus itself is inert)
+ */
+enum {
+    PULSAR_EMUL_OFF = 0,
+    PULSAR_EMUL_FP16 = 1,
+    PULSAR_EMUL_BF16 = 2,
+    PULSAR_EMUL_QONLY = 3,
+    PULSAR_EMUL_CTRL = 4,
+    PULSAR_EMUL_MODES = 5
+};
+
+template <int EMUL>
+__device__ __forceinline__ static float emul_round_q(float x) {
+    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
+    if constexpr (EMUL == PULSAR_EMUL_BF16 || EMUL == PULSAR_EMUL_QONLY)
+        return __bfloat162float(__float2bfloat16(x));
+    return x;
+}
+
+template <int EMUL>
+__device__ __forceinline__ static float emul_round_p(float x) {
+    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
+    if constexpr (EMUL == PULSAR_EMUL_BF16) return __bfloat162float(__float2bfloat16(x));
+    return x;
+}
+
+template <int EMUL>
+__device__ __forceinline__ static void emul_round_q4(float4 &v) {
+    if constexpr (EMUL != PULSAR_EMUL_OFF && EMUL != PULSAR_EMUL_CTRL) {
+        v.x = emul_round_q<EMUL>(v.x);
+        v.y = emul_round_q<EMUL>(v.y);
+        v.z = emul_round_q<EMUL>(v.z);
+        v.w = emul_round_q<EMUL>(v.w);
+    }
+}
+
+template <int EMUL>
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -1323,6 +1386,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         int raw_f16) {
+    /* EMUL: see the emulation block above. OFF is the shipped path. */
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1352,6 +1416,12 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
         q3 = q4[lane + 96u];
+        /* Q-side emulation: once per block, before any dot product. Compiles
+         * to zero instructions when EMUL is OFF/CTRL. */
+        emul_round_q4<EMUL>(q0);
+        emul_round_q4<EMUL>(q1);
+        emul_round_q4<EMUL>(q2);
+        emul_round_q4<EMUL>(q3);
     }
 
     float max_s = -INFINITY;
@@ -1386,7 +1456,11 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
+                /* P-side emulation: row_scale IS the unnormalized
+                 * probability a TC path would carry in reduced
+                 * precision. f32 when EMUL is OFF/CTRL/QONLY. */
+                const float row_scale =
+                        emul_round_p<EMUL>(expf(score - new_m));
                 sum_s = sum_s * old_scale + row_scale;
                 o0.x = o0.x * old_scale + k0.x * row_scale;
                 o0.y = o0.y * old_scale + k0.y * row_scale;
@@ -1434,6 +1508,49 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+/* Emulation mode, resolved ONCE per process (no getenv on a hot path). An
+ * unset or unrecognised value means OFF, so a typo can never silently ship
+ * altered numerics; an active mode announces itself loudly because it is a
+ * measurement apparatus, never a release path. */
+static int pulsar_attn_emul_mode(void) {
+    static const int mode = []() -> int {
+        const char *e = getenv("PULSAR_ATTN_EMUL");
+        int m = e && e[0] ? atoi(e) : PULSAR_EMUL_OFF;
+        if (m <= 0 || m >= PULSAR_EMUL_MODES) return PULSAR_EMUL_OFF;
+        fprintf(stderr, "pulsar: ATTENTION NUMERIC EMULATION ACTIVE (mode %d) "
+                        "-- diagnostic apparatus, NOT a release path\n", m);
+        return m;
+    }();
+    return mode;
+}
+
+/* Dispatch the shipped prefill window kernel through its emulation template.
+ * OFF instantiates code identical to the pre-emulation kernel. */
+#define PULSAR_ATTN_ONLINE_DISPATCH(grid_, blk_, ...)                          \
+    do {                                                                       \
+        switch (pulsar_attn_emul_mode()) {                                     \
+        case PULSAR_EMUL_FP16:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_FP16>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_BF16:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_BF16>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_QONLY:                                                \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_QONLY>     \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_CTRL:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_CTRL>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        default:                                                               \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_OFF>       \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        }                                                                      \
+    } while (0)
 
 
 __global__ static void attention_decode_mixed_heads8_online_kernel(
@@ -1840,18 +1957,18 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   0,
-                                                                   window,
-                                                                   1,
-                                                                   n_head,
-                                                                   head_dim,
-                                                                   raw_f16);
+        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
+                                    sinks,
+                                    (const float *)q->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    n_tokens,
+                                    0,
+                                    window,
+                                    1,
+                                    n_head,
+                                    head_dim,
+                                    raw_f16);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -2450,18 +2567,18 @@ static int attention_prefill_mixed_launch(
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim,
-                                                                   raw_f16);
+        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
+                                    sinks,
+                                    (const float *)q->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                    n_tokens,
+                                    n_comp,
+                                    window,
+                                    ratio,
+                                    n_head,
+                                    head_dim,
+                                    raw_f16);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
