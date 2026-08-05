@@ -39,6 +39,14 @@ typedef struct {
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
     const char *kl_file_path;
+    /* Pre-tokenized ids for the KL walk. Cross-rig KL pairs position p on both
+     * sides, so the two engines must score the SAME id sequence -- and they do
+     * not agree on text: measured 2026-08-05, pulsar and vLLM produced
+     * different tokenizations on 8 of 9 calib documents (+1..+64 ids), because
+     * pulsar_tokenize_rendered_chat folds <think>/DSML markers into single
+     * special ids the way the served model does. Feeding ids bypasses both
+     * tokenizers so the comparison is exact by construction. */
+    const char *kl_tokens_path;
     const char *kl_ref_dump_path;
     const char *kl_score_path;
     int kl_stride;
@@ -795,14 +803,67 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
     const int stride = cfg->gen.kl_stride > 0 ? cfg->gen.kl_stride : 4;
     const int vocab = pulsar_engine_vocab_size(engine);
 
-    char *text = read_prompt_file(cfg->gen.kl_file_path, true);
     pulsar_tokens tokens = {0};
+    if (cfg->gen.kl_tokens_path) {
+        /* Pre-tokenized lane: score EXACTLY these ids, tokenizer untouched, so
+         * the reference rig and this engine walk an identical sequence. The
+         * file is a flat JSON array of ints -- the same shape this mode already
+         * emits as its .tokens.json sidecar, so a capture can seed the other
+         * side of the comparison. */
+        FILE *tf = fopen(cfg->gen.kl_tokens_path, "rb");
+        if (!tf) {
+            fprintf(stderr, "pulsar: cannot open --kl-tokens: %s\n",
+                    cfg->gen.kl_tokens_path);
+            return 1;
+        }
+        int val = 0, have = 0, neg = 0;
+        long n_read = 0;
+        int ch;
+        while ((ch = fgetc(tf)) != EOF) {
+            if (ch == '-') { neg = 1; continue; }
+            if (ch >= '0' && ch <= '9') {
+                val = val * 10 + (ch - '0');
+                have = 1;
+                continue;
+            }
+            if (have) {
+                pulsar_tokens_push(&tokens, neg ? -val : val);
+                n_read++;
+            }
+            val = 0; have = 0; neg = 0;
+        }
+        if (have) { pulsar_tokens_push(&tokens, neg ? -val : val); n_read++; }
+        fclose(tf);
+        if (n_read <= 0) {
+            fprintf(stderr, "pulsar: --kl-tokens parsed 0 ids from %s\n",
+                    cfg->gen.kl_tokens_path);
+            pulsar_tokens_free(&tokens);
+            return 1;
+        }
+        const int vocab_n = pulsar_engine_vocab_size(engine);
+        for (long k = 0; k < n_read; k++) {
+            if (tokens.v[k] < 0 || tokens.v[k] >= vocab_n) {
+                fprintf(stderr, "pulsar: --kl-tokens id %d at index %ld is "
+                                "outside vocab [0,%d)\n",
+                        tokens.v[k], k, vocab_n);
+                pulsar_tokens_free(&tokens);
+                return 1;
+            }
+        }
+        fprintf(stderr, "pulsar: --kl-tokens loaded %ld pre-tokenized ids "
+                        "(tokenizer bypassed)\n", n_read);
+        goto tokens_ready;
+    }
+    {
+    char *text = read_prompt_file(cfg->gen.kl_file_path, true);
     /* Special-token-aware: honors <think>/</think>/DSML/etc. as single special
      * ids exactly as the served model (and the vLLM reference) do. Identical to
      * plain BPE on text without special markers, so calibration text is
      * unaffected; teacher-forced KL over reasoning/tool content now aligns. */
     pulsar_tokenize_rendered_chat(engine, text, &tokens);
     free(text);
+    }
+tokens_ready:
 
     /* Sidecar: dump the full token-id sequence next to the ref dump so an
      * external aligner can VERIFY this engine's tokenization matches the
@@ -1590,6 +1651,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kl-file")) {
             c.gen.kl_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kl-tokens")) {
+            c.gen.kl_tokens_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kl-ref-dump")) {
             c.gen.kl_ref_dump_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kl-score")) {
@@ -1687,7 +1750,7 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
-    } else if (cfg.gen.kl_file_path) {
+    } else if (cfg.gen.kl_file_path || cfg.gen.kl_tokens_path) {
         rc = run_kl_file(engine, &cfg);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);

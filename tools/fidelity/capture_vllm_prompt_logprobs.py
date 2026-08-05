@@ -83,6 +83,13 @@ def main():
     ap.add_argument("--model", default="auto")
     ap.add_argument("--topk", type=int, default=20)
     ap.add_argument("--out", default=None, help="default: <suite>/ref-<model-tag>")
+    ap.add_argument("--tokens-dir", default=None,
+                    help="directory of <doc>.json pre-tokenized id arrays. "
+                         "Posts ids instead of text so BOTH rigs score the "
+                         "identical sequence -- required for cross-rig KL, "
+                         "since pulsar and vLLM tokenize the same bytes "
+                         "differently on 8 of 9 calib docs (measured "
+                         "2026-08-05, +1..+64 ids from <think>/DSML folding)")
     a = ap.parse_args()
 
     manifest = json.load(open(os.path.join(a.suite, "manifest.json")))
@@ -98,14 +105,33 @@ def main():
         if os.path.exists(out_path):
             print(f"skip {name} (exists)", file=sys.stderr)
             continue
-        text = open(os.path.join(a.suite, entry["file"]),
-                    encoding="utf-8").read()
-        tokens = tokenize(a.endpoint, model, text)
-        print(f"capture {name}: {len(text)} chars, "
-              f"{len(tokens) if tokens else '?'} tokens", file=sys.stderr)
+        pre = None
+        if a.tokens_dir:
+            tp = os.path.join(a.tokens_dir, name + ".json")
+            if not os.path.exists(tp):
+                sys.exit(f"{name}: --tokens-dir given but {tp} is missing. "
+                         "Every document must be pre-tokenized or none, "
+                         "otherwise the reference mixes two conventions.")
+            pre = json.load(open(tp))
+            if not isinstance(pre, list) or not pre:
+                sys.exit(f"{tp}: expected a non-empty JSON array of token ids")
+
+        if pre is not None:
+            tokens = pre
+            prompt_field = pre          # vLLM accepts a list[int] prompt
+            print(f"capture {name}: {len(pre)} PRE-TOKENIZED ids",
+                  file=sys.stderr)
+        else:
+            text = open(os.path.join(a.suite, entry["file"]),
+                        encoding="utf-8").read()
+            tokens = tokenize(a.endpoint, model, text)
+            prompt_field = text
+            print(f"capture {name}: {len(text)} chars, "
+                  f"{len(tokens) if tokens else '?'} tokens", file=sys.stderr)
+
         resp = api(a.endpoint, "/v1/completions", {
             "model": model,
-            "prompt": text,
+            "prompt": prompt_field,
             "max_tokens": 1,
             "temperature": 0,
             "prompt_logprobs": a.topk,
@@ -125,6 +151,7 @@ def main():
                 "file": name,
                 "topk": a.topk,
                 "tokens": tokens,
+                "pretokenized": pre is not None,
             }) + "\n")
             for pos, topk in rows:
                 if not topk:
