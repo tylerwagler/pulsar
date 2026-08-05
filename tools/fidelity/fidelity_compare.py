@@ -57,6 +57,40 @@ def best_offset(a_tokens, b_tokens):
     return best, best_rate
 
 
+def token_agreement(ref_tokens, cand_tokens, offset):
+    """Full-length agreement check, NOT the 4096-token sample best_offset uses.
+
+    Position alignment is load-bearing: every KL number is computed by pairing
+    ref position p with cand position p+offset, so if the two tokenizers
+    disagree anywhere the pairing silently drifts from that point on and the
+    table still renders plausible-looking numbers.
+
+    Measured 2026-08-05: pulsar and vLLM agree byte-for-byte on plain calib
+    text (short-00, 1859/1859) but NOT on marked-up documents — long-mixed came
+    out 84,006 tokens vs the reference's 83,643, and dsml-tools 144 vs 141,
+    because pulsar_tokenize_rendered_chat folds <think>/DSML markers into single
+    special ids. So this must be checked per document, never assumed from one.
+    """
+    if not ref_tokens or not cand_tokens:
+        return None  # nothing to check against
+    n_ref, n_cand = len(ref_tokens), len(cand_tokens)
+    hit = tot = 0
+    first_bad = None
+    for i in range(n_ref):
+        j = i + offset
+        if not (0 <= j < n_cand):
+            continue
+        tot += 1
+        if ref_tokens[i] == cand_tokens[j]:
+            hit += 1
+        elif first_bad is None:
+            first_bad = i
+    return {"n_ref": n_ref, "n_cand": n_cand, "compared": tot,
+            "agree": hit, "rate": (hit / tot if tot else 0.0),
+            "first_mismatch": first_bad,
+            "exact": (n_ref == n_cand and hit == tot and tot == n_ref)}
+
+
 def trunc_kl(p_topk, q_topk):
     """KL(p || q) over union-of-supports + tail bucket, renormalized."""
     p = {t: lp for t, lp in p_topk}
@@ -102,6 +136,8 @@ def compare_file(ref_path, cand_path, bounds):
     ref_h, ref_rows = load(ref_path)
     cand_h, cand_rows = load(cand_path)
     off, rate = best_offset(ref_h.get("tokens") or [], cand_h.get("tokens") or [])
+    tok = token_agreement(ref_h.get("tokens") or [],
+                          cand_h.get("tokens") or [], off)
     stats = {}
     skipped = 0
     for pos, r in ref_rows.items():
@@ -121,7 +157,7 @@ def compare_file(ref_path, cand_path, bounds):
         if r.get("logprob") is not None and c.get("logprob") is not None:
             s["dlp"].append(abs(r["logprob"] - c["logprob"]))
     return {"offset": off, "align_rate": rate, "skipped": skipped,
-            "buckets": stats}
+            "buckets": stats, "tokens": tok}
 
 
 def pct(xs, q):
@@ -134,6 +170,17 @@ def pct(xs, q):
 def report(name, res, bounds):
     print(f"\n## {name}  (align offset {res['offset']}, "
           f"rate {res['align_rate']:.3f}, {res['skipped']} pos skipped)")
+    tok = res.get("tokens")
+    if tok is not None and not tok["exact"]:
+        print(f"\n> **TOKENIZATION MISMATCH — THIS ROW IS NOT COMPARABLE.**")
+        print(f"> ref {tok['n_ref']} tokens vs candidate {tok['n_cand']}; "
+              f"{tok['agree']}/{tok['compared']} agree "
+              f"({100.0 * tok['rate']:.2f}%)"
+              + (f", first mismatch at ref position {tok['first_mismatch']}"
+                 if tok["first_mismatch"] is not None else ""))
+        print("> Every KL below pairs ref position p with candidate p+offset, "
+              "so the pairing drifts past the first mismatch and these numbers "
+              "are meaningless. Reconcile the tokenizers, then re-capture.\n")
     print("| depth | n | KL med | KL p95 | top-1 % | |Δlogprob| |")
     print("|---|---|---|---|---|---|")
     total = {"n": 0, "kl": [], "top1": 0, "dlp": []}
@@ -165,20 +212,40 @@ def main():
     # depth is exactly where the competitor gap grows (2.4x@2k -> 3.3x@64k),
     # so the deepest bucket is the most diagnostic one we have.
     ap.add_argument("--buckets", default="2048,9216,38912,65536")
+    ap.add_argument("--allow-token-mismatch", action="store_true",
+                    help="report mismatched-tokenization rows instead of "
+                         "failing (they are NOT comparable — see README)")
     a = ap.parse_args()
     bounds = [int(x) for x in a.buckets.split(",")]
 
+    bad = []
     if a.dir:
         names = sorted(set(os.listdir(a.ref)) & set(os.listdir(a.cand)))
         names = [n for n in names if n.endswith(".jsonl")]
         if not names:
             sys.exit("no common .jsonl files")
         for n in names:
-            report(n, compare_file(os.path.join(a.ref, n),
-                                   os.path.join(a.cand, n), bounds), bounds)
+            res = compare_file(os.path.join(a.ref, n),
+                               os.path.join(a.cand, n), bounds)
+            report(n, res, bounds)
+            if res.get("tokens") is not None and not res["tokens"]["exact"]:
+                bad.append(n)
     else:
-        report(os.path.basename(a.cand),
-               compare_file(a.ref, a.cand, bounds), bounds)
+        res = compare_file(a.ref, a.cand, bounds)
+        report(os.path.basename(a.cand), res, bounds)
+        if res.get("tokens") is not None and not res["tokens"]["exact"]:
+            bad.append(os.path.basename(a.cand))
+
+    if bad:
+        msg = (f"\n{len(bad)} document(s) had mismatched tokenization and are "
+               f"NOT comparable: {', '.join(bad)}")
+        if not a.allow_token_mismatch:
+            # exit non-zero so a scripted A3 build cannot quietly publish rows
+            # whose position alignment drifted
+            sys.exit(msg + "\nRefusing to treat these as results. Reconcile the "
+                           "tokenizers and re-capture, or pass "
+                           "--allow-token-mismatch to see them anyway.")
+        print(msg + "\n(shown anyway: --allow-token-mismatch)")
 
 
 if __name__ == "__main__":

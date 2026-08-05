@@ -826,14 +826,36 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
         pulsar_tokens_free(&tokens);
         return 1;
     }
-    int scored = tokens.len - prefix_len;
-    if (cfg->gen.n_predict > 0 && scored > cfg->gen.n_predict) scored = cfg->gen.n_predict;
-    if (scored > cfg->gen.ctx_size - prefix_len) scored = cfg->gen.ctx_size - prefix_len;
+    const int scored_full = (int)tokens.len - prefix_len;
+    int scored = scored_full;
+    /* Truncation here is silent-by-default poison for a depth curve: n_predict
+     * carries a GENERATION default (50000), and inheriting it made a 83.6k-token
+     * document score only its first 50k positions with no output at all — the
+     * deep buckets a drift-vs-depth measurement exists to fill just came back
+     * empty, which reads as "no data" rather than "truncated". Name every cut. */
+    if (cfg->gen.n_predict > 0 && scored > cfg->gen.n_predict) {
+        scored = cfg->gen.n_predict;
+        fprintf(stderr,
+                "pulsar: --kl-file TRUNCATED to %d of %d scorable positions by "
+                "-n/--tokens (%d). Pass a larger -n to score the whole "
+                "document; depth buckets past position %d will be EMPTY.\n",
+                scored, scored_full, cfg->gen.n_predict, scored + prefix_len);
+    }
+    if (scored > cfg->gen.ctx_size - prefix_len) {
+        scored = cfg->gen.ctx_size - prefix_len;
+        fprintf(stderr,
+                "pulsar: --kl-file TRUNCATED to %d of %d scorable positions by "
+                "--ctx (%d). Raise --ctx to cover the document.\n",
+                scored, scored_full, cfg->gen.ctx_size);
+    }
     if (scored <= 0) {
         fprintf(stderr, "pulsar: context too small for KL scoring\n");
         pulsar_tokens_free(&tokens);
         return 1;
     }
+    fprintf(stderr, "pulsar: --kl-file scoring %d of %d positions "
+                    "(%d tokens, %d-token prefix, stride %d)\n",
+            scored, scored_full, (int)tokens.len, prefix_len, stride);
 
     FILE *fp = NULL;
     uint32_t ref_positions = 0;
