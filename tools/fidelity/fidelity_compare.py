@@ -144,14 +144,14 @@ def report(name, res, bounds):
         total["top1"] += s["top1"]
         total["dlp"] += s["dlp"]
         print(f"| {bucket_name(b, bounds)} | {s['n']} "
-              f"| {pct(s['kl'], 0.5):.4f} | {pct(s['kl'], 0.95):.4f} "
+              f"| {pct(s['kl'], 0.5):.3e} | {pct(s['kl'], 0.95):.3e} "
               f"| {100.0 * s['top1'] / max(1, s['n']):.2f} "
-              f"| {sum(s['dlp']) / max(1, len(s['dlp'])):.4f} |")
+              f"| {sum(s['dlp']) / max(1, len(s['dlp'])):.3e} |")
     s = total
-    print(f"| **all** | {s['n']} | {pct(s['kl'], 0.5):.4f} "
-          f"| {pct(s['kl'], 0.95):.4f} "
+    print(f"| **all** | {s['n']} | {pct(s['kl'], 0.5):.3e} "
+          f"| {pct(s['kl'], 0.95):.3e} "
           f"| {100.0 * s['top1'] / max(1, s['n']):.2f} "
-          f"| {sum(s['dlp']) / max(1, len(s['dlp'])):.4f} |")
+          f"| {sum(s['dlp']) / max(1, len(s['dlp'])):.3e} |")
 
 
 def main():
@@ -160,7 +160,11 @@ def main():
     ap.add_argument("cand")
     ap.add_argument("--dir", action="store_true",
                     help="ref/cand are directories; compare common *.jsonl")
-    ap.add_argument("--buckets", default="2048,9216,38912")
+    # Plan 90 depth points are 2k/9k/38k/64k: the 64k bound must be its own
+    # bucket boundary or everything past 38912 collapses into one bin — and
+    # depth is exactly where the competitor gap grows (2.4x@2k -> 3.3x@64k),
+    # so the deepest bucket is the most diagnostic one we have.
+    ap.add_argument("--buckets", default="2048,9216,38912,65536")
     a = ap.parse_args()
     bounds = [int(x) for x in a.buckets.split(",")]
 
