@@ -2048,6 +2048,24 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
     static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
     static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
+    /* One-shot branch report, same as the mixed path. This is the RAW entry;
+     * pulsar-bench showed real prefill never reaches the mixed launch, so this
+     * is where production prefill attention is actually served. */
+    static int raw_path_reported = 0;
+    if (!raw_path_reported) {
+        raw_path_reported = 1;
+        const int takes_window = n_tokens > 1 && head_dim == 512 &&
+                !no_window_attn &&
+                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+        fprintf(stderr,
+                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u quality=%d "
+                "-> %s\n",
+                n_tokens, head_dim, window, g_quality_mode,
+                takes_window ? "FUSED window kernel (no score matrix)"
+                             : (g_cublas_ready && !no_cublas_attn
+                                    ? "unfused cuBLAS two-GEMM"
+                                    : "generic per-token kernel"));
+    }
     if (n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
