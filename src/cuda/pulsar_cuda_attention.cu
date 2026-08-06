@@ -1362,6 +1362,37 @@ __device__ __forceinline__ static float emul_round_p(float x) {
     return x;
 }
 
+/* Elementwise rounding for the cuBLAS attention path, where Q and P are GEMM
+ * operands in memory rather than values in registers. Diagnostic-only: never
+ * launched while the emulation is OFF, so the shipped path is untouched.
+ *
+ * This path is the one that actually runs for a compressed-KV prefill --
+ * verified by dispatch-flag bisect: with PULSAR_CUDA_NO_CUBLAS_ATTENTION the
+ * dump changes, with PULSAR_CUDA_NO_WINDOW_ATTENTION it is byte-identical. The
+ * first version of this emulation instrumented the window kernel, which is
+ * dead code here, and the giveaway was three different rounding modes all
+ * returning bit-identical KL. */
+__global__ static void emul_round_array_kernel(float *dst, const float *src,
+                                               uint64_t n, int mode, int is_p) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = src[i];
+    switch (mode) {
+    case PULSAR_EMUL_FP16:
+        v = __half2float(__float2half(v));
+        break;
+    case PULSAR_EMUL_BF16:
+        v = __bfloat162float(__float2bfloat16(v));
+        break;
+    case PULSAR_EMUL_QONLY:
+        if (!is_p) v = __bfloat162float(__float2bfloat16(v));
+        break;
+    default:
+        break;
+    }
+    dst[i] = v;
+}
+
 template <int EMUL>
 __device__ __forceinline__ static void emul_round_q4(float4 &v) {
     if constexpr (EMUL != PULSAR_EMUL_OFF && EMUL != PULSAR_EMUL_CTRL) {
@@ -2591,12 +2622,29 @@ static int attention_prefill_mixed_launch(
         const uint64_t score_offset = (kv_bytes + 255u) & ~255ull;
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_offset = score_offset + ((score_bytes + 255u) & ~255ull);
-        const uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
+        /* Emulation needs a rounded copy of Q; Q is a const GEMM operand here,
+         * so it cannot be rounded in place. Costs nothing when OFF -- the
+         * region is not reserved and no kernel is launched. */
+        const int emul_mode = pulsar_attn_emul_mode();
+        const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t out_end = out_offset + out_count * sizeof(float);
+        const uint64_t qr_offset = (out_end + 255u) & ~255ull;
+        const uint64_t tmp_bytes = emul_mode
+                ? qr_offset + q_count * sizeof(float)
+                : out_end;
         float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention mixed cublas");
         if (!tmp) return 0;
         float *kv = tmp;
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
+        const float *q_eff = (const float *)q->ptr;
+        if (emul_mode) {
+            float *q_round = (float *)((char *)tmp + qr_offset);
+            emul_round_array_kernel<<<(q_count + 255) / 256, 256>>>(
+                    q_round, (const float *)q->ptr, q_count, emul_mode, 0);
+            if (!cuda_ok(cudaGetLastError(), "attention emul q round")) return 0;
+            q_eff = q_round;
+        }
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
@@ -2618,7 +2666,7 @@ static int attention_prefill_mixed_launch(
                                                       kv,
                                                       (int)head_dim,
                                                       0,
-                                                      (const float *)q->ptr,
+                                                      q_eff,
                                                       (int)(n_head * head_dim),
                                                       (long long)head_dim,
                                                       &beta,
@@ -2639,6 +2687,14 @@ static int attention_prefill_mixed_launch(
                 ratio,
                 n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
+        /* P-side emulation: `scores` now holds the normalized probabilities a
+         * tensor-core path would carry in reduced precision into the PV GEMM.
+         * Rounded in place; QONLY deliberately leaves P alone. */
+        if (emul_mode) {
+            emul_round_array_kernel<<<(score_count + 255) / 256, 256>>>(
+                    scores, scores, score_count, emul_mode, 1);
+            if (!cuda_ok(cudaGetLastError(), "attention emul p round")) return 0;
+        }
         const float one = 1.0f;
         st = cublasSgemmStridedBatched(g_cublas,
                                        CUBLAS_OP_N,
