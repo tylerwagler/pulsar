@@ -1602,6 +1602,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            /* Draft depth. The server CLI has always had this; the plain CLI
+             * did not, which made a draft-width sweep impossible from here --
+             * and the width sweep is what sets the expert-cost break-even for
+             * speculative decoding on a MoE decode. Same name and semantics as
+             * the server flag; engine clamps to 16. */
+            c.engine.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--expert-overlay")) {
             c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
