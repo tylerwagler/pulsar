@@ -1373,10 +1373,12 @@ __device__ __forceinline__ static float emul_round_p(float x) {
  * dead code here, and the giveaway was three different rounding modes all
  * returning bit-identical KL. */
 __global__ static void emul_round_array_kernel(float *dst, const float *src,
-                                               uint64_t n, int mode, int is_p) {
+                                               uint64_t n, int mode, int is_p,
+                                               unsigned long long *n_changed) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float v = src[i];
+    const float in = src[i];
+    float v = in;
     switch (mode) {
     case PULSAR_EMUL_FP16:
         v = __half2float(__float2half(v));
@@ -1390,6 +1392,10 @@ __global__ static void emul_round_array_kernel(float *dst, const float *src,
     default:
         break;
     }
+    /* Count elements the rounding actually moved. A variant reporting zero
+     * divergence is ambiguous between "this precision is free here" and "the
+     * rounding never happened"; this separates them at the source. */
+    if (n_changed && v != in) atomicAdd(n_changed, 1ull);
     dst[i] = v;
 }
 
@@ -2638,10 +2644,16 @@ static int attention_prefill_mixed_launch(
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
         const float *q_eff = (const float *)q->ptr;
+        static unsigned long long *emul_ctr = NULL;
+        static int emul_reported = 0;
+        if (emul_mode && !emul_ctr) cudaMalloc(&emul_ctr, 2 * sizeof(unsigned long long));
+        if (emul_mode && emul_ctr && !emul_reported)
+            cudaMemset(emul_ctr, 0, 2 * sizeof(unsigned long long));
         if (emul_mode) {
             float *q_round = (float *)((char *)tmp + qr_offset);
             emul_round_array_kernel<<<(q_count + 255) / 256, 256>>>(
-                    q_round, (const float *)q->ptr, q_count, emul_mode, 0);
+                    q_round, (const float *)q->ptr, q_count, emul_mode, 0,
+                    emul_reported ? NULL : emul_ctr);
             if (!cuda_ok(cudaGetLastError(), "attention emul q round")) return 0;
             q_eff = q_round;
         }
@@ -2692,8 +2704,19 @@ static int attention_prefill_mixed_launch(
          * Rounded in place; QONLY deliberately leaves P alone. */
         if (emul_mode) {
             emul_round_array_kernel<<<(score_count + 255) / 256, 256>>>(
-                    scores, scores, score_count, emul_mode, 1);
+                    scores, scores, score_count, emul_mode, 1,
+                    emul_reported ? NULL : (emul_ctr ? emul_ctr + 1 : NULL));
             if (!cuda_ok(cudaGetLastError(), "attention emul p round")) return 0;
+            if (!emul_reported && emul_ctr) {
+                unsigned long long h[2] = {0, 0};
+                cudaMemcpy(h, emul_ctr, sizeof h, cudaMemcpyDeviceToHost);
+                fprintf(stderr,
+                        "pulsar: EMUL mode %d rounded Q %llu/%llu elements, "
+                        "P %llu/%llu elements (first call)\n",
+                        emul_mode, h[0], (unsigned long long)q_count,
+                        h[1], (unsigned long long)score_count);
+                emul_reported = 1;
+            }
         }
         const float one = 1.0f;
         st = cublasSgemmStridedBatched(g_cublas,
