@@ -309,11 +309,19 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
         uint32_t n_comp,
         uint32_t window,
         uint32_t ratio,
-        uint32_t n_keys) {
+        uint32_t n_keys,
+        /* When non-NULL the normalized probabilities are stored HERE as fp16
+         * and the f32 store is skipped: the PV GEMM reads only one of the two,
+         * so this is one store instead of two, and it removes the separate
+         * f32->fp16 pass over the whole score matrix (which was memory-bound
+         * enough to eat the entire tensor-core win, measured 2026-08-05). */
+        __half *scores_h) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || ratio == 0) return;
-    float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
+    const uint64_t row_off = ((uint64_t)h * n_tokens + t) * n_keys;
+    float *row = scores + row_off;
+    __half *row_h = scores_h ? scores_h + row_off : NULL;
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -355,7 +363,11 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
     }
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
-    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
+    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
+        const float p = row[k] / denom;
+        if (row_h) row_h[k] = __float2half(p);
+        else row[k] = p;
+    }
 }
 
 
@@ -367,14 +379,20 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        /* Same idea as the softmax fp16 store: emit the packed KV directly in
+         * the GEMM's operand type instead of writing f32 and converting after. */
+        __half *dst_h) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)(n_tokens + n_comp) * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
-    dst[gid] = r < n_tokens ? raw_kv_ld(raw_kv, raw_f16, (uint64_t)r * head_dim + d)
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    const float v = r < n_tokens
+            ? raw_kv_ld(raw_kv, raw_f16, (uint64_t)r * head_dim + d)
+            : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    if (dst_h) dst_h[gid] = __float2half(v);
+    else dst[gid] = v;
 }
 
 
@@ -2049,7 +2067,8 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
                     n_tokens,
                     0,
                     head_dim,
-                    1);
+                    1,
+                    NULL);
             if (!cuda_ok(cudaGetLastError(), "attention raw f16 expand launch")) return 0;
             kv_mat = tmp;
         }
@@ -2685,6 +2704,14 @@ static int attention_prefill_mixed_launch(
             if (!cuda_ok(cudaGetLastError(), "attention emul q round")) return 0;
             q_eff = q_round;
         }
+        __half *kv_h = NULL, *q_h = NULL, *sc_h = NULL;
+        if (fp16_gemm) {
+            kv_h = (__half *)((char *)tmp + kvh_off);
+            q_h  = (__half *)((char *)tmp + qh_off);
+            sc_h = (__half *)((char *)tmp + sh_off);
+        }
+        /* fp16 path: the pack kernel emits the GEMM operand type directly, so
+         * there is no separate narrowing pass over KV. */
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
@@ -2692,18 +2719,17 @@ static int attention_prefill_mixed_launch(
                 n_tokens,
                 n_comp,
                 head_dim,
-                raw_f16);
+                raw_f16,
+                kv_h);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        __half *kv_h = NULL, *q_h = NULL, *sc_h = NULL;
         if (fp16_gemm) {
-            kv_h = (__half *)((char *)tmp + kvh_off);
-            q_h  = (__half *)((char *)tmp + qh_off);
-            sc_h = (__half *)((char *)tmp + sh_off);
-            f32_to_f16_kernel<<<(kv_count + 255) / 256, 256>>>(kv_h, kv, kv_count);
+            /* Q is the one operand with no producer kernel of its own to fold
+             * this into -- but it is only n_tokens*n_head*head_dim, orders of
+             * magnitude smaller than the score matrix. */
             f32_to_f16_kernel<<<(q_count + 255) / 256, 256>>>(q_h, q_eff, q_count);
-            if (!cuda_ok(cudaGetLastError(), "attention fp16 operand narrow")) return 0;
+            if (!cuda_ok(cudaGetLastError(), "attention fp16 q narrow")) return 0;
         }
         cublasStatus_t st;
         if (fp16_gemm) {
@@ -2753,7 +2779,8 @@ static int attention_prefill_mixed_launch(
                 n_comp,
                 window,
                 ratio,
-                n_keys);
+                n_keys,
+                sc_h);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
         /* P-side emulation: `scores` now holds the normalized probabilities a
          * tensor-core path would carry in reduced precision into the PV GEMM.
@@ -2776,8 +2803,7 @@ static int attention_prefill_mixed_launch(
         }
         const float one = 1.0f;
         if (fp16_gemm) {
-            f32_to_f16_kernel<<<(score_count + 255) / 256, 256>>>(sc_h, scores, score_count);
-            if (!cuda_ok(cudaGetLastError(), "attention fp16 p narrow")) return 0;
+            /* No narrowing pass here: the softmax already stored fp16. */
             st = cublasGemmStridedBatchedEx(g_cublas,
                                             CUBLAS_OP_N, CUBLAS_OP_N,
                                             (int)head_dim, (int)n_tokens, (int)n_keys,
