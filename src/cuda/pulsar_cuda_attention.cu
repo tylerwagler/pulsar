@@ -1362,6 +1362,21 @@ __device__ __forceinline__ static float emul_round_p(float x) {
     return x;
 }
 
+/* f32 -> fp16 narrowing for the tensor-core attention GEMM operands.
+ *
+ * The prefill attention pair already runs on tensor cores at TF32
+ * (CUBLAS_TF32_TENSOR_OP_MATH is the default; only --quality or
+ * PULSAR_CUDA_NO_TF32 disables it), and TF32 carries the SAME 10 explicit
+ * mantissa bits as fp16. Measured 2026-08-05: TF32 costs 5.806e-03 exact
+ * full-vocab KL against true FP32, while rounding Q/P to fp16 costs ZERO
+ * (byte-identical) -- precisely because the GEMM was already truncating to
+ * 10 bits. Feeding fp16 operands is therefore the same arithmetic precision
+ * we already ship, at roughly double the tensor-core rate. */
+__global__ static void f32_to_f16_kernel(__half *dst, const float *src, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
 /* Elementwise rounding for the cuBLAS attention path, where Q and P are GEMM
  * operands in memory rather than values in registers. Diagnostic-only: never
  * launched while the emulation is OFF, so the shipped path is untouched.
@@ -2635,9 +2650,22 @@ static int attention_prefill_mixed_launch(
         const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
         const uint64_t out_end = out_offset + out_count * sizeof(float);
         const uint64_t qr_offset = (out_end + 255u) & ~255ull;
-        const uint64_t tmp_bytes = emul_mode
+        uint64_t tmp_bytes = emul_mode
                 ? qr_offset + q_count * sizeof(float)
                 : out_end;
+        /* fp16 tensor-core operands: same 10-bit mantissa as the TF32 we
+         * already run, ~2x the rate. Read once; OFF reserves nothing. */
+        static int fp16_gemm_env = -1;
+        if (fp16_gemm_env < 0)
+            fp16_gemm_env = getenv("PULSAR_ATTN_FP16_GEMM") != NULL;
+        const int fp16_gemm = fp16_gemm_env;
+        uint64_t kvh_off = 0, qh_off = 0, sh_off = 0;
+        if (fp16_gemm) {
+            kvh_off = (tmp_bytes + 255u) & ~255ull;
+            qh_off  = (kvh_off + kv_count * sizeof(__half) + 255u) & ~255ull;
+            sh_off  = (qh_off + q_count * sizeof(__half) + 255u) & ~255ull;
+            tmp_bytes = sh_off + score_count * sizeof(__half);
+        }
         float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention mixed cublas");
         if (!tmp) return 0;
         float *kv = tmp;
@@ -2668,7 +2696,34 @@ static int attention_prefill_mixed_launch(
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+        __half *kv_h = NULL, *q_h = NULL, *sc_h = NULL;
+        if (fp16_gemm) {
+            kv_h = (__half *)((char *)tmp + kvh_off);
+            q_h  = (__half *)((char *)tmp + qh_off);
+            sc_h = (__half *)((char *)tmp + sh_off);
+            f32_to_f16_kernel<<<(kv_count + 255) / 256, 256>>>(kv_h, kv, kv_count);
+            f32_to_f16_kernel<<<(q_count + 255) / 256, 256>>>(q_h, q_eff, q_count);
+            if (!cuda_ok(cudaGetLastError(), "attention fp16 operand narrow")) return 0;
+        }
+        cublasStatus_t st;
+        if (fp16_gemm) {
+            /* fp16 operands, f32 accumulate: the softmax and the residual keep
+             * full f32 dynamic range, only the multiply-add operands narrow --
+             * to the same 10 mantissa bits TF32 was already giving us. */
+            st = cublasGemmStridedBatchedEx(g_cublas,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            (int)n_keys, (int)n_tokens, (int)head_dim,
+                                            &alpha,
+                                            kv_h, CUDA_R_16F, (int)head_dim, 0,
+                                            q_h, CUDA_R_16F,
+                                            (int)(n_head * head_dim), (long long)head_dim,
+                                            &beta,
+                                            scores, CUDA_R_32F,
+                                            (int)n_keys, (long long)n_keys * n_tokens,
+                                            (int)n_head,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        } else {
+            st = cublasSgemmStridedBatched(g_cublas,
                                                       CUBLAS_OP_T,
                                                       CUBLAS_OP_N,
                                                       (int)n_keys,
@@ -2686,6 +2741,7 @@ static int attention_prefill_mixed_launch(
                                                       (int)n_keys,
                                                       (long long)n_keys * n_tokens,
                                                       (int)n_head);
+        }
         if (!cublas_ok(st, "attention mixed score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
@@ -2719,7 +2775,23 @@ static int attention_prefill_mixed_launch(
             }
         }
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
+        if (fp16_gemm) {
+            f32_to_f16_kernel<<<(score_count + 255) / 256, 256>>>(sc_h, scores, score_count);
+            if (!cuda_ok(cudaGetLastError(), "attention fp16 p narrow")) return 0;
+            st = cublasGemmStridedBatchedEx(g_cublas,
+                                            CUBLAS_OP_N, CUBLAS_OP_N,
+                                            (int)head_dim, (int)n_tokens, (int)n_keys,
+                                            &one,
+                                            kv_h, CUDA_R_16F, (int)head_dim, 0,
+                                            sc_h, CUDA_R_16F,
+                                            (int)n_keys, (long long)n_keys * n_tokens,
+                                            &beta,
+                                            out_tmp, CUDA_R_32F,
+                                            (int)head_dim, (long long)head_dim * n_tokens,
+                                            (int)n_head,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        } else {
+            st = cublasSgemmStridedBatched(g_cublas,
                                        CUBLAS_OP_N,
                                        CUBLAS_OP_N,
                                        (int)head_dim,
@@ -2737,6 +2809,7 @@ static int attention_prefill_mixed_launch(
                                        (int)head_dim,
                                        (long long)head_dim * n_tokens,
                                        (int)n_head);
+        }
         if (!cublas_ok(st, "attention mixed value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
