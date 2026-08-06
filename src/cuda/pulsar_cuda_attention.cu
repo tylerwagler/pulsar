@@ -1455,7 +1455,18 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        /* Compressed-KV additive mask. Previously this fused kernel was gated
+         * OFF whenever a comp mask was in play (`!use_comp_mask`), so every
+         * compressed-KV prefill fell back to the UNFUSED two-GEMM cuBLAS path
+         * -- which materialises the whole n_head*n_tokens*n_keys score matrix
+         * to memory and reads it back. That round-trip is the real prefill
+         * attention cost; the GEMM datatype is worth only ~1% (measured
+         * 2026-08-05). Carrying the mask here lets the fused online-softmax
+         * path serve the masked case and never materialise scores at all.
+         * Pure bandwidth win: no precision is traded. */
+        const float *comp_mask,
+        uint32_t use_comp_mask) {
     /* EMUL: see the emulation block above. OFF is the shipped path. */
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
@@ -1523,6 +1534,20 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
                 score = __shfl_sync(0xffffffffu, score, 0);
+
+                /* Compressed rows carry the additive mask; a masked entry goes
+                 * to -inf, which the online softmax absorbs as a zero-weight
+                 * row (expf(-inf - m) == 0). Safe because row 0 is always a RAW
+                 * row -- raw_count >= 1 -- so max_s is finite before any comp
+                 * row folds in and old_scale never evaluates expf(-inf + inf).
+                 * Mirrors attention_prefill_mixed_softmax_kernel exactly: same
+                 * index, same -1.0e20f cutoff, mask added AFTER the scale. */
+                const uint32_t sr_i = row0 + rr;
+                if (use_comp_mask && sr_i >= raw_count) {
+                    const uint32_t c_i = sr_i - raw_count;
+                    const float add = comp_mask[(uint64_t)t * n_comp + c_i];
+                    score = add > -1.0e20f ? score + add : -INFINITY;
+                }
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -2038,7 +2063,9 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
                                     1,
                                     n_head,
                                     head_dim,
-                                    raw_f16);
+                                    raw_f16,
+                                    NULL,
+                                    0u);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -2634,7 +2661,31 @@ static int attention_prefill_mixed_launch(
     static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
     static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    /* The fused online-softmax kernel can now carry the comp mask, so the
+     * masked case no longer has to fall back to the unfused two-GEMM path that
+     * materialises the whole score matrix. Gated while it is A/B'd against
+     * that path; the fused kernel reassociates the softmax (online rescale vs
+     * batch max/sum), so it is NOT bit-identical to the GEMM path. */
+    static const int fused_comp_env = getenv("PULSAR_ATTN_FUSED_COMP") != NULL;
+    const int allow_fused = !use_comp_mask || fused_comp_env;
+    /* One-shot: which branch actually serves this workload. Guessing at this
+     * has been wrong twice; print it rather than infer it. */
+    static int mixed_path_reported = 0;
+    if (!mixed_path_reported) {
+        mixed_path_reported = 1;
+        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
+                !no_window_attn &&
+                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+        fprintf(stderr,
+                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u "
+                "quality=%d -> %s\n",
+                n_tokens, n_comp, use_comp_mask, g_quality_mode,
+                takes_window ? "FUSED window kernel"
+                             : (g_cublas_ready && !no_cublas_attn
+                                    ? "unfused cuBLAS two-GEMM"
+                                    : "generic per-token kernel"));
+    }
+    if (allow_fused && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -2649,7 +2700,9 @@ static int attention_prefill_mixed_launch(
                                     ratio,
                                     n_head,
                                     head_dim,
-                                    raw_f16);
+                                    raw_f16,
+                                    use_comp_mask ? (const float *)comp_mask->ptr : NULL,
+                                    use_comp_mask);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
