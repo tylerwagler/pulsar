@@ -1528,6 +1528,15 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
+                /* K-side emulation. A real MMA port narrows every operand, not
+                 * just Q and P, so price K too -- otherwise the estimate is a
+                 * floor of a floor. k0..k3 double as V here (MLA shares the
+                 * latent), so this narrows the PV operand as well, which is
+                 * what an MMA value stage would do. */
+                emul_round_q4<EMUL>(k0);
+                emul_round_q4<EMUL>(k1);
+                emul_round_q4<EMUL>(k2);
+                emul_round_q4<EMUL>(k3);
                 float score = dot4_f32(q0, k0) +
                               dot4_f32(q1, k1) +
                               dot4_f32(q2, k2) +
