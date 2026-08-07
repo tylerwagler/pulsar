@@ -3231,9 +3231,13 @@ static int routed_moe_try_mmq_gate_up(
         uint32_t n_expert,
         uint32_t n_tokens,
         float clamp) {
-    /* raw IQ2_XXS (16) only for now; the SoA twin (42) needs a load-time
-     * repack into the MMQ block stream -- plan 41b step 3, not wired yet. */
-    if (gate_type != 16u) return 0;
+    /* 16 = raw IQ2_XXS block stream (aligned lazily via the cache below).
+     * 43 = IQ2_XXS_MMQ, already stored aligned IN THE GGUF -- no cache, no
+     *      repack, no budget, and every tensor gets the fast path instead of
+     *      whichever ~58 won a 22.9 GiB cache.
+     * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
+    const int gate_prealigned = (gate_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
+    if (gate_type != 16u && !gate_prealigned) return 0;
     /* One-shot: the adapter allocates its persistent q8_1 scratch here.  Without
      * it every call falls back to per-call async allocation, which cost 6x
      * (78 vs 477 t/s) the first time this was wired.  One-shot, not per-token. */
@@ -3245,7 +3249,10 @@ static int routed_moe_try_mmq_gate_up(
         fprintf(stderr, "pulsar: MMQ routed gate/up %s\n", mmq_ready ? "ready" : "unavailable");
     }
     if (!mmq_ready) return 0;
-    if (!ds4_mmq_should_use((int)gate_type, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
+    /* should_use takes a GGML type; both 16 and our 43 are IQ2_XXS data, and 43
+     * is not a ggml type at all -- passing it through returned false and
+     * silently declined every pre-aligned layer. */
+    if (!ds4_mmq_should_use(16, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
     /* Aligned-artifact cache.  block_iq2_xxs is 66 B with qs[] at offset 2, so a
      * raw stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
@@ -3256,8 +3263,14 @@ static int routed_moe_try_mmq_gate_up(
      * We cannot hold an aligned copy of every IQ2 tensor (30 layers x 3 x
      * 0.39 GiB ~ 35 GB on top of an 86 GB model in 121 GB), so cache what fits
      * under a budget and leave the rest on the raw path. */
-    const void *gate_a = mmq_aligned_for(gate_w, expert_in_dim, expert_mid_dim, n_total_expert);
-    const void *up_a = gate_a ? mmq_aligned_for(up_w, expert_in_dim, expert_mid_dim, n_total_expert) : NULL;
+    const void *gate_a, *up_a;
+    if (gate_prealigned) {
+        gate_a = gate_w;   /* the gguf already holds the aligned layout */
+        up_a = up_w;
+    } else {
+        gate_a = mmq_aligned_for(gate_w, expert_in_dim, expert_mid_dim, n_total_expert);
+        up_a = gate_a ? mmq_aligned_for(up_w, expert_in_dim, expert_mid_dim, n_total_expert) : NULL;
+    }
 
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
     float *up_raw = mid_out;          /* folded in place below */
@@ -3304,9 +3317,20 @@ static int routed_moe_try_mmq_down(
         uint32_t out_dim,
         uint32_t n_total_expert,
         uint64_t pairs) {
-    if (down_type != 16u) return 0;
+    const int down_prealigned = (down_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
+    if (down_type != 16u && !down_prealigned) return 0;
     if (pairs > (uint64_t)INT32_MAX) return 0;
-    if (!ds4_mmq_should_use((int)down_type, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
+     * runtime cache could never afford -- letting down compete for a 22.9 GiB
+     * budget just starved late layers of gate/up (measured 566.46 vs 590.77).
+     * With the layout on disk there is no budget to compete for. */
+    if (down_prealigned) {
+        return ds4_mmq_iq2_xxs_moe_soa(down_w, mid_f32, selected_ptr, down_out,
+                                       (int)out_dim, (int)expert_mid_dim,
+                                       (int)pairs, (int)n_total_expert, 1,
+                                       cudaStreamPerThread) == 0;
+    }
     /* DOWN DELIBERATELY STAYS ON RAW while the aligned cache is capacity-bound.
      * ds4_mmq_iq2_xxs_moe_soa (added to the vendored adapter, upstream has only
      * q2_K single-soa and iq2 pair-soa) works and gives down the same 2.40x --
@@ -3386,8 +3410,17 @@ static int routed_moe_launch(
      * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
     static int fp4_tiled = -1;
     if (fp4_tiled < 0) { const char *e = getenv("PULSAR_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
-    if (gate_type != 16u && !gate_soa && !gate_q2k && !gate_mxfp4) return 0;
-    if (down_type != 10u && !down_iq2 && !down_mxfp4) return 0;
+    /* Type 43 (IQ2_XXS_MMQ, aligned in the gguf) is MMQ-only: the dp4a readers
+     * cannot parse that layout, so it must reach the MMQ arms below and must
+     * NOT fall through to a dp4a kernel.  Admit it here; the MMQ arms claim it,
+     * and if MMQ is unavailable we fail closed rather than misread the bytes. */
+    const int gate_mmq43 = (gate_type == 43u);
+    const int down_mmq43 = (down_type == 43u);
+    if (gate_type != 16u && !gate_soa && !gate_q2k && !gate_mxfp4 && !gate_mmq43) return 0;
+    if (down_type != 10u && !down_iq2 && !down_mxfp4 && !down_mmq43) return 0;
+#ifndef PULSAR_HAVE_MMQ
+    if (gate_mmq43 || down_mmq43) return 0;   /* no MMQ build -> unreadable */
+#endif
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -3559,6 +3592,11 @@ static int routed_moe_launch(
                 (const float *)weights->ptr, gate_type,
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
+        }
+        /* fail closed: the dp4a chain below cannot read the aligned layout */
+        if (ok && gate_mmq43 && !mmq_done) {
+            fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined; refusing dp4a fallback\n");
+            ok = 0;
         }
 #endif
         /* mmq_done means `mid` is already produced -- skip the ENTIRE gate/up
@@ -3769,6 +3807,10 @@ static int routed_moe_launch(
                                                     n_total_expert,
                                                     (uint64_t)n_tokens * n_expert);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
+        }
+        if (ok && down_mmq43 && !mmq_down_done) {
+            fprintf(stderr, "pulsar: type-43 down but MMQ declined; refusing dp4a fallback\n");
+            ok = 0;
         }
 #endif
         if (ok && !mmq_down_done) {

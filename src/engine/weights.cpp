@@ -170,6 +170,7 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == PULSAR_TENSOR_IQ2_XXS ||
            type == PULSAR_TENSOR_IQ2_XXS_SOA ||
+           type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
            type == PULSAR_TENSOR_Q2_K ||
            type == PULSAR_TENSOR_FP4_E2M1 ||
            type == PULSAR_TENSOR_CUTLASS_MXFP4;
@@ -186,6 +187,12 @@ static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
      * into the existing offset machinery unchanged.  Only the KERNEL's read
      * pattern differs (see dev_iq2_soa_planes). */
     case PULSAR_TENSOR_IQ2_XXS_SOA: return sizeof(block_iq2_xxs);
+    /* IQ2_XXS_MMQ (43) is likewise a pure permutation of type 16 -- llama.cpp
+     * MMQ's aligned-SoA layout rather than our Phase-0 one.  Verified byte-exact
+     * both ways over all 91 converted tensors, and the artifact is the SAME SIZE
+     * as raw (415,236,096 at the v5mx shape), so the offset machinery is
+     * untouched.  Only the kernel's read pattern differs. */
+    case PULSAR_TENSOR_IQ2_XXS_MMQ: return sizeof(block_iq2_xxs);
     case PULSAR_TENSOR_Q2_K:    return sizeof(block_q2_K);
     /* MXFP4: 17 bytes / 32 vals = [1 E8M0 scale][16 bytes = 32x E2M1]. Per-QK_K
      * (256 vals) = 8 sub-blocks * 17 = 136 bytes, matching the other per-QK_K sizes. */
@@ -290,10 +297,12 @@ static void tensor_expect_routed_expert_combo(
      * behaviour, since the fused gate+up kernels read one layout. */
     const bool gate_dp4a = gate->type == PULSAR_TENSOR_IQ2_XXS ||
                            gate->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
+                           gate->type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
                            gate->type == PULSAR_TENSOR_Q2_K ||
                            gate->type == PULSAR_TENSOR_FP4_E2M1;
     const bool down_dp4a = down->type == PULSAR_TENSOR_IQ2_XXS ||
                            down->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
+                           down->type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
                            down->type == PULSAR_TENSOR_Q2_K ||
                            down->type == PULSAR_TENSOR_FP4_E2M1;
     const bool gate_ok = gate_dp4a || gate_cut;
@@ -965,6 +974,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
      *     @2048  483.39 -> 494.30 tok/s  (+2.3%)
      *     @8192  460.00 -> 468.76 tok/s  (+1.9%) */
     case PULSAR_TENSOR_IQ2_XXS_SOA:
+    case PULSAR_TENSOR_IQ2_XXS_MMQ:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
     case PULSAR_TENSOR_FP8_E4M3:
