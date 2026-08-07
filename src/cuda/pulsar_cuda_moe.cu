@@ -1,4 +1,7 @@
 #include "pulsar_cuda_internal.h"
+#ifdef PULSAR_HAVE_MMQ
+#include "mmq/ds4_mmq.h"   /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
+#endif
 
 #include "pulsar_iq2_tables_cuda.inc"
 
@@ -3064,6 +3067,106 @@ static int routed_moe_launch_mixed40(
 
 
 
+#ifdef PULSAR_HAVE_MMQ
+/* ---- MMQ (llama.cpp INT8 tensor-core) routed gate/up -----------------------
+ * Plan 41b.  Measured on GB10, same box/model/prompt/metric: the shipped dp4a
+ * moe_gate_up_mid_expert_tile8_rowspan_kernel costs 73.20 ms/layer at a
+ * 4096-token prefill; Palaferri's stock mul_mat_q<IQ2_XXS> costs 29.99 ms/layer
+ * (2.44x) and Entrpi's bespoke fused D2R 18.01 ms (4.07x).  This routes our
+ * gate/up through the vendored stock MMQ.
+ *
+ * NOT BIT-EXACT vs the dp4a path by construction: the integer dots are exact
+ * but the per-block float scale-fold ORDER differs.  Gated at shape time only
+ * (never per token/layer, see [[no-hot-path-flags]]).
+ *
+ * MMQ emits RAW gate and up; our dp4a kernel fuses clamp + SwiGLU + the routing
+ * weight into mid.  moe_mmq_swiglu_fold_kernel reproduces that tail exactly:
+ *   off  = pair * mid_dim + row,  pair = tok * n_expert + slot
+ *   so weights[tok * n_expert + slot] == weights[pair].
+ */
+/* The vendored adapter references this ds4-engine hook from its q8-fold vec
+ * (decode) path: given an activation pointer it may hand back pre-quantized
+ * canonical q8_1 codes so the caller can skip its quantize prelude.  pulsar has
+ * no such registry, and the path is single-token only (n_tokens != 1 bails
+ * before this), so prefill never reaches it.  "No fold available" satisfies the
+ * link -- the same stub Palaferri's own cuda/mmq/test TUs use. */
+extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim, const void **q81) {
+    (void)src; (void)in_dim; (void)q81;
+    return 0;
+}
+
+__global__ static void moe_mmq_swiglu_fold_kernel(
+        float *mid_out,
+        const float *gate_raw,
+        const float *up_raw,
+        const float *weights,
+        uint64_t total,
+        uint32_t expert_mid_dim,
+        float clamp) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float g = gate_raw[idx];
+    float u = up_raw[idx];
+    /* identical clamp semantics to moe_gate_up_mid_expert_tile8_rowspan_kernel */
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    const uint64_t pair = idx / (uint64_t)expert_mid_dim;
+    mid_out[idx] = (g / (1.0f + expf(-g))) * u * weights[pair];
+}
+
+/* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
+static int routed_moe_try_mmq_gate_up(
+        pulsar_gpu_tensor *mid,
+        pulsar_gpu_tensor *up_scratch,
+        const char *gate_w,
+        const char *up_w,
+        const float *x_f32,
+        const int32_t *selected_ptr,
+        const float *weights_ptr,
+        uint32_t gate_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp) {
+    /* raw IQ2_XXS (16) only for now; the SoA twin (42) needs a load-time
+     * repack into the MMQ block stream -- plan 41b step 3, not wired yet. */
+    if (gate_type != 16u) return 0;
+    /* One-shot: the adapter allocates its persistent q8_1 scratch here.  Without
+     * it every call falls back to per-call async allocation, which cost 6x
+     * (78 vs 477 t/s) the first time this was wired.  One-shot, not per-token. */
+    static int mmq_ready = -1;
+    if (mmq_ready < 0) {
+        int dev = 0;
+        (void)cudaGetDevice(&dev);
+        mmq_ready = (ds4_mmq_init(dev) == 0) ? 1 : 0;
+        fprintf(stderr, "pulsar: MMQ routed gate/up %s\n", mmq_ready ? "ready" : "unavailable");
+    }
+    if (!mmq_ready) return 0;
+    if (!ds4_mmq_should_use((int)gate_type, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
+
+    float *gate_raw = (float *)up_scratch->ptr;   /* both are n_tokens*n_expert*mid f32 */
+    float *up_raw = (float *)mid->ptr;            /* folded in place below */
+    if (ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
+                                 gate_raw, up_raw,
+                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                 (int)n_tokens, (int)n_total_expert,
+                                 (int)n_expert, cudaStreamPerThread) != 0) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
+    const uint32_t threads = 256u;
+    const uint64_t blocks = (total + threads - 1u) / threads;
+    moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
+        (float *)mid->ptr, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+    return 1;
+}
+#endif /* PULSAR_HAVE_MMQ */
+
 static int routed_moe_launch(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *gate,
@@ -3291,7 +3394,22 @@ static int routed_moe_launch(
          * remains enforced is the binder's rule that gate and up share a type:
          * the fused gate+up kernels read ONE layout, so a half-repacked pair is
          * rejected at load rather than here. */
-        if (ok) {
+        int mmq_done = 0;
+#ifdef PULSAR_HAVE_MMQ
+        /* Shape-time decision, evaluated once per launch -- not per token. */
+        if (ok && sorted_pairs && !gate_mxfp4 && !gate_q2k && use_big_batch) {
+            mmq_done = routed_moe_try_mmq_gate_up(
+                mid, up, gate_w, up_w, (const float *)x->ptr, selected_ptr,
+                (const float *)weights->ptr, gate_type,
+                expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
+            if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
+        }
+#endif
+        /* mmq_done means `mid` is already produced -- skip the ENTIRE gate/up
+         * if/else chain.  Gating only its first branch let control fall through
+         * to the qwarp32 fallback, which then recomputed gate/up on top of MMQ:
+         * measured 27 x 1649 ms = 85.3% of GPU time, a 6x net LOSS. */
+        if (ok && !mmq_done) {
             if (sorted_pairs && !gate_mxfp4) {
                 if (use_big_batch) {
                     dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);

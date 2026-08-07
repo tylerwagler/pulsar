@@ -63,8 +63,16 @@ SERVER_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(SERVER_SRCS)))
 CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
 CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
+# Vendored llama.cpp MMQ (plan 41b, see src/cuda/mmq/VENDOR.md).  The wildcard is
+# empty unless the tree has actually been vendored, in which case PULSAR_HAVE_MMQ
+# lights up the routed gate/up MMQ arm in pulsar_cuda_moe.cu.  No tree -> stock build.
+MMQ_SRCS = $(wildcard src/cuda/mmq/*.cu)
+MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
+ifneq ($(strip $(MMQ_SRCS)),)
+MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
+endif
 LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS)
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -363,7 +371,13 @@ tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/spec_sampling_gate.cpp
 
 src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc
-	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) $(MMQ_CPPFLAGS) -Isrc -c -o $@ $<
+
+# Vendored llama.cpp MMQ TUs: templated C++17, own include root, and they do not
+# depend on the pulsar CUDA headers -- keep them off the generic src/cuda rule.
+src/cuda/mmq/%.o: src/cuda/mmq/%.cu
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda \
+		-diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda/mmq -c -o $@ $<
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
