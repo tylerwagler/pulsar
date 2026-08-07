@@ -61,9 +61,16 @@ static const gguf_type_info gguf_types[] = {
      * permutation, so it shares type 16's {256, 66} accounting exactly and
      * loads/mmaps through the generic path.  See PULSAR_TENSOR_IQ2_XXS_SOA. */
     /*42*/ {"iq2_xxs_soa", 256, 66},
+    /* IQ2_XXS_MMQ (pre-stored MMQ aligned-SoA IQ2_XXS): the same 66 B/block
+     * content again, permuted into the layout the vendored MMQ kernels read
+     * ([d plane][pad to 64B][64B-aligned code plane]).  A DIFFERENT
+     * permutation from type 42, but likewise pure, so it also shares type
+     * 16's {256, 66} accounting and loads/mmaps through the generic path.
+     * See PULSAR_TENSOR_IQ2_XXS_MMQ. */
+    /*43*/ {"iq2_xxs_mmq", 256, 66},
 };
 
-static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 43,
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 44,
               "gguf_types rows must line up with GGUF type ids");
 
 
