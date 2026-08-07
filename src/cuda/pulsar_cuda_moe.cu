@@ -3307,6 +3307,14 @@ static int routed_moe_try_mmq_down(
     if (down_type != 16u) return 0;
     if (pairs > (uint64_t)INT32_MAX) return 0;
     if (!ds4_mmq_should_use((int)down_type, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    /* DOWN DELIBERATELY STAYS ON RAW while the aligned cache is capacity-bound.
+     * ds4_mmq_iq2_xxs_moe_soa (added to the vendored adapter, upstream has only
+     * q2_K single-soa and iq2 pair-soa) works and gives down the same 2.40x --
+     * but the cache holds ~58 tensors against 90 (30 layers x gate/up/down), so
+     * letting down compete just starves late layers of gate/up alignment.
+     * MEASURED: down-aligned 566.46 vs gate/up-only 588.77 @4k, a net LOSS.
+     * Re-enable the moment the gguf stores IQ2 aligned (byte-identical size, so
+     * the cache disappears and all 90 tensors are aligned for free). */
     return ds4_mmq_iq2_xxs_moe(down_w, mid_f32, selected_ptr, down_out,
                                (int)out_dim, (int)expert_mid_dim,
                                (int)pairs, (int)n_total_expert, 1,
