@@ -3056,7 +3056,17 @@ static int routed_moe_launch(
          * behaviour (both-mxfp4 skips sorting and takes qwarp32). */
         const uint32_t use_sorted_pairs =
             n_tokens > 1u && (fp4_tiled || !(gate_mxfp4 && down_mxfp4));
-        const uint32_t use_big_batch = use_sorted_pairs && n_tokens >= 128u;
+        /* 128 is a throughput heuristic for type 16, which can always fall back
+         * to the dp4a chain below it.  Type 43 cannot -- the aligned layout is
+         * unreadable there, so the arm fails closed -- and the gate/up _vec arm
+         * only serves n_tokens==1.  That left 2..127 with no reader at all: any
+         * short prompt through the CLI is one small chunk and died with
+         * "type-43 gate/up but MMQ declined".  For 43 the batch arm is the only
+         * correct reader at n_tokens>1, so admit it at every such n.  n_tokens==1
+         * is unaffected: use_sorted_pairs already requires n_tokens > 1, so
+         * decode still takes the _vec arms. */
+        const uint32_t use_big_batch = use_sorted_pairs &&
+            (n_tokens >= 128u || gate_type == 43u || down_type == 43u);
         const uint32_t use_decode_lut_gate =
             gate_type == 16u && n_tokens == 1u && xq_blocks <= 16u;
         const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
