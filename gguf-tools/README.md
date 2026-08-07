@@ -80,6 +80,69 @@ Any engine at or after v0.4.0 loads either layout; older builds reject type 42.
 so repacking `ffn_gate_exps` without `ffn_up_exps` produces a GGUF the binder
 rejects at load.  Repack the pair together or not at all; `down` is independent.
 
+## Repack IQ2_XXS To IQ2_XXS_MMQ (type 43)
+
+Type 43 is a SECOND load-aligned twin of `IQ2_XXS`, and it is **not** type 42.
+Both hold the same 66 B/block content, but they are different permutations with
+different readers:
+
+| type | layout | reader |
+|------|--------|--------|
+| 42 `iq2_xxs_soa` | `q` plane first (64 B/block), then `d` plane (2 B/block), no padding | pulsar's own dp4a MoE kernels |
+| 43 `iq2_xxs_mmq` | `d` plane first (2 B/block), pad to 64 B, then a 64 B-aligned `q` plane | the vendored llama.cpp MMQ kernels |
+
+Type 43 is the layout `ds4_repack_iq2_aligned_device()` builds, so storing it in
+the GGUF is what lets MMQ read routed experts with full-width aligned loads
+instead of `LDG.E.U16` pairs.  Microbenched at the production shape (K=4096,
+M=2048, 192 experts, 6 used, 4096 tokens): raw blocks 44.704 vs aligned SoA
+18.654 ms/pair-call, a 2.40x.
+
+The artifact is exactly the same size as the raw stream
+(`align_up(nblk*2,64) + nblk*64 == nblk*66` whenever `nblk % 32 == 0`, which
+holds for every shipped expert stack), so the repack costs **zero** model
+growth and leaves every tensor's data offset untouched.  That is what replaces
+the runtime repack cache, which was capacity-bound (~22.9 GiB budget against
+~35 GB to align all 90+ stacks) and made the first prefill frontier pay for the
+repack.
+
+```sh
+python3 gguf-tools/repack_iq2_mmq.py in.gguf out.gguf
+python3 gguf-tools/verify_iq2_mmq_model.py in.gguf out.gguf manifest.txt
+```
+
+`repack_iq2_mmq.py` converts every 3-D `IQ2_XXS` routed-expert tensor by
+default; `--match` narrows it the same way `repack_iq2_soa.py` does, and gate
+and up must still be converted together.  It asserts per tensor that the
+aligned size equals the raw size and refuses to grow the file — that assertion
+is the load-bearing check that the dims were read correctly.
+
+`verify_iq2_mmq_model.py` checks the header (same size, same offsets, only
+16 -> 43) and byte-compares every region the repack was not supposed to touch,
+then writes a manifest of the converted spans.  The GPU-side verifiers, which
+need `nvcc` and the vendored adapter in `src/cuda/mmq`:
+
+```sh
+verify_iq2_mmq_model.cu        # per span: device-repack(raw) == shipped, and
+                               # derepack(shipped) == raw.  Run with the manifest.
+verify_iq2_mmq_roundtrip.cu    # same two directions on one extracted tensor
+                               # (pair it with extract_iq2_mmq_tensor.py)
+verify_iq2_mmq_kernel_equiv.cu # do the SoA kernels return the same f32 as the
+                               # raw-block kernels on the same weights?
+```
+
+**Measured caveat, and it is a real one.**  `verify_iq2_mmq_kernel_equiv.cu`
+shows that on this adapter `ds4_mmq_iq2_xxs_moe_soa(aligned)` is *bit-identical*
+to `ds4_mmq_iq2_xxs_moe(raw)` and to `ds4_mmq_iq2_xxs_moe_pair(raw)`, but
+`ds4_mmq_iq2_xxs_moe_pair_soa(aligned)` is **not** — it differs from all three
+by up to 1.43e-06 absolute on ~74% of outputs at the production shape.  Since
+the single-tensor SoA kernel reproduces the raw answer exactly from the *same*
+aligned bytes, the artifact is correct and the gap lives in `moe_pair_soa`'s own
+accumulation schedule.  Note what that implies for the runtime cache it
+replaces: that cache routed whichever gate/up tensors happened to fit through
+`moe_pair_soa` and the rest through `moe_pair`, so the current build's logits
+already depend on which tensors won the cache.  Pre-storing type 43 makes the
+choice uniform and deterministic instead.
+
 ## Generate Q2 And Q4 GGUFs
 
 The template GGUF supplies metadata, tokenizer, tensor order, and logical

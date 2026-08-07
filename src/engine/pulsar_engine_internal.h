@@ -392,6 +392,33 @@ enum {
      * is to FP8_E4M3 (38).  Layout spec: ds4q_iq2_xxs_soa_repack() in
      * gguf-tools/quants_common.c; device reader: dev_iq2_soa_planes(). */
     PULSAR_TENSOR_IQ2_XXS_SOA = 42,
+    /* Pre-stored MMQ *aligned-SoA* twin of IQ2_XXS (16).  Same 66 B/block
+     * content as type 16 and type 42, but permuted into the layout the
+     * vendored llama.cpp MMQ adapter's kernels read directly:
+     *
+     *   [ __half d[nblk] ][ pad to 64B ][ uint2 qs[nblk*8] ]
+     *
+     * i.e. the d plane FIRST and the code plane 64B-aligned.  This is NOT the
+     * same permutation as PULSAR_TENSOR_IQ2_XXS_SOA (42), which puts the q
+     * plane first with no padding -- the two layouts are not interchangeable
+     * and each has its own readers.  Byte size, dims and row size are
+     * UNCHANGED (align_up(nblk*2,64) + nblk*64 == nblk*66 whenever
+     * nblk % 32 == 0, which holds for every shipped expert stack), so it
+     * shares type 16's {256, 66} accounting and mmaps through the generic
+     * path, exactly as 42 and MXFP8_LT (41) do.
+     *
+     * Producer: gguf-tools/repack_iq2_mmq.py.  Layout spec and the device
+     * twin that must stay byte-identical to it:
+     * ds4_repack_iq2_aligned_device() in src/cuda/mmq/ds4_repack.cu; size
+     * oracle ds4_mmq_iq2_xxs_aligned_bytes() in src/cuda/mmq/ds4_mmq.h.
+     * Consumers: ds4_mmq_iq2_xxs_moe_pair_soa (gate/up) and
+     * ds4_mmq_iq2_xxs_moe_soa (down).
+     *
+     * Storing this layout in the GGUF replaces the runtime repack cache: that
+     * cache is capacity-bound (~22.9 GiB budget vs ~35 GB to hold all 90+ IQ2
+     * stacks), so it covered only part of the model and made the first prefill
+     * frontier absorb the repack.  Pre-storing costs zero model growth. */
+    PULSAR_TENSOR_IQ2_XXS_MMQ = 43,
 };
 
 typedef struct {
