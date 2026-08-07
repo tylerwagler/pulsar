@@ -39,7 +39,27 @@ using LayoutD    = cutlass::layout::RowMajor;
 constexpr int AlignA = 32, AlignB = 32;
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
 constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
-using TileShape    = Shape<_128,_128,_128>;
+/* Occupancy sweep knob (2026-08-07).  ncu says both CUTLASS MXFP4 kernels run
+ * 168 registers x 384 threads = 64512 regs/block against 65536 per SM, i.e.
+ * exactly ONE block resides and occupancy pins at 25% -- the same cliff that
+ * cost attention 1.42x until launch_bounds fixed it.  Here the register count
+ * is set by the f32 accumulator, which is TileM x TileN: 128x128 f32 over 384
+ * threads is ~43 regs of accumulator before anything else.
+ * Shrinking the tile trades compute efficiency (more tiles, more weight
+ * re-reads) for residency, so it must be MEASURED, not assumed.
+ * Override: -DPULSAR_MXFP4_TILE_M=64 etc. */
+#ifndef PULSAR_MXFP4_TILE_M
+#define PULSAR_MXFP4_TILE_M 128
+#endif
+#ifndef PULSAR_MXFP4_TILE_N
+#define PULSAR_MXFP4_TILE_N 128
+#endif
+#ifndef PULSAR_MXFP4_TILE_K
+#define PULSAR_MXFP4_TILE_K 128
+#endif
+using TileShape    = Shape<cute::Int<PULSAR_MXFP4_TILE_M>,
+                           cute::Int<PULSAR_MXFP4_TILE_N>,
+                           cute::Int<PULSAR_MXFP4_TILE_K>>;
 using ClusterShape = Shape<_1,_1,_1>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
