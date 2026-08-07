@@ -2733,6 +2733,15 @@ __global__ static void moe_padded_gather_pairflat_kernel(
     if (threadIdx.x == 0) padded_pair[R] = (int32_t)pair;
 }
 
+#ifdef PULSAR_HAVE_MMQ
+/* defined below, next to the gate/up arm */
+static int routed_moe_try_mmq_down(float *down_out, const float *mid_f32,
+                                   const char *down_w, const int32_t *selected_ptr,
+                                   uint32_t down_type, uint32_t expert_mid_dim,
+                                   uint32_t out_dim, uint32_t n_total_expert,
+                                   uint64_t pairs);
+#endif
+
 static int routed_moe_launch_mixed40(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down,
@@ -2956,14 +2965,26 @@ static int routed_moe_launch_mixed40(
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
         }
-        /* Phase 2: Q8_K-quantize mid_flat -> midq, then dp4a down per pair. */
+        /* Phase 2: Q8_K-quantize mid_flat -> midq, then dp4a down per pair.
+         * MMQ takes mid_flat as f32 directly, so when it handles down the whole
+         * midq quantize is skipped.  These mixed layers (CUTLASS mxfp4 gate/up +
+         * IQ2 down) were the last dp4a holdouts: 4 x 62.9 ms measured. */
         cuda_block_q8_K *midq = (cuda_block_q8_K *)(scratch + midq_o);
-        if (ok) {
+        int mmq_down_done = 0;
+#ifdef PULSAR_HAVE_MMQ
+        if (ok && !down_soa) {
+            mmq_down_done = routed_moe_try_mmq_down(down_flat, mid_flat, down_w, selected_ptr,
+                                                    down_type, expert_mid_dim, out_dim,
+                                                    n_total_expert, (uint64_t)pair_count);
+            if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "mixed40A mmq down");
+        }
+#endif
+        if (ok && !mmq_down_done) {
             dim3 mqg(midq_blocks, pair_count, 1);
             q8_K_quantize_kernel<<<mqg, 256>>>(midq, mid_flat, expert_mid_dim, pair_count);
             ok = cuda_ok(cudaGetLastError(), "mixed40A midq");
         }
-        if (ok) {
+        if (ok && !mmq_down_done) {
             if (tiled_down) {
                 dim3 tgrid((out_dim + 2047u) / 2048u, (uint32_t)tile16_cap, 1);
                 if (down_soa)
@@ -2996,6 +3017,11 @@ static int routed_moe_launch_mixed40(
         dim3 xqg(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xqg, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "mixed40B xq");
+        /* TODO(plan 41b): mixed40's IQ2 gate/up is the last dp4a holdout
+         * (3 x 75.4 ms = 226 ms, ~3% of prefill).  MMQ needs a second
+         * pair-sized f32 buffer for the raw gate, and this arena has no spare
+         * region of that size (midq is ~1.14 B/elem, we need 4).  Wiring it
+         * means widening the scratch sizing above -- deferred, not forgotten. */
         if (ok) {
             if (tiled_gateup) {
                 dim3 tgrid((expert_mid_dim + 1023u) / 1024u, (uint32_t)tile8_cap, 1);
@@ -3180,22 +3206,19 @@ static int routed_moe_try_mmq_gate_up(
  * the mid -> midq q8_K quantize entirely (MMQ does its own q8_1).
  */
 static int routed_moe_try_mmq_down(
-        pulsar_gpu_tensor *down_out,
-        const pulsar_gpu_tensor *mid,
+        float *down_out,
+        const float *mid_f32,
         const char *down_w,
         const int32_t *selected_ptr,
         uint32_t down_type,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t n_tokens) {
+        uint64_t pairs) {
     if (down_type != 16u) return 0;
-    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
     if (pairs > (uint64_t)INT32_MAX) return 0;
     if (!ds4_mmq_should_use((int)down_type, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
-    return ds4_mmq_iq2_xxs_moe(down_w, (const float *)mid->ptr, selected_ptr,
-                               (float *)down_out->ptr,
+    return ds4_mmq_iq2_xxs_moe(down_w, mid_f32, selected_ptr, down_out,
                                (int)out_dim, (int)expert_mid_dim,
                                (int)pairs, (int)n_total_expert, 1,
                                cudaStreamPerThread) == 0;
@@ -3641,9 +3664,12 @@ static int routed_moe_launch(
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
          * q8_1, so the whole mid -> midq q8_K quantize below is skipped too. */
         if (ok && sorted_pairs && !down_mxfp4 && !down_soa && use_big_batch && !use_direct_down_sum6) {
-            mmq_down_done = routed_moe_try_mmq_down(down, mid, down_w, selected_ptr,
+            mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
+                                                    (const float *)mid->ptr,
+                                                    down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
-                                                    n_total_expert, n_expert, n_tokens);
+                                                    n_total_expert,
+                                                    (uint64_t)n_tokens * n_expert);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
         }
 #endif
