@@ -2765,6 +2765,13 @@ static int routed_moe_launch_mixed40(
     const int caseA = (gate_type == 40u);       /* gate/up type-40, down dp4a */
     const int caseB = (down_type == 40u);       /* gate/up dp4a, down type-40 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
+    /* Q2_K (type 10) is no longer supported.  routed_moe_launch rejects it, but
+     * mixed40 only requires that ONE side be type-40, so a type-40 gate paired
+     * with a Q2_K down still reached the dp4a arms below.  Reject at the door.
+     * NOTE the down dispatch below had a BARE `else` falling through to
+     * GateUpDotQ2K -- i.e. any down type that was neither SoA nor type-16 was
+     * READ AS Q2_K.  That is the IQ2_XXS_SOA silent-misread shape exactly. */
+    if (gate_type == 10u || down_type == 10u) return 0;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
