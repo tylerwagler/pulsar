@@ -3215,6 +3215,59 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
     mid_out[idx] = (g / (1.0f + expf(-g))) * u * weights[pair];
 }
 
+/* DECODE arm for pre-aligned (type-43) tensors.
+ * The big-batch arm below needs n_tokens >= 128; at decode n_tokens is 1, so
+ * without this the dp4a qwarp32/LUT kernels would have to read the aligned
+ * layout -- which they cannot -- and the fail-closed guard aborts the run
+ * ("cuda decode failed").  ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec folds
+ * clamp + SwiGLU + router weight and writes mid[slot*M + row], which is exactly
+ * our mid layout (pair == slot when n_tokens == 1), so no fold kernel is needed
+ * here.  Returns 1 when it produced `mid`. */
+static int routed_moe_try_mmq_gate_up_vec(
+        float *mid_out,
+        const char *gate_w,
+        const char *up_w,
+        const float *x_f32,
+        const int32_t *selected_ptr,
+        const float *weights_ptr,
+        uint32_t gate_type,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp) {
+    if (gate_type != 43u) return 0;          /* aligned artifacts only */
+    if (n_tokens != 1u) return 0;            /* _vec entries are n_tokens==1 */
+    return ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+               gate_w, up_w, x_f32, selected_ptr, weights_ptr, mid_out,
+               (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
+               (int)n_total_expert, (int)n_expert, clamp,
+               cudaStreamPerThread) == 0;
+}
+
+/* DECODE arm for the routed down.  Same pairs reshape as the prefill arm: one
+ * row per (token,slot), each using exactly one expert.  Output stays per-pair
+ * so the existing fixed-order moe_sum_kernel still does the reduction. */
+static int routed_moe_try_mmq_down_vec(
+        float *down_out,
+        const float *mid_f32,
+        const char *down_w,
+        const int32_t *selected_ptr,
+        uint32_t down_type,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint64_t pairs) {
+    if (down_type != 43u) return 0;
+    if (pairs == 0 || pairs > (uint64_t)INT32_MAX) return 0;
+    return ds4_mmq_iq2_xxs_aligned_moe_vec(
+               down_w, mid_f32, selected_ptr, down_out,
+               (int)out_dim, (int)expert_mid_dim,
+               (int)pairs, (int)n_total_expert, 1,
+               cudaStreamPerThread) == 0;
+}
+
 /* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
 static int routed_moe_try_mmq_gate_up(
         float *mid_out,
@@ -3593,6 +3646,14 @@ static int routed_moe_launch(
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
         }
+        /* decode: n_tokens < 128 never reaches the big-batch arm above */
+        if (ok && !mmq_done && gate_type == 43u) {
+            mmq_done = routed_moe_try_mmq_gate_up_vec(
+                (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, selected_ptr,
+                (const float *)weights->ptr, gate_type,
+                expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
+            if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up vec");
+        }
         /* fail closed: the dp4a chain below cannot read the aligned layout */
         if (ok && gate_mmq43 && !mmq_done) {
             fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined; refusing dp4a fallback\n");
@@ -3808,6 +3869,19 @@ static int routed_moe_launch(
                                                     (uint64_t)n_tokens * n_expert);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
         }
+        /* decode: below the big-batch threshold, and possibly on the
+         * direct-sum6 path.  The _vec entry writes PER-PAIR, so whenever it
+         * runs the fixed-order moe_sum_kernel must run too -- see the sum gate
+         * below, which is widened by mmq_down_done for exactly this case. */
+        if (ok && !mmq_down_done && down_mmq43 && !down_mxfp4) {
+            mmq_down_done = routed_moe_try_mmq_down_vec((float *)down->ptr,
+                                                        (const float *)mid->ptr,
+                                                        down_w, selected_ptr,
+                                                        down_type, expert_mid_dim, out_dim,
+                                                        n_total_expert,
+                                                        (uint64_t)n_tokens * n_expert);
+            if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down vec");
+        }
         if (ok && down_mmq43 && !mmq_down_done) {
             fprintf(stderr, "pulsar: type-43 down but MMQ declined; refusing dp4a fallback\n");
             ok = 0;
@@ -3970,7 +4044,11 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        if (ok && !use_direct_down_sum6) {
+        /* mmq_down_done means the MMQ arm wrote PER-PAIR results, so the
+         * reduction is still owed even on the direct-sum6 decode path (whose
+         * dp4a kernel would have summed in-kernel).  Without this the decode
+         * output would be a single slot instead of the 6-expert sum. */
+        if (ok && (!use_direct_down_sum6 || mmq_down_done)) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
