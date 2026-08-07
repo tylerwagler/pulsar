@@ -220,8 +220,6 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
-    opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
-    opt(fp, c, "--gpu-graph-test", "Run the GPU-resident graph self-token stage diagnostic.");
     fputc('\n', fp);
 }
 

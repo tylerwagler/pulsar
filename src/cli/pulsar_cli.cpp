@@ -47,8 +47,6 @@ typedef struct {
     int imatrix_max_prompts;
     int imatrix_max_tokens;
     pulsar_think_mode think_mode;
-    bool head_test;
-    bool gpu_graph_test;
 } cli_generation_options;
 
 typedef struct {
@@ -1000,11 +998,6 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
     build_prompt(engine, &cfg->gen, &prompt);
 
     int rc = 0;
-    if (cfg->gen.gpu_graph_test) {
-        rc = pulsar_engine_gpu_graph_test(engine, &prompt);
-        pulsar_tokens_free(&prompt);
-        return rc;
-    }
     if (cfg->gen.dump_logits_path) {
         rc = run_logits_dump(engine, cfg, &prompt);
         pulsar_tokens_free(&prompt);
@@ -1016,11 +1009,7 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
         return rc;
     }
 
-    const bool diagnostic = cfg->gen.dump_tokens ||
-                            cfg->gen.head_test;
-    if (cfg->gen.head_test) {
-        rc = pulsar_engine_head_test(engine, &prompt);
-    }
+    const bool diagnostic = cfg->gen.dump_tokens;
     if (cfg->gen.dump_tokens) {
         pulsar_engine_dump_tokens(engine, &prompt);
     }
@@ -1591,11 +1580,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.think_mode = PULSAR_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
-        } else if (!strcmp(arg, "--head-test")) {
-            c.gen.head_test = true;
-        } else if (!strcmp(arg, "--gpu-graph-test")) {
-            c.gen.gpu_graph_test = true;
-            c.engine.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {

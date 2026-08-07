@@ -269,8 +269,6 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens);
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens);
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
-int pulsar_engine_head_test(pulsar_engine *e, const pulsar_tokens *prompt);
-int pulsar_engine_gpu_graph_test(pulsar_engine *e, const pulsar_tokens *prompt);
 
 void pulsar_tokens_push(pulsar_tokens *tv, int token);
 void pulsar_tokens_free(pulsar_tokens *tv);

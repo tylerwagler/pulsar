@@ -1656,33 +1656,9 @@ void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t
 
 
 
-static void quantize_q8_0_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    quantize_q8_0_batch_ctx *ctx = static_cast<quantize_q8_0_batch_ctx *>(vctx);
-    for (uint64_t t = t0; t < t1; t++) {
-        quantize_q8_0_activation(ctx->x + t * ctx->in_dim,
-                                 ctx->xq + t * ctx->blocks * 32,
-                                 ctx->xscale + t * ctx->blocks,
-                                 ctx->in_dim);
-    }
-}
 
 
 
-static void quantize_q8_0_activation_batch(
-        const float *x,
-        int8_t      *xq,
-        float       *xscale,
-        uint64_t     n_tok,
-        uint64_t     in_dim) {
-    quantize_q8_0_batch_ctx ctx = {
-        .x = x,
-        .xq = xq,
-        .xscale = xscale,
-        .in_dim = in_dim,
-        .blocks = (in_dim + 31) / 32,
-    };
-    pulsar_parallel_for(n_tok, quantize_q8_0_batch_worker, &ctx);
-}
 
 
 
@@ -1698,130 +1674,18 @@ static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 
 
-static void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_pair_ctx *ctx = static_cast<matvec_q8_0_pair_ctx *>(vctx);
-
-    for (uint64_t r = r0; r < r1; r++) {
-        const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
-        const uint8_t *row1 = ctx->data1 + r * ctx->blocks * 34;
-        dot_q8_0_row_pair(row0, row1, ctx->xq, ctx->xscale, ctx->in_dim, ctx->blocks,
-                          ctx->out0 + r, ctx->out1 + r);
-    }
-}
 
 
 
-static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_grouped_ctx *ctx = static_cast<matvec_q8_0_grouped_ctx *>(vctx);
-
-    for (uint64_t idx = r0; idx < r1; idx++) {
-        const uint64_t group = idx / ctx->rank;
-        const uint64_t row_in_group = idx - group * ctx->rank;
-        const uint64_t tensor_row = group * ctx->rank + row_in_group;
-        const uint8_t *row = ctx->data + tensor_row * ctx->blocks * 34;
-        const int8_t *xq = ctx->xq + group * ctx->blocks * 32;
-        const float *xscale = ctx->xscale + group * ctx->blocks;
-        ctx->out[idx] = dot_q8_0_row(row, xq, xscale, ctx->in_dim, ctx->blocks);
-    }
-}
 
 
 
-static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_grouped_batch_ctx *ctx = static_cast<matmul_q8_0_grouped_batch_ctx *>(vctx);
-
-    for (uint64_t idx = r0; idx < r1; idx++) {
-        const uint64_t group = idx / ctx->rank;
-        const uint64_t row_in_group = idx - group * ctx->rank;
-        const uint64_t tensor_row = group * ctx->rank + row_in_group;
-        const uint8_t *row = ctx->data + tensor_row * ctx->blocks * 34;
-
-        uint64_t t = 0;
-        for (; t + 1 < ctx->n_tok; t += 2) {
-            const uint64_t xbase0 = (t * ctx->n_groups + group) * ctx->blocks;
-            const uint64_t xbase1 = ((t + 1) * ctx->n_groups + group) * ctx->blocks;
-            dot_q8_0_row_2(row,
-                           ctx->xq + xbase0 * 32,
-                           ctx->xscale + xbase0,
-                           ctx->xq + xbase1 * 32,
-                           ctx->xscale + xbase1,
-                           ctx->group_dim,
-                           ctx->blocks,
-                           ctx->out + t * ctx->n_groups * ctx->rank + group * ctx->rank + row_in_group,
-                           ctx->out + (t + 1) * ctx->n_groups * ctx->rank + group * ctx->rank + row_in_group);
-        }
-        for (; t < ctx->n_tok; t++) {
-            const uint64_t xbase = (t * ctx->n_groups + group) * ctx->blocks;
-            ctx->out[t * ctx->n_groups * ctx->rank + group * ctx->rank + row_in_group] =
-                dot_q8_0_row(row,
-                             ctx->xq + xbase * 32,
-                             ctx->xscale + xbase,
-                             ctx->group_dim,
-                             ctx->blocks);
-        }
-    }
-}
 
 
 
-static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_batch_ctx *ctx = static_cast<matmul_q8_0_batch_ctx *>(vctx);
-
-    for (uint64_t r = r0; r < r1; r++) {
-        const uint8_t *row = ctx->data + r * ctx->blocks * 34;
-        uint64_t t = 0;
-        for (; t + 1 < ctx->n_tok; t += 2) {
-            dot_q8_0_row_2(row,
-                           ctx->xq + t * ctx->blocks * 32,
-                           ctx->xscale + t * ctx->blocks,
-                           ctx->xq + (t + 1) * ctx->blocks * 32,
-                           ctx->xscale + (t + 1) * ctx->blocks,
-                           ctx->in_dim,
-                           ctx->blocks,
-                           ctx->out + t * ctx->out_dim + r,
-                           ctx->out + (t + 1) * ctx->out_dim + r);
-        }
-        for (; t < ctx->n_tok; t++) {
-            ctx->out[t * ctx->out_dim + r] =
-                dot_q8_0_row(row,
-                             ctx->xq + t * ctx->blocks * 32,
-                             ctx->xscale + t * ctx->blocks,
-                             ctx->in_dim,
-                             ctx->blocks);
-        }
-    }
-}
 
 
 
-static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_pair_batch_ctx *ctx = static_cast<matmul_q8_0_pair_batch_ctx *>(vctx);
-
-    for (uint64_t r = r0; r < r1; r++) {
-        const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
-        const uint8_t *row1 = ctx->data1 + r * ctx->blocks * 34;
-        uint64_t t = 0;
-        for (; t + 1 < ctx->n_tok; t += 2) {
-            const int8_t *xq0 = ctx->xq + t * ctx->blocks * 32;
-            const float *xscale0 = ctx->xscale + t * ctx->blocks;
-            const int8_t *xq1 = ctx->xq + (t + 1) * ctx->blocks * 32;
-            const float *xscale1 = ctx->xscale + (t + 1) * ctx->blocks;
-            dot_q8_0_row_2(row0, xq0, xscale0, xq1, xscale1, ctx->in_dim, ctx->blocks,
-                           ctx->out0 + t * ctx->out_dim + r,
-                           ctx->out0 + (t + 1) * ctx->out_dim + r);
-            dot_q8_0_row_2(row1, xq0, xscale0, xq1, xscale1, ctx->in_dim, ctx->blocks,
-                           ctx->out1 + t * ctx->out_dim + r,
-                           ctx->out1 + (t + 1) * ctx->out_dim + r);
-        }
-        for (; t < ctx->n_tok; t++) {
-            const int8_t *xq = ctx->xq + t * ctx->blocks * 32;
-            const float *xscale = ctx->xscale + t * ctx->blocks;
-            dot_q8_0_row_pair(row0, row1, xq, xscale, ctx->in_dim, ctx->blocks,
-                              ctx->out0 + t * ctx->out_dim + r,
-                              ctx->out1 + t * ctx->out_dim + r);
-        }
-    }
-}
 
 
 
@@ -1859,146 +1723,18 @@ static void matvec_q8_0_rows_prequant(
 
 
 
-/* Compute two Q8_0 projections from the same input, used by gate/up and
- * compressor kv/score pairs. */
-void matvec_q8_0_pair_prequant(
-        float           * out0,
-        float           * out1,
-        const pulsar_model * m,
-        const pulsar_tensor * w0,
-        const pulsar_tensor * w1,
-        const int8_t    * xq,
-        const float     * xscale) {
-    if (w0->type != 8 || w1->type != 8 || w0->ndim != 2 || w1->ndim != 2) {
-        pulsar_die("expected two 2D Q8_0 tensors");
-    }
-    if (w0->dim[0] != w1->dim[0] || w0->dim[1] != w1->dim[1]) {
-        pulsar_die("paired Q8_0 tensors do not have the same shape");
-    }
-
-    const uint64_t in_dim = w0->dim[0];
-    matvec_q8_0_pair_ctx ctx = {
-        .out0 = out0,
-        .out1 = out1,
-        .data0 = (const uint8_t *)tensor_data(m, w0),
-        .data1 = (const uint8_t *)tensor_data(m, w1),
-        .xq = xq,
-        .xscale = xscale,
-        .in_dim = in_dim,
-        .blocks = (in_dim + 31) / 32,
-    };
-    pulsar_parallel_for(w0->dim[1], matvec_q8_0_pair_worker, &ctx);
-}
 
 
 
-static void matmul_q8_0_batch_prequant(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const int8_t    * xq,
-        const float     * xscale,
-        uint64_t          n_tok) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-
-    matmul_q8_0_batch_ctx ctx = {
-        .out = out,
-        .data = (const uint8_t *)tensor_data(m, w),
-        .xq = xq,
-        .xscale = xscale,
-        .n_tok = n_tok,
-        .in_dim = w->dim[0],
-        .out_dim = w->dim[1],
-        .blocks = (w->dim[0] + 31) / 32,
-    };
-    pulsar_parallel_for(ctx.out_dim, matmul_q8_0_batch_worker, &ctx);
-}
 
 
 
-static void matmul_q8_0_pair_batch_prequant(
-        float           * out0,
-        float           * out1,
-        const pulsar_model * m,
-        const pulsar_tensor * w0,
-        const pulsar_tensor * w1,
-        const int8_t    * xq,
-        const float     * xscale,
-        uint64_t          n_tok) {
-    if (w0->type != 8 || w1->type != 8 || w0->ndim != 2 || w1->ndim != 2) {
-        pulsar_die("expected two 2D Q8_0 tensors");
-    }
-    if (w0->dim[0] != w1->dim[0] || w0->dim[1] != w1->dim[1]) {
-        pulsar_die("paired Q8_0 tensors do not have the same shape");
-    }
-
-    matmul_q8_0_pair_batch_ctx ctx = {
-        .out0 = out0,
-        .out1 = out1,
-        .data0 = (const uint8_t *)tensor_data(m, w0),
-        .data1 = (const uint8_t *)tensor_data(m, w1),
-        .xq = xq,
-        .xscale = xscale,
-        .n_tok = n_tok,
-        .in_dim = w0->dim[0],
-        .out_dim = w0->dim[1],
-        .blocks = (w0->dim[0] + 31) / 32,
-    };
-    pulsar_parallel_for(ctx.out_dim, matmul_q8_0_pair_batch_worker, &ctx);
-}
 
 
 
-/* Batched Q8_0 matmul for prefill: quantize all token activations, then scan
- * weight rows once per output channel. */
-void matmul_q8_0_batch(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint64_t          n_tok) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = (float *)xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
-
-    quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
-    matmul_q8_0_batch_prequant(out, m, w, xq, xscale, n_tok);
-
-    free(xscale);
-    free(xq);
-}
 
 
 
-void matmul_q8_0_pair_batch(
-        float           * out0,
-        float           * out1,
-        const pulsar_model * m,
-        const pulsar_tensor * w0,
-        const pulsar_tensor * w1,
-        const float     * x,
-        uint64_t          n_tok) {
-    if (w0->type != 8 || w1->type != 8 || w0->ndim != 2 || w1->ndim != 2) {
-        pulsar_die("expected two 2D Q8_0 tensors");
-    }
-    if (w0->dim[0] != w1->dim[0] || w0->dim[1] != w1->dim[1]) {
-        pulsar_die("paired Q8_0 tensors do not have the same shape");
-    }
-
-    const uint64_t in_dim = w0->dim[0];
-    const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = (float *)xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
-
-    quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
-    matmul_q8_0_pair_batch_prequant(out0, out1, m, w0, w1, xq, xscale, n_tok);
-
-    free(xscale);
-    free(xq);
-}
 
 
 
@@ -2050,136 +1786,21 @@ void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const
 
 
 
-void matvec_q8_0_grouped_rows(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint32_t          n_groups,
-        uint64_t          group_dim,
-        uint64_t          rank) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-    if (w->dim[0] != group_dim || w->dim[1] < (uint64_t)n_groups * rank) {
-        pulsar_die("grouped Q8_0 tensor has an unexpected layout");
-    }
-
-    const uint64_t blocks = (group_dim + 31) / 32;
-    int8_t *xq = (int8_t *)xmalloc((size_t)n_groups * blocks * 32);
-    float *xscale = (float *)xmalloc((size_t)n_groups * blocks * sizeof(xscale[0]));
-
-    for (uint32_t g = 0; g < n_groups; g++) {
-        quantize_q8_0_activation(x + (uint64_t)g * group_dim,
-                                 xq + (uint64_t)g * blocks * 32,
-                                 xscale + (uint64_t)g * blocks,
-                                 group_dim);
-    }
-
-    matvec_q8_0_grouped_ctx ctx = {
-        .out = out,
-        .data = (const uint8_t *)tensor_data(m, w),
-        .xq = xq,
-        .xscale = xscale,
-        .in_dim = group_dim,
-        .blocks = blocks,
-        .rank = rank,
-    };
-    pulsar_parallel_for((uint64_t)n_groups * rank, matvec_q8_0_grouped_worker, &ctx);
-
-    free(xscale);
-    free(xq);
-}
 
 
 
 
 
 
-void matmul_q8_0_grouped_batch(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint64_t          n_tok,
-        uint32_t          n_groups,
-        uint64_t          group_dim,
-        uint64_t          rank) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-    if (w->dim[0] != group_dim || w->dim[1] < (uint64_t)n_groups * rank) {
-        pulsar_die("grouped Q8_0 tensor has an unexpected layout");
-    }
-
-    const uint64_t blocks = (group_dim + 31) / 32;
-    int8_t *xq = (int8_t *)xmalloc((size_t)n_tok * n_groups * blocks * 32);
-    float *xscale = (float *)xmalloc((size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
-
-    for (uint64_t t = 0; t < n_tok; t++) {
-        for (uint32_t g = 0; g < n_groups; g++) {
-            const uint64_t xbase = (t * n_groups + g) * blocks;
-            quantize_q8_0_activation(x + t * n_groups * group_dim + (uint64_t)g * group_dim,
-                                     xq + xbase * 32,
-                                     xscale + xbase,
-                                     group_dim);
-        }
-    }
-
-    matmul_q8_0_grouped_batch_ctx ctx = {
-        .out = out,
-        .data = (const uint8_t *)tensor_data(m, w),
-        .xq = xq,
-        .xscale = xscale,
-        .n_tok = n_tok,
-        .n_groups = n_groups,
-        .group_dim = group_dim,
-        .blocks = blocks,
-        .rank = rank,
-    };
-    pulsar_parallel_for((uint64_t)n_groups * rank, matmul_q8_0_grouped_batch_worker, &ctx);
-
-    free(xscale);
-    free(xq);
-}
 
 
 
-static void matvec_f32_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_f32_ctx *ctx = static_cast<matvec_f32_ctx *>(vctx);
-
-    for (uint64_t o = row0; o < row1; o++) {
-        double acc = 0.0;
-        const float *row = ctx->data + o * ctx->in_dim;
-        for (uint64_t i = 0; i < ctx->in_dim; i++) {
-            acc += (double)row[i] * ctx->x[i];
-        }
-        ctx->out[o] = (float)acc;
-    }
-}
 
 
 
-static void matvec_f32(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    if (w->type != 0 || w->ndim != 2) pulsar_die("expected a 2D F32 tensor");
-
-    matvec_f32_ctx ctx = {
-        .out = out,
-        .data = (const float *)tensor_data(m, w),
-        .x = x,
-        .in_dim = w->dim[0],
-    };
-    pulsar_parallel_for(w->dim[1], matvec_f32_worker, &ctx);
-}
 
 
 
-/* Dispatch for dense F32/F16/Q8_0 tensors used by auxiliary projections. */
-void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    switch (w->type) {
-    case 0: matvec_f32(out, m, w, x); break;
-    case 1: matvec_f16(out, m, w, x); break;
-    case 8: matvec_q8_0(out, m, w, x); break;
-    default:
-        pulsar_die("unsupported tensor type for dense matvec");
-    }
-}
 
 
 
@@ -2233,48 +1854,9 @@ const uint8_t *tensor_expert_bytes(
 
 
 
-static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_iq2_xxs_pair_ctx *ctx = static_cast<matvec_iq2_xxs_pair_ctx *>(vctx);
-    for (uint64_t row = row0; row < row1; row++) {
-        const block_iq2_xxs *br0 = (const block_iq2_xxs *)(ctx->base0 + row * ctx->row_bytes0);
-        const block_iq2_xxs *br1 = (const block_iq2_xxs *)(ctx->base1 + row * ctx->row_bytes1);
-        pulsar_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &ctx->out0[row], &ctx->out1[row], br0, br1, ctx->xq);
-    }
-}
 
 
 
-/* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
- * share the same Q8_K activation. */
-void matvec_iq2_xxs_expert_pair_prequant(
-        float            *out0,
-        float            *out1,
-        const pulsar_model  *m,
-        const pulsar_tensor *w0,
-        const pulsar_tensor *w1,
-        const block_q8_K *xq,
-        uint32_t          expert) {
-    if (w0->type != 16 || w1->type != 16) pulsar_die("expected IQ2_XXS expert tensors");
-
-    uint64_t in_dim0, out_dim0, row_bytes0;
-    uint64_t in_dim1, out_dim1, row_bytes1;
-    const uint8_t *base0 = tensor_expert_bytes(m, w0, expert, &in_dim0, &out_dim0, &row_bytes0);
-    const uint8_t *base1 = tensor_expert_bytes(m, w1, expert, &in_dim1, &out_dim1, &row_bytes1);
-    if (in_dim0 != in_dim1 || out_dim0 != out_dim1) pulsar_die("paired IQ2_XXS expert tensors do not match");
-    if (in_dim0 % QK_K != 0) pulsar_die("IQ2_XXS expert row is not QK_K aligned");
-
-    matvec_iq2_xxs_pair_ctx ctx = {
-        .out0 = out0,
-        .out1 = out1,
-        .base0 = base0,
-        .base1 = base1,
-        .xq = xq,
-        .in_dim = in_dim0,
-        .row_bytes0 = row_bytes0,
-        .row_bytes1 = row_bytes1,
-    };
-    pulsar_parallel_for(out_dim0, matvec_iq2_xxs_pair_worker, &ctx);
-}
 
 
 
@@ -2282,216 +1864,24 @@ float silu(float x);
 
 
 
-static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_iq2_xxs_mid_ctx *ctx = static_cast<matvec_iq2_xxs_mid_ctx *>(vctx);
-
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const int slot = (int)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)slot * ctx->out_dim;
-        float gate = 0.0f;
-        float up = 0.0f;
-
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
-        pulsar_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
-
-        if (ctx->clamp > 1.0e-6f) {
-            if (gate > ctx->clamp) gate = ctx->clamp;
-            if (up > ctx->clamp) up = ctx->clamp;
-            if (up < -ctx->clamp) up = -ctx->clamp;
-        }
-        ctx->mid[idx] = silu(gate) * up * ctx->expert_weight[slot];
-    }
-}
 
 
 
-/* Build all selected expert hidden vectors: IQ2_XXS gate/up, clamp, SwiGLU,
- * and router weight.  The down projection runs later on the quantized mids. */
-void matvec_iq2_xxs_experts_mid_prequant(
-        float            *mid,
-        const pulsar_model  *m,
-        const pulsar_tensor *gate_w,
-        const pulsar_tensor *up_w,
-        const block_q8_K *xq,
-        const int        *selected,
-        const float      *expert_weight,
-        int               n_expert,
-        float             clamp) {
-    if (gate_w->type != 16 || up_w->type != 16) pulsar_die("expected IQ2_XXS expert tensors");
-    if (n_expert < 1 || (uint32_t)n_expert > PULSAR_N_EXPERT_USED) pulsar_die("unexpected routed expert count");
-
-    uint64_t in_dim0 = 0;
-    uint64_t out_dim0 = 0;
-    matvec_iq2_xxs_mid_ctx ctx = {
-        .mid = mid,
-        .xq = xq,
-        .clamp = clamp,
-        .n_expert = n_expert,
-    };
-
-    for (int i = 0; i < n_expert; i++) {
-        uint64_t gate_in_dim, gate_out_dim;
-        uint64_t up_in_dim, up_out_dim;
-        ctx.gate_base[i] = tensor_expert_bytes(m, gate_w, (uint32_t)selected[i],
-                                               &gate_in_dim, &gate_out_dim, &ctx.gate_row_bytes[i]);
-        ctx.up_base[i] = tensor_expert_bytes(m, up_w, (uint32_t)selected[i],
-                                             &up_in_dim, &up_out_dim, &ctx.up_row_bytes[i]);
-        if (gate_in_dim != up_in_dim || gate_out_dim != up_out_dim) {
-            pulsar_die("paired IQ2_XXS expert tensors do not match");
-        }
-        if (i == 0) {
-            in_dim0 = gate_in_dim;
-            out_dim0 = gate_out_dim;
-        } else if (gate_in_dim != in_dim0 || gate_out_dim != out_dim0) {
-            pulsar_die("IQ2_XXS expert tensors do not share a layout");
-        }
-        ctx.expert_weight[i] = expert_weight[i];
-    }
-    if (in_dim0 % QK_K != 0) pulsar_die("IQ2_XXS expert row is not QK_K aligned");
-
-    ctx.in_dim = in_dim0;
-    ctx.out_dim = out_dim0;
-    pulsar_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx);
-}
 
 
 
-static void matvec_q2_k_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_ctx *ctx = static_cast<matvec_q2_k_ctx *>(vctx);
-    for (uint64_t row = row0; row < row1; row++) {
-        const block_q2_K *br = (const block_q2_K *)(ctx->base + row * ctx->row_bytes);
-        pulsar_vec_dot_q2_K_q8_K((int)ctx->in_dim, &ctx->out[row], br, ctx->xq);
-    }
-}
 
 
 
-/* Single expert Q2_K down projection, kept mostly for tracing and diagnostics. */
-void matvec_q2_k_expert(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const float      *x,
-        uint32_t          expert) {
-    if (w->type != 10) pulsar_die("expected a Q2_K expert tensor");
-
-    uint64_t in_dim, out_dim, row_bytes;
-    const uint8_t *base = tensor_expert_bytes(m, w, expert, &in_dim, &out_dim, &row_bytes);
-    if (in_dim % QK_K != 0) pulsar_die("Q2_K expert row is not QK_K aligned");
-
-    block_q8_K *xq = (block_q8_K *)xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
-    pulsar_quantize_row_q8_K(x, xq, (int64_t)in_dim);
-
-    matvec_q2_k_ctx ctx = {
-        .out = out,
-        .base = base,
-        .xq = xq,
-        .in_dim = in_dim,
-        .row_bytes = row_bytes,
-    };
-    pulsar_parallel_for(out_dim, matvec_q2_k_worker, &ctx);
-
-    free(xq);
-}
 
 
 
-static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_accum_ctx *ctx = static_cast<matvec_q2_k_accum_ctx *>(vctx);
-
-    for (uint64_t row = row0; row < row1; row++) {
-        float acc = 0.0f;
-        for (int i = 0; i < ctx->n_expert; i++) {
-            float v = 0.0f;
-            const block_q2_K *br = (const block_q2_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
-            pulsar_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
-            acc += v;
-        }
-        ctx->out[row] = acc;
-    }
-}
 
 
 
-/* Accumulate all selected experts' Q2_K down projections directly into the
- * 4096-wide MoE output. */
-void matvec_q2_k_experts_accum_prequant(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const block_q8_K *xq,
-        const int        *selected,
-        int               n_expert) {
-    if (w->type != 10) pulsar_die("expected a Q2_K expert tensor");
-    if (n_expert < 1 || (uint32_t)n_expert > PULSAR_N_EXPERT_USED) pulsar_die("unexpected routed expert count");
-
-    uint64_t in_dim0 = 0;
-    uint64_t out_dim0 = 0;
-    const uint8_t *base[PULSAR_MAX_EXPERT_USED];
-    uint64_t row_bytes[PULSAR_MAX_EXPERT_USED];
-
-    for (int i = 0; i < n_expert; i++) {
-        uint64_t in_dim, out_dim;
-        base[i] = tensor_expert_bytes(m, w, (uint32_t)selected[i], &in_dim, &out_dim, &row_bytes[i]);
-        if (i == 0) {
-            in_dim0 = in_dim;
-            out_dim0 = out_dim;
-        } else if (in_dim != in_dim0 || out_dim != out_dim0) {
-            pulsar_die("Q2_K expert tensors do not share a layout");
-        }
-    }
-    if (in_dim0 % QK_K != 0) pulsar_die("Q2_K expert row is not QK_K aligned");
-
-    const uint64_t n_blocks = in_dim0 / QK_K;
-    matvec_q2_k_accum_ctx ctx = {
-        .out = out,
-        .in_dim = in_dim0,
-        .n_expert = n_expert,
-    };
-    for (int i = 0; i < n_expert; i++) {
-        ctx.base[i] = base[i];
-        ctx.row_bytes[i] = row_bytes[i];
-        ctx.xq[i] = xq + (uint64_t)i * n_blocks;
-    }
-
-    pulsar_parallel_for(out_dim0, matvec_q2_k_accum_worker, &ctx);
-}
 
 
 
-void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_iq2_xxs_batch_mid_ctx *ctx = static_cast<matvec_iq2_xxs_batch_mid_ctx *>(vctx);
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const pulsar_expert_pair pair = ctx->pairs[pair_id];
-            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
-            float gate = 0.0f;
-            float up = 0.0f;
-
-            pulsar_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
-            }
-
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
-        }
-    }
-}
 
 
 
@@ -2509,30 +1899,4 @@ void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
 
 
 
-void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_batch_accum_rows_ctx *ctx = static_cast<matvec_q2_k_batch_accum_rows_ctx *>(vctx);
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
-        }
-
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const pulsar_expert_pair pair = ctx->pairs[pair_id];
-                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-                float v = 0.0f;
-
-                pulsar_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, xq);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
-            }
-        }
-    }
-}
 

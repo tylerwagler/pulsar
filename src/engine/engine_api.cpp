@@ -207,8 +207,6 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_prompts,
                                int max_tokens) { return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { e->dump_tokens(tokens); }
-int pulsar_engine_head_test(pulsar_engine *e, const pulsar_tokens *prompt) { return e->head_test(prompt); }
-int pulsar_engine_gpu_graph_test(pulsar_engine *e, const pulsar_tokens *prompt) { return e->gpu_graph_test(prompt); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 bool pulsar_engine_has_output_head(pulsar_engine *e) { return e && e->has_output_head(); }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }

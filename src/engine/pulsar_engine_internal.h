@@ -1343,8 +1343,6 @@ struct pulsar_engine {
     int collect_imatrix(const char *dataset_path, const char *output_path,
                         int ctx_size, int max_prompts, int max_tokens);
     void dump_tokens(const pulsar_tokens *tokens);
-    int head_test(const pulsar_tokens *prompt);
-    int gpu_graph_test(const pulsar_tokens *prompt);
     int routed_quant_bits();
     bool has_output_head();
     bool has_dspark();
@@ -2547,11 +2545,6 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
-int gpu_graph_decode_test(
-        const pulsar_model   *model,
-        const pulsar_weights *weights,
-        const token_vec   *prompt,
-        bool               quality);
 uint32_t gpu_graph_token_split_after_layers(void);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
