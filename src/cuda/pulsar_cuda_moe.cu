@@ -2734,7 +2734,14 @@ __global__ static void moe_padded_gather_pairflat_kernel(
 }
 
 #ifdef PULSAR_HAVE_MMQ
-/* defined below, next to the gate/up arm */
+/* both defined below, next to each other */
+static int routed_moe_try_mmq_gate_up(float *mid_out, float *gate_scratch,
+                                      const char *gate_w, const char *up_w,
+                                      const float *x_f32, const int32_t *selected_ptr,
+                                      const float *weights_ptr, uint32_t gate_type,
+                                      uint32_t expert_in_dim, uint32_t expert_mid_dim,
+                                      uint32_t n_total_expert, uint32_t n_expert,
+                                      uint32_t n_tokens, float clamp);
 static int routed_moe_try_mmq_down(float *down_out, const float *mid_f32,
                                    const char *down_w, const int32_t *selected_ptr,
                                    uint32_t down_type, uint32_t expert_mid_dim,
@@ -3017,12 +3024,22 @@ static int routed_moe_launch_mixed40(
         dim3 xqg(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xqg, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "mixed40B xq");
-        /* TODO(plan 41b): mixed40's IQ2 gate/up is the last dp4a holdout
-         * (3 x 75.4 ms = 226 ms, ~3% of prefill).  MMQ needs a second
-         * pair-sized f32 buffer for the raw gate, and this arena has no spare
-         * region of that size (midq is ~1.14 B/elem, we need 4).  Wiring it
-         * means widening the scratch sizing above -- deferred, not forgotten. */
-        if (ok) {
+        /* Last dp4a IQ2 holdout: mixed layers with IQ2 gate/up land here
+         * (3 x 75.4 ms measured).  `up` is pair-sized and only read by the
+         * qwarp32 branch below, which MMQ replaces -- so it serves as the raw
+         * gate buffer, no arena change needed. */
+        int mmq_gu_done = 0;
+#ifdef PULSAR_HAVE_MMQ
+        if (ok && !gate_soa) {
+            mmq_gu_done = routed_moe_try_mmq_gate_up(
+                mid_flat, (float *)up->ptr, gate_w, up_w,
+                (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
+                gate_type, expert_in_dim, expert_mid_dim,
+                n_total_expert, n_expert, n_tokens, clamp);
+            if (mmq_gu_done) ok = cuda_ok(cudaGetLastError(), "mixed40B mmq gate/up");
+        }
+#endif
+        if (ok && !mmq_gu_done) {
             if (tiled_gateup) {
                 dim3 tgrid((expert_mid_dim + 1023u) / 1024u, (uint32_t)tile8_cap, 1);
                 if (gate_soa)
@@ -3145,8 +3162,8 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
 
 /* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
 static int routed_moe_try_mmq_gate_up(
-        pulsar_gpu_tensor *mid,
-        pulsar_gpu_tensor *up_scratch,
+        float *mid_out,
+        float *gate_scratch,
         const char *gate_w,
         const char *up_w,
         const float *x_f32,
@@ -3175,8 +3192,8 @@ static int routed_moe_try_mmq_gate_up(
     if (!mmq_ready) return 0;
     if (!ds4_mmq_should_use((int)gate_type, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
-    float *gate_raw = (float *)up_scratch->ptr;   /* both are n_tokens*n_expert*mid f32 */
-    float *up_raw = (float *)mid->ptr;            /* folded in place below */
+    float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
+    float *up_raw = mid_out;          /* folded in place below */
     if (ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
                                  gate_raw, up_raw,
                                  (int)expert_mid_dim, (int)expert_in_dim,
@@ -3188,7 +3205,7 @@ static int routed_moe_try_mmq_gate_up(
     const uint32_t threads = 256u;
     const uint64_t blocks = (total + threads - 1u) / threads;
     moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
-        (float *)mid->ptr, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+        mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
     return 1;
 }
 /* Routed DOWN through MMQ.  The adapter has no IQ2 prefill down entry (only
@@ -3457,7 +3474,8 @@ static int routed_moe_launch(
         /* Shape-time decision, evaluated once per launch -- not per token. */
         if (ok && sorted_pairs && !gate_mxfp4 && !gate_q2k && use_big_batch) {
             mmq_done = routed_moe_try_mmq_gate_up(
-                mid, up, gate_w, up_w, (const float *)x->ptr, selected_ptr,
+                (float *)mid->ptr, (float *)up->ptr,
+                gate_w, up_w, (const float *)x->ptr, selected_ptr,
                 (const float *)weights->ptr, gate_type,
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
