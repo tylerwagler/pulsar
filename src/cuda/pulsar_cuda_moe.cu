@@ -35,15 +35,6 @@ __device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t
 
 
 
-__device__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-    int32_t sum = 0;
-    #pragma unroll
-    for (uint32_t i = 0; i < 16; i += 4) {
-        const int32_t v = (*(const int32_t *)(q2 + i) >> shift) & 0x03030303;
-        sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
-    }
-    return sum;
-}
 
 
 
@@ -1752,40 +1743,6 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
 
 
 
-__device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
-    float acc = 0.0f;
-    for (uint32_t b = 0; b < nb; b++) {
-        const cuda_block_iq2_xxs *xb = row + b;
-        const float d = dev_f16_to_f32(xb->d);
-        const uint16_t *q2 = xb->qs;
-        const float *xf = x + (uint64_t)b * CUDA_QK_K;
-        for (uint32_t ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-            const uint32_t aux_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-            const uint32_t aux_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-            q2 += 4;
-            const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
-            const uint8_t grids[4] = {
-                (uint8_t)(aux_g & 0xffu),
-                (uint8_t)((aux_g >> 8) & 0xffu),
-                (uint8_t)((aux_g >> 16) & 0xffu),
-                (uint8_t)((aux_g >> 24) & 0xffu),
-            };
-            for (uint32_t half = 0; half < 2; half++) {
-                for (uint32_t g = 0; g < 2; g++) {
-                    const uint32_t gi = half * 2 + g;
-                    const uint64_t grid = cuda_iq2xxs_grid[grids[gi]];
-                    const uint8_t signs = cuda_ksigns_iq2xs[(aux_s >> (14u * half + 7u * g)) & 127u];
-                    for (uint32_t i = 0; i < 8; i++) {
-                        float w = (float)((grid >> (8u * i)) & 0xffu);
-                        if (signs & (1u << i)) w = -w;
-                        acc += dl * w * xf[ib32 * 32u + half * 16u + g * 8u + i];
-                    }
-                }
-            }
-        }
-    }
-    return acc;
-}
 
 
 

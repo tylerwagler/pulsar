@@ -794,26 +794,6 @@ __global__ static void expert_gemv_down_kernel(
   if (lane == 0) o[n] = a;
 }
 
-/* Round-trip activations through the EXACT fp4 quantizer the GEMM path applies
- * (pack_act_rowmajor: per-32-group e=ceil(log2(max/6)) clamped to +-30, nearest
- * e2m1) and hand the dequantized f32 back to the GEMVs. Without this the GEMV
- * computes a numerically different function than the grouped path (f32 vs fp4
- * activations on every rich layer) and greedy output drifts -- the fp4
- * activation quant is part of the model's effective, quality-gated inference
- * function, not an implementation detail. */
-__global__ static void fp4_act_roundtrip_kernel(float *xq, const float *x, long nblk32) {
-  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= nblk32) return;
-  const float *src = x + b * 32;
-  float *dst = xq + b * 32;
-  float mx = 0.f;
-  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
-  int e = (mx > 0.f) ? (int)ceilf(log2f(mx / 6.f)) : 0;
-  if (e < -30) e = -30;
-  if (e > 30) e = 30;
-  const float s = exp2f((float)e);
-  for (int i = 0; i < 32; i++) dst[i] = d_kE2M1[d_to_e2m1(src[i] / s)] * s;
-}
 
 /* W4A8 activation round-trip for the decode/small-batch GEMV: quantize f32 -> E4M3 (per-32 dynamic
  * UE8M0 block scale, EXACTLY as pack_act_e4m3_rowmajor) then dequantize back to f32, so the GEMV
