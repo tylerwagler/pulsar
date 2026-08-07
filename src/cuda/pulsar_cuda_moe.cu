@@ -1,6 +1,7 @@
 #include "pulsar_cuda_internal.h"
 #ifdef PULSAR_HAVE_MMQ
-#include "mmq/ds4_mmq.h"   /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
+#include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
+#include "mmq/ds4_repack.h"  /* raw IQ2 block stream -> aligned artifact */
 #endif
 
 #include "pulsar_iq2_tables_cuda.inc"
@@ -3127,6 +3128,60 @@ static int routed_moe_launch_mixed40(
  *   off  = pair * mid_dim + row,  pair = tok * n_expert + slot
  *   so weights[tok * n_expert + slot] == weights[pair].
  */
+/* Aligned IQ2 artifact cache.  Keyed by the raw weight pointer, which is stable
+ * for the life of the model map, so one repack per tensor for the whole run.
+ * Budget-capped: when it is exhausted a tensor is marked raw-forever (entry with
+ * a NULL buffer) and never retried, so there is no per-launch allocation churn.
+ * Populated lazily on first use -- the alternative, repacking at model load,
+ * needs loader surgery; this gets the same steady state after the first chunk.
+ */
+#define PULSAR_MMQ_ALIGN_MAX_TENSORS 256
+struct pulsar_mmq_aligned_entry { const void *raw; void *aligned; };
+static pulsar_mmq_aligned_entry g_mmq_aligned[PULSAR_MMQ_ALIGN_MAX_TENSORS];
+static int g_mmq_aligned_n = 0;
+static uint64_t g_mmq_aligned_budget = 0;
+static int g_mmq_aligned_init = 0;
+
+static const void *mmq_aligned_for(const void *raw, uint32_t in_dim, uint32_t mid_dim,
+                                   uint32_t n_experts) {
+    for (int i = 0; i < g_mmq_aligned_n; i++) {
+        if (g_mmq_aligned[i].raw == raw) return g_mmq_aligned[i].aligned;
+    }
+    if (g_mmq_aligned_n >= PULSAR_MMQ_ALIGN_MAX_TENSORS) return NULL;
+
+    if (!g_mmq_aligned_init) {
+        g_mmq_aligned_init = 1;
+        size_t freeb = 0, totalb = 0;
+        if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {
+            /* leave headroom for KV growth and activations */
+            const uint64_t reserve = 6ull << 30;
+            g_mmq_aligned_budget = (freeb > reserve) ? (uint64_t)(freeb - reserve) : 0ull;
+        }
+        fprintf(stderr, "pulsar: MMQ aligned-IQ2 cache budget %.1f GiB\n",
+                g_mmq_aligned_budget / 1073741824.0);
+    }
+
+    const uint64_t need = ds4_mmq_iq2_xxs_aligned_bytes((int)mid_dim, (int)in_dim, (int)n_experts);
+    void *buf = NULL;
+    if (need && need <= g_mmq_aligned_budget && cudaMalloc(&buf, need) == cudaSuccess) {
+        if (ds4_repack_iq2_aligned_device(buf, raw, in_dim, mid_dim, n_experts,
+                                          cudaStreamPerThread)) {
+            g_mmq_aligned_budget -= need;
+        } else {
+            (void)cudaFree(buf);
+            buf = NULL;
+        }
+    } else if (buf) {
+        (void)cudaFree(buf);
+        buf = NULL;
+    }
+    /* record either way: a NULL entry pins this tensor to the raw path */
+    g_mmq_aligned[g_mmq_aligned_n].raw = raw;
+    g_mmq_aligned[g_mmq_aligned_n].aligned = buf;
+    g_mmq_aligned_n++;
+    return buf;
+}
+
 /* The vendored adapter references this ds4-engine hook from its q8-fold vec
  * (decode) path: given an activation pointer it may hand back pre-quantized
  * canonical q8_1 codes so the caller can skip its quantize prelude.  pulsar has
@@ -3192,15 +3247,32 @@ static int routed_moe_try_mmq_gate_up(
     if (!mmq_ready) return 0;
     if (!ds4_mmq_should_use((int)gate_type, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
+    /* Aligned-artifact cache.  block_iq2_xxs is 66 B with qs[] at offset 2, so a
+     * raw stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
+     * weight-read-bound, so that costs a LOT more than it does on our dp4a
+     * kernel: microbenched at the production shape (tests/mmq_align_bench.cu),
+     * raw 44.70 vs aligned 18.65 ms/pair-call = 2.40x, against a one-time
+     * repack of 4.81 ms/tensor.
+     * We cannot hold an aligned copy of every IQ2 tensor (30 layers x 3 x
+     * 0.39 GiB ~ 35 GB on top of an 86 GB model in 121 GB), so cache what fits
+     * under a budget and leave the rest on the raw path. */
+    const void *gate_a = mmq_aligned_for(gate_w, expert_in_dim, expert_mid_dim, n_total_expert);
+    const void *up_a = gate_a ? mmq_aligned_for(up_w, expert_in_dim, expert_mid_dim, n_total_expert) : NULL;
+
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
     float *up_raw = mid_out;          /* folded in place below */
-    if (ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
-                                 gate_raw, up_raw,
-                                 (int)expert_mid_dim, (int)expert_in_dim,
-                                 (int)n_tokens, (int)n_total_expert,
-                                 (int)n_expert, cudaStreamPerThread) != 0) {
-        return 0;
-    }
+    const int rc = (gate_a && up_a)
+        ? ds4_mmq_iq2_xxs_moe_pair_soa(gate_a, up_a, x_f32, selected_ptr,
+                                       gate_raw, up_raw,
+                                       (int)expert_mid_dim, (int)expert_in_dim,
+                                       (int)n_tokens, (int)n_total_expert,
+                                       (int)n_expert, cudaStreamPerThread)
+        : ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
+                                   gate_raw, up_raw,
+                                   (int)expert_mid_dim, (int)expert_in_dim,
+                                   (int)n_tokens, (int)n_total_expert,
+                                   (int)n_expert, cudaStreamPerThread);
+    if (rc != 0) return 0;
     const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
     const uint32_t threads = 256u;
     const uint64_t blocks = (total + threads - 1u) / threads;
