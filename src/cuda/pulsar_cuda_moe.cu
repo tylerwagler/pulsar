@@ -3469,8 +3469,12 @@ static int routed_moe_launch(
      * and if MMQ is unavailable we fail closed rather than misread the bytes. */
     const int gate_mmq43 = (gate_type == 43u);
     const int down_mmq43 = (down_type == 43u);
-    if (gate_type != 16u && !gate_soa && !gate_q2k && !gate_mxfp4 && !gate_mmq43) return 0;
-    if (down_type != 10u && !down_iq2 && !down_mxfp4 && !down_mmq43) return 0;
+    /* Q2_K (type 10) routed experts are no longer supported: the shipped
+     * recipe has never contained Q2_K (plan 41), and the only Q2_K artifacts
+     * in reach are the competitors', which we cannot load anyway (no Q8_0
+     * reader).  Rejecting here rather than carrying ~10 dispatch arms. */
+    if (gate_type != 16u && !gate_soa && !gate_mxfp4 && !gate_mmq43) return 0;
+    if (!down_iq2 && !down_mxfp4 && !down_mmq43) return 0;
 #ifndef PULSAR_HAVE_MMQ
     if (gate_mmq43 || down_mmq43) return 0;   /* no MMQ build -> unreadable */
 #endif
