@@ -62,6 +62,11 @@
  * requires the harness curve to BRACKET the engine's observed range. */
 static const double kEngineMin = 2.730;
 static const double kEngineMax = 10.364;
+/* The engine's spread is a repeating 8-launch cycle -- eight 512-token
+ * sub-batches per layer, ramping with CAUSAL DEPTH and plateauing once the
+ * compressed rows reach top_k=512.  One observed layer, in order: */
+static const double kEngineRamp[8] =
+    {2.730, 4.922, 7.232, 8.870, 10.314, 9.965, 10.265, 9.982};
 
 int main(int argc, char **argv) {
     const uint32_t n_tokens = argc > 1 ? (uint32_t)atoi(argv[1]) : 512u;  /* grid.x from the trace */
@@ -73,7 +78,7 @@ int main(int argc, char **argv) {
     const uint32_t window   = 128u;
     const uint32_t raw_cap  = 4352u;
     const uint32_t comp_cap = 1026u;
-    const uint32_t n_raw    = raw_cap;
+    uint32_t n_raw_rt       = raw_cap;
     /* n_comp is NOT comp_cap.  comp_cap is the ALLOCATION; n_comp is how many
      * compressed rows actually exist at this depth, and the engine logs
      * "ATTN-MIXED n_tokens=4096 n_comp=32" for a cold 4096-token prefill.
@@ -151,7 +156,7 @@ int main(int argc, char **argv) {
     auto launch = [&]() {
         attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
             heads, sinks, q, raw_kv, comp_kv, topk,
-            n_tokens, /*pos0=*/0u, n_raw, raw_cap, /*raw_start=*/0u,
+            n_tokens, /*pos0=*/0u, n_raw_rt, raw_cap, /*raw_start=*/0u,
             n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
             /*comp_kv_pack=*/0u, positions, /*seq_id=*/nullptr,
             /*comp_bank_ptrs=*/nullptr, comp_cap, /*n_banks=*/1u);
@@ -164,23 +169,38 @@ int main(int argc, char **argv) {
     cudaEvent_t a, b;
     CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
 
-    /* Sweep n_comp: the engine's 3.8x spread is this axis. */
-    const uint32_t sweep[] = {32u, 128u, 256u, 512u, 1026u};
+    /* Sweep CAUSAL DEPTH, not n_comp.  The kernel derives the compressed range
+     * from qpos = positions[t], so with positions pinned to 0..511 the scan was
+     * capped at ~128 rows regardless of the n_comp argument -- which is exactly
+     * why the earlier n_comp sweep went flat past 128 and failed the gate.
+     * Sub-batch i covers tokens [i*512, (i+1)*512) of a 4096-token chunk. */
     double lo = 1e30, hi = 0.0;
-    printf("\n  n_comp   ms/launch\n");
-    for (uint32_t ci = 0; ci < sizeof(sweep)/sizeof(sweep[0]); ci++) {
-        n_comp_rt = sweep[ci];
-        if (n_comp_rt > comp_cap) continue;
+    double worst_rel = 0.0;
+    printf("\n  sub-batch  base_pos   harness    engine     rel\n");
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t base = i * n_tokens;
+        n_comp_rt = (base + n_tokens) / ratio;
+        if (n_comp_rt > comp_cap) n_comp_rt = comp_cap;
+        n_raw_rt = base + n_tokens;
+        if (n_raw_rt > raw_cap) n_raw_rt = raw_cap;
         fill_topk(n_comp_rt);
-        launch(); CK(cudaDeviceSynchronize());
+        {
+            std::vector<int32_t> hp(n_tokens);
+            for (uint32_t t = 0; t < n_tokens; t++) hp[t] = (int32_t)(base + t);
+            CK(cudaMemcpy(positions, hp.data(), hp.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice));
+        }
+        launch(); CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
         double best = 1e30;
-        for (int i = 0; i < iters; i++) {
+        for (int k = 0; k < iters; k++) {
             CK(cudaEventRecord(a)); launch(); CK(cudaEventRecord(b));
             CK(cudaEventSynchronize(b));
             float ms = 0.f; CK(cudaEventElapsedTime(&ms, a, b));
             if (ms < best) best = ms;
         }
-        printf("  %6u   %8.3f\n", sweep[ci], best);
+        const double rel = best / kEngineRamp[i];
+        if (fabs(rel - 1.0) > worst_rel) worst_rel = fabs(rel - 1.0);
+        printf("  %8u  %8u  %8.3f  %8.3f  %6.2fx\n", i, base, best, kEngineRamp[i], rel);
         if (best < lo) lo = best;
         if (best > hi) hi = best;
     }
@@ -188,8 +208,11 @@ int main(int argc, char **argv) {
     printf("\n  harness range   %6.3f .. %6.3f ms\n", lo, hi);
     printf("  engine  range   %6.3f .. %6.3f ms  (168 launches, grid 512x4)\n",
            kEngineMin, kEngineMax);
+    printf("  worst per-point deviation from the engine ramp: %.1f%%\n", worst_rel * 100.0);
 
-    const bool brackets = (lo <= kEngineMax) && (hi >= kEngineMin);
+    /* Bracketing the range is necessary but weak; require the RAMP to match
+     * within 25% at every point, so the harness tracks the same work axis. */
+    const bool brackets = (lo <= kEngineMax) && (hi >= kEngineMin) && (worst_rel <= 0.25);
     if (!brackets) {
         printf("\n  CALIBRATION GATE: FAIL -- harness range does not overlap the engine's.\n"
                "  It is measuring a different regime; any stall breakdown taken from\n"
