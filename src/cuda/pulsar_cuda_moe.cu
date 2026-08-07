@@ -428,76 +428,6 @@ __device__ static void dev_dot_mxfp4_q8_K_block8(
 
 
 
-__device__ static float dev_dot_q2_K_q8_K_block(const cuda_block_q2_K *x, const cuda_block_q8_K *y) {
-    const uint8_t *q2 = x->qs;
-    const int8_t *q8 = y->qs;
-    const uint8_t *sc = x->scales;
-    int summs = 0;
-    for (int j = 0; j < 16; j++) summs += y->bsums[j] * (sc[j] >> 4);
-    const float dall = y->d * dev_f16_to_f32(x->d);
-    const float dmin = y->d * dev_f16_to_f32(x->dmin);
-    int isum = 0;
-    int is = 0;
-    for (int k = 0; k < CUDA_QK_K / 128; k++) {
-        int shift = 0;
-        for (int j = 0; j < 4; j++) {
-            int d = sc[is++] & 0x0f;
-            isum += d * dev_dot_q2_16(q2, q8, shift);
-            d = sc[is++] & 0x0f;
-            isum += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
-            shift += 2;
-            q8 += 32;
-        }
-        q2 += 32;
-    }
-    return dall * (float)isum - dmin * (float)summs;
-}
-
-
-
-__device__ static void dev_dot_q2_K_q8_K_block8(
-        const cuda_block_q2_K *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        uint32_t n,
-        float acc[8]) {
-    const uint8_t *sc = x->scales;
-    const float xd = dev_f16_to_f32(x->d);
-    const float xmin = dev_f16_to_f32(x->dmin);
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    int isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (uint32_t p = 0; p < n; p++) {
-        for (int j = 0; j < 16; j++) summs[p] += ys[p]->bsums[j] * (sc[j] >> 4);
-    }
-    for (uint32_t p = 0; p < n; p++) {
-        const uint8_t *q2 = x->qs;
-        const int8_t *q8 = ys[p]->qs;
-        int is = 0;
-        for (int k = 0; k < CUDA_QK_K / 128; k++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                int d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2, q8, shift);
-                d = sc[is++] & 0x0f;
-                isum[p] += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
-                shift += 2;
-                q8 += 32;
-            }
-            q2 += 32;
-        }
-    }
-    for (uint32_t p = 0; p < n; p++) {
-        const float yd = ys[p]->d;
-        acc[p] += yd * xd * (float)isum[p] - yd * xmin * (float)summs[p];
-    }
-}
 
 
 
@@ -619,28 +549,9 @@ struct GateUpDotMXFP4 {
         return dev_dot_mxfp4_q8_K_block((const unsigned char *)rowbase + (uint64_t)b * 8u * 17u, x);
     }
 };
-struct GateUpDotQ2K {
-    static constexpr bool soa = false;
-    __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
-        return dev_dot_q2_K_q8_K_block((const cuda_block_q2_K *)rowbase + b, x);
-    }
-};
-
 /* 8-wide batch variant of the same per-format decode, for the expert-tiled
  * prefill kernels (tile16 collapse below). Same addressing rules as the
  * single-block traits above. */
-struct Dot8Q2K {
-    static constexpr bool soa = false;
-    __device__ static inline void dot8(const char *rowbase, uint32_t b,
-            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
-            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
-            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
-            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
-            uint32_t np, float *acc) {
-        dev_dot_q2_K_q8_K_block8((const cuda_block_q2_K *)rowbase + b,
-                                 x0, x1, x2, x3, x4, x5, x6, x7, np, acc);
-    }
-};
 struct Dot8MXFP4 {
     static constexpr bool soa = false;
     __device__ static inline void dot8(const char *rowbase, uint32_t b,
@@ -1413,174 +1324,6 @@ uint32_t pulsar_gpu_moe_mxfp4_tile_width(void) {
 
 
 /* Q2_K gate/up variants of the three gate kernels above (mid preset:
- * all-Q2_K experts). Same structure and q8_K activations; the dot is the
- * production-validated dev_dot_q2_K_q8_K_block/block8 the down kernels use. */
-/* Q2_K routed gate/up: now moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K> — see the
- * collapsed template above (GateUpDotQ2K::dot = dev_dot_q2_K_q8_K_block over
- * cuda_block_q2_K rows). */
-
-
-__global__ static void moe_gate_up_mid_q2k_expert_tile8_row32_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        tok[np] = pair[np] / n_expert;
-        slot[np] = pair[np] - tok[np] * n_expert;
-        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
-    }
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    if (row >= expert_mid_dim) return;
-    const cuda_block_q2_K *gr = (const cuda_block_q2_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const cuda_block_q2_K *ur = (const cuda_block_q2_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        dev_dot_q2_K_q8_K_block8(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate);
-        dev_dot_q2_K_q8_K_block8(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up);
-    }
-    for (uint32_t p = 0; p < np; p++) {
-        gate[p] = quarter_warp_sum_f32(gate[p], lane);
-        up[p] = quarter_warp_sum_f32(up[p], lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate[p] > clamp) gate[p] = clamp;
-                if (up[p] > clamp) up[p] = clamp;
-                if (up[p] < -clamp) up[p] = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
-        }
-    }
-}
-
-
-template <uint32_t ROW_SPAN>
-__global__ static void moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        tok[np] = pair[np] / n_expert;
-        slot[np] = pair[np] - tok[np] * n_expert;
-        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
-    }
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
-        uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const cuda_block_q2_K *gr = (const cuda_block_q2_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_q2_K *ur = (const cuda_block_q2_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            dev_dot_q2_K_q8_K_block8(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate);
-            dev_dot_q2_K_q8_K_block8(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up);
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            gate[p] = quarter_warp_sum_f32(gate[p], lane);
-            up[p] = quarter_warp_sum_f32(up[p], lane);
-            if (lane == 0) {
-                if (clamp > 1.0e-6f) {
-                    if (gate[p] > clamp) gate[p] = clamp;
-                    if (up[p] > clamp) up[p] = clamp;
-                    if (up[p] < -clamp) up[p] = -clamp;
-                }
-                const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
-            }
-        }
-    }
-}
-
-
-
 /* Pulsar port: the moe_down qwarp32 IQ2/MXFP4/Q2_K clones collapsed into one
  * template, REUSING the format-generic GateUpDot* quant-dot decoder traits (the
  * down GEMV is the same weight x q8_K dot as gate/up, just over the mid activation).
@@ -1671,64 +1414,6 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
-
-
-__global__ static void moe_down_expert_tile8_row32_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    if (row >= out_dim) return;
-    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-        dev_dot_q2_K_q8_K_block8(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc);
-    }
-    for (uint32_t p = 0; p < np; p++) {
-        acc[p] = quarter_warp_sum_f32(acc[p], lane);
-        if (lane == 0) {
-            down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
-        }
-    }
-}
 
 
 
@@ -2104,125 +1789,6 @@ __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const
 
 
 
-__device__ static float dev_q2_K_dot_f32(const cuda_block_q2_K *row, const float *x, uint32_t nb) {
-    float acc = 0.0f;
-    for (uint32_t b = 0; b < nb; b++) {
-        const cuda_block_q2_K *xb = row + b;
-        const float d = dev_f16_to_f32(xb->d);
-        const float dmin = dev_f16_to_f32(xb->dmin);
-        for (uint32_t il = 0; il < 16; il++) {
-            const uint32_t chunk = il / 8u;
-            const uint32_t pair = il & 1u;
-            const uint32_t shift = ((il / 2u) & 3u) * 2u;
-            const uint8_t sc = xb->scales[il];
-            const float dl = d * (float)(sc & 0x0fu);
-            const float ml = dmin * (float)(sc >> 4);
-            const uint8_t *q = xb->qs + 32u * chunk + 16u * pair;
-            const float *xf = x + (uint64_t)b * CUDA_QK_K + chunk * 128u + ((il % 8u) / 2u) * 32u + pair * 16u;
-            for (uint32_t i = 0; i < 16; i++) {
-                const float w = dl * (float)((q[i] >> shift) & 3u) - ml;
-                acc += w * xf[i];
-            }
-        }
-    }
-    return acc;
-}
-
-
-
-__global__ static void moe_gate_up_mid_f32_kernel(
-        float *gate_out,
-        float *up_out,
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const float *x,
-        const int32_t *selected,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t row = blockIdx.x;
-    uint32_t pair = blockIdx.y;
-    if (row >= expert_mid_dim) return;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    uint32_t expert = (uint32_t)expert_i;
-    const uint32_t nb = expert_in_dim / CUDA_QK_K;
-    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-    const float *xr = x + (uint64_t)tok * expert_in_dim;
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
-        gate += dev_iq2_xxs_dot_f32(gr + b, xr + (uint64_t)b * CUDA_QK_K, 1);
-        up += dev_iq2_xxs_dot_f32(ur + b, xr + (uint64_t)b * CUDA_QK_K, 1);
-    }
-    __shared__ float partial_gate[256];
-    __shared__ float partial_up[256];
-    partial_gate[threadIdx.x] = gate;
-    partial_up[threadIdx.x] = up;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial_gate[threadIdx.x] += partial_gate[threadIdx.x + stride];
-            partial_up[threadIdx.x] += partial_up[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        gate = partial_gate[0];
-        up = partial_up[0];
-        if (clamp > 1.0e-6f) {
-            if (gate > clamp) gate = clamp;
-            if (up > clamp) up = clamp;
-            if (up < -clamp) up = -clamp;
-        }
-        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-        gate_out[off] = gate;
-        up_out[off] = up;
-        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
-    }
-}
-
-
-
-__global__ static void moe_down_f32_kernel(
-        float *down_out,
-        const char *down_base,
-        const float *mid,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t row = blockIdx.x;
-    uint32_t pair = blockIdx.y;
-    if (row >= out_dim) return;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    const uint32_t nb = expert_mid_dim / CUDA_QK_K;
-    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    const float *xr = mid + (uint64_t)pair * expert_mid_dim;
-    float acc = 0.0f;
-    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) acc += dev_q2_K_dot_f32(wr + b, xr + (uint64_t)b * CUDA_QK_K, 1);
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
-}
 
 
 
@@ -3019,10 +2585,11 @@ static int routed_moe_launch_mixed40(
                     moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
                         down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
                 else
-                    moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
-                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
+                    /* was a bare else -> GateUpDotQ2K, i.e. any unrecognised
+                     * down type silently READ AS Q2_K.  Refuse instead. */
+                    ok = 0;
             }
-            ok = cuda_ok(cudaGetLastError(), "mixed40A down");
+            if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40A down");
         }
     } else {
         /* Case B. Phase 1: dp4a gate/up per pair (fused swiglu) -> mid_flat. */
@@ -3074,10 +2641,6 @@ static int routed_moe_launch_mixed40(
                 if (gate_soa)
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
                         gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, selected_ptr, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
-                else if (gate_type == 10u)
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
-                        gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
                 else
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
@@ -3452,7 +3015,6 @@ static int routed_moe_launch(
      * matching pair, enforced at load) in {iq2_xxs, q2_k, mxfp4}, down in
      * {iq2_xxs, q2_k, mxfp4}, any pairing; combos vary layer to layer. */
     const int gate_mxfp4 = gate_type == 39u;
-    const int gate_q2k = gate_type == 10u;
     const int down_mxfp4 = down_type == 39u;
     /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) take the same
      * down kernels; the layout is a template/trait choice at each launch. */
@@ -3649,7 +3211,7 @@ static int routed_moe_launch(
         int mmq_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time decision, evaluated once per launch -- not per token. */
-        if (ok && sorted_pairs && !gate_mxfp4 && !gate_q2k && use_big_batch) {
+        if (ok && sorted_pairs && !gate_mxfp4 && use_big_batch) {
             mmq_done = routed_moe_try_mmq_gate_up(
                 (float *)mid->ptr, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
@@ -3679,14 +3241,7 @@ static int routed_moe_launch(
             if (sorted_pairs && !gate_mxfp4) {
                 if (use_big_batch) {
                     dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                    if (gate_q2k) {
-                        moe_gate_up_mid_q2k_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
-                    } else {
+                    {
                         if (gate_soa)
                             moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(
                                 (float *)mid->ptr,
@@ -3706,14 +3261,7 @@ static int routed_moe_launch(
                     }
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    if (gate_q2k) {
-                        moe_gate_up_mid_q2k_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            clamp);
-                    } else {
+                    {
                         if (gate_soa)
                             moe_gate_up_mid_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
                                 (float *)mid->ptr,
@@ -3813,22 +3361,6 @@ static int routed_moe_launch(
                             expert_mid_dim,
                             n_expert,
                             clamp);
-                } else if (gate_q2k) {
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotQ2K><<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                        xq,
-                        selected_ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        clamp);
                 } else {
                     if (gate_soa)
                         moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>(
@@ -3940,15 +3472,8 @@ static int routed_moe_launch(
                             midq_blocks,
                             out_dim);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<GateUpDotQ2K><<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim);
+                    /* Q2_K removed: no correct reader remains for this type. */
+                    ok = 0;
                 }
             }
             if (use_direct_down_sum6) {
@@ -3976,11 +3501,7 @@ static int routed_moe_launch(
                             tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert);
                 } else {
-                    moe_down_expert_tile16_row2048_kernel<Dot8Q2K><<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    ok = 0;   /* Q2_K removed: no correct reader */
                 }
             } else if (sorted_pairs && !down_mxfp4) {
                 dim3 tgrid((out_dim + 31u) / 32u, tile_capacity, 1);
@@ -3998,11 +3519,7 @@ static int routed_moe_launch(
                             tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert);
                 } else {
-                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                        midq_blocks, out_dim, n_expert);
+                    ok = 0;   /* Q2_K removed: no correct reader */
                 }
             } else {
                 if (down_mxfp4) {
@@ -4040,19 +3557,10 @@ static int routed_moe_launch(
                             out_dim,
                             n_expert);
                 } else {
-                    moe_down_qwarp32_kernel<GateUpDotQ2K><<<dgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert);
+                    ok = 0;   /* Q2_K removed: no correct reader */
                 }
             }
-            ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
+            if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         /* mmq_down_done means the MMQ arm wrote PER-PAIR results, so the
@@ -4085,55 +3593,18 @@ static int routed_moe_launch(
     }
 
     /* f32 scratch-starved fallback: FAIL CLOSED.
-     * This pair was never type-coherent -- moe_gate_up_mid_f32_kernel reads
-     * cuda_block_iq2_xxs while moe_down_f32_kernel reads cuda_block_q2_K, so it
-     * only ever matched an IQ2 gate/up + Q2_K down recipe.  That is the
-     * competitors' layout, never ours; on a v5mx (IQ2 down) it would have
-     * MISREAD the down weights had the scratch check above ever failed.  With
-     * Q2_K unsupported there is no correct reader left, so refuse rather than
-     * silently reinterpret.  Same hazard class as mixed40's bare `else`. */
+     * The pair of f32 kernels that used to live here was never type-coherent --
+     * the gate/up one read cuda_block_iq2_xxs while the down one read
+     * cuda_block_q2_K, so it only ever matched an IQ2 gate/up + Q2_K down
+     * recipe.  That is the competitors' layout, never ours; on a v5mx (IQ2
+     * down) it would have MISREAD the down weights had the scratch check above
+     * ever failed.  Both kernels are deleted along with the rest of Q2_K; there
+     * is no correct reader left, so refuse rather than silently reinterpret.
+     * Same hazard class as mixed40's bare `else`. */
     if (ok) {
         fprintf(stderr, "pulsar: routed MoE f32 fallback has no supported type "
                         "combination (scratch too small for the quantized path)\n");
         return 0;
-    }
-    if (0) {
-        dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
-        moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
-            (float *)gate->ptr,
-            (float *)up->ptr,
-            (float *)mid->ptr,
-            gate_w,
-            up_w,
-            (const float *)x->ptr,
-            selected_ptr,
-            (const float *)weights->ptr,
-            gate_expert_bytes,
-            gate_row_bytes,
-            expert_in_dim,
-            expert_mid_dim,
-            n_expert,
-            clamp);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
-    }
-    if (ok) {
-        dim3 dgrid(out_dim, n_tokens * n_expert, 1);
-        moe_down_f32_kernel<<<dgrid, 256>>>(
-            (float *)down->ptr,
-            down_w,
-            (const float *)mid->ptr,
-            selected_ptr,
-            down_expert_bytes,
-            down_row_bytes,
-            expert_mid_dim,
-            out_dim,
-            n_expert);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
-    }
-    if (ok) {
-        uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;
 }

@@ -122,13 +122,6 @@ __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
 typedef struct {
-    uint8_t scales[CUDA_QK_K / 16];
-    uint8_t qs[CUDA_QK_K / 4];
-    uint16_t d;
-    uint16_t dmin;
-} cuda_block_q2_K;
-
-typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
     int16_t bsums[CUDA_QK_K / 16];
