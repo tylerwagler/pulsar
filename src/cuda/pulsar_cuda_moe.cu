@@ -3165,6 +3165,41 @@ static int routed_moe_try_mmq_gate_up(
         (float *)mid->ptr, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
     return 1;
 }
+/* Routed DOWN through MMQ.  The adapter has no IQ2 prefill down entry (only
+ * _vec decode ones); Palaferri's down rides inside ds4_mmq_iq2_xxs_q2_K_moe_fused,
+ * which is Q2_K-specific and so useless for v5mx (our down is IQ2).
+ *
+ * But down does not need a fused kernel here: `mid` is ALREADY materialized f32
+ * per (token,slot), and `selected` is ALREADY the flat per-pair expert id
+ * (pair = tok*n_expert + slot).  So the generic MoE entry fits exactly if each
+ * pair is treated as its own row using exactly one expert:
+ *     n_tokens'      = n_tokens * n_expert     (one row per pair)
+ *     n_expert_used' = 1
+ * Output is per-pair, which is what the existing fixed-order moe_sum_kernel
+ * already consumes -- so the bit-exact reduction is untouched.  This also skips
+ * the mid -> midq q8_K quantize entirely (MMQ does its own q8_1).
+ */
+static int routed_moe_try_mmq_down(
+        pulsar_gpu_tensor *down_out,
+        const pulsar_gpu_tensor *mid,
+        const char *down_w,
+        const int32_t *selected_ptr,
+        uint32_t down_type,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    if (down_type != 16u) return 0;
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    if (pairs > (uint64_t)INT32_MAX) return 0;
+    if (!ds4_mmq_should_use((int)down_type, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    return ds4_mmq_iq2_xxs_moe(down_w, (const float *)mid->ptr, selected_ptr,
+                               (float *)down_out->ptr,
+                               (int)out_dim, (int)expert_mid_dim,
+                               (int)pairs, (int)n_total_expert, 1,
+                               cudaStreamPerThread) == 0;
+}
 #endif /* PULSAR_HAVE_MMQ */
 
 static int routed_moe_launch(
@@ -3601,13 +3636,24 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
         }
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
-        if (ok) {
+        int mmq_down_done = 0;
+#ifdef PULSAR_HAVE_MMQ
+        /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
+         * q8_1, so the whole mid -> midq q8_K quantize below is skipped too. */
+        if (ok && sorted_pairs && !down_mxfp4 && !down_soa && use_big_batch && !use_direct_down_sum6) {
+            mmq_down_done = routed_moe_try_mmq_down(down, mid, down_w, selected_ptr,
+                                                    down_type, expert_mid_dim, out_dim,
+                                                    n_total_expert, n_expert, n_tokens);
+            if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
+        }
+#endif
+        if (ok && !mmq_down_done) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
             q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
-        if (ok) {
+        if (ok && !mmq_down_done) {
             dim3 dgrid((out_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
