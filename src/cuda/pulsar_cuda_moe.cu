@@ -4084,7 +4084,20 @@ static int routed_moe_launch(
         return ok;
     }
 
+    /* f32 scratch-starved fallback: FAIL CLOSED.
+     * This pair was never type-coherent -- moe_gate_up_mid_f32_kernel reads
+     * cuda_block_iq2_xxs while moe_down_f32_kernel reads cuda_block_q2_K, so it
+     * only ever matched an IQ2 gate/up + Q2_K down recipe.  That is the
+     * competitors' layout, never ours; on a v5mx (IQ2 down) it would have
+     * MISREAD the down weights had the scratch check above ever failed.  With
+     * Q2_K unsupported there is no correct reader left, so refuse rather than
+     * silently reinterpret.  Same hazard class as mixed40's bare `else`. */
     if (ok) {
+        fprintf(stderr, "pulsar: routed MoE f32 fallback has no supported type "
+                        "combination (scratch too small for the quantized path)\n");
+        return 0;
+    }
+    if (0) {
         dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
         moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
             (float *)gate->ptr,
