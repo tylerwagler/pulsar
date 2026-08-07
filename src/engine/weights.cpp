@@ -1856,14 +1856,6 @@ static void matvec_q8_0_rows_prequant(
 
 
 
-static PULSAR_MAYBE_UNUSED void matvec_q8_0_prequant(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const int8_t    * xq,
-        const float     * xscale) {
-    matvec_q8_0_rows_prequant(out, m, w, xq, xscale, 0, w->dim[1]);
-}
 
 
 
@@ -2514,26 +2506,6 @@ void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
 
 
 
-static PULSAR_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q2_k_batch_down_ctx *ctx = static_cast<matvec_q2_k_batch_down_ctx *>(vctx);
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-        const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-            pulsar_vec_dot_q2_K_q8_K((int)ctx->in_dim,
-                                  ctx->down_pair + (uint64_t)pair_id * ctx->out_dim + row,
-                                  br, xq);
-        }
-    }
-}
 
 
 

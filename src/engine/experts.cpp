@@ -77,19 +77,6 @@ void matvec_expert_down(
 
 
 
-static PULSAR_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    sum_down_pairs_ctx *ctx = static_cast<sum_down_pairs_ctx *>(vctx);
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const uint32_t token = (uint32_t)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
-        float acc = 0.0f;
-        for (uint32_t slot = 0; slot < PULSAR_N_EXPERT_USED; slot++) {
-            const uint64_t pair_id = (uint64_t)token * PULSAR_N_EXPERT_USED + slot;
-            acc += ctx->down_pair[pair_id * ctx->out_dim + row];
-        }
-        ctx->moe[idx] = acc;
-    }
-}
 
 
 
