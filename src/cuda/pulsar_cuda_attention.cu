@@ -1075,8 +1075,29 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
 
 
 
+/* Occupancy knob for the prefill attention kernel.  ncu at the shipped shape:
+ * 70 registers/thread x 512 threads = 35840 regs/block against 65536 per SM, so
+ * exactly ONE block fits and occupancy pins at 33.3% (Block Limit Registers = 1,
+ * Block Limit Shared Mem = 1 -- both binding).  The dominant stall is
+ * short_scoreboard (MIO / shared memory) at 3.49 of ~9.3 cycles per
+ * issue-active, so more resident warps is the obvious lever.
+ *
+ * MEASURED, harness `tests/attn_indexed_bench.cu` at the shipped shape:
+ *   min_blocks   sub-batch 4   sub-batch 7
+ *   (none)          9.957         10.098 ms
+ *   2               6.998          7.097 ms   <- 1.42x, shipped
+ *   3              79.839         79.911 ms   <- register spill, 8x WORSE
+ * In-engine: prefill @4k 670.84 -> 730.71 (+8.9%), @8k 647.19 -> 702.79.
+ * Frontier logits are BYTE-IDENTICAL with and without, so this is free speed,
+ * not a precision trade -- verified by gguf-tools/lb_numerics_check.sh.
+ * Override with -DPULSAR_ATTN_MIN_BLOCKS=N; 3 is a cliff, do not raise blindly. */
+#ifndef PULSAR_ATTN_MIN_BLOCKS
+#define PULSAR_ATTN_MIN_BLOCKS 2
+#endif
+#define PULSAR_ATTN_LB __launch_bounds__(512, PULSAR_ATTN_MIN_BLOCKS)
+
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
-__global__ static void attention_indexed_mixed_heads8_online_kernel(
+__global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
