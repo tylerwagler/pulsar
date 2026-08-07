@@ -153,7 +153,29 @@ int main(int argc, char **argv) {
     };
 
     const dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
+    /* ROWS_PER_STAGE is the smem staging depth -- the knob that sets how many KV
+     * rows are buffered per iteration, i.e. exactly the traffic the dominant
+     * short_scoreboard (MIO/shared-memory) stall is waiting on.  Sweep it before
+     * contemplating any rewrite. */
+    uint32_t rps_rt = argc > 4 ? (uint32_t)atoi(argv[4]) : 8u;
     auto launch = [&]() {
+        switch (rps_rt) {
+        case 4:
+            attention_indexed_mixed_heads8_online_kernel<4, 16><<<grid, 512>>>(
+                heads, sinks, q, raw_kv, comp_kv, topk,
+                n_tokens, 0u, n_raw_rt, raw_cap, 0u,
+                n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
+                0u, positions, nullptr, nullptr, comp_cap, 1u);
+            return;
+        case 16:
+            attention_indexed_mixed_heads8_online_kernel<16, 16><<<grid, 512>>>(
+                heads, sinks, q, raw_kv, comp_kv, topk,
+                n_tokens, 0u, n_raw_rt, raw_cap, 0u,
+                n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
+                0u, positions, nullptr, nullptr, comp_cap, 1u);
+            return;
+        default: break;
+        }
         attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
             heads, sinks, q, raw_kv, comp_kv, topk,
             n_tokens, /*pos0=*/0u, n_raw_rt, raw_cap, /*raw_start=*/0u,
