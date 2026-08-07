@@ -1331,7 +1331,17 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 
 
 
-__global__ static void attention_static_mixed_heads8_online_kernel(
+/* Same cliff as the indexed kernel above, found by the occupancy audit: 70
+ * registers x 256 threads = 17920 per block against 65536 per SM, so 3 blocks
+ * fit and occupancy sits at 50%.  smem (8389 B) allows 12 blocks, so registers
+ * alone are binding here -- capping at 64 fits a 4th block (66.7%).  This is
+ * 299 ms of a ~4.6 s prefill.  Launched <<<grid, 256>>> at both call sites. */
+#ifndef PULSAR_ATTN_STATIC_MIN_BLOCKS
+#define PULSAR_ATTN_STATIC_MIN_BLOCKS 4
+#endif
+
+__global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
+static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
