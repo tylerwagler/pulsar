@@ -130,11 +130,15 @@ static void attn_f16_kernel(
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, int raw_f16,
         uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start_in,
-        uint32_t top_k) {
+        uint32_t top_k,
+        const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
+        const void *const *__restrict__ comp_bank_ptrs,
+        uint32_t comp_cap, uint32_t n_banks) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
+    (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -145,6 +149,17 @@ static void attn_f16_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t g = lane >> 2u;          /* fragment groupID 0..7 */
     const uint32_t tg = lane & 3u;          /* thread-in-group 0..3 */
+
+    /* Dead/evicted row: zero the heads and leave together.  This MUST precede
+     * every __syncthreads in the kernel, exactly as in the f32 twin -- a
+     * partial early return past a barrier hangs the block. */
+    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        for (uint32_t i = tid; i < AF16_HPB * AF16_DIM; i += AF16_THREADS) {
+            const uint32_t hh = hbase + i / AF16_DIM;
+            if (hh < n_head) heads[((uint64_t)t * n_head + hh) * AF16_DIM + (i % AF16_DIM)] = 0.0f;
+        }
+        return;
+    }
 
     /* ---- row plan ------------------------------------------------------
      * Two modes.  Dense window (topk == NULL) is the raw/mixed launchers'
@@ -157,14 +172,31 @@ static void attn_f16_kernel(
      * -- which is exactly the case its own comment documents as equivalent. */
     __shared__ uint32_t sRawRows[256];
     __shared__ uint32_t sRawCount, sRawFirst;
+    __shared__ uint32_t sVisComp;
     uint32_t raw_count, raw_start = 0u, comp_count = 0u;
+    uint32_t comp_base = 0u;
+    const float *comp_src = comp_kv;
     if (topk) {
-        const uint32_t qpos = pos0 + t;
-        const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+        /* Descriptor (banked) preamble, byte-for-byte as the f32 kernel derives
+         * it; NULL descriptors collapse to the scalar pos0+t path. */
+        const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+        uint32_t eff_n_raw = n_raw, eff_raw_start = raw_start_in, first_raw_pos;
+        if (positions) {
+            eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+            if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+            eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+            first_raw_pos = qpos + 1u - eff_n_raw;
+        } else {
+            first_raw_pos = pos0 + n_tokens - n_raw;
+        }
+        const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
+        const uint32_t raw_base = seq_id ? sid_b * raw_cap : 0u;
+        comp_src = comp_bank_ptrs ? (const float *)comp_bank_ptrs[sid_b] : comp_kv;
+        comp_base = comp_bank_ptrs ? 0u : (seq_id ? sid_b * comp_cap : 0u);
         if (tid == 0u) {
             uint32_t rc = 0u, rf = 0u;
-            if (n_raw != 0u) {
-                const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (eff_n_raw != 0u) {
+                const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
                 if (qpos >= first_raw_pos) {
                     uint32_t lo = first_raw_pos;
                     if (window != 0u && qpos + 1u > window) {
@@ -181,13 +213,14 @@ static void attn_f16_kernel(
         __syncthreads();
         raw_count = sRawCount;
         for (uint32_t r = tid; r < raw_count; r += AF16_THREADS)
-            sRawRows[r] = (raw_start_in + sRawFirst + r) % raw_cap;
+            sRawRows[r] = raw_base + (eff_raw_start + sRawFirst + r) % raw_cap;
         uint32_t visible_comp = n_comp;
         if (ratio != 0u) {
             visible_comp = (qpos + 1u) / ratio;
             if (visible_comp > n_comp) visible_comp = n_comp;
         }
         comp_count = top_k < visible_comp ? top_k : visible_comp;
+        sVisComp = visible_comp;
         __syncthreads();
     } else {
         raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
@@ -264,10 +297,14 @@ static void attn_f16_kernel(
                         /* Clamp exactly as the f32 kernel does: the engine keeps
                          * padding sentinels out, but a stray index would be a
                          * multi-GB wild read.  Substitute row 0 on violation. */
+                        /* Clamp against VISIBLE_comp, not n_comp: the f32
+                         * kernel substitutes row 0 for anything at or beyond
+                         * the visible prefix, and a looser bound here would
+                         * read a row it would have discarded. */
                         const int32_t c = topk[(uint64_t)t * top_k + ci];
-                        ci = (c >= 0 && (uint32_t)c < n_comp) ? (uint32_t)c : 0u;
+                        ci = (c >= 0 && (uint32_t)c < sVisComp) ? (uint32_t)c : 0u;
                     }
-                    const float *cr = comp_kv + (uint64_t)ci * AF16_DIM;
+                    const float *cr = comp_src + ((uint64_t)comp_base + ci) * AF16_DIM;
                     v = make_half2(__float2half(cr[d2]), __float2half(cr[d2 + 1u]));
                 }
             }
@@ -433,7 +470,8 @@ int pulsar_gpu_attention_f16_prefill(
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_f16, 0u, 0u, 1u, 0u, 0u);
+                                            n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
+                                            NULL, NULL, NULL, 0u, 1u);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -447,8 +485,13 @@ int pulsar_gpu_attention_f16_indexed(
         const float *raw_kv, const float *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16) {
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
+        const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
+        uint32_t comp_cap, uint32_t n_banks) {
     if (!heads || !sinks || !q || !raw_kv || !comp_kv || !topk) return 0;
+    /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
+    if ((positions != NULL) != (seq_id != NULL)) return 0;
+    if (positions && (n_banks == 0u || comp_cap == 0u)) return 0;
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
     if (n_tokens == 0u || raw_cap == 0u || top_k == 0u) return 0;
@@ -462,6 +505,10 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, raw_f16, pos0, n_raw, raw_cap,
-                                            raw_start, top_k);
+                                            raw_start, top_k,
+                                            (const int32_t *)positions,
+                                            (const int32_t *)seq_id,
+                                            comp_bank_ptrs, comp_cap,
+                                            positions ? n_banks : 1u);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }

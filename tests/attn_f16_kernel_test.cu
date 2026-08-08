@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
     /* ---- oracle, f64, same fp16 operands ---------------------------------- */
     std::vector<double> ref(bench_only ? 0 : (size_t)n_tokens * n_head * D, 0.0);
     for (uint32_t t = 0; t < (bench_only ? 0u : n_tokens); t++) {
-        uint32_t cnt, start = 0u, ccnt = 0u, rfirst = 0u;
+        uint32_t cnt, start = 0u, ccnt = 0u, rfirst = 0u, vis = n_comp;
         if (indexed) {
             const uint32_t qpos = pos0 + t;
             const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -113,7 +113,6 @@ int main(int argc, char **argv) {
                 }
             }
             cnt = rc;
-            uint32_t vis = n_comp;
             if (ratio) { vis = (qpos + 1u) / ratio; if (vis > n_comp) vis = n_comp; }
             ccnt = top_k < vis ? top_k : vis;
         } else {
@@ -129,8 +128,9 @@ int main(int argc, char **argv) {
             }
             uint32_t ci = r - cnt;
             if (indexed) {
+                /* clamp against VISIBLE comp, matching the f32 kernel */
                 const int32_t c = tk[(size_t)t * top_k + ci];
-                ci = (c >= 0 && (uint32_t)c < n_comp) ? (uint32_t)c : 0u;
+                ci = (c >= 0 && (uint32_t)c < vis) ? (uint32_t)c : 0u;
             }
             return &ckv[(size_t)ci * D];
         };
@@ -178,7 +178,8 @@ int main(int argc, char **argv) {
     const int rc = indexed
         ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, dtk,
                                            n_tokens, pos0, n_raw, rcap, 0u,
-                                           n_comp, top_k, window, ratio, n_head, D, 0)
+                                           n_comp, top_k, window, ratio, n_head, D, 0,
+                                           NULL, NULL, NULL, 0u, 1u)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
                                            n_comp ? dckv : NULL,
                                            n_tokens, n_comp, window, ratio,

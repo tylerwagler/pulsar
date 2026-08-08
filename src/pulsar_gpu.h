@@ -232,7 +232,12 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        int                     raw_f16);
+        int                     raw_f16,
+        const int               *positions,
+        const int               *seq_id,
+        const void * const      *comp_bank_ptrs,
+        uint32_t                comp_cap,
+        uint32_t                n_banks);
 
 /* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,

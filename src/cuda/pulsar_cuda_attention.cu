@@ -2465,7 +2465,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
          * descriptors is the case the gate above already forces to be
          * unpacked, so this covers it and refuses the rest. */
         static const int use_f16_idx = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
-        if (use_f16_idx && !descr && !comp_kv_pack && topk_ptr &&
+        if (use_f16_idx && !comp_kv_pack && topk_ptr &&
             head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u) {
             static int announced = 0;
             if (!announced) {
@@ -2477,7 +2477,9 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                     (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
                     (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
                     raw_start, n_comp, top_k, window, ratio, n_head, head_dim,
-                    (int)raw_f16))
+                    (int)raw_f16, (const int *)positions_ptr,
+                    (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
+                    comp_cap, descr ? n_banks : 1u))
                 return 1;
             fprintf(stderr, "pulsar: fp16 indexed attention FAILED; refusing to "
                             "fall through to the f32 kernel\n");
