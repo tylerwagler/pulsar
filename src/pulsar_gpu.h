@@ -192,6 +192,25 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
+/* fp16 tensor-core attention (m16n8k16, f32 accumulate).  Raw pointers: a leaf
+ * kernel behind the attention launchers, which do the tensor-level checking.
+ * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a
+ * multiple of 16.  Operand format chosen by measurement, not preference --
+ * see tests/attn_precision_fidelity.cc and docs/engine-perf-map.md. */
+int pulsar_gpu_attention_f16_prefill(
+        float                   *heads,
+        const float             *sinks,
+        const float             *q,
+        const float             *raw_kv,
+        const float             *comp_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        int                     raw_f16);
+
 /* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or

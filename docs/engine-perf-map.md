@@ -125,6 +125,36 @@ the win has to come from the tensor-core dataflow removing the 8x shared-memory
 re-read (8 warps each pulling the whole 2 KB row), not from raw math.  2-3x on
 the attention kernels is the realistic target, i.e. 11-17% of prefill.
 
+#### Built: src/cuda/pulsar_cuda_attn_f16.cu (opt-in, PULSAR_CUDA_ATTN_F16)
+
+fp16 chosen, kernel written, wired into both window launchers behind the env
+flag.  MEASURED in-engine, same workload:
+
+    attention_static_mixed_heads8_online   10.92 ms/launch   (43 launches)
+    attn_f16_kernel                         7.39 ms/launch   1.48x
+    cold prefill  869.5 -> 931.4 tok/s      +7.1%
+
+Beware a comparison that looks better and is wrong: a standalone bench of the
+new kernel at n_comp=0 runs 4.38 ms, which against 10.92 reads as 2.5x.  It is
+not the same work -- the engine's calls carry ~512 compressed rows on top of
+the 128-row raw window, so the standalone shape is a fifth of the rows.  1.48x
+is the honest number.
+
+The second frontier does not move (770 -> 768): continued prefill goes through
+attention_decode_mixed_heads8_online, which is NOT wired.  That kernel is 3.4%
+and the indexed one is 12.5%; both are still on the FMA pipe.  Wiring them is
+the obvious next step and worth more than what was just taken.
+
+Why only 1.48x when the instruction rate is 4.3x: the kernel still re-stages
+the whole KV window from global into shared, converting to fp16, once per
+(token, head-group) block -- grid is (n_tokens, n_head/16), so four head-groups
+each re-read the same rows.  That is better than the old kernel's eight, but it
+is still 4x redundant, and it is now the thing to fix rather than the math.
+
+End-to-end this IS a fidelity change, as designed: same greedy argmax, 9/10
+top-10 overlap, mean |logit delta| 0.32 against a [-47.7, 37.5] range on the
+frontier checked.  Default-on waits for the suite-v1 KL run.
+
 ### 2. MoE gate/up: 17.8% in one kernel
 
     Compute (SM) 58.5%, Memory 48.6%, L2 48.6%

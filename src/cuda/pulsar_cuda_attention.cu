@@ -1939,6 +1939,31 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
                               n_tokens, n_head, head_dim, window, raw_f16);
+        /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
+         * 0%; see docs/engine-perf-map.md.  OPT-IN until the suite-v1 KL run
+         * clears it: fp16 operands change the numbers, and the component
+         * measurement backing the choice (tests/attn_precision_fidelity.cc:
+         * top-1 attention position preserved ~100%, KL <= 3e-7) is evidence,
+         * not the shipping gate.  Shape conditions are checked by the launcher
+         * itself, and a 0 return here is a REAL failure, so it is reported
+         * rather than silently demoted to the FMA kernel. */
+        static const int use_f16_attn = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
+        if (use_f16_attn && head_dim == 512u && (n_head % 16u) == 0u) {
+            static int announced = 0;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
+                                "(PULSAR_CUDA_ATTN_F16; operands rounded to fp16)\n");
+            }
+            if (pulsar_gpu_attention_f16_prefill(
+                    (float *)heads->ptr, sinks, (const float *)q->ptr,
+                    (const float *)raw_kv->ptr, NULL,
+                    n_tokens, 0u, window, 1u, n_head, head_dim, (int)raw_f16))
+                return 1;
+            fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
+                            "fall through to the f32 kernel\n");
+            return 0;
+        }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -2549,6 +2574,27 @@ static int attention_prefill_mixed_launch(
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
+         * This is the site that carries the traffic: the raw-window one runs
+         * twice a prefill, this one runs per layer. */
+        static const int use_f16_attn_mixed = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
+        if (use_f16_attn_mixed && head_dim == 512u && (n_head % 16u) == 0u) {
+            static int announced = 0;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
+                                "(PULSAR_CUDA_ATTN_F16; operands rounded to fp16)\n");
+            }
+            if (pulsar_gpu_attention_f16_prefill(
+                    (float *)heads->ptr, sinks, (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : NULL,
+                    n_tokens, n_comp, window, ratio, n_head, head_dim, (int)raw_f16))
+                return 1;
+            fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
+                            "fall through to the f32 kernel\n");
+            return 0;
+        }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
