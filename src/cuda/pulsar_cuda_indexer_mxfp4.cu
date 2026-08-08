@@ -67,7 +67,15 @@
  * Padding by one word breaks the period without changing any addressing math
  * beyond the stride constant. */
 #define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
-#define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B */
+#define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B (global cache row) */
+/* Shared B is stored LANE-MAJOR, not row-major: 64 B per compressed row, laid
+ * out as [tig][slab][half] halfwords.  The MMA's B fragment wants, for lane
+ * group position tig, the halfword at row byte (slab*16 + half*8 + tig*2) --
+ * eight scattered 2-byte reads per row across the four slabs.  Permuting once
+ * at staging time makes those eight halfwords contiguous, so the whole k loop's
+ * B operand arrives in ONE 16-byte LDS.  No padding: the warp's 32 lanes read
+ * 32 consecutive 16 B chunks, which is already conflict-free. */
+#define IDX_BPSTRIDE  64u
 /* ONE token staged at a time.  With K resident across the group there is no
  * reuse argument left for staging two, and sA is the biggest smem consumer:
  * dropping it 16.9 KB -> 8.5 KB takes the block from ~31 KB to ~20 KB, i.e.
@@ -152,33 +160,70 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
  * at roughly 3 TFLOP/s -- i.e. the tensor cores were idling behind the encode.
  *
  * Hoisting it into its own pass is why Entrpi ships a separate
- * indexer_mxf4_encode_rows_kernel (12.83 ms) next to its scorer (4.94 ms). */
+ * indexer_mxf4_encode_rows_kernel (12.83 ms) next to its scorer (4.94 ms).
+ *
+ * And it is the whole remaining cost.  Sweeping n_comp with n_tokens fixed
+ * separates the two: the runtime is linear in n_comp with slope 1.23e-4 ms per
+ * compressed row and an intercept of 0.270 ms.  Only the slope is the GEMM, so
+ * at n_comp=512 the GEMM is 0.063 ms -- 34 TMAC/s, already competitive -- and
+ * the intercept, 82% of the launch, is this pack.  Every "the scorer runs at
+ * 6.5 TMAC/s" figure before that sweep divided total MACs by a runtime that was
+ * mostly this kernel, which is why tiling and occupancy work kept returning
+ * single-digit percent.
+ *
+ * ONE WARP PER (token, head) ROW.  The previous version put one thread on each
+ * 32-element scale block, so a thread walked 128 contiguous bytes while its
+ * neighbour started 128 B away: every warp-wide load fanned out into 32 separate
+ * transactions and the kernel ran at 78 GB/s against ~273 GB/s of bandwidth.
+ * With a warp on the row, lane L takes elements 4L..4L+3 as one float4, the
+ * warp covers the 512 B row in a single coalesced access, and the eight lanes
+ * spanning a scale block reduce their amax by shuffle instead of one thread
+ * scanning 32 values serially.  The e4m3 result stores the same way: four bytes
+ * per lane, 128 B per warp, one transaction. */
+__device__ __forceinline__ static int idx_amax_shift(float amax) {
+    if (!(amax > 0.0f)) return -127;
+    /* frexp's e is (unbiased exponent + 1), so se = (e-1)-8 is just a constant
+     * off the stored exponent field -- no need to call frexpf for it. */
+    const uint32_t ef = (__float_as_uint(amax) >> 23) & 0xFFu;
+    if (ef != 0u) return (int)ef - 135;            /* e4m3 emax = 8 */
+    int e; frexpf(amax, &e); return (e - 1) - 8;   /* subnormal amax: rare */
+}
+
 __global__ __launch_bounds__(256, 4)
 static void idx_pack_q_kernel(
         uint8_t *__restrict__ qa,            /* [n_tokens][heads][128] e4m3 */
         uint8_t *__restrict__ qsf,           /* [n_tokens][heads][4]   ue8m0 */
         const float *__restrict__ q,
-        uint32_t n_tokens) {
-    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = n_tokens * IDX_HEADS * IDX_KSLABS;
-    if (slot >= total) return;
-    const uint32_t blk = slot % IDX_KSLABS;
-    const uint32_t h   = (slot / IDX_KSLABS) % IDX_HEADS;
-    const uint32_t t   = slot / (IDX_KSLABS * IDX_HEADS);
+        uint32_t n_rows) {                   /* n_tokens * IDX_HEADS */
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row  = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    if (row >= n_rows) return;
 
-    const float *src = q + ((uint64_t)t * IDX_HEADS + h) * IDX_HEAD_DIM + blk * 32u;
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(src[i]));
-    int se = -127;
-    if (amax > 0.0f) { int e; frexpf(amax, &e); se = (e - 1) - 8; }   /* e4m3 emax = 8 */
-    int byte = se + 128;                       /* hw applies 2^(byte-128) */
-    if (byte < 0) byte = 0;
-    if (byte > 255) byte = 255;
-    qsf[((uint64_t)t * IDX_HEADS + h) * IDX_KSLABS + blk] = (uint8_t)byte;
+    /* qa and q share the [row][128] layout, so the row index needs no decompose
+     * into (token, head) at all. */
+    const float4 v = ((const float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane];
+
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    /* Lanes 8b..8b+7 hold scale block b, so xor over the low three lane bits
+     * reduces within the block and leaves every lane with its own block's amax. */
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
+
+    const int se = idx_amax_shift(amax);
+    if ((lane & 7u) == 0u) {
+        int byte = se + 128;                   /* hw applies 2^(byte-128) */
+        if (byte < 0) byte = 0;
+        if (byte > 255) byte = 255;
+        qsf[(uint64_t)row * IDX_KSLABS + (lane >> 3u)] = (uint8_t)byte;
+    }
 
     const float inv = ldexpf(1.0f, -se);
-    uint8_t *dst = qa + ((uint64_t)t * IDX_HEADS + h) * IDX_HEAD_DIM + blk * 32u;
-    for (uint32_t i = 0; i < 32u; i++) dst[i] = idx_f32_to_e4m3(src[i] * inv);
+    const uint32_t w = (uint32_t)idx_f32_to_e4m3(v.x * inv) |
+                       ((uint32_t)idx_f32_to_e4m3(v.y * inv) << 8) |
+                       ((uint32_t)idx_f32_to_e4m3(v.z * inv) << 16) |
+                       ((uint32_t)idx_f32_to_e4m3(v.w * inv) << 24);
+    ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = w;
 }
 
 /* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
@@ -190,7 +235,27 @@ __device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
 
 /* ---- kernel ------------------------------------------------------------- */
 
-__global__ __launch_bounds__(IDX_THREADS, 2)
+/* Occupancy target.  ncu on the 87-register build: LSU 37%, ALU 20%, tensor
+ * 17%, IPC 0.38 of 1.0 -- nothing saturated, so the kernel is latency-bound and
+ * wants more warps resident, not fewer instructions.  87 regs x 256 threads =
+ * 22272 of the SM's 65536, which caps it at 2 blocks (16 of 48 warps, 33%).
+ * Raising minBlocksPerMultiprocessor forces the register budget down: 3 blocks
+ * needs <=85 regs, 4 needs <=64.  Both now fit in smem, which 29 KB/block did
+ * not -- the B permute took the block to 19.5 KB, so 4 x 19.5 = 78 KB < 100 KB.
+ *
+ * MEASURED, and the two levers only pay together (ms per compressed row):
+ *                     2 blocks/SM   3 blocks/SM
+ *   B row-major        1.271e-4      1.3125e-4
+ *   B lane-major       1.323e-4      1.198e-4
+ * Either change alone is a regression.  Row-major B is LSU-bound, so extra
+ * warps only add contention on the pipe that is already the busiest; cutting
+ * the B loads is what turns the occupancy into a win.  4 and 5 blocks/SM both
+ * lose again -- ptxas spills (16 B and 32 B of stack) and the slope goes to
+ * 1.376e-4 and 1.497e-4. */
+#ifndef IDX_MINBLK
+#define IDX_MINBLK 3
+#endif
+__global__ __launch_bounds__(IDX_THREADS, IDX_MINBLK)
 static void idx_scores_mxfp4_kernel(
         float *__restrict__ scores,          /* [n_tokens][n_comp] */
         const uint8_t *__restrict__ qa,      /* [n_tokens][heads][128] e4m3 */
@@ -229,7 +294,7 @@ static void idx_scores_mxfp4_kernel(
      * Reducing in-register over the warp's own rows and combining warps through
      * a 2 KB partial buffer removes both problems, which is what lets N double. */
     __shared__ uint8_t sA[IDX_TOKTILE * IDX_HEADS * IDX_ASTRIDE];    /* ~17 KB e4m3 */
-    __shared__ uint8_t sB[IDX_NTILE * IDX_BSTRIDE];          /* ~8.7 KB packed nibbles */
+    __shared__ __align__(16) uint8_t sB[IDX_NTILE * IDX_BPSTRIDE];   /* 8 KB packed nibbles */
     __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
     __shared__ float   sPart[4][IDX_NTILE];                /*  2 KB: 4 m-tiles */
@@ -241,21 +306,25 @@ static void idx_scores_mxfp4_kernel(
      * which is what limits how many blocks an SM can hold.  Expanding two bytes
      * into four byte-containers is ~7 ALU ops at the point of use, against a
      * shared-memory read we no longer have to make. */
-    for (uint32_t slot = tid; slot < IDX_NTILE * 16u; slot += IDX_THREADS) {
-        const uint32_t c = slot / 16u;
-        const uint32_t j = slot % 16u;                  /* 16 x uint32 = 64 B/row */
+    /* Halfword-granular so the permute can be applied on the way in.  Source
+     * halfword u of a row decomposes as u = slab*8 + half*4 + tig, and lands at
+     * lane-major position tig*8 + slab*2 + half. */
+    for (uint32_t slot = tid; slot < IDX_NTILE * 32u; slot += IDX_THREADS) {
+        const uint32_t c = slot >> 5u;                  /* 32 halfwords = 64 B/row */
+        const uint32_t u = slot & 31u;
+        const uint32_t sl = u >> 3u, rem = u & 7u, hf = rem >> 2u, tg = rem & 3u;
+        uint16_t *dst = (uint16_t *)(sB + c * IDX_BPSTRIDE) + tg * 8u + sl * 2u + hf;
         const uint32_t comp_i = tile_c + c;
-        uint32_t *dst = (uint32_t *)(sB + c * IDX_BSTRIDE);
         if (comp_i >= n_comp) {
-            dst[j] = 0u;
-            if (j < IDX_KSLABS) sSFB[c * IDX_KSLABS + j] = 0;
+            *dst = 0u;
+            if (u < IDX_KSLABS) sSFB[c * IDX_KSLABS + u] = 0;
             continue;
         }
         const uint8_t *row = comp + (uint64_t)comp_i * PULSAR_MXKV_FP4_ROWBYTES(128u);
-        dst[j] = *(const uint32_t *)(row + j * 4u);
-        if (j < IDX_KSLABS) {
-            const int sfb = (int)row[64u + j] - 1;   /* +1 bias, -2 for the 4x */
-            sSFB[c * IDX_KSLABS + j] = (uint8_t)(sfb < 0 ? 0 : sfb);
+        *dst = *(const uint16_t *)(row + u * 2u);
+        if (u < IDX_KSLABS) {
+            const int sfb = (int)row[64u + u] - 1;   /* +1 bias, -2 for the 4x */
+            sSFB[c * IDX_KSLABS + u] = (uint8_t)(sfb < 0 ? 0 : sfb);
         }
     }
     __syncthreads();
@@ -304,12 +373,31 @@ static void idx_scores_mxfp4_kernel(
      * pressure cancels the traffic it saves.  minBlocksPerMultiprocessor is 2:
      * 4 was unsatisfiable at ~29 KB of smem per block and only distorted
      * register allocation (0.330 at 2, 0.336 at 1, 0.331 at 3). */
+    #ifndef IDX_NB
     #define IDX_NB 4u
+    #endif
     const uint32_t nt_lo = warp_n * (IDX_NTILE / 16u);
     for (uint32_t nt0 = nt_lo; nt0 < nt_lo + IDX_NTILE / 16u; nt0 += IDX_NB) {
         float d[IDX_NB][4];
         #pragma unroll
         for (uint32_t j = 0; j < IDX_NB; j++) { d[j][0] = d[j][1] = d[j][2] = d[j][3] = 0.f; }
+
+        /* B and its scales are now loop-invariant across the k slabs: the
+         * lane-major layout puts all four slabs of a row in one 16 B chunk, and
+         * the four scale bytes in one uint32.  So B costs 1 LDS per n-tile for
+         * the whole k loop instead of 8, and its scales 1 instead of 4 -- the
+         * warp goes from 17 LDS per slab per 4 MMAs (4.25 per MMA) to 4+1 for A
+         * and 2 per n-tile amortised over all four slabs.  ncu put L1/TEX at 69%
+         * with L2 at 10% and named an L1TEX scoreboard stall as 36% of the
+         * 12.9 cycles between issues, so this pipe, not the MMA, was the limit. */
+        uint4 braw[IDX_NB];
+        uint32_t sfb4[IDX_NB];
+        #pragma unroll
+        for (uint32_t j = 0; j < IDX_NB; j++) {
+            const uint32_t n_base = (nt0 + j) * 8u;
+            braw[j] = *(const uint4 *)(sB + (n_base + g) * IDX_BPSTRIDE + tig * 16u);
+            sfb4[j] = *(const uint32_t *)(sSFB + (n_base + g) * IDX_KSLABS);
+        }
 
         /* Software-pipelined within the slab: issue ALL operand fetches, then
          * all MMAs.  Previously each j fetched its B fragment immediately before
@@ -332,16 +420,19 @@ static void idx_scores_mxfp4_kernel(
             const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);
             const uint32_t sfa = sSFA[m_for_sfa * IDX_KSLABS + s];
 
+            /* s is a compile-time constant in every unrolled copy, so the word
+             * select folds and braw stays in registers. */
+            #define IDX_BSEL(v, i) ((i) == 0u ? (v).x : (i) == 1u ? (v).y : \
+                                    (i) == 2u ? (v).z : (v).w)
             uint32_t bb0[IDX_NB], bb1[IDX_NB], sfbv[IDX_NB];
             #pragma unroll
             for (uint32_t j = 0; j < IDX_NB; j++) {
-                const uint32_t n_base = (nt0 + j) * 8u;
-                const uint8_t *br = sB + (n_base + g) * IDX_BSTRIDE
-                                       + (k0 >> 1) + tig * 2u;
-                bb0[j]  = idx_spread4(*(const uint16_t *)br);
-                bb1[j]  = idx_spread4(*(const uint16_t *)(br + 8u));
-                sfbv[j] = sSFB[(n_base + g) * IDX_KSLABS + s];
+                const uint32_t bw = IDX_BSEL(braw[j], s);
+                bb0[j]  = idx_spread4(bw & 0xFFFFu);     /* half 0 */
+                bb1[j]  = idx_spread4(bw >> 16);         /* half 1 */
+                sfbv[j] = (sfb4[j] >> (s * 8u)) & 0xFFu;
             }
+            #undef IDX_BSEL
             #pragma unroll
             for (uint32_t j = 0; j < IDX_NB; j++)
                 idx_mma_m16n8k32(d[j][0], d[j][1], d[j][2], d[j][3],
@@ -364,7 +455,7 @@ static void idx_scores_mxfp4_kernel(
             }
         }
     }
-    #undef IDX_NB
+    /* left defined: the sweep sets it from the build line */
     __syncthreads();
 
     /* ---- combine the warps' head-groups, then scale and mask ------------ */
@@ -401,8 +492,9 @@ extern "C" int pulsar_gpu_indexer_scores_mxfp4(
     if (!qa) return 0;
     uint8_t *qsf = qa + qa_bytes;
 
-    const uint32_t pack_total = n_tokens * IDX_HEADS * IDX_KSLABS;
-    idx_pack_q_kernel<<<(pack_total + 255u) / 256u, 256>>>(qa, qsf, q, n_tokens);
+    /* One warp per (token, head) row, 8 warps per block. */
+    const uint32_t pack_rows = n_tokens * IDX_HEADS;
+    idx_pack_q_kernel<<<(pack_rows + 7u) / 8u, 256>>>(qa, qsf, q, pack_rows);
     if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q pack launch")) return 0;
 
     dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE,

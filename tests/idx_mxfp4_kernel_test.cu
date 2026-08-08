@@ -190,6 +190,36 @@ int main(int argc, char **argv) {
      * same per-launch work here.  This is a kernel-level number, not an
      * end-to-end one -- it does not include the Q packing the engine would
      * still have to do outside this kernel. */
+    /* Pack alone.  The n_comp sweep put 0.270 ms of the 0.329 in a term that
+     * does not scale with n_comp; time that term directly rather than keep
+     * reading it off a regression intercept. */
+    {
+        uint8_t *d_qa = nullptr, *d_qsf = nullptr;
+        const size_t qab = (size_t)n_tokens * IDX_HEADS * IDX_HEAD_DIM;
+        cudaMalloc(&d_qa, qab);
+        cudaMalloc(&d_qsf, (size_t)n_tokens * IDX_HEADS * IDX_KSLABS);
+        const uint32_t rows = n_tokens * IDX_HEADS;
+        cudaEvent_t p0, p1; cudaEventCreate(&p0); cudaEventCreate(&p1);
+        const int iters = 50;
+        for (int i = 0; i < 5; i++)
+            idx_pack_q_kernel<<<(rows + 7u) / 8u, 256>>>(d_qa, d_qsf, d_q, rows);
+        cudaDeviceSynchronize();
+        cudaEventRecord(p0);
+        for (int i = 0; i < iters; i++)
+            idx_pack_q_kernel<<<(rows + 7u) / 8u, 256>>>(d_qa, d_qsf, d_q, rows);
+        cudaEventRecord(p1);
+        cudaEventSynchronize(p1);
+        float ms = 0.f; cudaEventElapsedTime(&ms, p0, p1);
+        const double bytes = (double)qab * 4.0 + (double)qab;   /* f32 in, e4m3 out */
+        /* Cache-warm: the loop re-reads one 16.8 MB Q buffer, so this lands
+         * above DRAM bandwidth and is a lower bound on the real cost.  The
+         * honest number is the n_comp-sweep intercept, which pays cold misses
+         * and both launch overheads. */
+        printf("pack alone: %.4f ms/launch  (%.1f GB/s effective, cache-warm)\n",
+               ms / iters, bytes / ((ms / iters) * 1e-3) / 1e9);
+        cudaFree(d_qa); cudaFree(d_qsf);
+    }
+
     {
         cudaEvent_t e0, e1;
         cudaEventCreate(&e0); cudaEventCreate(&e1);

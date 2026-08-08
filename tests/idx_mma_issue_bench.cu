@@ -106,7 +106,10 @@ int main(void) {
     const double t4 = run(bench_mxf4nvf4, blocks, threads, "mxf4nvf4", 8192.0);
     if (t8 > 0 && t4 > 0)
         printf("\n  mxf4nvf4 / mxf8f6f4 = %.2fx on MACs\n", t4 / t8);
-    printf("\n  scorer currently achieves ~6.5 TMAC/s\n");
+    /* 6.5 TMAC/s was total MACs over a runtime that was 82% Q pack.  Measured
+     * against the n_comp slope alone the GEMM does ~33 TMAC/s, so the real
+     * comparison is 33 against the 125 below: a 3.8x headroom, not a 19x one. */
+    printf("\n  scorer GEMM (n_comp slope only) achieves ~33 TMAC/s\n");
     printf("BENCH_DONE\n");
     return 0;
 }
