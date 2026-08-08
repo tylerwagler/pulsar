@@ -131,8 +131,9 @@ fp16 chosen, kernel written, wired into both window launchers behind the env
 flag.  MEASURED in-engine, same workload:
 
     attention_static_mixed_heads8_online   10.92 ms/launch   (43 launches)
-    attn_f16_kernel                         7.39 ms/launch   1.48x
-    cold prefill  869.5 -> 931.4 tok/s      +7.1%
+    attn_f16_kernel, 1 M-tile               7.39 ms/launch   1.48x
+    attn_f16_kernel, 2 M-tiles              6.39 ms/launch   1.71x
+    cold prefill  868.4 -> 953.4 tok/s      +9.8%
 
 Beware a comparison that looks better and is wrong: a standalone bench of the
 new kernel at n_comp=0 runs 4.38 ms, which against 10.92 reads as 2.5x.  It is
@@ -145,11 +146,23 @@ attention_decode_mixed_heads8_online, which is NOT wired.  That kernel is 3.4%
 and the indexed one is 12.5%; both are still on the FMA pipe.  Wiring them is
 the obvious next step and worth more than what was just taken.
 
-Why only 1.48x when the instruction rate is 4.3x: the kernel still re-stages
-the whole KV window from global into shared, converting to fp16, once per
-(token, head-group) block -- grid is (n_tokens, n_head/16), so four head-groups
-each re-read the same rows.  That is better than the old kernel's eight, but it
-is still 4x redundant, and it is now the thing to fix rather than the math.
+Why not 4.3x, and what the second step bought.  ncu on the 1-M-tile build:
+pipe_tensor 6-8%, pipe_lsu 33%, 7.15 GB of L2 traffic in 11.9 ms -- the MMAs
+idled while the kernel moved KV.  Each block staged the whole window and four
+head-groups per token staged the SAME rows (modelled 10.7 GB against 7.15
+measured; the window ramps, so the model is high).
+
+With M fixed at 16 the block count is n_tokens*n_head/16 NO MATTER how the 16
+is split between tokens and heads, so batching tokens per block does not help
+and only widens the staged window.  The only lever is more (token, head) PAIRS
+per block -- more M-tiles -- which costs registers in both the Q fragments and
+the O accumulator.  Two tiles halves the traffic and fits (114 regs, no spill);
+four would need 128 before temporaries.
+
+Two M-tiles bought 7.39 -> 6.39 ms, i.e. 1.16x from a 2x traffic cut, so
+traffic was not the only limiter: at 512 threads only one block is resident, so
+occupancy is still ~33%.  The remaining gap is worth another look, but it is no
+longer obviously a bandwidth story.
 
 End-to-end this IS a fidelity change, as designed: same greedy argmax, 9/10
 top-10 overlap, mean |logit delta| 0.32 against a [-47.7, 37.5] range on the

@@ -51,14 +51,30 @@
 #include <cstdio>
 #include <cuda_fp16.h>
 
-#define AF16_HEADS     16u        /* heads per block = the MMA's M */
+#define AF16_MT         2u        /* M-tiles per block */
+#define AF16_HEADS     16u        /* the MMA's M */
+#define AF16_HPB      (AF16_HEADS * AF16_MT)       /* 32 heads per block */
 #define AF16_DIM      512u        /* head_dim this kernel is specialised for */
 #define AF16_ROWS      16u        /* KV rows per tile = the MMA's K in phase 3 */
-#define AF16_WARPS      8u
+#define AF16_WARPS     16u
 #define AF16_THREADS  (AF16_WARPS * 32u)
-#define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 64 output dims per warp */
+#define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
+
+/* WHY 2 M-TILES.  ncu on the 1-M-tile version: pipe_tensor 6-8%, pipe_lsu 33%,
+ * 7.15 GB of L2 traffic in 11.9 ms -- the MMAs idle while the kernel moves KV.
+ * Each block stages the whole window (up to 640 rows x 2 KB) and there were 4
+ * head-groups per token all staging the SAME rows, so the traffic modelled at
+ * 10.7 GB against the 7.15 measured (the window ramps up, so the model is high).
+ *
+ * With M fixed at 16, the block count is n_tokens*n_head/16 NO MATTER how the
+ * 16 is split between tokens and heads -- so batching tokens per block does not
+ * help, and adding a token only widens the staged window.  The only lever is
+ * more (token, head) PAIRS per block, i.e. more M-tiles, which costs registers:
+ * Q fragments and the O accumulator both scale with it.  Two tiles halves the
+ * traffic at 32 Q + 32 O registers, which fits; four would need 128 before
+ * temporaries and spill. */
 /* +8 halves of padding: the phase-1 B fragment walks DOWN a column of the tile
  * (fixed dim, varying row), so an unpadded 512-wide row stride would put every
  * lane in the same bank. */
@@ -95,7 +111,15 @@ __device__ __forceinline__ static float af16_kv(const float *raw, int raw_f16,
     return raw[base + d];
 }
 
-__global__ __launch_bounds__(AF16_THREADS, 2)
+/* 512 threads means one block already fills 65536/(512) = 128 registers worth
+ * of the SM budget, so asking for 2 resident blocks caps the kernel at 64 and
+ * it spills (measured: 192 B stack, 196 B spill traffic).  1 is not a
+ * concession here, it is the only setting that lets the accumulators live in
+ * registers at all. */
+#ifndef AF16_MINBLK
+#define AF16_MINBLK 1
+#endif
+__global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
         float *__restrict__ heads,            /* [n_tokens][n_head][512] */
         const float *__restrict__ sinks,      /* [n_head] */
@@ -109,7 +133,7 @@ static void attn_f16_kernel(
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
 #else
     const uint32_t t = blockIdx.x;
-    const uint32_t hbase = blockIdx.y * AF16_HEADS;
+    const uint32_t hbase = blockIdx.y * AF16_HPB;
     if (t >= n_tokens || hbase >= n_head) return;
 
     const uint32_t tid = threadIdx.x;
@@ -129,21 +153,24 @@ static void attn_f16_kernel(
     const float scale = rsqrtf((float)AF16_DIM);
 
     __shared__ __half sKV[AF16_ROWS * AF16_KVSTRIDE];
-    __shared__ float  sPart[4][AF16_HEADS][AF16_ROWS];   /* phase-1 k-split partials */
-    __shared__ float  sS[AF16_HEADS][AF16_ROWS];
-    __shared__ __half sP[AF16_HEADS][AF16_ROWS];
-    __shared__ float  sCorr[AF16_HEADS];
-    __shared__ float  sM[AF16_HEADS], sL[AF16_HEADS];
+    __shared__ float  sPart[4][AF16_MT][AF16_HEADS][AF16_ROWS];  /* k-split partials */
+    __shared__ float  sS[AF16_HPB][AF16_ROWS];
+    __shared__ __half sP[AF16_HPB][AF16_ROWS];
+    __shared__ float  sCorr[AF16_HPB];
+    __shared__ float  sM[AF16_HPB], sL[AF16_HPB];
 
     /* ---- Q fragments, once, into registers -----------------------------
      * Warp w owns k-steps [ (w>>1)*KPW, +KPW ) of head-block M=16.  Q is
      * constant for the whole kernel, so this is loaded once and never re-read;
      * that is the entire reason phase 1 splits k rather than n. */
-    const uint32_t kgrp = warp >> 1u;                   /* 0..3 */
-    const uint32_t ntile = warp & 1u;                   /* which 8 rows */
+    /* 4 jobs = 2 M-tiles x 2 n-tiles; 4 warps split k within each job. */
+    const uint32_t job = warp & 3u;
+    const uint32_t mtile = job >> 1u, ntile = job & 1u;
+    const uint32_t kgrp = warp >> 2u;                   /* 0..3 */
     uint32_t qf[AF16_KPW][4];
     {
-        const uint64_t qbase = ((uint64_t)t * n_head + hbase) * AF16_DIM;
+        const uint64_t qbase =
+            ((uint64_t)t * n_head + hbase + mtile * AF16_HEADS) * AF16_DIM;
         #pragma unroll
         for (uint32_t s = 0; s < AF16_KPW; s++) {
             const uint32_t k0 = (kgrp * AF16_KPW + s) * 16u;
@@ -159,11 +186,13 @@ static void attn_f16_kernel(
     }
 
     /* ---- running softmax state + output accumulator --------------------- */
-    if (tid < AF16_HEADS) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
-    float acc[AF16_DPW / 8u][4];
+    if (tid < AF16_HPB) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
+    float acc[AF16_MT][AF16_DPW / 8u][4];
     #pragma unroll
-    for (uint32_t n = 0; n < AF16_DPW / 8u; n++)
-        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    for (uint32_t m = 0; m < AF16_MT; m++)
+        #pragma unroll
+        for (uint32_t n = 0; n < AF16_DPW / 8u; n++)
+            acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.0f;
     __syncthreads();
 
     for (uint32_t row0 = 0; row0 < n_score; row0 += AF16_ROWS) {
@@ -203,22 +232,24 @@ static void attn_f16_kernel(
                 const uint32_t b1 = *(const uint32_t *)&kr[tg * 2u + 8u];
                 af16_mma(s0, s1, s2, s3, qf[s][0], qf[s][1], qf[s][2], qf[s][3], b0, b1);
             }
-            sPart[kgrp][g][rbase + tg * 2u]      = s0;
-            sPart[kgrp][g][rbase + tg * 2u + 1u] = s1;
-            sPart[kgrp][g + 8u][rbase + tg * 2u]      = s2;
-            sPart[kgrp][g + 8u][rbase + tg * 2u + 1u] = s3;
+            sPart[kgrp][mtile][g][rbase + tg * 2u]      = s0;
+            sPart[kgrp][mtile][g][rbase + tg * 2u + 1u] = s1;
+            sPart[kgrp][mtile][g + 8u][rbase + tg * 2u]      = s2;
+            sPart[kgrp][mtile][g + 8u][rbase + tg * 2u + 1u] = s3;
         }
         __syncthreads();
 
         /* ---- phase 2: sum the k-split, then online softmax --------------- */
-        for (uint32_t i = tid; i < AF16_HEADS * AF16_ROWS; i += AF16_THREADS) {
+        for (uint32_t i = tid; i < AF16_HPB * AF16_ROWS; i += AF16_THREADS) {
             const uint32_t h = i / AF16_ROWS, r = i % AF16_ROWS;
-            const float v = sPart[0][h][r] + sPart[1][h][r] + sPart[2][h][r] + sPart[3][h][r];
+            const uint32_t mt = h / AF16_HEADS, hh = h % AF16_HEADS;
+            const float v = sPart[0][mt][hh][r] + sPart[1][mt][hh][r] +
+                            sPart[2][mt][hh][r] + sPart[3][mt][hh][r];
             sS[h][r] = (r < nr) ? v * scale : -INFINITY;
         }
         __syncthreads();
 
-        if (tid < AF16_HEADS) {
+        if (tid < AF16_HPB) {
             const uint32_t h = tid;
             float mx = sM[h];
             for (uint32_t r = 0; r < nr; r++) mx = fmaxf(mx, sS[h][r]);
@@ -235,17 +266,21 @@ static void attn_f16_kernel(
         __syncthreads();
 
         /* ---- phase 3: O = O*corr + P . KV ------------------------------- */
-        {
-            /* The accumulator's two head rows for this lane are g and g+8. */
-            const float ca = sCorr[g], cb = sCorr[g + 8u];
-            const uint32_t pa0 = *(const uint32_t *)&sP[g][tg * 2u];
-            const uint32_t pa1 = *(const uint32_t *)&sP[g + 8u][tg * 2u];
-            const uint32_t pa2 = *(const uint32_t *)&sP[g][tg * 2u + 8u];
-            const uint32_t pa3 = *(const uint32_t *)&sP[g + 8u][tg * 2u + 8u];
+        #pragma unroll
+        for (uint32_t m = 0; m < AF16_MT; m++) {
+            /* The accumulator's two head rows for this lane are g and g+8 of
+             * THIS m-tile; every warp now sweeps both tiles against the one
+             * staged KV tile, which is the whole point of the change. */
+            const uint32_t hb0 = m * AF16_HEADS;
+            const float ca = sCorr[hb0 + g], cb = sCorr[hb0 + g + 8u];
+            const uint32_t pa0 = *(const uint32_t *)&sP[hb0 + g][tg * 2u];
+            const uint32_t pa1 = *(const uint32_t *)&sP[hb0 + g + 8u][tg * 2u];
+            const uint32_t pa2 = *(const uint32_t *)&sP[hb0 + g][tg * 2u + 8u];
+            const uint32_t pa3 = *(const uint32_t *)&sP[hb0 + g + 8u][tg * 2u + 8u];
             #pragma unroll
             for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
-                acc[n][0] *= ca; acc[n][1] *= ca;
-                acc[n][2] *= cb; acc[n][3] *= cb;
+                acc[m][n][0] *= ca; acc[m][n][1] *= ca;
+                acc[m][n][2] *= cb; acc[m][n][3] *= cb;
                 /* B[k=row][n=dim]: this lane's column is n_base+g, and its four
                  * k values are rows 2t, 2t+1, 2t+8, 2t+9.  Already fp16 in
                  * smem, so repack the bits rather than round-tripping f32. */
@@ -256,7 +291,7 @@ static void attn_f16_kernel(
                 const uint32_t b1 =
                     (uint32_t)__half_as_ushort(kc[(tg * 2u + 8u) * AF16_KVSTRIDE]) |
                     ((uint32_t)__half_as_ushort(kc[(tg * 2u + 9u) * AF16_KVSTRIDE]) << 16);
-                af16_mma(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
+                af16_mma(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
                          pa0, pa1, pa2, pa3, b0, b1);
             }
         }
@@ -264,7 +299,7 @@ static void attn_f16_kernel(
     }
 
     /* ---- epilogue: fold the sink, normalise, store ---------------------- */
-    if (tid < AF16_HEADS) {
+    if (tid < AF16_HPB) {
         const uint32_t h = hbase + tid;
         const float sink = (h < n_head) ? sinks[h] : -INFINITY;
         const float nm = fmaxf(sM[tid], sink);
@@ -281,18 +316,24 @@ static void attn_f16_kernel(
          * n_base+2t and n_base+2t+1.  Note N is the DIM axis here and the ROW
          * axis in phase 1 -- the two phases transpose, and mixing them up is
          * the one bug this kernel cannot detect at runtime. */
-        const float ia = sCorr[g]      / (sL[g]      == 0.0f ? 1.0f : sL[g]);
-        const float ib = sCorr[g + 8u] / (sL[g + 8u] == 0.0f ? 1.0f : sL[g + 8u]);
-        const uint32_t ha = hbase + g, hb = hbase + g + 8u;
-        float *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
-        float *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
         #pragma unroll
-        for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
-            const uint32_t nb = warp * AF16_DPW + n * 8u;
-            oa[nb + tg * 2u]      = acc[n][0] * ia;
-            oa[nb + tg * 2u + 1u] = acc[n][1] * ia;
-            ob[nb + tg * 2u]      = acc[n][2] * ib;
-            ob[nb + tg * 2u + 1u] = acc[n][3] * ib;
+        for (uint32_t m = 0; m < AF16_MT; m++) {
+            const uint32_t hb0 = m * AF16_HEADS;
+            const float ia = sCorr[hb0 + g] /
+                             (sL[hb0 + g] == 0.0f ? 1.0f : sL[hb0 + g]);
+            const float ib = sCorr[hb0 + g + 8u] /
+                             (sL[hb0 + g + 8u] == 0.0f ? 1.0f : sL[hb0 + g + 8u]);
+            const uint32_t ha = hbase + hb0 + g, hb = hbase + hb0 + g + 8u;
+            float *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
+            float *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
+            #pragma unroll
+            for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                const uint32_t nb = warp * AF16_DPW + n * 8u;
+                oa[nb + tg * 2u]      = acc[m][n][0] * ia;
+                oa[nb + tg * 2u + 1u] = acc[m][n][1] * ia;
+                ob[nb + tg * 2u]      = acc[m][n][2] * ib;
+                ob[nb + tg * 2u + 1u] = acc[m][n][3] * ib;
+            }
         }
     }
 #endif
@@ -326,12 +367,12 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t n_head, uint32_t head_dim, int raw_f16) {
     if (!heads || !sinks || !q || !raw_kv) return 0;
     if (head_dim != AF16_DIM) return 0;
-    if (n_head == 0u || (n_head % AF16_HEADS) != 0u) return 0;
+    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
     if (n_tokens == 0u) return 0;
     if (n_comp != 0u && !comp_kv) return 0;
     if (!af16_device_supported()) return 0;
     {
-    dim3 grid(n_tokens, n_head / AF16_HEADS, 1);
+    dim3 grid(n_tokens, n_head / AF16_HPB, 1);
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv,
                                             n_tokens, n_comp, window, ratio,
