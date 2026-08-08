@@ -2433,8 +2433,16 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * sampled; top-10 reorders and a greedy stream diverges within a token or
      * two).  Each build stays perfectly deterministic run to run.  Prefill is
      * untouched — it already took this kernel. */
+    /* The packed-comp clause below excludes multi-token non-descriptor calls
+     * because the f32 indexed kernel cannot read ATTN_PACK rows there.  The
+     * fp16 tier CAN, so it has to widen the gate -- nesting it inside meant a
+     * caller that passed packed rows silently fell through to the generic
+     * path instead, which measured 2.3x SLOWER and logged nothing, because the
+     * tier was never reached to refuse. */
+    const int f16_idx_ok = pulsar_gpu_attention_prefill_reads_packed_comp() &&
+                           head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u;
     if ((n_tokens > 1 || !no_indexed_decode_heads8) && head_dim == 512 && top_k <= 512u &&
-        (descr || !comp_kv_pack || n_tokens == 1u) &&
+        (descr || !comp_kv_pack || n_tokens == 1u || f16_idx_ok) &&
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
@@ -2445,9 +2453,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
          * plausible attention rather than an error.  Prefill without
          * descriptors is the case the gate above already forces to be
          * unpacked, so this covers it and refuses the rest. */
-        static const int use_f16_idx = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
-        if (use_f16_idx && topk_ptr &&
-            head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u) {
+        if (f16_idx_ok && topk_ptr) {
             static int announced = 0;
             if (!announced) {
                 announced = 1;

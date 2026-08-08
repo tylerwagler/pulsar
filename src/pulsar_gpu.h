@@ -192,6 +192,15 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
+/* Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
+ * natively?  When it does, the engine hands it the packed cache directly and
+ * skips dequantising into the f32 shadow -- 712 B/row instead of 2048, on the
+ * rows that dominate the tile, plus one whole pass removed.  Bit-exact either
+ * way: packed rows decode to exactly the values the f32 cache would hold.
+ * Backend-neutral question; the answer is a property of the backend's kernels,
+ * not of any particular one. */
+int pulsar_gpu_attention_prefill_reads_packed_comp(void);
+
 /* fp16 tensor-core attention (m16n8k16, f32 accumulate).  Raw pointers: a leaf
  * kernel behind the attention launchers, which do the tensor-level checking.
  * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a

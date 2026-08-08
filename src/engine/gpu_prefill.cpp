@@ -435,6 +435,14 @@ bool gpu_graph_encode_layer_attention_batch(
      * device descriptor arrays), scalar counters = read-only supersets.
      * step_begin rejects position-0 rows, so zero_prefix is never multiseq. */
     const bool mseq = g->batch_multiseq;
+    /* Single-sequence prefill has been dequantising the PULSAR_ATTN_PACK comp
+     * cache into an f32 shadow and reading that: 2048 B/row instead of 712, on
+     * the rows that dominate the attention tile, plus a whole dequant pass.
+     * The multi-sequence path already hands the packed pool over directly.
+     * Ask the backend whether its prefill attention reads packed rows natively
+     * and, when it does, skip the shadow.  Bit-exact by construction -- packed
+     * rows decode to exactly the values the f32 cache would hold. */
+    const bool pk_native = pulsar_gpu_attention_prefill_reads_packed_comp() != 0;
     const uint32_t nb = gpu_graph_bank_pool_count(g);
     if (mseq && (pos0 == 0 || n_tokens > g->batch_multiseq_rows ||
                  (uint32_t)g->ms_positions[0] != pos0)) {
@@ -1912,10 +1920,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                                        : g->layer_raw_cache[il],
                                                                                   mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                                       : gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                                       : (pk_native ? g->layer_attn_comp_cache[il]
+                                                                                                    : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
                                                                                   0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                                   mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                                       : 0 /* shadow is f32 */,
+                                                                                       : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
                                                                                   g->comp_selected,
                                                                                   sn,
                                                                                   spos0,
@@ -1958,10 +1967,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                               : g->layer_raw_cache[il],
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                              : gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              : (pk_native ? g->layer_attn_comp_cache[il]
+                                                                                           : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
                                                                          0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                          mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                              : 0 /* shadow is f32 */,
+                                                                              : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
                                                                          NULL,
                                                                          0,
                                                                          n_tokens,

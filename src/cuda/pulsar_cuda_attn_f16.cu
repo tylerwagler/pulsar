@@ -280,46 +280,66 @@ static void attn_f16_kernel(
     for (uint32_t row0 = 0; row0 < n_score; row0 += AF16_ROWS) {
         const uint32_t nr = min(AF16_ROWS, n_score - row0);
 
-        /* ---- stage the tile, converting to fp16 ------------------------- */
-        for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 2u; i += AF16_THREADS) {
-            const uint32_t r = i / (AF16_DIM / 2u);
-            const uint32_t d2 = (i % (AF16_DIM / 2u)) * 2u;
-            __half2 v = make_half2(__float2half(0.f), __float2half(0.f));
+        /* ---- stage the tile, converting to fp16 -------------------------
+         * FOUR elements per iteration, not two.  The packed path decodes a
+         * uint32 of four E4M3 bytes against ONE scale byte, the way the f32
+         * kernel does; reading them one element at a time through
+         * attn_comp_pack_ld costs four scattered BYTE loads where the format
+         * should have saved bandwidth, and measured 2.3x SLOWER than the f32
+         * shadow it was meant to beat.  The unpacked paths get a float4 out of
+         * the same restructuring. */
+        for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 4u; i += AF16_THREADS) {
+            const uint32_t r = i / (AF16_DIM / 4u);
+            const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
+            float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
             if (r < nr) {
                 const uint32_t sr = row0 + r;
                 if (sr < raw_count) {
                     const uint32_t rr = topk ? sRawRows[sr] : (raw_start + sr);
-                    const uint64_t b = (uint64_t)rr * AF16_DIM;
-                    v = make_half2(__float2half(af16_kv(raw_kv, raw_f16, b, d2)),
-                                   __float2half(af16_kv(raw_kv, raw_f16, b, d2 + 1u)));
+                    const uint64_t b = (uint64_t)rr * AF16_DIM + d4;
+                    if (raw_f16) {
+                        const __half *h = (const __half *)raw_kv + b;
+                        f0 = __half2float(h[0]); f1 = __half2float(h[1]);
+                        f2 = __half2float(h[2]); f3 = __half2float(h[3]);
+                    } else {
+                        const float4 v4 = *(const float4 *)(raw_kv + b);
+                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
+                    }
                 } else {
                     uint32_t ci = sr - raw_count;
                     if (topk) {
-                        /* Clamp exactly as the f32 kernel does: the engine keeps
-                         * padding sentinels out, but a stray index would be a
-                         * multi-GB wild read.  Substitute row 0 on violation. */
-                        /* Clamp against VISIBLE_comp, not n_comp: the f32
-                         * kernel substitutes row 0 for anything at or beyond
-                         * the visible prefix, and a looser bound here would
-                         * read a row it would have discarded. */
                         const int32_t c = topk[(uint64_t)t * top_k + ci];
                         ci = (c >= 0 && (uint32_t)c < sVisComp) ? (uint32_t)c : 0u;
                     }
                     const uint64_t crow = (uint64_t)comp_base + ci;
                     if (comp_pack) {
-                        /* Same attn_comp_pack_ld the f32 kernel uses -- shared,
-                         * not transcribed, so the ATTN_PACK contract has exactly
-                         * one implementation. */
-                        v = make_half2(
-                            __float2half(attn_comp_pack_ld(comp_src, crow, d2, AF16_DIM)),
-                            __float2half(attn_comp_pack_ld(comp_src, crow, d2 + 1u, AF16_DIM)));
+                        const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
+                        const uint8_t *pr = (const uint8_t *)comp_src +
+                            crow * PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);
+                        if (d4 < n_nope) {
+                            const float sc = __uint_as_float(
+                                (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
+                            const uint32_t w = *(const uint32_t *)(pr + d4);
+                            f0 = attn_pack_e4m3(w & 0xffu, sc);
+                            f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
+                            f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
+                            f3 = attn_pack_e4m3(w >> 24, sc);
+                        } else {
+                            const float *rope = (const float *)(pr + n_nope +
+                                PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
+                            const uint32_t o = d4 - n_nope;
+                            f0 = rope[o]; f1 = rope[o + 1u];
+                            f2 = rope[o + 2u]; f3 = rope[o + 3u];
+                        }
                     } else {
-                        const float *cr = comp_src + crow * AF16_DIM;
-                        v = make_half2(__float2half(cr[d2]), __float2half(cr[d2 + 1u]));
+                        const float4 v4 = *(const float4 *)(comp_src + crow * AF16_DIM + d4);
+                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
                     }
                 }
             }
-            *(__half2 *)&sKV[r * AF16_KVSTRIDE + d2] = v;
+            __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
+            dst[0] = make_half2(__float2half(f0), __float2half(f1));
+            dst[1] = make_half2(__float2half(f2), __float2half(f3));
         }
         __syncthreads();
 
@@ -463,6 +483,16 @@ static int af16_device_supported(void) {
         ok = (major >= 8) ? 1 : 0;      /* mma.m16n8k16.f16 is sm_80+ */
     }
     return ok;
+}
+
+/* Only the fp16 tier consumes packed comp rows on the multi-token
+ * single-sequence path; the f32 indexed kernel's own gate refuses them there
+ * (descr || !comp_kv_pack || n_tokens == 1).  So this answers for the tier
+ * that is actually going to run. */
+int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
+    static int on = -1;
+    if (on < 0) on = (getenv("PULSAR_CUDA_ATTN_F16") != NULL) && af16_device_supported();
+    return on;
 }
 
 int pulsar_gpu_attention_f16_prefill(
