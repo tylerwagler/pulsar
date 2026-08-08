@@ -309,16 +309,6 @@ int pulsar_gpu_matmul_f16_tensor(
 void pulsar_gpu_matmul_set_batch_mneutral(int n);
 int  pulsar_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
 
-int pulsar_gpu_matmul_bf16_tensor(
-        pulsar_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
-
 
 int pulsar_gpu_matmul_f16_pair_tensor(
         pulsar_gpu_tensor       *out_a,

@@ -2058,14 +2058,9 @@ bool gpu_graph_encode_output_head(
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
     if (ok) {
-        if (weights->output->type == PULSAR_TENSOR_BF16)
-            ok = pulsar_gpu_matmul_bf16_tensor(g->logits, model->map, model->size,
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, g->output_norm, 1) != 0;
-        else
-            ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, g->output_norm, 1) != 0;
+        ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
+                                        weights->output->abs_offset, PULSAR_N_EMBD,
+                                        vocab_dim, g->output_norm, 1) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, PULSAR_N_LAYER, 0);
@@ -2150,14 +2145,9 @@ bool gpu_graph_encode_output_head_batch(
                                                        n_tokens,
                                                        PULSAR_RMS_EPS) != 0;
     if (ok) {
-        if (weights->output->type == PULSAR_TENSOR_BF16)
-            ok = pulsar_gpu_matmul_bf16_tensor(logits, model->map, model->size,
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, output_norm, n_tokens) != 0;
-        else
-            ok = pulsar_gpu_matmul_mxfp8_tensor(logits, model->map, model->size,
-                                            weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, output_norm, n_tokens) != 0;
+        ok = pulsar_gpu_matmul_mxfp8_tensor(logits, model->map, model->size,
+                                        weights->output->abs_offset, PULSAR_N_EMBD,
+                                        vocab_dim, output_norm, n_tokens) != 0;
     }
 
     pulsar_gpu_tensor_free(logits);
@@ -2206,14 +2196,9 @@ bool gpu_graph_encode_dspark_output_head_batch(
                                                      dw->final_norm->abs_offset,
                                                      PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS) != 0;
     if (ok) {
-        if (bw->output->type == PULSAR_TENSOR_BF16)
-            ok = pulsar_gpu_matmul_bf16_tensor(logits, base_model->map, base_model->size,
-                                            bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                            output_norm, n_tokens) != 0;
-        else
-            ok = pulsar_gpu_matmul_mxfp8_tensor(logits, base_model->map, base_model->size,
-                                             bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                             output_norm, n_tokens) != 0;
+        ok = pulsar_gpu_matmul_mxfp8_tensor(logits, base_model->map, base_model->size,
+                                         bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
+                                         output_norm, n_tokens) != 0;
     }
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);

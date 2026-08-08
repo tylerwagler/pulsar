@@ -142,46 +142,10 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
 
 
 
-/* BF16 is the high 16 bits of f32, so conversions are pure bit ops (no header). */
-__device__ __forceinline__ static float bf16_to_f32(uint16_t b) {
-    return __uint_as_float((uint32_t)b << 16);
-}
 
 
-__global__ static void f32_to_bf16_kernel(uint16_t *out, const float *x, uint64_t n) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const uint32_t u = __float_as_uint(x[i]);
-        out[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  /* round-to-nearest-even */
-    }
-}
 
 
-__global__ static void matmul_bf16_kernel(
-        float *out,
-        const uint16_t *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-    float sum = 0.0f;
-    const uint16_t *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += bf16_to_f32(wr[i]) * xr[i];
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
-}
 
 
 
@@ -1609,39 +1573,6 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 
 
 
-int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map) return 0;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
-    if (!wptr) return 0;
-    const uint16_t *w = (const uint16_t *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
-        const uint64_t xb_count = n_tok * in_dim;
-        uint16_t *xb = (uint16_t *)cuda_tmp_alloc(xb_count * sizeof(uint16_t), "bf16 gemm activations");
-        if (!xb) return 0;
-        f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>(xb, (const float *)x->ptr, xb_count);
-        if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmEx(g_cublas,
-                                         CUBLAS_OP_T, CUBLAS_OP_N,
-                                         (int)out_dim, (int)n_tok, (int)in_dim,
-                                         &alpha,
-                                         w, CUDA_R_16BF, (int)in_dim,
-                                         xb, CUDA_R_16BF, (int)in_dim,
-                                         &beta,
-                                         out->ptr, CUDA_R_32F, (int)out_dim,
-                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-        return cublas_ok(st, "bf16 matmul");
-    }
-    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-    return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
-}
 
 
 
