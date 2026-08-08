@@ -68,7 +68,12 @@
  * beyond the stride constant. */
 #define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
 #define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B */
-#define IDX_TOKTILE   2u           /* tokens staged at once */
+/* ONE token staged at a time.  With K resident across the group there is no
+ * reuse argument left for staging two, and sA is the biggest smem consumer:
+ * dropping it 16.9 KB -> 8.5 KB takes the block from ~31 KB to ~20 KB, i.e.
+ * from 3 blocks/SM (50% occupancy) to 5 (83%).  Occupancy is the one limit the
+ * device numbers actually confirmed. */
+#define IDX_TOKTILE   1u
 /* Tokens PER BLOCK.  The compressed tile is identical for every token, so it is
  * staged once and every token in the group is swept through it: B staging and
  * its global traffic drop by IDX_TOKGROUP/IDX_TOKTILE.  Entrpi's scorer launches
@@ -227,7 +232,7 @@ static void idx_scores_mxfp4_kernel(
     __shared__ uint8_t sB[IDX_NTILE * IDX_BSTRIDE];          /* ~8.7 KB packed nibbles */
     __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
-    __shared__ float   sPart[IDX_THREADS / 32u][IDX_NTILE]; /*  2 KB */
+    __shared__ float   sPart[4][IDX_NTILE];                /*  2 KB: 4 m-tiles */
 
     /* ---- stage K ONCE for the whole token group -------------------------- */
     /* ---- stage K: raw copy; the nibble spread moves to the MMA load --------
@@ -267,13 +272,11 @@ static void idx_scores_mxfp4_kernel(
         const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
         const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
         /* row-wise, because the shared stride is padded and the global one is not */
-        for (uint32_t slot = tid; slot < IDX_TOKTILE * IDX_HEADS * 32u; slot += IDX_THREADS) {
-            const uint32_t r = slot / 32u;              /* row = token*heads + head */
+        for (uint32_t slot = tid; slot < IDX_HEADS * 32u; slot += IDX_THREADS) {
+            const uint32_t r = slot / 32u;              /* head */
             const uint32_t j = slot % 32u;              /* 32 x uint32 = 128 B */
             uint32_t *dst = (uint32_t *)(sA + r * IDX_ASTRIDE);
-            dst[j] = (r < ntok * IDX_HEADS)
-                   ? *(const uint32_t *)(qsrc + r * IDX_HEAD_DIM + j * 4u)
-                   : 0u;
+            dst[j] = *(const uint32_t *)(qsrc + r * IDX_HEAD_DIM + j * 4u);
         }
         for (uint32_t i = tid; i < sbytes; i += IDX_THREADS)
             sSFA[i] = ssrc[i];
@@ -283,13 +286,13 @@ static void idx_scores_mxfp4_kernel(
 
     /* ---- GEMM + fused head reduction ------------------------------------ */
     /* warp w owns m-tile w (heads 16w..16w+15) and sweeps every n-tile. */
-    const uint32_t wtok   = warp / 4u;                 /* which of the 2 tokens */
-    const uint32_t m_local = (warp % 4u) * 16u;         /* head offset within it */
-    const uint32_t m_base  = wtok * IDX_HEADS + m_local;
-    const uint32_t token_w = tok0 + wtok;
-    const float *wrow = weights + (uint64_t)(token_w < n_tokens ? token_w : tok0) * IDX_HEADS;
-    const float wg0 = (wtok < ntok) ? wrow[m_local + g]      : 0.0f;
-    const float wg1 = (wtok < ntok) ? wrow[m_local + g + 8u] : 0.0f;
+    /* 8 warps over a 64-row M (4 m-tiles) x 128-col N: warp = (n-half, m-tile). */
+    const uint32_t warp_m = warp & 3u;                  /* m-tile 0..3 */
+    const uint32_t warp_n = warp >> 2u;                 /* which half of N */
+    const uint32_t m_base = warp_m * 16u;
+    const float *wrow = weights + (uint64_t)tok0 * IDX_HEADS;
+    const float wg0 = wrow[m_base + g];
+    const float wg1 = wrow[m_base + g + 8u];
 
     /* Register-blocked over N: the A fragment (16 B/lane) is identical for every
      * n-tile at a given k-slab, so loading it once and firing NB MMAs against NB
@@ -302,11 +305,22 @@ static void idx_scores_mxfp4_kernel(
      * 4 was unsatisfiable at ~29 KB of smem per block and only distorted
      * register allocation (0.330 at 2, 0.336 at 1, 0.331 at 3). */
     #define IDX_NB 4u
-    for (uint32_t nt0 = 0; nt0 < IDX_NTILE / 8u; nt0 += IDX_NB) {
+    const uint32_t nt_lo = warp_n * (IDX_NTILE / 16u);
+    for (uint32_t nt0 = nt_lo; nt0 < nt_lo + IDX_NTILE / 16u; nt0 += IDX_NB) {
         float d[IDX_NB][4];
         #pragma unroll
         for (uint32_t j = 0; j < IDX_NB; j++) { d[j][0] = d[j][1] = d[j][2] = d[j][3] = 0.f; }
 
+        /* Software-pipelined within the slab: issue ALL operand fetches, then
+         * all MMAs.  Previously each j fetched its B fragment immediately before
+         * its own MMA, so every MMA sat behind a shared-memory read and the warp
+         * had one load in flight at a time.  At 48 SMs / 50% occupancy the
+         * kernel was measured at ~74 cycles per MMA per SM -- ~1.4% of issue
+         * rate -- i.e. latency-bound on exactly this chain, not on operand
+         * volume.  Batching the fetches gives the scheduler NB independent loads
+         * to overlap against the MMA chain, and unrolling the slab loop lets it
+         * hoist across slabs too. */
+        #pragma unroll
         for (uint32_t s = 0; s < IDX_KSLABS; s++) {
             const uint32_t k0 = s * 32u;
             const uint8_t *ar0 = sA + (m_base + g)      * IDX_ASTRIDE + k0 + tig * 4u;
@@ -318,17 +332,20 @@ static void idx_scores_mxfp4_kernel(
             const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);
             const uint32_t sfa = sSFA[m_for_sfa * IDX_KSLABS + s];
 
+            uint32_t bb0[IDX_NB], bb1[IDX_NB], sfbv[IDX_NB];
             #pragma unroll
             for (uint32_t j = 0; j < IDX_NB; j++) {
                 const uint32_t n_base = (nt0 + j) * 8u;
                 const uint8_t *br = sB + (n_base + g) * IDX_BSTRIDE
                                        + (k0 >> 1) + tig * 2u;
-                const uint32_t b0 = idx_spread4(*(const uint16_t *)br);
-                const uint32_t b1 = idx_spread4(*(const uint16_t *)(br + 8u));
-                const uint32_t sfb = sSFB[(n_base + g) * IDX_KSLABS + s];
-                idx_mma_m16n8k32(d[j][0], d[j][1], d[j][2], d[j][3],
-                                 a0, a1, a2, a3, b0, b1, sfa, sfb);
+                bb0[j]  = idx_spread4(*(const uint16_t *)br);
+                bb1[j]  = idx_spread4(*(const uint16_t *)(br + 8u));
+                sfbv[j] = sSFB[(n_base + g) * IDX_KSLABS + s];
             }
+            #pragma unroll
+            for (uint32_t j = 0; j < IDX_NB; j++)
+                idx_mma_m16n8k32(d[j][0], d[j][1], d[j][2], d[j][3],
+                                 a0, a1, a2, a3, bb0[j], bb1[j], sfa, sfbv[j]);
         }
 
         #pragma unroll
@@ -342,8 +359,8 @@ static void idx_scores_mxfp4_kernel(
                 c1 += __shfl_xor_sync(0xffffffffu, c1, m);
             }
             if (g == 0u) {
-                sPart[warp][n_base + tig * 2u]      = c0;
-                sPart[warp][n_base + tig * 2u + 1u] = c1;
+                sPart[warp_m][n_base + tig * 2u]      = c0;
+                sPart[warp_m][n_base + tig * 2u + 1u] = c1;
             }
         }
     }
@@ -351,18 +368,15 @@ static void idx_scores_mxfp4_kernel(
     __syncthreads();
 
     /* ---- combine the warps' head-groups, then scale and mask ------------ */
-    for (uint32_t i = tid; i < IDX_NTILE * ntok; i += IDX_THREADS) {
-        const uint32_t tl = i / IDX_NTILE;              /* 0 or 1 */
-        const uint32_t c  = i % IDX_NTILE;
+    for (uint32_t c = tid; c < IDX_NTILE; c += IDX_THREADS) {
         const uint32_t comp_i = tile_c + c;
         if (comp_i >= n_comp) continue;
         float acc = 0.f;
         #pragma unroll
-        for (uint32_t w = 0; w < 4u; w++) acc += sPart[tl * 4u + w][c];
+        for (uint32_t w = 0; w < 4u; w++) acc += sPart[w][c];
         float out = acc * scale;
-        const uint32_t t = tok0 + tl;
-        if (causal && comp_i >= ((pos0 + t + 1u) / ratio)) out = -INFINITY;
-        scores[(uint64_t)t * n_comp + comp_i] = out;
+        if (causal && comp_i >= ((pos0 + tok0 + 1u) / ratio)) out = -INFINITY;
+        scores[(uint64_t)tok0 * n_comp + comp_i] = out;
     }
     }   /* token group */
 }
