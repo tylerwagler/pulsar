@@ -205,6 +205,21 @@ PrismaQuant change, not a kernel change.
 
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 
+- **Double-buffering the fp16 attention KV tile buys nothing.**  Implemented,
+  measured, REVERTED.  ncu said the kernel is latency-bound (IPC 0.15-0.19 of
+  1.0, no pipe above 27%, 33% occupancy), so overlapping the staging looked
+  like the obvious fix.  It is not: the staging code BLOCKS ON ITS OWN LOADS.
+  It is load -> wait -> store, straight-line, so moving it ahead of the compute
+  does not overlap anything -- it still fully serialises before phase 1.
+  942.7/849.7 against 942.0/845.3 tok/s, i.e. nothing, for 18 KB more smem and
+  a second buffer's worth of complexity.
+  Real overlap needs one of two things this kernel cannot currently have:
+  cp.async, which copies BYTES and so cannot do the f32->fp16 conversion the
+  staging performs; or holding the loaded values in registers across the
+  compute, which is ~16 more registers against 119 of a 128 budget at 512
+  threads.  Making the KV cache fp16 in GLOBAL memory would unlock cp.async and
+  is the real fix, but that is an engine-wide format change, not a kernel one.
+
 - **The elementwise / normalisation tier is already at the roofline.**  L2 bytes
   over kernel time: `f32_to_f16` 241 GB/s, `rms_norm_plain` 245,
   `head_rms_norm_rope_tail` 246 -- all ~90% of the ~273 GB/s the device has.
