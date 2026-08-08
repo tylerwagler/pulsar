@@ -60,6 +60,14 @@
 #define IDX_HEAD_DIM  128u
 #define IDX_NTILE     128u         /* compressed rows per block */
 #define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
+/* Shared rows are PADDED off the bank period.  A 128-byte row stride is exactly
+ * 32 words = the bank count, so every row starts in bank 0: the eight lanes of
+ * an m16n8 group read eight different rows at the same k, and all eight hit the
+ * same bank -- an 8-way conflict on every A fetch, and 4-way on B at 64 B.
+ * Padding by one word breaks the period without changing any addressing math
+ * beyond the stride constant. */
+#define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
+#define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B */
 #define IDX_TOKTILE   2u           /* tokens per block: B is shared across them */
 #define IDX_THREADS   256u         /* 8 warps: 4 per token */
 
@@ -158,9 +166,16 @@ static void idx_pack_q_kernel(
     for (uint32_t i = 0; i < 32u; i++) dst[i] = idx_f32_to_e4m3(src[i] * inv);
 }
 
+/* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
+ * at bits [5:2], which is where the measured contract says the MMA reads them. */
+__device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
+    return (((x & 0x000Fu)) | ((x & 0x00F0u) << 4) |
+            ((x & 0x0F00u) << 8) | ((x & 0xF000u) << 12)) << 2;
+}
+
 /* ---- kernel ------------------------------------------------------------- */
 
-__global__ __launch_bounds__(IDX_THREADS, 4)
+__global__ __launch_bounds__(IDX_THREADS, 2)
 static void idx_scores_mxfp4_kernel(
         float *__restrict__ scores,          /* [n_tokens][n_comp] */
         const uint8_t *__restrict__ qa,      /* [n_tokens][heads][128] e4m3 */
@@ -198,47 +213,48 @@ static void idx_scores_mxfp4_kernel(
      * also capped N at 64, because [64 x 128] f32 would have been 64 KB.
      * Reducing in-register over the warp's own rows and combining warps through
      * a 2 KB partial buffer removes both problems, which is what lets N double. */
-    __shared__ uint8_t sA[IDX_TOKTILE * IDX_HEADS * IDX_HEAD_DIM];   /* 16 KB e4m3 */
-    __shared__ uint8_t sB[IDX_NTILE * IDX_HEAD_DIM];        /* 16 KB e2m1<<2 */
+    __shared__ uint8_t sA[IDX_TOKTILE * IDX_HEADS * IDX_ASTRIDE];    /* ~17 KB e4m3 */
+    __shared__ uint8_t sB[IDX_NTILE * IDX_BSTRIDE];          /* ~8.7 KB packed nibbles */
     __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
     __shared__ float   sPart[IDX_THREADS / 32u][IDX_NTILE]; /*  2 KB */
 
     /* ---- stage Q: straight copy of the pre-packed bytes ------------------ */
     {
-        const uint32_t abytes = ntok * IDX_HEADS * IDX_HEAD_DIM;
         const uint32_t sbytes = ntok * IDX_HEADS * IDX_KSLABS;
         const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
         const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
-        for (uint32_t i = tid * 4u; i < abytes; i += IDX_THREADS * 4u)
-            *(uint32_t *)(sA + i) = *(const uint32_t *)(qsrc + i);
+        /* row-wise, because the shared stride is padded and the global one is not */
+        for (uint32_t slot = tid; slot < IDX_TOKTILE * IDX_HEADS * 32u; slot += IDX_THREADS) {
+            const uint32_t r = slot / 32u;              /* row = token*heads + head */
+            const uint32_t j = slot % 32u;              /* 32 x uint32 = 128 B */
+            uint32_t *dst = (uint32_t *)(sA + r * IDX_ASTRIDE);
+            dst[j] = (r < ntok * IDX_HEADS)
+                   ? *(const uint32_t *)(qsrc + r * IDX_HEAD_DIM + j * 4u)
+                   : 0u;
+        }
         for (uint32_t i = tid; i < sbytes; i += IDX_THREADS)
             sSFA[i] = ssrc[i];
-        /* a second token that does not exist must contribute nothing */
-        for (uint32_t i = abytes + tid * 4u; i < IDX_TOKTILE * IDX_HEADS * IDX_HEAD_DIM;
-             i += IDX_THREADS * 4u)
-            *(uint32_t *)(sA + i) = 0u;
     }
 
-    /* ---- stage K: spread packed nibbles to bits [5:2], rebias scales ----- */
-    for (uint32_t slot = tid; slot < IDX_NTILE * 32u; slot += IDX_THREADS) {
-        const uint32_t c = slot / 32u;
-        const uint32_t j = slot % 32u;
+    /* ---- stage K: raw copy; the nibble spread moves to the MMA load --------
+     * Keeping the rows PACKED in shared halves this tile (16 KB -> 8 KB) and
+     * halves B's shared-read traffic, and the block's smem drops 37 KB -> 29 KB,
+     * which is what limits how many blocks an SM can hold.  Expanding two bytes
+     * into four byte-containers is ~7 ALU ops at the point of use, against a
+     * shared-memory read we no longer have to make. */
+    for (uint32_t slot = tid; slot < IDX_NTILE * 16u; slot += IDX_THREADS) {
+        const uint32_t c = slot / 16u;
+        const uint32_t j = slot % 16u;                  /* 16 x uint32 = 64 B/row */
         const uint32_t comp_i = tile_c + c;
-        uint8_t *dst = sB + c * IDX_HEAD_DIM;
+        uint32_t *dst = (uint32_t *)(sB + c * IDX_BSTRIDE);
         if (comp_i >= n_comp) {
-            dst[j * 2u] = 0; dst[j * 2u + 1u] = 0;
-            dst[j * 2u + 64u] = 0; dst[j * 2u + 65u] = 0;
+            dst[j] = 0u;
             if (j < IDX_KSLABS) sSFB[c * IDX_KSLABS + j] = 0;
             continue;
         }
         const uint8_t *row = comp + (uint64_t)comp_i * PULSAR_MXKV_FP4_ROWBYTES(128u);
-        const uint8_t b0 = row[j];
-        const uint8_t b1 = row[j + 32u];
-        dst[j * 2u]        = (uint8_t)(((uint32_t)b0 & 0xFu) << 2);
-        dst[j * 2u + 1u]   = (uint8_t)(((uint32_t)b0 >> 4) << 2);
-        dst[j * 2u + 64u]  = (uint8_t)(((uint32_t)b1 & 0xFu) << 2);
-        dst[j * 2u + 65u]  = (uint8_t)(((uint32_t)b1 >> 4) << 2);
+        dst[j] = *(const uint32_t *)(row + j * 4u);
         if (j < IDX_KSLABS) {
             const int sfb = (int)row[64u + j] - 1;   /* +1 bias, -2 for the 4x */
             sSFB[c * IDX_KSLABS + j] = (uint8_t)(sfb < 0 ? 0 : sfb);
@@ -262,6 +278,10 @@ static void idx_scores_mxfp4_kernel(
      * 24 B/lane to (16 + 8*NB)/NB.  At NB=4 that is 12 B/lane, a 2x reduction --
      * and smem traffic, not MMA issue, is what was holding this at ~8 TFLOP/s
      * (393 KB of smem reads per block against 2.1 M MACs). */
+    /* NB=4 measured best; NB=8 is 0.336 vs 0.330, i.e. the extra register
+     * pressure cancels the traffic it saves.  minBlocksPerMultiprocessor is 2:
+     * 4 was unsatisfiable at ~29 KB of smem per block and only distorted
+     * register allocation (0.330 at 2, 0.336 at 1, 0.331 at 3). */
     #define IDX_NB 4u
     for (uint32_t nt0 = 0; nt0 < IDX_NTILE / 8u; nt0 += IDX_NB) {
         float d[IDX_NB][4];
@@ -270,8 +290,8 @@ static void idx_scores_mxfp4_kernel(
 
         for (uint32_t s = 0; s < IDX_KSLABS; s++) {
             const uint32_t k0 = s * 32u;
-            const uint8_t *ar0 = sA + (m_base + g)      * IDX_HEAD_DIM + k0 + tig * 4u;
-            const uint8_t *ar1 = sA + (m_base + g + 8u) * IDX_HEAD_DIM + k0 + tig * 4u;
+            const uint8_t *ar0 = sA + (m_base + g)      * IDX_ASTRIDE + k0 + tig * 4u;
+            const uint8_t *ar1 = sA + (m_base + g + 8u) * IDX_ASTRIDE + k0 + tig * 4u;
             const uint32_t a0 = *(const uint32_t *)ar0;
             const uint32_t a1 = *(const uint32_t *)ar1;
             const uint32_t a2 = *(const uint32_t *)(ar0 + 16u);
@@ -282,9 +302,10 @@ static void idx_scores_mxfp4_kernel(
             #pragma unroll
             for (uint32_t j = 0; j < IDX_NB; j++) {
                 const uint32_t n_base = (nt0 + j) * 8u;
-                const uint8_t *br = sB + (n_base + g) * IDX_HEAD_DIM + k0 + tig * 4u;
-                const uint32_t b0 = *(const uint32_t *)br;
-                const uint32_t b1 = *(const uint32_t *)(br + 16u);
+                const uint8_t *br = sB + (n_base + g) * IDX_BSTRIDE
+                                       + (k0 >> 1) + tig * 2u;
+                const uint32_t b0 = idx_spread4(*(const uint16_t *)br);
+                const uint32_t b1 = idx_spread4(*(const uint16_t *)(br + 8u));
                 const uint32_t sfb = sSFB[(n_base + g) * IDX_KSLABS + s];
                 idx_mma_m16n8k32(d[j][0], d[j][1], d[j][2], d[j][3],
                                  a0, a1, a2, a3, b0, b1, sfa, sfb);
