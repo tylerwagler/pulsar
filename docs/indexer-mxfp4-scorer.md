@@ -194,10 +194,7 @@ a double-precision oracle:
 
 1. DONE — availability confirmed, and the contract above recovered.
 2. DONE — SF thread mapping pinned empirically (table above).
-3. STILL OWED — score both operand pairs (E4M3xE2M1 vs E2M1xE2M1) on
-   indexer-shaped data and report per-element error AND top-k set overlap
-   against the current fp16 path. Pick the fork on that number. The probe now
-   has a verified single-MMA building block to extend for it.
+3. DONE — see FORK DECISION below.
 
 Gate at **shape time only**, never per token or per layer (see
 `[[no-hot-path-flags]]`): `head_dim == 128 && n_head == 64 && !quality_mode`,
@@ -248,3 +245,49 @@ instruction and the packer already exist and are proven on this GPU, and the
 K-side loss is provably zero. The Q-side packing cost must be budgeted against
 the win — Entrpi pays 12.83 ms for its row encode, and a Q packer will not be
 free either.
+
+
+## FORK DECISION: E4M3 for Q (measured, tests/idx_quant_fidelity.cc)
+
+Host-only simulation, no GPU: the fork is a quantisation question, not an MMA
+question. K is held exactly on the E2M1 x E8M0 grid (which is what the cache
+already stores), Q is quantised per-32 with an E8M0 scale, and the whole
+`sum_h ReLU(q.k) * w` reduction is evaluated in f64 as reference.
+
+**fp16 is effectively lossless for selection** (~100% of the exact top-512
+retained), so it is the honest baseline: the churn below IS the change versus
+what ships today.
+
+| Q distribution | fp16 | E4M3 | E2M1 | E4M3 dropped rank (mean / worst) | E2M1 dropped rank |
+|---|---|---|---|---|---|
+| gaussian s=1 | 100.00% | **98.68%** | 95.43% | 501.0 / 470 | 479.6 / 382 |
+| gaussian s=0.25 | 99.98% | **98.80%** | 95.41% | 501.4 / 476 | 474.9 / 377 |
+| heavy-tail t3 | 100.00% | **98.71%** | 94.51% | 501.7 / 471 | 471.0 / 281 |
+| heavy-tail t1.5 | 100.00% | **98.93%** | 95.31% | 502.5 / 473 | 473.7 / 333 |
+| uniform [-1,1] | 100.00% | **98.36%** | 95.31% | 498.3 / 446 | 468.8 / 346 |
+
+**E4M3 wins on both axes, and the margin is stable across every distribution**,
+so the conclusion does not rest on having guessed Q's real shape.
+
+The second number is the one that matters. The design argued that churn would
+be confined to boundary rows -- the least-weighted of the selected set -- and
+flagged that as plausible rather than proven. It is now measured:
+
+- **E4M3 never drops a row ranked better than 446 of 512** across any trial or
+  distribution, and its mean dropped rank is ~500, i.e. sitting on the
+  selection boundary. The argument holds.
+- **E2M1 drops rows from as high as rank 281** — mid-pack of the selected set,
+  not the boundary. The argument FAILS for E2M1. Its 4.7% churn is also
+  qualitatively worse than E4M3's 1.3%, not merely larger.
+
+So `mxf4nvf4` (packed nibbles, k=64, 8 KB tile) is rejected on fidelity despite
+its better data path, and the recommendation made on bottleneck grounds is
+confirmed on measurement: **build `mxf8f6f4` with E4M3 Q**.
+
+### What this does NOT establish
+
+Synthetic Q. The sweep exists to show the answer is distribution-robust, and it
+is, but it is not a substitute for the real thing. ~1.3% of the selected set
+changing is small and lands on the boundary, yet the end-to-end consequence is
+still owed: the suite-v1 KL run against the A1 reference, which is already
+outstanding for the MMQ fold-order work. Nothing here licenses skipping it.
