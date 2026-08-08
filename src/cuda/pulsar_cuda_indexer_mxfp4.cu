@@ -256,9 +256,17 @@ static void idx_scores_mxfp4_kernel(
     const float wg0 = (wtok < ntok) ? wrow[m_local + g]      : 0.0f;
     const float wg1 = (wtok < ntok) ? wrow[m_local + g + 8u] : 0.0f;
 
-    for (uint32_t nt = 0; nt < IDX_NTILE / 8u; nt++) {
-        const uint32_t n_base = nt * 8u;
-        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    /* Register-blocked over N: the A fragment (16 B/lane) is identical for every
+     * n-tile at a given k-slab, so loading it once and firing NB MMAs against NB
+     * B fragments (8 B/lane each) cuts shared-memory traffic per MMA from
+     * 24 B/lane to (16 + 8*NB)/NB.  At NB=4 that is 12 B/lane, a 2x reduction --
+     * and smem traffic, not MMA issue, is what was holding this at ~8 TFLOP/s
+     * (393 KB of smem reads per block against 2.1 M MACs). */
+    #define IDX_NB 4u
+    for (uint32_t nt0 = 0; nt0 < IDX_NTILE / 8u; nt0 += IDX_NB) {
+        float d[IDX_NB][4];
+        #pragma unroll
+        for (uint32_t j = 0; j < IDX_NB; j++) { d[j][0] = d[j][1] = d[j][2] = d[j][3] = 0.f; }
 
         for (uint32_t s = 0; s < IDX_KSLABS; s++) {
             const uint32_t k0 = s * 32u;
@@ -268,33 +276,38 @@ static void idx_scores_mxfp4_kernel(
             const uint32_t a1 = *(const uint32_t *)ar1;
             const uint32_t a2 = *(const uint32_t *)(ar0 + 16u);
             const uint32_t a3 = *(const uint32_t *)(ar1 + 16u);
-            const uint8_t *br = sB + (n_base + g) * IDX_HEAD_DIM + k0 + tig * 4u;
-            const uint32_t b0 = *(const uint32_t *)br;
-            const uint32_t b1 = *(const uint32_t *)(br + 16u);
-            const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);   /* row -> lane 4*(m%8)+(m/8) */
+            const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);
             const uint32_t sfa = sSFA[m_for_sfa * IDX_KSLABS + s];
-            const uint32_t sfb = sSFB[(n_base + g) * IDX_KSLABS + s];
-            idx_mma_m16n8k32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb);
+
+            #pragma unroll
+            for (uint32_t j = 0; j < IDX_NB; j++) {
+                const uint32_t n_base = (nt0 + j) * 8u;
+                const uint8_t *br = sB + (n_base + g) * IDX_HEAD_DIM + k0 + tig * 4u;
+                const uint32_t b0 = *(const uint32_t *)br;
+                const uint32_t b1 = *(const uint32_t *)(br + 16u);
+                const uint32_t sfb = sSFB[(n_base + g) * IDX_KSLABS + s];
+                idx_mma_m16n8k32(d[j][0], d[j][1], d[j][2], d[j][3],
+                                 a0, a1, a2, a3, b0, b1, sfa, sfb);
+            }
         }
 
-        /* C layout: rows g (d0,d1) and g+8 (d2,d3), cols n_base + tig*2 + {0,1}.
-         * Apply ReLU and the per-head routing weight to each row here, so what
-         * crosses the shuffle is already the reduced quantity. */
-        float c0 = (d0 > 0.f ? d0 * wg0 : 0.f) + (d2 > 0.f ? d2 * wg1 : 0.f);
-        float c1 = (d1 > 0.f ? d1 * wg0 : 0.f) + (d3 > 0.f ? d3 * wg1 : 0.f);
-        /* Rows within the tile are spread across the 8 g-groups, and lanes of a
-         * group differ only in tig (i.e. in column).  So summing over the tile's
-         * 16 heads is an xor-shuffle over the g bits: lane offsets 4, 8, 16. */
         #pragma unroll
-        for (int m = 4; m < 32; m <<= 1) {
-            c0 += __shfl_xor_sync(0xffffffffu, c0, m);
-            c1 += __shfl_xor_sync(0xffffffffu, c1, m);
-        }
-        if (g == 0u) {                       /* lanes 0..3 carry tig 0..3 */
-            sPart[warp][n_base + tig * 2u]      = c0;
-            sPart[warp][n_base + tig * 2u + 1u] = c1;
+        for (uint32_t j = 0; j < IDX_NB; j++) {
+            const uint32_t n_base = (nt0 + j) * 8u;
+            float c0 = (d[j][0] > 0.f ? d[j][0] * wg0 : 0.f) + (d[j][2] > 0.f ? d[j][2] * wg1 : 0.f);
+            float c1 = (d[j][1] > 0.f ? d[j][1] * wg0 : 0.f) + (d[j][3] > 0.f ? d[j][3] * wg1 : 0.f);
+            #pragma unroll
+            for (int m = 4; m < 32; m <<= 1) {
+                c0 += __shfl_xor_sync(0xffffffffu, c0, m);
+                c1 += __shfl_xor_sync(0xffffffffu, c1, m);
+            }
+            if (g == 0u) {
+                sPart[warp][n_base + tig * 2u]      = c0;
+                sPart[warp][n_base + tig * 2u + 1u] = c1;
+            }
         }
     }
+    #undef IDX_NB
     __syncthreads();
 
     /* ---- combine the warps' head-groups, then scale and mask ------------ */
