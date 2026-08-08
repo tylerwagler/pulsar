@@ -61,6 +61,70 @@ formulation removes both -- the reduction becomes the MMA's k dimension, and
 operands are reused across the MMA's m dimension instead of being re-read per
 head.  That is a FlashAttention-style rewrite, not a tweak.
 
+#### The operand-format decision, measured
+
+`tests/attn_precision_fidelity.cc` scores each candidate on REAL activations
+(dumped with `PULSAR_DUMP_ATTN`, 24 tokens x 64 heads against an f64 reference),
+and `tests/idx_mma_issue_bench.cu` measures what each one buys.
+
+What it buys, measured on GB10:
+
+| format | rate | vs the FP32 FMA pipe attention uses today |
+|--------|------|-------------------------------------------|
+| f32 FMA pipe | 14.5 TMAC/s | 1.0x (today) |
+| f16 m16n8k16 | 62.9 TMAC/s | **4.3x** |
+| bf16 m16n8k16 | 62.9 TMAC/s | **4.3x** |
+| fp8 block-scaled | 125.0 TMAC/s | 8.6x |
+| fp4 block-scaled | 251.4 TMAC/s | 17.3x |
+
+What it costs, two independent activation sets (mean rel L2 / top-1 attention
+position preserved / worst single head):
+
+| format | set 1 | set 2 | set 2 max |
+|--------|-------|-------|-----------|
+| f32 (today) | 2.3e-7 / 100% | 1.7e-7 / 100% | 7.4e-7 |
+| fp16 | 2.0e-4 / 100.00% | 5.8e-4 / 99.93% | 3.7e-3 |
+| bf16 | 1.6e-3 / 99.87% | 4.9e-3 / 99.87% | 2.2e-2 |
+| e4m3 unscaled | 3.0e-2 / 97.85% | 9.3e-2 / 96.81% | 4.4e-1 |
+| MXFP8 | 3.0e-2 / 97.85% | 9.2e-2 / 96.81% | **1.00** |
+| MXFP4 | 1.7e-1 / 87.30% | 3.8e-1 / 84.44% | **3.52** |
+
+**bf16 is strictly dominated: identical throughput to fp16 (62.9 TMAC/s both)
+for 3-8x the error.** There is no case for it. That half of the question has an
+unambiguous answer and does not need judgement.
+
+The remaining choice is fp16 (4.3x, top-1 preserved ~100%, KL <= 3e-7) against
+fp8 (8.6x, but top-1 changes on 2-3% of head-token pairs and the worst single
+head is off by 100%).  **Recommendation: fp16.**  Attention feeds everything
+downstream, and doubling 4.3x to 8.6x is not worth a format whose worst case is
+a head attending somewhere else entirely.
+
+Two further findings:
+
+- **Nothing saturates.**  max|q| = 17.58, max|kv| = 5.65, and zero elements clip
+  in ANY candidate including e4m3 (limit 448).  This is purely a resolution
+  question, not a dynamic-range one.
+- **MX block scaling buys nothing here.**  MXFP8 is no better than unscaled
+  e4m3 on the mean and WORSE on the worst case (1.00 vs 0.44).  Block scaling
+  earns its keep when data spans many binades; this data does not, so the
+  shared per-32 exponent only costs the smaller elements in each block some
+  bits.  The device's block-scaled path has no fidelity advantage for attention
+  -- which is not what the indexer's experience would have predicted.
+
+Scope, honestly: both samples come from the raw-window path
+(`pulsar_gpu_attention_prefill_raw_heads_tensor`), where MLA passes ONE latent
+vector as both K and V -- so a format has to serve the score dot product and the
+value sum at once, with no option to keep V wider.  The compressed path
+(`n_comp > 0`) uses a separate `comp_kv` for the value and was NOT sampled.  The
+two sets already differ by ~3x, so treat the absolute numbers as indicative and
+the ORDERING as the result.
+
+Expected gain, not overstated: attention is LSU-bound at 56% and FMA-bound at
+only 40%, so 4.3x more math throughput does not become 4.3x end to end.  Much of
+the win has to come from the tensor-core dataflow removing the 8x shared-memory
+re-read (8 warps each pulling the whole 2 KB row), not from raw math.  2-3x on
+the attention kernels is the realistic target, i.e. 11-17% of prefill.
+
 ### 2. MoE gate/up: 17.8% in one kernel
 
     Compute (SM) 58.5%, Memory 48.6%, L2 48.6%

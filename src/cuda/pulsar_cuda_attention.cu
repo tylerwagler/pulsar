@@ -1853,6 +1853,73 @@ int pulsar_gpu_attention_decode_heads_tensor(
 
 
 
+/* One-shot dump of a REAL attention input set, for the operand-precision study
+ * in tests/attn_precision_fidelity.cc.  A measurement hook, not a feature: it
+ * is env-gated, fires once per process, and synchronises the stream.
+ *
+ * Real activations rather than synthetic ones because the whole question is
+ * dynamic range -- Q/K outlier channels and the spread of the latent kv vector
+ * are exactly what a Gaussian sample would not reproduce, and they decide
+ * whether an 8-bit format survives.
+ *
+ * q is dumped for a WINDOW of tokens (all heads); kv is dumped whole, since a
+ * token's window reaches backwards and the rows are cheap (n_tokens x 512).
+ * tok0 is recorded so the reader can rebuild the causal/window bounds. */
+static void attn_dump_inputs_once(const float *q, const void *kv, const float *sinks,
+                                  uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+                                  uint32_t window, uint32_t raw_f16) {
+    static int done = 0, seen = 0;
+    const char *path = getenv("PULSAR_DUMP_ATTN");
+    if (done || !path || !path[0]) return;
+    /* PULSAR_DUMP_ATTN_SKIP=N dumps the N+1'th call instead of the first, so the
+     * study can sample more than one layer -- outlier channels are not uniform
+     * across depth and a single layer is not evidence about the model. */
+    {
+        const char *sk = getenv("PULSAR_DUMP_ATTN_SKIP");
+        const int want = sk ? atoi(sk) : 0;
+        if (seen++ < want) return;
+    }
+    done = 1;
+
+    /* A middle slice sees full windows; the first tokens do not. */
+    const uint32_t ndump = n_tokens < 256u ? n_tokens : 256u;
+    const uint32_t tok0 = (n_tokens > ndump) ? (n_tokens - ndump) : 0u;
+
+    const size_t qn = (size_t)ndump * n_head * head_dim;
+    const size_t kvn = (size_t)n_tokens * head_dim;
+    const size_t kvesz = raw_f16 ? 2u : 4u;
+    float *hq = (float *)malloc(qn * sizeof(float));
+    void *hkv = malloc(kvn * kvesz);
+    float *hs = (float *)malloc((size_t)n_head * sizeof(float));
+    if (!hq || !hkv || !hs) { free(hq); free(hkv); free(hs); return; }
+
+    const float *qsrc = q + (size_t)tok0 * n_head * head_dim;
+    int ok = cudaMemcpy(hq, qsrc, qn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(hkv, kv, kvn * kvesz, cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(hs, sinks, (size_t)n_head * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (ok) {
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            const uint32_t hdr[8] = { 0x41545444u /*"ATTD"*/, n_tokens, n_head, head_dim,
+                                      window, raw_f16, tok0, ndump };
+            ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+                 fwrite(hq, sizeof(float), qn, f) == qn &&
+                 fwrite(hkv, kvesz, kvn, f) == kvn &&
+                 fwrite(hs, sizeof(float), n_head, f) == n_head;
+            if (fclose(f) != 0) ok = 0;
+            fprintf(stderr, "pulsar: attention dump %s %s (tok0=%u ndump=%u n_tokens=%u "
+                            "n_head=%u head_dim=%u window=%u raw_f16=%u)\n",
+                    ok ? "wrote" : "FAILED writing", path, tok0, ndump, n_tokens,
+                    n_head, head_dim, window, raw_f16);
+        } else {
+            fprintf(stderr, "pulsar: attention dump could not open %s\n", path);
+        }
+    } else {
+        fprintf(stderr, "pulsar: attention dump readback failed\n");
+    }
+    free(hq); free(hkv); free(hs);
+}
+
 int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
@@ -1870,6 +1937,8 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
     if (n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
+                              n_tokens, n_head, head_dim, window, raw_f16);
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
