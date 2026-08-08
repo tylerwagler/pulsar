@@ -84,6 +84,39 @@ billed cleanly to the tier; the estimate above excludes it.  Confirming this
 properly needs a model requantized to emit type 43 for those layers, which is a
 PrismaQuant change, not a kernel change.
 
+## Measured dead ends -- tried on 2026-08-08, do not retry without new information
+
+- **The elementwise / normalisation tier is already at the roofline.**  L2 bytes
+  over kernel time: `f32_to_f16` 241 GB/s, `rms_norm_plain` 245,
+  `head_rms_norm_rope_tail` 246 -- all ~90% of the ~273 GB/s the device has.
+  Together they are ~11% of prefill and NONE of it is recoverable by making the
+  kernels faster; only removing whole passes would do it, and the f32->f16 and
+  MXFP8 conversions are already cached and armed per activation
+  (`mxfp8_act_cache_t`, "1 quantization + 1 conversion instead of 2 + 5").
+  Note an analytical estimate put `head_rms_norm_rope_tail` at 128 GB/s and was
+  wrong by 2x -- it moves 544 MB, not the 268 MB the obvious arithmetic gives.
+  Measure the bytes, do not derive them.
+- **There is no scheduling or launch-overhead win.**  Sum of all kernel time is
+  4.651 s against 4.970 s of prefill wall: the GPU is 93.6% busy.  Everything
+  left is inside a kernel.
+- **`--prefill-chunk` is already optimal at its default.**  8000-token prompt:
+  1024 -> 673 tok/s, 2048 -> 728, 4096 (default) -> 729, 8192 -> 728.
+- **cuBLASLt algo autotune buys nothing.**  Implemented, measured, reverted.
+  Asking `cublasLtMatmulAlgoGetHeuristic` for 12 candidates and timing each on
+  the real operands returns only **2-3** candidates, because the
+  `REDUCTION_SCHEME_NONE` determinism constraint already prunes the set that
+  hard.  The tuner picks a different algo than the heuristic's top choice about
+  half the time, and throughput is IDENTICAL on cached shapes (792 vs 793,
+  772 vs 771 tok/s); on the dominant shape it re-picks the heuristic's own #0.
+  Net end-to-end it is slower, because each new `ntok` pays the tuning cost.
+  The heuristic is right; do not go looking here again.
+- **Why the biggest cuBLASLt GEMM sits at 31.8% of tensor peak.**  Its shape is
+  in=1024, out=32768, ntok=2048: 137 GFLOP in 1.93 ms is 71 TFLOP/s of ~250,
+  but it writes a 32768x2048 **f32** result -- 268 MB, i.e. ~139 GB/s of pure
+  output store, half the device's bandwidth spent on the write.  The limiter is
+  the output dtype, not the algo or the tile.  Narrowing it is a fidelity
+  decision, so it belongs with the attention precision question, not before it.
+
 ## What is already at the roofline -- do not re-open
 
 - `pack_act_e4m3_rowmajor_warp`: 260 GB/s of ~273 GB/s after the warp-per-
