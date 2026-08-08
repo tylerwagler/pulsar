@@ -58,14 +58,38 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <vector>
 #include <random>
 
-int main(void) {
+/* Encode a CONSTANT row in ATTN_PACK layout.  0.25/0.5/0.75/1.0 are all exact
+ * in E4M3 with a unit block scale, so the packed row decodes to exactly the
+ * same constant and the isolation assertion below is unchanged -- it now also
+ * exercises packed row ADDRESSING (row stride, scale offset, rope offset).
+ * The FORMAT itself is not at risk here: the kernel decodes through the same
+ * attn_comp_pack_ld the f32 kernel uses, so there is one implementation. */
+static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    uint32_t e = 0, m = 0;
+    for (uint32_t be = 1; be < 15u && !e; be++)
+        for (uint32_t mm = 0; mm < 8u; mm++) {
+            const float cand = ldexpf(1.0f + (float)mm / 8.0f, (int)be - 7);
+            if (cand == v) { e = be; m = mm; break; }
+        }
+    if (!e) { fprintf(stderr, "pack_const_row: %.4f not exact in e4m3\n", v); exit(2); }
+    for (uint32_t d = 0; d < n_nope; d++) dst[d] = (uint8_t)((e << 3) | m);
+    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_SCALES_PAD(head_dim); i++)
+        dst[n_nope + i] = 127u;                       /* scale = 2^0 */
+    float *rope = (float *)(dst + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = v;
+}
+
+int main(int argc, char **argv) {
+    const int packed = (argc > 1 && argv[1][0] == 'p');
     const uint32_t D = AF16_DIM, n_head = 32u;
     const uint32_t n_banks = 4u, raw_cap = 64u, comp_cap = 32u;
     const uint32_t n_tokens = 16u, top_k = 8u, window = 24u, ratio = 2u;
     const uint32_t n_comp = comp_cap, n_raw = raw_cap;
 
     printf("attn f16 BANK ISOLATION test: %u banks, raw_cap=%u comp_cap=%u,"
-           " %u tokens x %u heads\n\n", n_banks, raw_cap, comp_cap, n_tokens, n_head);
+           " %u tokens x %u heads, comp=%s\n\n", n_banks, raw_cap, comp_cap,
+           n_tokens, n_head, packed ? "ATTN_PACK" : "f32");
 
     /* bank b is the constant v_b, everywhere: raw ring slice AND comp slice */
     auto vb = [](uint32_t b) { return 0.25f * (float)(b + 1u); };
@@ -97,6 +121,14 @@ int main(void) {
             tk[(size_t)t * top_k + i] = (int32_t)((t * 5u + i * 3u) % comp_cap);
     }
 
+    /* packed comp banks: same constants, ATTN_PACK layout */
+    const uint64_t prow = PULSAR_ATTN_PACK_ROWBYTES(D);
+    std::vector<uint8_t> pcomp((size_t)n_banks * comp_cap * prow, 0);
+    if (packed)
+        for (uint32_t b = 0; b < n_banks; b++)
+            for (uint32_t r = 0; r < comp_cap; r++)
+                pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
+
     float *dq, *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
     cudaMalloc(&dq, q.size()*4); cudaMalloc(&draw, raw.size()*4);
     cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
@@ -112,16 +144,23 @@ int main(void) {
     cudaMemcpy(dseq, seq.data(), seq.size()*4, cudaMemcpyHostToDevice);
 
     /* comp_bank_ptrs: one base pointer per bank, the shape the engine passes */
+    uint8_t *dpk = NULL;
+    if (packed) {
+        cudaMalloc(&dpk, pcomp.size());
+        cudaMemcpy(dpk, pcomp.data(), pcomp.size(), cudaMemcpyHostToDevice);
+    }
     std::vector<const void *> hbp(n_banks);
-    for (uint32_t b = 0; b < n_banks; b++) hbp[b] = dcomp + (size_t)b * comp_cap * D;
+    for (uint32_t b = 0; b < n_banks; b++)
+        hbp[b] = packed ? (const void *)(dpk + (size_t)b * comp_cap * prow)
+                        : (const void *)(dcomp + (size_t)b * comp_cap * D);
     const void **dbp = NULL;
     cudaMalloc(&dbp, n_banks * sizeof(void *));
     cudaMemcpy(dbp, hbp.data(), n_banks * sizeof(void *), cudaMemcpyHostToDevice);
 
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, draw, dcomp, dtk, n_tokens, /*pos0*/0u, n_raw, raw_cap,
-        /*raw_start*/0u, n_comp, top_k, window, ratio, n_head, D, /*raw_f16*/0,
-        dpos, dseq, dbp, comp_cap, n_banks);
+        dout, ds, dq, draw, packed ? (const float *)dpk : dcomp, dtk, n_tokens,
+        /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, top_k, window, ratio,
+        n_head, D, /*raw_f16*/0, dpos, dseq, dbp, comp_cap, n_banks, packed);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;

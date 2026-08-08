@@ -97,6 +97,30 @@ enum {
     ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
      (uint64_t)PULSAR_ATTN_PACK_NROT * 4u)
 
+/* e4m3 byte * scale by pure bit math — bit-identical to
+ * pulsar_attn_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
+ * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;
+ * subnormals use the same mant*2^-9 product; scale is an exact power of two,
+ * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
+__device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
+    const uint32_t e = (b >> 3) & 15u;
+    const uint32_t m = b & 7u;
+    const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20))
+                      : (float)m * 0.001953125f;
+    const float sv = v * scale;
+    return (b & 0x80u) ? -sv : sv;
+}
+
+__device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    if (d < n_nope) {
+        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
+        return attn_pack_e4m3(r[d], scale);
+    }
+    return ((const float *)(r + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
+}
+
 struct pulsar_gpu_tensor {
     void *ptr;
     uint64_t bytes;

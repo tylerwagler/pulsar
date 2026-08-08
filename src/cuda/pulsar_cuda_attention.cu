@@ -45,29 +45,10 @@ __device__ static float pulsar_attn_fp8_kv_dequant(uint8_t byte, float scale) {
  * f32 directly, so scores/outputs are bit-identical to the f32 comp cache.
  * The 2^(e8-127) scale is built as a float exponent; the pack amax floor
  * (1e-4 -> e8 >= 105) rules out byte 0. */
-/* e4m3 byte * scale by pure bit math — bit-identical to
- * pulsar_attn_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
- * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;
- * subnormals use the same mant*2^-9 product; scale is an exact power of two,
- * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
-__device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
-    const uint32_t e = (b >> 3) & 15u;
-    const uint32_t m = b & 7u;
-    const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20))
-                      : (float)m * 0.001953125f;
-    const float sv = v * scale;
-    return (b & 0x80u) ? -sv : sv;
-}
-
-__device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    if (d < n_nope) {
-        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
-        return attn_pack_e4m3(r[d], scale);
-    }
-    return ((const float *)(r + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
-}
+/* attn_pack_e4m3 / attn_comp_pack_ld now live in pulsar_cuda_internal.h so the
+ * fp16 tensor-core kernel decodes ATTN_PACK rows with the SAME code rather
+ * than a transcription of it -- there is then no second copy of the contract
+ * to drift or to get wrong. */
 
 /* Packed-row dot walked d = 0..head_dim-1 by one thread: per-64-block scale
  * hoisted, e4m3 bytes fetched four at a time as one uint32 (rows are 4-byte
@@ -2465,7 +2446,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
          * descriptors is the case the gate above already forces to be
          * unpacked, so this covers it and refuses the rest. */
         static const int use_f16_idx = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
-        if (use_f16_idx && !comp_kv_pack && topk_ptr &&
+        if (use_f16_idx && topk_ptr &&
             head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u) {
             static int announced = 0;
             if (!announced) {
@@ -2479,7 +2460,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                     raw_start, n_comp, top_k, window, ratio, n_head, head_dim,
                     (int)raw_f16, (const int *)positions_ptr,
                     (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
-                    comp_cap, descr ? n_banks : 1u))
+                    comp_cap, descr ? n_banks : 1u, (int)comp_kv_pack))
                 return 1;
             fprintf(stderr, "pulsar: fp16 indexed attention FAILED; refusing to "
                             "fall through to the f32 kernel\n");

@@ -133,12 +133,13 @@ static void attn_f16_kernel(
         uint32_t top_k,
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks) {
+        uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
+    (void)comp_pack;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -304,8 +305,18 @@ static void attn_f16_kernel(
                         const int32_t c = topk[(uint64_t)t * top_k + ci];
                         ci = (c >= 0 && (uint32_t)c < sVisComp) ? (uint32_t)c : 0u;
                     }
-                    const float *cr = comp_src + ((uint64_t)comp_base + ci) * AF16_DIM;
-                    v = make_half2(__float2half(cr[d2]), __float2half(cr[d2 + 1u]));
+                    const uint64_t crow = (uint64_t)comp_base + ci;
+                    if (comp_pack) {
+                        /* Same attn_comp_pack_ld the f32 kernel uses -- shared,
+                         * not transcribed, so the ATTN_PACK contract has exactly
+                         * one implementation. */
+                        v = make_half2(
+                            __float2half(attn_comp_pack_ld(comp_src, crow, d2, AF16_DIM)),
+                            __float2half(attn_comp_pack_ld(comp_src, crow, d2 + 1u, AF16_DIM)));
+                    } else {
+                        const float *cr = comp_src + crow * AF16_DIM;
+                        v = make_half2(__float2half(cr[d2]), __float2half(cr[d2 + 1u]));
+                    }
                 }
             }
             *(__half2 *)&sKV[r * AF16_KVSTRIDE + d2] = v;
@@ -471,7 +482,7 @@ int pulsar_gpu_attention_f16_prefill(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u);
+                                            NULL, NULL, NULL, 0u, 1u, 0);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -487,7 +498,7 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks) {
+        uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
     if (!heads || !sinks || !q || !raw_kv || !comp_kv || !topk) return 0;
     /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
     if ((positions != NULL) != (seq_id != NULL)) return 0;
@@ -509,6 +520,6 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u);
+                                            positions ? n_banks : 1u, comp_pack);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }
