@@ -68,7 +68,14 @@
  * beyond the stride constant. */
 #define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
 #define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B */
-#define IDX_TOKTILE   2u           /* tokens per block: B is shared across them */
+#define IDX_TOKTILE   2u           /* tokens staged at once */
+/* Tokens PER BLOCK.  The compressed tile is identical for every token, so it is
+ * staged once and every token in the group is swept through it: B staging and
+ * its global traffic drop by IDX_TOKGROUP/IDX_TOKTILE.  Entrpi's scorer launches
+ * grid=4x256 block=512 for a whole 4096-token chunk, i.e. one launch per layer
+ * against our eight -- amortising the tile setup over far more math is the
+ * structural difference their geometry points at. */
+#define IDX_TOKGROUP  8u
 #define IDX_THREADS   256u         /* 8 warps: 4 per token */
 
 /* ---- E4M3 encode (host-side rules, device-side implementation) ----------- */
@@ -110,11 +117,14 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
     const uint16_t bid = 0, tid = 0;
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, {%14}, {%15,%16}, {%17}, {%18,%19};\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        /* D and C are the SAME registers: "+f" read-write operands, referenced
+         * twice.  Declaring them as separate "=f" outputs and "f" inputs let the
+         * compiler allocate two accumulator sets and copy between them on every
+         * MMA -- 16 accumulators x 4 k-slabs of pure register churn per n-block. */
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
           "r"(b0), "r"(b1),
-          "f"(d0), "f"(d1), "f"(d2), "f"(d3),
           "r"(sfa), "h"(bid), "h"(tid),
           "r"(sfb), "h"(bid), "h"(tid));
 #else
@@ -185,9 +195,9 @@ static void idx_scores_mxfp4_kernel(
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t ratio, float scale, int causal) {
     const uint32_t tile_c = blockIdx.x * IDX_NTILE;
-    const uint32_t tok0   = blockIdx.y * IDX_TOKTILE;
-    if (tok0 >= n_tokens) return;
-    const uint32_t ntok = min(IDX_TOKTILE, n_tokens - tok0);
+    const uint32_t tok_base = blockIdx.y * IDX_TOKGROUP;
+    if (tok_base >= n_tokens) return;
+    const uint32_t ngroup = min(IDX_TOKGROUP, n_tokens - tok_base);
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -197,10 +207,10 @@ static void idx_scores_mxfp4_kernel(
 
     /* Two tokens share this block, so the tile is only fully masked when it is
      * masked for the LATER (more permissive) of the two. */
-    const uint32_t vis_max = (pos0 + tok0 + ntok - 1u + 1u) / ratio;
+    const uint32_t vis_max = (pos0 + tok_base + ngroup) / ratio;
     if (causal && tile_c >= vis_max) {
-        for (uint32_t i = tid; i < IDX_NTILE * ntok; i += IDX_THREADS) {
-            const uint32_t t = tok0 + i / IDX_NTILE;
+        for (uint32_t i = tid; i < IDX_NTILE * ngroup; i += IDX_THREADS) {
+            const uint32_t t = tok_base + i / IDX_NTILE;
             const uint32_t comp_i = tile_c + (i % IDX_NTILE);
             if (comp_i < n_comp) scores[(uint64_t)t * n_comp + comp_i] = -INFINITY;
         }
@@ -219,24 +229,7 @@ static void idx_scores_mxfp4_kernel(
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
     __shared__ float   sPart[IDX_THREADS / 32u][IDX_NTILE]; /*  2 KB */
 
-    /* ---- stage Q: straight copy of the pre-packed bytes ------------------ */
-    {
-        const uint32_t sbytes = ntok * IDX_HEADS * IDX_KSLABS;
-        const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
-        const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
-        /* row-wise, because the shared stride is padded and the global one is not */
-        for (uint32_t slot = tid; slot < IDX_TOKTILE * IDX_HEADS * 32u; slot += IDX_THREADS) {
-            const uint32_t r = slot / 32u;              /* row = token*heads + head */
-            const uint32_t j = slot % 32u;              /* 32 x uint32 = 128 B */
-            uint32_t *dst = (uint32_t *)(sA + r * IDX_ASTRIDE);
-            dst[j] = (r < ntok * IDX_HEADS)
-                   ? *(const uint32_t *)(qsrc + r * IDX_HEAD_DIM + j * 4u)
-                   : 0u;
-        }
-        for (uint32_t i = tid; i < sbytes; i += IDX_THREADS)
-            sSFA[i] = ssrc[i];
-    }
-
+    /* ---- stage K ONCE for the whole token group -------------------------- */
     /* ---- stage K: raw copy; the nibble spread moves to the MMA load --------
      * Keeping the rows PACKED in shared halves this tile (16 KB -> 8 KB) and
      * halves B's shared-read traffic, and the block's smem drops 37 KB -> 29 KB,
@@ -260,6 +253,32 @@ static void idx_scores_mxfp4_kernel(
             sSFB[c * IDX_KSLABS + j] = (uint8_t)(sfb < 0 ? 0 : sfb);
         }
     }
+    __syncthreads();
+
+    /* ---- sweep the group's tokens through the resident K tile ------------ */
+    for (uint32_t tp = 0; tp < ngroup; tp += IDX_TOKTILE) {
+    const uint32_t tok0 = tok_base + tp;
+    const uint32_t ntok = min(IDX_TOKTILE, n_tokens - tok0);
+    if (tp) __syncthreads();          /* previous iteration's sPart/sA consumed */
+
+    /* ---- stage Q: straight copy of the pre-packed bytes ------------------ */
+    {
+        const uint32_t sbytes = ntok * IDX_HEADS * IDX_KSLABS;
+        const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
+        const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
+        /* row-wise, because the shared stride is padded and the global one is not */
+        for (uint32_t slot = tid; slot < IDX_TOKTILE * IDX_HEADS * 32u; slot += IDX_THREADS) {
+            const uint32_t r = slot / 32u;              /* row = token*heads + head */
+            const uint32_t j = slot % 32u;              /* 32 x uint32 = 128 B */
+            uint32_t *dst = (uint32_t *)(sA + r * IDX_ASTRIDE);
+            dst[j] = (r < ntok * IDX_HEADS)
+                   ? *(const uint32_t *)(qsrc + r * IDX_HEAD_DIM + j * 4u)
+                   : 0u;
+        }
+        for (uint32_t i = tid; i < sbytes; i += IDX_THREADS)
+            sSFA[i] = ssrc[i];
+    }
+
     __syncthreads();
 
     /* ---- GEMM + fused head reduction ------------------------------------ */
@@ -345,6 +364,7 @@ static void idx_scores_mxfp4_kernel(
         if (causal && comp_i >= ((pos0 + t + 1u) / ratio)) out = -INFINITY;
         scores[(uint64_t)t * n_comp + comp_i] = out;
     }
+    }   /* token group */
 }
 
 /* ---- launcher ----------------------------------------------------------- */
@@ -372,7 +392,7 @@ extern "C" int pulsar_gpu_indexer_scores_mxfp4(
     if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q pack launch")) return 0;
 
     dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE,
-              (n_tokens + IDX_TOKTILE - 1u) / IDX_TOKTILE, 1);
+              (n_tokens + IDX_TOKGROUP - 1u) / IDX_TOKGROUP, 1);
     idx_scores_mxfp4_kernel<<<grid, IDX_THREADS>>>(
         scores, qa, qsf, weights, (const uint8_t *)comp,
         n_comp, n_tokens, pos0, ratio, scale, causal);
