@@ -141,10 +141,22 @@ not the same work -- the engine's calls carry ~512 compressed rows on top of
 the 128-row raw window, so the standalone shape is a fifth of the rows.  1.48x
 is the honest number.
 
-The second frontier does not move (770 -> 768): continued prefill goes through
-attention_decode_mixed_heads8_online, which is NOT wired.  That kernel is 3.4%
-and the indexed one is 12.5%; both are still on the FMA pipe.  Wiring them is
-the obvious next step and worth more than what was just taken.
+The INDEXED path is now converted too, which is where most of the attention
+time was (12.5% against the static path's 10.1%).  Same kernel, second mode:
+compressed rows become a top-k SELECTION instead of a prefix and raw rows come
+from a ring buffer, so the row plan is reproduced verbatim from the f32 kernel.
+It is deliberately narrow -- banked descriptors and ATTN_PACK comp rows keep
+the f32 kernel, because approximating a plan that picks the WRONG KV rows
+produces plausible attention rather than an error.
+
+    attention_static  10.1% (43 x 10.92 ms)  + indexed 12.5% (84 x 6.67 ms)
+      = 22.6% of GPU, 1029 ms
+    attn_f16_kernel   14.5% (127 x 4.81 ms)  =  611 ms      1.68x
+    frontier 1 (cold)       869.1 -> 946.6 tok/s   +8.9%
+    frontier 2 (continued)  770.5 -> 851.6 tok/s  +10.5%
+
+Still on the FMA pipe: attention_decode_mixed_heads8_online (3.4%), plus the
+banked/packed indexed variants this tier refuses.
 
 Why not 4.3x, and what the second step bought.  ncu on the 1-M-tile build:
 pipe_tensor 6-8%, pipe_lsu 33%, 7.15 GB of L2 traffic in 11.9 ms -- the MMAs

@@ -211,6 +211,29 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                head_dim,
         int                     raw_f16);
 
+/* fp16 tensor-core attention, INDEXED: compressed rows are a top-k selection
+ * and raw rows come from a ring buffer.  Refuses banked descriptors and
+ * ATTN_PACK comp rows -- the caller keeps the f32 kernel for those. */
+int pulsar_gpu_attention_f16_indexed(
+        float                   *heads,
+        const float             *sinks,
+        const float             *q,
+        const float             *raw_kv,
+        const float             *comp_kv,
+        const int               *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        int                     raw_f16);
+
 /* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or

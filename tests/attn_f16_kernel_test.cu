@@ -56,6 +56,12 @@ int main(int argc, char **argv) {
      * the n_comp=0 path would have shipped that half untested. */
     const uint32_t n_comp   = (argc > 5) ? (uint32_t)atoi(argv[5]) : 0u;
     const uint32_t ratio    = (argc > 6) ? (uint32_t)atoi(argv[6]) : 4u;
+    /* top_k > 0 switches to INDEXED mode: compressed rows become a top-k
+     * selection and raw rows come from a ring buffer.  Exercised against the
+     * same f64 oracle, because the row PLAN is the part most likely to be
+     * subtly wrong and it is invisible in the output magnitude. */
+    const uint32_t top_k    = (argc > 7) ? (uint32_t)atoi(argv[7]) : 0u;
+    const uint32_t raw_cap  = (argc > 8) ? (uint32_t)atoi(argv[8]) : 0u;
     const uint32_t D = AF16_DIM;
 
     printf("attn f16 kernel test: n_tokens=%u window=%u n_head=%u head_dim=%u"
@@ -73,18 +79,60 @@ int main(int argc, char **argv) {
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
     const int bench_only = (argc > 4 && argv[4][0] == 'b');
+    const int indexed = (top_k != 0u);
+    const uint32_t rcap = raw_cap ? raw_cap : n_tokens;
+    const uint32_t n_raw = indexed ? (n_tokens < rcap ? n_tokens : rcap) : 0u;
+    const uint32_t pos0 = 0u;
+    /* deterministic pseudo-selection, deliberately unsorted and repeating so a
+     * kernel that assumed a sorted prefix would fail */
+    std::vector<int32_t> tk((size_t)n_tokens * (top_k ? top_k : 1u), 0);
+    if (indexed)
+        for (uint32_t t = 0; t < n_tokens; t++)
+            for (uint32_t i = 0; i < top_k; i++)
+                tk[(size_t)t * top_k + i] = n_comp ? (int32_t)((t * 7u + i * 13u) % n_comp) : 0;
 
     /* ---- oracle, f64, same fp16 operands ---------------------------------- */
     std::vector<double> ref(bench_only ? 0 : (size_t)n_tokens * n_head * D, 0.0);
     for (uint32_t t = 0; t < (bench_only ? 0u : n_tokens); t++) {
-        const uint32_t cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
-        const uint32_t start = t + 1u - cnt;
-        uint32_t ccnt = 0u;
-        if (n_comp && ratio) { ccnt = (t + 1u) / ratio; if (ccnt > n_comp) ccnt = n_comp; }
+        uint32_t cnt, start = 0u, ccnt = 0u, rfirst = 0u;
+        if (indexed) {
+            const uint32_t qpos = pos0 + t;
+            const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+            uint32_t rc = 0u;
+            if (n_raw != 0u) {
+                const uint32_t last = first_raw_pos + n_raw - 1u;
+                if (qpos >= first_raw_pos) {
+                    uint32_t lo = first_raw_pos;
+                    if (window != 0u && qpos + 1u > window) {
+                        const uint32_t wlo = qpos + 1u - window;
+                        if (wlo > lo) lo = wlo;
+                    }
+                    const uint32_t hi = qpos < last ? qpos : last;
+                    if (hi >= lo) { rfirst = lo - first_raw_pos; rc = hi - lo + 1u; }
+                    if (rc > 256u) rc = 256u;
+                }
+            }
+            cnt = rc;
+            uint32_t vis = n_comp;
+            if (ratio) { vis = (qpos + 1u) / ratio; if (vis > n_comp) vis = n_comp; }
+            ccnt = top_k < vis ? top_k : vis;
+        } else {
+            cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
+            start = t + 1u - cnt;
+            if (n_comp && ratio) { ccnt = (t + 1u) / ratio; if (ccnt > n_comp) ccnt = n_comp; }
+        }
         const uint32_t tot = cnt + ccnt;
-        /* row r < cnt is a raw row; beyond that it is a compressed one */
         auto kvrow = [&](uint32_t r) -> const float * {
-            return (r < cnt) ? &kv[(size_t)(start + r) * D] : &ckv[(size_t)(r - cnt) * D];
+            if (r < cnt) {
+                const uint32_t rr = indexed ? ((0u + rfirst + r) % rcap) : (start + r);
+                return &kv[(size_t)rr * D];
+            }
+            uint32_t ci = r - cnt;
+            if (indexed) {
+                const int32_t c = tk[(size_t)t * top_k + ci];
+                ci = (c >= 0 && (uint32_t)c < n_comp) ? (uint32_t)c : 0u;
+            }
+            return &ckv[(size_t)ci * D];
         };
         const double scale = 1.0 / std::sqrt((double)D);
         for (uint32_t h = 0; h < n_head; h++) {
@@ -122,10 +170,19 @@ int main(int argc, char **argv) {
     cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
 
-    const int rc = pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
-                                                    n_comp ? dckv : NULL,
-                                                    n_tokens, n_comp, window, ratio,
-                                                    n_head, D, 0);
+    int32_t *dtk = NULL;
+    if (indexed) {
+        cudaMalloc(&dtk, tk.size() * 4);
+        cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
+    }
+    const int rc = indexed
+        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, dtk,
+                                           n_tokens, pos0, n_raw, rcap, 0u,
+                                           n_comp, top_k, window, ratio, n_head, D, 0)
+        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
+                                           n_comp ? dckv : NULL,
+                                           n_tokens, n_comp, window, ratio,
+                                           n_head, D, 0);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;

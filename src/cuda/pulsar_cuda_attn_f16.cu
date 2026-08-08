@@ -126,11 +126,15 @@ static void attn_f16_kernel(
         const float *__restrict__ q,          /* [n_tokens][n_head][512] */
         const float *__restrict__ raw_kv,     /* [n_tokens][512], f16 or f32 */
         const float *__restrict__ comp_kv,    /* [n_comp][512] f32, may alias raw */
+        const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, int raw_f16) {
+        uint32_t n_head, int raw_f16,
+        uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start_in,
+        uint32_t top_k) {
 #if !PULSAR_ATTN_F16_MMA
-    (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv;
+    (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
+    (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -142,12 +146,56 @@ static void attn_f16_kernel(
     const uint32_t g = lane >> 2u;          /* fragment groupID 0..7 */
     const uint32_t tg = lane & 3u;          /* thread-in-group 0..3 */
 
-    const uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
-    const uint32_t raw_start = t + 1u - raw_count;
-    uint32_t comp_count = 0u;
-    if (n_comp != 0u && ratio != 0u) {
-        comp_count = (t + 1u) / ratio;
-        if (comp_count > n_comp) comp_count = n_comp;
+    /* ---- row plan ------------------------------------------------------
+     * Two modes.  Dense window (topk == NULL) is the raw/mixed launchers'
+     * contiguous causal window.  INDEXED mode reproduces
+     * attention_indexed_mixed_heads8_online_kernel's plan verbatim: the raw
+     * rows come out of a ring buffer (hence the modulo and the row table) and
+     * the compressed rows are a top-k SELECTION, not a prefix.  This launcher
+     * refuses the banked-descriptor and ATTN_PACK variants, so the qpos /
+     * raw_base / comp_base terms of that kernel collapse to the scalar path
+     * -- which is exactly the case its own comment documents as equivalent. */
+    __shared__ uint32_t sRawRows[256];
+    __shared__ uint32_t sRawCount, sRawFirst;
+    uint32_t raw_count, raw_start = 0u, comp_count = 0u;
+    if (topk) {
+        const uint32_t qpos = pos0 + t;
+        const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+        if (tid == 0u) {
+            uint32_t rc = 0u, rf = 0u;
+            if (n_raw != 0u) {
+                const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+                if (qpos >= first_raw_pos) {
+                    uint32_t lo = first_raw_pos;
+                    if (window != 0u && qpos + 1u > window) {
+                        const uint32_t wlo = qpos + 1u - window;
+                        if (wlo > lo) lo = wlo;
+                    }
+                    const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                    if (hi >= lo) { rf = lo - first_raw_pos; rc = hi - lo + 1u; }
+                    if (rc > 256u) rc = 256u;
+                }
+            }
+            sRawCount = rc; sRawFirst = rf;
+        }
+        __syncthreads();
+        raw_count = sRawCount;
+        for (uint32_t r = tid; r < raw_count; r += AF16_THREADS)
+            sRawRows[r] = (raw_start_in + sRawFirst + r) % raw_cap;
+        uint32_t visible_comp = n_comp;
+        if (ratio != 0u) {
+            visible_comp = (qpos + 1u) / ratio;
+            if (visible_comp > n_comp) visible_comp = n_comp;
+        }
+        comp_count = top_k < visible_comp ? top_k : visible_comp;
+        __syncthreads();
+    } else {
+        raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+        raw_start = t + 1u - raw_count;
+        if (n_comp != 0u && ratio != 0u) {
+            comp_count = (t + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
     }
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)AF16_DIM);
@@ -206,11 +254,20 @@ static void attn_f16_kernel(
             if (r < nr) {
                 const uint32_t sr = row0 + r;
                 if (sr < raw_count) {
-                    const uint64_t b = (uint64_t)(raw_start + sr) * AF16_DIM;
+                    const uint32_t rr = topk ? sRawRows[sr] : (raw_start + sr);
+                    const uint64_t b = (uint64_t)rr * AF16_DIM;
                     v = make_half2(__float2half(af16_kv(raw_kv, raw_f16, b, d2)),
                                    __float2half(af16_kv(raw_kv, raw_f16, b, d2 + 1u)));
                 } else {
-                    const float *cr = comp_kv + (uint64_t)(sr - raw_count) * AF16_DIM;
+                    uint32_t ci = sr - raw_count;
+                    if (topk) {
+                        /* Clamp exactly as the f32 kernel does: the engine keeps
+                         * padding sentinels out, but a stray index would be a
+                         * multi-GB wild read.  Substitute row 0 on violation. */
+                        const int32_t c = topk[(uint64_t)t * top_k + ci];
+                        ci = (c >= 0 && (uint32_t)c < n_comp) ? (uint32_t)c : 0u;
+                    }
+                    const float *cr = comp_kv + (uint64_t)ci * AF16_DIM;
                     v = make_half2(__float2half(cr[d2]), __float2half(cr[d2 + 1u]));
                 }
             }
@@ -374,9 +431,37 @@ int pulsar_gpu_attention_f16_prefill(
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
-                                            comp_kv ? comp_kv : raw_kv,
+                                            comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_f16);
+                                            n_head, raw_f16, 0u, 0u, 1u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
+}
+
+/* Indexed variant: compressed rows are a top-k SELECTION and raw rows come from
+ * a ring buffer.  Refuses the banked-descriptor and ATTN_PACK variants rather
+ * than approximating them -- the caller checks those and keeps the f32 kernel
+ * for them, so a 0 here is a real failure. */
+int pulsar_gpu_attention_f16_indexed(
+        float *heads, const float *sinks, const float *q,
+        const float *raw_kv, const float *comp_kv, const int *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16) {
+    if (!heads || !sinks || !q || !raw_kv || !comp_kv || !topk) return 0;
+    if (head_dim != AF16_DIM) return 0;
+    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
+    if (n_tokens == 0u || raw_cap == 0u || top_k == 0u) return 0;
+    /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
+     * is what sRawRows[256] must hold.  The kernel caps that at 256 exactly as
+     * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
+     * matches rather than silently differing. */
+    if (!af16_device_supported()) return 0;
+    dim3 grid(n_tokens, n_head / AF16_HPB, 1);
+    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv, comp_kv,
+                                            (const int32_t *)topk,
+                                            n_tokens, n_comp, window, ratio,
+                                            n_head, raw_f16, pos0, n_raw, raw_cap,
+                                            raw_start, top_k);
+    return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }
