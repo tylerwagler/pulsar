@@ -4,699 +4,77 @@
 #include "mmq/ds4_repack.h"  /* raw IQ2 block stream -> aligned artifact */
 #endif
 
-#include "pulsar_iq2_tables_cuda.inc"
-
-
-
-__device__ static float dev_f16_to_f32(uint16_t v) {
-    return __half2float(*reinterpret_cast<const __half *>(&v));
-}
-
-
-
-__device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
-    const uint32_t p = __popc(v) & 1u;
-    const uint32_t s = v ^ (p << 7u);
-    return s * 0x01010101u;
-}
-
-
-
-__device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
-    const uint32_t signs = dev_unpack_iq2_signs(sign);
-    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
-    const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
-    const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
-    acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
-    acc = __dp4a(g1, *(const int32_t *)(q8 + 4), acc);
-    return acc;
-}
-
-
-
-
-
-
-__device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uint8_t grid1, uint32_t sign1, const int8_t *q8) {
-    int32_t sum = 0;
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid0], cuda_ksigns_iq2xs[sign0], q8, sum);
-    sum = dev_iq2_dp4a_8(cuda_iq2xxs_grid[grid1], cuda_ksigns_iq2xs[sign1], q8 + 8, sum);
-    return sum;
-}
-
-
-
-__device__ __forceinline__ static void dev_iq2_i8x8_lut(
-        const uint64_t *grid,
-        const uint8_t *signs,
-        uint8_t grid_idx,
-        uint32_t sign_idx,
-        int32_t *w0,
-        int32_t *w1) {
-    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
-    const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
-    const uint64_t g = grid[grid_idx];
-    *w0 = __vsub4((int32_t)(uint32_t)g ^ sm0, sm0);
-    *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
-}
-
-
-
-/* ---- IQ2_XXS_SOA (type 42) device reader -----------------------------------
- * The packed type-16 block is { uint16 d; uint16 qs[32] } = 66 B, so qs[] sits
- * at offset 2 and the whole code stream is only 2-byte aligned: nvcc has to
- * emit LDG.E.U16, two 16-bit loads per 32-bit weight word (confirmed in SASS
- * -- the gate/up kernel has NO 64/128-bit global loads).  Type 42 stores the
- * SAME bytes with the planes split, so qs is 64 B-aligned per block and one
- * aligned uint2 replaces four U16 loads.
- *
- * Layout (must match ds4q_iq2_xxs_soa_repack() in gguf-tools/quants_common.c):
- *     [0,        nblk*64) q plane : block b at b*64  (uint16 qs[32])
- *     [nblk*64, +nblk*2)  d plane : block b at nblk*64 + b*2 (uint16 d)
- * nblk is the WHOLE TENSOR's block count, so the planes are tensor-global and
- * a per-expert/per-row base must be expressed as a block index, not a byte
- * offset -- see iq2_soa_planes below. */
-struct iq2_soa_planes {
-    const uint8_t  *q;   /* q plane base (tensor-global) */
-    const uint16_t *d;   /* d plane base (tensor-global) */
-};
-
-__device__ __forceinline__ static iq2_soa_planes dev_iq2_soa_planes(const char *tensor_base, uint64_t d_plane_off) {
-    iq2_soa_planes p;
-    p.q = (const uint8_t *)tensor_base;                      /* q plane at +0 */
-    p.d = (const uint16_t *)(tensor_base + d_plane_off);     /* d plane = nblk_total*64 */
-    return p;
-}
-
-/* SoA twin of dev_dot_iq2_xxs_q8_K_block_lut: same smem-LUT decode, same
- * accumulation order, only the two weight loads change. */
-__device__ static float dev_dot_iq2_soa_q8_K_block_lut(
-        const iq2_soa_planes p,
-        uint64_t blk,
-        const cuda_block_q8_K *y,
-        const uint64_t *grid,
-        const uint8_t *signs) {
-    const float d = dev_f16_to_f32(p.d[blk]) * y->d;
-    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);
-    const int8_t *q8 = y->qs;
-    int32_t bsum = 0;
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint2 wpair = q2[ib32];
-        const uint32_t aux0 = wpair.x, aux1 = wpair.y;
-        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
-        int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
-        int32_t sumi = 0;
-        sumi = __dp4a(w[0], *(const int32_t *)(q8 + 0),  sumi);
-        sumi = __dp4a(w[1], *(const int32_t *)(q8 + 4),  sumi);
-        sumi = __dp4a(w[2], *(const int32_t *)(q8 + 8),  sumi);
-        sumi = __dp4a(w[3], *(const int32_t *)(q8 + 12), sumi);
-        sumi = __dp4a(w[4], *(const int32_t *)(q8 + 16), sumi);
-        sumi = __dp4a(w[5], *(const int32_t *)(q8 + 20), sumi);
-        sumi = __dp4a(w[6], *(const int32_t *)(q8 + 24), sumi);
-        sumi = __dp4a(w[7], *(const int32_t *)(q8 + 28), sumi);
-        q8 += 32;
-        bsum += sumi * ls;
-    }
-    return 0.125f * d * (float)bsum;
-}
-
-__device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
-        const cuda_block_iq2_xxs *x,
-        const cuda_block_q8_K *y,
-        const uint64_t *grid,
-        const uint8_t *signs) {
-    const float xd = dev_f16_to_f32(x->d);
-    const uint16_t *q2 = x->qs;
-    const int8_t *q8 = y->qs;
-    int32_t bsum = 0;
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
-        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
-        int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
-        int32_t sumi = 0;
-        sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
-        sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
-        sumi = __dp4a(w[2], *(const int32_t *)(q8 + ib32 * 32u + 8),  sumi);
-        sumi = __dp4a(w[3], *(const int32_t *)(q8 + ib32 * 32u + 12), sumi);
-        sumi = __dp4a(w[4], *(const int32_t *)(q8 + ib32 * 32u + 16), sumi);
-        sumi = __dp4a(w[5], *(const int32_t *)(q8 + ib32 * 32u + 20), sumi);
-        sumi = __dp4a(w[6], *(const int32_t *)(q8 + ib32 * 32u + 24), sumi);
-        sumi = __dp4a(w[7], *(const int32_t *)(q8 + ib32 * 32u + 28), sumi);
-        bsum += sumi * ls;
-    }
-    return 0.125f * xd * y->d * (float)bsum;
-}
-
-
-
-
-/* SoA twin of dev_dot_iq2_xxs_q8_K_block.  Identical arithmetic and identical
- * accumulation order -- only the two loads change -- so results are
- * bit-identical to the packed path. */
-__device__ static float dev_dot_iq2_soa_q8_K_block(const iq2_soa_planes p, uint64_t blk, const cuda_block_q8_K *y) {
-    const float d = dev_f16_to_f32(p.d[blk]) * y->d;
-    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);   /* 8-byte aligned */
-    const int8_t *q8 = y->qs;
-    int32_t bsum = 0;
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint2 w = q2[ib32];
-        const uint32_t aux0 = w.x, aux1 = w.y;
-        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
-        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
-        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
-        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
-        int32_t sumi = 0;
-        sumi += dev_dot_iq2_pair_16(a0, (aux1 >> 0) & 127u, a1, (aux1 >> 7) & 127u, q8);
-        q8 += 16;
-        sumi += dev_dot_iq2_pair_16(a2, (aux1 >> 14) & 127u, a3, (aux1 >> 21) & 127u, q8);
-        q8 += 16;
-        bsum += sumi * (int32_t)ls;
-    }
-    return 0.125f * d * (float)bsum;
-}
-
-__device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, const cuda_block_q8_K *y) {
-    const float d = dev_f16_to_f32(x->d) * y->d;
-    const uint16_t *q2 = x->qs;
-    const int8_t *q8 = y->qs;
-    int32_t bsum = 0;
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
-        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
-        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
-        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
-        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
-        int32_t sumi = 0;
-        sumi += dev_dot_iq2_pair_16(a0, (aux1 >> 0) & 127u, a1, (aux1 >> 7) & 127u, q8);
-        q8 += 16;
-        sumi += dev_dot_iq2_pair_16(a2, (aux1 >> 14) & 127u, a3, (aux1 >> 21) & 127u, q8);
-        q8 += 16;
-        bsum += sumi * (int32_t)ls;
-    }
-    return 0.125f * d * (float)bsum;
-}
-
-
-
-/* SoA twin of dev_dot_iq2_xxs_q8_K_block8_deq_lut.  Identical LUT decode,
- * identical dp4a order, identical fold -- only the two weight loads change
- * (p.d[blk] for the scale, one aligned uint2 for each 4-uint16 group), so the
- * output is bit-identical to the packed path. */
-__device__ static void dev_dot_iq2_soa_q8_K_block8_deq_lut(
-        const iq2_soa_planes p, uint64_t blk,
-        const cuda_block_q8_K *y0, const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2, const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4, const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6, const cuda_block_q8_K *y7,
-        uint32_t n, float acc[8],
-        const uint64_t *grid, const uint8_t *signs) {
-    const float xd = dev_f16_to_f32(p.d[blk]);
-    const uint2 *q2 = (const uint2 *)(p.q + blk * 64ull);
-    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const int8_t *q8[8] = {
-        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
-        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
-    };
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint2 w = q2[ib32];
-        const uint32_t aux0 = w.x, aux1 = w.y;
-        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
-        int32_t wv[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &wv[0], &wv[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &wv[2], &wv[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &wv[4], &wv[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &wv[6], &wv[7]);
-        for (uint32_t pi = 0; pi < n; pi++) {
-            const int8_t *q = q8[pi] + ib32 * 32;
-            int32_t sumi = 0;
-            sumi = __dp4a(wv[0], *(const int32_t *)(q + 0),  sumi);
-            sumi = __dp4a(wv[1], *(const int32_t *)(q + 4),  sumi);
-            sumi = __dp4a(wv[2], *(const int32_t *)(q + 8),  sumi);
-            sumi = __dp4a(wv[3], *(const int32_t *)(q + 12), sumi);
-            sumi = __dp4a(wv[4], *(const int32_t *)(q + 16), sumi);
-            sumi = __dp4a(wv[5], *(const int32_t *)(q + 20), sumi);
-            sumi = __dp4a(wv[6], *(const int32_t *)(q + 24), sumi);
-            sumi = __dp4a(wv[7], *(const int32_t *)(q + 28), sumi);
-            bsum[pi] += sumi * ls;
-        }
-    }
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    for (uint32_t pi = 0; pi < n; pi++) acc[pi] += 0.125f * xd * ys[pi]->d * (float)bsum[pi];
-}
-
-__device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
-        const cuda_block_iq2_xxs *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        uint32_t n,
-        float acc[8],
-        const uint64_t *grid,
-        const uint8_t *signs) {
-    const float xd = dev_f16_to_f32(x->d);
-    const uint16_t *q2 = x->qs;
-    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const int8_t *q8[8] = {
-        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
-        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
-    };
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
-        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
-        int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
-        for (uint32_t p = 0; p < n; p++) {
-            const int8_t *q = q8[p] + ib32 * 32;
-            int32_t sumi = 0;
-            sumi = __dp4a(w[0], *(const int32_t *)(q + 0),  sumi);
-            sumi = __dp4a(w[1], *(const int32_t *)(q + 4),  sumi);
-            sumi = __dp4a(w[2], *(const int32_t *)(q + 8),  sumi);
-            sumi = __dp4a(w[3], *(const int32_t *)(q + 12), sumi);
-            sumi = __dp4a(w[4], *(const int32_t *)(q + 16), sumi);
-            sumi = __dp4a(w[5], *(const int32_t *)(q + 20), sumi);
-            sumi = __dp4a(w[6], *(const int32_t *)(q + 24), sumi);
-            sumi = __dp4a(w[7], *(const int32_t *)(q + 28), sumi);
-            bsum[p] += sumi * ls;
-        }
-    }
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
-}
-
-
-
-/* e2m1 nibble -> signed int8 magnitude.  The 8 magnitudes are exactly
- * {0,1,2,3,4,6,8,12}, so the arithmetic form
- *     e = (nib>>1)&3; m = nib&1; mag = e ? ((1<<e)|(m<<(e-1))) : m;
- * can be replaced by a byte select out of two 32-bit IMMEDIATES.  Identical on
- * all 16 nibbles -- each byte below IS the value the arithmetic produces -- and
- * weight decode is 42.9% of the gate/up instruction stream, so this is a real
- * lever rather than a micro-optimisation.  Shared by every MXFP4 dot, so both
- * gate/up and down get it.
- *
- * NOT A TABLE LOOKUP, and the distinction is the whole point: a
- * `static const int8_t lut[16]` is numerically identical but nvcc lowers it to
- * GLOBAL GATHERS (LDG.E.U8.CONSTANT), which is slower AND -- during the
- * microbench -- silently rewrote the kernel being measured, collapsing decode's
- * apparent share from 43% to 13% and nearly inverting the whole finding.  Two
- * immediates plus a shift keep it in registers with no memory operand.
- *
- * Verified in SASS on the shipped object, which is the check that matters: the
- * global-load count does NOT move (LDG 301 -> 301 at NT=8, 325 -> 325 at
- * NT=16), so no gather was introduced, while `decode` falls 5019 -> 2203 at
- * NT=8 and 5090 -> 2267 at NT=16, and NT=16 registers ease 128 -> 126. */
-__device__ __forceinline__ static int dev_e2m1_x2(unsigned nib) {
-    const uint32_t w0 = 0x03020100u;      /* nib 0..3 -> 0, 1, 2, 3  */
-    const uint32_t w1 = 0x0C080604u;      /* nib 4..7 -> 4, 6, 8, 12 */
-    const unsigned k = nib & 7u;
-    const uint32_t w = (k < 4u) ? w0 : w1;
-    const int mag = (int)((w >> ((k & 3u) * 8u)) & 0xFFu);
-    return (nib & 8u) ? -mag : mag;
-}
-
-
-
-__device__ static float dev_dot_mxfp4_q8_K_block(const unsigned char *x, const cuda_block_q8_K *y) {
-    const int8_t *q8 = y->qs;
-    float acc = 0.0f;
-    #pragma unroll
-    for (int sb = 0; sb < 8; sb++) {
-        const unsigned char *blk = x + (size_t)sb * 17;
-        /* E8M0 -> 2^(b-127): a bare float exponent field. Bitcast (b<<23) beats
-         * exp2f (transcendental) — valid for b in [1,254]; real scales never hit
-         * 0 (2^-127, ~0) or 255 (E8M0 NaN). */
-        const float scale = __int_as_float((uint32_t)blk[0] << 23);
-        int32_t sumi = 0;
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {                         /* 8 groups of 4 -> dp4a */
-            const unsigned char b0 = blk[1 + g * 2];
-            const unsigned char b1 = blk[1 + g * 2 + 1];
-            const int32_t wpack =
-                  ((uint32_t)(uint8_t)dev_e2m1_x2(b0 & 0xF))
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b0 >> 4)  << 8)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 & 0xF) << 16)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 >> 4)  << 24);
-            sumi = __dp4a(wpack, *(const int32_t *)(q8 + sb * 32 + g * 4), sumi);
-        }
-        acc += scale * (float)sumi;
-    }
-    return 0.5f * y->d * acc;
-}
-
-
-
-/* MXFP4 (type-39) weight block vs up to 8 q8_K activation blocks, decoding each
- * weight nibble-group ONCE (into wpack) and dp4a-ing it against all 8 tokens --
- * the cross-token weight reuse the per-pair qwarp32 kernel lacks. Accumulates
- * into acc[8] with the SAME per-subblock (scale*sumi) then 0.5*y->d order as
- * dev_dot_mxfp4_q8_K_block, so a tile of 8 is bit-identical to 8 single dots. */
-__device__ static void dev_dot_mxfp4_q8_K_block8(
-        const unsigned char *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
-        uint32_t n,
-        float acc[8]) {
-    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
-    float facc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    #pragma unroll
-    for (int sb = 0; sb < 8; sb++) {
-        const unsigned char *blk = x + (size_t)sb * 17;
-        const float scale = __int_as_float((uint32_t)blk[0] << 23);
-        int32_t wpack[8];
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {
-            const unsigned char b0 = blk[1 + g * 2];
-            const unsigned char b1 = blk[1 + g * 2 + 1];
-            wpack[g] =
-                  ((uint32_t)(uint8_t)dev_e2m1_x2(b0 & 0xF))
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b0 >> 4)  << 8)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 & 0xF) << 16)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 >> 4)  << 24);
-        }
-        for (uint32_t p = 0; p < n; p++) {
-            const int8_t *q8 = ys[p]->qs + sb * 32;
-            int32_t sumi = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; g++)
-                sumi = __dp4a(wpack[g], *(const int32_t *)(q8 + g * 4), sumi);
-            facc[p] += scale * (float)sumi;
-        }
-    }
-    for (uint32_t p = 0; p < n; p++) acc[p] += 0.5f * ys[p]->d * facc[p];
-}
-
-
-
-
-
-
-
-
-
-__device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
-    uint32_t mask = 0xffu << (threadIdx.x & 24u);
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset, 8);
-    }
-    (void)lane8;
-    return v;
-}
-
-
-
-__global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
-    uint32_t b = blockIdx.x;
-    uint32_t row = blockIdx.y;
-    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
-    const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * CUDA_QK_K;
-    cuda_block_q8_K *yb = out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
-    __shared__ float abs_part[256];
-    __shared__ float val_part[256];
-    __shared__ float maxv_s;
-    __shared__ float iscale_s;
-    uint32_t tid = threadIdx.x;
-    float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
-    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
-    val_part[tid] = v;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
-            abs_part[tid] = abs_part[tid + stride];
-            val_part[tid] = val_part[tid + stride];
-        }
-        __syncthreads();
-    }
-    float amax = abs_part[0];
-    if (amax == 0.0f) {
-        if (tid == 0) yb->d = 0.0f;
-        if (tid < CUDA_QK_K) yb->qs[tid] = 0;
-        if (tid < CUDA_QK_K / 16) yb->bsums[tid] = 0;
-        return;
-    }
-    if (tid == 0) {
-        maxv_s = val_part[0];
-        iscale_s = -127.0f / maxv_s;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K) {
-        /* v already holds xr[tid] (loaded above; the reduction only touches the
-         * shared arrays), so reuse it instead of a second global load. */
-        int qv = (int)lrintf(iscale_s * v);
-        if (qv > 127) qv = 127;
-        if (qv < -128) qv = -128;
-        yb->qs[tid] = (int8_t)qv;
-    }
-    __syncthreads();
-    if (tid < CUDA_QK_K / 16) {
-        int sum = 0;
-        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
-        yb->bsums[tid] = (int16_t)sum;
-    }
-    if (tid == 0) yb->d = 1.0f / iscale_s;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-/* Pulsar C++ port (plan-70, kernel template phase): the IQ2_XXS / MXFP4 / Q2_K
- * gate_up_mid qwarp32 kernels were three byte-identical clones differing ONLY in
- * the per-format weight-row decode (block cast + dot fn + row addressing).
- * Collapsed into one template parameterized by a decoder-traits struct. Each
- * instantiation inlines to the EXACT body of its original clone, so the SASS —
- * and the output — is byte-identical (verified by the dump-logits gate). This
- * removes ~100 lines of hand-cloned duplication. */
-/* SoA-layout traits.  The packed traits address a ROW BASE in bytes; the SoA
- * planes are tensor-global, so these address a BLOCK INDEX instead.  `soa` lets
- * the kernels pick the addressing with `if constexpr` and keeps the packed
- * instantiations byte-identical to before. */
-struct GateUpDotIQ2SoA {
-    static constexpr bool soa = true;
-    __device__ static inline float dot(const iq2_soa_planes p, uint64_t blk, const cuda_block_q8_K *x) {
-        return dev_dot_iq2_soa_q8_K_block(p, blk, x);
-    }
-};
-struct Dot8IQ2SoA {
-    static constexpr bool soa = true;
-    __device__ static inline void dot8(const iq2_soa_planes p, uint64_t blk,
-            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
-            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
-            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
-            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
-            uint32_t np, float *acc, const uint64_t *grid, const uint8_t *signs) {
-        dev_dot_iq2_soa_q8_K_block8_deq_lut(p, blk, x0, x1, x2, x3, x4, x5, x6, x7,
-                                            np, acc, grid, signs);
-    }
-};
-
-struct GateUpDotIQ2 {
-    static constexpr bool soa = false;
-    __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
-        return dev_dot_iq2_xxs_q8_K_block((const cuda_block_iq2_xxs *)rowbase + b, x);
-    }
-};
-struct GateUpDotMXFP4 {
-    static constexpr bool soa = false;
-    __device__ static inline float dot(const char *rowbase, uint32_t b, const cuda_block_q8_K *x) {
-        return dev_dot_mxfp4_q8_K_block((const unsigned char *)rowbase + (uint64_t)b * 8u * 17u, x);
-    }
-};
-/* 8-wide batch variant of the same per-format decode, for the expert-tiled
- * prefill kernels (tile16 collapse below). Same addressing rules as the
- * single-block traits above. */
-struct Dot8MXFP4 {
-    static constexpr bool soa = false;
-    __device__ static inline void dot8(const char *rowbase, uint32_t b,
-            const cuda_block_q8_K *x0, const cuda_block_q8_K *x1,
-            const cuda_block_q8_K *x2, const cuda_block_q8_K *x3,
-            const cuda_block_q8_K *x4, const cuda_block_q8_K *x5,
-            const cuda_block_q8_K *x6, const cuda_block_q8_K *x7,
-            uint32_t np, float *acc) {
-        dev_dot_mxfp4_q8_K_block8((const unsigned char *)rowbase + (uint64_t)b * 8u * 17u,
-                                  x0, x1, x2, x3, x4, x5, x6, x7, np, acc);
-    }
-};
-
-template <class Dot>
-__global__ static void moe_gate_up_mid_qwarp32_kernel(
-        float *gate_out,
-        float *up_out,
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        uint64_t gate_d_off,        /* SoA traits only: byte offset to the d plane */
-        uint64_t up_d_off,
-        const cuda_block_q8_K *xq,
-        const int32_t *selected,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t pair = blockIdx.y;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    uint32_t expert = (uint32_t)expert_i;
-    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const uint64_t rowbase = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-        const char *gr = gate_base + rowbase;
-        const char *ur = up_base + rowbase;
-        float gate = 0.0f;
-        float up = 0.0f;
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            if constexpr (Dot::soa) {
-                /* SoA planes are tensor-global: address by block index. */
-                const uint64_t blk0 = rowbase / 66ull;
-                gate += Dot::dot(dev_iq2_soa_planes(gate_base, gate_d_off), blk0 + b, xqb + b);
-                up   += Dot::dot(dev_iq2_soa_planes(up_base, up_d_off), blk0 + b, xqb + b);
-            } else {
-            gate += Dot::dot(gr, b, xqb + b);
-            up += Dot::dot(ur, b, xqb + b);
-            }
-        }
-        gate = quarter_warp_sum_f32(gate, lane);
-        up = quarter_warp_sum_f32(up, lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate > clamp) gate = clamp;
-                if (up > clamp) up = clamp;
-                if (up < -clamp) up = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-            gate_out[off] = gate;
-            up_out[off] = up;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
-        }
-    }
-}
-
-
-
-/* MXFP4 routed gate/up (type-39 experts): now moe_gate_up_mid_qwarp32_kernel
- * <GateUpDotMXFP4> — see the collapsed template above. One (token,expert) pair
- * per blockIdx.y, 128 rows per block via the rr loop; each Q8_K input block maps
- * to 8*17 MXFP4 bytes (GateUpDotMXFP4::dot). */
-
-
-
-/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
- * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
- * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
-template <int SOA>
-__global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
-        uint64_t up_d_off,
-        const cuda_block_q8_K *xq,
-        const int32_t *selected,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t pair = blockIdx.y;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    uint32_t expert = (uint32_t)expert_i;
-    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    __shared__ cuda_block_q8_K sxq[16];
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
-        xqb = sxq;
-    }
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const uint64_t rowbase_gr = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + rowbase_gr);
-        const uint64_t rowbase_ur = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + rowbase_ur);
-        float gate = 0.0f;
-        float up = 0.0f;
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            if (SOA) {
-                const uint64_t blk = rowbase_gr / 66ull + b;
-                gate += dev_dot_iq2_soa_q8_K_block_lut(dev_iq2_soa_planes(gate_base, gate_d_off), blk, xqb + b, s_iq2_grid, s_iq2_signs);
-                up   += dev_dot_iq2_soa_q8_K_block_lut(dev_iq2_soa_planes(up_base, up_d_off), blk, xqb + b, s_iq2_grid, s_iq2_signs);
-            } else {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            }
-        }
-        gate = quarter_warp_sum_f32(gate, lane);
-        up = quarter_warp_sum_f32(up, lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate > clamp) gate = clamp;
-                if (up > clamp) up = clamp;
-                if (up < -clamp) up = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
-        }
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -784,949 +162,41 @@ __global__ static void moe_build_expert_tiles_kernel(
 
 
 
-/* CLEARED (2026-08-03).  This kernel was suspected of the non-finite-logit
- * failure because forcing use_big_batch true -- which routes every chunk to
- * the rowspan sibling instead -- made a gate/up-only SoA model pass all 5 gate
- * depths.  That inference was wrong: the same switch ALSO flips use_tiled in
- * routed_moe_launch_mixed40, and the real defect was there (a missing gate_soa
- * arm on its non-tiled qwarp32 launch).  tests/iq2_row32_soa_diff.cu drives
- * this kernel's SOA=1 and SOA=0 arms on identical data at the shipped
- * 192-expert/2048-row shape and they are bit-exact, as is the rowspan control.
- * Keep that harness green when touching either arm. */
-/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
- * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
- * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
-template <int SOA>
-__global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
-        uint64_t up_d_off,
-        const cuda_block_q8_K *xq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        tok[np] = pair[np] / n_expert;
-        slot[np] = pair[np] - tok[np] * n_expert;
-        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
-    }
-    /* The IQ2 dictionary is staged UNCONDITIONALLY.  It used to live inside the
-     * `xq_blocks <= 16` activation-staging branch below, but the dot reads
-     * s_iq2_grid/s_iq2_signs on EVERY path -- so an xq_blocks > 16 layer decoded
-     * its weights against uninitialised shared memory.  Unreachable at the
-     * shipped v5mx shape (n_embd 4096 => xq_blocks exactly 16, so the guard held
-     * by one block) and latent rather than live, but it is one bad dim away from
-     * silent garbage, and the two IQ2 *down* kernels already stage it
-     * unconditionally -- this pair was the outlier, not the rule. */
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-    }
-    /* ONE barrier on every path; xq_blocks is block-uniform so hoisting it out
-     * of the branch is free.
-     *
-     * COST, measured with ptxas -v at sm_120f: this kernel goes 96 -> 121
-     * registers, because the dictionary loops now always execute and their
-     * addressing stays live across the barrier.  smem is unchanged (39,552 B)
-     * and occupancy is unchanged -- at 256 threads both 96 and 121 regs hold
-     * 2 blocks/SM (65,536 / (121*256) = 2.12), and 2*39,552 < 102,400 -- so this
-     * stays clear of the occupancy cliff that made the NT=16 widen a regression
-     * (see 21e992a).  Not measured end-to-end. */
-    __syncthreads();
-    if (xq_blocks <= 16u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    if (row >= expert_mid_dim) return;
-    const uint64_t rowbase_gr = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-    const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + rowbase_gr);
-    const uint64_t rowbase_ur = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-    const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + rowbase_ur);
-    float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        if (SOA) {
-            const uint64_t blk = rowbase_gr / 66ull + b;
-            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(gate_base, gate_d_off), blk,
-                    xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate, s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(up_base, up_d_off), blk,
-                    xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                    xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                    xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up, s_iq2_grid, s_iq2_signs);
-        } else {
-        dev_dot_iq2_xxs_q8_K_block8_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                            s_iq2_grid, s_iq2_signs);
-        dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                            s_iq2_grid, s_iq2_signs);
-        }
-    }
-    for (uint32_t p = 0; p < np; p++) {
-        gate[p] = quarter_warp_sum_f32(gate[p], lane);
-        up[p] = quarter_warp_sum_f32(up[p], lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate[p] > clamp) gate[p] = clamp;
-                if (up[p] > clamp) up[p] = clamp;
-                if (up[p] < -clamp) up[p] = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
-            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
-        }
-    }
-}
-
-
-
-/* SOA: the gate/up tensors are IQ2_XXS_SOA (type 42) rather than IQ2_XXS (16).
- * Pure permutation of the same bytes, so gate_expert_bytes / gate_row_bytes
- * still describe the tensor exactly -- but the SoA planes are TENSOR-GLOBAL, so
- * an (expert,row) base must be a BLOCK INDEX, not a byte offset.  Both strides
- * are exact multiples of the 66 B block, so the kernel derives the index by
- * dividing; the host passes each tensor's d-plane byte offset (nblk_total*64).
- * Packed and SoA are bit-identical -- same values, same order, different loads. */
-template <uint32_t ROW_SPAN, int SOA>
-__global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        uint64_t gate_d_off,        /* SOA only: byte offset to this tensor's d plane */
-        uint64_t up_d_off,
-        const cuda_block_q8_K *xq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        tok[np] = pair[np] / n_expert;
-        slot[np] = pair[np] - tok[np] * n_expert;
-        xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
-    }
-    /* Staged unconditionally -- see the note in the row32 kernel above: the dot
-     * reads the dictionary on every path, so gating its stage on activation
-     * staging left xq_blocks > 16 reading uninitialised shared memory. */
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-    }
-    __syncthreads();            /* one barrier on every path -- see the row32 note */
-    if (xq_blocks <= 16u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
-        uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const uint64_t rowbase = (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
-        /* packed: byte base into the AoS blocks.  SoA: block index into the
-         * tensor-global planes (rowbase is an exact multiple of 66). */
-        const cuda_block_iq2_xxs *gr = SOA ? NULL : (const cuda_block_iq2_xxs *)(gate_base + rowbase);
-        const cuda_block_iq2_xxs *ur = SOA ? NULL : (const cuda_block_iq2_xxs *)(up_base + rowbase);
-        const uint64_t blk0 = SOA ? rowbase / 66ull : 0ull;
-        const iq2_soa_planes gp   = dev_iq2_soa_planes(gate_base, gate_d_off);
-        const iq2_soa_planes up_p = dev_iq2_soa_planes(up_base, up_d_off);
-        float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            if (SOA) {
-                dev_dot_iq2_soa_q8_K_block8_deq_lut(gp, blk0 + b,
-                                                xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
-                dev_dot_iq2_soa_q8_K_block8_deq_lut(up_p, blk0 + b,
-                                                xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
-            } else {
-            dev_dot_iq2_xxs_q8_K_block8_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
-            }
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            gate[p] = quarter_warp_sum_f32(gate[p], lane);
-            up[p] = quarter_warp_sum_f32(up[p], lane);
-            if (lane == 0) {
-                if (clamp > 1.0e-6f) {
-                    if (gate[p] > clamp) gate[p] = clamp;
-                    if (up[p] > clamp) up[p] = clamp;
-                    if (up[p] < -clamp) up[p] = -clamp;
-                }
-                const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
-            }
-        }
-    }
-}
-
-
-/* Dynamic-SMEM bytes the MXFP4 N-tile gate/up kernel stages for NT tokens of
- * xq_blocks q8_K activation blocks each -- or 0, meaning "read the activations
- * straight from global".  HOST AND DEVICE CALL THIS SAME FUNCTION: the kernel
- * stages iff it returns non-zero, and the launch's dynamic-SMEM argument is
- * exactly what it returns.  One predicate, two callers -- two copies could
- * drift apart into a kernel that indexes SMEM the host never allocated. */
-__host__ __device__ __forceinline__ static uint32_t moe_mxfp4_gate_up_smem_bytes(
-        uint32_t nt, uint32_t xq_blocks) {
-    return (xq_blocks <= 16u) ? (uint32_t)(nt * xq_blocks * (uint32_t)sizeof(cuda_block_q8_K)) : 0u;
-}
-
-/* The most the NT=16 kernel can ever stage, given the xq_blocks <= 16 bound
- * above: 16 tokens * 16 blocks * 292 B = 74,752 B.  That is over the 48 KB
- * static __shared__ cap -- which is the whole reason this tile was pinned to 8
- * -- so NT=16 is reachable only through the one-time dynamic-SMEM opt-in in
- * moe_mxfp4_gate_up_tile_width(). */
-#define MOE_MXFP4_GATE_UP_NT16_SMEM_MAX (16u * 16u * (uint32_t)sizeof(cuda_block_q8_K))
-
-/* MXFP4 (type-39) weight block vs up to NT q8_K activation blocks: the N-tile
- * generalisation of dev_dot_mxfp4_q8_K_block8, decoding each weight
- * nibble-group ONCE (into wpack) and dp4a-ing it against all NT tokens.
- *
- * BIT-EXACTNESS: the reduction is over K, and NT tiles TOKENS.  The per-subblock
- * (scale*sumi) order and the trailing 0.5*y->d fold are identical at every NT,
- * and tokens are independent output columns, so a tile of NT is bit-identical to
- * NT single dev_dot_mxfp4_q8_K_block calls -- for any NT.  Widening N moves zero
- * bits; `make cuda-prefill-gate` is the referee.
- *
- * The loops over the token arrays are unrolled over the COMPILE-TIME bound NT
- * with a uniform `break`, never over runtime `n`.  A runtime bound makes ptxas
- * spill ys[]/facc[] to LOCAL memory, which trades the tile win for local-memory
- * traffic.  np is block-uniform, so the predicate is a uniform branch, not
- * divergence.  (dev_dot_mxfp4_q8_K_block8 above keeps its runtime loop and its
- * 8 scalar parameters: it is the down kernel's dot, which this increment does
- * not touch -- down is already past its tile knee, measured 1.00x at NT=32.
- * Any change to the decode arithmetic here must be mirrored there.) */
-template <uint32_t NT>
-__device__ static void dev_dot_mxfp4_q8_K_blockN(
-        const unsigned char *x,
-        const cuda_block_q8_K *const *ys,
-        uint32_t n,
-        float acc[NT]) {
-    float facc[NT];
-    #pragma unroll
-    for (uint32_t p = 0; p < NT; p++) facc[p] = 0.0f;
-    #pragma unroll
-    for (int sb = 0; sb < 8; sb++) {
-        const unsigned char *blk = x + (size_t)sb * 17;
-        const float scale = __int_as_float((uint32_t)blk[0] << 23);
-        int32_t wpack[8];
-        #pragma unroll
-        for (int g = 0; g < 8; g++) {
-            const unsigned char b0 = blk[1 + g * 2];
-            const unsigned char b1 = blk[1 + g * 2 + 1];
-            wpack[g] =
-                  ((uint32_t)(uint8_t)dev_e2m1_x2(b0 & 0xF))
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b0 >> 4)  << 8)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 & 0xF) << 16)
-                | ((uint32_t)(uint8_t)dev_e2m1_x2(b1 >> 4)  << 24);
-        }
-        #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) {
-            if (p >= n) break;
-            const int8_t *q8 = ys[p]->qs + sb * 32;
-            int32_t sumi = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; g++)
-                sumi = __dp4a(wpack[g], *(const int32_t *)(q8 + g * 4), sumi);
-            facc[p] += scale * (float)sumi;
-        }
-    }
-    #pragma unroll
-    for (uint32_t p = 0; p < NT; p++) { if (p >= n) break; acc[p] += 0.5f * ys[p]->d * facc[p]; }
-}
-
-
-/* MXFP4 (type-39) gate/up big-batch expert-tiled kernel: mirror of
- * moe_gate_up_mid_expert_tile8_rowspan_kernel but with the MXFP4 dot (no
- * iq2 grid/signs tables needed). One NT-token tile reuses each weight row's
- * decode across all NT tokens -- the prefill weight-reuse the per-pair
- * qwarp32 kernel lacks. Writes only mid_out (swiglu fused), same as the
- * iq2/q2k tiled kernels. Bit-identical to the qwarp32 path per token.
- *
- * NT was 8 until this increment, inherited from the iq2 gate (7c92951 "mirrors
- * the iq2 gate") despite MXFP4 carrying 2.06x the weight bytes -- and 8 was
- * never a register or occupancy choice, it was the largest tile whose staging
- * fit the 48 KB STATIC __shared__ cap (8*16*292 = 37,376 B; 16 tokens needs
- * 74,752 and ptxas refuses it outright).  Staging in DYNAMIC SMEM lifts that
- * ceiling, and NT=16 measures 2.30x on the GB10, bit-exact.
- *
- * Two counter-intuitive results, recorded so they are not "optimised" away:
- *   - NT=16 runs at 1 block/SM (16.7% occupancy), HALF the NT=8 kernel's, and is
- *     still 2.30x faster.  Occupancy is not the constraint; decode amortisation
- *     (per-weight, flat in NT) and the halved weight re-reads are.
- *   - Dropping the staging at NT=16 looks better on every traffic metric (4.2 GB
- *     of L2 vs 14.6) and is 2x SLOWER.  The kernel is issue/latency-bound, not
- *     bandwidth-bound.  STAGE AT 16.
- * NT=32 cannot stage at all (149,504 B > the 101,376 B opt-in cap) and unstaged
- * hits 255 registers + spill (1.43x, worse than NT=16 staged); NT=64 spills
- * 1536 B and is SLOWER than shipped.  16 is the peak, not a waypoint. */
-template <uint32_t ROW_SPAN, uint32_t NT>
-__global__ static void moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel(
-        float *mid_out,
-        const char *gate_base,
-        const char *up_base,
-        const cuda_block_q8_K *xq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        const float *weights,
-        uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes,
-        uint32_t xq_blocks,
-        uint32_t expert_mid_dim,
-        uint32_t n_expert,
-        float clamp) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    /* [NT][xq_blocks], packed to the real xq_blocks stride (the static array
-     * this replaces was [8][16] and wasted the tail when xq_blocks < 16).
-     * Sized by the host from moe_mxfp4_gate_up_smem_bytes(); untouched when
-     * that returns 0. */
-    extern __shared__ cuda_block_q8_K sxq_dyn[];
-    uint32_t pair[NT];
-    uint32_t tok[NT];
-    uint32_t slot[NT];
-    const cuda_block_q8_K *xqb[NT];
-    #pragma unroll
-    for (uint32_t i = 0; i < NT; i++) { pair[i] = 0; tok[i] = 0; slot[i] = 0; xqb[i] = NULL; }
-    const uint32_t cnt = counts[expert];
-    const uint32_t avail = (local_start < cnt) ? (cnt - local_start) : 0u;
-    const uint32_t np = avail < NT ? avail : NT;
-    #pragma unroll
-    for (uint32_t i = 0; i < NT; i++) {
-        if (i >= np) break;
-        pair[i] = sorted_pairs[offsets[expert] + local_start + i];
-        tok[i] = pair[i] / n_expert;
-        slot[i] = pair[i] - tok[i] * n_expert;
-        xqb[i] = xq + (uint64_t)tok[i] * xq_blocks;
-    }
-    if (moe_mxfp4_gate_up_smem_bytes(NT, xq_blocks)) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq_dyn[p * xq_blocks + b] = xqb[p][b];
-        }
-        __syncthreads();
-        #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) { if (p >= np) break; xqb[p] = sxq_dyn + p * xq_blocks; }
-    }
-    for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
-        uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const unsigned char *gr = (const unsigned char *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const unsigned char *ur = (const unsigned char *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        float gate[NT], up[NT];
-        #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) { gate[p] = 0.0f; up[p] = 0.0f; }
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            const cuda_block_q8_K *yb[NT];
-            #pragma unroll
-            for (uint32_t p = 0; p < NT; p++) { yb[p] = (p < np) ? xqb[p] + b : NULL; }
-            dev_dot_mxfp4_q8_K_blockN<NT>(gr + (uint64_t)b * 8u * 17u, yb, np, gate);
-            dev_dot_mxfp4_q8_K_blockN<NT>(ur + (uint64_t)b * 8u * 17u, yb, np, up);
-        }
-        #pragma unroll
-        for (uint32_t p = 0; p < NT; p++) {
-            if (p >= np) break;
-            gate[p] = quarter_warp_sum_f32(gate[p], lane);
-            up[p] = quarter_warp_sum_f32(up[p], lane);
-            if (lane == 0) {
-                if (clamp > 1.0e-6f) {
-                    if (gate[p] > clamp) gate[p] = clamp;
-                    if (up[p] > clamp) up[p] = clamp;
-                    if (up[p] < -clamp) up[p] = -clamp;
-                }
-                const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
-                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
-            }
-        }
-    }
-}
-
-
-/* The MXFP4 gate/up token-tile width, resolved ONCE from a DEVICE QUERY plus
- * the opt-in call itself -- deliberately NOT an env switch (project rule: no
- * getenv/flag branching on per-token/per-layer paths).  NT=16 stages 74,752 B,
- * over the 48 KB default cap; a device whose opt-in cap cannot cover that, or a
- * driver that refuses the opt-in, gets NT=8 -- which needs no opt-in (37,376 B)
- * and is the shipped behaviour -- rather than a launch that fails at 16.
- *
- * The cudaGetLastError() bracketing is not superstition.  A failed
- * cudaFuncSetAttribute leaves a STICKY last-error that the next unrelated
- * cudaGetLastError() reads as its own; in the microbench that exact mechanism
- * reported NT=32/64 as "launch failures" they never were and inverted the
- * finding.  So: clear before, trust the call's OWN return value, clear after --
- * never infer this call's outcome from a later cudaGetLastError().
- *
- * ROW_SPAN is a template parameter because the attribute is per-INSTANTIATION:
- * it must be set on exactly the specialisation that gets launched. */
-/* Does this device grant the NT=16 tile?  Split out from the caching wrapper so
- * that the cache is published EXACTLY ONCE, with its final value, rather than
- * staging an 8 up front as an "unresolved" marker that a concurrent caller could
- * observe as a resolved 8 and take the narrow tile on.  (That would only ever
- * have been a lost speedup, never a wrong result -- each caller re-derives its
- * nt, its smem size and its tile list together, so any launch is self-consistent
- * and bit-exact -- and engine access is single-threaded today.  But the
- * multi-session work would make it reachable, and a once-resolver that can hand
- * out a provisional answer is not worth keeping.) */
-template <uint32_t ROW_SPAN>
-static uint32_t moe_mxfp4_gate_up_resolve_tile_width(void) {
-    int dev = 0;
-    int optin_cap = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&optin_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "pulsar: MoE MXFP4 gate/up: device SMEM query failed; using the NT=8 tile\n");
-        return 8u;
-    }
-    if ((uint32_t)optin_cap < MOE_MXFP4_GATE_UP_NT16_SMEM_MAX) {
-        fprintf(stderr,
-                "pulsar: MoE MXFP4 gate/up: device dynamic-SMEM opt-in cap %d B < %u B needed for the "
-                "NT=16 tile; using the NT=8 tile (~2.3x slower on this stage)\n",
-                optin_cap, MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
-        return 8u;
-    }
-    (void)cudaGetLastError();       /* clear: a stale error must not be misread as ours */
-    const cudaError_t at = cudaFuncSetAttribute(
-        (const void *)moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<ROW_SPAN, 16u>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)MOE_MXFP4_GATE_UP_NT16_SMEM_MAX);
-    (void)cudaGetLastError();       /* clear: a FAILED setattr is sticky and would surface as the next launch's error */
-    if (at != cudaSuccess) {
-        fprintf(stderr,
-                "pulsar: MoE MXFP4 gate/up: dynamic-SMEM opt-in for %u B refused (%s); "
-                "using the NT=8 tile\n",
-                MOE_MXFP4_GATE_UP_NT16_SMEM_MAX, cudaGetErrorString(at));
-        return 8u;
-    }
-    return 16u;
-}
-
-/* NOTE: the attribute cudaFuncSetAttribute sets is per-device/per-context, while
- * this cache is per-process.  Tearing down and recreating the primary context, or
- * selecting a second device with a smaller opt-in cap, would leave a cached 16
- * launching against a kernel whose attribute is unset -- which surfaces as a loud
- * cudaErrorInvalidValue on the launch check, not as bad output.  No
- * cudaDeviceReset exists in the tree and the target is single-GPU, so this is
- * latent; it needs re-resolving per device if that ever changes. */
-template <uint32_t ROW_SPAN>
-static uint32_t moe_mxfp4_gate_up_tile_width(void) {
-    static uint32_t width = 0;      /* 0 = unresolved; resolved once, then cached */
-    if (!width) width = moe_mxfp4_gate_up_resolve_tile_width<ROW_SPAN>();
-    return width;
-}
-
-/* Boot-line accessor for the resolved gate/up MXFP4 tile width at the production
- * <1024u> row span.  Same cached value the prefill launcher reads at :2756;
- * calling it early only warms the cache (idempotent) -- generation is unchanged. */
-uint32_t pulsar_gpu_moe_mxfp4_tile_width(void) {
-    return moe_mxfp4_gate_up_tile_width<1024u>();
-}
-
-
-/* Q2_K gate/up variants of the three gate kernels above (mid preset:
-/* Pulsar port: the moe_down qwarp32 IQ2/MXFP4/Q2_K clones collapsed into one
- * template, REUSING the format-generic GateUpDot* quant-dot decoder traits (the
- * down GEMV is the same weight x q8_K dot as gate/up, just over the mid activation).
- * Byte-identical per instantiation (verbatim decoder extraction). */
-template <class Dot>
-__global__ static void moe_down_qwarp32_kernel(
-        float *down_out,
-        const char *down_base,
-        uint64_t down_d_off,        /* SoA traits only: byte offset to the d plane */
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t pair = blockIdx.y;
-    if (row >= out_dim) return;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    const uint64_t rowbase = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-    const char *wr = down_base + rowbase;
-    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
-    float acc = 0.0f;
-    if constexpr (Dot::soa) {
-        /* SoA planes are tensor-global: address by block index. */
-        const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
-        const uint64_t blk0 = rowbase / 66ull;
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(p, blk0 + b, xq + b);
-    } else {
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
-    }
-    acc = quarter_warp_sum_f32(acc, lane);
-    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
-}
-
-
-
-/* MXFP4 routed down (type-39 experts): now moe_down_qwarp32_kernel<GateUpDotMXFP4>
- * — see the collapsed template above. */
-
-
-
-/* Fused decode down: the 6 selected experts' down-projections summed straight into
- * the final output row (skips the separate down buffer + moe_sum pass). n_expert==6.
- * Template-collapsed (plan-70 kernel phase): the MXFP4 and Q2_K clones differed only
- * in the per-format row decode, so they share this body via the GateUpDot* traits.
- * The iq2_xxs variant stays a separate kernel below: it deliberately uses the
- * smem-LUT decoder, not the plain block dot. */
-template <class Dot>
-__global__ static void moe_down_sum6_qwarp32_kernel(
-        float *out,
-        const char *down_base,
-        uint64_t down_d_off,        /* SoA traits only: byte offset to the d plane */
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    if (row >= out_dim) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
-        const uint64_t rowbase = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const char *wr = down_base + rowbase;
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-        float acc = 0.0f;
-        if constexpr (Dot::soa) {
-            /* SoA planes are tensor-global: address by block index. */
-            const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
-            const uint64_t blk0 = rowbase / 66ull;
-            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(p, blk0 + b, xq + b);
-        } else {
-            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += Dot::dot(wr, b, xq + b);
-        }
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) total += acc;
-    }
-    if (lane == 0) out[row] = total;
-}
 
 
 
 
-/* Template-collapsed (plan-70 kernel phase): the Q2_K and MXFP4 tile16 clones
- * differed only in the 8-wide row decode (Dot8 traits above). The iq2_xxs
- * variant stays separate: it uses the smem-LUT decoder and a restructured
- * midq staging order. Per-pair stores + fixed-order moe_sum, no atomicAdd. */
-template <class Dot8>
-__global__ static void moe_down_expert_tile16_row2048_kernel(
-        float *down_out,
-        const char *down_base,
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t local_start = tile_starts[tile];
-    if (local_start & 8u) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
-    uint32_t pair[16] = {0};
-    const cuda_block_q8_K *xqb[16] = {NULL};
-    uint32_t np = 0;
-    for (; np < 16u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < 64u; rr++) {
-        uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
-        if (row >= out_dim) continue;
-        const char *wr = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        float acc[16] = {0.0f};
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-            Dot8::dot8(wr, b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                       xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                       xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                       xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc);
-            if (np > 8u) {
-                Dot8::dot8(wr, b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                           xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                           xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                           xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8);
-            }
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            acc[p] = quarter_warp_sum_f32(acc[p], lane);
-            if (lane == 0) {
-                /* per-pair store; the fixed-order moe_sum pass accumulates.
-                 * (was atomicAdd per token: float order varied with tile
-                 * scheduling AND with the sorted-pair scatter order -- the
-                 * prefill nondeterminism behind the #17 flake) */
-                down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
-            }
-        }
-    }
-}
 
 
 
-/* IQ2_XXS down variants of the down kernels above (v5mx mixed per-layer
- * expert combos: iq2_xxs down paired with any gate/up format). Same
- * structure and q8_K mid activations; the dots are the production-validated
- * dev_dot_iq2_xxs_q8_K_block / _block_lut / _block8_deq_lut helpers the
- * gate/up kernels use. Prefill tiles keep the per-pair store + fixed-order
- * moe_sum accumulation (no atomicAdd) so numerics stay run-to-run
- * deterministic, matching the Q2_K down family. */
-/* IQ2_XXS routed down: now moe_down_qwarp32_kernel<GateUpDotIQ2> — see the
- * collapsed template above. (Deterministic moe_sum accumulation, no atomicAdd,
- * matching the Q2_K down family — preserved by the shared template body.) */
 
 
 
-/* Fused decode down for iq2_xxs experts: the 6 selected experts' down
- * projections summed straight into the final output row (skips the separate
- * down buffer + moe_sum pass). n_expert==6. Uses the smem-LUT iq2 dot like
- * the decode gate kernel. */
-/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
- * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
- * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
-template <int SOA>
-__global__ static void moe_down_iq2_sum6_qwarp32_kernel(
-        float *out,
-        const char *down_base,
-        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
-        const cuda_block_q8_K *midq,
-        const int32_t *selected,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    __syncthreads();
-    if (row >= out_dim) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
-        const uint64_t rowbase_wr = (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
-        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
-        float acc = 0.0f;
-        if (SOA) {
-            const iq2_soa_planes p = dev_iq2_soa_planes(down_base, down_d_off);
-            const uint64_t blk0 = rowbase_wr / 66ull;
-            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_soa_q8_K_block_lut(p, blk0 + b, xq + b, s_iq2_grid, s_iq2_signs);
-        } else {
-            for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xq + b, s_iq2_grid, s_iq2_signs);
-        }
-        acc = quarter_warp_sum_f32(acc, lane);
-        if (lane == 0) total += acc;
-    }
-    if (lane == 0) out[row] = total;
-}
 
 
 
-/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
- * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
- * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
-template <int SOA>
-__global__ static void moe_down_iq2_expert_tile8_row32_kernel(
-        float *down_out,
-        const char *down_base,
-        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    uint32_t np = 0;
-    for (; np < 8u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-    }
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    __syncthreads();
-    if (midq_blocks <= 8u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    if (row >= out_dim) return;
-    const uint64_t rowbase_wr = (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
-    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-        if (SOA) {
-            dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc,
-                                            s_iq2_grid, s_iq2_signs);
-        } else {
-        dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc,
-                                            s_iq2_grid, s_iq2_signs);
-        }
-    }
-    for (uint32_t p = 0; p < np; p++) {
-        acc[p] = quarter_warp_sum_f32(acc[p], lane);
-        if (lane == 0) {
-            down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
-        }
-    }
-}
 
 
 
-/* SOA: this tensor is IQ2_XXS_SOA (42).  The planes are TENSOR-GLOBAL, so an
- * (expert,row) base becomes a BLOCK INDEX (both strides are exact multiples of
- * the 66 B block).  Same values, same fold order -- bit-identical to packed. */
-template <int SOA>
-__global__ static void moe_down_iq2_expert_tile16_row2048_kernel(
-        float *down_out,
-        const char *down_base,
-        uint64_t down_d_off,        /* SOA only: byte offset to the d plane */
-        const cuda_block_q8_K *midq,
-        const uint32_t *sorted_pairs,
-        const uint32_t *offsets,
-        const uint32_t *counts,
-        const uint32_t *tile_total,
-        const uint32_t *tile_experts,
-        const uint32_t *tile_starts,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes,
-        uint32_t midq_blocks,
-        uint32_t out_dim,
-        uint32_t n_expert) {
-    uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
-    uint32_t local_start = tile_starts[tile];
-    if (local_start & 8u) return;
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t expert = tile_experts[tile];
-    __shared__ cuda_block_q8_K sxq[16][8];
-    __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    uint32_t pair[16] = {0};
-    const cuda_block_q8_K *xqb[16] = {NULL};
-    uint32_t np = 0;
-    for (; np < 16u; np++) {
-        uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
-        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
-    }
-    if (midq_blocks <= 8u) {
-        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
-            uint32_t p = i / midq_blocks;
-            uint32_t b = i - p * midq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-    }
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    __syncthreads();
-    if (midq_blocks <= 8u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
-    for (uint32_t rr = 0; rr < 64u; rr++) {
-        uint32_t row = blockIdx.x * 2048u + row_lane + rr * 32u;
-        if (row >= out_dim) continue;
-        const uint64_t rowbase_wr = (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + rowbase_wr);
-        float acc[16] = {0.0f};
-        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-            if (SOA) {
-                dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc,
-                                                s_iq2_grid, s_iq2_signs);
-            } else {
-            dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                                xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
-                                                xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
-                                                xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np < 8u ? np : 8u, acc,
-                                                s_iq2_grid, s_iq2_signs);
-            }
-            if (np > 8u) {
-                if (SOA) {
-                    dev_dot_iq2_soa_q8_K_block8_deq_lut(dev_iq2_soa_planes(down_base, down_d_off), rowbase_wr / 66ull + b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                                                    xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                                                    xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                                                    xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8,
-                                                    s_iq2_grid, s_iq2_signs);
-                } else {
-                dev_dot_iq2_xxs_q8_K_block8_deq_lut(wr + b, xqb[8] ? xqb[8] + b : NULL, xqb[9] ? xqb[9] + b : NULL,
-                                                    xqb[10] ? xqb[10] + b : NULL, xqb[11] ? xqb[11] + b : NULL,
-                                                    xqb[12] ? xqb[12] + b : NULL, xqb[13] ? xqb[13] + b : NULL,
-                                                    xqb[14] ? xqb[14] + b : NULL, xqb[15] ? xqb[15] + b : NULL, np - 8u, acc + 8,
-                                                    s_iq2_grid, s_iq2_signs);
-                }
-            }
-        }
-        for (uint32_t p = 0; p < np; p++) {
-            acc[p] = quarter_warp_sum_f32(acc[p], lane);
-            if (lane == 0) {
-                /* per-pair store; the fixed-order moe_sum pass accumulates
-                 * (deterministic -- see the Q2_K tile16 kernel above). */
-                down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
-            }
-        }
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2208,23 +678,26 @@ static int routed_moe_launch_cutlass_dispatch(
 
 
 
-/* ---- MIXED type-40 (CUTLASS W4A8) + iq2/q2k (dp4a) layer dispatch. ------------------------------
- * After the type-40 unification, some layers have ONE projection as CUTLASS MXFP4 (type 40) and the
- * others as iq2/q2k. The grouped path needs all-three-same-type, and the dp4a kernels cannot read
- * the type-40 swizzle, so we run each projection in its native precision and compose in f32. The
- * CUTLASS side runs as a GROUPED single-projection GEMM over 128-row-padded gathered activations
- * (pulsar_cutlass_grouped_proj) -- device-built ptr-array, NO host readback, NO per-expert sync -- the
- * same machinery the uniform grouped path uses. The dp4a side stays in the per-(token,expert) pair
- * layout with the existing kernels; padded gather/scatter bridge the two layouts:
- *   Case A (gate/up type-40, down dp4a): padded-gather x -> grouped W4A8 gate & up GEMMs -> swiglu
- *     (+routing weight) on the gathered rows -> padded-scatter mid into pair layout -> Q8_K-quantize
- *     mid -> existing dp4a down per pair -> moe_sum.
- *   Case B (gate/up dp4a, down type-40): existing dp4a gate/up per pair (fused swiglu) -> padded-gather
- *     mid -> grouped W4A8 down GEMM -> padded-scatter into pair layout -> moe_sum.
+/* ---- MIXED type-40 (CUTLASS W4A8) + type-43 (MMQ) layer dispatch. --------------------------------
+ * Some layers have ONE projection as CUTLASS MXFP4 (type 40) and the other as IQ2_XXS_MMQ (type 43);
+ * the artifact has 7 such layers (4x gate=40/down=43, 3x gate=43/down=40). The grouped path needs
+ * all-three-same-type and CUTLASS cannot read the MMQ layout (or vice versa), so we run each
+ * projection in its native precision and compose in f32. The CUTLASS side runs as a GROUPED
+ * single-projection GEMM over 128-row-padded gathered activations (pulsar_cutlass_grouped_proj) --
+ * device-built ptr-array, NO host readback, NO per-expert sync -- the same machinery the uniform
+ * grouped path uses. The MMQ side stays in the per-(token,expert) pair layout; padded gather/scatter
+ * bridge the two:
+ *   Case A (gate/up type-40, down type-43): padded-gather x -> grouped W4A8 gate & up GEMMs -> swiglu
+ *     (+routing weight) on the gathered rows -> padded-scatter mid into pair layout -> MMQ down per
+ *     pair (takes mid as f32, does its own q8_1) -> moe_sum.
+ *   Case B (gate/up type-43, down type-40): MMQ gate/up per pair (fused swiglu) -> padded-gather mid
+ *     -> grouped W4A8 down GEMM -> padded-scatter into pair layout -> moe_sum.
  * The grouped CUTLASS projection is bit-identical to the per-expert single-proj path it replaces
- * (same pack + same g_build_arrays gather order + same GEMM, just batched); the dp4a projection is
- * bit-identical to the all-dp4a path. No cross-contamination: each projection reads only its own
- * weight/SF and its own activation quant. */
+ * (same pack + same g_build_arrays gather order + same GEMM, just batched). No cross-contamination:
+ * each projection reads only its own weight/SF and its own activation quant.
+ *
+ * Both MMQ arms fail closed if MMQ declines: the dp4a kernels that used to back them up are gone
+ * with types 16/42/39/10, and no other reader understands the aligned layout. */
 __global__ static void moe_swiglu_gathered_kernel(
         float *mid_g, const float *gate_g, const float *up_g, const float *w_g,
         float clamp, uint32_t mid_dim, uint32_t n_rows) {
@@ -2285,24 +758,20 @@ static int routed_moe_launch_mixed40(
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    const int caseA = (gate_type == 40u);       /* gate/up type-40, down dp4a */
-    const int caseB = (down_type == 40u);       /* gate/up dp4a, down type-40 */
+    const int caseA = (gate_type == 40u);       /* gate/up type-40, down MMQ-43 */
+    const int caseB = (down_type == 40u);       /* gate/up MMQ-43, down type-40 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
-    /* Q2_K (type 10) is no longer supported.  routed_moe_launch rejects it, but
-     * mixed40 only requires that ONE side be type-40, so a type-40 gate paired
-     * with a Q2_K down still reached the dp4a arms below.  Reject at the door.
-     * NOTE the down dispatch below had a BARE `else` falling through to
-     * GateUpDotQ2K -- i.e. any down type that was neither SoA nor type-16 was
-     * READ AS Q2_K.  That is the IQ2_XXS_SOA silent-misread shape exactly. */
-    if (gate_type == 10u || down_type == 10u) return 0;
-    /* Type 43 (IQ2_XXS_MMQ) is NOT rejected here: unlike Q2_K it has a correct
-     * reader on both sides -- routed_moe_try_mmq_down (caseA) and
-     * routed_moe_try_mmq_gate_up (caseB) both accept it, and they run before
-     * the dp4a arms below.  7 of this model's 43 routed layers are mixed 40/43
-     * (4x gate=40/down=43, 3x gate=43/down=40), so a door guard here takes out
-     * live layers.  The residual hazard is MMQ *declining* a type-43 side and
-     * falling through to dp4a, which cannot read the aligned layout -- that is
-     * handled by the explicit `else ok = 0` in both arms, not by a door guard. */
+    /* ...and the OTHER side must be type 43, the only non-cutlass expert format
+     * left.  This is where the artifact's 7 mixed layers land (4x gate=40/
+     * down=43, 3x gate=43/down=40); the dp4a types that used to be admitted
+     * here -- IQ2_XXS (16), IQ2_XXS_SOA (42), Q2_K (10), FP4_E2M1 (39) -- are
+     * gone along with their kernels.
+     *
+     * Stated as an equality rather than a list of rejections on purpose: the
+     * dispatch below is a chain keyed on a type tag, and every silent misread
+     * this file has produced came from such a chain ACCEPTING an unknown tag and
+     * reading its bytes as the last arm's format.  An allowlist cannot do that. */
+    if ((caseA ? down_type : gate_type) != 43u) return 0;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
@@ -2313,8 +782,6 @@ static int routed_moe_launch_mixed40(
         up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
-    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
     /* Host upper bound on padded rows: #active experts <= min(n_total, pair_count), each adds <=127
      * padding; round to 128. Using min() (not n_total) keeps the gathered buffer / memset / pack
@@ -2338,12 +805,6 @@ static int routed_moe_launch_mixed40(
     const int use_grouped = pulsar_gpu_matmul_batch_mneutral()
             ? (n_tokens > 8u) : (n_tokens > 4u);
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
-    /* The dp4a side (iq2/q2k) must use the production SORTED-TILED kernels at prefill, not the slow
-     * generic qwarp32 -- that (not the CUTLASS GEMM) is where the mixed-layer time went. Big-batch
-     * tiles: gate/up on block_m=8, down on block_m=16. Small batches (decode/verify) keep qwarp32. */
-    const int use_tiled = (n_tokens >= 128u);
-    const uint64_t tile8_cap  = (use_tiled && caseB) ? ((uint64_t)(pair_count + 7u) / 8u + n_total_expert) : 0;
-    const uint64_t tile16_cap = (use_tiled && caseA) ? ((uint64_t)(pair_count + 15u) / 16u + n_total_expert) : 0;
 
     /* model weight bases */
     const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
@@ -2362,14 +823,6 @@ static int routed_moe_launch_mixed40(
     const uint64_t cursors_b = counts_b;
     const uint64_t sorted_b  = (uint64_t)pair_count * sizeof(uint32_t);
     const uint64_t padoff_b  = counts_b;
-    const uint64_t t8off_b  = (use_tiled && caseB) ? offsets_b : 0;            /* tile8 offsets (gate/up) */
-    const uint64_t t8tot_b  = (use_tiled && caseB) ? sizeof(uint32_t) : 0;
-    const uint64_t t8exp_b  = tile8_cap * sizeof(uint32_t);
-    const uint64_t t8sta_b  = tile8_cap * sizeof(uint32_t);
-    const uint64_t t16off_b = (use_tiled && caseA) ? offsets_b : 0;           /* tile16 offsets (down) */
-    const uint64_t t16tot_b = (use_tiled && caseA) ? sizeof(uint32_t) : 0;
-    const uint64_t t16exp_b = tile16_cap * sizeof(uint32_t);
-    const uint64_t t16sta_b = tile16_cap * sizeof(uint32_t);
     const uint64_t xg_b   = rows * cut_k * sizeof(float);              /* gathered x(A)/mid(B) */
     const uint64_t wg_b   = rows * sizeof(float);                      /* routing weights (A) */
     const uint64_t ppair_b= rows * sizeof(int32_t);
@@ -2377,8 +830,6 @@ static int routed_moe_launch_mixed40(
     const uint64_t ug_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* up_g   (A) */
     const uint64_t mg_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* mid_g  (A) */
     const uint64_t og_b   = caseB ? rows * out_dim * sizeof(float) : 0;         /* out_g  (B) */
-    const uint64_t xq_b   = caseB ? (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K) : 0;
-    const uint64_t midq_b = caseA ? (uint64_t)pair_count * midq_blocks * sizeof(cuda_block_q8_K) : 0;
     const uint64_t proj_b = use_grouped
         ? (caseA ? pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim)
                  : pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim))
@@ -2391,14 +842,6 @@ static int routed_moe_launch_mixed40(
     const uint64_t cursors_o = off; off = cutlass_moe_align_up(off + cursors_b, A);
     const uint64_t sorted_o  = off; off = cutlass_moe_align_up(off + sorted_b, A);
     const uint64_t padoff_o  = off; off = cutlass_moe_align_up(off + padoff_b, A);
-    const uint64_t t8off_o  = off; off = cutlass_moe_align_up(off + t8off_b, A);
-    const uint64_t t8tot_o  = off; off = cutlass_moe_align_up(off + t8tot_b, A);
-    const uint64_t t8exp_o  = off; off = cutlass_moe_align_up(off + t8exp_b, A);
-    const uint64_t t8sta_o  = off; off = cutlass_moe_align_up(off + t8sta_b, A);
-    const uint64_t t16off_o = off; off = cutlass_moe_align_up(off + t16off_b, A);
-    const uint64_t t16tot_o = off; off = cutlass_moe_align_up(off + t16tot_b, A);
-    const uint64_t t16exp_o = off; off = cutlass_moe_align_up(off + t16exp_b, A);
-    const uint64_t t16sta_o = off; off = cutlass_moe_align_up(off + t16sta_b, A);
     const uint64_t xg_o   = off; off = cutlass_moe_align_up(off + xg_b, A);
     const uint64_t wg_o   = off; off = cutlass_moe_align_up(off + wg_b, A);
     const uint64_t ppair_o= off; off = cutlass_moe_align_up(off + ppair_b, A);
@@ -2406,8 +849,6 @@ static int routed_moe_launch_mixed40(
     const uint64_t ug_o   = off; off = cutlass_moe_align_up(off + ug_b, A);
     const uint64_t mg_o   = off; off = cutlass_moe_align_up(off + mg_b, A);
     const uint64_t og_o   = off; off = cutlass_moe_align_up(off + og_b, A);
-    const uint64_t xq_o   = off; off = cutlass_moe_align_up(off + xq_b, A);
-    const uint64_t midq_o = off; off = cutlass_moe_align_up(off + midq_b, A);
     const uint64_t proj_o = off; off = cutlass_moe_align_up(off + proj_b, A);
     uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(off, "routed_moe mixed40");
     if (!scratch) return 0;
@@ -2439,40 +880,6 @@ static int routed_moe_launch_mixed40(
               ok = cuda_ok(cudaGetLastError(), "mixed40 padded offsets"); }
     if (!ok) return 0;
 
-    /* dp4a-side sorted tile lists (big-batch prefill): tile8 for gate/up (caseB), tile16 for down (caseA). */
-    uint32_t *t8_total = NULL, *t8_experts = NULL, *t8_starts = NULL;
-    uint32_t *t16_total = NULL, *t16_experts = NULL, *t16_starts = NULL;
-    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) share this
-     * kernel; the layout is a template parameter, chosen at the launch below. */
-    const int gate_soa     = (gate_type == 42u);
-    const int tiled_gateup = use_tiled && caseB && (gate_type == 16u || gate_soa);
-    /* d plane starts after the whole tensor's q plane: nblk_total * 64.
-     * nblk_total = n_total_expert * (expert_bytes / 66); the stride is an exact
-     * multiple of the 66 B block for both layouts. */
-    const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
-    const int down_soa     = (down_type == 42u);
-    const uint64_t down_d_off = (uint64_t)n_total_expert * (down_expert_bytes / 66ull) * 64ull;
-    const int tiled_down   = use_tiled && caseA && (down_type == 16u || down_soa);  /* iq2 down tiled kernel */
-    if (tiled_gateup) {
-        uint32_t *t8_off = (uint32_t *)(scratch + t8off_o);
-        t8_total = (uint32_t *)(scratch + t8tot_o);
-        t8_experts = (uint32_t *)(scratch + t8exp_o);
-        t8_starts = (uint32_t *)(scratch + t8sta_o);
-        moe_build_expert_tile_offsets_kernel<<<1, 1>>>(t8_off, t8_total, counts, n_total_expert, 8u);
-        if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40 tile8 offsets");
-        if (ok) moe_build_expert_tiles_kernel<<<(n_total_expert + 255u) / 256u, 256>>>(t8_experts, t8_starts, t8_off, counts, n_total_expert, 8u);
-        if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40 tile8 build");
-    }
-    if (tiled_down) {
-        uint32_t *t16_off = (uint32_t *)(scratch + t16off_o);
-        t16_total = (uint32_t *)(scratch + t16tot_o);
-        t16_experts = (uint32_t *)(scratch + t16exp_o);
-        t16_starts = (uint32_t *)(scratch + t16sta_o);
-        moe_build_expert_tile_offsets_kernel<<<1, 1>>>(t16_off, t16_total, counts, n_total_expert, 16u);
-        if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40 tile16 offsets");
-        if (ok) moe_build_expert_tiles_kernel<<<(n_total_expert + 255u) / 256u, 256>>>(t16_experts, t16_starts, t16_off, counts, n_total_expert, 16u);
-        if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40 tile16 build");
-    }
     if (!ok) return 0;
 
     if (caseA) {
@@ -2511,66 +918,36 @@ static int routed_moe_launch_mixed40(
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
         }
-        /* Phase 2: Q8_K-quantize mid_flat -> midq, then dp4a down per pair.
-         * MMQ takes mid_flat as f32 directly, so when it handles down the whole
-         * midq quantize is skipped.  These mixed layers (CUTLASS mxfp4 gate/up +
-         * IQ2 down) were the last dp4a holdouts: 4 x 62.9 ms measured. */
-        cuda_block_q8_K *midq = (cuda_block_q8_K *)(scratch + midq_o);
+        /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
+         * layers).  MMQ takes mid_flat as f32 directly and does its own q8_1,
+         * which is why no midq quantize remains here. */
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
-        if (ok && !down_soa) {
+        if (ok) {
             mmq_down_done = routed_moe_try_mmq_down(down_flat, mid_flat, down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
                                                     n_total_expert, (uint64_t)pair_count);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "mixed40A mmq down");
         }
 #endif
+        /* Fail closed: the dp4a chain that used to follow is gone with Q2_K and
+         * type 16, so a declined MMQ has nothing left to fall through to. */
         if (ok && !mmq_down_done) {
-            dim3 mqg(midq_blocks, pair_count, 1);
-            q8_K_quantize_kernel<<<mqg, 256>>>(midq, mid_flat, expert_mid_dim, pair_count);
-            ok = cuda_ok(cudaGetLastError(), "mixed40A midq");
-        }
-        if (ok && !mmq_down_done) {
-            if (tiled_down) {
-                dim3 tgrid((out_dim + 2047u) / 2048u, (uint32_t)tile16_cap, 1);
-                if (down_soa)
-                    moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(down_flat, down_w, down_d_off, midq,
-                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
-                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
-                else
-                    moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq,
-                        sorted_pairs, offsets, counts, t16_total, t16_experts, t16_starts,
-                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
-            } else {
-                dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
-                if (down_soa)
-                    moe_down_qwarp32_kernel<GateUpDotIQ2SoA><<<dgrid, 256>>>(down_flat, down_w, down_d_off, midq, selected_ptr,
-                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
-                else if (down_type == 16u)
-                    moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(down_flat, down_w, 0ull /*down_d_off*/, midq, selected_ptr,
-                        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert);
-                else
-                    /* was a bare else -> GateUpDotQ2K, i.e. any unrecognised
-                     * down type silently READ AS Q2_K.  Refuse instead. */
-                    ok = 0;
-            }
-            if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40A down");
+            fprintf(stderr, "pulsar: mixed40 type-43 down but MMQ declined and no fallback exists\n");
+            ok = 0;
         }
     } else {
-        /* Case B. Phase 1: dp4a gate/up per pair (fused swiglu) -> mid_flat. */
-        cuda_block_q8_K *xq = (cuda_block_q8_K *)(scratch + xq_o);
+        /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat.  The Q8_K
+         * quantize of x that used to run here fed the dp4a kernels; MMQ takes x
+         * as f32 and does its own q8_1, so it was pure waste once they went. */
         float *mid_g = (float *)(scratch + xg_o);   /* reuse the gather buffer (K=mid_dim=cut_k) */
         float *out_g = (float *)(scratch + og_o);
-        dim3 xqg(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xqg, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "mixed40B xq");
-        /* Last dp4a IQ2 holdout: mixed layers with IQ2 gate/up land here
-         * (3 x 75.4 ms measured).  `up` is pair-sized and only read by the
-         * qwarp32 branch below, which MMQ replaces -- so it serves as the raw
-         * gate buffer, no arena change needed. */
+        /* Type-43 gate/up against a type-40 down (3 of the artifact's layers).
+         * `up` is pair-sized and was only read by the deleted qwarp32 branch, so
+         * it serves as MMQ's raw gate buffer -- no arena change needed. */
         int mmq_gu_done = 0;
 #ifdef PULSAR_HAVE_MMQ
-        if (ok && !gate_soa) {
+        if (ok) {
             mmq_gu_done = routed_moe_try_mmq_gate_up(
                 mid_flat, (float *)up->ptr, gate_w, up_w,
                 (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
@@ -2579,52 +956,11 @@ static int routed_moe_launch_mixed40(
             if (mmq_gu_done) ok = cuda_ok(cudaGetLastError(), "mixed40B mmq gate/up");
         }
 #endif
+        /* Fail closed: the dp4a chain that used to follow is gone with type 16,
+         * so a declined MMQ has nothing left to fall through to. */
         if (ok && !mmq_gu_done) {
-            if (tiled_gateup) {
-                dim3 tgrid((expert_mid_dim + 1023u) / 1024u, (uint32_t)tile8_cap, 1);
-                if (gate_soa)
-                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(mid_flat,
-                        gate_w, up_w, gate_d_off, gate_d_off, xq, sorted_pairs, offsets, counts,
-                        t8_total, t8_experts, t8_starts,
-                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
-                        xq_blocks, expert_mid_dim, n_expert, clamp);
-                else
-                    moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(mid_flat,
-                        gate_w, up_w, 0ull, 0ull, xq, sorted_pairs, offsets, counts,
-                        t8_total, t8_experts, t8_starts,
-                        (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
-                        xq_blocks, expert_mid_dim, n_expert, clamp);
-            } else {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-                /* gate_soa MUST be tested before the packed IQ2 fallback.  Until
-                 * this commit a type-42 layer whose chunk was too short for the
-                 * tiled path (n_tokens < 128 -- e.g. the 6-token trailing chunk
-                 * of a 4102-token prefill) fell through to <GateUpDotIQ2> with
-                 * 0 d-offsets, i.e. the PACKED reader pointed at SoA planes: the
-                 * fp16 scale came out of quantised weight bytes, so every logit
-                 * went non-finite.  That is the depth-4102 prefill-gate failure. */
-                if (gate_soa)
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
-                        gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, selected_ptr, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
-                else if (gate_type == 16u)
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
-                        gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
-                else
-                    /* was a bare else -> GateUpDotIQ2, i.e. any unrecognised
-                     * gate type silently READ AS raw IQ2_XXS.  Type 43 normally
-                     * never gets here (the MMQ arm above claims it), but if MMQ
-                     * ever declines one -- unsupported shape, no-MMQ build --
-                     * the fall-through would read its aligned layout as packed.
-                     * Refuse instead.  Mirrors the caseA down arm above. */
-                    ok = 0;
-            }
-            /* `if (ok)`, not a bare assignment: the refusal above sets ok = 0,
-             * and an unconditional cuda_ok() would hand it straight back to 1
-             * (no CUDA error was raised -- we declined to launch anything).
-             * Matches the caseA down arm. */
-            if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40B gate/up");
+            fprintf(stderr, "pulsar: mixed40 type-43 gate/up but MMQ declined and no fallback exists\n");
+            ok = 0;
         }
         /* Phase 2: mid -> W4A8 down -> down_flat[pair]. */
         if (ok && use_grouped) {
@@ -2988,41 +1324,23 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    /* Per-role, per-layer kernel selection (v5mx mixed combos): gate/up (a
-     * matching pair, enforced at load) in {iq2_xxs, q2_k, mxfp4}, down in
-     * {iq2_xxs, q2_k, mxfp4}, any pairing; combos vary layer to layer. */
-    const int gate_mxfp4 = gate_type == 39u;
-    const int down_mxfp4 = down_type == 39u;
-    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) take the same
-     * down kernels; the layout is a template/trait choice at each launch. */
-    const int down_iq2 = (down_type == 16u) || (down_type == 42u);
-    /* IQ2_XXS (16) and its load-aligned twin IQ2_XXS_SOA (42) share the tiled
-     * gate/up kernel; the layout is a template parameter picked at the launch.
-     * d plane starts after the whole tensor's q plane: nblk_total * 64, with
-     * nblk_total = n_total_expert * (expert_bytes / 66) -- the stride is an
-     * exact multiple of the 66 B block in both layouts. */
-    const int gate_soa = (gate_type == 42u);
-    const int down_soa = (down_type == 42u);
-    const uint64_t gate_d_off = (uint64_t)n_total_expert * (gate_expert_bytes / 66ull) * 64ull;
-    const uint64_t down_d_off = (uint64_t)n_total_expert * (down_expert_bytes / 66ull) * 64ull;
-    /* MXFP4 (type-39) big-batch expert-tiled prefill path (PULSAR_MOE_FP4_TILED, default on;
-     * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
-    static int fp4_tiled = -1;
-    if (fp4_tiled < 0) { const char *e = getenv("PULSAR_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
-    /* Type 43 (IQ2_XXS_MMQ, aligned in the gguf) is MMQ-only: the dp4a readers
-     * cannot parse that layout, so it must reach the MMQ arms below and must
-     * NOT fall through to a dp4a kernel.  Admit it here; the MMQ arms claim it,
-     * and if MMQ is unavailable we fail closed rather than misread the bytes. */
-    const int gate_mmq43 = (gate_type == 43u);
-    const int down_mmq43 = (down_type == 43u);
-    /* Q2_K (type 10) routed experts are no longer supported: the shipped
-     * recipe has never contained Q2_K (plan 41), and the only Q2_K artifacts
-     * in reach are the competitors', which we cannot load anyway (no Q8_0
-     * reader).  Rejecting here rather than carrying ~10 dispatch arms. */
-    if (gate_type != 16u && !gate_soa && !gate_mxfp4 && !gate_mmq43) return 0;
-    if (!down_iq2 && !down_mxfp4 && !down_mmq43) return 0;
+    /* This function is now IQ2_XXS_MMQ (43) on BOTH sides, and nothing else.
+     *
+     * The three dispatchers above it split the space first: 40/40 goes to
+     * routed_moe_launch_cutlass, exactly-one-40 to routed_moe_launch_mixed40,
+     * and what is left arrives here.  That used to mean any pairing of
+     * {IQ2_XXS 16, IQ2_XXS_SOA 42, Q2_K 10, FP4_E2M1 39, 43}; a scan of the
+     * shipped artifact found only 40 and 43 among its expert tensors, none of
+     * the other four is ever synthesised at load, and their kernels have been
+     * deleted.  So the door is a simple equality and everything downstream is
+     * MMQ-only -- no layout traits, no d-plane offsets, no dp4a fallback.
+     *
+     * Anything else is refused rather than reinterpreted: a dispatch chain that
+     * accepts an unknown tag does not fail, it reads the bytes as some other
+     * format and returns plausible garbage. */
+    if (gate_type != 43u || down_type != 43u) return 0;
 #ifndef PULSAR_HAVE_MMQ
-    if (gate_mmq43 || down_mmq43) return 0;   /* no MMQ build -> unreadable */
+    return 0;   /* no MMQ build -> type 43 is unreadable */
 #endif
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
@@ -3038,15 +1356,13 @@ static int routed_moe_launch(
     if (!gate_w || !up_w || !down_w) return 0;
 
     int ok = 1;
-    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
-    const uint64_t xq_count = (uint64_t)n_tokens * xq_blocks;
-    const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
-    const uint64_t xq_bytes = xq_count * sizeof(cuda_block_q8_K);
-    const uint64_t midq_bytes = midq_count * sizeof(cuda_block_q8_K);
-    if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
-        cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
-        cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
+    /* No Q8_K scratch is carved out of `down`/`gate` any more: it existed only
+     * to feed the dp4a readers, and MMQ takes x and mid as f32 and does its own
+     * q8_1.  The scratch-size guard that used to wrap this body went with it --
+     * it could only ever have failed into an f32 fallback that no longer
+     * exists.  `down` is still the per-pair output buffer, sized by the caller
+     * checks above. */
+    {
         const uint32_t profile_moe = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
@@ -3068,27 +1384,20 @@ static int routed_moe_launch(
          * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
          * precisely why these stages are bit-exact and re-tileable.) */
         const uint32_t pair_count = n_tokens * n_expert;
-        /* Sorted expert tiles exist for the iq2_xxs/q2_k kernels only; mxfp4
-         * stages take the per-pair qwarp32 kernels. Build the sorted
-         * structures whenever at least one stage consumes them. */
-        /* With the tiled MXFP4 path enabled, both-mxfp4 layers also build the sorted
-         * structures (the tiled kernels consume them). Without it, keep the legacy
-         * behaviour (both-mxfp4 skips sorting and takes qwarp32). */
-        const uint32_t use_sorted_pairs =
-            n_tokens > 1u && (fp4_tiled || !(gate_mxfp4 && down_mxfp4));
-        /* 128 is a throughput heuristic for type 16, which can always fall back
-         * to the dp4a chain below it.  Type 43 cannot -- the aligned layout is
-         * unreadable there, so the arm fails closed -- and the gate/up _vec arm
-         * only serves n_tokens==1.  That left 2..127 with no reader at all: any
-         * short prompt through the CLI is one small chunk and died with
-         * "type-43 gate/up but MMQ declined".  For 43 the batch arm is the only
-         * correct reader at n_tokens>1, so admit it at every such n.  n_tokens==1
-         * is unaffected: use_sorted_pairs already requires n_tokens > 1, so
-         * decode still takes the _vec arms. */
-        const uint32_t use_big_batch = use_sorted_pairs &&
-            (n_tokens >= 128u || gate_type == 43u || down_type == 43u);
-        const uint32_t use_decode_lut_gate =
-            gate_type == 16u && n_tokens == 1u && xq_blocks <= 16u;
+        /* The sorted-pair structures are not read by MMQ itself; they survive as
+         * the shape signal the batch arms are gated on (and the tile lists the
+         * deleted dp4a kernels used to consume).  n_tokens > 1 is the whole
+         * condition now that the both-mxfp4 special case is gone. */
+        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        /* 128 used to be a throughput heuristic for type 16, which could always
+         * fall back to the dp4a chain below it.  Type 43 cannot, and the gate/up
+         * _vec arm only serves n_tokens==1, so 2..127 had no reader at all: any
+         * short CLI prompt is one small chunk and died with "MMQ declined".  The
+         * batch arm is the only correct reader at n_tokens>1, so it takes every
+         * such n.  With type 16 gone the threshold has no remaining meaning and
+         * use_big_batch is simply use_sorted_pairs; n_tokens==1 still routes to
+         * the _vec arms, which is what use_sorted_pairs excludes. */
+        const uint32_t use_big_batch = use_sorted_pairs;
         const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
@@ -3101,9 +1410,6 @@ static int routed_moe_launch(
         uint32_t *tile16_starts = NULL;
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
-        dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
             const uint32_t sort_expert_count = n_total_expert;
@@ -3189,16 +1495,16 @@ static int routed_moe_launch(
             }
         }
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
-        /* Every IQ2 reader now has a layout arm (rowspan, row32, decode-LUT and
-         * the qwarp32 trait on gate/up; tile16, tile8, sum6 and the qwarp32
-         * trait on down), so the earlier fail-closed guard is retired.  What
-         * remains enforced is the binder's rule that gate and up share a type:
-         * the fused gate+up kernels read ONE layout, so a half-repacked pair is
-         * rejected at load rather than here. */
+        /* MMQ is now the ONLY reader here: this function is type-43-on-both-
+         * sides, and the dp4a chains that used to follow each arm are gone with
+         * the types that fed them.  So "MMQ declined" is terminal -- there is
+         * nothing to fall through to, which is exactly what the two fail-closed
+         * arms below say.  What stays enforced at load is the binder's rule that
+         * gate and up share a type: the fused gate+up kernels read ONE layout. */
         int mmq_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time decision, evaluated once per launch -- not per token. */
-        if (ok && sorted_pairs && !gate_mxfp4 && use_big_batch) {
+        if (ok && sorted_pairs && use_big_batch) {
             mmq_done = routed_moe_try_mmq_gate_up(
                 (float *)mid->ptr, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
@@ -3207,201 +1513,28 @@ static int routed_moe_launch(
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
         }
         /* decode: n_tokens < 128 never reaches the big-batch arm above */
-        if (ok && !mmq_done && gate_type == 43u) {
+        if (ok && !mmq_done) {
             mmq_done = routed_moe_try_mmq_gate_up_vec(
                 (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, selected_ptr,
                 (const float *)weights->ptr, gate_type,
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up vec");
         }
-        /* fail closed: the dp4a chain below cannot read the aligned layout */
-        if (ok && gate_mmq43 && !mmq_done) {
-            fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined; refusing dp4a fallback\n");
+        /* fail closed: nothing else can read the aligned layout */
+        if (ok && !mmq_done) {
+            fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined and no fallback exists\n");
             ok = 0;
         }
+#else
+        (void)mmq_done;
+        return 0;   /* no MMQ build -> type 43 is unreadable; rejected at the door */
 #endif
-        /* mmq_done means `mid` is already produced -- skip the ENTIRE gate/up
-         * if/else chain.  Gating only its first branch let control fall through
-         * to the qwarp32 fallback, which then recomputed gate/up on top of MMQ:
-         * measured 27 x 1649 ms = 85.3% of GPU time, a 6x net LOSS. */
-        if (ok && !mmq_done) {
-            if (sorted_pairs && !gate_mxfp4) {
-                if (use_big_batch) {
-                    dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                    {
-                        if (gate_soa)
-                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 1><<<tgrid, 256>>>(
-                                (float *)mid->ptr,
-                                gate_w, up_w, gate_d_off, gate_d_off,
-                                xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                clamp);
-                        else
-                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024, 0><<<tgrid, 256>>>(
-                                (float *)mid->ptr,
-                                gate_w, up_w, 0ull, 0ull,
-                                xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                clamp);
-                    }
-                } else {
-                    dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    {
-                        if (gate_soa)
-                            moe_gate_up_mid_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
-                                (float *)mid->ptr,
-                                gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                clamp);
-                        else
-                            moe_gate_up_mid_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
-                                (float *)mid->ptr,
-                                gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                clamp);
-                    }
-                }
-            } else if (sorted_pairs && gate_mxfp4 && fp4_tiled && use_big_batch) {
-                /* NT=16 where the device allows the dynamic-SMEM opt-in (measured
-                 * 2.30x, bit-exact), else the NT=8 fallback.  The two widths must
-                 * read tile lists of their OWN width: a 16-token tile walking the
-                 * tile-8 list would re-process pairs and skip others.  Both lists
-                 * are already built above under use_big_batch, which this branch
-                 * requires; the mxfp4 down stage has consumed the tile16 list since
-                 * 7c92951. */
-                /* NT=16 ONLY WHERE IT CAN STAGE.  The width and the staging are not
-                 * independent knobs -- measured at the v5mx shape: staged, 8 ->
-                 * 171.67 ms and 16 -> 74.64 (2.30x); UNSTAGED, 8 -> 122.53 but 16 ->
-                 * 152.71, i.e. unstaged the WIDER tile is ~25% SLOWER than the
-                 * narrower one.  So when xq_blocks > 16 puts staging out of reach
-                 * (moe_mxfp4_gate_up_smem_bytes -> 0), widening would be a
-                 * regression, not a win: keep NT=8 there. */
-                const uint32_t nt = moe_mxfp4_gate_up_smem_bytes(16u, xq_blocks)
-                                        ? moe_mxfp4_gate_up_tile_width<1024u>()
-                                        : 8u;
-                const uint32_t smem = moe_mxfp4_gate_up_smem_bytes(nt, xq_blocks);
-                if (nt == 16u) {
-                    dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile16_capacity, 1);
-                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 16u><<<tgrid, 256, smem>>>(
-                        (float *)mid->ptr,
-                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile16_total, tile16_experts, tile16_starts, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                        clamp);
-                } else {
-                    dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                    moe_gate_up_mid_mxfp4_expert_ntile_rowspan_kernel<1024u, 8u><<<tgrid, 256, smem>>>(
-                        (float *)mid->ptr,
-                        gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                        tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                        gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                        clamp);
-                }
-            } else {
-                dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                if (gate_mxfp4) {
-                    moe_gate_up_mid_qwarp32_kernel<GateUpDotMXFP4><<<qgrid, 256>>>(
-                        (float *)gate->ptr,
-                        (float *)up->ptr,
-                        (float *)mid->ptr,
-                        gate_w,
-                        up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                        xq,
-                        selected_ptr,
-                        (const float *)weights->ptr,
-                        gate_expert_bytes,
-                        gate_row_bytes,
-                        xq_blocks,
-                        expert_mid_dim,
-                        n_expert,
-                        clamp);
-                } else if (use_decode_lut_gate) {
-                    if (gate_soa)
-                        moe_gate_up_mid_decode_lut_qwarp32_kernel<1><<<qgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w,
-                            up_w, gate_d_off, gate_d_off /*up: same shape as gate*/,
-                            xq,
-                            selected_ptr,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes,
-                            gate_row_bytes,
-                            xq_blocks,
-                            expert_mid_dim,
-                            n_expert,
-                            clamp);
-                    else
-                        moe_gate_up_mid_decode_lut_qwarp32_kernel<0><<<qgrid, 256>>>(
-                            (float *)mid->ptr,
-                            gate_w,
-                            up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                            xq,
-                            selected_ptr,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes,
-                            gate_row_bytes,
-                            xq_blocks,
-                            expert_mid_dim,
-                            n_expert,
-                            clamp);
-                } else {
-                    if (gate_soa)
-                        moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>(
-                            (float *)gate->ptr,
-                            (float *)up->ptr,
-                            (float *)mid->ptr,
-                            gate_w,
-                            up_w, gate_d_off, gate_d_off /*up: same shape as gate*/,
-                            xq,
-                            selected_ptr,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes,
-                            gate_row_bytes,
-                            xq_blocks,
-                            expert_mid_dim,
-                            n_expert,
-                            clamp);
-                    else if (gate_type == 16u)
-                        moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>(
-                            (float *)gate->ptr,
-                            (float *)up->ptr,
-                            (float *)mid->ptr,
-                            gate_w,
-                            up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/,
-                            xq,
-                            selected_ptr,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes,
-                            gate_row_bytes,
-                            xq_blocks,
-                            expert_mid_dim,
-                            n_expert,
-                            clamp);
-                    else
-                        /* Unreachable today: the type-43 arm above fails closed
-                         * before the chain, and the door rejects everything
-                         * else.  Explicit anyway -- this is a dispatch chain
-                         * keyed on a type tag, and a bare `else` on one of
-                         * those does not refuse an unknown tag, it silently
-                         * REINTERPRETS its bytes as whatever the last arm
-                         * reads (here raw IQ2_XXS).  Cheap to state; the
-                         * failure mode when an upstream guard stops covering a
-                         * type is wrong numbers, not an error. */
-                        ok = 0;
-                }
-            }
-            if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
-        }
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
-         * q8_1, so the whole mid -> midq q8_K quantize below is skipped too. */
-        if (ok && sorted_pairs && !down_mxfp4 && !down_soa && use_big_batch && !use_direct_down_sum6) {
+         * q8_1, which is why there is no mid -> midq q8_K quantize left here. */
+        if (ok && sorted_pairs && use_big_batch && !use_direct_down_sum6) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
                                                     (const float *)mid->ptr,
                                                     down_w, selected_ptr,
@@ -3414,7 +1547,7 @@ static int routed_moe_launch(
          * direct-sum6 path.  The _vec entry writes PER-PAIR, so whenever it
          * runs the fixed-order moe_sum_kernel must run too -- see the sum gate
          * below, which is widened by mmq_down_done for exactly this case. */
-        if (ok && !mmq_down_done && down_mmq43 && !down_mxfp4) {
+        if (ok && !mmq_down_done) {
             mmq_down_done = routed_moe_try_mmq_down_vec((float *)down->ptr,
                                                         (const float *)mid->ptr,
                                                         down_w, selected_ptr,
@@ -3423,143 +1556,12 @@ static int routed_moe_launch(
                                                         (uint64_t)n_tokens * n_expert);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down vec");
         }
-        if (ok && down_mmq43 && !mmq_down_done) {
-            fprintf(stderr, "pulsar: type-43 down but MMQ declined; refusing dp4a fallback\n");
+        if (ok && !mmq_down_done) {
+            fprintf(stderr, "pulsar: type-43 down but MMQ declined and no fallback exists\n");
             ok = 0;
         }
 #endif
-        if (ok && !mmq_down_done) {
-            dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
-            ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
-        }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
-        if (ok && !mmq_down_done) {
-            dim3 dgrid((out_dim + 31u) / 32u, n_tokens * n_expert, 1);
-            if (use_direct_down_sum6) {
-                dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                if (down_mxfp4) {
-                    moe_down_sum6_qwarp32_kernel<GateUpDotMXFP4><<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim);
-                } else if (down_iq2) {
-                    if (down_soa)
-                        moe_down_iq2_sum6_qwarp32_kernel<1><<<sgrid, 256>>>(
-                            (float *)out->ptr,
-                            down_w, down_d_off,
-                            midq,
-                            selected_ptr,
-                            down_expert_bytes,
-                            down_row_bytes,
-                            midq_blocks,
-                            out_dim);
-                    else
-                        moe_down_iq2_sum6_qwarp32_kernel<0><<<sgrid, 256>>>(
-                            (float *)out->ptr,
-                            down_w, 0ull /*down_d_off*/,
-                            midq,
-                            selected_ptr,
-                            down_expert_bytes,
-                            down_row_bytes,
-                            midq_blocks,
-                            out_dim);
-                } else {
-                    /* Q2_K removed: no correct reader remains for this type. */
-                    ok = 0;
-                }
-            }
-            if (use_direct_down_sum6) {
-                /* The direct decode kernel writes the final token row. */
-            } else if (sorted_pairs && down_mxfp4 && fp4_tiled && use_big_batch) {
-                dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
-                moe_down_expert_tile16_row2048_kernel<Dot8MXFP4><<<tgrid, 256>>>(
-                    (float *)down->ptr,
-                    down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                    tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                    midq_blocks, out_dim, n_expert);
-            } else if (sorted_pairs && !down_mxfp4 && use_big_batch) {
-                dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
-                if (down_iq2) {
-                    if (down_soa)
-                        moe_down_iq2_expert_tile16_row2048_kernel<1><<<tgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, down_d_off, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert);
-                    else
-                        moe_down_iq2_expert_tile16_row2048_kernel<0><<<tgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile16_total, tile16_experts, tile16_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert);
-                } else {
-                    ok = 0;   /* Q2_K removed: no correct reader */
-                }
-            } else if (sorted_pairs && !down_mxfp4) {
-                dim3 tgrid((out_dim + 31u) / 32u, tile_capacity, 1);
-                if (down_iq2) {
-                    if (down_soa)
-                        moe_down_iq2_expert_tile8_row32_kernel<1><<<tgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, down_d_off, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert);
-                    else
-                        moe_down_iq2_expert_tile8_row32_kernel<0><<<tgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, 0ull /*down_d_off*/, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert);
-                } else {
-                    ok = 0;   /* Q2_K removed: no correct reader */
-                }
-            } else {
-                if (down_mxfp4) {
-                    moe_down_qwarp32_kernel<GateUpDotMXFP4><<<dgrid, 256>>>(
-                        (float *)down->ptr,
-                        down_w, 0ull /*down_d_off*/,
-                        midq,
-                        selected_ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert);
-                } else if (down_iq2) {
-                    if (down_soa)
-                        moe_down_qwarp32_kernel<GateUpDotIQ2SoA><<<dgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, down_d_off,
-                            midq,
-                            selected_ptr,
-                            down_expert_bytes,
-                            down_row_bytes,
-                            midq_blocks,
-                            out_dim,
-                            n_expert);
-                    else
-                        moe_down_qwarp32_kernel<GateUpDotIQ2><<<dgrid, 256>>>(
-                            (float *)down->ptr,
-                            down_w, 0ull /*down_d_off*/,
-                            midq,
-                            selected_ptr,
-                            down_expert_bytes,
-                            down_row_bytes,
-                            midq_blocks,
-                            out_dim,
-                            n_expert);
-                } else {
-                    ok = 0;   /* Q2_K removed: no correct reader */
-                }
-            }
-            if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
-        }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         /* mmq_down_done means the MMQ arm wrote PER-PAIR results, so the
          * reduction is still owed even on the direct-sum6 decode path (whose
@@ -3590,20 +1592,6 @@ static int routed_moe_launch(
         return ok;
     }
 
-    /* f32 scratch-starved fallback: FAIL CLOSED.
-     * The pair of f32 kernels that used to live here was never type-coherent --
-     * the gate/up one read cuda_block_iq2_xxs while the down one read
-     * cuda_block_q2_K, so it only ever matched an IQ2 gate/up + Q2_K down
-     * recipe.  That is the competitors' layout, never ours; on a v5mx (IQ2
-     * down) it would have MISREAD the down weights had the scratch check above
-     * ever failed.  Both kernels are deleted along with the rest of Q2_K; there
-     * is no correct reader left, so refuse rather than silently reinterpret.
-     * Same hazard class as mixed40's bare `else`. */
-    if (ok) {
-        fprintf(stderr, "pulsar: routed MoE f32 fallback has no supported type "
-                        "combination (scratch too small for the quantized path)\n");
-        return 0;
-    }
     return ok;
 }
 
@@ -3669,8 +1657,9 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
                                          selected, weights, n_total_expert, n_expert, clamp, x, 1);
     }
     if ((gate_type == 40u) != (down_type == 40u)) {
-        /* MIXED type-40 + iq2/q2k: per-projection dispatch. Fail-closed -- routed_moe_launch's
-         * dp4a kernels cannot read the type-40 swizzle, so never fall through to it. */
+        /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed --
+         * routed_moe_launch is 43/43 only and cannot read the type-40 swizzle,
+         * so a mixed layer must never fall through to it. */
         return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
@@ -3849,7 +1838,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
                                          n_tokens);
     }
     if ((gate_type == 40u) != (down_type == 40u)) {
-        /* MIXED type-40 + iq2/q2k: per-projection dispatch. Fail-closed. */
+        /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
         return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,

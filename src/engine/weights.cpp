@@ -167,12 +167,15 @@ static void tensor_expect_plain_layout(
 
 
 
+/* The two routed-expert types the engine still reads.  IQ2_XXS (16),
+ * IQ2_XXS_SOA (42), Q2_K (10) and FP4_E2M1 (39) were dropped: a scan of the
+ * shipped artifact found only types 0/1/26/38/40/41/43 in the file, none of the
+ * four is ever synthesised at load (they can only arrive FROM a gguf), and the
+ * kernels behind them are gone.  Refusing here is what keeps that honest -- an
+ * old artifact now fails to load with a clear message instead of dispatching
+ * into a reader that no longer exists. */
 static bool tensor_is_routed_expert_type(uint32_t type) {
-    return type == PULSAR_TENSOR_IQ2_XXS ||
-           type == PULSAR_TENSOR_IQ2_XXS_SOA ||
-           type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
-           type == PULSAR_TENSOR_Q2_K ||
-           type == PULSAR_TENSOR_FP4_E2M1 ||
+    return type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
            type == PULSAR_TENSOR_CUTLASS_MXFP4;
 }
 
@@ -180,23 +183,11 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 
 static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
-    case PULSAR_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
-    /* IQ2_XXS_SOA (42) is a pure permutation of type 16: the same 66 B/block,
-     * planes split.  Byte accounting -- row bytes, expert stride, tensor size
-     * -- is therefore IDENTICAL, which is exactly why the SoA artifact drops
-     * into the existing offset machinery unchanged.  Only the KERNEL's read
-     * pattern differs (see dev_iq2_soa_planes). */
-    case PULSAR_TENSOR_IQ2_XXS_SOA: return sizeof(block_iq2_xxs);
-    /* IQ2_XXS_MMQ (43) is likewise a pure permutation of type 16 -- llama.cpp
-     * MMQ's aligned-SoA layout rather than our Phase-0 one.  Verified byte-exact
-     * both ways over all 91 converted tensors, and the artifact is the SAME SIZE
-     * as raw (415,236,096 at the v5mx shape), so the offset machinery is
-     * untouched.  Only the kernel's read pattern differs. */
+    /* IQ2_XXS_MMQ (43) is a pure permutation of the old raw IQ2_XXS -- llama.cpp
+     * MMQ's aligned-SoA layout.  Same 66 B/block, so row bytes, expert stride
+     * and tensor size are unchanged; that is why it drops into the existing
+     * offset machinery.  Only the kernel's read pattern differs. */
     case PULSAR_TENSOR_IQ2_XXS_MMQ: return sizeof(block_iq2_xxs);
-    case PULSAR_TENSOR_Q2_K:    return sizeof(block_q2_K);
-    /* MXFP4: 17 bytes / 32 vals = [1 E8M0 scale][16 bytes = 32x E2M1]. Per-QK_K
-     * (256 vals) = 8 sub-blocks * 17 = 136 bytes, matching the other per-QK_K sizes. */
-    case PULSAR_TENSOR_FP4_E2M1: return (QK_K / 32) * 17;
     default:                 pulsar_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -278,44 +269,24 @@ static void tensor_expect_routed_expert_combo(
         const pulsar_tensor *up,
         const pulsar_tensor *down) {
     /* gate/up must match (the fused gate+up kernels assume one format). Each of
-     * gate/up and down may independently be a dp4a quant (iq2_xxs/q2_k/mxfp4) OR
-     * CUTLASS_MXFP4 (type 40) -- the GPU MoE path handles all-cutlass (uniform,
-     * grouped/gemv), all-dp4a (heterogeneous), AND the two MIXED shapes
-     * (cutlass gate/up + iq2/q2k down; iq2/q2k gate/up + cutlass down) via
-     * per-projection dispatch. The ONE combo the GPU can't compose is CUTLASS
-     * mixed with the legacy 17-byte FP4_E2M1 (type 39) on the other side -- that
-     * dp4a format can't be read by CUTLASS and vice-versa; reject it fail-closed
-     * (it never occurs after the type-40 unification repack, which converts every
-     * type-39 mxfp4 to type-40). */
+     * gate/up and down is independently either IQ2_XXS_MMQ (43, read by the MMQ
+     * arms) or CUTLASS_MXFP4 (40) -- the GPU MoE path handles all-cutlass
+     * (uniform, grouped/gemv), all-MMQ, AND the two MIXED shapes via
+     * per-projection dispatch, which is what the shipped artifact needs: its 43
+     * routed layers are 9 all-40, 27 all-43 and 7 mixed.
+     *
+     * The old dp4a types (IQ2_XXS 16, IQ2_XXS_SOA 42, Q2_K 10, FP4_E2M1 39) are
+     * gone along with their kernels, so the former "bad_mix" cross (CUTLASS
+     * against a legacy type-39 side) can no longer be expressed and its check
+     * went with them. */
     const bool gate_up_pair = gate->type == up->type;
-    const bool gate_cut = gate->type == PULSAR_TENSOR_CUTLASS_MXFP4;
-    const bool down_cut = down->type == PULSAR_TENSOR_CUTLASS_MXFP4;
-    /* IQ2_XXS_SOA (42) is accepted anywhere IQ2_XXS (16) is: same values, same
-     * byte accounting, different load alignment.  gate/up must still MATCH each
-     * other, so a half-repacked pair (16 on one side, 42 on the other) is
-     * rejected by gate_up_pair below -- which is the intended fail-closed
-     * behaviour, since the fused gate+up kernels read one layout. */
-    const bool gate_dp4a = gate->type == PULSAR_TENSOR_IQ2_XXS ||
-                           gate->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
-                           gate->type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
-                           gate->type == PULSAR_TENSOR_Q2_K ||
-                           gate->type == PULSAR_TENSOR_FP4_E2M1;
-    const bool down_dp4a = down->type == PULSAR_TENSOR_IQ2_XXS ||
-                           down->type == PULSAR_TENSOR_IQ2_XXS_SOA ||
-                           down->type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
-                           down->type == PULSAR_TENSOR_Q2_K ||
-                           down->type == PULSAR_TENSOR_FP4_E2M1;
-    const bool gate_ok = gate_dp4a || gate_cut;
-    const bool down_ok = down_dp4a || down_cut;
-    /* the unhandled cross: CUTLASS on one side + legacy type-39 FP4 on the other */
-    const bool bad_mix = (gate_cut && down->type == PULSAR_TENSOR_FP4_E2M1) ||
-                         (down_cut && gate->type == PULSAR_TENSOR_FP4_E2M1);
-    if (gate_up_pair && gate_ok && down_ok && !bad_mix) return;
+    const bool gate_ok = tensor_is_routed_expert_type(gate->type);
+    const bool down_ok = tensor_is_routed_expert_type(down->type);
+    if (gate_up_pair && gate_ok && down_ok) return;
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; gate/up must match and be one of "
-            "iq2_xxs/q2_k/mxfp4/cutlass_mxfp4, down one of the same; a CUTLASS_MXFP4 "
-            "side may NOT pair with a legacy type-39 mxfp4 side; "
+            "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
+            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq (43); "
             "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
@@ -941,46 +912,25 @@ void config_validate_model(const pulsar_model *m) {
 
 
 
-/* Weight formats the engine still decodes.  Legacy Q4_K and Q8_0 weight
- * support has been removed; reject such GGUFs up front with one clear error
- * instead of failing on the first per-tensor layout check. */
+/* Weight formats the engine still decodes -- exactly the seven types present in
+ * the shipped artifact (a full scan of its 1406 tensors found 0/1/26/38/40/41/43
+ * and nothing else).  Q4_K, Q8_0, Q2_K (10), IQ2_XXS (16), FP4_E2M1 (39) and IQ2_XXS_SOA (42) have been removed along with their readers.
+ * Rejecting up front gives one clear error instead of failing on the first
+ * per-tensor layout check -- or, worse, dispatching into a deleted arm.
+ *
+ * BF16 (30) is also absent from the artifact but is still accepted here: it is
+ * the alternative OUTPUT-HEAD format, and dropping it means deleting the
+ * dedicated bf16 matmul and its three decode branches.  Separate change. */
 static bool weights_tensor_type_supported(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_F32:
     case PULSAR_TENSOR_F16:
-    case PULSAR_TENSOR_Q2_K:
-    case PULSAR_TENSOR_IQ2_XXS:
-    /* IQ2_XXS_SOA (42): a pure permutation of type 16, accepted since the
-     * non-finite-logit defect was fixed.  Cause was NOT the kernels or the
-     * artifact (both proved correct: tests/iq2_row32_soa_diff.cu shows the
-     * row32/rowspan SoA arms bit-exact against packed at the shipped shape,
-     * and gguf-tools/verify_iq2_soa.py unpacks the file back to AoS exactly)
-     * -- it was DISPATCH.  routed_moe_launch_mixed40 had no gate_soa/down_soa
-     * arm on its non-tiled (n_tokens < 128) qwarp32 launches, so a short
-     * prefill chunk read SoA planes with the PACKED reader.  See the comment
-     * at that launch site.
-     *
-     * VALIDATED 2026-08-03 on the full 91-tensor SoA model vs the packed one,
-     * same binary (so the delta is layout, not code):
-     *   prefill_bitexact_gate --check: PASS, all 5 depths (512/2048/4096/4102
-     *     /6144) 129280 full-vocab logits BYTE-IDENTICAL.  4102 is the depth
-     *     that used to fail.
-     *   PULSAR_CUDA_PREFILL_CHUNK=8192 (the other pre-fix failure mode): the
-     *     gate refuses that knob by design, so it was checked directly with
-     *     pulsar-bench --dump-frontier-logits-dir -- frontiers 4096 and 8192
-     *     identical, no nan/inf.
-     *   pulsar-eval q1..q4 traces byte-identical (same text, same verdicts).
-     *   prefill A/B, median of 3, 6/6 paired runs positive:
-     *     @2048  483.39 -> 494.30 tok/s  (+2.3%)
-     *     @8192  460.00 -> 468.76 tok/s  (+1.9%) */
-    case PULSAR_TENSOR_IQ2_XXS_SOA:
-    case PULSAR_TENSOR_IQ2_XXS_MMQ:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
     case PULSAR_TENSOR_FP8_E4M3:
     case PULSAR_TENSOR_MXFP8_LT:
-    case PULSAR_TENSOR_FP4_E2M1:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
+    case PULSAR_TENSOR_IQ2_XXS_MMQ:
         return true;
     default:
         return false;
@@ -1006,9 +956,13 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
         any = true;
     }
     if (any) {
+        /* Keep this list in step with weights_tensor_type_supported() above --
+         * it is the only thing the user sees when an old artifact is refused,
+         * and a list naming types the engine no longer reads sends them looking
+         * for a bug in their file instead of re-quantising it. */
         fprintf(stderr,
-                "pulsar: supported weight tensor types: f32, f16, bf16, i32, q2_k, "
-                "iq2_xxs, fp8_e4m3 (MXFP8), mxfp4\n");
+                "pulsar: supported weight tensor types: f32, f16, i32, bf16, "
+                "fp8_e4m3 (MXFP8), mxfp8_lt, cutlass_mxfp4 (40), iq2_xxs_mmq (43)\n");
         exit(1);
     }
 }

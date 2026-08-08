@@ -61,12 +61,6 @@ typedef struct pulsar_gpu_tensor pulsar_gpu_tensor;
 int pulsar_gpu_init(void);
 void pulsar_gpu_cleanup(void);
 
-/* Boot-time observability: the resolved gate/up MXFP4 tile width (NT=16 where
- * the device accepts the dynamic-SMEM opt-in, else NT=8) -- the same cached
- * value the mxfp4 prefill path launches at <1024u>.  Resolving it is idempotent
- * (a single cudaFuncSetAttribute) and does not alter any generated token. */
-uint32_t pulsar_gpu_moe_mxfp4_tile_width(void);
-
 /* Running total of live tensor-alloc bytes (owned allocations only, views
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
@@ -324,6 +318,7 @@ int pulsar_gpu_matmul_bf16_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
+
 
 int pulsar_gpu_matmul_f16_pair_tensor(
         pulsar_gpu_tensor       *out_a,

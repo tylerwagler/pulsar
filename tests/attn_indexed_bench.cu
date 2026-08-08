@@ -16,7 +16,8 @@
  * works modelless.  Hence this TU.
  *
  * It #includes the shipped .cu so the file-static kernel is the REAL one, not a
- * copy (the pattern from tests/iq2_row32_soa_diff.cu).
+ * copy.  (tests/iq2_row32_soa_diff.cu used the same pattern; it went with the
+ * IQ2 dp4a kernels it diffed.)
  *
  * CALIBRATION GATE -- the whole point.  A synthetic attention bench is worthless
  * unless it reproduces the engine's own cost; the 2026-07-22 MoE NO-GO came from

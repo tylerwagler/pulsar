@@ -29,8 +29,7 @@ int pulsar_engine::routed_quant_bits() {
         for (int k = 0; k < 3; k++) {
             const pulsar_tensor *t = proj[k];
             if (!t) continue;
-            if (t->type == PULSAR_TENSOR_FP4_E2M1 ||
-                t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
+            if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4)
                 return 4;
             if (bits == 0) bits = 2;
         }
@@ -521,10 +520,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 pulsar_backend_name(e->backend));
 
         /* One MoE-tier boot line so a silent slow tier is no longer silent:
-         * resolved expert weight type (grouped-CUTLASS type-40 vs per-expert
-         * tiled type-39) + the resolved gate/up MXFP4 tile width (NT16/NT8).
-         * Reuses the bound-layer expert tensors and the CUDA tile-width
-         * accessor; log-only, runs once at open on every GPU serve. */
+         * the resolved expert weight types per layer (grouped-CUTLASS type-40
+         * on both sides vs the per-expert MMQ/mixed path).  Reuses the
+         * bound-layer expert tensors; log-only, runs once at open on every GPU
+         * serve.  PULSAR_DUMP_MOE_TYPES=1 additionally prints every routed
+         * layer's gate/down type pair -- that census is what established the
+         * artifact is 40 and 43 only. */
         {
             /* Count the tier PER LAYER.  Reporting the first bound layer's type
              * as "the" tier is actively misleading on a heterogeneous model:
@@ -547,15 +548,25 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     l->ffn_down_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4) n_grouped++;
                 else n_tiled++;
             }
+            if (getenv("PULSAR_DUMP_MOE_TYPES")) {
+                for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                    const pulsar_layer_weights *l = &e->weights.layer[il];
+                    if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
+                    fprintf(stderr, "MOETYPES layer %u gate=%u down=%u\n",
+                            il, l->ffn_gate_exps->type, l->ffn_down_exps->type);
+                }
+            }
             if (ml) {
                 const uint32_t gt = ml->ffn_gate_exps->type;
                 const uint32_t dt = ml->ffn_down_exps->type;
+                /* The "mxfp4 tile=NT%u" field is gone with the type-39 gate/up
+                 * kernel it described: nothing reads that tile width now that
+                 * every MXFP4 layer goes through CUTLASS. */
                 fprintf(stderr,
                         "pulsar: MoE expert tier: %u/%u layers grouped-CUTLASS, %u/%u per-expert-tiled "
-                        "(first routed layer gate=%s(%u) down=%s(%u)) mxfp4 tile=NT%u\n",
+                        "(first routed layer gate=%s(%u) down=%s(%u))\n",
                         n_grouped, n_routed, n_tiled, n_routed,
-                        tensor_type_name(gt), gt, tensor_type_name(dt), dt,
-                        pulsar_gpu_moe_mxfp4_tile_width());
+                        tensor_type_name(gt), gt, tensor_type_name(dt), dt);
             }
         }
     }
