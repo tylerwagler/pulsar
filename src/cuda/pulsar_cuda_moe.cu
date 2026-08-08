@@ -2295,6 +2295,14 @@ static int routed_moe_launch_mixed40(
      * GateUpDotQ2K -- i.e. any down type that was neither SoA nor type-16 was
      * READ AS Q2_K.  That is the IQ2_XXS_SOA silent-misread shape exactly. */
     if (gate_type == 10u || down_type == 10u) return 0;
+    /* Type 43 (IQ2_XXS_MMQ) is NOT rejected here: unlike Q2_K it has a correct
+     * reader on both sides -- routed_moe_try_mmq_down (caseA) and
+     * routed_moe_try_mmq_gate_up (caseB) both accept it, and they run before
+     * the dp4a arms below.  7 of this model's 43 routed layers are mixed 40/43
+     * (4x gate=40/down=43, 3x gate=43/down=40), so a door guard here takes out
+     * live layers.  The residual hazard is MMQ *declining* a type-43 side and
+     * falling through to dp4a, which cannot read the aligned layout -- that is
+     * handled by the explicit `else ok = 0` in both arms, not by a door guard. */
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
@@ -2599,12 +2607,24 @@ static int routed_moe_launch_mixed40(
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2SoA><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
                         gate_w, up_w, gate_d_off, gate_d_off /*up: same shape as gate*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
-                else
+                else if (gate_type == 16u)
                     moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>((float *)gate->ptr, (float *)up->ptr, mid_flat,
                         gate_w, up_w, 0ull /*gate_d_off*/, 0ull /*up_d_off*/, xq, selected_ptr, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                else
+                    /* was a bare else -> GateUpDotIQ2, i.e. any unrecognised
+                     * gate type silently READ AS raw IQ2_XXS.  Type 43 normally
+                     * never gets here (the MMQ arm above claims it), but if MMQ
+                     * ever declines one -- unsupported shape, no-MMQ build --
+                     * the fall-through would read its aligned layout as packed.
+                     * Refuse instead.  Mirrors the caseA down arm above. */
+                    ok = 0;
             }
-            ok = cuda_ok(cudaGetLastError(), "mixed40B gate/up");
+            /* `if (ok)`, not a bare assignment: the refusal above sets ok = 0,
+             * and an unconditional cuda_ok() would hand it straight back to 1
+             * (no CUDA error was raised -- we declined to launch anything).
+             * Matches the caseA down arm. */
+            if (ok) ok = cuda_ok(cudaGetLastError(), "mixed40B gate/up");
         }
         /* Phase 2: mid -> W4A8 down -> down_flat[pair]. */
         if (ok && use_grouped) {
@@ -3345,7 +3365,7 @@ static int routed_moe_launch(
                             expert_mid_dim,
                             n_expert,
                             clamp);
-                    else
+                    else if (gate_type == 16u)
                         moe_gate_up_mid_qwarp32_kernel<GateUpDotIQ2><<<qgrid, 256>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
@@ -3361,9 +3381,20 @@ static int routed_moe_launch(
                             expert_mid_dim,
                             n_expert,
                             clamp);
+                    else
+                        /* Unreachable today: the type-43 arm above fails closed
+                         * before the chain, and the door rejects everything
+                         * else.  Explicit anyway -- this is a dispatch chain
+                         * keyed on a type tag, and a bare `else` on one of
+                         * those does not refuse an unknown tag, it silently
+                         * REINTERPRETS its bytes as whatever the last arm
+                         * reads (here raw IQ2_XXS).  Cheap to state; the
+                         * failure mode when an upstream guard stops covering a
+                         * type is wrong numbers, not an error. */
+                        ok = 0;
                 }
             }
-            ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+            if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
         }
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         int mmq_down_done = 0;

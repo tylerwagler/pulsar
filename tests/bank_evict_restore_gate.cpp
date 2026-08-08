@@ -40,6 +40,19 @@ static double now_ms(void) {
 
 static const double GIB = 1024.0 * 1024.0 * 1024.0;
 static int g_fail;
+
+/* Scratch dir for the KV snapshot files. These paths used to be hardcoded into
+ * one developer's home, which made the gate unrunnable as anyone else: the
+ * fopen failed, every later stage cascaded off the never-written snapshot (bank
+ * 0 stayed evicted, so the bit-identical and no-cascade findings both reported
+ * bogus FAILs), and finding-3's unchecked fwrite on the NULL FILE* finished the
+ * job with SIGSEGV. Derive it instead; override only for odd setups. */
+static const char *gate_tmpdir(void) {
+    const char *d = getenv("PULSAR_GATE_TMPDIR");
+    if (!d || !*d) d = getenv("TMPDIR");
+    if (!d || !*d) d = "/tmp";
+    return d;
+}
 #define CHECK(cond, ...) do { if(!(cond)){ fprintf(stderr,"EVICT-RESTORE FAIL: " __VA_ARGS__); fprintf(stderr,"\n"); g_fail=1; } } while(0)
 
 static char *read_file(const char *path, size_t *len_out) {
@@ -124,7 +137,9 @@ int main(int argc, char **argv) {
      * bank 0 is cur). Measure disk-snapshot latency (an eviction stalls the
      * evicted session's next turn by save+reload time). */
     pulsar_gpu_graph *g = &s->graph;
-    const char *snap_path = "/home/tyler/Projects/AI/temp/tier2-inc1/bank0.kvsnap";
+    char snap_buf[512];
+    snprintf(snap_buf, sizeof snap_buf, "%s/pulsar_gate_bank0.kvsnap", gate_tmpdir());
+    const char *snap_path = snap_buf;
     { double t0 = now_ms();
       FILE *fp = fopen(snap_path, "wb");
       CHECK(fp != NULL, "open snap for write");
@@ -212,14 +227,20 @@ int main(int argc, char **argv) {
     /* ===== Review finding 3 — a corrupt/short snapshot must fail kv_load SAFELY:
      * validate counts <= cap, don't install rows over unwritten KV. Bank 1 is now
      * freed (frontier 0). ===== */
-    const char *cpath = "/home/tyler/Projects/AI/temp/tier2-inc1/corrupt.kvsnap";
+    char corrupt_buf[512];
+    snprintf(corrupt_buf, sizeof corrupt_buf, "%s/pulsar_gate_corrupt.kvsnap", gate_tmpdir());
+    const char *cpath = corrupt_buf;
     /* (a) count > cap. */
     { FILE *fp = fopen(cpath, "wb");
+      CHECK(fp != NULL, "finding3(a): open corrupt snap for write");
+      if (!fp) goto finding3_done;
       uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
       fwrite(hdr, sizeof hdr, 1, fp);
       for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) { uint32_t c[2] = { 0xFFFFFFFFu, 0u }; fwrite(c, sizeof c, 1, fp); }
       fclose(fp);
       fp = fopen(cpath, "rb");
+      CHECK(fp != NULL, "finding3(a): reopen corrupt snap for read");
+      if (!fp) goto finding3_done;
       const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
       fclose(fp);
       CHECK(rc != 0, "finding3(a): kv_load ACCEPTED a count > cap");
@@ -228,6 +249,8 @@ int main(int argc, char **argv) {
               rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
     /* (b) truncated: valid small counts but the row bytes are missing (short read). */
     { FILE *fp = fopen(cpath, "wb");
+      CHECK(fp != NULL, "finding3(b): open corrupt snap for write");
+      if (!fp) goto finding3_done;
       uint32_t hdr[4] = { 0x4B564232u, 1u, 1u, (uint32_t)PULSAR_N_LAYER };
       fwrite(hdr, sizeof hdr, 1, fp);
       for (uint32_t il = 0; il < (uint32_t)PULSAR_N_LAYER; il++) {
@@ -235,12 +258,15 @@ int main(int argc, char **argv) {
       /* no row data written -> fread of rows fails */
       fclose(fp);
       fp = fopen(cpath, "rb");
+      CHECK(fp != NULL, "finding3(b): reopen corrupt snap for read");
+      if (!fp) goto finding3_done;
       const int rc = pulsar_session_bank_kv_load(s, 1, fp, err, sizeof err);
       fclose(fp);
       CHECK(rc != 0, "finding3(b): kv_load ACCEPTED a truncated file");
       CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0, "finding3(b): bank1 advertises rows after truncated load");
       fprintf(stderr, "evict_restore_gate: finding-3(b) truncated rejected: rc=%d touched(1)=%.3f : %s\n",
               rc, (double)pulsar_session_bank_touched_kv_bytes(s, 1)/GIB, (rc != 0) ? "OK" : "FAIL"); }
+finding3_done:
     remove(cpath);
 
     remove(snap_path);
