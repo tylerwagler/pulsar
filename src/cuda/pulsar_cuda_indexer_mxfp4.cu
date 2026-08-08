@@ -58,9 +58,10 @@
 
 #define IDX_HEADS     64u
 #define IDX_HEAD_DIM  128u
-#define IDX_NTILE     64u          /* compressed rows per block */
+#define IDX_NTILE     128u         /* compressed rows per block */
 #define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
-#define IDX_THREADS   128u         /* 4 warps */
+#define IDX_TOKTILE   2u           /* tokens per block: B is shared across them */
+#define IDX_THREADS   256u         /* 8 warps: 4 per token */
 
 /* ---- E4M3 encode (host-side rules, device-side implementation) ----------- */
 
@@ -169,8 +170,9 @@ static void idx_scores_mxfp4_kernel(
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t ratio, float scale, int causal) {
     const uint32_t tile_c = blockIdx.x * IDX_NTILE;
-    const uint32_t token  = blockIdx.y;
-    if (token >= n_tokens) return;
+    const uint32_t tok0   = blockIdx.y * IDX_TOKTILE;
+    if (tok0 >= n_tokens) return;
+    const uint32_t ntok = min(IDX_TOKTILE, n_tokens - tok0);
 
     const uint32_t tid  = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -178,38 +180,50 @@ static void idx_scores_mxfp4_kernel(
     const uint32_t g    = lane >> 2u;        /* groupID  0..7 */
     const uint32_t tig  = lane & 3u;         /* thread-in-group 0..3 */
 
-    /* Causal early-out: identical rule to the kernel being replaced. */
-    if (causal) {
-        const uint32_t visible = (pos0 + token + 1u) / ratio;
-        if (tile_c >= visible) {
-            for (uint32_t c = tid; c < IDX_NTILE; c += IDX_THREADS) {
-                const uint32_t comp_i = tile_c + c;
-                if (comp_i < n_comp) scores[(uint64_t)token * n_comp + comp_i] = -INFINITY;
-            }
-            return;
+    /* Two tokens share this block, so the tile is only fully masked when it is
+     * masked for the LATER (more permissive) of the two. */
+    const uint32_t vis_max = (pos0 + tok0 + ntok - 1u + 1u) / ratio;
+    if (causal && tile_c >= vis_max) {
+        for (uint32_t i = tid; i < IDX_NTILE * ntok; i += IDX_THREADS) {
+            const uint32_t t = tok0 + i / IDX_NTILE;
+            const uint32_t comp_i = tile_c + (i % IDX_NTILE);
+            if (comp_i < n_comp) scores[(uint64_t)t * n_comp + comp_i] = -INFINITY;
         }
+        return;
     }
 
-    __shared__ uint8_t sA[IDX_HEADS * IDX_HEAD_DIM];        /*  8 KB e4m3      */
-    __shared__ uint8_t sB[IDX_NTILE * IDX_HEAD_DIM];        /*  8 KB e2m1<<2   */
-    __shared__ uint8_t sSFA[IDX_HEADS * IDX_KSLABS];        /*  256 B          */
-    __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /*  256 B          */
-    __shared__ float   sS[IDX_HEADS * IDX_NTILE];           /* 16 KB f32       */
+    /* No S tile.  The first version materialised a [heads x N] f32 tile in
+     * shared and swept 64 heads per output column through it -- 16 KB of smem
+     * and a strided, bank-conflicting, 64-deep dependent chain per column.  It
+     * also capped N at 64, because [64 x 128] f32 would have been 64 KB.
+     * Reducing in-register over the warp's own rows and combining warps through
+     * a 2 KB partial buffer removes both problems, which is what lets N double. */
+    __shared__ uint8_t sA[IDX_TOKTILE * IDX_HEADS * IDX_HEAD_DIM];   /* 16 KB e4m3 */
+    __shared__ uint8_t sB[IDX_NTILE * IDX_HEAD_DIM];        /* 16 KB e2m1<<2 */
+    __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
+    __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
+    __shared__ float   sPart[IDX_THREADS / 32u][IDX_NTILE]; /*  2 KB */
 
     /* ---- stage Q: straight copy of the pre-packed bytes ------------------ */
     {
-        const uint8_t *qsrc = qa  + (uint64_t)token * IDX_HEADS * IDX_HEAD_DIM;
-        const uint8_t *ssrc = qsf + (uint64_t)token * IDX_HEADS * IDX_KSLABS;
-        for (uint32_t i = tid * 4u; i < IDX_HEADS * IDX_HEAD_DIM; i += IDX_THREADS * 4u)
+        const uint32_t abytes = ntok * IDX_HEADS * IDX_HEAD_DIM;
+        const uint32_t sbytes = ntok * IDX_HEADS * IDX_KSLABS;
+        const uint8_t *qsrc = qa  + (uint64_t)tok0 * IDX_HEADS * IDX_HEAD_DIM;
+        const uint8_t *ssrc = qsf + (uint64_t)tok0 * IDX_HEADS * IDX_KSLABS;
+        for (uint32_t i = tid * 4u; i < abytes; i += IDX_THREADS * 4u)
             *(uint32_t *)(sA + i) = *(const uint32_t *)(qsrc + i);
-        for (uint32_t i = tid; i < IDX_HEADS * IDX_KSLABS; i += IDX_THREADS)
+        for (uint32_t i = tid; i < sbytes; i += IDX_THREADS)
             sSFA[i] = ssrc[i];
+        /* a second token that does not exist must contribute nothing */
+        for (uint32_t i = abytes + tid * 4u; i < IDX_TOKTILE * IDX_HEADS * IDX_HEAD_DIM;
+             i += IDX_THREADS * 4u)
+            *(uint32_t *)(sA + i) = 0u;
     }
 
     /* ---- stage K: spread packed nibbles to bits [5:2], rebias scales ----- */
     for (uint32_t slot = tid; slot < IDX_NTILE * 32u; slot += IDX_THREADS) {
         const uint32_t c = slot / 32u;
-        const uint32_t j = slot % 32u;                 /* 32 bytes of 64 per pass */
+        const uint32_t j = slot % 32u;
         const uint32_t comp_i = tile_c + c;
         uint8_t *dst = sB + c * IDX_HEAD_DIM;
         if (comp_i >= n_comp) {
@@ -226,67 +240,76 @@ static void idx_scores_mxfp4_kernel(
         dst[j * 2u + 64u]  = (uint8_t)(((uint32_t)b1 & 0xFu) << 2);
         dst[j * 2u + 65u]  = (uint8_t)(((uint32_t)b1 >> 4) << 2);
         if (j < IDX_KSLABS) {
-            const int s = (int)row[64u + j] - 1;        /* +1 bias, -2 for the 4x */
-            sSFB[c * IDX_KSLABS + j] = (uint8_t)(s < 0 ? 0 : s);
+            const int sfb = (int)row[64u + j] - 1;   /* +1 bias, -2 for the 4x */
+            sSFB[c * IDX_KSLABS + j] = (uint8_t)(sfb < 0 ? 0 : sfb);
         }
     }
     __syncthreads();
 
-    /* ---- GEMM: M=64 heads, N=64 comp, K=128 ----------------------------- */
-    /* warp w owns m-tile w (heads 16w..16w+15) and sweeps all 8 n-tiles. */
-    const uint32_t m_base = warp * 16u;
+    /* ---- GEMM + fused head reduction ------------------------------------ */
+    /* warp w owns m-tile w (heads 16w..16w+15) and sweeps every n-tile. */
+    const uint32_t wtok   = warp / 4u;                 /* which of the 2 tokens */
+    const uint32_t m_local = (warp % 4u) * 16u;         /* head offset within it */
+    const uint32_t m_base  = wtok * IDX_HEADS + m_local;
+    const uint32_t token_w = tok0 + wtok;
+    const float *wrow = weights + (uint64_t)(token_w < n_tokens ? token_w : tok0) * IDX_HEADS;
+    const float wg0 = (wtok < ntok) ? wrow[m_local + g]      : 0.0f;
+    const float wg1 = (wtok < ntok) ? wrow[m_local + g + 8u] : 0.0f;
+
     for (uint32_t nt = 0; nt < IDX_NTILE / 8u; nt++) {
         const uint32_t n_base = nt * 8u;
         float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
         for (uint32_t s = 0; s < IDX_KSLABS; s++) {
             const uint32_t k0 = s * 32u;
-            /* A: rows m_base+g and m_base+g+8; k = tig*4 + {0..3} and +16 */
             const uint8_t *ar0 = sA + (m_base + g)      * IDX_HEAD_DIM + k0 + tig * 4u;
             const uint8_t *ar1 = sA + (m_base + g + 8u) * IDX_HEAD_DIM + k0 + tig * 4u;
             const uint32_t a0 = *(const uint32_t *)ar0;
             const uint32_t a1 = *(const uint32_t *)ar1;
             const uint32_t a2 = *(const uint32_t *)(ar0 + 16u);
             const uint32_t a3 = *(const uint32_t *)(ar1 + 16u);
-            /* B: col n_base+g; k = tig*4 + {0..3} and +16 */
             const uint8_t *br = sB + (n_base + g) * IDX_HEAD_DIM + k0 + tig * 4u;
             const uint32_t b0 = *(const uint32_t *)br;
             const uint32_t b1 = *(const uint32_t *)(br + 16u);
-            /* SFA: row m <- lane 4*(m%8)+(m/8).  Lane t therefore supplies the
-             * scale for row (t&3)==1 ? g+8 : g; lanes with (t&3)>=2 are unused
-             * but must still pass something defined. */
-            const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);
+            const uint32_t m_for_sfa = m_base + ((tig == 1u) ? (g + 8u) : g);   /* row -> lane 4*(m%8)+(m/8) */
             const uint32_t sfa = sSFA[m_for_sfa * IDX_KSLABS + s];
-            /* SFB: col n <- lane 4n, i.e. lane 4g supplies col g. */
             const uint32_t sfb = sSFB[(n_base + g) * IDX_KSLABS + s];
             idx_mma_m16n8k32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb);
         }
 
-        /* C layout: rows g (d0,d1) and g+8 (d2,d3), cols tig*2 + {0,1}. */
-        const uint32_t c0 = n_base + tig * 2u;
-        sS[(m_base + g)      * IDX_NTILE + c0]      = d0;
-        sS[(m_base + g)      * IDX_NTILE + c0 + 1u] = d1;
-        sS[(m_base + g + 8u) * IDX_NTILE + c0]      = d2;
-        sS[(m_base + g + 8u) * IDX_NTILE + c0 + 1u] = d3;
+        /* C layout: rows g (d0,d1) and g+8 (d2,d3), cols n_base + tig*2 + {0,1}.
+         * Apply ReLU and the per-head routing weight to each row here, so what
+         * crosses the shuffle is already the reduced quantity. */
+        float c0 = (d0 > 0.f ? d0 * wg0 : 0.f) + (d2 > 0.f ? d2 * wg1 : 0.f);
+        float c1 = (d1 > 0.f ? d1 * wg0 : 0.f) + (d3 > 0.f ? d3 * wg1 : 0.f);
+        /* Rows within the tile are spread across the 8 g-groups, and lanes of a
+         * group differ only in tig (i.e. in column).  So summing over the tile's
+         * 16 heads is an xor-shuffle over the g bits: lane offsets 4, 8, 16. */
+        #pragma unroll
+        for (int m = 4; m < 32; m <<= 1) {
+            c0 += __shfl_xor_sync(0xffffffffu, c0, m);
+            c1 += __shfl_xor_sync(0xffffffffu, c1, m);
+        }
+        if (g == 0u) {                       /* lanes 0..3 carry tig 0..3 */
+            sPart[warp][n_base + tig * 2u]      = c0;
+            sPart[warp][n_base + tig * 2u + 1u] = c1;
+        }
     }
     __syncthreads();
 
-    /* ---- epilogue: sum_h ReLU(S) * w[t,h], then scale + causal mask ------ */
-    const float *wrow = weights + (uint64_t)token * IDX_HEADS;
-    for (uint32_t c = tid; c < IDX_NTILE; c += IDX_THREADS) {
+    /* ---- combine the warps' head-groups, then scale and mask ------------ */
+    for (uint32_t i = tid; i < IDX_NTILE * ntok; i += IDX_THREADS) {
+        const uint32_t tl = i / IDX_NTILE;              /* 0 or 1 */
+        const uint32_t c  = i % IDX_NTILE;
         const uint32_t comp_i = tile_c + c;
         if (comp_i >= n_comp) continue;
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < IDX_HEADS; h++) {
-            const float v = sS[h * IDX_NTILE + c];
-            if (v > 0.0f) acc += v * wrow[h];
-        }
+        float acc = 0.f;
+        #pragma unroll
+        for (uint32_t w = 0; w < 4u; w++) acc += sPart[tl * 4u + w][c];
         float out = acc * scale;
-        if (causal) {
-            const uint32_t visible = (pos0 + token + 1u) / ratio;
-            if (comp_i >= visible) out = -INFINITY;
-        }
-        scores[(uint64_t)token * n_comp + comp_i] = out;
+        const uint32_t t = tok0 + tl;
+        if (causal && comp_i >= ((pos0 + t + 1u) / ratio)) out = -INFINITY;
+        scores[(uint64_t)t * n_comp + comp_i] = out;
     }
 }
 
@@ -314,7 +337,8 @@ extern "C" int pulsar_gpu_indexer_scores_mxfp4(
     idx_pack_q_kernel<<<(pack_total + 255u) / 256u, 256>>>(qa, qsf, q, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q pack launch")) return 0;
 
-    dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE, n_tokens, 1);
+    dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE,
+              (n_tokens + IDX_TOKTILE - 1u) / IDX_TOKTILE, 1);
     idx_scores_mxfp4_kernel<<<grid, IDX_THREADS>>>(
         scores, qa, qsf, weights, (const uint8_t *)comp,
         n_comp, n_tokens, pos0, ratio, scale, causal);
