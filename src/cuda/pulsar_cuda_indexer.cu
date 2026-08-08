@@ -975,6 +975,40 @@ static int indexer_scores_launch(
                                                          comp_cap, kernel_n_banks);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
+    /* Block-scaled tier (src/cuda/pulsar_cuda_indexer_mxfp4.cu): feeds the
+     * stored MXFP4 rows straight to the SM120 tensor cores instead of
+     * dequantising them to fp16 first.  3.4x the WMMA tier at n_comp=512,
+     * n_tokens=512 on a locked clock.
+     *
+     * OPT-IN, and it stays opt-in until the suite-v1 KL run clears it: this
+     * path quantises Q to E4M3, so it is a fidelity change, not just a faster
+     * route to the same numbers.  tests/idx_quant_fidelity.cc measured the
+     * top-k overlap and backs the choice, but that is a component measurement,
+     * not the shipping gate.
+     *
+     * The shape conditions are checked HERE rather than read off the
+     * launcher's return, so its 0 means a real allocation or launch failure.
+     * Falling through on 0 would turn either into a silent demotion to the
+     * slower kernel -- the same fail-open shape the type-tag dispatches keep
+     * getting bitten by. */
+    static const int use_mxfp4 = getenv("PULSAR_CUDA_INDEXER_MXFP4") != NULL;
+    if (use_mxfp4 && !descr && !g_quality_mode && fp4 &&
+        head_dim == 128u && n_head == 64u) {
+        /* Say so once: this tier changes the numbers, so "did it engage" must
+         * be answerable from a log rather than inferred from a timing delta. */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: indexer scorer = block-scaled MXFP4 tier "
+                            "(PULSAR_CUDA_INDEXER_MXFP4; Q quantised to E4M3)\n");
+        }
+        return pulsar_gpu_indexer_scores_mxfp4(
+                (float *)scores->ptr, (const float *)q->ptr,
+                (const float *)weights->ptr, index_comp->ptr,
+                n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
+                causal ? 1 : 0, fp4);
+    }
+
     /* The WMMA tier stays single-bank (like the reference design): banked
      * multi-token rows are forced onto the generic per-(comp,row) kernel. */
     if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u && !no_wmma) {

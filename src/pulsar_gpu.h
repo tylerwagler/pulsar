@@ -192,6 +192,26 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
+/* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
+ * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
+ * which does the tensor-level bounds checking.  Returns 0 on refusal or
+ * failure; the caller checks the shape conditions itself so a 0 is always a
+ * real failure.  Requires n_head == 64, head_dim == 128 and fp4 rows. */
+int pulsar_gpu_indexer_scores_mxfp4(
+        float                   *scores,
+        const float             *q,
+        const float             *weights,
+        const void              *comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale,
+        int                     causal,
+        int                     fp4);
+
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
         const pulsar_gpu_tensor *scores,
