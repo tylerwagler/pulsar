@@ -172,6 +172,61 @@ __global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const flo
   outp[0]=obp[0]; outp[1]=obp[1];
   tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
 }
+/* Warp-per-4-blocks twin (2026-08-08).  The vec kernel above still gives one
+ * THREAD the whole 32-block, so a lane reads 128 contiguous bytes while its
+ * neighbour starts 128 B away: each of its 8 LDG.128 spans 4 KB across the warp
+ * and lands in 32 separate sectors, and every sector gets requested twice (a
+ * 32 B sector holds two of the thread's consecutive float4).  Measured on a
+ * real prefill: 57344 blocks x 128 threads x 32 elem = 235 M elements, 1.18 GB
+ * moved in 7.72 ms = 154 GB/s against ~273 GB/s of bandwidth.
+ *
+ * Here a WARP owns four consecutive 32-blocks: lane L takes elements 4L..4L+3
+ * as one float4, so the warp's load is 512 B of contiguous memory in a single
+ * coalesced access, and the store is 128 B the same way.  The amax for a block
+ * is then a shuffle across the eight lanes that span it rather than a serial
+ * scan.  (Same restructuring as idx_pack_q_kernel in the indexer scorer, which
+ * this pattern came from.)
+ *
+ * STILL BIT-EXACT to both twins.  fmaxf is associative AND commutative on this
+ * data, so folding the amax by shuffle instead of in index order 0..31 cannot
+ * change it -- unlike a sum, a max reassociates exactly.  NaN does not break
+ * that either: fabsf(NaN) is NaN and fmaxf(x, NaN) returns x, so a NaN is
+ * skipped in any order.  Each element's encode is the same
+ * cutlass::float_e4m3_t(v*inv) on the same float; only the load/store width and
+ * the reduction order change.
+ *
+ * Requires K/32 divisible by 4 (i.e. K a 128-multiple) so a warp's four blocks
+ * never straddle a row; pack_activation checks that and falls back if not. */
+template<class TSFA>
+__global__ void pack_act_e4m3_rowmajor_warp(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
+  const int nblk = K/32;
+  const long total_blk = (long)M*nblk;
+  const int lane = threadIdx.x & 31;
+  const long grp = ((long)blockIdx.x*blockDim.x + threadIdx.x) >> 5;  // group of 4 blocks
+  const long blk0 = grp*4;
+  if (blk0 >= total_blk) return;
+  const int m = (int)(blk0 / nblk), kb0 = (int)(blk0 % nblk);
+
+  const float4 v = reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb0*32)[lane];
+  float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
+  // lanes 8b..8b+7 span block b: xor over the low three lane bits reduces within it
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+
+  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
+  if(se<-127)se=-127; if(se>127)se=127;
+  const float inv=exp2f((float)-se);
+
+  cutlass::float_e4m3_t ob[4];
+  ob[0]=cutlass::float_e4m3_t(v.x*inv); ob[1]=cutlass::float_e4m3_t(v.y*inv);
+  ob[2]=cutlass::float_e4m3_t(v.z*inv); ob[3]=cutlass::float_e4m3_t(v.w*inv);
+  reinterpret_cast<uint32_t*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)
+                              +(size_t)m*K+(size_t)kb0*32)[lane]
+      = *reinterpret_cast<const uint32_t*>(ob);
+  if((lane & 7)==0) tSFA(m, (kb0+(lane>>3))*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
+}
+
 // LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
 __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
@@ -189,12 +244,24 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  /* Vectorized pack is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar twin
-   * (bit-exact) for the A/B. Env read ONCE (init-time static), not per launch. */
-  static int scalar = -1;
-  if (scalar < 0) { const char *e = getenv("PULSAR_ACT_PACK_SCALAR"); scalar = (e && e[0]=='1') ? 1 : 0; }
-  if (scalar) pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
-  else        pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
+  /* Warp-per-4-blocks is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar
+   * twin and =2 the thread-per-block vec twin, both bit-exact, for the A/B.
+   * Env read ONCE (init-time static), not per launch. */
+  static int mode = -1;
+  if (mode < 0) { const char *e = getenv("PULSAR_ACT_PACK_SCALAR");
+                  mode = (e && e[0]=='1') ? 1 : (e && e[0]=='2') ? 2 : 0; }
+  /* The warp kernel gives a warp four consecutive 32-blocks, so they must not
+   * straddle a row.  Fall back rather than mis-index if K is ever not a
+   * 128-multiple (per-expert K is, but this is the only thing guaranteeing it). */
+  const int can_warp = ((K/32) % 4) == 0;
+  if (mode == 1)            pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
+  else if (mode == 2 || !can_warp)
+                            pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
+  else {
+    const long groups = (long)M*(K/32)/4;          /* one warp per group */
+    const long thr = groups*32, bw = (thr+t-1)/t;
+    pack_act_e4m3_rowmajor_warp<<<(unsigned)bw,t>>>(A_data, tSFA, x, M, K);
+  }
 }
 
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
