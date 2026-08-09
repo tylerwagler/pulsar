@@ -214,7 +214,34 @@ all 14).  Re-capture on the work rig force-feeding the frozen token ids
 (capture script change) before trusting any per-doc vs-reference number
 beyond short-00/dsml-tools.
 
-### 2. MoE gate/up: 17.8% in one kernel
+### The 2k decode deficit (2026-08-09): diagnosed, and the cheap fixes are dead
+
+The one cell Entrpi still wins (19.85 vs 18.41 tok/s at 2k) is NOT overhead:
+decode is 97.8% GPU-busy, one ~500us sampling gap per step (<1%).  The step
+is 50.1 ms of kernel time and the slack is concentrated in
+`attention_decode_mixed_heads8_online_kernel`: 7.5 ms/step (15%) from
+grid (1, 8) — EIGHT blocks on a 48-SM chip, each walking all n_score rows.
+Everything else in the step is at or near the 273 GB/s roofline.
+
+Two hypotheses built, measured, and KILLED (kernels were bit-exact, reverted):
+
+- Finer head split (more blocks, fewer heads each): void by inspection —
+  every block still walks the full row list; the serial chain length is
+  unchanged.  Never benched because the code read disproved it.
+- Prefetch pipelining (group g+1's loads into registers during group g's
+  scoring; tried 4-row and 8-row groups): 18.41 -> 18.37 -> 18.31, i.e.
+  noise.  ncu: 1.71 active warps/scheduler, 57% long-scoreboard.  The
+  decisive observation: per-ROW cost is ~287 ns across BOTH group sizes
+  (160x1.17us == 80x2.3us), so the cost scales with rows, not with groups —
+  the chain is per-row (score -> 5-deep shuffle reduction -> broadcast ->
+  online update, plus a load round trip per row with ~2 warps/scheduler and
+  40 idle SMs offering zero interleave).  No staging trick attacks that.
+
+Conclusion: the ONLY fix is fewer rows per block — split-KV (flash-decoding)
+with a softmax merge: e.g. 8 row-splits x 8 head-groups = 64 blocks, chain
+shortens ~8x, est. 7.5 -> ~1.5-2 ms/step => ~+11% decode at 2k (flips the
+cell) and gains at every depth.  This is the same merge machinery the
+flash-style prefill rewrite wants; build it once, spend it twice.
 
     Compute (SM) 58.5%, Memory 48.6%, L2 48.6%
     pipe_lsu 44%, pipe_alu 31%, pipe_tensor 19%, pipe_fma 15%
