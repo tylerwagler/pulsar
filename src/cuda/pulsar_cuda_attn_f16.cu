@@ -495,7 +495,7 @@ static int af16_device_supported(void) {
  * that is actually going to run. */
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     static int on = -1;
-    if (on < 0) on = (getenv("PULSAR_CUDA_ATTN_F16") != NULL) && af16_device_supported();
+    if (on < 0) on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && af16_device_supported();
     return on;
 }
 

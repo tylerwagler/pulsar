@@ -97,6 +97,17 @@ enum {
     ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
      (uint64_t)PULSAR_ATTN_PACK_NROT * 4u)
 
+/* Default-ON env gate for the measured fast tiers.  Suite-v1 KL cleared the
+ * fp16 attention and MXFP4 indexer tiers on 2026-08-08 (exact per-position
+ * KL(off||on) p95 well inside the quant's own divergence-from-reference
+ * budget; docs/engine-perf-map.md, "fidelity ledger"), so presence-means-on
+ * flipped to on-unless-"0".  Setting the variable to "0" opts out; any other
+ * value (or unset) leaves the tier enabled. */
+static inline int pulsar_env_tier_on(const char *name) {
+    const char *v = getenv(name);
+    return !(v && v[0] == '0' && v[1] == '\0');
+}
+
 /* e4m3 byte * scale by pure bit math — bit-identical to
  * pulsar_attn_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
  * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;

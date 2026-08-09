@@ -1928,13 +1928,13 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
          * not the shipping gate.  Shape conditions are checked by the launcher
          * itself, and a 0 return here is a REAL failure, so it is reported
          * rather than silently demoted to the FMA kernel. */
-        static const int use_f16_attn = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
+        static const int use_f16_attn = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
         if (use_f16_attn && head_dim == 512u && (n_head % 16u) == 0u) {
             static int announced = 0;
             if (!announced) {
                 announced = 1;
                 fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(PULSAR_CUDA_ATTN_F16; operands rounded to fp16)\n");
+                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
             }
             if (pulsar_gpu_attention_f16_prefill(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
@@ -2621,13 +2621,13 @@ static int attention_prefill_mixed_launch(
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
-        static const int use_f16_attn_mixed = getenv("PULSAR_CUDA_ATTN_F16") != NULL;
+        static const int use_f16_attn_mixed = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
         if (use_f16_attn_mixed && head_dim == 512u && (n_head % 16u) == 0u) {
             static int announced = 0;
             if (!announced) {
                 announced = 1;
                 fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(PULSAR_CUDA_ATTN_F16; operands rounded to fp16)\n");
+                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
             }
             if (pulsar_gpu_attention_f16_prefill(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,

@@ -991,7 +991,7 @@ static int indexer_scores_launch(
      * Falling through on 0 would turn either into a silent demotion to the
      * slower kernel -- the same fail-open shape the type-tag dispatches keep
      * getting bitten by. */
-    static const int use_mxfp4 = getenv("PULSAR_CUDA_INDEXER_MXFP4") != NULL;
+    static const int use_mxfp4 = pulsar_env_tier_on("PULSAR_CUDA_INDEXER_MXFP4");
     if (use_mxfp4 && !descr && !g_quality_mode && fp4 &&
         head_dim == 128u && n_head == 64u) {
         /* Say so once: this tier changes the numbers, so "did it engage" must
@@ -1000,7 +1000,7 @@ static int indexer_scores_launch(
         if (!announced) {
             announced = 1;
             fprintf(stderr, "pulsar: indexer scorer = block-scaled MXFP4 tier "
-                            "(PULSAR_CUDA_INDEXER_MXFP4; Q quantised to E4M3)\n");
+                            "(default; PULSAR_CUDA_INDEXER_MXFP4=0 opts out; Q quantised to E4M3)\n");
         }
         return pulsar_gpu_indexer_scores_mxfp4(
                 (float *)scores->ptr, (const float *)q->ptr,

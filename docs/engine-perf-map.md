@@ -180,6 +180,40 @@ End-to-end this IS a fidelity change, as designed: same greedy argmax, 9/10
 top-10 overlap, mean |logit delta| 0.32 against a [-47.7, 37.5] range on the
 frontier checked.  Default-on waits for the suite-v1 KL run.
 
+#### Fidelity ledger: suite-v1 KL run (2026-08-08) — CLEARED, defaults flipped
+
+Method note first, because the first attempt measured nothing: the KL harness
+walks the doc token-by-token (decode path), so with the stock 32-token prefix
+a candidate that only changes PREFILL produced bit-identical dumps — a
+vacuous pass.  `--kl-prefix` (added for this run) makes the KV cache be built
+by production-shaped prefill chunks; the walked logits then measure exactly
+what a served request sees.  The dsml-tools doc (141 tokens, prompt below the
+128-token chunk gate) stayed at KL ~1e-26 as the designed control.
+
+Exact full-vocab KL(defaults || fp16+mxfp4), v5mx4-0731-mmqaligned, stride 4:
+
+    depth ~1k (12 shorts, prefix 1024): mean 0.008-0.055, median ~2.4e-2,
+                                        per-position p95 0.03-0.21
+    depth  8k (long-mixed, prefix 8192):  mean 0.029, median 1.7e-2, p95 0.10
+    depth 32k (long-mixed, prefix 32768): mean 0.013, median 3.2e-3, p95 0.06
+
+Divergence SHRINKS with depth — the fp16 softmax error does not compound.
+
+Against the full-fat vLLM reference (the one clean doc, see defect below):
+defaults KL med 0.0011 / p95 0.390 / top-1 97.7%; candidate 0.0013 / 0.382 /
+96.9%.  The quant's own divergence from source dominates; the flags moved
+nothing outside noise.  Verdict: flipped both to default-on
+(`pulsar_env_tier_on`, opt out with =0), closed-loop verified: no-env binary
+reproduces the candidate dumps to 1e-26, =0 binary reproduces the baseline.
+
+KNOWN DEFECT, blocks the wider cross-rig ledger: the ref-DeepSeek-V4-Flash-0731
+capture let vLLM re-tokenize the suite TEXT, and on 12/14 docs it collapsed
+special-looking spans into single ids — the reference model was conditioned on
+a different token stream (pulsar matches the frozen suite tokens exactly on
+all 14).  Re-capture on the work rig force-feeding the frozen token ids
+(capture script change) before trusting any per-doc vs-reference number
+beyond short-00/dsml-tools.
+
 ### 2. MoE gate/up: 17.8% in one kernel
 
     Compute (SM) 58.5%, Memory 48.6%, L2 48.6%
