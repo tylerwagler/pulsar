@@ -699,6 +699,155 @@ void json_escape(buf *b, const char *s);
 
 
 
+/* Length-aware Python-style string spelling for canonicalized tool schemas.
+ * Decoded JSON strings may contain an embedded U+0000, so the ordinary
+ * NUL-terminated json_escape() helper is not safe here.  (Ported from
+ * upstream ds4 3196149.) */
+static void json_prompt_escape_n(buf *b, const char *s, size_t n) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            buf_putc(b, '\\');
+            buf_putc(b, (char)c);
+        } else if (c == '\b') {
+            buf_puts(b, "\\b");
+        } else if (c == '\f') {
+            buf_puts(b, "\\f");
+        } else if (c == '\n') {
+            buf_puts(b, "\\n");
+        } else if (c == '\r') {
+            buf_puts(b, "\\r");
+        } else if (c == '\t') {
+            buf_puts(b, "\\t");
+        } else if (c < 0x20) {
+            buf_printf(b, "\\u%04x", (unsigned)c);
+        } else {
+            buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+/* Render a parsed JSON value in the lexical form used by the official DS4
+ * tokenizer: preserve object insertion order, emit the default Python
+ * separators (", " and ": "), and keep decoded UTF-8 instead of client-
+ * specific \u escapes.  Tool schemas are part of the model prompt, so
+ * forwarding their HTTP spelling verbatim makes semantically identical
+ * requests tokenize differently depending on the caller's JSON serializer —
+ * off the trained distribution for picky clients, and (pulsar-specific) it
+ * fragments warm-bank prefix matching and disk-cache keys across clients
+ * that serialize the same toolset differently. */
+static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+
+    if (**p == '"') {
+        char *s = NULL;
+        size_t n = 0;
+        if (!json_string_n(p, &s, &n)) return false;
+        json_prompt_escape_n(out, s, n);
+        free(s);
+        return true;
+    }
+
+    if (**p == '{') {
+        (*p)++;
+        buf_putc(out, '{');
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            buf_putc(out, '}');
+            return true;
+        }
+        bool first = true;
+        for (;;) {
+            char *key = NULL;
+            size_t key_len = 0;
+            if (!json_string_n(p, &key, &key_len)) return false;
+            if (!first) buf_puts(out, ", ");
+            first = false;
+            json_prompt_escape_n(out, key, key_len);
+            free(key);
+            json_ws(p);
+            if (**p != ':') return false;
+            (*p)++;
+            buf_puts(out, ": ");
+            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            json_ws(p);
+            if (**p == '}') {
+                (*p)++;
+                buf_putc(out, '}');
+                return true;
+            }
+            if (**p != ',') return false;
+            (*p)++;
+        }
+    }
+
+    if (**p == '[') {
+        (*p)++;
+        buf_putc(out, '[');
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            buf_putc(out, ']');
+            return true;
+        }
+        bool first = true;
+        for (;;) {
+            if (!first) buf_puts(out, ", ");
+            first = false;
+            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            json_ws(p);
+            if (**p == ']') {
+                (*p)++;
+                buf_putc(out, ']');
+                return true;
+            }
+            if (**p != ',') return false;
+            (*p)++;
+        }
+    }
+
+    if (json_lit(p, "true")) {
+        buf_puts(out, "true");
+        return true;
+    }
+    if (json_lit(p, "false")) {
+        buf_puts(out, "false");
+        return true;
+    }
+    if (json_lit(p, "null")) {
+        buf_puts(out, "null");
+        return true;
+    }
+
+    /* JSON serializers already agree on ordinary schema numbers.  Preserve
+     * their exact finite lexeme here rather than introducing libc-dependent
+     * binary-float formatting. */
+    const char *start = *p;
+    double value = 0.0;
+    if (!json_number(p, &value) || !isfinite(value)) return false;
+    for (const char *s = start; s < *p; s++) buf_putc(out, *s);
+    return true;
+}
+
+static char *json_prompt_value(const char *json) {
+    const char *p = json;
+    buf out = {0};
+    if (!json_prompt_value_depth(&p, &out, 0)) {
+        buf_free(&out);
+        return NULL;
+    }
+    json_ws(&p);
+    if (*p != '\0') {
+        buf_free(&out);
+        return NULL;
+    }
+    return buf_take(&out);
+}
+
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
     json_ws(&p);
@@ -718,7 +867,13 @@ static char *openai_function_schema_from_tool(const char *raw) {
         if (!strcmp(key, "function")) {
             free(key);
             if (!json_raw_value(&p, &value)) return NULL;
-            return value;
+            /* Canonicalize the schema's JSON spelling; fail OPEN to the
+             * verbatim bytes so a schema the mini-walker cannot round-trip
+             * still reaches the prompt the way it always did. */
+            char *prompt_value = json_prompt_value(value);
+            if (!prompt_value) return value;
+            free(value);
+            return prompt_value;
         }
         free(key);
         if (!json_skip_value(&p)) return NULL;

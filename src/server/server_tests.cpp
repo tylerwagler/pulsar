@@ -53,7 +53,7 @@ static void test_tool_schema_order_from_openai_tools(void) {
     char *schemas = NULL;
     tool_schema_orders orders = {0};
     TEST_ASSERT(parse_tools_value(&p, &schemas, &orders, false, NULL));
-    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"edit\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\": \"edit\""));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "edit");
     TEST_ASSERT(order != NULL);
     TEST_ASSERT(order && order->len == 3);
@@ -62,6 +62,41 @@ static void test_tool_schema_order_from_openai_tools(void) {
     TEST_ASSERT(order && !strcmp(order->prop[2], "newString"));
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+
+
+/* Ported from upstream ds4 3196149: two spellings of the SAME schema —
+ * compact-with-\u-escapes and whitespace-padded-with-raw-UTF-8 — must render
+ * identical canonical prompt bytes (Python separators, decoded UTF-8,
+ * preserved key order), so a client's JSON serializer can no longer change
+ * how the toolset tokenizes (or which warm-bank prefixes it can hit). */
+static void test_openai_tool_schema_json_spelling_is_canonical(void) {
+    const char *compact =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+        "\"description\":\"Run \\u2014 now\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{\"type\":\"string\","
+        "\"description\":\"line\\nrocket \\ud83d\\ude80\"}},"
+        "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
+    const char *spaced =
+        "[ { \"type\" : \"function\", \"function\" : { \"name\" : \"bash\", "
+        "\"description\" : \"Run \xe2\x80\x94 now\", \"parameters\" : { \"type\" : \"object\", "
+        "\"properties\" : { \"command\" : { \"type\" : \"string\", "
+        "\"description\" : \"line\\nrocket \xf0\x9f\x9a\x80\" } }, \"required\" : [ \"command\" ], "
+        "\"additionalProperties\" : false } } } ]";
+    char *a = NULL, *b = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    const char *pa = compact, *pb = spaced;
+    TEST_ASSERT(parse_tools_value(&pa, &a, &oa, false, NULL));
+    TEST_ASSERT(parse_tools_value(&pb, &b, &ob, false, NULL));
+    TEST_ASSERT(a && b && !strcmp(a, b));
+    TEST_ASSERT(strstr(a, "\"name\": \"bash\""));
+    TEST_ASSERT(strstr(a, "rocket \xf0\x9f\x9a\x80"));   /* decoded UTF-8, not \u */
+    TEST_ASSERT(strstr(a, "line\\nrocket"));             /* control escape kept */
+    TEST_ASSERT(!strstr(a, "\\u2014"));                  /* em-dash decoded */
+    free(a); free(b);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
 }
 
 
@@ -5091,6 +5126,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_openai_tool_schema_json_spelling_is_canonical();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();

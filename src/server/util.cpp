@@ -224,7 +224,12 @@ static bool json_u16(const char **p, uint32_t *out) {
 
 
 
-bool json_string(const char **p, char **out) {
+bool json_string_n(const char **p, char **out, size_t *out_len) {
+    /* Null *out up front: callers that reparse in place (`free(x);
+     * json_string(&p, &x)`) must not be left holding a dangling pointer on a
+     * failure path (upstream ds4 3196149's double-free hardening). */
+    *out = NULL;
+    if (out_len) *out_len = 0;
     json_ws(p);
     if (**p != '"') return false;
     (*p)++;
@@ -267,11 +272,16 @@ bool json_string(const char **p, char **out) {
     }
     if (**p != '"') goto fail;
     (*p)++;
+    if (out_len) *out_len = b.len;
     *out = buf_take(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+bool json_string(const char **p, char **out) {
+    return json_string_n(p, out, NULL);
 }
 
 
