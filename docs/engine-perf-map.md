@@ -428,3 +428,37 @@ Two measurement traps cost real time on 2026-08-08, both worth repeating:
    measured 1.376e-4 and 1.178e-4 ms/row on two runs -- a 17% spread across
    differences being resolved at the 5% level, and it picked the wrong winner
    twice.  `sudo nvidia-smi -lgc 2600`, then `-rgc` afterwards.
+
+## TEB comparison + the "quality loss" investigation (2026-08-09)
+
+tool-eval-bench v2.5.1.dev11, 84-scenario hardmode, temp 0, seeds 42/43/44,
+both engines on their own artifacts, same protocol.
+
+Evals: Entrpi 85/85/85 (identical to the category, history-free).  Ours
+86/79/75 on one long-lived server -- NOT nondeterminism and NOT decay.  A
+fresh server reproduces seed 42's 86 exactly; 8 hardmode-only passes across
+seeds x cache states are all identical (P=17/30); an aged server moved
+hardmode P UP (21/30).  Outcomes are deterministic given (request, server
+HISTORY): warm bank forking (route -> FORK-partial, 87% of eval requests)
+resumes thinking checkpoints whose visible context differs from a cold
+build, so borderline agentic trajectories land differently either way.
+Coupling vector confirmed by falsification: disk KV cache OFF changes
+nothing; kernels exonerated (split-KV scratch included).  This is a SERVING
+DESIGN property (thinking-checkpoint reuse), not an engine numerics bug --
+whether evals should pin behavior (exact-match forks only / fork-off flag)
+is a product decision.
+
+The remembered "92 on v0.1.0": not reachable by any current config we
+measured (best cell 86); v0.1.0 = different artifact (pre-type-43), older
+TEB scoring -- treat as incommensurable until someone re-runs that exact
+combination.
+
+Perf (TEB llama-benchy, pp2048/tg128, aggregate tg t/s, his -> ours):
+    d0:    c1 20.2 -> 19.7 | c2 17.1 -> 23.1 | c4 16.0 -> 26.2
+    d4096: c1 16.8 -> 24.7 | c2 11.7 -> 20.7 | c4 10.2 -> 23.9
+    d8192: c1 16.6 -> 24.5 | c2  9.8 -> 17.3 | c4  8.1 -> 17.7
+Opposite concurrency shapes: his falls with c (spec gated off batched),
+ours rises.  His one cell: c1/d0 by 0.5 t/s.  Same-day locked-clock bench
+sweep (his latest b030961, unchanged since Aug 5): we lead decode at every
+depth (+5.4%..+8.7%) and prefill 2k-16k; his 32k prefill edge 1.1% is
+inside his run-to-run variance.
