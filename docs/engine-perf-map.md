@@ -231,6 +231,19 @@ claim is not reproduced here -- different workload, likely spec-on with a
 drafter and possibly shared prefixes -- so treat the 54% as the like-for-like
 result and the README figure as unverified on this box.
 
+### Speculation vs batching: neither fork speculates in a batch
+
+The donor hard-disables speculation whenever batched mode is active
+(ds4_server.c: the decode loop gates on !batched_mode, and boot logs "MTP
+speculative decoding is disabled while native session batching is active") --
+even with one live stream.  Ours keeps speculation for ONE live session
+(spec_max_live=1), which is why single-stream-through-the-server was 24.8 with
+the drafter while the donor's equivalent cannot exceed its plain rate.  Neither
+fork speculates across concurrent sessions; if DSpark's ~+30% single-stream
+gain applied to 4-5 batched sessions it would stack on the 54% aggregate lead.
+The hard part is that a rejected draft desyncs its session from the coalesced
+batch step, which is presumably why both forks stopped at the same line.
+
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 
 - **The startup "gap" against the donor engine was a misread, and our startup
