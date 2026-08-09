@@ -42,6 +42,7 @@ typedef struct {
     const char *kl_ref_dump_path;
     const char *kl_score_path;
     int kl_stride;
+    int kl_prefix;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -818,7 +819,13 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
         }
     }
 
-    const int prefix_len = 32;
+    /* Teacher-forcing walks the decode path token by token, so a 32-token
+     * prefix never exercises the chunked-prefill kernels at all.  --kl-prefix
+     * widens the prefix so the KV cache is BUILT by production-shaped prefill
+     * (>=128-token chunks) and the walked logits then measure exactly what a
+     * served request sees: decode numerics on top of that cache.  The dump
+     * header records the prefix, so --kl-score cross-checks it. */
+    const int prefix_len = cfg->gen.kl_prefix > 0 ? cfg->gen.kl_prefix : 32;
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "pulsar: --kl-file needs more than %d tokens\n", prefix_len);
         pulsar_tokens_free(&tokens);
@@ -1563,6 +1570,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.kl_score_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kl-stride")) {
             c.gen.kl_stride = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kl-prefix")) {
+            c.gen.kl_prefix = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
