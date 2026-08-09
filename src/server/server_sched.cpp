@@ -192,6 +192,7 @@ int server::slot_frontier_pos(const session_slot *sl) const {
 int server::slot_common_prefix(const session_slot *sl,
                                const pulsar_tokens *prompt) const {
     const auto *s = this;
+    if (s->eval_pin) return 0;   /* choke point: no prefix reuse, ever */
     if (!sl || !sl->provisioned) return 0;
     if (s->pool_banks > 0)
         return pulsar_session_bank_common_prefix(s->sess, sl->bank, prompt);
@@ -406,7 +407,18 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             best = sl;
         }
     }
-    if (bound) return bound;
+    if (bound) {
+        /* Same never-silent rule as the fork log below: a thinking-bind hit
+         * routes onto live KV whose retained reasoning EXCEEDS the visible
+         * transcript, so whether it fired must be answerable from the log
+         * (the 2026-08-09 eval-variance hunt could not tell). */
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: route: thinking-bind bank %u visible=%zu "
+                   "prompt=%zu",
+                   bound->bank, bound_visible,
+                   j->req.prompt_text ? strlen(j->req.prompt_text) : 0);
+        return bound;
+    }
     const bool best_clobbers_warm_state =
         best && server_slot_match_is_trivial(best_common,
                                              s->slot_frontier_pos(best),

@@ -1064,6 +1064,13 @@ int main(int argc, char **argv) {
         }
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm-fork routing %s (partial-min %d)",
                    s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
+        const char *ep = getenv("PULSAR_EVAL_PIN");
+        s.eval_pin = ep && ep[0] == '1' && ep[1] == '\0';
+        if (s.eval_pin)
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: EVAL PIN active (PULSAR_EVAL_PIN=1): "
+                       "thinking-bind, warm-fork and prefix continuation OFF; "
+                       "every request cold-prefills (reproducible, slower)");
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;

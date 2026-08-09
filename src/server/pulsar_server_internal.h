@@ -999,6 +999,15 @@ struct server {
      * read once at startup; floored to the ratio-4 align (partial cuts below R
      * reuse nothing). */
     int          warm_partial_min;
+    /* PULSAR_EVAL_PIN=1: history-independent serving for reproducible evals.
+     * Kills every cross-request reuse channel at its choke point — thinking-
+     * bind routing, warm forks, and in-place prefix continuation (common
+     * prefix reported as 0, so every request cold-prefills from position 0).
+     * Same request -> same output regardless of what the server did before.
+     * The 2026-08-09 TEB investigation measured +-10 final points of history
+     * dependence on identical requests at temperature 0; this flag is how an
+     * eval pins behavior WITHOUT changing production defaults. */
+    bool         eval_pin;
     uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
                                          mode (even split of the admitted pool
                                          cost; conservative, demand-paged reality
@@ -1478,6 +1487,7 @@ void buf_free(buf *b);
 void json_ws(const char **p);
 bool json_lit(const char **p, const char *lit);
 bool json_string(const char **p, char **out);
+bool json_string_n(const char **p, char **out, size_t *out_len);
 bool json_number(const char **p, double *out);
 bool json_int(const char **p, int *out);
 bool json_bool(const char **p, bool *out);

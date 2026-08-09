@@ -806,7 +806,12 @@ void server::gen_begin(session_slot *sl) {
         return;
     }
     const int old_pos = pulsar_session_pos(s->sess);
-    const int common = pulsar_session_common_prefix(s->sess, &j->req.prompt);
+    /* EVAL PIN: report no live common prefix, so every request re-prefills
+     * from position 0 regardless of what this bank served before.  The
+     * choke-point twins live in slot_common_prefix (routing) and the live
+     * resolvers below. */
+    const int common = s->eval_pin ? 0
+                     : pulsar_session_common_prefix(s->sess, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
