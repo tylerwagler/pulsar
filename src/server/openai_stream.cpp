@@ -1066,6 +1066,41 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
 
 
 
+/* Generation ended (final) while a streamed tool call is still open: the
+ * client has already received the call header and a prefix of the argument
+ * deltas, so the truncation cannot be reclassified as text (the non-stream
+ * path's try_repair_dsml equivalent).  What CAN be guaranteed is well-formed
+ * wire JSON: flush the un-emitted value bytes, close an open string value,
+ * close the args object.  The argument VALUE stays truncated — exactly what
+ * the repaired non-stream parse of the same bytes yields — and the finish
+ * reason (length) still tells the client the turn was cut. */
+static bool openai_tool_stream_finalize(int fd, const request *r, const char *id,
+                                        openai_tool_stream *ts,
+                                        const char *raw, size_t raw_len) {
+    if (!ts->active) return true;
+    if (ts->state == DSML_TOOL_PARAM_VALUE) {
+        if (raw_len > ts->parse_pos) {
+            bool ok = ts->param_is_string ?
+                openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                              raw_len - ts->parse_pos) :
+                openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos);
+            if (!ok) return false;
+            ts->parse_pos = raw_len;
+        }
+        if (ts->param_is_string &&
+            !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    }
+    if (ts->args_open) {
+        if (!openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
+        ts->args_open = false;
+    }
+    ts->active = false;
+    ts->state = DSML_TOOL_DONE;
+    return true;
+}
+
 static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
@@ -1221,6 +1256,8 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
 
     if (st->mode == OPENAI_STREAM_TOOL) {
         if (!openai_tool_stream_update(fd, s, r, id, &st->tool, raw, raw_len)) return false;
+        if (final && st->tool.active &&
+            !openai_tool_stream_finalize(fd, r, id, &st->tool, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
     }
     return true;

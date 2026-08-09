@@ -757,6 +757,63 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
 
 
+/* A generation cut mid-argument (finish=length) used to leave the streamed
+ * tool call's arguments as UNTERMINATED JSON on the wire: the header and a
+ * string-value prefix had been emitted, then nothing.  The finalize path
+ * (upstream ds4 0ead8a8's problem, solved pulsar-shaped: our non-stream side
+ * already repairs via try_repair_dsml; the stream now closes the open string
+ * and args object so the wire JSON is well-formed and byte-consistent with
+ * that repair).  The value stays visibly truncated; finish_reason=length
+ * still marks the cut. */
+static void test_openai_tool_stream_truncated_call_closes_args(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = PULSAR_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    buf raw = {0};
+    buf_puts(&raw, "<think>go</think>Running.\n\n" PULSAR_TOOL_CALLS_START "\n");
+    buf_puts(&raw, PULSAR_INVOKE_START " name=\"bash\">\n");
+    buf_puts(&raw, PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la /tmp/prof");
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
+                                         raw.ptr, raw.len, false));
+    /* generation ends here: no </parameter>, no </invoke>, no closing tag */
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
+                                       raw.ptr, raw.len, NULL,
+                                       "length", 10, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    /* the args stream must END well-formed: a closing quote fragment and a
+     * closing brace fragment after the value prefix */
+    const char *val = strstr(out, "ls -la /tmp/prof");
+    const char *closequote = val ? strstr(val, "\"arguments\":\"\\\"\"") : NULL;
+    const char *closebrace = closequote ? strstr(closequote, "\"arguments\":\"}\"") : NULL;
+    TEST_ASSERT(val != NULL);
+    TEST_ASSERT(closequote != NULL);
+    TEST_ASSERT(closebrace != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"length\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    buf_free(&raw);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
 static void test_openai_stream_usage_reports_cache_details(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -5145,6 +5202,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_tool_stream_truncated_call_closes_args();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();

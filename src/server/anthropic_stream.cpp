@@ -508,6 +508,42 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
 
 
 
+/* Twin of openai_tool_stream_finalize: generation ended mid-call, the client
+ * already holds the tool_use block header and a prefix of input_json_delta,
+ * so make the wire JSON well-formed (flush value bytes, close the string,
+ * close the args object, stop the content block).  The value stays truncated
+ * -- matching the repaired non-stream parse -- and stop_reason still marks
+ * the turn as cut. */
+static bool anthropic_tool_stream_finalize(int fd, const char *id,
+                                           anthropic_stream *st,
+                                           const char *raw, size_t raw_len) {
+    anthropic_tool_stream *ts = &st->tool;
+    if (!ts->active) return true;
+    if (ts->state == DSML_TOOL_PARAM_VALUE) {
+        if (raw_len > ts->parse_pos) {
+            bool ok = ts->param_is_string ?
+                anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                                 raw_len - ts->parse_pos) :
+                anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
+                                                  raw_len - ts->parse_pos);
+            if (!ok) return false;
+            ts->parse_pos = raw_len;
+        }
+        if (ts->param_is_string &&
+            !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    }
+    if (ts->args_open) {
+        if (!anthropic_tool_emit_args_fragment(fd, st, "}", 1)) return false;
+        ts->args_open = false;
+        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+        ts->index++;
+    }
+    ts->active = false;
+    ts->state = DSML_TOOL_DONE;
+    return true;
+}
+
 static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
                                          anthropic_stream *st,
                                          const char *raw, size_t raw_len) {
@@ -723,6 +759,8 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
 
     if (st->mode == ANTH_STREAM_TOOL) {
         if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (final && st->tool.active &&
+            !anthropic_tool_stream_finalize(fd, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
