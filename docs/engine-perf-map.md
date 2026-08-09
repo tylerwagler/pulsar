@@ -203,6 +203,34 @@ billed cleanly to the tier; the estimate above excludes it.  Confirming this
 properly needs a model requantized to emit type 43 for those layers, which is a
 PrismaQuant change, not a kernel change.
 
+## Concurrency (measured 2026-08-08, servers, ctx 8192)
+
+Same client load against both servers, one at a time: N concurrent chats with
+DISTINCT prompts (so warm-reuse cannot serve one request from another), 200
+greedy tokens each, aggregate = total completion tokens / wall.  Ours ran 5
+auto-sized banks; the donor ran with --batched-session 12, its best case.
+
+  N     ours plain   ours +DSpark   donor plain (12 sessions)
+   1       19.1          24.8            14.9
+   4       29.7          30.4            19.4
+   8        --           30.1            19.4
+  12       29.9          30.1            19.4
+
+Ours leads aggregate serving throughput by ~54% at every batch level.  BOTH
+engines saturate at N=4 and are flat to N=12 -- extra resident sessions buy
+nothing on this load.  Speculation moves only the single-stream number
+(spec_max_live=1), not the batch.
+
+Two honesty notes.  First, the initial run of ours was accidentally spec-ON --
+the v5mx4 gguf EMBEDS a DSpark drafter, so "no drafter found (gguf/dspark.gguf)"
+does not mean plain; the later "DSpark drafter found in model" line does.
+--no-dspark is required for a plain run, and the plain rerun changed N=1 from
+24.8 to 19.1 while leaving the batch numbers alone.  Second, the donor README
+claims 59 tok/s at 12 concurrent; on this load profile it measured 19.4.  The
+claim is not reproduced here -- different workload, likely spec-on with a
+drafter and possibly shared prefixes -- so treat the 54% as the like-for-like
+result and the README figure as unverified on this box.
+
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 
 - **The startup "gap" against the donor engine was a misread, and our startup
