@@ -1597,6 +1597,37 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         }
     }
 
+    /* GB10-class coherent memory: the GPU walks the HOST page tables, so the
+     * mmap is already addressable from the device.  Registration is then not
+     * merely unnecessary -- it FAILS ("operation not supported") on a
+     * file-backed mapping, and the fallback stages the whole model into a
+     * device cache.  Measured here: 75.88 GiB copied in 17.25s at startup,
+     * against the donor engine's 8.20 GiB in 1.70s -- the same ~4.5 GiB/s, 9x
+     * less data.  On unified memory that copy also DUPLICATES the model, which
+     * is why MemAvailable landed at 11.3 GiB on a 128 GB machine.
+     *
+     * Verified on this device: cudaDevAttrPageableMemoryAccess = 1,
+     * cudaDevAttrPageableMemoryAccessUsesHostPageTables = 1, and
+     * cudaHostGetDevicePointer on an UNREGISTERED pointer succeeds with
+     * device == host.  Gate on the ATTRIBUTES, not the arch, so a part without
+     * ATS still takes the registration path.
+     * PULSAR_CUDA_NO_ATS_MODEL_MAP=1 forces the old behaviour for an A/B. */
+    {
+        int dev_id = 0, pageable = 0, ptables = 0;
+        static const int no_ats = getenv("PULSAR_CUDA_NO_ATS_MODEL_MAP") != NULL;
+        if (!no_ats && cudaGetDevice(&dev_id) == cudaSuccess &&
+            cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, dev_id) == cudaSuccess &&
+            cudaDeviceGetAttribute(&ptables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev_id) == cudaSuccess &&
+            pageable && ptables) {
+            g_model_device_base = (const char *)model_map;
+            g_model_registered = 0;      /* nothing to unregister on teardown */
+            fprintf(stderr, "pulsar: CUDA coherent host memory (ATS): model mapping "
+                            "%.2f GiB addressable in place, no staging copy\n",
+                    (double)model_size / 1073741824.0);
+            return 1;
+        }
+    }
+
     unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
     if (getenv("PULSAR_CUDA_HOST_REGISTER_PLAIN") != NULL) {
         flags = cudaHostRegisterMapped;
