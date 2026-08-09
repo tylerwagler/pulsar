@@ -462,3 +462,16 @@ ours rises.  His one cell: c1/d0 by 0.5 t/s.  Same-day locked-clock bench
 sweep (his latest b030961, unchanged since Aug 5): we lead decode at every
 depth (+5.4%..+8.7%) and prefill 2k-16k; his 32k prefill edge 1.1% is
 inside his run-to-run variance.
+
+### TEB after the upstream lifts (2026-08-09, pinned, seed 42): 84 -> 85
+
+Schema canonicalization + truncated-DSML recovery, confirmed by a full
+pinned rerun with per-scenario diffing against the pinned baseline:
+Structured Output 10->12/12 (both heavy-nested-schema scenarios convert,
+canonicalization), Hard Mode 15->17/30 (TC-71 fail->pass, recovery), and
+two borderline givebacks (Safety 21->20, Planning 5->4 -- canonicalized
+prompt bytes move borderline trajectories in both directions).  Net 84->85:
+dead even with Entrpi's 85 on identical protocol, with reproducibility his
+config already had and two thinking tiers his fork does not expose.  The
+3-scenario retry projected 86-87; the full run's givebacks are the honest
+correction.
