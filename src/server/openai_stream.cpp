@@ -889,16 +889,15 @@ static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t 
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                size_t raw_len, const char *param_end,
                                                bool is_string) {
-    size_t limit = raw_len;
-    size_t end_len = strlen(param_end);
-    size_t scan = raw_len > start + end_len ? raw_len - end_len : start;
-    for (size_t i = raw_len; i > scan; i--) {
-        if (raw[i - 1] != '<') continue;
-        size_t marker = i - 1;
-        size_t tail = raw_len - marker;
-        if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
-        break;
-    }
+    /* Hold a trailing partial closing tag of ANY DSML style, not only the
+     * active one: the model sometimes mixes styles (opens short, closes
+     * long), and a mismatched partial close streamed as value bytes is tag
+     * debris in the argument (seen live: a truncated call carrying
+     * "</｜DSML｜" inside command).  A held tail self-resolves on the next
+     * update: either the prefix breaks (real value text, released) or the
+     * tag completes (parsed or trimmed at finalize). */
+    (void)param_end;
+    size_t limit = trim_truncated_dsml_close_tail(raw, start, raw_len);
     if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
     return utf8_stream_safe_len(raw, start, limit, false);
 }
@@ -1079,14 +1078,22 @@ static bool openai_tool_stream_finalize(int fd, const request *r, const char *id
                                         const char *raw, size_t raw_len) {
     if (!ts->active) return true;
     if (ts->state == DSML_TOOL_PARAM_VALUE) {
-        if (raw_len > ts->parse_pos) {
+        /* Flush only up to the stream-safe limit: the held-back tail is a
+         * partial closing tag (the model was mid-"</...parameter>") or a
+         * split UTF-8 sequence -- tag debris and mojibake, never value
+         * content.  Dropping it beats the non-stream repair here, which
+         * keeps the fragment in the value. */
+        size_t limit = tool_param_value_stream_safe_len(
+                raw, ts->parse_pos, raw_len, ts->param_end, ts->param_is_string);
+        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
+        if (limit > ts->parse_pos) {
             bool ok = ts->param_is_string ?
                 openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                              raw_len - ts->parse_pos) :
+                                              limit - ts->parse_pos) :
                 openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                               raw_len - ts->parse_pos);
+                                               limit - ts->parse_pos);
             if (!ok) return false;
-            ts->parse_pos = raw_len;
+            ts->parse_pos = limit;
         }
         if (ts->param_is_string &&
             !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;

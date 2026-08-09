@@ -235,6 +235,38 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 }
 
 
+/* Trim a TRAILING partial DSML closing tag of ANY style from [start, len).
+ * A truncated generation can end mid-closing-tag, and the model sometimes
+ * mixes styles (opens short "<DSML|...>", closes long "</|DSML|...>"), so
+ * the active-style hold in the streamers cannot recognize the tail.  Any
+ * suffix beginning at a '<' that is a prefix of ANY known closing form is
+ * tag debris, never value content.  Returns len unchanged when the tail is
+ * not tag-shaped. */
+size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len) {
+    static const char *ends[] = {
+        PULSAR_PARAM_END, PULSAR_INVOKE_END, PULSAR_TOOL_CALLS_END,
+        PULSAR_PARAM_END_SHORT, PULSAR_INVOKE_END_SHORT, PULSAR_TOOL_CALLS_END_SHORT,
+        "</parameter>", "</invoke>", "</tool_calls>",
+    };
+    size_t max_tag = 0;
+    for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
+        const size_t l = strlen(ends[i]);
+        if (l > max_tag) max_tag = l;
+    }
+    const size_t scan = len - start > max_tag ? len - max_tag : start;
+    for (size_t i = len; i > scan; i--) {
+        if (raw[i - 1] != '<') continue;
+        const size_t marker = i - 1;
+        const size_t tail = len - marker;
+        for (size_t e = 0; e < sizeof(ends) / sizeof(ends[0]); e++) {
+            if (tail < strlen(ends[e]) && !memcmp(raw + marker, ends[e], tail))
+                return marker;
+        }
+        break;
+    }
+    return len;
+}
+
 const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
@@ -729,8 +761,14 @@ bool try_repair_dsml(const char *s, size_t len, buf *out) {
          * unsigned differences below cannot wrap and append a huge suffix. */
         return false;
     }
-    /* Repair: copy original text and append missing closing tags in reverse order */
-    buf_puts(out, s);
+    /* Repair: copy original text and append missing closing tags in reverse
+     * order.  First TRIM a trailing partial closing tag: the model was cut
+     * mid-"</...>", and appending a fresh close after the fragment would bake
+     * tag debris into the parsed parameter VALUE (seen live: a truncated bash
+     * call carrying "</｜DSML｜" inside command).  The fragment counts no tag
+     * above, so the appended deficit is unchanged by the trim. */
+    size_t keep = trim_truncated_dsml_close_tail(s, (size_t)(scan_start - s), len);
+    buf_append(out, s, keep);
     for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
     for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
     for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);

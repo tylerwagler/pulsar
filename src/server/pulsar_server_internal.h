@@ -1488,6 +1488,7 @@ void json_ws(const char **p);
 bool json_lit(const char **p, const char *lit);
 bool json_string(const char **p, char **out);
 bool json_string_n(const char **p, char **out, size_t *out_len);
+size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len);
 bool json_number(const char **p, double *out);
 bool json_int(const char **p, int *out);
 bool json_bool(const char **p, bool *out);

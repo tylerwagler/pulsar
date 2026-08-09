@@ -520,14 +520,20 @@ static bool anthropic_tool_stream_finalize(int fd, const char *id,
     anthropic_tool_stream *ts = &st->tool;
     if (!ts->active) return true;
     if (ts->state == DSML_TOOL_PARAM_VALUE) {
-        if (raw_len > ts->parse_pos) {
+        /* See openai_tool_stream_finalize: the held tail is tag debris or a
+         * split UTF-8 sequence, never value content -- trim, don't flush. */
+        size_t limit = tool_param_value_stream_safe_len(
+                raw, ts->parse_pos, raw_len, ts->syn->param_end,
+                ts->param_is_string);
+        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
+        if (limit > ts->parse_pos) {
             bool ok = ts->param_is_string ?
                 anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                                 raw_len - ts->parse_pos) :
+                                                 limit - ts->parse_pos) :
                 anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                                  raw_len - ts->parse_pos);
+                                                  limit - ts->parse_pos);
             if (!ok) return false;
-            ts->parse_pos = raw_len;
+            ts->parse_pos = limit;
         }
         if (ts->param_is_string &&
             !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;

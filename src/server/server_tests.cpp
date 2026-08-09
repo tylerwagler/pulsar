@@ -757,6 +757,26 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
 
 
+/* A truncated generation often ends MID-closing-tag.  Repair used to append
+ * fresh closing tags after the fragment, baking "</｜DSML｜"-style debris into
+ * the parsed parameter value (and into the streamed args, since the final
+ * flush parses repaired text).  The repair must trim the partial tag first. */
+static void test_repair_dsml_trims_partial_closing_tag(void) {
+    buf fixed = {0};
+    buf in = {0};
+    buf_puts(&in, "<think>go</think>" PULSAR_TOOL_CALLS_START "\n");
+    buf_puts(&in, PULSAR_INVOKE_START " name=\"bash\">\n");
+    buf_puts(&in, PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -l /var/log</｜DSML｜");
+    TEST_ASSERT(try_repair_dsml(in.ptr, in.len, &fixed));
+    TEST_ASSERT(fixed.ptr != NULL);
+    /* value ends at the real content; the partial tag is gone and exactly one
+     * full closing sequence follows */
+    TEST_ASSERT(strstr(fixed.ptr, "/var/log" PULSAR_PARAM_END) != NULL);
+    TEST_ASSERT(strstr(fixed.ptr, "</｜DSML｜" PULSAR_PARAM_END) == NULL);
+    buf_free(&in);
+    buf_free(&fixed);
+}
+
 /* A generation cut mid-argument (finish=length) used to leave the streamed
  * tool call's arguments as UNTERMINATED JSON on the wire: the header and a
  * string-value prefix had been emitted, then nothing.  The finalize path
@@ -5203,6 +5223,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_tool_stream_truncated_call_closes_args();
+    test_repair_dsml_trims_partial_closing_tag();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
