@@ -205,6 +205,27 @@ PrismaQuant change, not a kernel change.
 
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 
+- **The startup "gap" against the donor engine was a misread, and our startup
+  is FASTER.**  His boot log's "8.20 GiB in 1.70s" line is only the dense-span
+  prep; a tail-windowed read missed the 20.9s his engine spends REBUILDING
+  78.71 GiB of aligned SoA expert artifacts on 6 CPU threads at every process
+  start.  Totals on the same box, same day: ours ~17s of model prep (21.4s
+  wall including the bench), his ~24s (29.6s wall).  The mmqaligned GGUF is
+  the reason -- it bakes the SoA layout at quantize time, so load is a plain
+  16s copy instead of a repack.  Bake-at-quantize was the right design.
+- **Every alternative to the startup staging copy measured WORSE on GB10:**
+    staging copy (shipped)     ~17s prep   956/854 tok/s
+    cudaMemPrefetch migration   66s prep   916/841   (driver faults every page
+                                                      on the calling thread)
+    madvise + ATS direct map    ~0s prep   102/623   (GPU first-touch ATS
+                                                      faults land in prefill,
+                                                      and recur every process)
+  cudaHostRegister on the 86 GiB mapping returns "operation not supported" for
+  BOTH MAP_SHARED and MAP_PRIVATE file-backed mappings on this driver, so the
+  registration route is closed regardless of mmap flags.  The GPU-visible copy
+  has to be made once somewhere; the staging copy makes it at 4.4 GiB/s up
+  front, which is the cheapest of the three places to pay it.
+
 - **Double-buffering the fp16 attention KV tile buys nothing.**  Implemented,
   measured, REVERTED.  ncu said the kernel is latency-bound (IPC 0.15-0.19 of
   1.0, no pipe above 27%, 33% occupancy), so overlapping the staging looked
