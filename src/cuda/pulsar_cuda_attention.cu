@@ -2186,6 +2186,35 @@ static int attention_decode_batch_launch(
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
+         * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
+         * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
+         * fp16 decomposition applies.  True decode (n_tokens == 1) never
+         * reaches this branch and stays on the f32 kernel.  Refused rather
+         * than approximated: comp-mask, non-causal, and FP8 comp rows.  A 0
+         * from the launcher is a real failure and is reported, not demoted. */
+        if (pulsar_gpu_attention_prefill_reads_packed_comp() &&
+            !non_causal && !comp_kv_fp8 && (n_head % 32u) == 0u) {
+            static int announced_dc = 0;
+            if (!announced_dc) {
+                announced_dc = 1;
+                fprintf(stderr, "pulsar: continued-prefill attention = fp16 tensor-core tier\n");
+            }
+            if (pulsar_gpu_attention_f16_indexed(
+                    (float *)heads->ptr, sinks, (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    NULL /* no topk: visible-prefix sweep */,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                    0u, window, ratio, n_head, head_dim, (int)raw_f16,
+                    (const int *)positions_ptr, (const int *)seq_id_ptr,
+                    comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
+                    (int)comp_kv_pack))
+                return 1;
+            fprintf(stderr, "pulsar: fp16 continued-prefill attention FAILED; "
+                            "refusing to fall through\n");
+            return 0;
+        }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,

@@ -79,7 +79,12 @@ int main(int argc, char **argv) {
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
     const int bench_only = (argc > 4 && argv[4][0] == 'b');
-    const int indexed = (top_k != 0u);
+    /* top_k > 0: indexed selection.  top_k == 0 with raw_cap set: the
+     * DECODE-BATCH shape -- ring raw rows plus a visible-prefix comp sweep
+     * with NO topk table.  At pos0=0 and raw_cap >= n_tokens the ring
+     * collapses to the dense window, so the dense oracle is the reference. */
+    const int indexed = (top_k != 0u) || (raw_cap != 0u);
+    const int use_topk = (top_k != 0u);
     const uint32_t rcap = raw_cap ? raw_cap : n_tokens;
     const uint32_t n_raw = indexed ? (n_tokens < rcap ? n_tokens : rcap) : 0u;
     const uint32_t pos0 = 0u;
@@ -114,7 +119,7 @@ int main(int argc, char **argv) {
             }
             cnt = rc;
             if (ratio) { vis = (qpos + 1u) / ratio; if (vis > n_comp) vis = n_comp; }
-            ccnt = top_k < vis ? top_k : vis;
+            ccnt = use_topk ? (top_k < vis ? top_k : vis) : vis;
         } else {
             cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
             start = t + 1u - cnt;
@@ -127,7 +132,7 @@ int main(int argc, char **argv) {
                 return &kv[(size_t)rr * D];
             }
             uint32_t ci = r - cnt;
-            if (indexed) {
+            if (indexed && use_topk) {
                 /* clamp against VISIBLE comp, matching the f32 kernel */
                 const int32_t c = tk[(size_t)t * top_k + ci];
                 ci = (c >= 0 && (uint32_t)c < vis) ? (uint32_t)c : 0u;
@@ -171,15 +176,15 @@ int main(int argc, char **argv) {
     cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
 
     int32_t *dtk = NULL;
-    if (indexed) {
+    if (use_topk) {
         cudaMalloc(&dtk, tk.size() * 4);
         cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
     }
     const int rc = indexed
-        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, dtk,
+        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D, 0,
-                                           NULL, NULL, NULL, 0u, 1u)
+                                           NULL, NULL, NULL, 0u, 1u, 0)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
                                            n_comp ? dckv : NULL,
                                            n_tokens, n_comp, window, ratio,

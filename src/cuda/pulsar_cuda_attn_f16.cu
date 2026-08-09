@@ -133,13 +133,15 @@ static void attn_f16_kernel(
         uint32_t top_k,
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
+        uint32_t comp_cap, uint32_t n_banks, int comp_pack,
+        int ring) {                       /* ring/descriptor row plan; topk may
+                                           * be NULL -> visible comp prefix */
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
-    (void)comp_pack;
+    (void)comp_pack; (void)ring;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -177,7 +179,7 @@ static void attn_f16_kernel(
     uint32_t raw_count, raw_start = 0u, comp_count = 0u;
     uint32_t comp_base = 0u;
     const float *comp_src = comp_kv;
-    if (topk) {
+    if (ring) {
         /* Descriptor (banked) preamble, byte-for-byte as the f32 kernel derives
          * it; NULL descriptors collapse to the scalar pos0+t path. */
         const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
@@ -220,7 +222,9 @@ static void attn_f16_kernel(
             visible_comp = (qpos + 1u) / ratio;
             if (visible_comp > n_comp) visible_comp = n_comp;
         }
-        comp_count = top_k < visible_comp ? top_k : visible_comp;
+        /* No topk table means this launcher sweeps the visible prefix (the
+         * decode-batch path); with a table, top_k caps the selection. */
+        comp_count = topk ? (top_k < visible_comp ? top_k : visible_comp) : visible_comp;
         sVisComp = visible_comp;
         __syncthreads();
     } else {
@@ -295,7 +299,7 @@ static void attn_f16_kernel(
             if (r < nr) {
                 const uint32_t sr = row0 + r;
                 if (sr < raw_count) {
-                    const uint32_t rr = topk ? sRawRows[sr] : (raw_start + sr);
+                    const uint32_t rr = ring ? sRawRows[sr] : (raw_start + sr);
                     const uint64_t b = (uint64_t)rr * AF16_DIM + d4;
                     if (raw_f16) {
                         const __half *h = (const __half *)raw_kv + b;
@@ -512,7 +516,7 @@ int pulsar_gpu_attention_f16_prefill(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, 0);
+                                            NULL, NULL, NULL, 0u, 1u, 0, 0);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -529,13 +533,17 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
-    if (!heads || !sinks || !q || !raw_kv || !comp_kv || !topk) return 0;
+    /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
+     * visible comp prefix rather than a selection. */
+    if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
+    if (n_comp != 0u && !comp_kv) return 0;
     /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
     if ((positions != NULL) != (seq_id != NULL)) return 0;
     if (positions && (n_banks == 0u || comp_cap == 0u)) return 0;
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
-    if (n_tokens == 0u || raw_cap == 0u || top_k == 0u) return 0;
+    if (n_tokens == 0u || raw_cap == 0u) return 0;
+    if (topk && top_k == 0u) return 0;      /* a table with no budget is a bug */
     /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
      * is what sRawRows[256] must hold.  The kernel caps that at 256 exactly as
      * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
@@ -550,6 +558,6 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u, comp_pack);
+                                            positions ? n_banks : 1u, comp_pack, 1);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }
