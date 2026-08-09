@@ -242,7 +242,10 @@ the drafter while the donor's equivalent cannot exceed its plain rate.  Neither
 fork speculates across concurrent sessions; if DSpark's ~+30% single-stream
 gain applied to 4-5 batched sessions it would stack on the 54% aggregate lead.
 The hard part is that a rejected draft desyncs its session from the coalesced
-batch step, which is presumably why both forks stopped at the same line.
+batch step.  For OUR fork that limit is a confirmed deliberate decision
+(2026-08-08), not an oversight -- spec_max_live=1 is where it was intentionally
+stopped.  Treat lifting it as a design proposal to bring to Tyler, not a bug
+fix.
 
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 
