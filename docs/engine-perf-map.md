@@ -243,6 +243,34 @@ shortens ~8x, est. 7.5 -> ~1.5-2 ms/step => ~+11% decode at 2k (flips the
 cell) and gains at every depth.  This is the same merge machinery the
 flash-style prefill rewrite wants; build it once, spend it twice.
 
+#### SHIPPED (2026-08-09): split-KV decode, default-on
+
+One kernel, two modes: gridDim.z > 1 makes each z-block walk its slice and
+emit (m, l, o) partials to static device scratch (graph-safe, 16.8 MiB);
+`attention_decode_split_merge_kernel` folds them log-sum-exp style and
+applies the sink once.  gridDim.z == 1 is bit-identical to the old walk and
+still serves n_tokens > 8.  All three heads8 sites route through one
+dispatcher; PULSAR_CUDA_DECODE_SPLITKV=0 opts out (bit-identical restore,
+verified 1e-26).  PULSAR_SPLITKV_DEBUG=1 A/Bs both walks per call.
+
+Measured, locked clocks, v5mx4-mmqaligned (baseline -> split):
+    2k  18.41 -> 20.72  (+12.5%, flips the last Entrpi-winning cell: 19.85)
+    4k  17.48 -> 17.80   8k 17.22 -> 17.52   16k 17.02 -> 17.48
+Past 2k the indexed carve-out serves the ratio-4 layers, so heads8's share
+(and the win) shrinks — expected.
+
+Fidelity: reassociation class, NOT bit-exact.  Unit gate
+(tests/attn_decode_split_test.cu): split+merge vs single-walk across all
+staging branches and descriptor modes, worst 1.1e-6 rel L2.  Engine KL
+(cache-compounded teacher forcing): 2.9e-3..4.6e-2 by doc — same class as
+the two PREVIOUSLY ACCEPTED reassociations (fp16 tier 0.008..0.055; the
+heads8 carve-out itself scores 1.86e-2 on the same lens).  Vs full-fat
+reference (clean doc): KL med 0.0016 / p95 0.388 / top-1 96.9% — noise
+against defaults (0.0011 / 0.390 / 97.7%).  Spec verify batches ride the
+split path; spec-on greedy text is identical split-on vs split-off (the
+"need/should" near-tie flip between spec modes is pre-existing batched-GEMM
+numerics, confirmed by control).
+
     Compute (SM) 58.5%, Memory 48.6%, L2 48.6%
     pipe_lsu 44%, pipe_alu 31%, pipe_tensor 19%, pipe_fma 15%
 

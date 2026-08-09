@@ -1472,7 +1472,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const int32_t * __restrict__ seq_id,
         const void * const * __restrict__ comp_bank_ptrs,
         uint32_t comp_cap,
-        uint32_t n_banks) {
+        uint32_t n_banks,
+        float * __restrict__ part_o,
+        float * __restrict__ part_ml) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1480,12 +1482,37 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
+    /* Split-KV mode (gridDim.z > 1): each z-block walks only its slice of the
+     * row list and emits UNNORMALIZED partials (m, l, o) for a separate merge
+     * kernel; the sink joins at merge time, once per head.  gridDim.z == 1
+     * (part_o/part_ml NULL) is the classic single-walk kernel, bit-identical
+     * to before this parameter existed: the slice below degenerates to
+     * [0, n_score) and the epilogue takes the old path. */
+    const uint32_t n_split = gridDim.z;
+    const uint32_t split = blockIdx.z;
     if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
         /* Dead/evicted row: see attention_decode_mixed_kernel.  All threads
-         * return together (no __syncthreads has run yet). */
+         * return together (no __syncthreads has run yet).  In split mode the
+         * merge kernel reads every partial slot, so a dead row must write
+         * m=-inf/l=0/o=0 partials rather than leave stale scratch: the merge
+         * then yields exactly 0, matching the direct zeroing below. */
         if (valid_head) {
-            float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
-            for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+            if (n_split > 1u) {
+                const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split + split;
+                float4 *po = (float4 *)(part_o + pbase * head_dim);
+                const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                po[lane +  0u] = z4;
+                po[lane + 32u] = z4;
+                po[lane + 64u] = z4;
+                po[lane + 96u] = z4;
+                if (lane == 0) {
+                    part_ml[pbase * 2u + 0u] = -INFINITY;
+                    part_ml[pbase * 2u + 1u] = 0.0f;
+                }
+            } else {
+                float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
+                for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+            }
         }
         return;
     }
@@ -1569,6 +1596,13 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __syncthreads();
 
     const uint32_t n_score = raw_count + comp_count;
+    /* This block's row slice: ceil-divided so the last split absorbs the
+     * remainder; an empty slice ([lo >= n_score)) skips the walk and emits
+     * the m=-inf/l=0 identity partial.  n_split==1 => [0, n_score). */
+    const uint32_t rows_per_split = (n_score + n_split - 1u) / n_split;
+    const uint32_t row_lo = split * rows_per_split;
+    uint32_t row_hi = row_lo + rows_per_split;
+    if (row_hi > n_score) row_hi = n_score;
     const float scale = rsqrtf((float)head_dim);
     const uint32_t comp_row_bytes = comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
     const float4 *q4 = valid_head
@@ -1588,8 +1622,8 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+    for (uint32_t row0 = row_lo; row0 < row_hi; row0 += 4u) {
+        const uint32_t nr = row_hi - row0 < 4u ? row_hi - row0 : 4u;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
@@ -1675,6 +1709,23 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         __syncthreads();
     }
 
+    if (valid_head && n_split > 1u) {
+        /* Split mode: emit the raw online-softmax state for the merge kernel.
+         * o is the UNNORMALIZED sum exp(s - m)*v over this slice; the sink
+         * joins at merge, once per head.  An empty slice emits the identity
+         * (m=-inf, l=0, o=0). */
+        const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split + split;
+        float4 *po = (float4 *)(part_o + pbase * head_dim);
+        po[lane +  0u] = o0;
+        po[lane + 32u] = o1;
+        po[lane + 64u] = o2;
+        po[lane + 96u] = o3;
+        if (lane == 0) {
+            part_ml[pbase * 2u + 0u] = max_s;
+            part_ml[pbase * 2u + 1u] = sum_s;
+        }
+        return;
+    }
     if (valid_head) {
         const float sink = sinks[head];
         const float new_m = fmaxf(max_s, sink);
@@ -1698,6 +1749,198 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+/* Softmax merge for the split-KV decode walk: combines the per-slice
+ * online-softmax partials (m_i, l_i, o_i) of one (token, head) with the
+ * standard log-sum-exp reassociation and applies the sink term exactly once:
+ *
+ *   m*  = max(max_i m_i, sink)
+ *   l*  = sum_i l_i*exp(m_i - m*) + exp(sink - m*)
+ *   out = sum_i o_i*exp(m_i - m*) / l*
+ *
+ * Empty or dead slices carry (m=-inf, l=0, o=0) and vanish: exp(-inf - m*)
+ * is 0 because m* >= sink is finite.  A dead row (every slice the identity)
+ * therefore yields exactly 0, matching the direct kernel's zeroing.  NOT
+ * bit-identical to the single-walk kernel -- the summation is reassociated;
+ * same numerics class as the heads8-online carve-out itself, gated the same
+ * way (engine KL closed loop, see docs/engine-perf-map.md).
+ * Launch: grid (n_tokens, n_head), 128 threads; each thread owns 4 dims. */
+__global__ static void attention_decode_split_merge_kernel(
+        float *heads,
+        const float *sinks,
+        const float * __restrict__ part_o,
+        const float * __restrict__ part_ml,
+        uint32_t n_split,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head || head_dim != 512u) return;
+    const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split;
+
+    const float sink = sinks[head];
+    float m_star = sink;
+    for (uint32_t i = 0; i < n_split; i++)
+        m_star = fmaxf(m_star, part_ml[(pbase + i) * 2u + 0u]);
+    float l_star = expf(sink - m_star);
+    float w[8];
+    for (uint32_t i = 0; i < n_split && i < 8u; i++) {
+        w[i] = expf(part_ml[(pbase + i) * 2u + 0u] - m_star);
+        l_star += part_ml[(pbase + i) * 2u + 1u] * w[i];
+    }
+    const float inv = l_star == 0.0f ? 0.0f : 1.0f / l_star;
+
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (uint32_t i = 0; i < n_split && i < 8u; i++) {
+        const float4 v = ((const float4 *)(part_o + (pbase + i) * head_dim))[tid];
+        acc.x += w[i] * v.x;
+        acc.y += w[i] * v.y;
+        acc.z += w[i] * v.z;
+        acc.w += w[i] * v.w;
+    }
+    acc.x *= inv; acc.y *= inv; acc.z *= inv; acc.w *= inv;
+    ((float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim))[tid] = acc;
+}
+
+/* Split-KV partial scratch: static device storage so the split launch is
+ * CUDA-graph-safe (no allocation at capture or replay time) and needs no
+ * per-call setup.  Sized for the worst gated shape (8 tokens x 128 heads x
+ * 8 splits x 512 dims = 16.8 MiB).  The decode step executes one attention
+ * launch at a time on one stream, so a single scratch is safe; a future
+ * multi-stream decode would need per-stream scratch. */
+#define PULSAR_DEC_SPLITKV_S 8u
+#define PULSAR_DEC_SPLITKV_MAX_TOKENS 8u
+#define PULSAR_DEC_SPLITKV_MAX_HEADS 128u
+static __device__ float g_dec_splitkv_part_o[PULSAR_DEC_SPLITKV_MAX_TOKENS *
+        PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 512u];
+static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *
+        PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 2u];
+
+/* One entry point for every heads8-online launch site.  Small-batch decode
+ * (n_tokens <= 8) is the latency regime where the classic grid is 8-64
+ * blocks on a 48-SM chip and the per-row serial chain IS the wall time
+ * (docs/engine-perf-map.md, "2k decode deficit"), so it routes to the
+ * split-KV walk + softmax merge; larger batches keep the single walk whose
+ * grid already fills the machine.  A 0 return is a real launch failure. */
+/* Debug A/B (PULSAR_SPLITKV_DEBUG=1): run BOTH walks per call and report the
+ * first call whose outputs differ beyond reassociation tolerance, with its
+ * full parameter set.  Diagnostic only -- massively slow. */
+__global__ static void attention_splitkv_debug_cmp_kernel(
+        const float *a, const float *b, uint32_t n, float *worst) {
+    __shared__ float wsh[256];
+    float w = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float d = fabsf(a[i] - b[i]);
+        const float m = fmaxf(fabsf(a[i]), 1e-3f);
+        const float r = d / m;
+        if (r > w) w = r;
+    }
+    wsh[threadIdx.x] = w;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) wsh[threadIdx.x] = fmaxf(wsh[threadIdx.x], wsh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *worst = wsh[0];
+}
+
+static int attention_decode_heads8_launch(
+        float *heads, const float *sinks, const float *q, const float *raw_kv,
+        const float *comp_kv, uint32_t non_causal, uint32_t comp_kv_fp8,
+        uint32_t comp_kv_pack, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
+        const int32_t *positions, const int32_t *seq_id,
+        const void * const *comp_bank_ptrs, uint32_t comp_cap, uint32_t n_banks,
+        const char *what) {
+    static const int use_split = pulsar_env_tier_on("PULSAR_CUDA_DECODE_SPLITKV");
+    static const int dbg = getenv("PULSAR_SPLITKV_DEBUG") != NULL;
+    if (dbg && use_split && n_tokens <= PULSAR_DEC_SPLITKV_MAX_TOKENS &&
+        n_head <= PULSAR_DEC_SPLITKV_MAX_HEADS && head_dim == 512u) {
+        static float *ref = NULL, *dworst = NULL;
+        static uint64_t call_no = 0;
+        const uint32_t n = n_tokens * n_head * head_dim;
+        if (!ref) {
+            cudaMalloc(&ref, (size_t)PULSAR_DEC_SPLITKV_MAX_TOKENS * n_head * head_dim * 4);
+            cudaMalloc(&dworst, 4);
+        }
+        call_no++;
+        /* reference: single walk into ref[] */
+        dim3 g1(n_tokens, (n_head + 7u) / 8u, 1);
+        attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(ref, sinks, q,
+                raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens,
+                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+                head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
+                n_banks, NULL, NULL);
+        /* candidate: split+merge into heads (production result) */
+        static float *po = NULL, *pml = NULL;
+        if (!po) {
+            cudaGetSymbolAddress((void **)&po, g_dec_splitkv_part_o);
+            cudaGetSymbolAddress((void **)&pml, g_dec_splitkv_part_ml);
+        }
+        dim3 gs(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
+        attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(heads, sinks, q,
+                raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens,
+                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+                head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
+                n_banks, po, pml);
+        dim3 gm(n_tokens, n_head, 1);
+        attention_decode_split_merge_kernel<<<gm, 128>>>(heads, sinks, po, pml,
+                PULSAR_DEC_SPLITKV_S, n_head, head_dim);
+        attention_splitkv_debug_cmp_kernel<<<1, 256>>>(ref, heads, n, dworst);
+        float hw = 0.0f;
+        cudaMemcpy(&hw, dworst, 4, cudaMemcpyDeviceToHost);
+        if (hw > 1e-4f) {
+            fprintf(stderr, "SPLITKV DIVERGE call=%llu worst_rel=%.3e  "
+                    "nt=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
+                    "win=%u ratio=%u fp8=%u pack=%u rawf16=%d descr=%d nc=%u (%s)\n",
+                    (unsigned long long)call_no, hw, n_tokens, pos0, n_raw,
+                    raw_cap, raw_start, n_comp, window, ratio, comp_kv_fp8,
+                    comp_kv_pack, raw_f16, positions != NULL, non_causal, what);
+        }
+        return cuda_ok(cudaGetLastError(), what);
+    }
+    if (use_split && n_tokens <= PULSAR_DEC_SPLITKV_MAX_TOKENS &&
+        n_head <= PULSAR_DEC_SPLITKV_MAX_HEADS && head_dim == 512u) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: decode attention = split-KV x%u tier "
+                            "(default; PULSAR_CUDA_DECODE_SPLITKV=0 opts out; "
+                            "softmax-merge reassociation)\n",
+                    PULSAR_DEC_SPLITKV_S);
+        }
+        static float *part_o = NULL;
+        static float *part_ml = NULL;
+        if (!part_o &&
+            (cudaGetSymbolAddress((void **)&part_o, g_dec_splitkv_part_o) != cudaSuccess ||
+             cudaGetSymbolAddress((void **)&part_ml, g_dec_splitkv_part_ml) != cudaSuccess)) {
+            part_o = NULL;
+            fprintf(stderr, "pulsar: split-KV scratch symbol lookup FAILED; "
+                            "refusing to fall through\n");
+            return 0;
+        }
+        dim3 sgrid(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
+        attention_decode_mixed_heads8_online_kernel<<<sgrid, 256>>>(heads, sinks,
+                q, raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                n_head, head_dim, raw_f16, positions, seq_id, comp_bank_ptrs,
+                comp_cap, n_banks, part_o, part_ml);
+        dim3 mgrid(n_tokens, n_head, 1);
+        attention_decode_split_merge_kernel<<<mgrid, 128>>>(heads, sinks,
+                part_o, part_ml, PULSAR_DEC_SPLITKV_S, n_head, head_dim);
+        return cuda_ok(cudaGetLastError(), what);
+    }
+    dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+    attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(heads, sinks,
+            q, raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+            n_head, head_dim, raw_f16, positions, seq_id, comp_bank_ptrs,
+            comp_cap, n_banks, NULL, NULL);
+    return cuda_ok(cudaGetLastError(), what);
+}
+
 
 
 
@@ -1790,28 +2033,13 @@ int pulsar_gpu_attention_decode_heads_tensor(
     if (!cuda_attention_score_buffer_fits(n_comp) ||
         (!no_decode_heads8 && !use_mask && head_dim == 512u)) {
         if (!use_mask && head_dim == 512u) {
-            dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
-                                                                              sinks,
-                                                                              (const float *)q->ptr,
-                                                                              (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                              0,
-                                                                              comp_kv_fp8,
-                                                                              comp_kv_pack,
-                                                                              1,
-                                                                              0,
-                                                                              n_raw,
-                                                                              raw_cap,
-                                                                              raw_start,
-                                                                              n_comp,
-                                                                              0,
-                                                                              0,
-                                                                              n_head,
-                                                                              head_dim,
-                                                                              raw_f16,
-                                                                              NULL, NULL, NULL, 0, 1);
-            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+            return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+                    (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    0, comp_kv_fp8, comp_kv_pack, 1, 0, n_raw, raw_cap,
+                    raw_start, n_comp, 0, 0, n_head, head_dim, raw_f16,
+                    NULL, NULL, NULL, 0, 1,
+                    "attention decode online launch");
         }
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
@@ -2150,32 +2378,14 @@ static int attention_decode_batch_launch(
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u) {
-            dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
-                                                                              sinks,
-                                                                              (const float *)q->ptr,
-                                                                              (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                              non_causal,
-                                                                              comp_kv_fp8,
-                                                                              comp_kv_pack,
-                                                                              n_tokens,
-                                                                              pos0,
-                                                                              n_raw,
-                                                                              raw_cap,
-                                                                              raw_start,
-                                                                              n_comp,
-                                                                              window,
-                                                                              ratio,
-                                                                              n_head,
-                                                                              head_dim,
-                                                                              raw_f16,
-                                                                              positions_ptr,
-                                                                              seq_id_ptr,
-                                                                              comp_bank_ptrs_ptr,
-                                                                              comp_cap,
-                                                                              kernel_n_banks);
-            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+            return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+                    (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0,
+                    n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+                    head_dim, raw_f16, positions_ptr, seq_id_ptr,
+                    comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
+                    "attention decode online launch");
         }
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
@@ -2215,32 +2425,14 @@ static int attention_decode_batch_launch(
                             "refusing to fall through\n");
             return 0;
         }
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   non_causal,
-                                                                   comp_kv_fp8,
-                                                                   comp_kv_pack,
-                                                                   n_tokens,
-                                                                   pos0,
-                                                                   n_raw,
-                                                                   raw_cap,
-                                                                   raw_start,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim,
-                                                                   raw_f16,
-                                                                   positions_ptr,
-                                                                   seq_id_ptr,
-                                                                   comp_bank_ptrs_ptr,
-                                                                   comp_cap,
-                                                                   kernel_n_banks);
-        return cuda_ok(cudaGetLastError(), "attention decode window launch");
+        return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+                (const float *)q->ptr, (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0,
+                n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+                head_dim, raw_f16, positions_ptr, seq_id_ptr,
+                comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
+                "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
