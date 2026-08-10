@@ -130,7 +130,7 @@ binder is stricter than upstream's.** It accepts exactly:
 | Tensor group | Accepted formats |
 | --- | --- |
 | Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales), run on the FP8 tensor-core GEMM path |
-| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`IQ2_XXS_SOA`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`IQ2_XXS_SOA`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
+| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`IQ2_XXS_SOA`/`IQ2_XXS_MMQ`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`IQ2_XXS_SOA`/`IQ2_XXS_MMQ`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
 | Output head | `BF16` or MXFP8 |
 | Norms, embeddings, indexer, HC | `F32`/`F16` |
 
@@ -166,14 +166,21 @@ A few things this fork's GGUFs do beyond upstream:
   quantization artifact.) Recommended sampling for the shipped build is
   temperature 0.95, top-p 0.38 (send these as the `temperature`/`top_p` API
   parameters).
-- **REAP expert pruning.** Production GGUFs are REAP expert-pruned: expert
-  tensors are dense-trimmed to a per-layer survivor count while the router
-  stays padded to the full expert count. This trades a small quality margin
-  for significant residency headroom on the GB10. The survivor set is the
-  REAP-25 (LiveCodeBench-50-calibrated) prune published by
+- **`IQ2_XXS_MMQ` (type 43) aligned pre-store.** The v4 line stores the
+  2-bit experts with the MMQ tensor-core tile layout baked at quantize time,
+  so the engine maps the weights and starts serving in ~21 s with no
+  boot-time repack pass.  Same values as `IQ2_XXS`, byte-identical logits.
+- **REAP expert pruning (v3 line).** The v3 GGUFs are REAP expert-pruned:
+  expert tensors are dense-trimmed to a per-layer survivor count while the
+  router stays padded to the full expert count. This trades a small quality
+  margin for significant residency headroom on the GB10. The survivor set is
+  the REAP-25 (LiveCodeBench-50-calibrated) prune published by
   [eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4),
   vendored and transplanted per `gguf-tools/reap/` (full build DAG in
-  [REPRODUCE.md](REPRODUCE.md)).
+  [REPRODUCE.md](REPRODUCE.md)).  **The v4 (0731) line is NOT pruned** — the
+  MLA KV ledger leaves ~20 GiB of headroom on the GB10 even with the full
+  256-expert set resident (measured: twelve 32k sessions plus a 384k-context
+  window fit comfortably), so v4 keeps every expert.
 - **Merged DSpark drafter.** The speculative drafter's tensors ship inside
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
@@ -181,26 +188,23 @@ A few things this fork's GGUFs do beyond upstream:
 `download_model.sh` fetches this fork's shipped GGUF from our release repo:
 
 ```sh
-./download_model.sh v3          # measured-allocation release build, ~92 GB on disk
-./download_model.sh v3-packed   # same build, pre-v0.4.0 IQ2_XXS layout
+./download_model.sh v4          # current release: 0731 weights, full 256 experts, type-43 pre-store
 ```
 
-`v3` downloads `ds4flash-v3-soa.gguf`
+This release ships **one artifact**.  `v4` downloads `ds4flash-v4.gguf`
 (92,495,809,696 bytes, sha256
-`fb220dcb75a60dc81dddc4d6bc1358147b003b9bff6acd3810049d05f9d9efce`), the
-type-42 `IQ2_XXS_SOA` build — identical values and byte-identical logits to the
-packed artifact, ~+2% prefill. **It requires pulsar v0.4.0 or newer**; older
-engines reject type 42 at load.
+`2e9879170bb1f98f9091e74bf519e3cea5f0310dda8a41a59b3c4e9d1c7214c2`):
+DeepSeek-V4-Flash-**0731** weights, the full 256-expert
+set (this line is not REAP-pruned), the 0731 DSpark drafter merged in-file,
+2-bit experts in the type-43 `IQ2_XXS_MMQ` aligned pre-store with 16 layers
+promoted to CUTLASS `MXFP4`, and MXFP8 attention/shared/head.  **Requires an
+engine with type-43 support** (this release); older engines reject it at
+load.  Older artifact lines are no longer published — the release repo hosts
+the latest only.
 
-`v3-packed` downloads the original `ds4flash-v3.gguf`
-(92,495,809,696 bytes, sha256
-`d866cd83f292b852d065651a1a62cecc93a7e9da0c88dc8829dc34f0bd978525`) in the
-type-16 `IQ2_XXS` layout, for engines older than v0.4.0.
-
-Both come from
+It comes from
 <https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
-are stored under `./gguf/`, and update `./ds4flash.gguf` to point at the
-selected file. The
+is stored under `./gguf/`, and `./ds4flash.gguf` is updated to point at it. The
 script prefers the Xet-aware Hugging Face CLI (`hf download`, chunk-deduplicated
 and resumable) when present and falls back to `curl -C -` otherwise. The repo is
 public, so authentication is optional; `--token TOKEN`, `HF_TOKEN`, or the local

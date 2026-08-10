@@ -1,17 +1,19 @@
 #!/bin/sh
 set -e
 
-# ds4 (DwarfStar) release GGUFs live in this repo. Each file is a single,
-# self-contained artifact: REAP-25-pruned DeepSeek-V4-Flash experts, MXFP8
-# attention/shared/head, and the DSpark drafter merged in-file (auto-enabled
-# on load). The repo is public; no token is required for the download.
+# The ds4 (DwarfStar) release GGUF lives in this repo.  One artifact, one
+# target: the current release only.  It is a single self-contained file with
+# the DSpark drafter merged in-file (auto-enabled on load).  The repo is
+# public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
-# v3 is the IQ2_XXS_SOA (type-42) build as of v0.4.0 -- same values as the
-# packed artifact, byte-identical logits, ~+2% prefill.  It requires a pulsar
-# at or after v0.4.0; older engines reject type 42 at load, so the previous
-# packed layout stays available as `v3-packed`.
-V3_FILE="ds4flash-v3-soa.gguf"
-V3_PACKED_FILE="ds4flash-v3.gguf"
+# v4: DeepSeek-V4-Flash-0731 weights, FULL 256-expert set (this line is not
+# REAP-pruned; the repo name is a holdover from the v3 line), 0731 DSpark
+# drafter merged in-file, 2-bit routed experts in the type-43 IQ2_XXS_MMQ
+# aligned-SoA pre-store (tensor-core layout baked at quantize time -- no
+# boot-time repack), 16 quality-sensitive expert layers at CUTLASS MXFP4,
+# MXFP8 attention/shared/head.  Requires an engine with type-43 support;
+# older engines reject it at load.
+V4_FILE="ds4flash-v4.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${PULSAR_GGUF_DIR:-"$ROOT/gguf"}
@@ -26,24 +28,21 @@ usage() {
 DeepSeek V4 Flash GGUF downloader (ds4 / DwarfStar)
 
 Usage:
-  ./download_model.sh v3 [--token TOKEN]
-  ./download_model.sh v3-packed [--token TOKEN]
+  ./download_model.sh v4 [--token TOKEN]
 
-Targets:
+Target:
 
-  v3     Measured-allocation release build, about 92 GB on disk. Routed
-         experts on an IQ2_XXS floor with byte-lossless MXFP4 promoted on the
-         quality-sensitive layers (per-layer, per-role); MXFP8 attention,
-         shared experts, and LM head; DSpark drafter merged in-file.
-         Targets a single NVIDIA GB10 (~121 GB usable) with room for a 1M
-         token context. Requires a pulsar engine built with CUDA_ARCH=sm_120f.
-         Since v0.4.0 the 2-bit experts ship in the type-42 IQ2_XXS_SOA
-         layout: identical values and byte-identical logits, ~+2% prefill.
-         NEEDS PULSAR v0.4.0 OR NEWER -- older engines reject type 42.
-
-  v3-packed
-         The same build in the original type-16 IQ2_XXS layout. Use this if
-         you are running a pulsar older than v0.4.0.
+  v4     Current release build, about 92 GB on disk: DeepSeek-V4-Flash-0731
+         weights with the FULL 256-expert set, the 0731 DSpark drafter
+         merged in-file, and the measured precision allocation -- 2-bit
+         routed experts in the type-43 IQ2_XXS_MMQ aligned-SoA pre-store
+         (tensor-core layout baked at quantize time: no boot-time repack,
+         the engine starts serving in ~21 s), 16 quality-sensitive expert
+         layers at CUTLASS MXFP4, MXFP8 attention/shared/head.  Targets a
+         single NVIDIA GB10 (~121 GB usable) with room for very deep
+         context (measured: full tool-calling coherence at ~295k live
+         tokens).  Requires a pulsar engine with type-43 support, built
+         with CUDA_ARCH=sm_120f.
 
 Options:
   --token TOKEN  Hugging Face token (optional; the repo is public). Otherwise
@@ -70,16 +69,14 @@ MODEL=$1
 shift
 
 case "$MODEL" in
-    v3) MODEL_FILE=$V3_FILE ;;
-    v3-packed) MODEL_FILE=$V3_PACKED_FILE ;;
+    v4) MODEL_FILE=$V4_FILE ;;
     -h|--help|help)
         usage
         exit 0
         ;;
     *)
         echo "Unknown model: $MODEL" >&2
-        echo >&2
-        usage >&2
+        echo "This release ships one artifact; use: ./download_model.sh v4" >&2
         exit 1
         ;;
 esac

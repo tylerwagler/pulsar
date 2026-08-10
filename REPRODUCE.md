@@ -173,3 +173,27 @@ Two honest caveats:
 - Bit-exact model output depends on the pulsar engine build (`CUDA_ARCH=sm_120f`)
   and the driver/CUDA stack; same-seed reproducibility is guaranteed only on
   identical hardware/build.
+
+## v4 (0731) addendum — `ds4flash-v4.gguf`
+
+The v4 release line differs from the DAG above in three ways and reuses it
+for everything else:
+
+1. **Source checkpoint is the 0731 refresh** —
+   `deepseek-ai/DeepSeek-V4-Flash-DSpark-0731` (weights AND the matching
+   0731 DSpark drafter; the merge stage is unchanged).
+2. **No REAP stage.** The v4 line keeps the full 256-expert set — skip
+   stage (b) entirely and quantize the un-pruned oracle.  The GB10 KV
+   ledger no longer needs the pruning headroom (see README "Model
+   Weights").
+3. **Type-43 pre-store.** After the mixed-quant pass, rewrite the
+   `IQ2_XXS` expert tensors into the MMQ aligned-SoA artifact layout:
+
+   ```sh
+   python3 gguf-tools/repack_iq2_mmq.py ds4flash-v4-iq2.gguf ds4flash-v4.gguf
+   ```
+
+   This is a byte permutation, not a re-quantize — same values, identical
+   logits (`gguf-tools/verify_iq2_mmq_roundtrip.cu` /
+   `verify_iq2_mmq_model.py` prove it) — and it is what lets the engine
+   start serving in ~21 s with no boot-time repack.
