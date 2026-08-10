@@ -980,11 +980,11 @@ static int indexer_scores_launch(
      * dequantising them to fp16 first.  3.4x the WMMA tier at n_comp=512,
      * n_tokens=512 on a locked clock.
      *
-     * OPT-IN, and it stays opt-in until the suite-v1 KL run clears it: this
-     * path quantises Q to E4M3, so it is a fidelity change, not just a faster
-     * route to the same numbers.  tests/idx_quant_fidelity.cc measured the
-     * top-k overlap and backs the choice, but that is a component measurement,
-     * not the shipping gate.
+     * DEFAULT-ON since 2026-08-08 (PULSAR_CUDA_INDEXER_MXFP4=0 opts out):
+     * this path quantises Q to E4M3, so it is a fidelity change, not just a
+     * faster route to the same numbers — the suite-v1 KL run cleared it
+     * (docs/engine-perf-map.md, "fidelity ledger").
+     * tests/idx_quant_fidelity.cc's top-k overlap was the component evidence.
      *
      * The shape conditions are checked HERE rather than read off the
      * launcher's return, so its 0 means a real allocation or launch failure.

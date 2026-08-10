@@ -230,8 +230,45 @@ full flag list, and start serving with:
 
 ## Speed
 
-Performance is measured on this fork's target hardware — a **DGX Spark GB10**
-running the ~92 GB REAP-pruned Flash build. The artifact unifies every
+### Current branch (2026-08-09, GB10, locked clocks)
+
+Measured with `pulsar-bench` at `sudo nvidia-smi -lgc 2600` on the full
+256-expert (un-pruned) `v5mx4-0731-mmqaligned` artifact — IQ2_XXS_MMQ
+(type 43) routed experts with 16 layers at CUTLASS MXFP4 (type 40).  Three
+numeric tiers are **on by default** on this branch, each behind an `=0`
+opt-out and each gated by measured fidelity (suite-v1 teacher-forced KL and
+the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
+
+- `PULSAR_CUDA_ATTN_F16` — fp16 tensor-core prefill attention (all window,
+  indexed, banked and continued-prefill paths; reads the packed comp cache
+  directly).
+- `PULSAR_CUDA_INDEXER_MXFP4` — block-scaled MXFP4 indexer scorer.
+- `PULSAR_CUDA_DECODE_SPLITKV` — split-KV decode attention with softmax
+  merge (8 row-splits; the small-batch decode walk no longer serializes on
+  8 blocks).
+
+| Context | Prefill (t/s, cold) | Decode plain (t/s) |
+| ---: | ---: | ---: |
+| 2k  | 951 | 20.7 |
+| 4k  | 918 | 17.8 |
+| 8k  | 945 | 17.5 |
+| 16k | 932 | 17.5 |
+| 32k | 909 | 17.1 |
+
+Single-stream speculative decode (drafter on, chat-style structured output)
+averages **~24.6 t/s with bursts above 30**.  Aggregate decode under
+concurrency (pp2048/tg128, llama-benchy protocol): 23.1 t/s at c2/d0 and
+26.2 at c4/d0, still 17.3-17.7 at c2-c4/d8192 — throughput *rises* with
+stream count.  Deep context is measured, not advertised: the 84-scenario
+short set scores **identically (97/97) at 0 and at ~295k tokens of live
+context pressure** on a 384k window, with prefill sustaining ~900+ t/s at
+that depth.
+
+Earlier-build numbers below are kept for history; the protocols differ
+(server wall-clock vs locked-clock bench), so do not compare across tables.
+
+Historic v0.3.1 numbers were measured on the ~92 GB REAP-pruned Flash
+build of that era. The artifact unifies every
 MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
 (4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
 **type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
@@ -443,6 +480,16 @@ The disk KV cache is on by default (see [Disk KV Cache](#disk-kv-cache));
 add `--kv-disk-dir DIR` / `--kv-disk-space-mb N` only to relocate or resize it,
 or `--no-kv-disk` to turn it off.
 
+For benchmarking and evals, `PULSAR_EVAL_PIN=1` makes serving
+**history-independent**: thinking-bind routing, warm bank forks and live
+prefix continuation are all disabled at their choke points, so every request
+cold-prefills and the same request always produces the same output no matter
+what the server handled before.  Warm reuse legitimately moves borderline
+outputs in either direction (measured at up to ±10 points of eval swing on
+identical greedy requests), so published numbers should be taken pinned —
+pair with `--no-kv-disk` for a fully cold protocol.  Production leaves the
+pin off: the reuse is the TTFT win.
+
 Use `--chdir /path/to/pulsar` when launching `pulsar-server` from another directory,
 so relative runtime paths such as the default `./ds4flash.gguf` model and
 `dir-steering/` data resolve from the project tree.
@@ -589,6 +636,23 @@ turn, it compares the live sampled token stream with the prompt that the next
 client request will render. If needed, it rewrites the live checkpoint, or
 falls back to an older disk KV snapshot and replays only the suffix. This keeps
 the model continuation aligned with the stateless API transcript.
+
+Tool **schemas** are canonicalized on the way in (ported from upstream ds4):
+the OpenAI `function` object is re-rendered in the official tokenizer's
+lexical form — Python separators, decoded UTF-8, preserved key order — so
+semantically identical toolsets tokenize identically no matter how the
+client's JSON serializer spells them.  That keeps schema bytes on the
+model's trained distribution, and it means two clients advertising the same
+tools (or one client changing serializers) hit the same warm-bank prefixes
+and disk KV keys instead of forking cold.  A schema the canonicalizer cannot
+round-trip is passed through verbatim (fail-open).
+
+Truncated tool calls are repaired rather than dropped: a generation cut
+mid-call (length stop) has its missing DSML closing tags appended, a
+trailing partial closing tag of any DSML style is trimmed instead of leaking
+into the argument value, and the streaming paths close an open string and
+args object so the wire JSON stays well-formed with `finish_reason` marking
+the cut.
 
 During generation, the server also treats DSML syntax differently from payload.
 When the model is emitting stable protocol structure such as DSML tags,

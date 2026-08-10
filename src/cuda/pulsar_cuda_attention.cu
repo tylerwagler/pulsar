@@ -2149,13 +2149,14 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
         attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
                               n_tokens, n_head, head_dim, window, raw_f16);
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
-         * 0%; see docs/engine-perf-map.md.  OPT-IN until the suite-v1 KL run
-         * clears it: fp16 operands change the numbers, and the component
-         * measurement backing the choice (tests/attn_precision_fidelity.cc:
-         * top-1 attention position preserved ~100%, KL <= 3e-7) is evidence,
-         * not the shipping gate.  Shape conditions are checked by the launcher
-         * itself, and a 0 return here is a REAL failure, so it is reported
-         * rather than silently demoted to the FMA kernel. */
+         * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
+         * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
+         * and the suite-v1 KL run is what cleared the flip — the component
+         * measurement (tests/attn_precision_fidelity.cc: top-1 attention
+         * position preserved ~100%, KL <= 3e-7) was evidence, not the gate.
+         * Shape conditions are checked by the launcher itself, and a 0 return
+         * here is a REAL failure, so it is reported rather than silently
+         * demoted to the FMA kernel. */
         static const int use_f16_attn = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
         if (use_f16_attn && head_dim == 512u && (n_head % 16u) == 0u) {
             static int announced = 0;

@@ -125,7 +125,7 @@ the win has to come from the tensor-core dataflow removing the 8x shared-memory
 re-read (8 warps each pulling the whole 2 KB row), not from raw math.  2-3x on
 the attention kernels is the realistic target, i.e. 11-17% of prefill.
 
-#### Built: src/cuda/pulsar_cuda_attn_f16.cu (opt-in, PULSAR_CUDA_ATTN_F16)
+#### Built: src/cuda/pulsar_cuda_attn_f16.cu (default-on since 2026-08-08; PULSAR_CUDA_ATTN_F16=0 opts out)
 
 fp16 chosen, kernel written, wired into both window launchers behind the env
 flag.  MEASURED in-engine, same workload:
@@ -178,7 +178,8 @@ longer obviously a bandwidth story.
 
 End-to-end this IS a fidelity change, as designed: same greedy argmax, 9/10
 top-10 overlap, mean |logit delta| 0.32 against a [-47.7, 37.5] range on the
-frontier checked.  Default-on waits for the suite-v1 KL run.
+frontier checked.  Default-on shipped after the suite-v1 KL run cleared it
+(see "Fidelity ledger" below).
 
 #### Fidelity ledger: suite-v1 KL run (2026-08-08) — CLEARED, defaults flipped
 

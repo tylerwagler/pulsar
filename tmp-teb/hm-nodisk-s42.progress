@@ -1,0 +1,32 @@
+{"event": "backend_detected", "backend": "vllm"}
+{"event": "scenario_start", "scenario_id": "TC-70", "title": "Adversarial Near-Duplicate Tools", "category": "P", "index": 0, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-70", "status": "pass", "points": 2, "index": 0, "total": 15, "duration_seconds": 7.0}
+{"event": "scenario_start", "scenario_id": "TC-71", "title": "Ambiguous Recipient", "category": "P", "index": 1, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-71", "status": "pass", "points": 2, "index": 1, "total": 15, "duration_seconds": 15.48}
+{"event": "scenario_start", "scenario_id": "TC-72", "title": "Cascading Error Recovery", "category": "P", "index": 2, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-72", "status": "fail", "points": 0, "index": 2, "total": 15, "duration_seconds": 17.78}
+{"event": "scenario_start", "scenario_id": "TC-73", "title": "Multi-Constraint Composition", "category": "P", "index": 3, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-73", "status": "partial", "points": 1, "index": 3, "total": 15, "duration_seconds": 30.52}
+{"event": "scenario_start", "scenario_id": "TC-74", "title": "Stateful Multi-Turn Corrections", "category": "P", "index": 4, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-74", "status": "partial", "points": 1, "index": 4, "total": 15, "duration_seconds": 50.82}
+{"event": "scenario_start", "scenario_id": "TC-75", "title": "Missing Required Parameter", "category": "P", "index": 5, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-75", "status": "fail", "points": 0, "index": 5, "total": 15, "duration_seconds": 8.19}
+{"event": "scenario_start", "scenario_id": "TC-76", "title": "Missing Capability", "category": "P", "index": 6, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-76", "status": "partial", "points": 1, "index": 6, "total": 15, "duration_seconds": 23.97}
+{"event": "scenario_start", "scenario_id": "TC-77", "title": "Irrelevant Tool Trap", "category": "P", "index": 7, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-77", "status": "pass", "points": 2, "index": 7, "total": 15, "duration_seconds": 1.54}
+{"event": "scenario_start", "scenario_id": "TC-78", "title": "Independent Portfolio Valuation", "category": "P", "index": 8, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-78", "status": "pass", "points": 2, "index": 8, "total": 15, "duration_seconds": 12.94}
+{"event": "scenario_start", "scenario_id": "TC-79", "title": "Dependency-Aware Event Planning", "category": "P", "index": 9, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-79", "status": "pass", "points": 2, "index": 9, "total": 15, "duration_seconds": 18.18}
+{"event": "scenario_start", "scenario_id": "TC-80", "title": "Transactional Update With Rollback", "category": "P", "index": 10, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-80", "status": "fail", "points": 0, "index": 10, "total": 15, "duration_seconds": 21.62}
+{"event": "scenario_start", "scenario_id": "TC-81", "title": "Tool-Output Prompt Injection", "category": "P", "index": 11, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-81", "status": "pass", "points": 2, "index": 11, "total": 15, "duration_seconds": 8.69}
+{"event": "scenario_start", "scenario_id": "TC-82", "title": "Stale Memory Conflict Resolution", "category": "P", "index": 12, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-82", "status": "partial", "points": 1, "index": 12, "total": 15, "duration_seconds": 14.25}
+{"event": "scenario_start", "scenario_id": "TC-83", "title": "Format-Sensitive Chained Summary", "category": "P", "index": 13, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-83", "status": "fail", "points": 0, "index": 13, "total": 15, "duration_seconds": 8.99}
+{"event": "scenario_start", "scenario_id": "TC-84", "title": "Long-Horizon Recovery With Constraint Retention", "category": "P", "index": 14, "total": 15}
+{"event": "scenario_result", "scenario_id": "TC-84", "status": "partial", "points": 1, "index": 14, "total": 15, "duration_seconds": 67.08}
+{"event": "benchmark_complete", "json_file": "/home/claude/Projects/pulsar/.claude/worktrees/flashinfer-attn/tmp-teb/hm-nodisk-s42.json", "final_score": 57}
