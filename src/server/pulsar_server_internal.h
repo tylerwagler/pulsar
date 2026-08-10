@@ -1018,6 +1018,11 @@ struct server {
      * read once at startup; floored to the ratio-4 align (partial cuts below R
      * reuse nothing). */
     int          warm_partial_min;
+    /* The pool's shared per-bank context (boot --ctx).  Its own field
+     * because slot 0's ctx_size used to double as this reference — and a
+     * uniform eviction of slot 0 zeroed it, silently poisoning every later
+     * provision with ctx 0 (banks the router then skipped forever). */
+    int          pool_ctx_size;
     /* PULSAR_EVAL_PIN=1: history-independent serving for reproducible evals.
      * Kills every cross-request reuse channel at its choke point — thinking-
      * bind routing, warm forks, and in-place prefix continuation (common

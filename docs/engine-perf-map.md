@@ -543,7 +543,19 @@ Measured after: 8-on-8 and pinned 12-on-12 multi-turn both fully warm from
 a fresh boot (turn-2 median 0.56 s vs 2.35 s cold; zero stragglers), 12-way
 aggregate unchanged at 29.0, 9-on-8 overload degrades to ordinary thrash.
 
-RESIDUAL CLOSED (same day): the churned-pool cold mode was slot 0's
+SLOT 0 DE-WARTED (same day, superseding the soft-evict below): in pool
+mode slot 0 is now an ORDINARY bank — not boot-provisioned, provisioned
+lazily from the uniform loop (from 0), evicted like any other.  The whole
+special-case family (boot phantom, empty-reuse scan, soft evict, pinned
+provisioning) is deleted.  Two subtleties the uniformity flushed out:
+slot 0's ctx_size doubled as the pool's shared-ctx reference and eviction
+zeroed it, poisoning every later provision with ctx 0 (now its own
+pool_ctx_size field); and the fork-pin protect loop skipped slot 0.
+Ladder after: fresh 8-on-8, churn-then-8-on-8, pinned 12-on-12 all warm
+(0.56 s turn-2 median; back-to-back runs even get warm TURN-1s at 0.47 s),
+aggregate 29.2, classic mode (banks=1) unaffected.
+
+HISTORICAL — RESIDUAL CLOSED (same day): the churned-pool cold mode was slot 0's
 immortality — the eviction victim picker started at slot 1, so a one-shot's
 leftovers squatting bank 0 could never be evicted, shrinking the evictable
 pool to N-1 and re-seeding the domino whenever traffic had filled bank 0

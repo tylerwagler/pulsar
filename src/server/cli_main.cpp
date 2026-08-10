@@ -1091,8 +1091,15 @@ int main(int argc, char **argv) {
          * one share, so committed == session_est only when all banks are live,
          * and that sum was already verified <= budget above. */
         s.bank_marginal_bytes = session_est / (uint64_t)pool_banks;
-        s.kv_committed_bytes = s.bank_marginal_bytes;
-        s.slots[0].est_cost_bytes = s.bank_marginal_bytes;
+        /* Pool mode: NO bank is provisioned at boot — bank 0 is an ordinary
+         * bank provisioned on first use like the rest (uniform ledger:
+         * committed starts at 0, each provision charges one marginal).  The
+         * old boot-provisioned slot 0 was the root of a whole wart family:
+         * the routing phantom (first conversation routed "in place" to the
+         * empty boot slot but landing on bank 1), the un-provisionable /
+         * un-evictable squatter, and the compensating special cases each of
+         * those needed. */
+        s.kv_committed_bytes = 0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 shared pool ACTIVE: %d banks, "
                    "spec_max_live=%d, per-bank marginal %.2f GiB "
@@ -1151,9 +1158,16 @@ int main(int argc, char **argv) {
                    s.spill_dir);
     }
     s.sess = session;                /* the one session; slot 0 describes it */
-    s.slots[0].provisioned = true;
-    s.slots[0].state = SLOT_IDLE;
+    /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
+     * read regardless of provisioning state.  Classic mode (no pool) keeps
+     * the boot session live on slot 0; pool mode provisions bank 0 lazily
+     * like every other bank. */
     s.slots[0].ctx_size = cfg.ctx_size;
+    s.pool_ctx_size = cfg.ctx_size;
+    if (s.pool_banks == 0) {
+        s.slots[0].provisioned = true;
+        s.slots[0].state = SLOT_IDLE;
+    }
     /* Slot-routing trivial-match threshold (choose_slot_for_job): the token
      * depth at which a shared prefix stops meaning "same rendered template
      * header" and starts meaning "same conversation". Derived once per model

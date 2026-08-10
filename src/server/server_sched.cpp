@@ -61,7 +61,9 @@ int server::job_needed_ctx(const job *j) const {
                    (int64_t)(j->req.max_tokens > 0 ? j->req.max_tokens
                                                    : s->default_tokens) +
                    64;
-    if (need > s->slots[0].ctx_size) need = s->slots[0].ctx_size;
+    const int ref_ctx = s->pool_banks > 0 ? s->pool_ctx_size
+                                          : s->slots[0].ctx_size;
+    if (need > ref_ctx) need = ref_ctx;
     if (need < 1) need = 1;
     return (int)need;
 }
@@ -212,29 +214,11 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     auto *s = this;
     *refusal = PROVISION_OK;
     int idx = -1;
-    bool recharge = true;
-    for (int i = 1; i < s->pool_banks; i++) {     /* bank 0 == slot 0, pinned */
+    /* Pool mode: bank 0 is an ordinary bank (no boot pre-provisioning, no
+     * pinning) — the uniform loop from 0 replaced the boot-phantom /
+     * empty-reuse / soft-evict special-case family (2026-08-10). */
+    for (int i = 0; i < s->pool_banks; i++) {
         if (!s->slots[i].provisioned) { idx = i; break; }
-    }
-    if (idx < 0) {
-        /* No never-provisioned slot.  A provisioned-but-EMPTY idle bank
-         * (frontier <= 1) is free capacity wearing a "provisioned" coat:
-         * the boot slot-0 phantom (routing sends the first conversation
-         * "in place" to slot 0 but it actually lands on bank 1, and slot 0
-         * then counts against the pool forever — measured 2026-08-10, the
-         * seed of the LRU domino at capacity == banks) and any evict-reset
-         * leftover.  Reuse it WITHOUT a second ledger charge; slot 0 is
-         * eligible here because an empty bank carries no classic-session
-         * state to protect. */
-        for (int i = 0; i < s->pool_banks; i++) {
-            session_slot *c = &s->slots[i];
-            if (c->provisioned && !c->active_job &&
-                s->slot_frontier_pos(c) <= 1) {
-                idx = i;
-                recharge = false;
-                break;
-            }
-        }
     }
     if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
     /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
@@ -268,16 +252,13 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     sl->bank = (uint32_t)idx;
     sl->committed_pos = 0;
     sl->state = SLOT_IDLE;
-    sl->ctx_size = s->slots[0].ctx_size;          /* every bank shares pool ctx */
-    /* A reused empty bank keeps its original ledger charge (slot 0's boot
-     * cost is not the pooled marginal); only a first-time provision prices
-     * at the marginal. */
-    if (recharge) sl->est_cost_bytes = s->bank_marginal_bytes;
+    sl->ctx_size = s->pool_ctx_size;              /* every bank shares pool ctx */
+    sl->est_cost_bytes = s->bank_marginal_bytes;
     sl->tokens_emitted = 0;
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     sl->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->mu);
-    if (recharge) s->kv_committed_bytes += s->bank_marginal_bytes;
+    s->kv_committed_bytes += s->bank_marginal_bytes;
     if (idx >= s->n_slots) s->n_slots = idx + 1;
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_DEFAULT,
@@ -311,7 +292,9 @@ session_slot *server::provision_slot(int ctx,
 int server::provision_ctx_for_job(const job *j) const {
     const auto *s = this;
     int ctx = PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS;
-    if (ctx > s->slots[0].ctx_size) ctx = s->slots[0].ctx_size;
+    const int cap_ctx = s->pool_banks > 0 ? s->pool_ctx_size
+                                          : s->slots[0].ctx_size;
+    if (ctx > cap_ctx) ctx = cap_ctx;
     const int needed = s->job_needed_ctx(j);
     if (ctx < needed) ctx = needed;
     return ctx;
@@ -838,7 +821,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * and never interleave, but the invariant "a pinned source is never freed"
      * must hold for both eviction paths). */
     if (s->pool_banks > 0 && s->sess) {
-        for (int i = 1; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
+        for (int i = 0; i < s->n_slots && i < PULSAR_SESSION_POOL_CAP; i++) {
             if (pulsar_session_bank_fork_pinned(s->sess, s->slots[i].bank)) protect[i] = true;
         }
     }
@@ -886,34 +869,17 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * ledger releases only this bank's even-split marginal. */
     pulsar_session_invalidate(s->sess);
     pulsar_session_bank_state_save(s->sess, (uint32_t)sl->bank);
+    freed = committed; /* logical release; no allocator delta to verify */
     const int evicted_ctx = sl->ctx_size;
-    const bool soft = (vi == 0 && s->pool_banks > 0);
-    if (soft) {
-        /* SLOT-0 SOFT EVICT (pool mode): reset the content but keep the slot
-         * provisioned and its structural boot charge on the ledger — the
-         * empty bank is then ordinary free capacity for provision_bank's
-         * empty-reuse scan.  Marking it !provisioned would orphan it: the
-         * primary provisioning loop starts at 1 by design. */
-        freed = 0;
-        sl->gen = NULL;
-        sl->active_job = NULL;
-        sl->state = SLOT_IDLE;
-        sl->committed_pos = 0;
-        sl->tokens_emitted = 0;
-        sl->last_serviced_us = 0;
-        sl->continued_last_store_tokens = 0;
-    } else {
-        freed = committed; /* logical release; no allocator delta to verify */
-        sl->provisioned = false;
-        sl->gen = NULL;
-        sl->active_job = NULL;
-        sl->state = SLOT_EVICTED;
-        sl->ctx_size = 0;
-        sl->est_cost_bytes = 0;
-        sl->tokens_emitted = 0;
-        sl->last_serviced_us = 0;
-        sl->continued_last_store_tokens = 0;
-    }
+    sl->provisioned = false;
+    sl->gen = NULL;
+    sl->active_job = NULL;
+    sl->state = SLOT_EVICTED;
+    sl->ctx_size = 0;
+    sl->est_cost_bytes = 0;
+    sl->tokens_emitted = 0;
+    sl->last_serviced_us = 0;
+    sl->continued_last_store_tokens = 0;
     /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
      * flag or leave an orphan spill file (invariant: physical freed IFF spilled).
      * server_bank_switch above restored a spilled victim (physical present, flag
@@ -926,8 +892,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
         sl->spilled = false;
     }
     pthread_mutex_lock(&s->mu);
-    if (!soft)
-        s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
+    s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
     const uint64_t committed_now = s->kv_committed_bytes;
     /* The evicted conversation must replay from a checkpoint on its next turn,
      * which is the dominant tail-latency source on a busy pool — worth a
