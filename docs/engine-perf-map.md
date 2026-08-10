@@ -565,3 +565,20 @@ ledger; the empty bank is then ordinary free capacity for the empty-reuse
 scan).  Churn-then-capacity (conc 12 -> multiturn 8, one boot), fresh
 8-on-8 and pinned 12-on-12 all run fully warm (turn-2 median 0.56 s);
 aggregate unchanged at 29.0.
+
+### Multi-turn TTFT with the disk KV cache ON (2026-08-10, production config)
+
+tools/multiturn_ttft.py, default boot (8 banks, disk cache on), ~2.3k-token
+conversations:
+
+    8-on-8, wiped cache:   turn-1 2.75 s   turn-2 0.56 s
+    12-on-8 OVERLOAD:      turn-2 0.71 s   (was 2.35 s without disk: evicted
+                           conversations snapshot out and reload in, so
+                           exceeding bank capacity now costs ~0.15 s/turn,
+                           not a full re-prefill)
+    server RESTART:        turn-1 0.58 s   (checkpoints reload from disk —
+                           first turns warm across restarts; reproduced x2)
+
+The disk adds ~0.4 s to cold turns (snapshot writes) and buys graceful
+overload plus 4.7x faster restart turns.  Banks handle capacity <= N warm
+in memory; the disk catches everything past that.
