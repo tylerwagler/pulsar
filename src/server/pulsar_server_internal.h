@@ -1869,7 +1869,8 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * index or -1. Pure selection over host fields — never touches the session
  * (defined in generate.c; unit-tested in cli_main.c). */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                                    const bool *protect);
+                                    const bool *protect,
+                                    bool allow_slot0 = false);
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,

@@ -543,7 +543,13 @@ Measured after: 8-on-8 and pinned 12-on-12 multi-turn both fully warm from
 a fresh boot (turn-2 median 0.56 s vs 2.35 s cold; zero stragglers), 12-way
 aggregate unchanged at 29.0, 9-on-8 overload degrades to ordinary thrash.
 
-OPEN RESIDUAL: capacity == banks goes cold again when the pool was heavily
-churned by one-shots BEFORE the multi-turn load (repro: conc.py 12 then
-multiturn 8 on one boot; fresh-boot multiturn 8 is warm).  Same tooling
-applies (PULSAR_ROUTE_DEBUG=1); not yet diagnosed.
+RESIDUAL CLOSED (same day): the churned-pool cold mode was slot 0's
+immortality — the eviction victim picker started at slot 1, so a one-shot's
+leftovers squatting bank 0 could never be evicted, shrinking the evictable
+pool to N-1 and re-seeding the domino whenever traffic had filled bank 0
+first.  Slot 0 now competes in LRU normally in pool mode with a SOFT evict
+(content reset, slot stays provisioned, structural boot charge stays on the
+ledger; the empty bank is then ordinary free capacity for the empty-reuse
+scan).  Churn-then-capacity (conc 12 -> multiturn 8, one boot), fresh
+8-on-8 and pinned 12-on-12 all run fully warm (turn-2 median 0.56 s);
+aggregate unchanged at 29.0.

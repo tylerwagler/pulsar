@@ -725,9 +725,15 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
 
 
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                             const bool *protect) {
+                             const bool *protect, bool allow_slot0) {
     int victim = -1;
-    for (int i = 1; i < n_slots; i++) { /* slot 0 pinned (see block comment) */
+    /* Slot 0 competes in LRU only when the caller says so (pool mode, where
+     * bank 0 is just another bank): an idle conversation squatting bank 0 was
+     * otherwise IMMORTAL, silently shrinking the evictable pool to N-1 and
+     * seeding the churned-pool LRU domino (measured 2026-08-10: a one-shot's
+     * leftovers on bank 0 forced an 8-conversation load into 7 banks, and the
+     * shortage evicted a live conversation every turn forever). */
+    for (int i = allow_slot0 ? 0 : 1; i < n_slots; i++) {
         const session_slot *sl = &slots[i];
         if (!sl->provisioned || sl->active_job) continue;
         if (protect && protect[i]) continue;
@@ -836,7 +842,8 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
             if (pulsar_session_bank_fork_pinned(s->sess, s->slots[i].bank)) protect[i] = true;
         }
     }
-    const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect);
+    const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect,
+                                            /*allow_slot0=*/s->pool_banks > 0);
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
 
@@ -879,17 +886,34 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * ledger releases only this bank's even-split marginal. */
     pulsar_session_invalidate(s->sess);
     pulsar_session_bank_state_save(s->sess, (uint32_t)sl->bank);
-    freed = committed; /* logical release; no allocator delta to verify */
     const int evicted_ctx = sl->ctx_size;
-    sl->provisioned = false;
-    sl->gen = NULL;
-    sl->active_job = NULL;
-    sl->state = SLOT_EVICTED;
-    sl->ctx_size = 0;
-    sl->est_cost_bytes = 0;
-    sl->tokens_emitted = 0;
-    sl->last_serviced_us = 0;
-    sl->continued_last_store_tokens = 0;
+    const bool soft = (vi == 0 && s->pool_banks > 0);
+    if (soft) {
+        /* SLOT-0 SOFT EVICT (pool mode): reset the content but keep the slot
+         * provisioned and its structural boot charge on the ledger — the
+         * empty bank is then ordinary free capacity for provision_bank's
+         * empty-reuse scan.  Marking it !provisioned would orphan it: the
+         * primary provisioning loop starts at 1 by design. */
+        freed = 0;
+        sl->gen = NULL;
+        sl->active_job = NULL;
+        sl->state = SLOT_IDLE;
+        sl->committed_pos = 0;
+        sl->tokens_emitted = 0;
+        sl->last_serviced_us = 0;
+        sl->continued_last_store_tokens = 0;
+    } else {
+        freed = committed; /* logical release; no allocator delta to verify */
+        sl->provisioned = false;
+        sl->gen = NULL;
+        sl->active_job = NULL;
+        sl->state = SLOT_EVICTED;
+        sl->ctx_size = 0;
+        sl->est_cost_bytes = 0;
+        sl->tokens_emitted = 0;
+        sl->last_serviced_us = 0;
+        sl->continued_last_store_tokens = 0;
+    }
     /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
      * flag or leave an orphan spill file (invariant: physical freed IFF spilled).
      * server_bank_switch above restored a spilled victim (physical present, flag
@@ -902,7 +926,8 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
         sl->spilled = false;
     }
     pthread_mutex_lock(&s->mu);
-    s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
+    if (!soft)
+        s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
     const uint64_t committed_now = s->kv_committed_bytes;
     /* The evicted conversation must replay from a checkpoint on its next turn,
      * which is the dominant tail-latency source on a busy pool — worth a
@@ -915,7 +940,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
                vi, evicted_ctx, live_tokens, stored ? "disk" : "none",
-               (double)committed / (1024.0 * 1024.0 * 1024.0),
+               (double)freed / (1024.0 * 1024.0 * 1024.0),
                (double)freed / (1024.0 * 1024.0 * 1024.0),
                (double)committed_now / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
