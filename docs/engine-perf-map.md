@@ -475,3 +475,13 @@ dead even with Entrpi's 85 on identical protocol, with reproducibility his
 config already had and two thinking tiers his fork does not expose.  The
 3-scenario retry projected 86-87; the full run's givebacks are the honest
 correction.
+
+### Context pressure (2026-08-09): 295k tokens of live context costs nothing
+
+TEB --short at --context-pressure 0.75 on a 393216 window (five-bank pool,
+production defaults) vs the same set at zero pressure: 97 == 97, identical
+per-scenario statuses (14 pass + the one scenario that partials at every
+depth).  Every scenario is an honest cold ~295k prefill -- TEB nonces the
+filler per scenario specifically to defeat prefix caches -- and serving
+sustained ~900+ tok/s prefill at that depth (~420 s/scenario end to end).
+Deep-context tool-calling coherence: no measurable degradation.
