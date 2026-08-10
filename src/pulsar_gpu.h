@@ -220,9 +220,12 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                head_dim,
         int                     raw_f16);
 
-/* fp16 tensor-core attention, INDEXED: compressed rows are a top-k selection
- * and raw rows come from a ring buffer.  Refuses banked descriptors and
- * ATTN_PACK comp rows -- the caller keeps the f32 kernel for those. */
+/* fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
+ * compressed rows are a top-k selection (topk != NULL) or the visible prefix
+ * (topk == NULL, the continued-prefill sweep).  Banked descriptors
+ * (positions/seq_id/comp_bank_ptrs; all-or-nothing) and ATTN_PACK comp rows
+ * (comp_pack) are served natively -- bank isolation gated by
+ * tests/attn_f16_banked_test.cu.  Returns 0 on refusal or failure. */
 int pulsar_gpu_attention_f16_indexed(
         float                   *heads,
         const float             *sinks,

@@ -2668,13 +2668,16 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
-        /* fp16 tensor-core tier for the indexed path -- the largest single
-         * kernel in the prefill map (12.5%).  Deliberately NARROW: banked
-         * descriptors and ATTN_PACK comp rows keep the f32 kernel, because
-         * approximating a row plan that selects the wrong KV rows produces
-         * plausible attention rather than an error.  Prefill without
-         * descriptors is the case the gate above already forces to be
-         * unpacked, so this covers it and refuses the rest. */
+        /* fp16 tensor-core tier for the indexed path -- it replaced the f32
+         * kernel that was the largest single entry in the prefill map
+         * (12.5%).  Banked descriptors and ATTN_PACK comp rows ride the fp16
+         * tier too, each behind its own gate: bank isolation is proven
+         * algebraically (tests/attn_f16_banked_test.cu -- a wrong-bank read
+         * is plausible attention, not an error, so it needs a test that
+         * cannot be fooled), and packed rows decode through the one shared
+         * attn_comp_pack_ld.  What KEEPS the f32 online kernel: single-token
+         * indexed decode (n_tokens == 1) and opted-out builds
+         * (PULSAR_CUDA_ATTN_F16=0). */
         if (f16_idx_ok && topk_ptr) {
             static int announced = 0;
             if (!announced) {

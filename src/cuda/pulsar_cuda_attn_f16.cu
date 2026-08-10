@@ -165,14 +165,19 @@ static void attn_f16_kernel(
     }
 
     /* ---- row plan ------------------------------------------------------
-     * Two modes.  Dense window (topk == NULL) is the raw/mixed launchers'
-     * contiguous causal window.  INDEXED mode reproduces
-     * attention_indexed_mixed_heads8_online_kernel's plan verbatim: the raw
-     * rows come out of a ring buffer (hence the modulo and the row table) and
-     * the compressed rows are a top-k SELECTION, not a prefix.  This launcher
-     * refuses the banked-descriptor and ATTN_PACK variants, so the qpos /
-     * raw_base / comp_base terms of that kernel collapse to the scalar path
-     * -- which is exactly the case its own comment documents as equivalent. */
+     * Two modes.  Dense window (topk == NULL, ring == 0) is the raw/mixed
+     * launchers' contiguous causal window.  RING mode reproduces
+     * attention_indexed_mixed_heads8_online_kernel's plan verbatim: raw rows
+     * come out of a ring buffer (hence the modulo and the row table) and the
+     * compressed rows are either a top-k SELECTION (topk != NULL) or the
+     * visible prefix (topk == NULL -- the continued-prefill sweep).  The
+     * banked-descriptor variant (positions/seq_id/comp_bank_ptrs) and
+     * ATTN_PACK comp rows are both served: the preamble below derives the
+     * per-row qpos / raw_base / comp_src byte-for-byte as the f32 kernel
+     * does, and NULL descriptors collapse every term to the scalar
+     * pos0+t path.  Bank isolation is gated by
+     * tests/attn_f16_banked_test.cu; pack decode goes through the shared
+     * attn_comp_pack_ld. */
     __shared__ uint32_t sRawRows[256];
     __shared__ uint32_t sRawCount, sRawFirst;
     __shared__ uint32_t sVisComp;
@@ -491,8 +496,9 @@ static int af16_device_supported(void) {
 
 /* Only the fp16 tier consumes packed comp rows on the multi-token
  * single-sequence path; the f32 indexed kernel's own gate refuses them there
- * (descr || !comp_kv_pack || n_tokens == 1).  So this answers for the tier
- * that is actually going to run. */
+ * (descr || !comp_kv_pack || n_tokens == 1 || f16_idx_ok -- the last term IS
+ * this function, widening the gate for the tier that reads pack natively).
+ * So this answers for the tier that is actually going to run. */
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     static int on = -1;
     if (on < 0) on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && af16_device_supported();
@@ -521,10 +527,12 @@ int pulsar_gpu_attention_f16_prefill(
     }
 }
 
-/* Indexed variant: compressed rows are a top-k SELECTION and raw rows come from
- * a ring buffer.  Refuses the banked-descriptor and ATTN_PACK variants rather
- * than approximating them -- the caller checks those and keeps the f32 kernel
- * for them, so a 0 here is a real failure. */
+/* Indexed variant: raw rows come from a ring buffer; compressed rows are a
+ * top-k SELECTION (topk != NULL) or the visible prefix (topk == NULL).
+ * Banked descriptors are all-or-nothing (positions+seq_id+comp_bank_ptrs
+ * together or none -- a partial set is refused rather than guessed at), and
+ * ATTN_PACK comp rows are read natively via comp_pack.  A 0 here is a real
+ * failure, never a silent shape demotion. */
 int pulsar_gpu_attention_f16_indexed(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv, const int *topk,
