@@ -839,7 +839,15 @@ typedef struct {
  * c71a49ac9316db02eaa6322dee2c919e6de1e792).  Reimplemented from scratch
  * against this engine's packed MXFP8/MXFP4 KV layout; no Entrpi code was
  * copied. */
-#define PULSAR_MSEQ_MAX 8u
+/* Raised 8 -> 16 (2026-08-10): banks are WARM-STATE slots, not decode
+ * streams — decode throughput saturates ~4 concurrent streams, but every
+ * bank beyond that keeps another conversation's KV warm between turns
+ * instead of evicting it.  imatrix's run-head structure documents <= 16 as
+ * its bound; the batched custom-nt matmul lane and the split-KV decode
+ * gate still cap their fast paths at 8 rows, so a step with >8
+ * simultaneously-decoding sessions takes the slower lane (correct, and
+ * rare at the ~4-stream saturation point). */
+#define PULSAR_MSEQ_MAX 16u
 
 /* Fixed per-bank KV slabs: per layer, one contiguous allocation per cache
  * kind, bank-major, stride = one bank's single-session capacity.  When the

@@ -390,8 +390,27 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     int best_common = -1;
     session_slot *bound = NULL;   /* thinking-binding match (preference 2) */
     size_t bound_visible = 0;     /* longest key = most recent frontier */
+    static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
+        if (route_debug) {
+            const int dbg_common = sl->provisioned && !sl->active_job
+                ? s->slot_common_prefix(sl, &j->req.prompt) : -1;
+            const pulsar_tokens *bank_toks = sl->provisioned
+                ? pulsar_session_bank_tokens(s->sess, sl->bank) : NULL;
+            const int bt = (bank_toks && dbg_common >= 0 &&
+                            dbg_common < bank_toks->len) ? bank_toks->v[dbg_common] : -1;
+            const int pt = (dbg_common >= 0 && dbg_common < j->req.prompt.len)
+                ? j->req.prompt.v[dbg_common] : -1;
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: route-scan slot %d bank %u: active=%d "
+                       "provisioned=%d ctx=%d needed=%d frontier=%d common=%d "
+                       "bank[c]=%d prompt[c]=%d",
+                       i, sl->bank, sl->active_job != NULL, (int)sl->provisioned,
+                       sl->ctx_size, needed,
+                       sl->provisioned ? s->slot_frontier_pos(sl) : -1,
+                       dbg_common, bt, pt);
+        }
         if (sl->active_job || !sl->provisioned) continue;
         if (sl->ctx_size < needed) continue;
         const size_t visible =
@@ -434,6 +453,18 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j),
                                              refusal);
         if (fresh) return fresh;
+        /* Pool full of idle stale banks: without eviction HERE, every new
+         * conversation falls through to the same trivial-match bank and
+         * clobbers it serially while the other banks sit pinned with dead
+         * state forever — measured 2026-08-10: an 8-bank pool pre-churned by
+         * 12 one-shots served every later conversation cold off bank 1, and
+         * warm-turn TTFT never engaged (2.35 s vs the 0.6 s a fresh pool
+         * gives).  Evict an LRU idle bank (live-tool owners protected, no
+         * trunk to preserve) and retry once, mirroring the fork path. */
+        if (*refusal == PROVISION_REFUSED_POOL_FULL && s->fork_make_room(NULL)) {
+            fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
+            if (fresh) return fresh;
+        }
     }
     /* plan-33 inc B/D: warm FORK routing. `best`'s committed history shares a
      * token prefix `best_common` with the request (validated bit-for-bit inside
@@ -876,10 +907,12 @@ int server::pick_superseded_idle(const bool *protect) {
  * true when a bank was freed. */
 bool server::fork_make_room(const session_slot *trunk) {
     auto *s = this;
-    if (s->pool_banks <= 0 || !trunk) return false;
+    if (s->pool_banks <= 0) return false;
     bool protect[PULSAR_SESSION_POOL_CAP];
     s->worker_protect_queued_owner_slots(protect);      /* live-tool owners */
-    const int ti = (int)(trunk - s->slots);
+    /* trunk == NULL is the FRESH-SLOT caller: a new conversation that
+     * matched nothing worth keeping, so only live owners are protected. */
+    const int ti = trunk ? (int)(trunk - s->slots) : -1;
     if (ti >= 0 && ti < PULSAR_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
     const int sup = s->pick_superseded_idle(protect);
     if (sup >= 0) {

@@ -753,7 +753,18 @@ typedef struct {
  * conversation's warm KV) AND the packed-KV admission budget still has room.
  * A single client therefore always runs on slot 0, byte-identical to the
  * increment-2 single-session server. */
-#define PULSAR_SESSION_POOL_CAP 5
+/* Raised 5 -> 8 (2026-08-10): banks are warm-state slots, not decode
+ * streams, and 5 was below the fast-lane boundary for no reason.  8 is the
+ * measured sweet spot: the batched custom-nt matmul lane and the split-KV
+ * decode gate cap their fast paths at 8 rows, and N=12 aggregate decode
+ * holds 29.2 tok/s at 8 banks vs 21.9 at 12 (the >8-row steps fall to the
+ * slow lanes).  The engine allows up to PULSAR_MSEQ_MAX=16 via an operator
+ * PULSAR_MSEQ_BANKS pin for TTFT-focused deploys that accept that cliff.
+ * KNOWN LIMIT, measured: with active conversations == banks, pool-full
+ * eviction is LRU and cyclic traffic evicts exactly the next returning
+ * conversation's bank (domino, everyone cold); warm reuse needs headroom
+ * (convs < banks) until the victim policy is smarter than LRU. */
+#define PULSAR_SESSION_POOL_CAP 8
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;

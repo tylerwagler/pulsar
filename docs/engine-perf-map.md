@@ -486,3 +486,35 @@ depth).  Every scenario is an honest cold ~295k prefill -- TEB nonces the
 filler per scenario specifically to defeat prefix caches -- and serving
 sustained ~900+ tok/s prefill at that depth (~420 s/scenario end to end).
 Deep-context tool-calling coherence: no measurable degradation.
+
+## Bank pool revisited (2026-08-10): 5 -> 8 default, and the LRU domino
+
+Banks are warm-state slots, not decode streams.  Decode saturates ~4
+concurrent streams, but each bank keeps one conversation's KV warm between
+turns: with enough banks, a returning turn costs ~0.6 s TTFT (suffix-only
+prefill) instead of ~2.35 s (full re-prefill) — tools/multiturn_ttft.py
+measures it (N conversations x T turns, round-robin).
+
+Measured (12-way one-shot aggregate / multi-turn warm TTFT):
+    5 banks:  agg 29.9   12 convs multi-turn: all cold (thrash)
+    8 banks:  agg 29.2   convs < banks: warm (0.57 s turn-2 median)
+    12 banks: agg 21.9   12 convs: warm — but >8-row batched steps fall off
+              the custom-nt matmul and split-KV fast lanes (-25% aggregate)
+
+Default POOL_CAP is now 8 (the fast-lane boundary); PULSAR_MSEQ_MAX raised
+to 16 so an operator pin can trade the lane cliff for warm capacity.
+
+Two scheduler findings the experiment surfaced, one fixed, one open:
+
+1. FIXED: pool-full + trivial match never evicted — every new conversation
+   clobbered the same bank serially while stale banks sat pinned forever
+   (a long-lived server degenerated to ONE effective bank).  The fresh-slot
+   path now LRU-evicts (fork_make_room with no trunk) and retries once.
+2. OPEN: with active conversations == banks, pool-full eviction is LRU and
+   cyclic traffic evicts exactly the NEXT returning conversation's bank —
+   a full domino, everyone cold (measured: 8-on-8 cold, 3-on-8 and 6-on-8
+   warm).  LRU is the worst victim policy for cyclic loads; a smarter
+   victim (e.g. protect banks with live thinking-binds, or score by
+   match-potential) would let capacity == banks.  PULSAR_ROUTE_DEBUG=1 now
+   logs the per-slot scan (ctx/frontier/common + divergence token ids) —
+   the instrumentation that found all of this.
