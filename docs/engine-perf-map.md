@@ -518,3 +518,32 @@ Two scheduler findings the experiment surfaced, one fixed, one open:
    match-potential) would let capacity == banks.  PULSAR_ROUTE_DEBUG=1 now
    logs the per-slot scan (ctx/frontier/common + divergence token ids) —
    the instrumentation that found all of this.
+
+### LRU domino: fixed for capacity == banks (2026-08-10), one residual open
+
+Three stacked causes, three fixes (tools/multiturn_ttft.py is the gate):
+
+1. PHANTOM SLOT 0: routing sends the first conversation "in place" to the
+   boot slot, but it actually lands on bank 1 — slot 0 then counts as
+   provisioned-but-empty forever, so effective capacity was banks-1 and the
+   Nth conversation seeded the first live eviction.  provision_bank now
+   reuses provisioned-but-EMPTY idle banks (frontier <= 1) as free capacity
+   without a second ledger charge.
+2. LIVE EVICTION FOR FORKS: the fork path's make-room now takes SUPERSEDED
+   victims only; when the pool is genuinely full of live banks, a partial
+   continuation advances IN PLACE on its own trunk
+   (pulsar_session_bank_fork_partial src == dst, the engine's documented
+   truncate-reuse degenerate) — nobody's warm state dies for a fork.
+3. SLOTS OVERRUN: an engine PULSAR_MSEQ_BANKS pin above the server slot cap
+   walked slots[] out of bounds (latent since the 5-slot era).  The array is
+   now sized to PULSAR_MSEQ_MAX=16 with a clamp+warning; auto-sizing stays
+   capped at 8 (PULSAR_SESSION_POOL_AUTO_MAX, the fast-lane boundary).
+
+Measured after: 8-on-8 and pinned 12-on-12 multi-turn both fully warm from
+a fresh boot (turn-2 median 0.56 s vs 2.35 s cold; zero stragglers), 12-way
+aggregate unchanged at 29.0, 9-on-8 overload degrades to ordinary thrash.
+
+OPEN RESIDUAL: capacity == banks goes cold again when the pool was heavily
+churned by one-shots BEFORE the multi-turn load (repro: conc.py 12 then
+multiturn 8 on one boot; fresh-boot multiturn 8 is warm).  Same tooling
+applies (PULSAR_ROUTE_DEBUG=1); not yet diagnosed.

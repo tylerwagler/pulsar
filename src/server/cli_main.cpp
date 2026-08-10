@@ -752,7 +752,7 @@ int main(int argc, char **argv) {
      * pulsar_engine_session_cost_bytes call (gpu_graph_bank_pool_n caches
      * PULSAR_MSEQ_BANKS on first read); the fit probe uses the _banked cost variant,
      * which prices an explicit N without touching that cache. */
-    const int pool_auto_max = PULSAR_SESSION_POOL_CAP; /* throughput saturates ~4 */
+    const int pool_auto_max = PULSAR_SESSION_POOL_AUTO_MAX; /* fast-lane boundary */
 
     /* Tier-2 overcommit (task #55, increment 1). Precompute the per-bank split of
      * the banked session cost into an EAGER floor (raw ring + state lanes +
@@ -980,7 +980,16 @@ int main(int argc, char **argv) {
      * bookkeeping. In classic mode (pool_banks==0) slot 0 is the only slot —
      * a job needing another one queues. */
     const int pool_banks = pulsar_session_bank_count(session);
-    s.pool_banks = pool_banks > 1 ? pool_banks : 0;
+    /* Hard clamp to the slots array: an engine-side PULSAR_MSEQ_BANKS pin
+     * beyond POOL_CAP used to walk the server's slots[] out of bounds. */
+    int pool_banks_clamped = pool_banks;
+    if (pool_banks_clamped > PULSAR_SESSION_POOL_CAP) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: engine bank pool %d clamped to slot cap %d",
+                   pool_banks_clamped, PULSAR_SESSION_POOL_CAP);
+        pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
+    }
+    s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
     s.live_bank = 0;
     /* Three-way scheduler knob (worker_main): decode banks <= spec_max_live run
      * the per-bank spec/plain time-slice lane; more than that batch. DATA-SET

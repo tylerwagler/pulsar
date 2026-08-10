@@ -764,7 +764,15 @@ typedef struct {
  * eviction is LRU and cyclic traffic evicts exactly the next returning
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
-#define PULSAR_SESSION_POOL_CAP 8
+#define PULSAR_SESSION_POOL_CAP 16
+/* Auto-sizing cap: the batched custom-nt matmul lane and the split-KV decode
+ * gate cap their fast paths at 8 rows, and N=12 aggregate decode holds 29.2
+ * tok/s at 8 banks vs 21.9 at 12 (>8-row steps fall to the slow lanes) — so
+ * the DEFAULT config never auto-sizes past 8.  POOL_CAP above is the hard
+ * array bound = PULSAR_MSEQ_MAX, so an operator PULSAR_MSEQ_BANKS pin up to
+ * 16 is safe (it was an out-of-bounds walk when the pin exceeded the array,
+ * a latent bug up to and including the 5-slot era). */
+#define PULSAR_SESSION_POOL_AUTO_MAX 8
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
  * keep the default per-session context far below the lone-session maximum;
@@ -1205,7 +1213,7 @@ struct server {
     bool enqueue(job *j);
     void close_resources();
     bool bank_switch(int bank);
-    bool fork_make_room(const session_slot *trunk);
+    bool fork_make_room(const session_slot *trunk, bool superseded_only = false);
     bool bank_restore_spilled(int bank);
     int pick_superseded_idle(const bool *protect);
     bool spill_bank(session_slot *victim);

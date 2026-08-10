@@ -212,8 +212,29 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     auto *s = this;
     *refusal = PROVISION_OK;
     int idx = -1;
+    bool recharge = true;
     for (int i = 1; i < s->pool_banks; i++) {     /* bank 0 == slot 0, pinned */
         if (!s->slots[i].provisioned) { idx = i; break; }
+    }
+    if (idx < 0) {
+        /* No never-provisioned slot.  A provisioned-but-EMPTY idle bank
+         * (frontier <= 1) is free capacity wearing a "provisioned" coat:
+         * the boot slot-0 phantom (routing sends the first conversation
+         * "in place" to slot 0 but it actually lands on bank 1, and slot 0
+         * then counts against the pool forever — measured 2026-08-10, the
+         * seed of the LRU domino at capacity == banks) and any evict-reset
+         * leftover.  Reuse it WITHOUT a second ledger charge; slot 0 is
+         * eligible here because an empty bank carries no classic-session
+         * state to protect. */
+        for (int i = 0; i < s->pool_banks; i++) {
+            session_slot *c = &s->slots[i];
+            if (c->provisioned && !c->active_job &&
+                s->slot_frontier_pos(c) <= 1) {
+                idx = i;
+                recharge = false;
+                break;
+            }
+        }
     }
     if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
     /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
@@ -248,12 +269,15 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     sl->committed_pos = 0;
     sl->state = SLOT_IDLE;
     sl->ctx_size = s->slots[0].ctx_size;          /* every bank shares pool ctx */
-    sl->est_cost_bytes = s->bank_marginal_bytes;
+    /* A reused empty bank keeps its original ledger charge (slot 0's boot
+     * cost is not the pooled marginal); only a first-time provision prices
+     * at the marginal. */
+    if (recharge) sl->est_cost_bytes = s->bank_marginal_bytes;
     sl->tokens_emitted = 0;
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     sl->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->mu);
-    s->kv_committed_bytes += s->bank_marginal_bytes;
+    if (recharge) s->kv_committed_bytes += s->bank_marginal_bytes;
     if (idx >= s->n_slots) s->n_slots = idx + 1;
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_DEFAULT,
@@ -452,7 +476,15 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         }
         session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j),
                                              refusal);
-        if (fresh) return fresh;
+        if (fresh) {
+            if (route_debug)
+                server_log(PULSAR_LOG_DEFAULT,
+                           "pulsar-server: route-branch: FRESH bank %u "
+                           "(best_common %d, best %d)",
+                           fresh->bank, best_common,
+                           best ? (int)best->bank : -1);
+            return fresh;
+        }
         /* Pool full of idle stale banks: without eviction HERE, every new
          * conversation falls through to the same trivial-match bank and
          * clobbers it serially while the other banks sit pinned with dead
@@ -506,9 +538,40 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         provision_refusal fr;
         session_slot *dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
         if (!dst && fr == PROVISION_REFUSED_POOL_FULL &&
-            s->fork_make_room(best)) {
-            /* Freed one non-trunk victim; the trunk was protected. Retry once. */
+            s->fork_make_room(best, /*superseded_only=*/true)) {
+            /* Freed a SUPERSEDED victim; the trunk was protected. Retry once.
+             * Live banks are never evicted for a fork: under cyclic
+             * multi-tenant traffic the LRU live bank is exactly the next
+             * returning conversation (the measured domino), and the partial
+             * case has a strictly better option below — advance IN PLACE. */
             dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
+        }
+        if (!dst && partial && fr == PROVISION_REFUSED_POOL_FULL) {
+            /* Pool full of LIVE banks: consume the requester's OWN trunk
+             * instead of evicting anyone — pulsar_session_bank_fork_partial
+             * with src == dst is the engine's documented in-place
+             * truncate-reuse degenerate (cut to the R-aligned common, then
+             * re-prefill only the suffix).  This is what makes capacity ==
+             * banks WORK: every returning conversation advances its own bank
+             * warm, nobody's state dies.  The trunk is not preserved for
+             * siblings — at a full pool that luxury costs another
+             * conversation its warmth. */
+            const int rc = pulsar_session_bank_fork_partial(
+                    s->sess, best->bank, best->bank,
+                    j->req.prompt.v, best_common);
+            if (rc == 0) {
+                best->committed_pos = pulsar_session_bank_pos(s->sess, best->bank);
+                server_log(PULSAR_LOG_DEFAULT,
+                           "pulsar-server: warm-advance-in-place: bank %u cut "
+                           "(frontier %d, common %d) resume %d; no eviction",
+                           best->bank, frontier, best_common,
+                           best->committed_pos);
+                *clobbers = false;
+                return best;
+            }
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: warm-advance-in-place refused (bank %u); "
+                       "falling through", best->bank);
         }
         if (dst && dst != best) {
             pulsar_session *pool = s->sess;
@@ -905,7 +968,7 @@ int server::pick_superseded_idle(const bool *protect) {
  * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
  * body (snapshot + ledger release + bank reset). Worker thread only; returns
  * true when a bank was freed. */
-bool server::fork_make_room(const session_slot *trunk) {
+bool server::fork_make_room(const session_slot *trunk, bool superseded_only) {
     auto *s = this;
     if (s->pool_banks <= 0) return false;
     bool protect[PULSAR_SESSION_POOL_CAP];
@@ -921,10 +984,16 @@ bool server::fork_make_room(const session_slot *trunk) {
         for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) only[i] = (i != sup);
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: warm-fork make-room: evicting LRU-superseded bank %u "
-                   "(trunk bank %u preserved)", s->slots[sup].bank, trunk->bank);
+                   "(trunk bank %u preserved)",
+                   s->slots[sup].bank, trunk ? trunk->bank : (uint32_t)-1);
         return s->worker_evict_one(only);
     }
-    /* No superseded victim: plain LRU among unprotected idle, trunk still safe. */
+    /* No superseded victim.  superseded_only callers stop here: evicting a
+     * LIVE conversation's bank under cyclic multi-tenant traffic hits
+     * exactly the next returning conversation (the LRU domino, measured
+     * 2026-08-10) — those callers have a better option (advance in place). */
+    if (superseded_only) return false;
+    /* Plain LRU among unprotected idle, trunk still safe. */
     return s->worker_evict_one(protect);
 }
 
