@@ -63,25 +63,28 @@ This fork also stands on:
 
 ## Status
 
-This is **beta quality**, but a first release has shipped: the
-measured-allocation DeepSeek-V4-Flash GGUF (the `v5mx` build) and the
-`pulsar-server` engine that serves it. The inference path, the MXFP4/MXFP8/IQ2
-quantization, and speculative decoding are validated against the tests in this
-tree and the `tool-eval-bench` quality suite — a 4-seed run of the
-shipping build averages ~90/100 with hardmode included (range 87–92 across seeds).
-v0.3.1 was re-verified **quality-neutral** versus v0.2.3 on the full 84-scenario
-hardmode suite (every committed change — the f32→BF16 residual carrier included —
-within seed noise, no regression cluster).
-**v0.3.1** is the current release — the first shippable v0.3.x. It brings the v0.3
-engine work (Tier-2 batched multi-session decode, KV overcommit with proactive
-eviction, the head-grouped decode-attention kernel, and the f32→BF16 residual
-carrier) together with the pooled-routing and KV round-trip fixes that stabilized
-the line: a divergent prompt match now routes to a fresh bank instead of
-clobbering a live one (plus a live-lock follow-up), and two round-trip fixes
-eliminate deep cold re-prefills for agentic clients that replay reasoning
-(opencode) or strip it (openwebui). It also adds the
-`--served-model-id`/`--served-model-name` flags and a default bank-pool cap of 5
-(4 concurrent conversations plus the pinned base).
+This is **beta quality**, but releases ship regularly. The current release
+serves the **v4 (0731) artifact** — DeepSeek-V4-Flash-0731 weights, the full
+256-expert set, the matching 0731 DSpark drafter merged in-file, and the
+type-43 `IQ2_XXS_MMQ` aligned pre-store (see Model Weights). The inference
+path, the MXFP4/MXFP8/IQ2 quantization, and speculative decoding are validated
+against the tests in this tree and the `tool-eval-bench` quality suite — the
+pinned TEB score is 84-85, level with the strongest competing GB10 engine, and
+the 84-scenario short set scores identically at 0 and at ~295k tokens of live
+context pressure.
+This release line moves the engine onto the tensor cores end to end: the
+vendored-MMQ D2R path runs every 2-bit routed-expert GEMM on the tensor cores,
+prefill attention is fp16 tensor-core on all paths, the indexer scorer runs
+block-scaled MXFP4, and split-KV decode attention lifts shallow-context decode
+— cold prefill now holds ~900-950 t/s from 2k through 32k (see Speed). On the
+serving side it adds the 0731 three-level reasoning-effort scheme, the
+Anthropic `web_search` server tool (backed by a SearXNG endpoint you point it
+at), request-latency/admission metrics, and an 8-bank warm-state pool (up from
+5; see Model residency).
+Earlier lines: v0.3.x brought Tier-2 batched multi-session decode, KV
+overcommit with proactive eviction, and the pooled-routing and KV round-trip
+fixes that stabilized agentic serving; v0.3.1 was re-verified quality-neutral
+versus v0.2.3 on the full 84-scenario hardmode suite.
 Model serving is
 a large surface, so rough edges remain; we keep the project usable and are
 actively hardening it. If you hit a problem, run `pulsar-server --trace
@@ -350,10 +353,13 @@ stored in the type-41 **MXFP8_LT** swizzle and loaded zero-copy (no runtime
 repack cache), and the type-40 W4A8 expert path runs the rich layers on the
 tensor cores.
 
-**KV state, in v0.3.1, is overcommitted rather than fully charged.** The default
+**KV state is overcommitted rather than fully charged** (since v0.3.1). The default
 context is **1M tokens** with **overcommit ON**: a small pool of banks (auto-sized,
-up to 5 as of v0.3.1 — 4 concurrent conversations plus a pinned base bank) comes
-up "grow-to-1M-capable," but only the *eager floor* (raw sliding
+up to 8 by default — banks are warm-state slots, not decode streams, and 8 is the
+fast-lane boundary: the batched matmul lane and split-KV decode cap their fast
+paths at 8 rows, so the default never auto-sizes past it; an operator
+`PULSAR_MSEQ_BANKS` pin up to 16 is allowed for TTFT-focused deploys that accept
+the >8-row slow-lane cliff) comes up "grow-to-1M-capable," but only the *eager floor* (raw sliding
 window + state lanes + drafter) is charged at admission — the ctx-scaled
 compressed-KV/indexer term is virtual-address-only, made physical on touch. A
 short session pays only for the KV it actually uses. Banks that genuinely grow
@@ -381,7 +387,9 @@ At startup, before the listener accepts requests, the server logs the overcommit
 fit table and runs a short warmup generation that materializes the
 first-generation CUDA working set (~7.2 GiB). Warmup lets admission measure the
 *actual* memory cost of a slot rather than estimate it. At the 1M default the
-boot log reads, for example:
+boot log reads, for example (this capture is from an earlier 5-bank-default
+build; the current default auto-sizes up to 8 banks, and the GiB figures vary
+with the artifact — the shape of the ledger is what matters):
 
 ```text
 Tier-2 pool fit table (budget 14.0 GiB, cap 5 banks):
@@ -399,7 +407,7 @@ Tier-2 2b guard ENABLED: touched budget 7.69 GiB (kv budget 13.95 - eager 6.26),
 
 Without overcommit the 1M context would admit a single session (the full-charge
 fit table shows only 2 banks fit even at the 1M ceiling); with overcommit the
-same box brings up all 5 banks at the eager floor and lets each grow into its
+same box brings up the full bank pool at the eager floor and lets each grow into its
 touched budget under the eviction guard. Admission is driven by this measured
 ledger, not a fixed slot count. (Prefill numbers are effectively post-warmup —
 the first real request already has its working set resident, which is why cold
@@ -553,7 +561,8 @@ Supported endpoints:
 - `POST /v1/completions` — OpenAI-compatible
 - `POST /v1/responses` — OpenAI Responses (Codex CLI)
 - `POST /v1/messages` — Anthropic-compatible (Claude Code style clients)
-- `GET /metrics` — Prometheus counters (spec-decode acceptance, token totals)
+- `GET /metrics` — Prometheus counters (spec-decode acceptance, token totals,
+  request latency, per-slot generation phase, pool churn and admission pressure)
 
 `GET /v1/models/{id}` accepts any id (`deepseek-v4-flash`, `deepseek-v4-pro`)
 as a compatibility alias: it reports the model actually loaded from the GGUF
@@ -678,6 +687,27 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "stream":true
   }'
 ```
+
+### Web search server tool
+
+Anthropic-style clients (Claude Code among them) advertise web search as a
+**server** tool — the request carries a `{"type":"web_search_20250305"}` tool
+entry and expects the backend to run the search mid-request. Point the server
+at a SearXNG-compatible JSON endpoint and it will:
+
+```sh
+./pulsar-server --web-search-url http://searxng.local:8888   # or PULSAR_WEB_SEARCH_URL
+```
+
+With a backend configured, `web_search_*` tool entries are recognized and
+rendered to the model as a real callable tool; when the model calls it, the
+server runs the query itself (bounded plain-HTTP GET, top-8 results, 8 s I/O
+timeout, 2 MiB body cap) and splices the results into the transcript before
+generation continues, honoring the tool entry's `max_uses` (default 8 per
+request). **Without** `--web-search-url` the entry is dropped at parse time, so
+the model never emits search calls nobody can execute. The search runs on the
+serving thread, so a slow search backend can stall other sessions for up to
+the I/O timeout — keep the endpoint local.
 
 ### Agent Client Usage
 
@@ -1162,19 +1192,6 @@ dropped as measurements come in.
 
 ### Near term (v1.x)
 
-- **Temperature-matched draft sampling.** Today drafts are proposed greedily
-  and verified with exact sampled acceptance against the target distribution.
-  The next step is to sample drafts from a real q-distribution built at the
-  request's sampling parameters, with a fused GPU p/q rejection verify:
-  accept with probability `min(1, p/q)`, sample the `(p - q)+` residual on
-  rejection. This is expected to roughly double draft acceptance at
-  temperature compared to greedy drafts. Prior art: the p/q scheme from the
-  DSpark paper, and Marco Palaferri's independent GB10 fork
-  ([xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA),
-  MIT) as a reference implementation. Our version will keep the
-  exact-output-distribution property under top-k/top-p/min-p filtering, and
-  the statistical oracle used to validate sampled acceptance will be
-  extended to the p/q case.
 - **Fused K-row GPU accept kernel.** The sampled verify currently reads
   per-row logits back to the host; a fused accept kernel removes that
   readback from the decode loop.
@@ -1185,18 +1202,16 @@ dropped as measurements come in.
   native agent loop, with rewind-on-forced-token handling so injected
   protocol tokens do not desynchronize the drafter.
 
-The measured-allocation release artifact has **shipped** (the `v5mx` build; see
-Model Weights and Speed above); it is no longer a near-term roadmap item.
+Shipped and off the roadmap: the measured-allocation release artifact (the
+`v5mx` build, then the v4/0731 line), **temperature-matched draft sampling**
+(drafts are now sampled from the drafter's own distribution at the request's
+sampling parameters and verified with exact `min(1, p/q)` acceptance —
+see Speculative decoding), **batched multi-session decode** (Tier-2, since
+v0.3.1 — see Server), and the **CPU inference path retirement** (deleted;
+the engine is CUDA-only end to end).
 
 ### Longer term
 
-- **Batched multi-session decode.** Concurrent sessions are served today by
-  time-slicing one engine lane (a session pool with round-robin scheduling,
-  KV-budget admission control, and LRU eviction to a disk KV cache). The next
-  step is a batched decode step so co-scheduled sessions share a single read of
-  the weights: decode is weight-bandwidth-bound, so aggregate throughput should
-  scale toward ~N× (early engine-level measurements show ~1.7× at three
-  sessions before it saturates).
 - **MXFP6 tensor-core paths**, if measured demand holds. MXFP6 (E2M3) is
   expected to beat `Q6_K` on quality-per-byte for FP8-source tensors.
 - **MoE verify-microbatch routing audit.** Verify batches are only a few
@@ -1208,10 +1223,8 @@ Model Weights and Speed above); it is no longer a near-term roadmap item.
   builder without a CUTLASS bump) would remove that readback and the
   per-expert launch overhead — a prefill-only win, worth profiling first
   since prefill is already competitive.
-- **Retire the remaining CPU compute paths.** The engine is CUDA-only; the
-  leftover host-side decode code inherited from upstream should go. In the
-  same pass, revisit the Q8_K activation quantization used by the MoE
-  kernels.
+- **Revisit the Q8_K activation quantization** used by the MoE kernels (the
+  CPU inference path itself is already gone).
 - **Upstream quantization-pipeline fixes.** Offer the fixes developed here
   for the measured-KL allocation pipeline — Fisher-proxy normalization,
   footprint accounting, solver corrections, DP decision units — to the
