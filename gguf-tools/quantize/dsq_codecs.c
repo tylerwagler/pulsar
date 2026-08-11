@@ -63,10 +63,20 @@ float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64_t *n_o
     const int64_t in_dim = w->shape[1];
     const int64_t block_out = 128;
     const int64_t block_in = 128;
+    if (out_dim <= 0 || in_dim <= 0) die("FP8 dims must be positive");
     if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
     const int64_t scale_rows = out_dim / block_out;
     const int64_t scale_cols = in_dim / block_in;
     if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* The loop bounds come from the header shape while data comes from
+     * data_offsets; a shape declared over a short data range is heap OOB
+     * (upstream ds4 a968c08). */
+    if ((uint64_t)out_dim > SIZE_MAX / sizeof(float) / (uint64_t)in_dim)
+        die("FP8 tensor shape overflows");
+    if (w->nbytes < (uint64_t)out_dim * (uint64_t)in_dim)
+        die("FP8 weight bytes shorter than the declared shape");
+    if (scale->nbytes < (uint64_t)scale_rows * (uint64_t)scale_cols)
+        die("FP8 scale bytes shorter than the declared shape");
     float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
     for (int64_t ob = 0; ob < scale_rows; ob++) {
         for (int64_t ib = 0; ib < scale_cols; ib++) {
@@ -93,10 +103,18 @@ float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64_t *n_o
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP4 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t packed_in = w->shape[1];
+    if (out_dim <= 0 || packed_in <= 0) die("FP4 dims must be positive");
+    if (packed_in > INT64_MAX / 2) die("FP4 packed dim overflows");
     const int64_t in_dim = packed_in * 2;
     if (in_dim % 32) die("FP4 in_dim is not divisible by 32");
     const int64_t n_blocks = in_dim / 32;
     if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) die("FP4 scale shape mismatch");
+    if ((uint64_t)out_dim > SIZE_MAX / sizeof(float) / (uint64_t)in_dim)
+        die("FP4 tensor shape overflows");
+    if (w->nbytes < (uint64_t)out_dim * (uint64_t)packed_in)
+        die("FP4 weight bytes shorter than the declared shape");
+    if (scale->nbytes < (uint64_t)out_dim * (uint64_t)n_blocks)
+        die("FP4 scale bytes shorter than the declared shape");
     float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
     for (int64_t r = 0; r < out_dim; r++) {
         for (int64_t b = 0; b < n_blocks; b++) {

@@ -259,6 +259,8 @@ bool str_starts(const char *s, const char *prefix);
 bool str_ends(const char *s, const char *suffix);
 char *read_file(const char *path, size_t *len_out);
 uint64_t read_u64_le_fp(FILE *fp, const char *what);
+uint64_t bytes_remaining_fp(FILE *fp, const char *what);
+uint64_t read_checked_len_fp(FILE *fp, const char *what);
 uint32_t read_u32_le_fp(FILE *fp, const char *what);
 int32_t read_i32_fp(FILE *fp, const char *what);
 uint16_t load_u16_le(const uint8_t *p);

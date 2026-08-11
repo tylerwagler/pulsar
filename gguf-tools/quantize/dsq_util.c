@@ -90,6 +90,30 @@ uint64_t read_u64_le_fp(FILE *fp, const char *what) {
     return v;
 }
 
+/* Bytes between the cursor and EOF.  File-declared lengths must be checked
+ * against this before allocation (upstream ds4 a968c08/c7689db): a corrupt
+ * length near UINT64_MAX otherwise wraps the +1 in the alloc and the
+ * following fread heap-overflows a tiny buffer with the rest of the file. */
+uint64_t bytes_remaining_fp(FILE *fp, const char *what) {
+    off_t pos = ftello(fp);
+    if (pos < 0) die_errno("ftello", what);
+    if (fseeko(fp, 0, SEEK_END) != 0) die_errno("fseeko", what);
+    off_t end = ftello(fp);
+    if (end < 0) die_errno("ftello", what);
+    if (fseeko(fp, pos, SEEK_SET) != 0) die_errno("fseeko", what);
+    return end >= pos ? (uint64_t)(end - pos) : 0;
+}
+
+uint64_t read_checked_len_fp(FILE *fp, const char *what) {
+    uint64_t n = read_u64_le_fp(fp, what);
+    if (n > bytes_remaining_fp(fp, what)) {
+        fprintf(stderr, "error: %s %llu exceeds the remaining file bytes\n",
+                what, (unsigned long long)n);
+        exit(1);
+    }
+    return n;
+}
+
 uint32_t read_u32_le_fp(FILE *fp, const char *what) {
     uint32_t v;
     if (fread(&v, 1, sizeof(v), fp) != sizeof(v)) {

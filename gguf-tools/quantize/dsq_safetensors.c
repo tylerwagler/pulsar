@@ -18,7 +18,9 @@ static void parse_shape(const json_doc *d, int arr_tok, st_info *info, const cha
     int nd = 0;
     for (int i = arr_tok + 1; i < d->len && d->v[i].parent == arr_tok; i = json_skip(d, i)) {
         if (nd >= MAX_DIMS) die("too many safetensors dimensions");
-        info->shape[nd++] = json_i64(d, i);
+        int64_t dim = json_i64(d, i);
+        if (dim < 0) die("negative safetensors dimension");
+        info->shape[nd++] = dim;
     }
     info->n_dims = nd;
 }
@@ -51,7 +53,7 @@ static void shard_load(shard *s) {
     if (s->loaded) return;
     FILE *fp = fopen(s->path, "rb");
     if (!fp) die_errno("open", s->path);
-    uint64_t header_len = read_u64_le_fp(fp, "safetensors header length");
+    uint64_t header_len = read_checked_len_fp(fp, "safetensors header length");
     char *header = xmalloc((size_t)header_len + 1);
     if (fread(header, 1, (size_t)header_len, fp) != (size_t)header_len) die_errno("read header", s->path);
     header[header_len] = '\0';
@@ -186,6 +188,7 @@ tensor_entry *db_tensor(st_db *db, const char *name, shard **shard_out) {
 st_value db_read(st_db *db, const char *name) {
     shard *s = NULL;
     tensor_entry *te = db_tensor(db, name, &s);
+    if (te->info.end < te->info.begin) die("tensor data_offsets are inverted");
     const size_t nbytes = (size_t)(te->info.end - te->info.begin);
     st_value v = {0};
     v.dtype = xstrdup(te->info.dtype);

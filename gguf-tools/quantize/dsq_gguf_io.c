@@ -26,7 +26,7 @@ static size_t gguf_scalar_size(uint32_t type) {
 }
 
 static char *read_gguf_string_fp(FILE *fp) {
-    uint64_t n = read_u64_le_fp(fp, "GGUF string length");
+    uint64_t n = read_checked_len_fp(fp, "GGUF string length");
     char *s = xmalloc((size_t)n + 1);
     if (n && fread(s, 1, (size_t)n, fp) != (size_t)n) die("short GGUF string read");
     s[n] = '\0';
@@ -54,6 +54,8 @@ static void skip_gguf_value_fp(FILE *fp, uint32_t type) {
         } else {
             size_t sz = gguf_scalar_size(elem_type);
             if (!sz) die("unsupported GGUF array type");
+            if (n > bytes_remaining_fp(fp, "GGUF array") / sz)
+                die("GGUF array size exceeds the remaining file bytes");
             skip_bytes_fp(fp, n * sz);
         }
         return;
