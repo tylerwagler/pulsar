@@ -149,6 +149,9 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     st->active = ok;
     st->orders = &r->tool_orders;
     st->mode = pulsar_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->has_tools = r->has_tools;
+    st->guard_second_reasoning =
+        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
 }
 
@@ -731,6 +734,31 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            /* Second </think> before any tool marker: the held text was
+             * another reasoning pass — emit it as a thinking block. */
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool2 = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool2 || close < tool2)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos) {
+                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
+                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                                  raw + st->emit_pos,
+                                                  limit - st->emit_pos)) return false;
+                    st->sent_thinking = true;
+                }
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool2 && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -896,4 +924,5 @@ void anthropic_sse_round_reset(anthropic_stream *st, bool thinking_enabled) {
     st->checked_think_prefix = false;
     st->open_block = ANTH_BLOCK_NONE;
     st->mode = thinking_enabled ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->guard_second_reasoning = thinking_enabled && st->has_tools;
 }

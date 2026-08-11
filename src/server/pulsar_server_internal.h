@@ -461,6 +461,10 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    /* Thinking+tools: hold tentative answer text after the first </think>
+     * until a tool marker, stream end, or a SECOND close proves whether it
+     * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
+    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -511,6 +515,9 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    /* See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0;
+     * upstream left Responses out, but our leak is identical). */
+    bool guard_second_reasoning;
     bool reasoning_item_opened;
     bool reasoning_item_closed;
     bool reasoning_summary_started;
@@ -581,6 +588,11 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    /* See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0).
+     * has_tools is copied from the request at start so the round reset can
+     * re-arm without a request pointer. */
+    bool guard_second_reasoning;
+    bool has_tools;
     bool sent_thinking;
     bool sent_text;
     anthropic_tool_stream tool;

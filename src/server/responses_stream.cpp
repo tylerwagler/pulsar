@@ -26,6 +26,8 @@ static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
 void responses_stream_init(const request *r, responses_stream *st) {
     memset(st, 0, sizeof(*st));
     st->mode = pulsar_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->guard_second_reasoning =
+        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
     responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
@@ -641,6 +643,41 @@ bool responses_sse_stream_update(int fd, const request *r,
     }
 
     if (st->mode == RESP_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            /* Second </think> before any tool marker: the held text was
+             * another reasoning pass — reroute (or drop, when reasoning
+             * summaries are off) instead of leaking it into output_text. */
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool2 = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool2 || close < tool2)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos && r->reasoning_summary_emit) {
+                    if (!st->reasoning_item_opened) {
+                        st->reasoning_index = st->next_output_index++;
+                        if (!responses_sse_reasoning_added(fd, st)) return false;
+                        st->reasoning_item_opened = true;
+                    }
+                    if (!st->reasoning_summary_started) {
+                        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+                        st->reasoning_summary_started = true;
+                    }
+                    if (!responses_sse_reasoning_delta(fd, st,
+                                                       raw + st->emit_pos,
+                                                       limit - st->emit_pos)) return false;
+                    buf_append(&st->reasoning_text, raw + st->emit_pos,
+                               limit - st->emit_pos);
+                    st->reasoning_emitted_any = true;
+                }
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool2 && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);

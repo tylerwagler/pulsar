@@ -21,7 +21,12 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
         "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+        /* Do not ask the model to OPEN a <think> block the prompt already
+         * opened — that wording provoked a second reasoning pass after the
+         * first </think> (upstream ds4 fe2d3b0). NOTE: changes the rendered
+         * tools-prompt bytes — one-time full re-prefill of cached prefixes on
+         * first request after upgrade. */
+        "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
     buf_puts(b, tool_schemas);

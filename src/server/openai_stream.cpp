@@ -324,6 +324,8 @@ void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = pulsar_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->guard_second_reasoning =
+        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
 }
 
 
@@ -1237,6 +1239,29 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            /* A second </think> before any tool marker means the held text
+             * was another reasoning pass — reroute it. A tool marker or the
+             * final flush releases the hold as genuine answer text. */
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool2 = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool2 || close < tool2)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos &&
+                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                      raw + st->emit_pos,
+                                      limit - st->emit_pos)) return false;
+                if (limit > st->emit_pos) st->sent_reasoning = true;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool2 && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
