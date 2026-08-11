@@ -110,6 +110,42 @@ static void spec_report(const char *tag, spec_snap a, spec_snap b) {
            rounds > 0 ? gen / rounds : 0.0, rounds, gen);
 }
 
+/* Advance one token through the SPECULATIVE machinery with the drafter
+ * contributing nothing: max_tokens=1 clamps K to 0 (session_spec.cpp ~536), so
+ * n_batch = 1+K = 1 and the step still runs gpu_graph_verify_suffix_tops rather
+ * than the plain decode kernels. This is the "1-row spec batch, drafter off"
+ * arm this file's header asks for, so mode 0 can read batch-sourced rows and
+ * compare like with like. Returns the token, or -1 on error.
+ *
+ * MEASURED 2026-08-11 — THIS REPAIR IS INSUFFICIENT, and the measurement is the
+ * point. Running mode 0 through here changes the numerics (top-2 margins move:
+ * pos1 0.4367->0.5422, pos7 0.5151->0.4803), so the batch-vs-decode graph
+ * difference is real. But the divergence does NOT move: still position 7, still
+ * plain=12549 vs spec=114881, prefix still 7/24.
+ *
+ * Holding the entry point constant and varying only the WIDTH isolates the
+ * cause: a 1-row batch still has n_tokens==1 and takes the _vec MoE arms, while
+ * mode 1's 4-row batch takes MMQ (pulsar_cuda_moe.cu ~1389, type-43 has no
+ * non-MMQ fallback). This is positive evidence for the MoE arm split, which
+ * could not be obtained by a no-MMQ control build -- that build cannot load the
+ * artifact at all.
+ *
+ * So "1-row spec batch, drafter off" cannot restore a token-exact hard gate:
+ * the width IS the variable. A true like-with-like mode 0 must be WIDTH-MATCHED
+ * to mode 1 (a 4-row batch), which this API cannot express -- max_tokens=N>1
+ * re-enables the drafter and reintroduces real drafts. Kept as a diagnostic. */
+static int gate_step_batched(pulsar_session *s, float temperature, int top_k,
+                             float top_p, float min_p, uint64_t *rng,
+                             int eos, char *err, size_t errlen) {
+    int toks[2];
+    int k = pulsar_session_generate_speculative(s, temperature, top_k, top_p, min_p,
+                                                rng, /*max_tokens=*/1, eos,
+                                                toks, (int)(sizeof(toks)/sizeof(toks[0])),
+                                                err, errlen);
+    if (k <= 0) return -1;
+    return toks[0];
+}
+
 int main(int argc, char **argv) {
     /* progress must be visible in a redirected log: stdout to a file is
      * block-buffered, which makes a long run look like a hang. */
@@ -184,6 +220,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     const int eos = pulsar_token_eos(engine);
+    /* Mode 0 stays PLAIN DECODE by default: spec-vs-plain is the question a
+     * reader of this gate actually has, and the 1-row batch arm below buys no
+     * hard gate (measured -- see gate_step_batched). Set
+     * PULSAR_SPEC_GATE_MODE0_BATCH=1 for the diagnostic arm. */
+    const bool mode0_batched = getenv("PULSAR_SPEC_GATE_MODE0_BATCH") != NULL;
+    printf("mode 0 arm: %s\n",
+           mode0_batched ? "1-row spec batch (diagnostic; batch-sourced, drafter off)"
+                         : "plain decode (default)");
 
     /* ---- greedy gates ----
      * Plain decode and speculative verify do not run the same MoE kernels on
@@ -255,11 +299,19 @@ int main(int argc, char **argv) {
                 }
                 g = b1 - b2;
             }
-            int tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
-            if (tok == eos) break;
+            int tok;
+            if (mode0_batched) {
+                tok = gate_step_batched(session, 0.0f, 0, 1.0f, 0.0f, &rng, eos,
+                                        err, sizeof(err));
+                if (tok < 0) { fprintf(stderr, "ref batched step: %s\n", err); return 1; }
+                if (tok == eos) break;
+            } else {
+                tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+                if (tok == eos) break;
+                if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
+            }
             ref_gap[nref] = g;
             ref[nref++] = tok;
-            if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
         }
         free(lg);
         const spec_snap g0 = spec_take(engine);
@@ -344,10 +396,19 @@ int main(int argc, char **argv) {
             int got = 0;
             if (mode == 0) {
                 while (got < DEPTH) {
-                    int tok = pulsar_session_sample(session, TEMP, 0, TOP_P, MIN_P, &rng);
-                    dst[got++] = tok;
-                    if (tok == eos) break;
-                    if (got < DEPTH && pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
+                    int tok;
+                    if (mode0_batched) {
+                        tok = gate_step_batched(session, TEMP, 0, TOP_P, MIN_P, &rng,
+                                                eos, err, sizeof(err));
+                        if (tok < 0) { fprintf(stderr, "mode0 batched step: %s\n", err); return 1; }
+                        dst[got++] = tok;
+                        if (tok == eos) break;
+                    } else {
+                        tok = pulsar_session_sample(session, TEMP, 0, TOP_P, MIN_P, &rng);
+                        dst[got++] = tok;
+                        if (tok == eos) break;
+                        if (got < DEPTH && pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
+                    }
                 }
             } else {
                 while (got < DEPTH) {
