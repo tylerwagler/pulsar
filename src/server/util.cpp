@@ -301,7 +301,9 @@ bool json_number(const char **p, double *out) {
 bool json_int(const char **p, int *out) {
     double v = 0.0;
     if (!json_number(p, &v)) return false;
-    if (v < 0) v = 0;
+    /* strtod accepts nan/inf lexemes; (int)NaN is UB, so fold NaN with the
+     * negatives (upstream ds4 8340f35). The INT_MAX clamp handles +inf. */
+    if (!(v >= 0)) v = 0;
     if (v > INT_MAX) v = INT_MAX;
     *out = (int)v;
     return true;

@@ -25,8 +25,27 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
  *
  * The DS4 payload stores the exact token sequence and graph state.  The rendered
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
+/* Bytes left between the cursor and EOF, or false on a seek error.  File-
+ * declared string lengths are checked against this before allocation, so one
+ * corrupt .kv header cannot drive a ~4 GiB alloc on every session listing
+ * (upstream ds4 0fa15c6). */
+static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
+    off_t pos = ftello(fp);
+    if (pos < 0) return false;
+    if (fseeko(fp, 0, SEEK_END) != 0) return false;
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, pos, SEEK_SET) != 0) return false;
+    *out = end >= pos ? (uint64_t)(end - pos) : 0;
+    return true;
+}
+
 bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || (uint64_t)text_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated cached text");
+        return false;
+    }
     char *text = (char *)agent_xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
@@ -80,6 +99,12 @@ bool agent_kv_read_title_trailer(FILE *fp, const pulsar_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = pulsar_kvstore_le_get32(tb);
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || (uint64_t)title_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     char *title = (char *)agent_xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");

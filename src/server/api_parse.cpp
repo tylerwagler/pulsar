@@ -115,7 +115,10 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
+            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
+            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
+                    : v > 0.0                                 ? UINT64_MAX
+                                                              : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1521,7 +1524,10 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
+            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
+            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
+                    : v > 0.0                                 ? UINT64_MAX
+                                                              : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
