@@ -290,11 +290,19 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
         uint32_t n_comp,
         uint32_t window,
         uint32_t ratio,
-        uint32_t n_keys) {
+        uint32_t n_keys,
+        /* When non-NULL the normalized probabilities are stored HERE as fp16
+         * and the f32 store is skipped: the PV GEMM reads only one of the two,
+         * so this is one store instead of two, and it removes the separate
+         * f32->fp16 pass over the whole score matrix (which was memory-bound
+         * enough to eat the entire tensor-core win, measured 2026-08-05). */
+        __half *scores_h) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || ratio == 0) return;
-    float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
+    const uint64_t row_off = ((uint64_t)h * n_tokens + t) * n_keys;
+    float *row = scores + row_off;
+    __half *row_h = scores_h ? scores_h + row_off : NULL;
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -336,7 +344,11 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
     }
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
-    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) row[k] /= denom;
+    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
+        const float p = row[k] / denom;
+        if (row_h) row_h[k] = __float2half(p);
+        else row[k] = p;
+    }
 }
 
 
@@ -348,14 +360,20 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        /* Same idea as the softmax fp16 store: emit the packed KV directly in
+         * the GEMM's operand type instead of writing f32 and converting after. */
+        __half *dst_h) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)(n_tokens + n_comp) * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
-    dst[gid] = r < n_tokens ? raw_kv_ld(raw_kv, raw_f16, (uint64_t)r * head_dim + d)
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    const float v = r < n_tokens
+            ? raw_kv_ld(raw_kv, raw_f16, (uint64_t)r * head_dim + d)
+            : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    if (dst_h) dst_h[gid] = __float2half(v);
+    else dst[gid] = v;
 }
 
 
@@ -1321,6 +1339,127 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 #define PULSAR_ATTN_STATIC_MIN_BLOCKS 4
 #endif
 
+/* ---- Attention numeric emulation (plan 90 B1 variant pricing) -------------
+ *
+ * Rounds exactly the values a tensor-core attention path WOULD round, inside
+ * our exact SIMT kernel, so each B1 variant's fidelity cost can be MEASURED
+ * against the work-rig reference before anyone spends weeks porting a kernel.
+ * This is the method that priced the fp16-HMMA question in task #65; that
+ * apparatus was never committed and is lost, so this is a rebuild — but now
+ * aimed at divergence-from-SOURCE rather than divergence-from-ourselves.
+ *
+ * Q and P are the only NEW roundings a TC path adds on our stack: the raw ring
+ * is already __float2half-rounded and the comp cache is e4m3 (ATTN_PACK), so
+ * K/V precision is not ours to lose a second time here. In this kernel k0..k3
+ * carry BOTH K and V (MLA shares the latent), which is why only Q and P are
+ * touched below.
+ *
+ * What this deliberately does NOT model (same caveat the #65 measurement
+ * carried, and the reason its numbers were a FLOOR): a real port also changes
+ * k-dim reassociation and online-softmax rescale ordering. Treat any result
+ * here as a lower bound on the true divergence.
+ *
+ * Modes (PULSAR_ATTN_EMUL, read once at launch dispatch per no-hot-path-flags):
+ *   0 OFF   byte-identical -- the template collapses to the shipped code
+ *   1 FP16  Q,P -> __half            (the fp16-HMMA variant)
+ *   2 BF16  Q,P -> __nv_bfloat16     (bf16 QK/PV, expected cheapest divergence)
+ *   3 QONLY Q -> bf16, P left f32    (isolates the Q-side cost alone)
+ *   4 CTRL  no rounding at all       (must come back byte-identical to OFF;
+ *                                     proves the apparatus itself is inert)
+ */
+enum {
+    PULSAR_EMUL_OFF = 0,
+    PULSAR_EMUL_FP16 = 1,
+    PULSAR_EMUL_BF16 = 2,
+    PULSAR_EMUL_QONLY = 3,
+    PULSAR_EMUL_CTRL = 4,
+    PULSAR_EMUL_MODES = 5
+};
+
+template <int EMUL>
+__device__ __forceinline__ static float emul_round_q(float x) {
+    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
+    if constexpr (EMUL == PULSAR_EMUL_BF16 || EMUL == PULSAR_EMUL_QONLY)
+        return __bfloat162float(__float2bfloat16(x));
+    return x;
+}
+
+template <int EMUL>
+__device__ __forceinline__ static float emul_round_p(float x) {
+    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
+    if constexpr (EMUL == PULSAR_EMUL_BF16) return __bfloat162float(__float2bfloat16(x));
+    return x;
+}
+
+/* f32 -> fp16 narrowing for the tensor-core attention GEMM operands.
+ *
+ * The prefill attention pair already runs on tensor cores at TF32
+ * (CUBLAS_TF32_TENSOR_OP_MATH is the default; only --quality or
+ * PULSAR_CUDA_NO_TF32 disables it), and TF32 carries the SAME 10 explicit
+ * mantissa bits as fp16. Measured 2026-08-05: TF32 costs 5.806e-03 exact
+ * full-vocab KL against true FP32, while rounding Q/P to fp16 costs ZERO
+ * (byte-identical) -- precisely because the GEMM was already truncating to
+ * 10 bits. Feeding fp16 operands is therefore the same arithmetic precision
+ * we already ship, at roughly double the tensor-core rate. */
+__global__ static void f32_to_f16_kernel(__half *dst, const float *src, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+/* Elementwise rounding for the cuBLAS attention path, where Q and P are GEMM
+ * operands in memory rather than values in registers. Diagnostic-only: never
+ * launched while the emulation is OFF, so the shipped path is untouched.
+ *
+ * This path is the one that actually runs for a compressed-KV prefill --
+ * verified by dispatch-flag bisect: with PULSAR_CUDA_NO_CUBLAS_ATTENTION the
+ * dump changes, with PULSAR_CUDA_NO_WINDOW_ATTENTION it is byte-identical. The
+ * first version of this emulation instrumented the window kernel, which is
+ * dead code here, and the giveaway was three different rounding modes all
+ * returning bit-identical KL. */
+__global__ static void emul_round_array_kernel(float *dst, const float *src,
+                                               uint64_t n, int mode, int is_p,
+                                               unsigned long long *n_changed) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float in = src[i];
+    float v = in;
+    switch (mode) {
+    case PULSAR_EMUL_FP16:
+        v = __half2float(__float2half(v));
+        break;
+    case PULSAR_EMUL_BF16:
+        v = __bfloat162float(__float2bfloat16(v));
+        break;
+    case PULSAR_EMUL_QONLY:
+        if (!is_p) v = __bfloat162float(__float2bfloat16(v));
+        break;
+    default:
+        break;
+    }
+    /* Count elements the rounding actually moved. A variant reporting zero
+     * divergence is ambiguous between "this precision is free here" and "the
+     * rounding never happened"; this separates them at the source. */
+    if (n_changed && v != in) atomicAdd(n_changed, 1ull);
+    dst[i] = v;
+}
+
+template <int EMUL>
+__device__ __forceinline__ static void emul_round_q4(float4 &v) {
+    if constexpr (EMUL != PULSAR_EMUL_OFF && EMUL != PULSAR_EMUL_CTRL) {
+        v.x = emul_round_q<EMUL>(v.x);
+        v.y = emul_round_q<EMUL>(v.y);
+        v.z = emul_round_q<EMUL>(v.z);
+        v.w = emul_round_q<EMUL>(v.w);
+    }
+}
+
+/* Merge 2026-08-11: both sides land on this declaration. The release line's
+ * occupancy cap (__launch_bounds__, +8.9% prefill, bit-exact — 1d2ef4f) and the
+ * B1 emulation template are independent and both wanted. launch_bounds binds
+ * per instantiation, so the EMUL=OFF instantiation — the only one the shipped
+ * path ever launches — keeps exactly the register budget the cap was measured
+ * with. */
+template <int EMUL>
 __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
 static void attention_static_mixed_heads8_online_kernel(
         float *heads,
@@ -1334,7 +1473,19 @@ static void attention_static_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16) {
+        int raw_f16,
+        /* Compressed-KV additive mask. Previously this fused kernel was gated
+         * OFF whenever a comp mask was in play (`!use_comp_mask`), so every
+         * compressed-KV prefill fell back to the UNFUSED two-GEMM cuBLAS path
+         * -- which materialises the whole n_head*n_tokens*n_keys score matrix
+         * to memory and reads it back. That round-trip is the real prefill
+         * attention cost; the GEMM datatype is worth only ~1% (measured
+         * 2026-08-05). Carrying the mask here lets the fused online-softmax
+         * path serve the masked case and never materialise scores at all.
+         * Pure bandwidth win: no precision is traded. */
+        const float *comp_mask,
+        uint32_t use_comp_mask) {
+    /* EMUL: see the emulation block above. OFF is the shipped path. */
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1364,6 +1515,12 @@ static void attention_static_mixed_heads8_online_kernel(
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
         q3 = q4[lane + 96u];
+        /* Q-side emulation: once per block, before any dot product. Compiles
+         * to zero instructions when EMUL is OFF/CTRL. */
+        emul_round_q4<EMUL>(q0);
+        emul_round_q4<EMUL>(q1);
+        emul_round_q4<EMUL>(q2);
+        emul_round_q4<EMUL>(q3);
     }
 
     float max_s = -INFINITY;
@@ -1389,6 +1546,15 @@ static void attention_static_mixed_heads8_online_kernel(
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
+                /* K-side emulation. A real MMA port narrows every operand, not
+                 * just Q and P, so price K too -- otherwise the estimate is a
+                 * floor of a floor. k0..k3 double as V here (MLA shares the
+                 * latent), so this narrows the PV operand as well, which is
+                 * what an MMA value stage would do. */
+                emul_round_q4<EMUL>(k0);
+                emul_round_q4<EMUL>(k1);
+                emul_round_q4<EMUL>(k2);
+                emul_round_q4<EMUL>(k3);
                 float score = dot4_f32(q0, k0) +
                               dot4_f32(q1, k1) +
                               dot4_f32(q2, k2) +
@@ -1396,9 +1562,27 @@ static void attention_static_mixed_heads8_online_kernel(
                 score = warp_sum_f32(score) * scale;
                 score = __shfl_sync(0xffffffffu, score, 0);
 
+                /* Compressed rows carry the additive mask; a masked entry goes
+                 * to -inf, which the online softmax absorbs as a zero-weight
+                 * row (expf(-inf - m) == 0). Safe because row 0 is always a RAW
+                 * row -- raw_count >= 1 -- so max_s is finite before any comp
+                 * row folds in and old_scale never evaluates expf(-inf + inf).
+                 * Mirrors attention_prefill_mixed_softmax_kernel exactly: same
+                 * index, same -1.0e20f cutoff, mask added AFTER the scale. */
+                const uint32_t sr_i = row0 + rr;
+                if (use_comp_mask && sr_i >= raw_count) {
+                    const uint32_t c_i = sr_i - raw_count;
+                    const float add = comp_mask[(uint64_t)t * n_comp + c_i];
+                    score = add > -1.0e20f ? score + add : -INFINITY;
+                }
+
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
+                /* P-side emulation: row_scale IS the unnormalized
+                 * probability a TC path would carry in reduced
+                 * precision. f32 when EMUL is OFF/CTRL/QONLY. */
+                const float row_scale =
+                        emul_round_p<EMUL>(expf(score - new_m));
                 sum_s = sum_s * old_scale + row_scale;
                 o0.x = o0.x * old_scale + k0.x * row_scale;
                 o0.y = o0.y * old_scale + k0.y * row_scale;
@@ -1446,6 +1630,49 @@ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+/* Emulation mode, resolved ONCE per process (no getenv on a hot path). An
+ * unset or unrecognised value means OFF, so a typo can never silently ship
+ * altered numerics; an active mode announces itself loudly because it is a
+ * measurement apparatus, never a release path. */
+static int pulsar_attn_emul_mode(void) {
+    static const int mode = []() -> int {
+        const char *e = getenv("PULSAR_ATTN_EMUL");
+        int m = e && e[0] ? atoi(e) : PULSAR_EMUL_OFF;
+        if (m <= 0 || m >= PULSAR_EMUL_MODES) return PULSAR_EMUL_OFF;
+        fprintf(stderr, "pulsar: ATTENTION NUMERIC EMULATION ACTIVE (mode %d) "
+                        "-- diagnostic apparatus, NOT a release path\n", m);
+        return m;
+    }();
+    return mode;
+}
+
+/* Dispatch the shipped prefill window kernel through its emulation template.
+ * OFF instantiates code identical to the pre-emulation kernel. */
+#define PULSAR_ATTN_ONLINE_DISPATCH(grid_, blk_, ...)                          \
+    do {                                                                       \
+        switch (pulsar_attn_emul_mode()) {                                     \
+        case PULSAR_EMUL_FP16:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_FP16>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_BF16:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_BF16>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_QONLY:                                                \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_QONLY>     \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        case PULSAR_EMUL_CTRL:                                                 \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_CTRL>      \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        default:                                                               \
+            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_OFF>       \
+                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
+            break;                                                             \
+        }                                                                      \
+    } while (0)
 
 
 __global__ static void attention_decode_mixed_heads8_online_kernel(
@@ -2143,6 +2370,24 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
     static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
     static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
+    /* One-shot branch report, same as the mixed path. This is the RAW entry;
+     * pulsar-bench showed real prefill never reaches the mixed launch, so this
+     * is where production prefill attention is actually served. */
+    static int raw_path_reported = 0;
+    if (!raw_path_reported) {
+        raw_path_reported = 1;
+        const int takes_window = n_tokens > 1 && head_dim == 512 &&
+                !no_window_attn &&
+                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+        fprintf(stderr,
+                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u quality=%d "
+                "-> %s\n",
+                n_tokens, head_dim, window, g_quality_mode,
+                takes_window ? "FUSED window kernel (no score matrix)"
+                             : (g_cublas_ready && !no_cublas_attn
+                                    ? "unfused cuBLAS two-GEMM"
+                                    : "generic per-token kernel"));
+    }
     if (n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
@@ -2175,18 +2420,20 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
             return 0;
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   0,
-                                                                   window,
-                                                                   1,
-                                                                   n_head,
-                                                                   head_dim,
-                                                                   raw_f16);
+        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
+                                    sinks,
+                                    (const float *)q->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    n_tokens,
+                                    0,
+                                    window,
+                                    1,
+                                    n_head,
+                                    head_dim,
+                                    raw_f16,
+                                    NULL,
+                                    0u);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -2215,7 +2462,8 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
                     n_tokens,
                     0,
                     head_dim,
-                    1);
+                    1,
+                    NULL);
             if (!cuda_ok(cudaGetLastError(), "attention raw f16 expand launch")) return 0;
             kv_mat = tmp;
         }
@@ -2811,7 +3059,31 @@ static int attention_prefill_mixed_launch(
     static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
     static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    /* The fused online-softmax kernel can now carry the comp mask, so the
+     * masked case no longer has to fall back to the unfused two-GEMM path that
+     * materialises the whole score matrix. Gated while it is A/B'd against
+     * that path; the fused kernel reassociates the softmax (online rescale vs
+     * batch max/sum), so it is NOT bit-identical to the GEMM path. */
+    static const int fused_comp_env = getenv("PULSAR_ATTN_FUSED_COMP") != NULL;
+    const int allow_fused = !use_comp_mask || fused_comp_env;
+    /* One-shot: which branch actually serves this workload. Guessing at this
+     * has been wrong twice; print it rather than infer it. */
+    static int mixed_path_reported = 0;
+    if (!mixed_path_reported) {
+        mixed_path_reported = 1;
+        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
+                !no_window_attn &&
+                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+        fprintf(stderr,
+                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u "
+                "quality=%d -> %s\n",
+                n_tokens, n_comp, use_comp_mask, g_quality_mode,
+                takes_window ? "FUSED window kernel"
+                             : (g_cublas_ready && !no_cublas_attn
+                                    ? "unfused cuBLAS two-GEMM"
+                                    : "generic per-token kernel"));
+    }
+    if (allow_fused && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
@@ -2836,18 +3108,20 @@ static int attention_prefill_mixed_launch(
             return 0;
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim,
-                                                                   raw_f16);
+        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
+                                    sinks,
+                                    (const float *)q->ptr,
+                                    (const float *)raw_kv->ptr,
+                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                    n_tokens,
+                                    n_comp,
+                                    window,
+                                    ratio,
+                                    n_head,
+                                    head_dim,
+                                    raw_f16,
+                                    use_comp_mask ? (const float *)comp_mask->ptr : NULL,
+                                    use_comp_mask);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -2860,12 +3134,56 @@ static int attention_prefill_mixed_launch(
         const uint64_t score_offset = (kv_bytes + 255u) & ~255ull;
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_offset = score_offset + ((score_bytes + 255u) & ~255ull);
-        const uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
+        /* Emulation needs a rounded copy of Q; Q is a const GEMM operand here,
+         * so it cannot be rounded in place. Costs nothing when OFF -- the
+         * region is not reserved and no kernel is launched. */
+        const int emul_mode = pulsar_attn_emul_mode();
+        const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t out_end = out_offset + out_count * sizeof(float);
+        const uint64_t qr_offset = (out_end + 255u) & ~255ull;
+        uint64_t tmp_bytes = emul_mode
+                ? qr_offset + q_count * sizeof(float)
+                : out_end;
+        /* fp16 tensor-core operands: same 10-bit mantissa as the TF32 we
+         * already run, ~2x the rate. Read once; OFF reserves nothing. */
+        static int fp16_gemm_env = -1;
+        if (fp16_gemm_env < 0)
+            fp16_gemm_env = getenv("PULSAR_ATTN_FP16_GEMM") != NULL;
+        const int fp16_gemm = fp16_gemm_env;
+        uint64_t kvh_off = 0, qh_off = 0, sh_off = 0;
+        if (fp16_gemm) {
+            kvh_off = (tmp_bytes + 255u) & ~255ull;
+            qh_off  = (kvh_off + kv_count * sizeof(__half) + 255u) & ~255ull;
+            sh_off  = (qh_off + q_count * sizeof(__half) + 255u) & ~255ull;
+            tmp_bytes = sh_off + score_count * sizeof(__half);
+        }
         float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention mixed cublas");
         if (!tmp) return 0;
         float *kv = tmp;
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
+        const float *q_eff = (const float *)q->ptr;
+        static unsigned long long *emul_ctr = NULL;
+        static int emul_reported = 0;
+        if (emul_mode && !emul_ctr) cudaMalloc(&emul_ctr, 2 * sizeof(unsigned long long));
+        if (emul_mode && emul_ctr && !emul_reported)
+            cudaMemset(emul_ctr, 0, 2 * sizeof(unsigned long long));
+        if (emul_mode) {
+            float *q_round = (float *)((char *)tmp + qr_offset);
+            emul_round_array_kernel<<<(q_count + 255) / 256, 256>>>(
+                    q_round, (const float *)q->ptr, q_count, emul_mode, 0,
+                    emul_reported ? NULL : emul_ctr);
+            if (!cuda_ok(cudaGetLastError(), "attention emul q round")) return 0;
+            q_eff = q_round;
+        }
+        __half *kv_h = NULL, *q_h = NULL, *sc_h = NULL;
+        if (fp16_gemm) {
+            kv_h = (__half *)((char *)tmp + kvh_off);
+            q_h  = (__half *)((char *)tmp + qh_off);
+            sc_h = (__half *)((char *)tmp + sh_off);
+        }
+        /* fp16 path: the pack kernel emits the GEMM operand type directly, so
+         * there is no separate narrowing pass over KV. */
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
@@ -2873,11 +3191,37 @@ static int attention_prefill_mixed_launch(
                 n_tokens,
                 n_comp,
                 head_dim,
-                raw_f16);
+                raw_f16,
+                kv_h);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+        if (fp16_gemm) {
+            /* Q is the one operand with no producer kernel of its own to fold
+             * this into -- but it is only n_tokens*n_head*head_dim, orders of
+             * magnitude smaller than the score matrix. */
+            f32_to_f16_kernel<<<(q_count + 255) / 256, 256>>>(q_h, q_eff, q_count);
+            if (!cuda_ok(cudaGetLastError(), "attention fp16 q narrow")) return 0;
+        }
+        cublasStatus_t st;
+        if (fp16_gemm) {
+            /* fp16 operands, f32 accumulate: the softmax and the residual keep
+             * full f32 dynamic range, only the multiply-add operands narrow --
+             * to the same 10 mantissa bits TF32 was already giving us. */
+            st = cublasGemmStridedBatchedEx(g_cublas,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            (int)n_keys, (int)n_tokens, (int)head_dim,
+                                            &alpha,
+                                            kv_h, CUDA_R_16F, (int)head_dim, 0,
+                                            q_h, CUDA_R_16F,
+                                            (int)(n_head * head_dim), (long long)head_dim,
+                                            &beta,
+                                            scores, CUDA_R_32F,
+                                            (int)n_keys, (long long)n_keys * n_tokens,
+                                            (int)n_head,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        } else {
+            st = cublasSgemmStridedBatched(g_cublas,
                                                       CUBLAS_OP_T,
                                                       CUBLAS_OP_N,
                                                       (int)n_keys,
@@ -2887,7 +3231,7 @@ static int attention_prefill_mixed_launch(
                                                       kv,
                                                       (int)head_dim,
                                                       0,
-                                                      (const float *)q->ptr,
+                                                      q_eff,
                                                       (int)(n_head * head_dim),
                                                       (long long)head_dim,
                                                       &beta,
@@ -2895,6 +3239,7 @@ static int attention_prefill_mixed_launch(
                                                       (int)n_keys,
                                                       (long long)n_keys * n_tokens,
                                                       (int)n_head);
+        }
         if (!cublas_ok(st, "attention mixed score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
@@ -2906,10 +3251,45 @@ static int attention_prefill_mixed_launch(
                 n_comp,
                 window,
                 ratio,
-                n_keys);
+                n_keys,
+                sc_h);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
+        /* P-side emulation: `scores` now holds the normalized probabilities a
+         * tensor-core path would carry in reduced precision into the PV GEMM.
+         * Rounded in place; QONLY deliberately leaves P alone. */
+        if (emul_mode) {
+            emul_round_array_kernel<<<(score_count + 255) / 256, 256>>>(
+                    scores, scores, score_count, emul_mode, 1,
+                    emul_reported ? NULL : (emul_ctr ? emul_ctr + 1 : NULL));
+            if (!cuda_ok(cudaGetLastError(), "attention emul p round")) return 0;
+            if (!emul_reported && emul_ctr) {
+                unsigned long long h[2] = {0, 0};
+                cudaMemcpy(h, emul_ctr, sizeof h, cudaMemcpyDeviceToHost);
+                fprintf(stderr,
+                        "pulsar: EMUL mode %d rounded Q %llu/%llu elements, "
+                        "P %llu/%llu elements (first call)\n",
+                        emul_mode, h[0], (unsigned long long)q_count,
+                        h[1], (unsigned long long)score_count);
+                emul_reported = 1;
+            }
+        }
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
+        if (fp16_gemm) {
+            /* No narrowing pass here: the softmax already stored fp16. */
+            st = cublasGemmStridedBatchedEx(g_cublas,
+                                            CUBLAS_OP_N, CUBLAS_OP_N,
+                                            (int)head_dim, (int)n_tokens, (int)n_keys,
+                                            &one,
+                                            kv_h, CUDA_R_16F, (int)head_dim, 0,
+                                            sc_h, CUDA_R_16F,
+                                            (int)n_keys, (long long)n_keys * n_tokens,
+                                            &beta,
+                                            out_tmp, CUDA_R_32F,
+                                            (int)head_dim, (long long)head_dim * n_tokens,
+                                            (int)n_head,
+                                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        } else {
+            st = cublasSgemmStridedBatched(g_cublas,
                                        CUBLAS_OP_N,
                                        CUBLAS_OP_N,
                                        (int)head_dim,
@@ -2927,6 +3307,7 @@ static int attention_prefill_mixed_launch(
                                        (int)head_dim,
                                        (long long)head_dim * n_tokens,
                                        (int)n_head);
+        }
         if (!cublas_ok(st, "attention mixed value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,

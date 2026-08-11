@@ -872,6 +872,54 @@ static int routed_moe_launch_mixed40(
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
     if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
+    /* PULSAR_MOE_OVERLAP: expert-set overlap probe (read-only diagnostic).
+     *
+     * Three spec levers died on "wider spec batches don't amortize on our
+     * bandwidth-bound decode" (BlockV #1, DTree #33, HybridLC #74). The ledger
+     * blames verify running the prefill batch path, but that path is the
+     * bandwidth-FAVOURABLE one -- it reads each dense weight once for all rows.
+     * The likelier wall is MoE expert-set growth: M rows route to up to M*top_k
+     * DISTINCT experts, and routed experts dominate model bytes.
+     *
+     * This measures it directly. `counts[e]` already holds rows-per-expert, so
+     * SUM = pair_count = rows * top_k, and UNION = #{e : counts[e] > 0}. If
+     * union is far below sum, drafts already share experts and the ceiling for
+     * "expert-coherent drafting" is low; if union tracks sum, each extra verify
+     * row really does drag in its own expert weights and there is headroom.
+     *
+     * Costs a sync + copy, so it is OFF unless asked for and never on a
+     * measured path. Changes no computation. */
+    static int overlap_env = -1;
+    if (overlap_env < 0) overlap_env = getenv("PULSAR_MOE_OVERLAP") != NULL;
+    if (ok && overlap_env && n_tokens > 0) {
+        uint32_t *h_counts = (uint32_t *)malloc((size_t)n_total_expert * sizeof(uint32_t));
+        if (h_counts) {
+            if (cudaMemcpy(h_counts, counts,
+                           (size_t)n_total_expert * sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                uint32_t distinct = 0, maxc = 0;
+                uint64_t total = 0;
+                for (uint32_t e = 0; e < n_total_expert; e++) {
+                    if (h_counts[e]) { distinct++; total += h_counts[e]; }
+                    if (h_counts[e] > maxc) maxc = h_counts[e];
+                }
+                /* saturation = distinct / min(sum, n_total_expert): 1.0 means
+                 * every routed slot pulled a different expert (no sharing). */
+                const uint32_t ceil_distinct =
+                        (uint64_t)pair_count < (uint64_t)n_total_expert
+                        ? pair_count : n_total_expert;
+                fprintf(stderr,
+                        "pulsar: MOE-OVERLAP rows=%u top_k=%u sum=%u "
+                        "distinct=%u of %u experts (saturation %.3f of the "
+                        "%u reachable) max_rows_per_expert=%u\n",
+                        n_tokens, n_expert, pair_count, distinct,
+                        n_total_expert,
+                        ceil_distinct ? (double)distinct / (double)ceil_distinct : 0.0,
+                        ceil_distinct, maxc);
+            }
+            free(h_counts);
+        }
+    }
     if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
     if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
