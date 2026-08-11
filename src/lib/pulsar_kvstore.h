@@ -68,6 +68,7 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    int sys_prefix_margin_tokens;
 } pulsar_kvstore_options;
 
 typedef struct {
@@ -143,6 +144,7 @@ int pulsar_kvstore_chat_anchor_pos(const pulsar_kvstore *kc,
                                 const pulsar_tokens *prompt,
                                 int user_token_id,
                                 int assistant_token_id);
+int pulsar_kvstore_sys_prefix_cut(const pulsar_kvstore *kc, int anchor);
 int pulsar_kvstore_continued_store_target(const pulsar_kvstore *kc, int live_tokens);
 void pulsar_kvstore_note_store(pulsar_kvstore *kc, int tokens);
 int pulsar_kvstore_suppress_continued_store(pulsar_kvstore *kc, int tokens);

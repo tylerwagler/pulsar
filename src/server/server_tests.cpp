@@ -3404,6 +3404,27 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
 
 
 
+/* The anchor sits above harness-injected preamble jitter, so the cut must back
+ * off below it. Numbers are the live Claude Code session measured 2026-08-11:
+ * anchor 21,950, replay agreement wandering over 20,393..21,886. */
+static void test_kv_cache_sys_prefix_cut_clears_preamble_jitter(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+
+    const int anchor = 21950;
+    const int cut = kv_cache_sys_prefix_cut(&kc, anchor);
+    TEST_ASSERT(cut == 18432);
+    TEST_ASSERT(cut % kc.opt.boundary_align_tokens == 0);
+    /* Must sit below every observed replay-agreement point, or the checkpoint
+     * is stored and evicted forever without ever being a valid byte-prefix. */
+    TEST_ASSERT(cut < 20393);
+
+    /* Degenerate inputs yield "no checkpoint", never a negative length. */
+    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, 0) == 0);
+    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, kc.opt.min_tokens - 1) == 0);
+    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, kc.opt.sys_prefix_margin_tokens) == 0);
+}
+
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -5165,6 +5186,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

@@ -1020,16 +1020,20 @@ void server::gen_begin(session_slot *sl) {
     if (cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+        s->kv.opt.cold_max_tokens > 0)
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     pulsar_token_user(s->engine),
                                                     pulsar_token_assistant(s->engine));
-        if (anchor >= s->kv.opt.min_tokens) {
-            cold_store_len = anchor;
+        const int cut = kv_cache_sys_prefix_cut(&s->kv, anchor);
+        /* The shared preamble is worth checkpointing however long the
+         * conversation has grown behind it — that is exactly when a cold
+         * re-prefill is most expensive. Only a whole-prompt cold cut is bounded
+         * by cold_max_tokens, because that one is consumed on load. */
+        if (cut > 0) {
+            cold_store_len = cut;
             g->cold_store_is_anchor = true;
-        } else {
+        } else if (prompt_for_sync->len <= s->kv.opt.cold_max_tokens) {
             cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
         }
     }

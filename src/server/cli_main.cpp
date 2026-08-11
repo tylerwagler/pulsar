@@ -635,6 +635,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-cache-sys-prefix-margin-tokens")) {
+            c.kv_cache.sys_prefix_margin_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {

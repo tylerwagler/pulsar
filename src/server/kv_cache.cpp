@@ -454,6 +454,10 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
     return pulsar_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
+int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
+    return pulsar_kvstore_sys_prefix_cut(kc, anchor);
+}
+
 
 
 
