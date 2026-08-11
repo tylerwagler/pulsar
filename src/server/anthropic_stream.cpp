@@ -699,8 +699,18 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        /* Unclosed-reasoning recovery (upstream ds4 51a1c14): see the OpenAI
+         * stream twin. */
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -717,6 +727,15 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
                                           limit - st->emit_pos)) return false;
             st->sent_thinking = true;
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = ANTH_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close || final) {

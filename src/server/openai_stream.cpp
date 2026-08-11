@@ -1208,8 +1208,20 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        /* A tool call starting before any </think> is the unclosed-reasoning
+         * recovery case (upstream ds4 51a1c14): stream only the prose before
+         * the marker as reasoning, hold until the block completes, and keep
+         * the protocol bytes off every channel. */
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -1225,6 +1237,14 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
                                   limit - st->emit_pos)) return false;
             st->sent_reasoning = true;
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close) {

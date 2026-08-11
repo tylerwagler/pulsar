@@ -1183,7 +1183,6 @@ struct server {
     size_t thinking_live_binds_prompt(session_slot *sl, const request *req, int live_pos);
     bool responses_validate_tool_outputs(const chat_msgs *msgs, pulsar_think_mode think_mode, bool *requires_live_tool_state, bool *requires_live_reasoning, char *err, size_t errlen);
     bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
-    int chat_think_tool_recovery(session_slot *sl, buf *text, thinking_state *thinking, size_t *scan_from, int *completion, int max_tokens, char *err, size_t errlen);
     bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix, int *tokens_appended, char *err, size_t errlen);
     bool continue_after_invalid_dsml(session_slot *sl, const request *r, const thinking_state *thinking, const char *detail, int *tokens_appended, char *err, size_t errlen);
     bool gen_web_search_round(session_slot *sl, const tool_calls *calls, const char *pre_content, const char *pre_reasoning);
@@ -1434,7 +1433,6 @@ struct gen_state {
     bool thinking_gates_tool_markers;
     bool tool_scan_waiting_for_think_close;
     size_t think_recovery_scan_from;
-    bool think_tool_recovery_enabled;
     bool dspark_spec_enabled;
     dsml_decode_tracker dsml_tracker;
 
@@ -1609,6 +1607,8 @@ void json_escape(buf *b, const char *s);
 void json_escape_n(buf *b, const char *s, size_t n);
 void json_escape_fragment_n(buf *b, const char *s, size_t n);
 const char *find_any_tool_start(const char *s);
+const char *find_any_tool_end(const char *s);
+bool complete_tool_call_inside_thinking(const char *text, size_t len, size_t *scan_from);
 void observe_tool_markers(const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end);
 size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit);

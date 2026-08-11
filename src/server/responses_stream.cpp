@@ -599,8 +599,18 @@ bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        /* Unclosed-reasoning recovery (upstream ds4 51a1c14): see the OpenAI
+         * stream twin. */
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -628,6 +638,14 @@ bool responses_sse_stream_update(int fd, const request *r,
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close) {

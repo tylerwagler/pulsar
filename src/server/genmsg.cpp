@@ -282,7 +282,7 @@ const char *find_any_tool_start(const char *s) {
 
 
 
-static const char *find_any_tool_end(const char *s) {
+const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
         strstr(s, PULSAR_TOOL_CALLS_END),
@@ -518,11 +518,28 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
 
 
 
+/* The prefix before a tool call recovered from UNCLOSED reasoning is
+ * reasoning, not content (upstream ds4 51a1c14). */
+static void unterminated_reasoning_before_tool(const char *text,
+                                               size_t prefix_len,
+                                               char **content_out,
+                                               char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (prefix_len > strlen(body)) prefix_len = strlen(body);
+    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
+        body += 7;
+        prefix_len -= 7;
+    }
+    *reasoning_out = xstrndup(body, prefix_len);
+    *content_out = xstrdup("");
+}
+
 bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
 
     /* When thinking mode is enabled the model is expected to close
      * </think> before it enters the executable assistant surface.  DSML inside
@@ -534,17 +551,26 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking (truncation or stop inside the
-             * think block) — the whole text is reasoning, even when the
-             * <think> opener lives in the prompt rather than the generation.
-             * Ignore any DSML in it, and keep it off the content channel. */
-            server_log(PULSAR_LOG_TOOL, "thinking not closed, ignoring DSML in reasoning");
-            const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
-            *reasoning_out = xstrdup(body);
-            *content_out = xstrdup("");
-            return true;
+            /* Model did not close thinking. A COMPLETE tool block in the
+             * buffer is unambiguous enough to recover structurally (upstream
+             * ds4 51a1c14); anything less — truncation, a quoted opening —
+             * stays reasoning, even when the <think> opener lives in the
+             * prompt rather than the generation, and off the content
+             * channel. */
+            const char *candidate = find_any_tool_start(text);
+            if (!candidate || !find_any_tool_end(candidate)) {
+                server_log(PULSAR_LOG_TOOL,
+                           "thinking not closed, ignoring incomplete DSML in reasoning");
+                const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
+                *reasoning_out = xstrdup(body);
+                *content_out = xstrdup("");
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
         }
-        tool_search = think_end + 8;
     }
 
     const char *start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START);
@@ -605,7 +631,12 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_dsml);
             calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
-            split_reasoning_content(text, content_len, content_out, reasoning_out);
+            if (recovered_unclosed_tool) {
+                unterminated_reasoning_before_tool(text, content_len,
+                                                   content_out, reasoning_out);
+            } else {
+                split_reasoning_content(text, content_len, content_out, reasoning_out);
+            }
             return true;
         }
         if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;

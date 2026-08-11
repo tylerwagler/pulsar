@@ -10,76 +10,25 @@
 
 
 
-/* Live recovery for a tool call started inside an unclosed <think> block.
- *
- * The model sometimes opens a DSML stanza without closing its thinking first.
- * Waiting for a </think> that never comes stalls the turn: the marker is never
- * scanned as executable and the block is dropped at parse time.  Instead of
- * rewriting sampled context, recover forward: force-feed "</think>" plus a
- * blank line and let the model continue.  Measured on the real model, that
- * position predicts a fresh stanza opening so strongly that the model
- * restarts the call cleanly on the executable side of the close.  Re-emitting
- * the stanza opening ourselves was tried and is counterproductive: with the
- * dangling opening right before the close and a forced copy right after it,
- * the model reads the call as already made and ends the turn.  The dangling
- * opening stays harmlessly inside reasoning.
- *
- * Detection works on accumulated text, so the tokenization of the marker does
- * not matter, and it triggers only on a complete stanza opening: a lone "<"
- * or a partial marker keeps decoding untouched, while *scan_from holds back
- * far enough that an opening split across future tokens is still seen from
- * its first byte.  The forced text is tokenized with the rendered-chat
- * tokenizer so </think> maps to its special token.
- *
- * Returns 1 when an injection was performed (text extended, thinking closed),
- * 0 when there is nothing to do or no budget, -1 on eval failure. */
-int server::chat_think_tool_recovery(session_slot *sl,
-                                    buf *text,
-                                    thinking_state *thinking,
-                                    size_t *scan_from,
-                                    int *completion,
-                                    int max_tokens,
-                                    char *err,
-                                    size_t errlen) {
-    auto *s = this;
-    (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
-    if (!thinking->inside || !text->ptr) return 0;
-    if (*scan_from > text->len) *scan_from = text->len;
-    if (!find_any_tool_start(text->ptr + *scan_from)) {
+/* A completed tool block inside unclosed reasoning can be recovered without
+ * predicting what the model will emit after an injected close marker
+ * (upstream ds4 51a1c14; replaces the forced-</think> injection recovery,
+ * which sometimes made the model read the call as already issued and end the
+ * turn without it). Keep a short overlap until the opening appears, then wait
+ * for its matching end — a lone "<" or partial marker keeps decoding
+ * untouched. */
+bool complete_tool_call_inside_thinking(const char *text, size_t len,
+                                        size_t *scan_from) {
+    if (!text || !scan_from) return false;
+    if (*scan_from > len) *scan_from = len;
+    const char *start = find_any_tool_start(text + *scan_from);
+    if (!start) {
         const size_t hold = 80; /* > longest stanza opening */
-        *scan_from = text->len > hold ? text->len - hold : 0;
-        return 0;
+        *scan_from = len > hold ? len - hold : 0;
+        return false;
     }
-
-    const char *inject = "</think>\n\n";
-    const size_t inject_len = strlen(inject);
-    pulsar_tokens toks = {0};
-    pulsar_tokenize_rendered_chat(s->engine, inject, &toks);
-
-    const int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
-    if (toks.len <= 0 ||
-        toks.len >= room ||
-        *completion + toks.len >= max_tokens) {
-        /* Not enough budget to recover; leave the stream as generated and let
-         * the parse-time fallback deal with it.  Skip past this marker so the
-         * scan does not retry it every token. */
-        pulsar_tokens_free(&toks);
-        *scan_from = text->len;
-        return 0;
-    }
-
-    for (int i = 0; i < toks.len; i++) {
-        if (pulsar_session_eval(s->sess, toks.v[i], err, errlen) != 0) {
-            pulsar_tokens_free(&toks);
-            return -1;
-        }
-        (*completion)++;
-    }
-    buf_append(text, inject, inject_len);
-    thinking->feed(inject, inject_len);
-    *scan_from = text->len;
-    pulsar_tokens_free(&toks);
-    return 1;
+    *scan_from = (size_t)(start - text);
+    return find_any_tool_end(start) != NULL;
 }
 
 
@@ -1292,8 +1241,6 @@ void server::gen_decode_init(session_slot *sl) {
     g->tool_scan_waiting_for_think_close =
         g->thinking_gates_tool_markers && g->thinking.inside;
     g->think_recovery_scan_from = 0;
-    g->think_tool_recovery_enabled =
-        getenv("PULSAR_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL;
     dsml_decode_tracker_init(&g->dsml_tracker);
 
@@ -1438,35 +1385,25 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         if (g->thinking_gates_tool_markers && g->thinking.inside) {
-            /* A DSML block inside reasoning is not executable.  This is
-             * the live guard: do not let a quoted or mistaken marker in
-             * <think> stop decoding as a real tool call.  A complete
-             * stanza opening, however, almost always means the model
-             * forgot to close its thinking; recover by forcing the
-             * close so the model restarts the call on the executable
-             * side. */
-            const int recovered = g->think_tool_recovery_enabled ?
-                s->chat_think_tool_recovery(sl, &g->text, &g->thinking,
-                                         &g->think_recovery_scan_from,
-                                         &g->completion, g->max_tokens,
-                                         g->err, sizeof(g->err)) : 0;
-            if (recovered < 0) {
-                g->finish = "error";
-                return true;
-            }
-            if (recovered) {
+            /* A DSML block inside reasoning is not executable, and an opening
+             * marker alone can be quoted protocol text. A COMPLETE block is
+             * unambiguous enough to recover: stop with finish=tool_calls and
+             * let the parse-side recovery return the call structurally
+             * (upstream ds4 51a1c14). */
+            if (complete_tool_call_inside_thinking(
+                    g->text.ptr, g->text.len, &g->think_recovery_scan_from)) {
+                g->saw_tool_start = true;
+                g->saw_tool_end = true;
                 server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
-                           "forced </think> after %d generated tokens",
+                           "pulsar-server: chat ctx=%s%s%s recovered a complete tool call "
+                           "from unclosed reasoning after %d generated tokens",
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
                            g->completion);
                 s->trace_event(g->trace_id,
-                            "think tool recovery after %d generated tokens",
+                            "recovered complete tool call from unclosed reasoning after %d generated tokens",
                             g->completion);
-                dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-                g->tool_scan_waiting_for_think_close = true;
             } else {
                 g->tool_scan_waiting_for_think_close = true;
                 g->tool_scan_from = g->text.len;
