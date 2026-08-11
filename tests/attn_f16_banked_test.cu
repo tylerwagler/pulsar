@@ -76,8 +76,10 @@ static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
     for (uint32_t d = 0; d < n_nope; d++) dst[d] = (uint8_t)((e << 3) | m);
     for (uint32_t i = 0; i < PULSAR_ATTN_PACK_SCALES_PAD(head_dim); i++)
         dst[n_nope + i] = 127u;                       /* scale = 2^0 */
-    float *rope = (float *)(dst + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = v;
+    /* v is exact in e4m3 (3 mantissa bits) and therefore exact in bf16 (7), so
+     * the narrowed rope tail still decodes to precisely v. */
+    __nv_bfloat16 *rope = (__nv_bfloat16 *)(dst + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(v);
 }
 
 int main(int argc, char **argv) {

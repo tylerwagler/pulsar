@@ -194,7 +194,7 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
 
 /* Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
  * natively?  When it does, the engine hands it the packed cache directly and
- * skips dequantising into the f32 shadow -- 712 B/row instead of 2048, on the
+ * skips dequantising into the f32 shadow -- 584 B/row instead of 2048, on the
  * rows that dominate the tile, plus one whole pass removed.  Bit-exact either
  * way: packed rows decode to exactly the values the f32 cache would hold.
  * Backend-neutral question; the answer is a property of the backend's kernels,
@@ -524,10 +524,12 @@ int pulsar_gpu_mxkv_dequant_tensor(
         uint32_t               head_dim);
 
 /* PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
- * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot f32 rope]
- * (712 B at head_dim 512 / n_rot 64).  The stored values are exactly the
+ * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16 rope]
+ * (584 B at head_dim 512 / n_rot 64, byte-identical to vLLM's fp8_ds_mla DSv4
+ * cache line).  The stored values are exactly the
  * pulsar_gpu_dsv4_fp8_kv_quantize_tensor roundtrip for the nope dims and the
- * untouched f32 rope tail, so read-back is bit-identical to the f32 cache.
+ * bf16 roundtrip for the rope tail, so read-back is bit-identical to the f32
+ * cache -- quantize_store applies BOTH roundtrips to the source rows in place.
  * quantize_store additionally roundtrips the f32 source rows IN PLACE
  * (identical to the plain quantize entry) so stages/dumps stay consistent.
  * Requires n_rot == 64 and (head_dim - n_rot) % 64 == 0. */

@@ -127,7 +127,7 @@ int main() {
             }
         }
 
-        /* ATTN_PACK rows: 448 e4m3 bytes + 7 E8M0 scales + pad + 64 f32 rope.
+        /* ATTN_PACK rows: 448 e4m3 bytes + 7 E8M0 scales + pad + 64 bf16 rope.
          * Random VALID bytes -- attn_pack_e4m3 is total (no NaN encodings in
          * its bit math), so any byte pattern decodes deterministically and
          * golden-vs-split agreement is what's under test. */
@@ -141,8 +141,8 @@ int main() {
                 for (uint32_t d = 0; d < n_nope; d++) row[d] = (uint8_t)bd(rng);
                 for (uint32_t s = 0; s < PULSAR_ATTN_PACK_SCALES_PAD(D); s++)
                     row[n_nope + s] = (uint8_t)(120 + (int)(r + s) % 14);
-                float *rope = (float *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
-                for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = nd(rng);
+                __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
+                for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
             }
         }
 

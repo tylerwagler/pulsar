@@ -436,7 +436,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * step_begin rejects position-0 rows, so zero_prefix is never multiseq. */
     const bool mseq = g->batch_multiseq;
     /* Single-sequence prefill has been dequantising the PULSAR_ATTN_PACK comp
-     * cache into an f32 shadow and reading that: 2048 B/row instead of 712, on
+     * cache into an f32 shadow and reading that: 2048 B/row instead of 584, on
      * the rows that dominate the attention tile, plus a whole dequant pass.
      * The multi-sequence path already hands the packed pool over directly.
      * Ask the backend whether its prefill attention reads packed rows natively

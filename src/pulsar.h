@@ -509,7 +509,10 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(2)
+/* v3 (2026-08-11): the ATTN_PACK comp row's rope tail narrowed f32 -> bf16,
+ * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
+ * old stride, so it MUST be rejected rather than reinterpreted. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(3)
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 13u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);

@@ -334,11 +334,13 @@ static void attn_f16_kernel(
                             f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
                             f3 = attn_pack_e4m3(w >> 24, sc);
                         } else {
-                            const float *rope = (const float *)(pr + n_nope +
+                            const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
                                 PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
                             const uint32_t o = d4 - n_nope;
-                            f0 = rope[o]; f1 = rope[o + 1u];
-                            f2 = rope[o + 2u]; f3 = rope[o + 3u];
+                            f0 = __bfloat162float(rope[o]);
+                            f1 = __bfloat162float(rope[o + 1u]);
+                            f2 = __bfloat162float(rope[o + 2u]);
+                            f3 = __bfloat162float(rope[o + 3u]);
                         }
                     } else {
                         const float4 v4 = *(const float4 *)(comp_src + crow * AF16_DIM + d4);

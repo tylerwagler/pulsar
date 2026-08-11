@@ -40,9 +40,11 @@ __device__ static float pulsar_attn_fp8_kv_dequant(uint8_t byte, float scale) {
 
 /* comp_kv_pack: per-call flag — the comp cache operand is PULSAR_ATTN_PACK rows
  * (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h): [n_nope e4m3][n_nope/64 E8M0]
- * [pad][n_rot f32 rope].  Nope dims decode e4m3_value * 2^(e8-127) — exactly
- * the fp8_kv_quantize roundtrip value the f32 cache holds — and rope dims read
- * f32 directly, so scores/outputs are bit-identical to the f32 comp cache.
+ * [pad][n_rot bf16 rope].  Nope dims decode e4m3_value * 2^(e8-127) — exactly
+ * the fp8_kv_quantize roundtrip value the f32 cache holds — and rope dims widen
+ * from bf16, which is likewise exactly what the f32 cache holds since the pack
+ * store roundtrips the rope tail in place, so scores/outputs are bit-identical
+ * to the f32 comp cache.
  * The 2^(e8-127) scale is built as a float exponent; the pack amax floor
  * (1e-4 -> e8 >= 105) rules out byte 0. */
 /* attn_pack_e4m3 / attn_comp_pack_ld now live in pulsar_cuda_internal.h so the
@@ -52,7 +54,7 @@ __device__ static float pulsar_attn_fp8_kv_dequant(uint8_t byte, float scale) {
 
 /* Packed-row dot walked d = 0..head_dim-1 by one thread: per-64-block scale
  * hoisted, e4m3 bytes fetched four at a time as one uint32 (rows are 4-byte
- * aligned: 712-byte stride).  Accumulation order is identical to the scalar
+ * aligned: 584-byte stride).  Accumulation order is identical to the scalar
  * d-ascending loop, so the result is bit-identical. */
 __device__ static inline float attn_pack_dot_full(const float *qh, const float *comp_kv, uint64_t row, uint32_t head_dim, float dot) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
@@ -70,8 +72,8 @@ __device__ static inline float attn_pack_dot_full(const float *qh, const float *
             dot += qh[d + 3u] * attn_pack_e4m3(w >> 24, scale);
         }
     }
-    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * rope[d];
+    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * __bfloat162float(rope[d]);
     return dot;
 }
 
@@ -88,8 +90,8 @@ __device__ static inline float attn_pack_dot_lane8(const float *qh, const float 
             dot += qh[d] * attn_pack_e4m3(pr[d], scale);
         }
     }
-    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += qh[d] * rope[d - n_nope];
+    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += qh[d] * __bfloat162float(rope[d - n_nope]);
     return dot;
 }
 
@@ -1252,11 +1254,11 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
                     v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
                     v.w = attn_pack_e4m3(w >> 24, scale);
                 } else {
-                    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-                    v.x = rope[base - n_nope + 0u];
-                    v.y = rope[base - n_nope + 1u];
-                    v.z = rope[base - n_nope + 2u];
-                    v.w = rope[base - n_nope + 3u];
+                    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+                    v.x = __bfloat162float(rope[base - n_nope + 0u]);
+                    v.y = __bfloat162float(rope[base - n_nope + 1u]);
+                    v.z = __bfloat162float(rope[base - n_nope + 2u]);
+                    v.w = __bfloat162float(rope[base - n_nope + 3u]);
                 }
                 kv_shared[off] = v;
             } else {
@@ -1883,11 +1885,11 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                     v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
                     v.w = attn_pack_e4m3(w >> 24, scale);
                 } else {
-                    const float *rope = (const float *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-                    v.x = rope[base - n_nope + 0u];
-                    v.y = rope[base - n_nope + 1u];
-                    v.z = rope[base - n_nope + 2u];
-                    v.w = rope[base - n_nope + 3u];
+                    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+                    v.x = __bfloat162float(rope[base - n_nope + 0u]);
+                    v.y = __bfloat162float(rope[base - n_nope + 1u]);
+                    v.z = __bfloat162float(rope[base - n_nope + 2u]);
+                    v.w = __bfloat162float(rope[base - n_nope + 3u]);
                 }
                 kv_shared[off] = v;
             } else {

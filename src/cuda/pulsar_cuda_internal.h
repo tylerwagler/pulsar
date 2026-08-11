@@ -81,13 +81,20 @@ enum {
  * PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
  * f32 with the nope dims already fp8-roundtripped in place (fp8_kv_quantize:
  * per-64 block scale = exp2f(ceilf(log2f(fmaxf(amax,1e-4)/448))), e4m3
- * clamp-roundtrip) and the n_rot rope tail untouched f32.  The packed row
- * stores exactly those values:
- *   [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot f32]
- * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 256 = 712 B/row (vs 2048 f32).
+ * clamp-roundtrip) and the n_rot rope tail bf16-roundtripped in place.  The
+ * packed row stores exactly those values:
+ *   [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16]
+ * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 128 = 584 B/row (vs 2048 f32).
  * The E8M0 byte is the scale exponent + 127 (power-of-two by construction),
- * so decode (e4m3 value * 2^(e8-127); rope read f32) is bit-identical to the
- * f32 cache.  Must stay in sync with PULSAR_ENGINE_ATTN_PACK_ROWBYTES.
+ * so decode (e4m3 value * 2^(e8-127); rope __bfloat162float) is bit-identical
+ * to the f32 cache.  Must stay in sync with PULSAR_ENGINE_ATTN_PACK_ROWBYTES.
+ *
+ * This row is BYTE-IDENTICAL to vLLM's `fp8_ds_mla` DSv4 cache line (448 e4m3 +
+ * 7 ue8m0-per-64 + 1 pad + 64 bf16 = 584 B).  The rope tail was f32 (712 B/row)
+ * until 2026-08-11; the source model runs a BF16 residual, so f32 there stored
+ * precision the model never had.  Keep the two layouts in step: a divergence
+ * costs the cross-engine KV diff that validates this cache against a stock vLLM
+ * run.  Bumping this row layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION.
  */
 #define PULSAR_ATTN_PACK_NROT 64u
 #define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
@@ -95,7 +102,7 @@ enum {
     ((PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_FP8_KV_BLOCK + 3u) & ~3u)
 #define PULSAR_ATTN_PACK_ROWBYTES(HD) \
     ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 4u)
+     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 
 /* Default-ON env gate for the measured fast tiers.  Suite-v1 KL cleared the
  * fp16 attention and MXFP4 indexer tiers on 2026-08-08 (exact per-position
