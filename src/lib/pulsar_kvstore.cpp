@@ -1013,32 +1013,28 @@ public:
             const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
             kc_.continued_last_store_tokens = loaded;
             const char *key_kind = pulsar_kvstore_key_kind(hdr.ext_flags);
-            bool consumed = false;
-            if (kc_.opt.cold_max_tokens > 0 && loaded > kc_.opt.cold_max_tokens) {
-                unlink(path);
-                consumed = true;
-                logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                     "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
-                     log_name(),
-                     responses_protocol ? " " : "",
-                     responses_protocol ? "RESPPROTO" : "",
-                     loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-            } else {
-                pulsar_kvstore_touch_file(path, hdr.hits + 1);
-                logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                     "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
-                     log_name(),
-                     responses_protocol ? " " : "",
-                     responses_protocol ? "RESPPROTO" : "",
-                     loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-            }
+            /* Checkpoints survive successful loads (upstream ds4 24fa85e).
+             * The old cold_max_tokens consume branch unlinked any checkpoint
+             * deeper than the cold-store limit after its FIRST restore — and
+             * since the load also advances continued_last_store_tokens, the
+             * continued-store scheduler then believed the file still existed,
+             * so a second replay of the same deep prefix cold-prefilled the
+             * whole thing. Disk reclamation belongs to budget eviction, not
+             * load. cold_max_tokens keeps its real job: gating cold-store
+             * writes. */
+            pulsar_kvstore_touch_file(path, hdr.hits + 1);
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                 "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                 log_name(),
+                 responses_protocol ? " " : "",
+                 responses_protocol ? "RESPPROTO" : "",
+                 loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
             if (result) {
                 result->tokens = loaded;
                 result->text_bytes = text_bytes;
                 result->quant_bits = hdr.quant_bits;
                 result->ext_flags = hdr.ext_flags;
                 result->load_ms = load_ms;
-                result->consumed = consumed;
                 result->path = kv_xstrdup(path);
             }
         }
