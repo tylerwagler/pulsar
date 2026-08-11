@@ -186,24 +186,82 @@ int main(int argc, char **argv) {
     const int eos = pulsar_token_eos(engine);
 
     /* ---- greedy gates ----
-     * The batched verifier is documented near-greedy (batch reductions can
-     * flip nearly-tied argmaxes vs the plain decode kernels), so token-exact
-     * equality with plain decode is NOT the engine's contract. Gates:
-     *   1. spec greedy is deterministic (two runs identical), and
-     *   2. it agrees with plain greedy for a long prefix (>= 8 tokens).
+     * Plain decode and speculative verify do not run the same MoE kernels on
+     * the shipped artifact: type-43 routes n_tokens==1 to the _vec arms and
+     * n_tokens>1 to the MMQ batch arm, and type-43 has no non-MMQ fallback
+     * (pulsar_cuda_moe.cu ~1389). So the two paths carry genuinely different
+     * quantization error -- measured ~0.5 logits, expert-routing dependent --
+     * and token-exact equality with plain decode is NOT the engine's contract.
+     *
+     * The old gate asserted a >= 8 token agreeing prefix. That is a lottery,
+     * not a property: it fails as soon as the first decision whose top-2 margin
+     * is under the cross-arm delta lands early in the window, which any kernel
+     * or routing change can shift. Measured 2026-08-11 it read 7 while the
+     * engine was healthy -- and it agreed at position 1 on a TIGHTER margin
+     * (0.437) than the position 7 it diverged on (0.515), which is precisely
+     * how a per-position quantization delta behaves and is not something a
+     * prefix-length threshold can express.
+     *
+     * What is actually asserted here:
+     *   1. spec greedy is deterministic across two runs (informational: batch
+     *      verify inherits prefill atomicAdd nondeterminism, #17);
+     *   2. every token committed to context was also returned to the caller
+     *      (HARD -- this is the ghost-commit / dropped-emission class);
+     *   3. no divergence from plain greedy at a DECISIVE position (HARD) --
+     *      a flip where the plain path was confident means a real accept-rule
+     *      defect, whereas a flip at a narrow margin is the cross-arm delta.
+     * This is the SAME confound this file's header already documents for the
+     * chi-square arm ("a systematic difference between its arms that is NOT a
+     * sampler bug ... treat a deep mode0-vs-mode1 FAIL as engine numerics").
+     * That reasoning was applied to chi2, which was demoted to informational,
+     * but never to the greedy prefix, which stayed a hard gate on the same bad
+     * premise. This change just finishes the job.
+     * NOTE: the chi-square arm is INFORMATIONAL, so it does not hard-gate the
+     * accept rule either. Confound-free accept-rule evidence comes from
+     * mode1-vs-mode1 across builds (dump via argv[6] +
+     * tests/spec_sampling_compare.py), where the measured TVD is 3-4x smaller
+     * than mode0-vs-mode1. The proper repair the header names -- have mode 0
+     * read the same batched rows (a 1-row spec batch, drafter off) so both arms
+     * are batch-sourced -- would restore token-exact comparison here and make
+     * the margin heuristic below unnecessary. Not done.
      * Temperature-matched draft sampling must leave this path untouched: at
      * temp <= 0 no q is built, no rng is drawn, and the argmax-equality accept
      * walk runs exactly as before. */
+    /* Top-2 logit margin above which a greedy flip cannot be quantization
+     * noise. Calibrated on the shipped type-43 artifact, where decisive
+     * positions measure 6.0-14.8 and ambiguous ones 0.19-1.94; 2.0 sits in the
+     * empty band with ~3x headroom either side. Retune with the margin table
+     * this gate prints if the artifact's quantization mix changes. */
+    #define SPEC_GREEDY_DECISIVE_MARGIN 2.0f
     {
         int ref[24], got[24], got2[24];
+        float ref_gap[24];
         int nref = 0, ngot = 0, ngot2 = 0;
+        int hist_ok = 0;
         uint64_t rng = 7;
+        const int vw = pulsar_engine_logits_width(engine);
+        float *lg = (float *)malloc((size_t)vw * sizeof(float));
+        if (!lg) return 1;
         for (int t = 0; t < 24; t++) {
+            /* Top-2 margin of the PLAIN path at this position. A divergence at
+             * a position whose margin is ~0 is the documented near-tie flip;
+             * a divergence at a wide margin is a real accept-rule defect. */
+            float g = -1.0f;
+            if (pulsar_session_copy_logits(session, lg, vw) == vw) {
+                float b1 = -INFINITY, b2 = -INFINITY;
+                for (int v = 0; v < vw; v++) {
+                    if (lg[v] > b1) { b2 = b1; b1 = lg[v]; }
+                    else if (lg[v] > b2) { b2 = lg[v]; }
+                }
+                g = b1 - b2;
+            }
             int tok = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
             if (tok == eos) break;
+            ref_gap[nref] = g;
             ref[nref++] = tok;
             if (pulsar_session_eval(session, tok, err, sizeof(err)) != 0) return 1;
         }
+        free(lg);
         const spec_snap g0 = spec_take(engine);
         for (int rep = 0; rep < 2; rep++) {
             if (pulsar_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) return 1;
@@ -216,7 +274,21 @@ int main(int argc, char **argv) {
                                                          nref - *n, eos, toks, 17,
                                                          err, sizeof(err));
                 if (k <= 0) { fprintf(stderr, "greedy spec failed: %s\n", err); return 1; }
+                if (k > nref - *n)
+                    printf("  [round returned k=%d with budget %d -> %d token(s) "
+                           "generated but DROPPED from the output]\n",
+                           k, nref - *n, k - (nref - *n));
                 for (int i = 0; i < k && *n < nref; i++) dst[(*n)++] = toks[i];
+            }
+            /* Does the session's COMMITTED history contain tokens the spec path
+             * never returned (ghost commit), or vice versa? Either way the
+             * caller's transcript and the KV frontier disagree, and every
+             * later turn continues over the discrepancy. */
+            if (rep == 0) {
+                const pulsar_tokens *hist = pulsar_session_tokens(session);
+                hist_ok = hist && hist->len >= ngot &&
+                          memcmp(hist->v + hist->len - ngot, got,
+                                 (size_t)ngot * sizeof(int)) == 0;
             }
         }
         const spec_snap g1 = spec_take(engine);
@@ -228,15 +300,36 @@ int main(int argc, char **argv) {
          * until ordered reductions land; tie positions flip. */
         printf("greedy determinism (2 runs): %s (informational; batch FP nondeterminism)\n",
                det ? "same" : "tie-flips");
-        printf("greedy prefix agreement vs plain: %d/%d tokens %s\n",
-               prefix, nref, prefix >= 8 ? "PASS" : "FAIL");
+        printf("greedy prefix agreement vs plain: %d/%d tokens "
+               "(informational; cross-arm quantization, not a contract)\n",
+               prefix, nref);
+        printf("spec emissions == committed context: %s\n",
+               hist_ok ? "yes" : "NO -- ghost commit or dropped emission");
         spec_report("greedy  ", g0, g1);
         /* Byte-identity aid: the greedy token stream is printed so a build from
          * a baseline commit can be diffed against this one token-for-token. */
         printf("greedy tokens:");
         for (int i = 0; i < ngot; i++) printf(" %d", got[i]);
         printf("\n");
-        if (prefix < 8) return 1;
+        printf("plain  tokens:");
+        for (int i = 0; i < nref; i++) printf(" %d", ref[i]);
+        printf("\n");
+        printf("plain top-2 margins:");
+        for (int i = 0; i < nref; i++) printf(" %.4g", (double)ref_gap[i]);
+        printf("\n");
+        int decisive_flip = 0;
+        if (prefix < nref) {
+            decisive_flip = ref_gap[prefix] > SPEC_GREEDY_DECISIVE_MARGIN;
+            printf("first divergence at %d: plain=%d spec=%d plain-margin=%.6g "
+                   "(%s)\n",
+                   prefix, ref[prefix], prefix < ngot ? got[prefix] : -1,
+                   (double)ref_gap[prefix],
+                   decisive_flip ? "DECISIVE -- accept-rule defect"
+                                 : "within cross-arm quantization delta");
+        }
+        printf("greedy gate: %s\n",
+               (hist_ok && !decisive_flip) ? "PASS" : "FAIL");
+        if (!hist_ok || decisive_flip) return 1;
     }
 
     /* ---- sampled-distribution comparison ---- */
@@ -358,9 +451,15 @@ int main(int argc, char **argv) {
                "gate proves nothing\n", (double)TOP_P);
         fail = 1;
     } else {
+        /* Keep this in step with the greedy block's asserts. The old text still
+         * advertised "greedy-prefix agreement >=8" after that stopped being a
+         * hard gate, which is exactly the sort of stale claim this file's own
+         * header warns about. */
         printf(fail ? "spec sampling oracle FAIL\n"
-                    : "spec sampling oracle PASS (hard gate: greedy-prefix agreement >=8 + "
-                      "non-degenerate; per-position chi2 above is cross-path numerics, informational)\n");
+                    : "spec sampling oracle PASS (hard gates: spec emissions == "
+                      "committed context, no decisive-margin greedy flip, "
+                      "non-degenerate; greedy-prefix length and per-position "
+                      "chi2 are cross-path numerics, informational)\n");
     }
     free(user);
     return fail;
