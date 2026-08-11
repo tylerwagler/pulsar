@@ -1814,6 +1814,7 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         const char *suffix_text,
         pulsar_tokens *out);
 int kv_cache_store_len(const kv_disk_cache *kc, int tokens);
+int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const pulsar_tokens *prompt,
                                     int user_token_id,

@@ -48,6 +48,17 @@
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
+/* Agent harnesses inject ephemeral blocks (task-tool nags, mode-change notices)
+ * INSIDE the shared preamble, at positions that vary between replays of the
+ * same conversation. A checkpoint cut exactly at the chat anchor therefore sits
+ * above the volatile zone and can never be a byte-prefix of the next prompt, so
+ * it is stored and evicted forever at hits=0. Backing the cut off by one
+ * alignment unit puts it below the jitter and costs a couple of seconds of
+ * prefill. Measured 2026-08-11 against a live Claude Code session: anchor
+ * 21,950, replay agreement varied over 20,393..21,886 (span 1,493) — a 2048
+ * margin clears the whole observed range, and the shorter cut is additionally
+ * shareable between projects whose preambles diverge at ~21,077. */
+#define KV_CACHE_DEFAULT_SYS_PREFIX_MARGIN_TOKENS 2048
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
@@ -515,6 +526,16 @@ public:
         return last_user >= kc_.opt.min_tokens ? last_user : -1;
     }
 
+    /* Back the anchor cut off below harness-injected preamble jitter and land
+     * it on an alignment boundary. Returns 0 when nothing useful survives. */
+    int sys_prefix_cut(int anchor) const {
+        if (anchor < kc_.opt.min_tokens) return 0;
+        int cut = anchor - kc_.opt.sys_prefix_margin_tokens;
+        const int align = kc_.opt.boundary_align_tokens;
+        if (align > 0) cut -= cut % align;
+        return cut >= kc_.opt.min_tokens ? cut : 0;
+    }
+
     int continued_step() const {
         if (!kc_.enabled || kc_.opt.continued_interval_tokens <= 0) return 0;
         int step = kc_.opt.continued_interval_tokens;
@@ -578,6 +599,8 @@ public:
         const size_t prompt_bytes = strlen(prompt_text);
         refresh();
         int best = -1;
+        int eligible = 0;
+        int rejected_tokens = 0;
         for (int i = 0; i < kc_.len; i++) {
             pulsar_kvstore_entry *e = &kc_.entry[i];
             if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
@@ -585,6 +608,7 @@ public:
             if (e->model_id != (uint8_t)model_id) continue;
             if ((uint32_t)ctx_size < e->ctx_size) continue;
             if (kc_.reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+            eligible++;
             if (best >= 0) {
                 pulsar_kvstore_entry *b = &kc_.entry[best];
                 if (e->text_bytes < b->text_bytes) continue;
@@ -593,6 +617,18 @@ public:
             char sha[41];
             Sha1::bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
             if (!strcmp(sha, e->sha)) best = i;
+            else if ((int)e->tokens > rejected_tokens) rejected_tokens = (int)e->tokens;
+        }
+        /* A checkpoint that is short enough to fit the prompt but is not a byte
+         * prefix of it means the client re-rendered the shared preamble
+         * differently. Silence here reads as "no checkpoint existed", which is
+         * the opposite of the truth and hides a permanent cold-prefill loop. */
+        if (best < 0 && rejected_tokens > 0) {
+            logf(PULSAR_KVSTORE_LOG_KVCACHE,
+                 "%s: kv cache text-prefix miss: %d eligible checkpoint(s), "
+                 "largest %d tokens is not a byte prefix of this %zu-byte prompt "
+                 "(client re-rendered the shared preamble)",
+                 log_name(), eligible, rejected_tokens, prompt_bytes);
         }
         return best;
     }
@@ -1070,6 +1106,7 @@ pulsar_kvstore_options pulsar_kvstore_default_options(void) {
     o.continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS;
     o.boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS;
     o.boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS;
+    o.sys_prefix_margin_tokens = KV_CACHE_DEFAULT_SYS_PREFIX_MARGIN_TOKENS;
     return o;
 }
 
@@ -1331,6 +1368,10 @@ void pulsar_kvstore_clear(pulsar_kvstore *kc) {
 
 int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens) {
     return KvStore(*const_cast<pulsar_kvstore *>(kc)).store_len(tokens);
+}
+
+int pulsar_kvstore_sys_prefix_cut(const pulsar_kvstore *kc, int anchor) {
+    return KvStore(*const_cast<pulsar_kvstore *>(kc)).sys_prefix_cut(anchor);
 }
 
 int pulsar_kvstore_chat_anchor_pos(const pulsar_kvstore *kc,
