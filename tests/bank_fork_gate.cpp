@@ -375,6 +375,23 @@ int main(int argc, char **argv) {
         CHECK(!gpu_graph_bank_fork_copy_cut(&s->graph, 2, 1, 3840, 8192),
               "P4 wrapped-ring cut NOT refused (window guard broken)");
         fprintf(stderr, "fork_gate: P4 wrapped-ring cut refused : OK\n");
+
+        /* P4b: the same refusal through the public fork API must carry the
+         * RING_SCROLLED reason code, and the routing-time feasibility probe
+         * must agree in BOTH directions (refuse the scrolled cut, admit a
+         * near-frontier one) — the probe and the fork share one host check,
+         * and this pins that they can never drift apart. bank 2 holds
+         * toks[0..8192): n_cached 3900 cuts at R=3840 (scrolled, == P4's),
+         * n_cached 8000 cuts at R=7936 (inside the ring). */
+        const int wrc = pulsar_session_bank_fork_partial(s, 2, 1, toks, 3900);
+        CHECK(wrc == PULSAR_FORK_RING_SCROLLED,
+              "P4b fork rc %d != PULSAR_FORK_RING_SCROLLED", wrc);
+        const int frc = pulsar_session_bank_fork_partial_feasible(s, 2, 3900);
+        CHECK(frc == PULSAR_FORK_RING_SCROLLED,
+              "P4b probe rc %d != PULSAR_FORK_RING_SCROLLED", frc);
+        const int orc = pulsar_session_bank_fork_partial_feasible(s, 2, 8000);
+        CHECK(orc == PULSAR_FORK_OK, "P4b near-frontier probe rc %d != OK", orc);
+        fprintf(stderr, "fork_gate: P4b reason codes + feasibility probe : OK\n");
         free(toks2);
     }
 

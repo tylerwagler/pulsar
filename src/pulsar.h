@@ -240,9 +240,31 @@ bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank);
  * validates tokens[0..R+4) vs src BEFORE any device write, clones [0,R) (+ the
  * byte-stashed ratio-4 boundary row, emit-restored during the replay), and makes
  * dst's committed history tokens[0..R) — the caller then re-prefills [R, ...).
- * src==dst = in-place truncate-reuse. 0 on success; non-zero -> cold prefill. */
+ * src==dst = in-place truncate-reuse. 0 on success; non-zero -> cold prefill,
+ * with the refusal reason coded (all callers checking !=0 stay correct):    */
+enum {
+    PULSAR_FORK_OK            = 0,
+    PULSAR_FORK_EINVAL        = 1, /* bad args / bank out of range / cut beyond history */
+    PULSAR_FORK_SHALLOW       = 2, /* R < align: cut too close to the origin */
+    PULSAR_FORK_NOHIST        = 3, /* src has no valid committed-history carry */
+    PULSAR_FORK_MISMATCH      = 4, /* tokens[0..R+4) != src committed history */
+    PULSAR_FORK_EVICTED       = 5, /* src bank has no physical KV */
+    PULSAR_FORK_RING_SCROLLED = 6, /* raw ring wrapped past the cut: the replay's
+                                    * attention window [R-raw_window, R) is gone.
+                                    * PERMANENT for this (bank, cut) — the ring
+                                    * only scrolls forward (see _partial_feasible) */
+    PULSAR_FORK_COPY_FAIL     = 7, /* device clone-with-cut failed */
+};
 int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
                                    const int *tokens, int n_cached);
+/* Host-only feasibility probe for the partial fork: every check above EXCEPT the
+ * token compare (the caller already knows its common prefix) and the device copy.
+ * Lets a scheduler route an infeasible cut (typically PULSAR_FORK_RING_SCROLLED
+ * after a client compacts history) straight to a cold path instead of retrying a
+ * fork that can never succeed. Returns PULSAR_FORK_OK when a fork with this
+ * n_cached could proceed. Pure host reads; safe at routing time. */
+int  pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src,
+                                            int n_cached);
 /* GPU bytes the session's create actually allocated (allocator delta measured
  * across pulsar_session_create).  Reconcile against
  * pulsar_engine_session_cost_bytes after each create; commit this actual to any

@@ -3290,7 +3290,9 @@ static void test_json_parser_handles_tool_heavy_requests(void) {
         TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders, false, NULL));
         json_ws(&tp);
         TEST_ASSERT(*tp == '\0');
-        TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"opencode_tool_00\""));
+        /* The heavy schema goes through the canonical re-render (Python-style
+         * spacing, request.cpp json_prompt_value) — assert the spaced form. */
+        TEST_ASSERT(schemas && strstr(schemas, "\"name\": \"opencode_tool_00\""));
         TEST_ASSERT(tool_schema_orders_find(&orders, "opencode_tool_00") != NULL);
         free(schemas);
         tool_schema_orders_free(&orders);

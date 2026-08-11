@@ -191,6 +191,22 @@ int server::slot_frontier_pos(const session_slot *sl) const {
     return pulsar_session_pos(s->sess);
 }
 
+/* Human name for a pulsar_session_bank_fork_partial refusal code, for the
+ * routing logs (a bare "refused" hid the ring-scrolled class for a day). */
+static const char *server_fork_rc_name(int rc) {
+    switch (rc) {
+    case PULSAR_FORK_OK:            return "ok";
+    case PULSAR_FORK_EINVAL:        return "einval";
+    case PULSAR_FORK_SHALLOW:       return "cut-too-shallow";
+    case PULSAR_FORK_NOHIST:        return "no-history";
+    case PULSAR_FORK_MISMATCH:      return "token-mismatch";
+    case PULSAR_FORK_EVICTED:       return "src-evicted";
+    case PULSAR_FORK_RING_SCROLLED: return "ring-scrolled";
+    case PULSAR_FORK_COPY_FAIL:     return "copy-fail";
+    default:                        return "unknown";
+    }
+}
+
 int server::slot_common_prefix(const session_slot *sl,
                                const pulsar_tokens *prompt) const {
     const auto *s = this;
@@ -501,22 +517,39 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                          !best_clobbers_warm_state && !best->active_job &&
                          best_common > 0 && best_common < j->req.prompt.len;
     const bool full    = warm_ok && best_common == frontier;                 /* inc B */
-    const bool partial = warm_ok && !full && best_common >= s->warm_partial_min &&
-                         best_common < frontier;                             /* inc D */
+    /* inc D geometry alone isn't enough: the engine's raw ring may have
+     * scrolled past the cut (typical after a client compacts history on a
+     * deep bank), which makes every partial fork AND the in-place advance
+     * permanently infeasible — the ring only moves forward. Probe before
+     * proposing, so a doomed FORK-partial routes to the divergent/fresh path
+     * immediately instead of re-attempting an impossible fork every quantum
+     * (observed 2026-08-10: ~30 s of refusal retries stalled a compacted
+     * 42k-token turn before an eviction finally let it cold-prefill). */
+    const bool partial_geom = warm_ok && !full && best_common >= s->warm_partial_min &&
+                              best_common < frontier;
+    const int  partial_rc   = partial_geom
+        ? pulsar_session_bank_fork_partial_feasible(s->sess, best->bank, best_common)
+        : PULSAR_FORK_OK;
+    const bool partial = partial_geom && partial_rc == PULSAR_FORK_OK;       /* inc D */
     /* Always-on routing-decision inputs, so a 0-fork count is never silent (the
      * verbose KVCACHE stream; one line per bind, not per token). Confirmed nuance:
      * re-tokenized generated tail rarely reproduces the trunk's exact frontier, so
      * best_common < frontier (the PARTIAL path) is the common case; full is the
      * rare exact-continuation. */
+    char infeasible[48] = "";
+    if (partial_geom && !partial)
+        snprintf(infeasible, sizeof infeasible, " [partial-infeasible: %s]",
+                 server_fork_rc_name(partial_rc));
     if (s->pool_banks > 0 && s->warm_fork_enabled)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: route: best bank %d common %d frontier %d prompt %d "
-                   "partial_min %d -> %s%s%s",
+                   "partial_min %d -> %s%s%s%s",
                    best ? (int)best->bank : -1, best_common, frontier,
                    j->req.prompt.len, s->warm_partial_min,
                    full ? "FORK-full" : partial ? "FORK-partial" : "in-place/cold",
                    best_clobbers_warm_state ? " [trivial]" : "",
-                   (best && best->active_job) ? " [busy]" : "");
+                   (best && best->active_job) ? " [busy]" : "",
+                   infeasible);
     if (full || partial) {
         provision_refusal fr;
         session_slot *dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
@@ -553,8 +586,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                 return best;
             }
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: warm-advance-in-place refused (bank %u); "
-                       "falling through", best->bank);
+                       "pulsar-server: warm-advance-in-place refused (bank %u, %s); "
+                       "falling through", best->bank, server_fork_rc_name(rc));
         }
         if (dst && dst != best) {
             pulsar_session *pool = s->sess;
@@ -579,8 +612,9 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             /* Refused (history moved / evicted src / cut below R): dst stays a
              * fresh empty bank — cold on it is safe and beats clobbering best. */
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: warm-fork-%s refused (bank %u); cold on bank %u",
-                       full ? "full" : "partial", best->bank, dst->bank);
+                       "pulsar-server: warm-fork-%s refused (bank %u, %s); cold on bank %u",
+                       full ? "full" : "partial", best->bank,
+                       server_fork_rc_name(rc), dst->bank);
             *clobbers = false;
             return dst;
         }
@@ -760,6 +794,47 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
             owner = s->anthropic_live_slot_for_ids(&r->anthropic_live_call_ids);
         }
         if (owner) protect[owner - s->slots] = true;
+    }
+}
+
+/* Soft eviction protection: OR into protect[] every bank that is some QUEUED
+ * job's best USABLE warm match. Without this the fresh-path domino recurs:
+ * job A's eviction lands on job B's warm trunk, and B — often the very next
+ * bind — cold-replays its whole history. "Usable" is the operative word: a
+ * match whose partial cut the raw ring has scrolled past (a compacted client)
+ * is dead warmth and stays evictable — protecting it would evict live warmth
+ * in its stead. Best-effort by contract: callers retry without this overlay
+ * when it leaves no victim, so binding always progresses. Worker thread only
+ * (slot_common_prefix reads engine host carries). */
+void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]) {
+    auto *s = this;
+    if (s->pool_banks <= 0) return;
+    job *queued[PULSAR_SERVER_MAX_CLIENTS];
+    int n = 0;
+    pthread_mutex_lock(&s->mu);
+    for (job *q = s->head; q && n < PULSAR_SERVER_MAX_CLIENTS; q = q->next) {
+        queued[n++] = q;
+    }
+    pthread_mutex_unlock(&s->mu);
+    for (int i = 0; i < n; i++) {
+        const job *q = queued[i];
+        int best_i = -1, best_common = 0;
+        for (int k = 0; k < s->n_slots && k < PULSAR_SESSION_POOL_CAP; k++) {
+            const session_slot *sl = &s->slots[k];
+            if (!sl->provisioned) continue;
+            const int common = s->slot_common_prefix(sl, &q->req.prompt);
+            if (common > best_common) { best_common = common; best_i = k; }
+        }
+        if (best_i < 0 || best_common < s->warm_partial_min) continue;
+        const session_slot *sl = &s->slots[best_i];
+        const int frontier = s->slot_frontier_pos(sl);
+        /* Usable = a full fork (exact frontier) or a ring-feasible partial cut.
+         * best_common == prompt.len (bank contains the whole prompt) rides the
+         * partial predicate too: conservative, never protects dead warmth. */
+        const bool usable = best_common == frontier ||
+            pulsar_session_bank_fork_partial_feasible(s->sess, sl->bank,
+                                                   best_common) == PULSAR_FORK_OK;
+        if (usable) protect[best_i] = true;
     }
 }
 
@@ -983,7 +1058,14 @@ bool server::fork_make_room(const session_slot *trunk, bool superseded_only) {
      * exactly the next returning conversation (the LRU domino, measured
      * 2026-08-10) — those callers have a better option (advance in place). */
     if (superseded_only) return false;
-    /* Plain LRU among unprotected idle, trunk still safe. */
+    /* Plain LRU among unprotected idle, trunk still safe. Two-phase: first
+     * avoid banks that are a queued job's usable warm match (the fresh-path
+     * domino), then — if that leaves no victim — retry without the overlay,
+     * because binding must progress. */
+    bool with_warm[PULSAR_SESSION_POOL_CAP];
+    memcpy(with_warm, protect, sizeof with_warm);
+    s->worker_protect_queued_warm_matches(with_warm);
+    if (s->worker_evict_one(with_warm)) return true;
     return s->worker_evict_one(protect);
 }
 
@@ -1040,7 +1122,14 @@ bool server::worker_try_bind() {
                 for (int i = 0; i < s->n_slots; i++) {
                     if (!s->slots[i].provisioned) protect[i] = true;
                 }
-                if (!s->worker_evict_one(protect)) break;
+                /* Two-phase: prefer victims that are no queued job's usable
+                 * warm match; fall back to owner-only protection when the
+                 * overlay leaves nothing evictable (progress over warmth). */
+                bool with_warm[PULSAR_SESSION_POOL_CAP];
+                memcpy(with_warm, protect, sizeof with_warm);
+                s->worker_protect_queued_warm_matches(with_warm);
+                if (!s->worker_evict_one(with_warm) &&
+                    !s->worker_evict_one(protect)) break;
                 sl = s->choose_slot_for_job(j, &reject_ctx, &waiting_owner,
                                          &clobbers, &refusal);
             }

@@ -582,3 +582,46 @@ conversations:
 The disk adds ~0.4 s to cold turns (snapshot writes) and buys graceful
 overload plus 4.7x faster restart turns.  Banks handle capacity <= N warm
 in memory; the disk catches everything past that.
+
+### Live-workload watch: the compaction stall, and its fixes (2026-08-10)
+
+Watched ~6 min of real agentic traffic (tool calls + thinking, 27k-42k
+contexts, 1-5 concurrent streams).  Decode profile: c1 12.1 t/s, c2 6.1
+t/s/stream, c4 3.9 t/s/stream — the fused spec lane pauses whenever 2+
+deep decoders exceed 16384 aggregate rows (deep-guard), prefill absorbed
+~484k prompt tokens in the window (83% prefix-cached), and clocks sat at
+2502/3003 MHz sustained.  All expected at these depths; the surprise was:
+
+**The compaction stall.** A client-side history compaction produced a 42k
+prompt sharing only 21k tokens with its bank's 42k frontier.  Both warm
+paths were PERMANENTLY infeasible — the raw ring (raw_cap 4352 rows) had
+scrolled past the cut, so the replay's attention window [R-raw_window, R)
+no longer existed — but the router had no way to know: it re-proposed
+FORK-partial every quantum for ~30 s (engine refused each time, reason
+uncoded), until an eviction freed the very trunk it was courting and the
+turn cold-prefilled 42k tokens (49 s).
+
+Fixes (engine + scheduler, gated by bank_fork_gate P4b):
+
+- `pulsar_session_bank_fork_partial` now returns CODED refusals
+  (PULSAR_FORK_RING_SCROLLED et al.) and the shared host-check is exposed
+  as `pulsar_session_bank_fork_partial_feasible` — a pure host probe.
+- The route probes feasibility BEFORE proposing FORK-partial: a scrolled
+  cut routes to the divergent/fresh path on the FIRST attempt
+  (`[partial-infeasible: ring-scrolled]` in the route log).
+- Eviction got a soft protection pass: the LRU picker avoids banks that
+  are some queued job's best USABLE warm match (usable = full-fork exact
+  or ring-feasible partial; dead warmth stays evictable), falling back to
+  owner-only protection when the overlay leaves no victim.
+
+Consequence of raw_cap 4352: partial-fork warmth only exists within ~4.3k
+tokens of a bank's frontier.  Deep compactions are structurally cold —
+the fix makes them cold IMMEDIATELY instead of after a 30 s doomed-retry
+stall, and stops them costing an innocent bank its warmth.
+
+Known-stale: tests/pulsar_test local golden `long_story_4096` fails top20
+overlap (12/20, max_abs 9.4) against the v4 artifact — golden captured on
+an older artifact; recapture pending.  Do NOT run model-loading test
+binaries while a server holds the GPU: pulsar_test maps its own 86 GiB
+tensor cache and earlyoom kills the LARGEST process first — which is the
+server, not the (oom_score_adj 1000) test.  Learned the hard way.

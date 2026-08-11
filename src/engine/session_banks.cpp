@@ -169,17 +169,19 @@ bool pulsar_session::bank_fork_pinned(uint32_t bank) const {
  * the stash. src==dst is the in-place truncate-reuse degenerate (no copies).
  * Returns 0 on success; non-zero refusal (mismatch, unaligned/short cut, evicted
  * src, wrapped-out ring) -> caller cold-prefills. */
-int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
-                                  const int *tokens, int n_cached) {
-    auto *s = this;
-    if (!s || !tokens || n_cached < 4) return 1;
+/* Host-side guards for the partial fork: everything checkable without reading
+ * the request tokens or touching the device. Shared verbatim between the fork
+ * itself and the routing-time feasibility probe so the two can never disagree.
+ * Returns PULSAR_FORK_OK and (optionally) the cut R + src history on success. */
+static int bank_fork_partial_host_check(pulsar_session *s, uint32_t src,
+                                        int n_cached, uint32_t *R_out,
+                                        const token_vec **hist_out) {
+    if (!s || n_cached < 4) return PULSAR_FORK_EINVAL;
     pulsar_gpu_graph *g = &s->graph;
-    if (g->banks.n_banks == 0 || src >= g->banks.n_banks || dst >= g->banks.n_banks)
-        return 1;
+    if (g->banks.n_banks == 0 || src >= g->banks.n_banks) return PULSAR_FORK_EINVAL;
     const uint32_t align = pulsar_partial_fork_base_align();
     const uint32_t R = (uint32_t)((n_cached - 4) / (int)align) * align;
-    if (R < align) return 1;                        /* cut too shallow */
-    /* 1. VALIDATE tokens[0..R+4) vs src's committed history BEFORE any write. */
+    if (R < align) return PULSAR_FORK_SHALLOW;
     const uint32_t cur = g->banks.cur_bank;
     const token_vec *hist = NULL;
     if (src == cur) {
@@ -188,22 +190,53 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
                s->bank_carry[src].valid && s->bank_carry[src].checkpoint_valid) {
         hist = &s->bank_carry[src].checkpoint;
     }
-    if (!hist || hist->len < (int)(R + 4u)) return 1;
+    if (!hist) return PULSAR_FORK_NOHIST;
+    if (hist->len < (int)(R + 4u)) return PULSAR_FORK_EINVAL;
+    /* Wrapped-ring window guard (mirrors gpu_graph_bank_fork_copy_cut): the
+     * replay from R attends over raw rows [R - raw_window, R); once the ring
+     * has scrolled past them the cut is unreplayable — and permanently so,
+     * because the ring only moves forward as the bank's frontier grows. */
+    const uint32_t rcap = g->raw_cap;
+    const uint64_t oldest = (uint64_t)hist->len > rcap
+        ? (uint64_t)hist->len - rcap : 0u;
+    if ((uint64_t)R < oldest + g->raw_window) return PULSAR_FORK_RING_SCROLLED;
+    if (gpu_graph_bank_is_evicted(g, src)) return PULSAR_FORK_EVICTED;
+    if (R_out) *R_out = R;
+    if (hist_out) *hist_out = hist;
+    return PULSAR_FORK_OK;
+}
+
+int pulsar_session::bank_fork_partial_feasible(uint32_t src, int n_cached) {
+    return bank_fork_partial_host_check(this, src, n_cached, NULL, NULL);
+}
+
+int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
+                                  const int *tokens, int n_cached) {
+    auto *s = this;
+    if (!s || !tokens) return PULSAR_FORK_EINVAL;
+    pulsar_gpu_graph *g = &s->graph;
+    if (g->banks.n_banks == 0 || dst >= g->banks.n_banks) return PULSAR_FORK_EINVAL;
+    uint32_t R = 0;
+    const token_vec *hist = NULL;
+    const int host_rc = bank_fork_partial_host_check(s, src, n_cached, &R, &hist);
+    if (host_rc != PULSAR_FORK_OK) return host_rc;
+    /* 1. VALIDATE tokens[0..R+4) vs src's committed history BEFORE any write. */
+    const uint32_t cur = g->banks.cur_bank;
     for (uint32_t i = 0; i < R + 4u; i++) {
-        if (hist->v[i] != tokens[i]) return 1;      /* mismatch -> cold */
+        if (hist->v[i] != tokens[i]) return PULSAR_FORK_MISMATCH;
     }
-    /* 2. Pin src; refuse evicted. Snapshot src's host carry FIRST: state_save
-     * re-captures the live frontier counters, which MUST happen before copy_cut
-     * writes the CUT counters into ms[dst] (src==dst truncate would otherwise
-     * be clobbered back to the live frontier). */
+    /* 2. Pin src; re-check evicted under the pin. Snapshot src's host carry
+     * FIRST: state_save re-captures the live frontier counters, which MUST
+     * happen before copy_cut writes the CUT counters into ms[dst] (src==dst
+     * truncate would otherwise be clobbered back to the live frontier). */
     g->fork_pin[src] = 1u;
-    if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return 1; }
-    if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return 1; }
+    if (gpu_graph_bank_is_evicted(g, src)) { g->fork_pin[src] = 0u; return PULSAR_FORK_EVICTED; }
+    if (!bank_carry_ensure(s)) { g->fork_pin[src] = 0u; return PULSAR_FORK_EINVAL; }
     if (src == cur) s->bank_state_save(src);
     /* 3-4. Clone-with-cut (cut counters + boundary stash + keep threshold). */
     if (!gpu_graph_bank_fork_copy_cut(g, src, dst, R, (uint32_t)hist->len)) {
         g->fork_pin[src] = 0u;
-        return 1;
+        return PULSAR_FORK_COPY_FAIL;
     }
     /* 5. Host carry: dst owns tokens[0..R) as its committed history. Copy src's
      * carry for the auxiliary state (logits/dspark), then SET the checkpoint

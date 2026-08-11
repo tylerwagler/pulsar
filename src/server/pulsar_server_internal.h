@@ -1230,6 +1230,7 @@ struct server {
     void count_metric(uint64_t *counter);
     int n_slots_snapshot();
     void worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]);
+    void worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]);
     bool worker_eviction_could_help(const job *j, const bool *protect);
     bool worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]);
     bool worker_try_bind();
