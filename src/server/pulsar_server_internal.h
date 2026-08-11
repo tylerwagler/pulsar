@@ -1256,6 +1256,12 @@ struct job {
     int fd;
     request req;
     bool done;
+    /* Set (under mu) by the client thread when its socket dies while the job
+     * is still queued; the worker reaps the job pre-bind. The client thread
+     * NEVER unlinks or frees — it stays parked on cv until the worker
+     * signals done, preserving the worker-only pop/free invariant the
+     * queued-job protect helpers depend on (see worker_try_bind). */
+    bool cancelled;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -1622,6 +1628,7 @@ bool http_error(int fd, bool enable_cors, int code, const char *msg);
 void request_forced_tool_seed(const request *r, buf *out);
 void request_apply_forced_tool_prefill(request *r);
 bool request_exceeds_context(const request *r, int ctx_size);
+bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                const request *r,
                                                int n_prompt_tokens,

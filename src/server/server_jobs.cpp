@@ -724,7 +724,7 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
  * run-to-completion behavior without a rebuild if some client ever misbehaves.
  * The env is read ONCE (project rule: no per-token getenv). */
-static bool gen_client_disconnected(int fd) {
+bool gen_client_disconnected(int fd) {
     if (fd < 0) return false;
     static int enabled = -1;
     if (enabled < 0) {

@@ -758,7 +758,21 @@ void *client_main(void *arg) {
         pulsar::ScopedLock lk(&j.mu);
         enqueued = s->enqueue(&j);
         if (enqueued) {
-            while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+            /* Wake periodically to notice a client that hung up while the
+             * job sits in the queue: flag it (the worker reaps pre-bind,
+             * skipping eviction/provisioning for a dead fd) and KEEP
+             * waiting for done — the client thread never unlinks or frees,
+             * so the worker-only pop invariant holds (upstream ds4 e9ded97,
+             * reshaped for our stack-owned jobs). */
+            while (!j.done) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 250 * 1000000L;
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&j.cv, &j.mu, &ts);
+                if (!j.done && !j.cancelled && gen_client_disconnected(j.fd))
+                    j.cancelled = true;
+            }
         }
     }
     if (!enqueued) http_error(fd, s->enable_cors, 503, "server shutting down");

@@ -1108,6 +1108,32 @@ bool server::worker_try_bind() {
     pthread_mutex_unlock(&s->mu);
     if (!j) return false;
 
+    /* Reap a head whose client disconnected while queued BEFORE the bind
+     * machinery: choose_slot_for_job can evict warm banks and spend seconds
+     * inside pulsar_session_create — none of it for a dead fd. The client
+     * thread only flags and stays parked on j->cv until this signal, so the
+     * worker remains the sole popper (the invariant the queued-job protect
+     * helpers rely on). No HTTP error write: the socket is gone. */
+    pthread_mutex_lock(&j->mu);
+    const bool head_cancelled = j->cancelled;
+    pthread_mutex_unlock(&j->mu);
+    if (head_cancelled) {
+        pthread_mutex_lock(&s->mu);
+        s->head = j->next;
+        if (!s->head) s->tail = NULL;
+        if (s->n_queued > 0) s->n_queued--;
+        pthread_mutex_unlock(&s->mu);
+        j->next = NULL;
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: dropping queued job for disconnected client fd=%d",
+                   j->fd);
+        pthread_mutex_lock(&j->mu);
+        j->done = true;
+        pthread_cond_signal(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+        return true;
+    }
+
     int reject_ctx = 0;
     bool waiting_owner = false;
     bool clobbers = false;
@@ -1913,13 +1939,20 @@ void *worker_main(void *arg) {
              * work or shutdown is safe.  If a refusal path is ever added
              * that can leave head set with nothing active, this predicate
              * becomes a hard spin — keep the first-bank guarantee. */
-            bool quit;
+            bool quit, had_head;
             {
                 pulsar::ScopedLock lk(&s->mu);
+                had_head = s->head != NULL;
                 while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
                 quit = !s->head && s->stopping;   /* read shared state under the lock */
             }
             if (quit) break;
+            /* A head that was already queued when nothing is active is a head
+             * worker_try_bind just refused (provisioning refusal, waiting
+             * owner). Re-attempting it in a tight loop burns a core on
+             * /proc/meminfo reads — poll instead. Fresh work arriving through
+             * the condvar wait has had_head == false and binds immediately. */
+            if (had_head) usleep(10000);
             continue;
         }
 
