@@ -10,8 +10,16 @@ tensor-core layout the engine's DSpark path loads; byte-lossless from the QAT
 E2M1+E8M0 source):
   gguf-tools/deepseek4-quantize \\
     --hf HF_DIR --template dspark_template.gguf --out dspark.gguf \\
-    --experts cutlass_mxfp4
+    --experts cutlass_mxfp4 $(cat gguf-tools/dspark_type_flags.txt)
 Then splice into the main model with gguf-tools/merge_dspark_gguf.py.
+
+The dspark_type_flags.txt overrides are REQUIRED: the engine's
+dspark_weights_bind() expects exactly f32 norms/gates, fp8_e4m3 attention and
+shared-expert weights, and cutlass_mxfp4 routed experts. The quantizer's
+current defaults (native MXFP8_LT rework) produce mxfp8_lt/bf16/type-39 for
+these tensors and the resulting drafter will not load ("has type bf16,
+expected f32"). Gate every drafter build on a type-parity diff of 0 against a
+known-good drafter before merging.
 """
 import json, os, struct, sys
 
@@ -107,6 +115,10 @@ def make_kvs(cfg):
     R = cfg['n_routed_experts']
     F = cfg['moe_intermediate_size']
     eps = cfg.get('rms_norm_eps', 1e-6)
+    # The 3 draft sublayers target the last 3 main-model layers; the engine's
+    # dspark_weights_bind() reads these KVs and merge_dspark_gguf requires
+    # them (a merged artifact without them fails to bind the drafter).
+    L = cfg['num_hidden_layers']
     kvs = [
         ('general.architecture', VAL_STRING, 'deepseek_v4_dspark'),
         ('deepseek_v4_dspark.embedding_length', VAL_UINT32, E),
@@ -117,6 +129,9 @@ def make_kvs(cfg):
         ('deepseek_v4_dspark.expert_count', VAL_UINT32, R),
         ('deepseek_v4_dspark.expert_feed_forward_length', VAL_UINT32, F),
         ('deepseek_v4_dspark.layer_norm_rms_eps', VAL_FLOAT32, eps),
+        ('dspark.target_layer_ids.0', VAL_UINT32, L - 3),
+        ('dspark.target_layer_ids.1', VAL_UINT32, L - 2),
+        ('dspark.target_layer_ids.2', VAL_UINT32, L - 1),
         ('general.file_type', VAL_UINT32, 1),
         ('general.quantization_version', VAL_UINT32, 2),
     ]
