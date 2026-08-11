@@ -687,6 +687,22 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         }
     }
 
+    /* Ghost-token guard: never commit drafts PAST an accepted EOS. The
+     * emission loop below stops at EOS, but the checkpoint trim uses commit —
+     * without this clamp the bank history keeps invisible tokens after the
+     * stop: the exact-frontier warm gate misses next turn, and the
+     * thinking-live continuation embeds the ghosts into the next prompt. The
+     * EOS row itself stays committed (it was evaluated in the batch, matching
+     * the batched lane's convention); hit_eos below invalidates the carry, so
+     * nothing ever samples from a post-EOS row. */
+    if ((int)first_token == (int)eos_token) {
+        commit = 0;
+    } else {
+        for (int i = 0; i < commit; i++) {
+            if (pend[i] == (int32_t)eos_token) { commit = i + 1; break; }
+        }
+    }
+
     /* Prometheus /metrics spec-decode counters (server /metrics endpoint). The
      * base token is always emitted; K drafts were verified this step and the
      * accepted prefix is [0,commit). num_drafts counts draft rounds only. */

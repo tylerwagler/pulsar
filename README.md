@@ -433,16 +433,22 @@ Acceptance is **exact sampled acceptance at all temperatures**: a draft token
 is accepted with its filtered target probability, and on rejection the engine
 samples from the residual distribution. The speculative path filters logits
 exactly like the plain sampler (temperature scale, top-k, min-p, top-p), so
-the output distribution is provably identical to plain sampling — greedy
-decoding is just the point-mass special case of the same walk. Speculative
-decoding is purely a speedup, never a quality knob, and it now applies to the
-sampling recipes people actually use, not only temperature 0.
+the acceptance rule itself introduces no bias — greedy decoding is just the
+point-mass special case of the same walk. Speculative decoding is a speed
+knob, not a quality knob, and it applies to the sampling recipes people
+actually use, not only temperature 0.
 
-This guarantee is only meaningful because decode and prefill numerics are
-run-to-run deterministic: accumulation orders are fixed everywhere
-(no atomic-order races, no split-K reduction schemes), so the same prompt,
-sampling parameters, and seed reproduce the same output across runs, and the
-speculative verify pass sees exactly the numerics plain decode would.
+One honest numerics caveat: the verify pass evaluates draft rows through the
+batch kernel family, whose floating-point accumulation order differs from
+single-token decode by ~1 ULP — the same class of difference as batched
+inference in any engine (and as our own M≥2 co-batched decode, noted under
+Server). On a near-tie argmax that can flip a token, so a speculative greedy
+continuation is not guaranteed byte-identical to plain greedy decode; the
+divergence is quality-neutral (verified on the 84-scenario hardmode suite)
+and irrelevant under sampling. Within one numerics class the engine is
+run-to-run deterministic: fixed accumulation orders, no atomic-order races,
+so the same prompt, parameters, and seed reproduce the same output across
+runs.
 
 ### Yield-quench safety net
 

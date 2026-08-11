@@ -1563,6 +1563,15 @@ void server::gen_step_decode(session_slot *sl) {
 
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
             if (s->gen_emit_token(sl, toks[ti])) {
+                /* A speculative block can stop mid-block (tool-call end, stop
+                 * string): tokens ti+1..ntok-1 are already committed to the
+                 * bank's history but never emitted. Leaving them makes the
+                 * live KV frontier disagree with every client-visible byte —
+                 * the thinking-tool checkpoint binds on exactly that identity
+                 * and the next turn would continue over ghost tokens.
+                 * Invalidate, matching the stop-string precedent (a fresh
+                 * prefill rebuilds from the emitted text). */
+                if (ti + 1 < ntok) pulsar_session_invalidate(s->sess);
                 stop_decode = true;
                 break;
             }
@@ -2112,6 +2121,15 @@ void server::generate_job_step(session_slot *sl) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         g->finish = "error";
+        if (g->phase == GEN_FINISH) {
+            /* Already finishing and the restore STILL fails: run the finish
+             * step anyway — the error epilogue answers the client without
+             * engine work. Returning here re-steps the slot forever (finish
+             * never runs, GEN_DONE never set, slot never freed, client never
+             * answered). */
+            s->gen_step_finish(sl);
+            return;
+        }
         g->phase = GEN_FINISH;
         return;
     }
