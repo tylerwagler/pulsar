@@ -76,7 +76,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
+.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
 
 all: help
 
@@ -85,6 +85,8 @@ help:
 	@echo "  make cuda-spark          Build for the DGX Spark / GB10 (sm_120f)"
 	@echo "  make test                Build and run tests"
 	@echo "  make cuda-regression     Kernel smokes vs synthetic slabs (modelless)"
+	@echo "  make cuda-attn-gates     fp16 attention correctness gates: kernel oracle,"
+	@echo "                           banked KV-leak isolation, split-KV merge (modelless)"
 	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
 	@echo "                           FRONTIER_MODEL=./ds4flash.gguf by default)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
@@ -125,6 +127,25 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/v
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# fp16 attention correctness gates (standalone .cu, no model needed):
+# kernel-vs-f64 oracle, banked cross-sequence isolation (the KV-leak oracle
+# for the default-on fp16 tier), and split-KV decode merge vs the single-walk
+# golden across every staging branch.  Each file's header documents its scope;
+# these were previously build-by-hand only.
+tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu
+	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+
+tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu
+	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+
+tests/attn_decode_split_test: tests/attn_decode_split_test.cu
+	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	./tests/attn_f16_kernel_test
+	./tests/attn_f16_banked_test
+	./tests/attn_decode_split_test
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips
@@ -430,6 +451,5 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 

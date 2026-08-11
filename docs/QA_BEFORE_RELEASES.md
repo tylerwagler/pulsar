@@ -15,8 +15,10 @@ and any non-default flags for every manual run.
 
 - Start from a clean tree except intentional release notes:
   `git status --short`.
-- Build the release binaries:
-  `make clean && make cuda-spark`.
+- Build the release binary:
+  `make clean && make cuda-spark` (this builds **only `pulsar-server`** — the
+  shipped release).  Build the development tools by name with the same arch:
+  `make pulsar pulsar-agent pulsar-bench pulsar-eval CUDA_ARCH=sm_120f`.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm `./pulsar --help`, `./pulsar-server --help`, and `./pulsar-agent --help` render
@@ -35,7 +37,36 @@ and any non-default flags for every manual run.
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
   `./pulsar_test --server`.
+- Build and run the agent unit tests: `make pulsar_agent_test CUDA_ARCH=sm_120f
+  && ./pulsar_agent_test` (they are not part of `make test`).
 - Run `./pulsar-eval --self-test-extractors`.
+
+### CUDA gates ledger
+
+These are the release-blocking engine gates.  All need the GB10 and (except
+the first two) the shipped model at `./ds4flash.gguf`.  Run each; record
+pass/fail against the release commit:
+
+- `make cuda-regression` — modelless kernel smokes.
+- `make cuda-attn-gates` — fp16 attention kernel oracle, banked cross-session
+  KV-leak isolation, split-KV decode merge (modelless).
+- `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
+  `PREFILL_BASELINE_REF` blob.  **The baseline ref must postdate type-43**
+  (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the
+  shipped artifact and the gate cannot certify the release.  Rebuild the blob
+  with `make cuda-prefill-gate-baseline` after bumping the ref.
+- `make cuda-evict-restore-gate` and `make cuda-fork-gate` — bank evict/restore
+  bit-identity and fork==cold oracle (covers warm-fork routing).
+- `warm_fork_3way` / `warm_partial_fork_3way` (`make warm-fork-3way
+  warm-partial-fork-3way`) — server-level warm-fork determinism.
+- `make cuda-frontier-gate`, `make cuda-multiseq-gate`,
+  `make cuda-multiseq-gate-nodspark` — multiseq isolation and throughput.
+- `make cuda-bank-spec-gate`, `make cuda-accounting-gate`,
+  `make cuda-algo-stability-gate` — bank/spec interaction, admission
+  accounting exactness, cuBLASLt M-independence.
+- `make cuda-mixed-prefill-gate`, `make cuda-mixed-neutrality-gate` — mixed
+  decode+prefill batching neutrality.
+- `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
 ## 3. Flash Inference Path
 
@@ -83,12 +114,24 @@ clients.
 - Test keepalive during long prefill and confirm clients do not time out.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
+- `curl /metrics` and confirm the Prometheus page renders: spec-decode
+  acceptance, token totals, request latency, per-slot generation phase, pool
+  churn and admission pressure counters all present and moving after a request.
+- Reasoning effort: send Anthropic requests at `low`, `high`, and `max` effort
+  and confirm the reported `prompt_tokens` reflects the three distinct effort
+  prefixes (and that `xhigh` maps to `max`).
+- web_search smoke (needs a reachable SearXNG endpoint): start with
+  `--web-search-url`, send a Claude-Code-style request advertising
+  `web_search_20250305`, and confirm the model's search call executes, results
+  splice into the answer, and a second turn replays the search block from
+  cache. Without the flag, confirm the tool entry is dropped and the model
+  never emits a dead search call.
 
 ## 6. pulsar-agent
 
 The agent is the most stateful component.  Test it manually, not only by build.
 
-- Startup banner, status bar, help, `/power`, `/save`, `/list`, `/switch`,
+- Startup banner, status bar, help, `/save`, `/list`, `/switch`,
   `/history`, `/compact`, `/new`, `/del`, and `/strip`.
 - Ctrl+C during generation, during prefill, during a web fetch, and during a
   long tool call.  After `Stopped by user`, typing a new prompt must work.
@@ -121,12 +164,9 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 
-## 8. Performance And Power
+## 8. Performance
 
 - Run `pulsar-bench` on the release machine and compare with tracked CSV baselines.
-- Test `--power 100` is not throttled.
-- Test `--power 50` visibly reduces duty cycle in CLI, server, agent, eval, and
-  bench where practical.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
@@ -135,6 +175,8 @@ The agent is the most stateful component.  Test it manually, not only by build.
 Do not sign off until:
 
 - `make test` and `make cuda-regression` passed on the GB10 host.
+- The CUDA gates ledger (section 2) passed against the release commit and the
+  shipped artifact, with a post-type-43 prefill-gate baseline.
 - The Flash inference path (CLI, thinking modes, long-context recall) was
   exercised.
 - Disk KV cache was exercised.
