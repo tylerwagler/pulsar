@@ -880,8 +880,6 @@ static int routed_moe_launch_mixed40(
               ok = cuda_ok(cudaGetLastError(), "mixed40 padded offsets"); }
     if (!ok) return 0;
 
-    if (!ok) return 0;
-
     if (caseA) {
         /* Phase 1: gate & up W4A8 -> swiglu -> mid (pair layout). */
         float *gate_g = (float *)(scratch + gg_o);

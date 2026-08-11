@@ -233,15 +233,24 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     /* Pool mode: bank 0 is an ordinary bank (no boot pre-provisioning, no
      * pinning) — the uniform loop from 0 replaced the boot-phantom /
      * empty-reuse / soft-evict special-case family (2026-08-10). */
+    int n_provisioned = 0;
     for (int i = 0; i < s->pool_banks; i++) {
-        if (!s->slots[i].provisioned) { idx = i; break; }
+        if (s->slots[i].provisioned) { n_provisioned++; continue; }
+        if (idx < 0) idx = i;
     }
     if (idx < 0) { *refusal = PROVISION_REFUSED_POOL_FULL; return NULL; }
     /* Belt-and-suspenders: refuse if the box is physically tight (fail closed on
      * an unreadable gauge), matching provision_slot. The marginal is what the
-     * bank may still demand-page as it fills. */
+     * bank may still demand-page as it fills.
+     * The FIRST bank is exempt: before the 2026-08-10 slot-0 rework it was
+     * boot-provisioned and never floor-gated, and an empty-pool floor refusal
+     * is a hang — worker_main's wait predicate stays false (head queued,
+     * nothing active), so the worker hard-spins re-reading /proc/meminfo and
+     * the first request never completes.  One bank's eager floor is small;
+     * admission pressure on a tight box belongs to the SECOND bank onward. */
     const uint64_t avail = server_mem_available_bytes();
-    if (avail == 0 || !server_mem_floor_admits(avail, s->bank_marginal_bytes)) {
+    if (n_provisioned > 0 &&
+        (avail == 0 || !server_mem_floor_admits(avail, s->bank_marginal_bytes))) {
         static bool warned; /* single worker thread */
         if (!warned) {
             warned = true;
@@ -577,6 +586,12 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                     j->req.prompt.v, best_common);
             if (rc == 0) {
                 best->committed_pos = pulsar_session_bank_pos(s->sess, best->bank);
+                /* The cut moved the frontier BACKWARD; the pre-truncation
+                 * continued-store watermark would refuse every continued disk
+                 * checkpoint until the new conversation outgrows the old
+                 * frontier (gen_begin only resets it when cached == 0, which
+                 * a successful cut is exactly not). */
+                best->continued_last_store_tokens = 0;
                 server_log(PULSAR_LOG_DEFAULT,
                            "pulsar-server: warm-advance-in-place: bank %u cut "
                            "(frontier %d, common %d) resume %d; no eviction",
@@ -1001,14 +1016,14 @@ int server::pick_superseded_idle(const bool *protect) {
     pulsar_session *pool = s->sess;
     if (!pool) return -1;
     int victim = -1;
-    for (int i = 1; i < s->n_slots; i++) {
+    for (int i = 0; i < s->n_slots; i++) {
         session_slot *a = &s->slots[i];
         if (!a->provisioned || a->active_job || (protect && protect[i])) continue;
         if (pulsar_session_bank_fork_pinned(pool, a->bank)) continue;
         const pulsar_tokens *at = pulsar_session_bank_tokens(pool, a->bank);
         if (!at || at->len == 0) continue;              /* empty: LRU handles it */
         bool superseded = false;
-        for (int k = 1; k < s->n_slots && !superseded; k++) {
+        for (int k = 0; k < s->n_slots && !superseded; k++) {
             if (k == i) continue;
             session_slot *b = &s->slots[k];
             if (!b->provisioned) continue;
@@ -1892,9 +1907,12 @@ void *worker_main(void *arg) {
         }
         if (n_active == 0) {
             /* With every slot free, choose_slot_for_job never returns NULL
-             * (slot 0 always fits), so an unbound head cannot reach this
-             * wait: sleeping on the condvar until new work or shutdown is
-             * safe. */
+             * (provision_bank floor-gates only the SECOND bank onward, so an
+             * empty pool always provisions its first bank), so an unbound
+             * head cannot reach this wait: sleeping on the condvar until new
+             * work or shutdown is safe.  If a refusal path is ever added
+             * that can leave head set with nothing active, this predicate
+             * becomes a hard spin — keep the first-bank guarantee. */
             bool quit;
             {
                 pulsar::ScopedLock lk(&s->mu);

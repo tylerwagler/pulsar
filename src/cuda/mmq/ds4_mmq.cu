@@ -1952,7 +1952,10 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
     x8 += (long long)(slot / n_expert_used) * nyb;
 
     float acc = 0.0f;
-    // 32 lanes cover 4 blocks x 8 pairs per pass.
+    // 32 lanes cover 4 blocks x 8 pairs per pass.  There is NO per-lane
+    // b < nb bound here: the launcher's K % 1024 gate (nb % 4 == 0) is
+    // load-bearing.  Relaxing that gate without adding the bound turns the
+    // tail pass into an OOB read AND a silent wrong accumulation.
     for (int b0 = 0; !invalid_id && b0 < nb; b0 += 4) {
         const int b = b0 + (lane >> 3);
         const int p = lane & 7;
