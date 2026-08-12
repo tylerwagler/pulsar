@@ -110,9 +110,9 @@ next sections.
   per-layer expert-format allocation, used to build the mixed-quant GGUFs.
 - [gguf-tools/reap/README.md](gguf-tools/reap/README.md): the vendored REAP-25
   expert-survivor map and the Path-B transplant tool.
-- [REPRODUCE.md](REPRODUCE.md): the full end-to-end build DAG for the shipped
-  v5mx GGUF (templates → oracle → REAP transplant → imatrix → allocation →
-  mixed-quant → DSpark merge).
+- [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md): the verified end-to-end
+  rebuild of the serving artifact from source weights (two templates, then a
+  single quantizer pass that prunes, pre-formats and merges the drafter).
 - [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
   V4 model card, with the architecture details that matter for Pulsar.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
@@ -179,8 +179,8 @@ A few things this fork's GGUFs do beyond upstream:
   margin for significant residency headroom on the GB10. The survivor set is
   the REAP-25 (LiveCodeBench-50-calibrated) prune published by
   [eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4),
-  vendored and transplanted per `gguf-tools/reap/` (full build DAG in
-  [REPRODUCE.md](REPRODUCE.md)).  **The v4 (0731) line is NOT pruned** — the
+  vendored and applied by the quantizer's `--reap-survivors` (full build in
+  [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md)).  **The v4 (0731) line is NOT pruned** — the
   MLA KV ledger leaves ~20 GiB of headroom on the GB10 even with the full
   256-expert set resident (measured: twelve 32k sessions plus a 384k-context
   window fit comfortably), so v4 keeps every expert.

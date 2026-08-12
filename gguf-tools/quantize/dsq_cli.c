@@ -55,7 +55,7 @@ static void usage(const char *argv0) {
     printf("                         binding KVs merged in. Replaces merge_dspark_gguf.py.\n");
     printf("  --reap-survivors JSON  REAP survivor map: emit an already-pruned artifact\n");
     printf("                         (expert tensors trimmed to survivors, router/bias kept\n");
-    printf("                          padded with -1e30 sentinels). Replaces reap/trim_reap.py;\n");
+    printf("                          padded with -1e30 sentinels).\n");
     printf("                          the template must be built with the same map.\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");

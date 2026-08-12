@@ -298,7 +298,7 @@ void reap_load(reap_map *rm, const char *path) {
         if (L < 0 || L >= n_layers) die("reap survivor map: survivor layer out of range");
         rm->survivors[L] = reap_int_array(&d, v, rm->keep[L], "survivors entry");
         /* Ascending original ids: dense slot order must be deterministic, and
-         * trim_reap.py asserts the same invariant on its side. */
+         * the survivor map is generated in this order too. */
         for (int j = 1; j < rm->keep[L]; j++)
             if (rm->survivors[L][j] <= rm->survivors[L][j - 1])
                 die("reap survivor map: survivors are not strictly ascending");

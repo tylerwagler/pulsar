@@ -40,9 +40,10 @@ Note the ordering: artifacts built before this change (including the first
 collapsed-pipeline validation run) still carry `quantize.imatrix.file`. Compare
 their metadata accordingly.
 
-**Executable form: `gguf-tools/build/rebuild_stages_3_7.sh`** — stages 3-7 with
-`set -euo pipefail`. Prefer it over the prose below; a script cannot silently
-omit a stage, and four of the defects listed under §5 were exactly that.
+**Executable form: `gguf-tools/build/rebuild_collapsed.sh`** — the whole build
+with `set -euo pipefail`. Prefer it over the prose below; a script cannot
+silently omit a stage, and four of the defects listed under §5 were exactly
+that.
 
 ---
 
@@ -52,7 +53,7 @@ omit a stage, and four of the defects listed under §5 were exactly that.
 |---|---|---|
 | HF source checkpoint | `/mnt/pve1-models/dsv4-flash-0731/` (NAS; **not** on any local disk) | 225 shards |
 | imatrix | `/mnt/pve1-models/ds4-quant-archive/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat` | sha256 `02a7c78c29875e4653d6ce21d8821c02161e83ed90c506bdd8d275f76d4ac97e`, 450,892,648 B |
-| format map (v5mx4, **the shipped one**) | `gguf-tools/prisma/v5mx4-format-map.json` | 345 MXFP8_LT / 38 CUTLASS_MXFP4 / 91 IQ2_XXS |
+| format map (v5mx4, **the only one**) | `gguf-tools/prisma/v5mx4-format-map.json` | 345 MXFP8_LT / 38 CUTLASS_MXFP4 / 91 IQ2_XXS_MMQ |
 | REAP survivor map | `gguf-tools/reap/reap25-lcb50-survivors.json` | — |
 | drafter type pins | `gguf-tools/dspark_type_flags.txt` | 25 mxfp8_lt / 44 f32 / 9 cutlass_mxfp4 |
 | imatrix calib corpus | `gguf-tools/imatrix/dataset/` | `calib-diverse-ds4-v1` |
@@ -63,6 +64,32 @@ The imatrix filename on the NAS does not contain the word "imatrix". That is the
 whole reason it looked missing during the audit. It is byte-identical to what was
 sitting in `~/Projects/AI/temp/imatrix.dat`; prefer the NAS copy and verify the
 hash above.
+
+### Upstream provenance
+
+Everything in this repo derives from two external artifacts:
+
+1. **`deepseek-ai/DeepSeek-V4-Flash-DSpark`** (MIT) — the source checkpoint:
+   FP8/FP4 QAT weights plus the DSpark drafter, which rides in the same repo as
+   the `mtp.*` block rather than as a separate download.
+2. **`eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4`** — the REAP-25
+   (LiveCodeBench-50-calibrated) expert prune. The 68 GB GGUF is **not**
+   needed: its survivor map is vendored here as
+   `gguf-tools/reap/reap25-lcb50-survivors.json`. To regenerate it,
+   `gguf-tools/reap/recover_survivors.py` range-fetches only the router
+   tensors (~140 MB, not the whole file).
+
+**Regenerating the imatrix** (the IQ2 floor needs a real importance vector):
+
+```sh
+python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py   # corpus, in-tree
+./pulsar -m ARTIFACT.gguf \
+  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+  --imatrix-out routed-moe.dat --ctx 32768
+```
+
+A published imatrix also exists at `antirez/deepseek-v4-gguf`
+(`imatrix/…routed-moe-ds4-1p5m.dat`).
 
 ### Tokenizer: the bootstrap is now broken (2026-08-12)
 
@@ -128,14 +155,13 @@ quantizer pass emits main + drafter, pruned and pre-formatted, straight to the
 92.5 GB artifact.
 
 **Three stages collapsed into the quantizer on 2026-08-12** (see §Collapse
-below): `trim_reap.py` → `--reap-survivors`, `merge_dspark_gguf.py` →
+below): the REAP transplant → `--reap-survivors`, `merge_dspark_gguf.py` →
 `--dspark-template`, and `repack_iq2_mmq.py` → a format map naming
 `IQ2_XXS_MMQ`. The 102 GB full-256 intermediate is gone entirely.
 
 **Cost.** ~92.5 GB written for a 92.5 GB artifact (1.0x amplification, was
 4.1x). There are no full-size intermediates left, so nothing has to be deleted
-mid-run. The old staged script (`build/rebuild_stages_3_7.sh`) is superseded and
-kept only as history.
+mid-run. The old staged script was deleted along with the passes it drove.
 
 **Every stage here fails silently if skipped.** That is why they were collapsed
 rather than documented harder: the drafter shipped 0.43 GiB of double-store for
@@ -147,14 +173,14 @@ over better discipline.
 
 REAP had to collapse **first**, and that is not a preference:
 
-- `trim_reap.py` is a post-quantize transplant that re-slices whole tensors, so
+- the old REAP transplant was a post-quantize pass that re-sliced whole tensors, so
   it needs block geometry for every type in the file. Pointing the old pipeline
   at an MMQ format map died with `KeyError: 43` in `tbytes()` — the repack stage
   ran *after* trim, but trim had to parse the type trim itself never emits.
 - With REAP inside the quantizer there is no post-pass left to trip over, so
-  MMQ became emittable in the same step. `trim_reap.py` now refuses type 43
-  outright rather than growing a block-geometry entry that would re-enable the
-  broken ordering.
+  MMQ became emittable in the same step. The transplant script was deleted
+  rather than taught about type 43, so the broken ordering cannot be re-entered;
+  git history is the record.
 
 Both collapses were verified byte-exact against the shipped v5mx4 artifact
 *before* replacing the staged script, using `--compare-tensor`:
@@ -239,7 +265,7 @@ the argument for the script over the prose.
    Building the drafter with default types is the 2026-08-01
    `has type bf16, expected f32` load failure.
 3. **The Python environment never migrated off the decommissioned LXC.**
-   `trim_reap.py` died on `ModuleNotFoundError: numpy` at the first stage. The
+   the REAP transplant died on `ModuleNotFoundError: numpy` at the first stage. The
    tools need `/home/claude/.venvs/pulsar-quant`, not system python3.
 4. **Disk sequencing needed two deletion points, not one.** Dropping only the
    102 GB intermediate still left compact + drafter + merged + final = 277 GB on

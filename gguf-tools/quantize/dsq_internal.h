@@ -184,8 +184,8 @@ typedef struct {
  * indexes experts by id and so structurally cannot be pruned); policy 2 = layer
  * is trimmed to keep[L] survivors, listed in ascending ORIGINAL expert id.
  * Router and bias stay padded to n_expert -- pruned bias slots get -1e30 so
- * they can never win top-k. See gguf-tools/reap/trim_reap.py, which this
- * replaces, and validate_reap_metadata() in the engine's weights.cpp. */
+ * they can never win top-k. See validate_reap_metadata() in the engine's
+ * weights.cpp, which checks the reap.* KVs this shape implies. */
 typedef struct {
     bool  enabled;
     char *layout;
