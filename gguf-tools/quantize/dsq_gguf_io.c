@@ -124,6 +124,120 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
+/* Raw bytes of the named KV records, concatenated in the order requested.
+ * Fails if any is missing: a merged artifact without dspark.target_layer_ids
+ * dies in dspark_weights_bind() at load, which is a long way from here. */
+static uint8_t *gguf_take_kvs(const char *path, const char *const *want, int n_want,
+                              size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open GGUF", path);
+    char magic[4];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) || memcmp(magic, "GGUF", 4) != 0)
+        die("bad GGUF template");
+    (void)read_u32_le_fp(fp, "GGUF version");
+    (void)read_u64_le_fp(fp, "GGUF tensor count");
+    const uint64_t n_kv = read_u64_le_fp(fp, "GGUF KV count");
+
+    byte_span *found = xcalloc((size_t)n_want, sizeof(found[0]));
+    bool *seen = xcalloc((size_t)n_want, sizeof(seen[0]));
+    const off_t kv_start = ftello(fp);
+    if (kv_start < 0) die("GGUF ftell failed");
+    for (uint64_t i = 0; i < n_kv; i++) {
+        const off_t rec_start = ftello(fp);
+        char *key = read_gguf_string_fp(fp);
+        const uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
+        skip_gguf_value_fp(fp, type);
+        const off_t rec_end = ftello(fp);
+        if (rec_start < 0 || rec_end < rec_start) die("GGUF ftell failed");
+        for (int k = 0; k < n_want; k++) {
+            if (strcmp(key, want[k]) != 0) continue;
+            if (seen[k]) die("duplicate KV key in dspark template");
+            seen[k] = true;
+            found[k] = (byte_span){ .start = (size_t)(rec_start - kv_start),
+                                    .end = (size_t)(rec_end - kv_start) };
+        }
+        free(key);
+    }
+    const off_t kv_end = ftello(fp);
+    if (kv_end < kv_start) die("GGUF ftell failed");
+    for (int k = 0; k < n_want; k++) {
+        if (!seen[k]) {
+            fprintf(stderr, "error: %s: missing required kv %s\n", path, want[k]);
+            exit(1);
+        }
+    }
+    const size_t blob_len = (size_t)(kv_end - kv_start);
+    uint8_t *blob = xmalloc(blob_len ? blob_len : 1);
+    if (fseeko(fp, kv_start, SEEK_SET) != 0) die("GGUF seek failed");
+    if (blob_len && fread(blob, 1, blob_len, fp) != blob_len) die("GGUF KV read failed");
+    fclose(fp);
+
+    size_t total = 0;
+    for (int k = 0; k < n_want; k++) total += found[k].end - found[k].start;
+    uint8_t *out = xmalloc(total ? total : 1);
+    size_t pos = 0;
+    for (int k = 0; k < n_want; k++) {
+        const size_t n = found[k].end - found[k].start;
+        memcpy(out + pos, blob + found[k].start, n);
+        pos += n;
+    }
+    free(blob);
+    free(found);
+    free(seen);
+    *out_len = total;
+    return out;
+}
+
+/* KVs the engine needs to bind the drafter; mirrors MERGE_KEYS in the
+ * merge_dspark_gguf.py this replaces. */
+static const char *const DSPARK_MERGE_KEYS[] = {
+    "deepseek_v4_dspark.embedding_length",
+    "dspark.target_layer_ids.0",
+    "dspark.target_layer_ids.1",
+    "dspark.target_layer_ids.2",
+};
+#define N_DSPARK_MERGE_KEYS ((int)(sizeof(DSPARK_MERGE_KEYS) / sizeof(DSPARK_MERGE_KEYS[0])))
+
+void gguf_append_dspark(gguf_file *g, const char *dspark_path) {
+    for (uint64_t i = 0; i < g->n_tensors; i++)
+        if (str_starts(g->tensors[i].name, "dspark."))
+            die("main template already contains dspark.* tensors");
+
+    gguf_file d = load_gguf_metadata(dspark_path);
+    if (d.alignment != g->alignment) die("dspark template alignment differs from main");
+
+    size_t kv_add_len = 0;
+    uint8_t *kv_add = gguf_take_kvs(dspark_path, DSPARK_MERGE_KEYS,
+                                    N_DSPARK_MERGE_KEYS, &kv_add_len);
+
+    g->tensors = xrealloc(g->tensors, (size_t)(g->n_tensors + d.n_tensors) * sizeof(g->tensors[0]));
+    for (uint64_t i = 0; i < d.n_tensors; i++) {
+        g->tensors[g->n_tensors + i] = d.tensors[i];   /* steals d's name pointers */
+        d.tensors[i].name = NULL;
+    }
+    g->n_tensors += d.n_tensors;
+
+    g->kv_raw = xrealloc(g->kv_raw, g->kv_raw_len + kv_add_len);
+    memcpy(g->kv_raw + g->kv_raw_len, kv_add, kv_add_len);
+    g->kv_raw_len += kv_add_len;
+    g->n_kv += N_DSPARK_MERGE_KEYS;
+    free(kv_add);
+
+    hmap_free(&g->tensor_map);
+    char **keys = xmalloc((size_t)g->n_tensors * sizeof(keys[0]));
+    for (uint64_t i = 0; i < g->n_tensors; i++) keys[i] = g->tensors[i].name;
+    hmap_build(&g->tensor_map, keys, (int)g->n_tensors);
+    free(keys);
+
+    free(d.path);
+    free(d.kv_raw);
+    free(d.tensors);
+    hmap_free(&d.tensor_map);
+
+    fprintf(stderr, "dspark: appended %" PRIu64 " tensors and %d kv from %s\n",
+            d.n_tensors, N_DSPARK_MERGE_KEYS, dspark_path);
+}
+
 gguf_file load_gguf_metadata(const char *path) {
     gguf_file g = {0};
     g.path = xstrdup(path);

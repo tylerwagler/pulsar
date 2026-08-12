@@ -1,26 +1,27 @@
 #!/bin/bash
 # Full artifact rebuild from source weights -- COLLAPSED pipeline.
 #
-# Supersedes rebuild_stages_3_7.sh. Two stages of the old seven are gone
+# Supersedes rebuild_stages_3_7.sh. Three of the old seven stages are gone
 # because the quantizer now does them itself:
 #
-#   old 3  reap/trim_reap.py     -> --reap-survivors  (expert trim + router/bias
-#                                   permutation happen during generation)
-#   old 6  repack_iq2_mmq.py     -> a format map naming IQ2_XXS_MMQ, which the
-#                                   quantizer emits as type 43 directly
+#   old 3  reap/trim_reap.py       -> --reap-survivors   (expert trim + router/
+#                                     bias permutation during generation)
+#   old 5  merge_dspark_gguf.py    -> --dspark-template  (drafter tensors and
+#                                     binding KVs emitted into the same file)
+#   old 6  repack_iq2_mmq.py       -> a format map naming IQ2_XXS_MMQ, emitted
+#                                     as type 43 directly
 #
-# Both collapses were verified byte-exact against the shipped v5mx4 artifact
-# before this script replaced the staged one; see docs/ARTIFACT_BUILD.md §Collapse.
+# What is left is: build two templates, run the quantizer once, gate it.
 #
-# ORDER IS LOAD-BEARING: REAP had to collapse FIRST. trim_reap.py is a
-# post-quantize transplant that re-slices whole tensors, and it cannot parse a
-# type it has no block geometry for -- pointing the old pipeline at an MMQ map
-# died with `KeyError: 43` in tbytes(). With REAP inside the quantizer there is
-# no post-pass left to trip over, so MMQ became emittable in the same step.
+# ORDER WAS FORCED, not chosen. REAP had to collapse FIRST: trim_reap.py is a
+# post-quantize transplant that re-slices whole tensors, so it needs block
+# geometry for every type in the file -- pointing the old pipeline at an MMQ
+# map died with `KeyError: 43` in tbytes(), because trim had to parse a type
+# trim never emits. With REAP inside the quantizer there is no post-pass left
+# to trip over, and the merge collapse then had nothing to sequence against.
 #
-# Cost: ~185 GB written for a 92.5 GB artifact (2.0x, was 4.1x), one full-size
-# intermediate instead of three, and the peak now fits without deleting anything
-# mid-run.
+# Cost: ~92.5 GB written for a 92.5 GB artifact (1.0x, was 4.1x). No full-size
+# intermediates at all, so nothing has to be deleted mid-run.
 set -euo pipefail
 
 R=${R:-/home/claude/rebuild}
@@ -34,41 +35,43 @@ SURV=$G/reap/reap25-lcb50-survivors.json
 MAP=$G/prisma/v5mx4-format-map-mmq.json     # MMQ variant: 91 IQ2_XXS -> IQ2_XXS_MMQ
 
 TMPL=$R/template-reap.gguf
-COMPACT=$R/compact-mmq.gguf                  # 81.5 GB, 192 experts, type 43
 DTMPL=$R/dspark-template.gguf
-DRAFT=$R/dspark-drafter.gguf
 FINAL=$R/v5mx4-collapsed.gguf
 
 step() { echo; echo "=== $* ==="; date -u +%H:%M:%S; }
 
 mkdir -p "$R"
 
-step "1/5 build_main_template (REAP-shaped: expert dims 192, router/bias stay 256)"
+step "1/3 build_main_template (REAP-shaped: expert dim 192, router/bias stay 256)"
 "$PY" "$G/build_main_template.py" --hf "$HF" --out "$TMPL" \
     --tokenizer-from-hf --reap-survivors "$SURV"
 
-step "2/5 quantize: pruned + pre-formatted in ONE pass (was steps 2, 3 and 6)"
-"$G/deepseek4-quantize" --hf "$HF" --template "$TMPL" --out "$COMPACT" \
-    --format-map "$MAP" --reap-survivors "$SURV" \
-    --imatrix "$IMATRIX" --threads "$THREADS" --overwrite
-
-step "3/5 build_dspark_template (drafter manifest from the checkpoint's mtp.* block)"
+step "2/3 build_dspark_template (drafter manifest from the checkpoint's mtp.* block)"
 "$PY" "$G/build_dspark_template.py" --hf "$HF" --out "$DTMPL"
 
-step "4/5 quantize the drafter with the pinned type table"
-# dspark_type_flags.txt holds exact-name --tensor-type overrides; they are
-# QUANTIZER arguments, not template-builder ones. Building the drafter with
+step "3/3 quantize: main + drafter, pruned and pre-formatted, in ONE pass"
+# dspark_type_flags.txt holds exact-name --tensor-type overrides and is a
+# QUANTIZER argument, not a template-builder one. Building the drafter with
 # default types is what produced the 2026-08-01 'has type bf16, expected f32'
 # load failure.
 # shellcheck disable=SC2046
-"$G/deepseek4-quantize" --hf "$HF" --template "$DTMPL" --out "$DRAFT" \
-    --overwrite $(cat "$G/dspark_type_flags.txt")
-
-step "5/5 merge drafter into main (main bytes preserved verbatim)"
-"$PY" "$G/merge_dspark_gguf.py" "$COMPACT" "$DRAFT" "$FINAL"
+"$G/deepseek4-quantize" --hf "$HF" --template "$TMPL" --dspark-template "$DTMPL" \
+    --out "$FINAL" --overwrite \
+    --format-map "$MAP" --reap-survivors "$SURV" \
+    --imatrix "$IMATRIX" --threads "$THREADS" \
+    $(cat "$G/dspark_type_flags.txt")
 
 step "gate: audit_artifact_types (fails on any plain twin type)"
 "$PY" "$G/audit_artifact_types.py" "$FINAL"
+
+step "gate: classify every difference against the shipped reference"
+# Expect IDENTICAL for most, MMQ for the 91 IQ2 stacks, LT for the 25 drafter
+# tensors, and zero MISMATCH. A reference is optional -- skip if unset.
+if [ -n "${REFERENCE:-}" ]; then
+    "$PY" "$G/verify_against_reference.py" "$FINAL" "$REFERENCE"
+else
+    echo "REFERENCE unset; skipping the differential gate"
+fi
 
 step "done"
 ls -la "$FINAL"

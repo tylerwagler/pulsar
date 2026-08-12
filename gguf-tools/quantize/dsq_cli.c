@@ -12,6 +12,7 @@ typedef struct {
     char *compare_tensor;
     char *imatrix_file;
     char *reap_survivors;
+    char *dspark_template;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -49,6 +50,9 @@ static void usage(const char *argv0) {
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --format-map FILE      JSON manifest of per-tensor formats (prisma_alloc.py output)\n");
+    printf("  --dspark-template FILE emit the DSpark drafter into the SAME artifact:\n");
+    printf("                         its tensors are appended after the main ones and its\n");
+    printf("                         binding KVs merged in. Replaces merge_dspark_gguf.py.\n");
     printf("  --reap-survivors JSON  REAP survivor map: emit an already-pruned artifact\n");
     printf("                         (expert tensors trimmed to survivors, router/bias kept\n");
     printf("                          padded with -1e30 sentinels). Replaces reap/trim_reap.py;\n");
@@ -109,6 +113,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--reap-survivors") == 0) {
             p.reap_survivors = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--dspark-template") == 0) {
+            p.dspark_template = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
@@ -217,6 +223,9 @@ int main(int argc, char **argv) {
     if (p.reap_survivors) reap_load(&reap, p.reap_survivors);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    /* Before build_output_context: the drafter's tensors have to be part of the
+     * plan so they get offsets in the same data region. */
+    if (p.dspark_template) gguf_append_dspark(&tmpl, p.dspark_template);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;

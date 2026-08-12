@@ -349,6 +349,9 @@ byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
 
 /* dsq_gguf_io.c */
 gguf_file load_gguf_metadata(const char *path);
+/* Append the drafter template's tensors + its required KVs to the main
+ * template, so one quantizer pass emits the merged artifact directly. */
+void gguf_append_dspark(gguf_file *g, const char *dspark_path);
 byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name);
 uint64_t fnv1a64_bytes(const uint8_t *data, size_t n);
 output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,

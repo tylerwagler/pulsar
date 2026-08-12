@@ -357,6 +357,14 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
                                 const imatrix_store *imatrix, const reap_map *reap) {
+    /* REAP describes the MAIN model's expert stacks only. The drafter carries
+     * its own dspark.N.ffn_*_exps tensors whose N collides with main layer
+     * indices, so handing the survivor map down would trim them against some
+     * unrelated layer's policy. It happens to be harmless today because
+     * dspark's layers 0-2 map onto the three policy-1 (untouched) layers --
+     * that is luck, not a design, and it becomes silent expert corruption the
+     * moment the survivor map changes. Cut it off by name instead. */
+    if (str_starts(name, "dspark.")) reap = NULL;
     if (parse_expert_tensor(name).is_expert) {
         return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix, reap);
     }

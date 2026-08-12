@@ -122,19 +122,20 @@ The build proper, given a map — run it with
          --format-map MAP-MMQ --reap-survivors SURV [--imatrix ...] --threads N
          -> pruned AND pre-formatted in one pass
     3. build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
-    4. deepseek4-quantize (drafter)                                          11 GB
-         with the exact-name --tensor-type overrides in dspark_type_flags.txt
-    5. merge_dspark_gguf.py         (main bytes preserved verbatim)         92.5 GB
 
-**Two stages collapsed into the quantizer on 2026-08-12** (see §Collapse below):
-the old step 3 (`trim_reap.py`) is now `--reap-survivors`, and the old step 6
-(`repack_iq2_mmq.py`) is now just a format map that names `IQ2_XXS_MMQ`. The
-102 GB full-256 intermediate is gone entirely.
+...and that is the whole build. Step 2 takes `--dspark-template` too, so one
+quantizer pass emits main + drafter, pruned and pre-formatted, straight to the
+92.5 GB artifact.
 
-**Cost.** ~185 GB written for a 92.5 GB artifact (2.0x amplification, was 4.1x),
-one full-size intermediate instead of three, and the peak now fits on the build
-disk without deleting anything mid-run. The old staged script
-(`build/rebuild_stages_3_7.sh`) is superseded and kept only as history.
+**Three stages collapsed into the quantizer on 2026-08-12** (see §Collapse
+below): `trim_reap.py` → `--reap-survivors`, `merge_dspark_gguf.py` →
+`--dspark-template`, and `repack_iq2_mmq.py` → a format map naming
+`IQ2_XXS_MMQ`. The 102 GB full-256 intermediate is gone entirely.
+
+**Cost.** ~92.5 GB written for a 92.5 GB artifact (1.0x amplification, was
+4.1x). There are no full-size intermediates left, so nothing has to be deleted
+mid-run. The old staged script (`build/rebuild_stages_3_7.sh`) is superseded and
+kept only as history.
 
 **Every stage here fails silently if skipped.** That is why they were collapsed
 rather than documented harder: the drafter shipped 0.43 GiB of double-store for
@@ -166,6 +167,21 @@ Both collapses were verified byte-exact against the shipped v5mx4 artifact
 | REAP expert remap | `blk.5.ffn_gate_exps.weight` (cutlass_mxfp4, 855 MB) | byte-identical |
 | REAP + imatrix-by-original-id | `blk.12.ffn_down_exps.weight` (iq2_xxs, 415 MB) | byte-identical |
 | MMQ collapse | `blk.12.ffn_down_exps.weight` type 43 | == `repack(type 39)` |
+| merge collapse, drafter experts | `dspark.0.ffn_gate_exps.weight` (1.14 GB) | byte-identical |
+| merge collapse, drafter dense | `dspark.main_norm.weight`, `dspark.0.hc_attn_fn.weight` | byte-identical |
+| merge collapse, main unaffected | `blk.5.ffn_gate_inp.weight` | byte-identical |
+
+The fully-collapsed plan also reproduces the shipped artifact's shape exactly
+before a single byte is quantized: 1406 tensors and `approx_file_bytes`
+92,495,809,696, both matching the served copy.
+
+**The drafter carries its own `dspark.N.ffn_*_exps` stacks**, and those N
+collide with main layer indices. Handing the REAP survivor map down to them
+would trim them against an unrelated layer's policy. It is harmless *today*
+only because dspark's layers 0-2 land on the three policy-1 (untouched) layers
+— luck, not design — so `generate_tensor` cuts REAP off by name for anything
+under `dspark.`. Without that, changing the survivor map would silently corrupt
+the drafter's experts.
 
 Layers 5 and 12 were chosen because their survivor lists deviate from identity
 at slot 0 and 1 respectively and run out to source experts 254/255 — an identity
