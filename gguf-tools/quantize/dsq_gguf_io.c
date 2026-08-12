@@ -270,6 +270,12 @@ gguf_file load_gguf_metadata(const char *path) {
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, "reap.enabled") == 0 && type == GGUF_TYPE_BOOL) {
+            uint8_t b = 0;
+            if (fread(&b, 1, 1, fp) != 1) die("GGUF reap.enabled read failed");
+            g.reap_enabled = b != 0;
+        } else if (strcmp(key, "reap.survivors.sha256") == 0 && type == GGUF_TYPE_STRING) {
+            g.reap_sha256 = read_gguf_string_fp(fp);
         } else {
             skip_gguf_value_fp(fp, type);
         }

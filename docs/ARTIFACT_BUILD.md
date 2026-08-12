@@ -201,6 +201,18 @@ The fully-collapsed plan also reproduces the shipped artifact's shape exactly
 before a single byte is quantized: 1406 tensors and `approx_file_bytes`
 92,495,809,696, both matching the served copy.
 
+**The template is bound to its survivor map by hash.** `build_main_template.py
+--reap-survivors` stamps `reap.survivors.sha256`, and the quantizer refuses any
+map that does not match it. This closes a hole the shape checks could not see:
+the `reap.*` KVs carry only per-layer counts and policies, so two maps keeping
+the same *number* of experts per layer — but different ones — shape a
+byte-identical template, pass the expert-count cross-check, and route every
+token to a different expert. The artifact loads, generates, and is quietly
+wrong. Verified by building a map that swaps one survivor in layer 5 while
+keeping `keep_count` and `policy` identical: the old checks accept it, the hash
+refuses it and prints both digests. A template built before this change is
+rejected with an instruction to rebuild rather than silently trusted.
+
 **The drafter carries its own `dspark.N.ffn_*_exps` stacks**, and those N
 collide with main layer indices. Handing the REAP survivor map down to them
 would trim them against an unrelated layer's policy. It is harmless *today*

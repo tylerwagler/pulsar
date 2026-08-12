@@ -215,6 +215,37 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     free_gguf_file(&ref);
 }
 
+/* The template's reap.* arrays only carry per-layer counts and policies, so two
+ * survivor maps that keep the same NUMBER of experts per layer -- but different
+ * ones -- shape an identical template and pass the expert-count cross-check,
+ * while routing every token to a different expert. Nothing downstream notices:
+ * the artifact loads, generates, and is quietly wrong. The template therefore
+ * records the hash of the map that shaped it, and this refuses any other. */
+static void check_reap_binding(const gguf_file *tmpl, const char *map_path) {
+    if (tmpl->reap_sha256 && !map_path) {
+        fprintf(stderr, "error: template is REAP-shaped (reap.survivors.sha256 %s)"
+                " but no --reap-survivors was given\n", tmpl->reap_sha256);
+        exit(1);
+    }
+    if (!map_path) return;
+    if (!tmpl->reap_sha256) {
+        if (tmpl->reap_enabled)
+            die("template has reap.enabled but no reap.survivors.sha256; rebuild it "
+                "with build_main_template.py --reap-survivors so the two are bound");
+        die("--reap-survivors given but the template is not REAP-shaped");
+    }
+    char *have = sha256_file_hex(map_path);
+    if (strcmp(have, tmpl->reap_sha256) != 0) {
+        fprintf(stderr,
+                "error: survivor map does not match the one this template was built from\n"
+                "  template %s\n  supplied %s (%s)\n",
+                tmpl->reap_sha256, have, map_path);
+        exit(1);
+    }
+    fprintf(stderr, "reap: survivor map matches the template (sha256 %.16s...)\n", have);
+    free(have);
+}
+
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     imatrix_store imatrix = {0};
@@ -226,6 +257,7 @@ int main(int argc, char **argv) {
     /* Before build_output_context: the drafter's tensors have to be part of the
      * plan so they get offsets in the same data region. */
     if (p.dspark_template) gguf_append_dspark(&tmpl, p.dspark_template);
+    check_reap_binding(&tmpl, p.reap_survivors);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;

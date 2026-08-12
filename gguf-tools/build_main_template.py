@@ -37,7 +37,7 @@ just the model's tokenizer, not a layout choice).
 Usage:
   gguf-tools/build_main_template.py --hf HF_DIR --out main_template.gguf
 """
-import argparse, json, os, struct, sys
+import argparse, hashlib, json, os, struct, sys
 
 GGUF_MAGIC = b'GGUF'
 
@@ -248,7 +248,7 @@ def build_tensor_list(ckpt, keep=None):
 # ---------------------------------------------------------------------------
 # deepseek4.*/general.* metadata, derived from config.json + generation_config.json.
 # ---------------------------------------------------------------------------
-def build_kvs(ckpt, reap=None):
+def build_kvs(ckpt, reap=None, reap_sha=None):
     cfg = ckpt.config
     gen = ckpt.generation_config
     L = cfg['num_hidden_layers']
@@ -320,6 +320,14 @@ def build_kvs(ckpt, reap=None):
             ('reap.layer.keep_count', VAL_ARRAY, (VAL_UINT32, [int(x) for x in reap['keep_count']])),
             ('reap.layer.policy', VAL_ARRAY, (VAL_UINT32, [int(x) for x in reap['policy']])),
         ]
+        # Binds this template to the EXACT survivor map it was shaped by. The
+        # arrays above only carry per-layer counts and policies, so two maps
+        # that keep the same NUMBER of experts per layer -- but different ones
+        # -- produce byte-identical templates and pass every shape check, while
+        # routing every token to a different expert. Nothing else in the build
+        # would notice. The quantizer refuses a map whose hash does not match.
+        if reap_sha:
+            kvs.append(('reap.survivors.sha256', VAL_STRING, reap_sha))
     return kvs
 
 
@@ -421,14 +429,17 @@ def main():
 
     ckpt = HFCheckpoint(a.hf)
     reap = None
+    reap_sha = None
     if a.reap_survivors:
+        with open(a.reap_survivors, 'rb') as f:
+            reap_sha = hashlib.sha256(f.read()).hexdigest()
         with open(a.reap_survivors, encoding='utf-8') as f:
             reap = json.load(f)
         for k in ('layout', 'expert_count', 'keep_count', 'policy', 'survivors'):
             if k not in reap:
                 raise SystemExit(f'{a.reap_survivors}: survivor map is missing "{k}"')
     tensors = build_tensor_list(ckpt, keep=reap['keep_count'] if reap else None)
-    kvs = build_kvs(ckpt, reap=reap)
+    kvs = build_kvs(ckpt, reap=reap, reap_sha=reap_sha)
 
     if a.tokenizer_from_hf:
         # Derive the tokenizer KVs from the checkpoint instead of copying them

@@ -257,6 +257,8 @@ typedef struct {
     size_t kv_raw_len;
     size_t alignment;
     int n_experts;
+    bool reap_enabled;      /* template was built REAP-shaped */
+    char *reap_sha256;      /* hex sha256 of the survivor map that shaped it */
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
