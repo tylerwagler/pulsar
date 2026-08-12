@@ -522,10 +522,27 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * LRU-superseded preferred). Any refusal (history moved, evicted src, cut
      * below R, no evictable bank) degrades to today's path — never a client error. */
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
+    /* `best_common <= prompt.len`, NOT `<`. A client that ROLLS BACK or compacts
+     * history resends a prompt that is a strict prefix of the trunk's committed
+     * tokens, giving best_common == prompt.len < frontier. Under `<` that case
+     * failed warm_ok, skipped both fork paths, and fell into the cross-wire guard
+     * below — which correctly refuses to clobber the trunk and provisions a FRESH
+     * bank, i.e. a FULL cold prefill of an already-resident prompt. Measured
+     * 2026-08-11: `common 164812 frontier 165045 prompt 164812` re-prefilled
+     * 123,852 tokens (~2.5 min) with the whole prompt already in bank 0. It also
+     * broke the invariant the cross-wire comment below asserts ("deep divergent
+     * matches already FORKED above and never reach here"). The partial cut handles
+     * it exactly: align down from best_common, re-prefill only the remainder.
+     *
+     * `full` keeps the strict `<`: a FULL fork exists to re-prefill a suffix, and
+     * best_common == prompt.len == frontier means the trunk IS the prompt, with no
+     * suffix and no divergence. That is a plain in-place continuation and must stay
+     * one — forking there would copy a bank to do nothing. */
     const bool warm_ok = s->pool_banks > 0 && s->warm_fork_enabled && best &&
                          !best_clobbers_warm_state && !best->active_job &&
-                         best_common > 0 && best_common < j->req.prompt.len;
-    const bool full    = warm_ok && best_common == frontier;                 /* inc B */
+                         best_common > 0 && best_common <= j->req.prompt.len;
+    const bool full    = warm_ok && best_common == frontier &&
+                         best_common < j->req.prompt.len;                    /* inc B */
     /* inc D geometry alone isn't enough: the engine's raw ring may have
      * scrolled past the cut (typical after a client compacts history on a
      * deep bank), which makes every partial fork AND the in-place advance
