@@ -136,7 +136,8 @@ __device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t 
         const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
         return attn_pack_e4m3(r[d], scale);
     }
-    return ((const float *)(r + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope];
+    return __bfloat162float(((const __nv_bfloat16 *)(r + n_nope +
+                             PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope]);
 }
 
 struct pulsar_gpu_tensor {
