@@ -49,6 +49,10 @@ static void usage(const char *argv0) {
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --format-map FILE      JSON manifest of per-tensor formats (prisma_alloc.py output)\n");
+    printf("  --reap-survivors JSON  REAP survivor map: emit an already-pruned artifact\n");
+    printf("                         (expert tensors trimmed to survivors, router/bias kept\n");
+    printf("                          padded with -1e30 sentinels). Replaces reap/trim_reap.py;\n");
+    printf("                          the template must be built with the same map.\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q2_k, iq2_xxs, fp8_e4m3, mxfp4\n");
