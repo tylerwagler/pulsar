@@ -65,6 +65,23 @@ def parse(path):
 
 
 def tbytes(typ, dims):
+    if typ == 43:
+        # IQ2_XXS_MMQ is PLANAR: one d plane then one q plane, each spanning
+        # every block of every expert. The 'exp' branch below slices contiguous
+        # per-expert byte ranges (correct for the expert-major types 16/40/41),
+        # which for a planar tensor would splice d-plane bytes onto q-plane
+        # bytes -- right size, silently corrupt data, artifact loads clean.
+        #
+        # This is an ORDERING constraint, not a missing table row: the MMQ
+        # permutation must happen AFTER this trim (the stage-7 repack pass), or
+        # REAP must move into the quantizer so it emits already-pruned tensors
+        # and the tensor-global permutation applies to the final shape. Do not
+        # "fix" this by adding 43 to BLK.
+        raise SystemExit(
+            "trim_reap: refusing type 43 (IQ2_XXS_MMQ) -- it is planar and this "
+            "tool slices experts as contiguous ranges. Quantize experts as plain "
+            "IQ2_XXS (16) and let the stage-7 repack convert AFTER the trim, or "
+            "collapse REAP into the quantizer first.")
     be, bb = BLK[typ]; ne = 1
     for d in dims: ne *= d
     assert ne % be == 0, (typ, dims); return ne // be * bb

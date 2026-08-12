@@ -54,10 +54,23 @@ ls -la "$MERGED"
 rm -v "$COMPACT" "$DRAFT"
 df -h /home | tail -1
 
-step "7/7 repack IQ2_XXS (16) -> IQ2_XXS_MMQ (43)"
-"$PY" "$G/repack_iq2_mmq.py" "$MERGED" "$FINAL"
+# Stage 7 is CONDITIONAL, and the gate decides -- not the operator's memory.
+# A format map naming IQ2_XXS_MMQ emits type 43 straight out of the quantizer,
+# so the merged artifact is already clean and this whole ~92 GB copy-and-rewrite
+# pass is dead weight. A map naming plain IQ2_XXS still needs it. Asking the
+# audit rather than hardcoding the step means neither pipeline can silently skip
+# a conversion it needed: the exact failure that shipped 2.4x-slower MMQ weights.
+step "7/7 repack IQ2_XXS (16) -> IQ2_XXS_MMQ (43), only if the audit says so"
+if "$PY" "$G/audit_artifact_types.py" "$MERGED" >/dev/null 2>&1; then
+    echo "merged artifact already clean (quantizer emitted type 43) -- skipping repack"
+    mv -v "$MERGED" "$FINAL"
+else
+    echo "merged artifact carries plain twins -- running the repack pass"
+    "$PY" "$G/repack_iq2_mmq.py" "$MERGED" "$FINAL"
+    rm -v "$MERGED"
+fi
 
-step "GATE: artifact-type audit"
+step "GATE: artifact-type audit (must pass whichever path ran)"
 "$PY" "$G/audit_artifact_types.py" "$FINAL" --census
 
 step "DONE"

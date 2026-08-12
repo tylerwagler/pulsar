@@ -239,6 +239,15 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
+    /* IQ2_XXS_MMQ is a TENSOR-GLOBAL permutation of IQ2_XXS: one d plane across
+     * every block of every expert, then one q plane. The per-expert workers
+     * below therefore quantize the BASE type into their own slices, and the
+     * permutation runs once after the join. Doing it per-expert (the shape the
+     * MXFP8_LT branch in f32_to_type uses, which is per-row and so composes
+     * fine) would emit per-expert planes: same bytes, wrong arrangement, loads
+     * clean, reads garbage. */
+    const bool want_iq2_mmq = (target == DS4Q_TYPE_IQ2_XXS_MMQ);
+    if (want_iq2_mmq) target = DS4Q_TYPE_IQ2_XXS;
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
@@ -264,6 +273,17 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
     pthread_mutex_destroy(&job.lock);
     free(threads);
+    if (want_iq2_mmq) {
+        /* Whole-tensor permutation, size-preserving. This is what
+         * gguf-tools/repack_iq2_mmq.py used to do as a separate ~92 GB
+         * copy-and-rewrite pass over the finished artifact. */
+        const int64_t nblk = (int64_t)(out.size / 66);
+        if ((size_t)nblk * 66 != out.size) die("iq2_xxs_mmq: tensor is not a whole number of 66 B blocks");
+        uint8_t *packed = xmalloc(out.size);
+        ds4q_pack_iq2_xxs_mmq((const uint8_t *)out.data, packed, nblk);
+        free(out.data);
+        out.data = packed;
+    }
     return out;
 }
 
