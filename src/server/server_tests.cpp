@@ -1065,6 +1065,56 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
 
 
 
+/* A DSML block whose START is inside <think> but whose END lands AFTER
+ * </think> straddles the reasoning boundary and is NOT an executable call
+ * (upstream ds4 0ead8a8).  Classifying it as a complete tool suppressed the
+ * stream from the marker onward, so the post-thinking answer never reached the
+ * client.  The boundary text itself is malformed either way; what must not
+ * happen is losing the content after </think>. */
+static void test_openai_stream_keeps_text_when_tool_straddles_think_close(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = PULSAR_THINK_HIGH;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<think>consider " PULSAR_TOOL_CALLS_START "</think>Answer."
+        PULSAR_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_straddle", &st,
+                                         raw, strlen(raw), false));
+    /* The regression discriminator: the straddling block used to be classified
+     * as a complete call, latching the stream into SUPPRESS from the marker
+     * onward.  It must instead close reasoning at </think> and continue. */
+    TEST_ASSERT(st.mode != OPENAI_STREAM_SUPPRESS);
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TEXT);
+
+    /* Flush: TEXT mode holds the tail back until final. */
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_straddle", &st,
+                                         raw, strlen(raw), true));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    /* The user-visible regression: content after </think> was swallowed. */
+    TEST_ASSERT(strstr(out, "Answer.") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -5252,6 +5302,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
+    test_openai_stream_keeps_text_when_tool_straddles_think_close();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();

@@ -1215,16 +1215,25 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
         const char *tool = r->has_tools ?
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
-        const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+        /* The END must also land before </think>: a block whose end falls past
+         * the close straddles the reasoning boundary and is NOT an executable
+         * call (upstream ds4 0ead8a8). */
+        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
+        const bool complete_tool = tool_end && (!close || tool_end < close);
         size_t limit;
-        if (tool_before_close) {
+        if (complete_tool) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
                                            (size_t)(tool - raw));
         } else if (close) {
+            /* An incomplete marker that remains inside a closed think block is
+             * reasoning text, not an executable call. */
             limit = (size_t)(close - raw);
         } else if (final) {
+            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
             limit = raw_len;
+        } else if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -1239,11 +1248,9 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
             st->emit_pos = limit;
         }
 
-        if (tool_before_close) {
-            if (complete_tool) {
-                st->emit_pos = (size_t)(tool - raw);
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
+        if (complete_tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = OPENAI_STREAM_SUPPRESS;
             return true;
         }
 
