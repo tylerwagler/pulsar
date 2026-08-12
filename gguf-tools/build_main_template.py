@@ -386,14 +386,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--hf', required=True, help='HF checkpoint directory')
     ap.add_argument('--out', required=True)
-    ap.add_argument('--splice-tokenizer-from', help='existing ds4 GGUF to copy tokenizer.* KVs from (scoped-out piece, see docstring)')
+    ap.add_argument('--splice-tokenizer-from', help='existing ds4 GGUF to copy tokenizer.* KVs from (legacy bootstrap; prefer --tokenizer-from-hf)')
+    ap.add_argument('--tokenizer-from-hf', action='store_true',
+                    help='derive tokenizer.* KVs from the HF checkpoint (no prior GGUF needed)')
+    ap.add_argument('--tokenizer-template', default=None,
+                    help='chat template for --tokenizer-from-hf (default: gguf-tools/tokenizer/chat_template.jinja)')
     a = ap.parse_args()
 
     ckpt = HFCheckpoint(a.hf)
     tensors = build_tensor_list(ckpt)
     kvs = build_kvs(ckpt)
 
-    tok_raw_kvs = splice_tokenizer_kvs(a.splice_tokenizer_from) if a.splice_tokenizer_from else []
+    if a.tokenizer_from_hf:
+        # Derive the tokenizer KVs from the checkpoint instead of copying them
+        # out of a prior artifact. Same raw-blob format and same order, so the
+        # concatenation below is unchanged. Verified byte-identical to a spliced
+        # block by gguf-tools/tokenizer/build_tokenizer_kvs.py --verify-against.
+        tokdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tokenizer')
+        sys.path.insert(0, tokdir)
+        from build_tokenizer_kvs import build as build_tokenizer_kvs
+        tmpl = a.tokenizer_template or os.path.join(tokdir, 'chat_template.jinja')
+        tok_raw_kvs = list(build_tokenizer_kvs(a.hf, tmpl).values())
+    elif a.splice_tokenizer_from:
+        tok_raw_kvs = splice_tokenizer_kvs(a.splice_tokenizer_from)
+    else:
+        tok_raw_kvs = []
 
     buf = Buf()
     for key, typ, val in kvs:
