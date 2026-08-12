@@ -32,17 +32,43 @@ whole reason it looked missing during the audit. It is byte-identical to what wa
 sitting in `~/Projects/AI/temp/imatrix.dat`; prefer the NAS copy and verify the
 hash above.
 
-### ⚠ Bootstrap dependency: you cannot build from source weights alone
+### Tokenizer: the bootstrap is now broken (2026-08-12)
 
-`build_main_template.py` takes `--splice-tokenizer-from <existing ds4 GGUF>` and
-**never converts the HF tokenizer by design**. So a "from scratch" rebuild still
-needs one previously-good GGUF to copy `tokenizer.*` KVs from. Omitting the flag
-does not fail loudly at build time — it emits a template with `0 spliced
-tokenizer KVs`, and the engine only rejects it later with "GGUF tokenizer token
-table missing". That cost ~15 minutes of server downtime on 2026-07-31.
+`build_main_template.py` still defaults to `--splice-tokenizer-from <existing ds4
+GGUF>`, copying `tokenizer.*` KVs verbatim from a prior artifact. That made a
+strict from-source rebuild impossible: each artifact needed an earlier one.
 
-**Rule: never proceed past a template build whose log does not show >0 spliced
-tokenizer KVs and an MB-scale file size.**
+**`gguf-tools/tokenizer/build_tokenizer_kvs.py` replaces it.** It derives all
+eleven KVs from `tokenizer.json` + `tokenizer_config.json`, verified
+**byte-identical** to the live artifact (including the 2.3 MB tokens and 2.4 MB
+merges arrays):
+
+    python3 gguf-tools/tokenizer/build_tokenizer_kvs.py \
+        --hf /mnt/pve1-models/dsv4-flash-0731 --out KVDIR \
+        [--verify-against REFDIR]
+
+Three inputs are **not derivable** from any HF file and live in the repo as
+explicit constants — they are our decisions, not borrowed artifact bytes:
+
+| input | where | why not derivable |
+|---|---|---|
+| `tokenizer.ggml.pre` = `joyai-llm` | `build_tokenizer_kvs.py` | llama.cpp pretokenizer id; a classification |
+| chat template | `gguf-tools/tokenizer/chat_template.jinja` | checkpoint ships the format as Python (`encoding/encoding_dsv4.py`), not Jinja |
+| 6 `USER_DEFINED` tokens | `build_tokenizer_kvs.py` | hand-curated; HF's `special` flag gives 1230/53, not the required 1277/6 |
+
+That last one is not cosmetic. `<think>`, `</think>` and the DSML markers must be
+USER_DEFINED (4), not CONTROL (3), because CONTROL tokens are skipped during
+detokenization — mark them wrong and the model's reasoning output and tool calls
+are silently swallowed, with every other gate still green.
+
+**Always run `--verify-against` when the tokenizer path changes.** A tokenizer
+that is merely close yields an artifact that loads, generates, and mis-tokenizes;
+nothing else here catches that.
+
+⚠ **Still to do:** wire this into `build_main_template.py` so splicing is no
+longer the default. Needs a full template build to verify; not yet run. Until
+then, if you do splice: never proceed past a template build whose log does not
+show >0 spliced tokenizer KVs and an MB-scale file size.
 
 ## 2. Pipeline
 
