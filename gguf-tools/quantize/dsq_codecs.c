@@ -139,6 +139,9 @@ float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64_t *n_o
 void imatrix_load(imatrix_store *im, const char *path, bool strict) {
     memset(im, 0, sizeof(*im));
     im->file = xstrdup(path);
+    /* Hashed before parsing so the recorded identity covers the file as it was
+     * read, not just the parts this loader happens to understand. */
+    im->sha256 = sha256_file_hex(path);
     im->strict = strict;
     im->chunks = -1;
     FILE *fp = fopen(path, "rb");
@@ -239,6 +242,7 @@ void imatrix_free(imatrix_store *im) {
     }
     free(im->entries);
     free(im->file);
+    free(im->sha256);
     free(im->dataset);
     hmap_free(&im->map);
     memset(im, 0, sizeof(*im));

@@ -49,7 +49,10 @@
 #error "deepseek4-quantize.c currently targets POSIX systems"
 #endif
 
-#define DS4_KV_QUANTIZE_IMATRIX_FILE      "quantize.imatrix.file"
+/* Content hash, not a path: a path records where someone's disk was, a hash
+ * records WHICH imatrix it was. Replaced "quantize.imatrix.file" on 2026-08-12;
+ * nothing outside this tool ever read that key. */
+#define DS4_KV_QUANTIZE_IMATRIX_SHA256    "quantize.imatrix.sha256"
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
@@ -166,6 +169,7 @@ typedef struct {
 
 typedef struct {
     char *file;
+    char *sha256;      /* hex content hash; what identifies the imatrix */
     char *dataset;
     imatrix_entry *entries;
     int n_entries;
@@ -269,6 +273,10 @@ typedef struct {
 } output_context;
 
 /* ===== Cross-TU declarations ===== */
+
+/* dsq_sha256.c */
+/* Hex SHA-256 of a whole file, streamed. Caller frees. Self-tests on first use. */
+char *sha256_file_hex(const char *path);
 
 /* dsq_util.c */
 void die(const char *msg);

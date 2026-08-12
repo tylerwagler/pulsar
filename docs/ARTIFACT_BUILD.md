@@ -23,9 +23,22 @@ routed-moe-ds4-1p5m.dat` on the served copy vs the NAS path here. That 46-byte
 string difference pushes `data_pos` one 32-byte alignment unit, which is the
 entire 32-byte file-size delta.
 
-**Fix worth making:** record the imatrix sha256 instead of its path. A path says
-where someone's disk was; a hash says which imatrix it was, and would make the
-artifact byte-reproducible rather than byte-reproducible-modulo-one-KV.
+**Fixed 2026-08-12.** The GGUF now records `quantize.imatrix.sha256` — the
+imatrix's content hash — and no longer records its path at all. A path says
+where someone's disk was; a hash says which imatrix it was. The KV is now a
+fixed 64 hex chars, so it is identical on every machine and the one remaining
+metadata divergence (and the 32-byte `data_pos` shift it caused) is gone.
+
+SHA-256 is implemented in `quantize/dsq_sha256.c` to keep the quantizer
+dependency-free. It self-tests against the FIPS 180-4 vectors on first use,
+including a multi-block case, because a silently wrong hash would stamp a
+confident and meaningless identity into every artifact. It was also checked
+against this document's independently recorded value for the real 450 MB
+imatrix — `02a7c78c…` — which it reproduces exactly.
+
+Note the ordering: artifacts built before this change (including the first
+collapsed-pipeline validation run) still carry `quantize.imatrix.file`. Compare
+their metadata accordingly.
 
 **Executable form: `gguf-tools/build/rebuild_stages_3_7.sh`** — stages 3-7 with
 `set -euo pipefail`. Prefer it over the prose below; a script cannot silently

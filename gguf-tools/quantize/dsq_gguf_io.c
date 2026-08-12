@@ -90,7 +90,7 @@ static bool is_imatrix_kv_key(const char *key) {
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
-    n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_FILE) + 4 + gguf_string_size(im->file);
+    n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_SHA256) + 4 + gguf_string_size(im->sha256);
     n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES) + 4 + 8;
     if (im->dataset) n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_DATASET) + 4 + gguf_string_size(im->dataset);
     if (im->chunks > 0) n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS) + 4 + 8;
@@ -104,9 +104,9 @@ static uint64_t extra_imatrix_kv_count(const imatrix_store *im) {
 
 static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     if (!imatrix_enabled(im)) return;
-    write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_FILE);
+    write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_SHA256);
     write_u32(fp, GGUF_TYPE_STRING);
-    write_gguf_string(fp, im->file);
+    write_gguf_string(fp, im->sha256);
 
     write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES);
     write_u32(fp, GGUF_TYPE_UINT64);
