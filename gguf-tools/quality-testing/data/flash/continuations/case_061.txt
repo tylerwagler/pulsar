@@ -1,0 +1,3 @@
+This is a great question because it gets to the heart of why we organize data.
+
+The core reason sorted arrays make membership

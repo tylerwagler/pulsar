@@ -1,0 +1,1 @@
+In the context of a network server, **backpressure** is a mechanism (or a state) that occurs when a

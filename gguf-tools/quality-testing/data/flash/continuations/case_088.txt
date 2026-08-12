@@ -1,0 +1,1 @@
+A tokenizer should treat special tags carefully because these tags often carry specific semantic, structural, or functional meaning that is critical

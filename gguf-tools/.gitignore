@@ -1,6 +1,11 @@
 deepseek4-quantize
 quality-testing/score_official
-quality-testing/data/
+
+# NOT ignored: quality-testing/data/ is the 100-case reference eval corpus
+# (prompts + reference continuations + manifest, 4.4 MB of plain text), not
+# build output. It was ignored here as if it were generated, which left the
+# only version-controlled copy in the local-only ds4-quant rescue repo -- one
+# host, no remote, for the baseline every quantization is scored against.
 
 # test binaries
 quantize/tests/mxfp8_lt_emit

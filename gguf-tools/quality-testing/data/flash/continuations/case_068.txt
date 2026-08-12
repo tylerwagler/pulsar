@@ -1,0 +1,1 @@
+This is a nuanced and insightful question. The core reason quantization error affects **rare experts** more than **common experts**

@@ -1,0 +1,3 @@
+Let's break down **online softmax** in the context of attention, using simple variables.
+
+First, recall the standard

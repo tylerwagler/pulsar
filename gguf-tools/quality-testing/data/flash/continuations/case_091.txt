@@ -1,0 +1,3 @@
+Here is the best plain-language explanation of a confidence interval:
+
+**A confidence interval is a "net" you cast to

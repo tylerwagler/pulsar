@@ -1,0 +1,3 @@
+This is an excellent question that gets to the heart of modern graphics programming and the trade-offs between simplicity and performance.
+
+The

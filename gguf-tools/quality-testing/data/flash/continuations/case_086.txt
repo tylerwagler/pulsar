@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they rely on a mathematical algorithm that condenses a file or data block into a small

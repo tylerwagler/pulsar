@@ -1,0 +1,3 @@
+Here are three essential server metrics, each with a brief explanation of why it is useful:
+
+1.  **CPU Utilization

@@ -1,0 +1,1 @@
+L'errore di quantizzazione è un fenomeno che si verifica quando si riduce la precisione di un

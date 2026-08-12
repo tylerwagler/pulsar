@@ -1,0 +1,1 @@
+Certamente. La cache KV (Key-Value) su disco è un componente cruciale per rendere le sessioni

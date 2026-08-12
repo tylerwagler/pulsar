@@ -1,0 +1,1 @@
+Certamente. La ragione principale per cui un array ordinato rende la ricerca di appartenenza (cioè

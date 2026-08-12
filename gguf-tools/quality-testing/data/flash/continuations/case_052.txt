@@ -1,0 +1,1 @@
+Certamente! Ti spiego l'**online softmax** nell'attenzione in modo semplice, usando variabili

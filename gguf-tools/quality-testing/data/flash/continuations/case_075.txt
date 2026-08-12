@@ -1,0 +1,1 @@
+Un **trie** (o albero digitale) rappresenta un insieme di stringhe organizzandole in una struttura

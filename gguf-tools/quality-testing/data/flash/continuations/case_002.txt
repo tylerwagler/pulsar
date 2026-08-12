@@ -1,0 +1,4 @@
+Here's a comprehensive comparison between mmaped model weights and copying all weights into private buffers on macOS:
+
+## Memory Management
+

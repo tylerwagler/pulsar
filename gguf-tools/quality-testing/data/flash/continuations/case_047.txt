@@ -1,0 +1,1 @@
+Here’s a clear breakdown of the difference between **raw KV rows** and **compressed KV rows** in the

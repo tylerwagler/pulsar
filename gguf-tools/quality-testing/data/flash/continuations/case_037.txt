@@ -1,0 +1,1 @@
+Nella quantizzazione **low-bit** (a bassa precisione, come 4-bit, 2-bit o
