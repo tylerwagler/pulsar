@@ -163,6 +163,16 @@ The agent is the most stateful component.  Test it manually, not only by build.
   behavior, file naming, and symlink policy.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
+- Run the artifact-type gate on every shipped gguf:
+  `python3 gguf-tools/audit_artifact_types.py MODEL.gguf`
+  It fails if any tensor ships in a PLAIN type that has a pre-formatted twin
+  (16 -> 42/43, 38 -> 41, 39 -> 40). Those are pure byte permutations, so the
+  plain form is never *wrong* -- the engine just converts at first use and
+  keeps a second device copy beside the mmap, silently. The drafter shipped
+  0.429 GiB of type-38 double-store this way from its first build until
+  2026-08-12, because it is built from a separate pinned type table
+  (`gguf-tools/dspark_type_flags.txt`) that was never revisited when the main
+  model moved to MXFP8_LT. Use `--census` for the full type breakdown.
 
 ## 8. Performance
 
