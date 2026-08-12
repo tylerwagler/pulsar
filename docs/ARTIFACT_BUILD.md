@@ -6,11 +6,30 @@ was an untracked JSON in a scratch directory, and the imatrix that drives every
 quantization decision was a 450 MB file whose only backup nobody could find
 because the NAS copy has a different name. Both are now pinned below.
 
-**Provenance note.** The INPUTS, their locations and their hashes in §1 were
-verified directly on 2026-08-12. The step ORDER in §2 is reconstructed from the
-0731 campaign record and the tools' own docstrings; the individual tools were
-not all re-run end to end for this document. Treat §2 as the map, not the
-territory, until someone completes a full rebuild and updates it.
+## ✅ VERIFIED 2026-08-12 — this recipe has been executed end to end
+
+A full rebuild from the source weights was run and compared against the served
+artifact `v5mx4-0731-ltdraft.gguf`:
+
+    tensor data, both 92,490,470,016 bytes
+      rebuild b4c4ac7c47463b4046215975aa904603c0b63789c3e5cbb68e026413b3350523
+      served  b4c4ac7c47463b4046215975aa904603c0b63789c3e5cbb68e026413b3350523
+
+**Byte-identical.** Same 1406 tensors, same 69 KVs, same type census
+(F32 536 / MXFP8_LT 370 / F16 359 / IQ2_XXS_MMQ 91 / CUTLASS_MXFP4 47 / I32 3),
+audit gate PASS. The ONLY difference in the whole 92.5 GB file is the
+`quantize.imatrix.file` KV, which records the imatrix's PATH — `../v5mx2-build/
+routed-moe-ds4-1p5m.dat` on the served copy vs the NAS path here. That 46-byte
+string difference pushes `data_pos` one 32-byte alignment unit, which is the
+entire 32-byte file-size delta.
+
+**Fix worth making:** record the imatrix sha256 instead of its path. A path says
+where someone's disk was; a hash says which imatrix it was, and would make the
+artifact byte-reproducible rather than byte-reproducible-modulo-one-KV.
+
+**Executable form: `gguf-tools/build/rebuild_stages_3_7.sh`** — stages 3-7 with
+`set -euo pipefail`. Prefer it over the prose below; a script cannot silently
+omit a stage, and four of the defects listed under §5 were exactly that.
 
 ---
 
@@ -72,16 +91,45 @@ show >0 spliced tokenizer KVs and an MB-scale file size.
 
 ## 2. Pipeline
 
-    HF checkpoint
-      -> sensitivity probe            (CACHE_HEADROOM_GB=90 REQUIRED, see below)
-      -> cost stage                   (per-(tensor,format) measured cost)
-      -> prisma_alloc.py              -> format map JSON
-      -> build_main_template.py --splice-tokenizer-from <good.gguf>
-      -> deepseek4-quantize --format-map <map.json> [--imatrix ...]
-      -> build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
-           with the exact-name --tensor-type overrides in dspark_type_flags.txt
-      -> merge_dspark_gguf.py         (main bytes preserved verbatim)
-      -> repack_iq2_mmq.py            (IQ2_XXS -> IQ2_XXS_MMQ, pure permutation)
+**Reproducing an artifact does NOT re-run the probe/cost/allocator stages.** Those
+MEASURE, and re-measuring yields a new map — a different (also valid) exercise.
+A reproduction uses the pinned `v5mx4-format-map.json` from §1. Re-derivation is:
+
+    HF checkpoint -> sensitivity probe -> cost stage -> prisma_alloc.py -> map
+    (CACHE_HEADROOM_GB=90 REQUIRED for probe AND cost, or autoscale takes an
+     ~86 GB layer cache and earlyoom kills the run, exit 137)
+
+The build proper, given a map:
+
+    1. build_main_template.py --hf DIR --out T.gguf --tokenizer-from-hf     5 MB
+    2. deepseek4-quantize --hf DIR --template T.gguf --format-map MAP       102 GB
+         [--imatrix ...] --threads N      -> FULL 256-expert intermediate
+    3. reap/trim_reap.py --oracle INTERMEDIATE --out COMPACT                 86 GB
+         stamps reap25-lcb50-survivors.json: expert tensors dense-trimmed to
+         the survivors, router/bias stay PADDED to 256 with pruned bias slots
+         set to -1e30 so they can never win top-k (see §3 and the tool header)
+    4. build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
+         with the exact-name --tensor-type overrides in dspark_type_flags.txt
+    5. merge_dspark_gguf.py         (main bytes preserved verbatim)           92.5 GB
+    6. repack_iq2_mmq.py            (IQ2_XXS 16 -> IQ2_XXS_MMQ 43)            92.5 GB
+
+**Step 3 was missing from the first version of this document** — found on
+2026-08-12 by actually running the pipeline. REAP is a POST-quantize transplant,
+not part of quantization. Following the old text produced an unpruned 256-expert
+artifact ~16 GB too large, with no gate to say so.
+
+**Cost.** ~383 GB written for a 92.5 GB artifact (4.1x amplification), three
+full-size intermediates, and a disk peak that does not fit unless the 102 GB
+intermediate is deleted immediately after step 3. Steps 3, 5 and 6 are each a
+full-artifact copy; step 6 is a pure permutation the quantizer cannot emit
+directly only because `DS4Q_TYPE_*` stops at 42 while the engine's
+`PULSAR_TENSOR_IQ2_XXS_MMQ` is 43. Collapsing 3/5/6 into the quantizer would take
+this to template -> quantize; each collapse is byte-exactly verifiable against a
+reference artifact.
+
+**Every stage here fails silently if skipped.** Missing step 6 costs 2.4x on the
+MMQ path with nothing going red; the drafter shipped 0.43 GiB of double-store for
+months because a repack was never run. Prefer fewer stages over better discipline.
 
 `CACHE_HEADROOM_GB=90` must be set explicitly for the probe and cost stages or
 autoscale grabs an ~86 GB layer cache and earlyoom kills the run (exit 137).
@@ -109,6 +157,26 @@ Run all of these. Each one has caught a real defect:
   0.429 GiB of avoidable double-store this way for months.
 - **Generation smoke** — load, generate, check a known answer. Do not leave a
   model swap before a health check AND a real generation have returned.
+
+## 5. What executing it caught that reading it did not
+
+Every one of these was present in the first written version of this document and
+invisible until the pipeline was actually run. They are listed because they are
+the argument for the script over the prose.
+
+1. **The REAP stage was missing entirely.** Following the doc produced an
+   unpruned 256-expert artifact ~16 GB too large, with no gate to say so.
+2. **The drafter type flags were attached to the wrong tool.**
+   `dspark_type_flags.txt` holds `--tensor-type` overrides for the QUANTIZER;
+   the doc hung them on `build_dspark_template.py`, which does not take them.
+   Building the drafter with default types is the 2026-08-01
+   `has type bf16, expected f32` load failure.
+3. **The Python environment never migrated off the decommissioned LXC.**
+   `trim_reap.py` died on `ModuleNotFoundError: numpy` at the first stage. The
+   tools need `/home/claude/.venvs/pulsar-quant`, not system python3.
+4. **Disk sequencing needed two deletion points, not one.** Dropping only the
+   102 GB intermediate still left compact + drafter + merged + final = 277 GB on
+   a 296 GB disk, which hit ENOSPC partway through the final copy.
 
 ## 4. Known reproduction gaps
 

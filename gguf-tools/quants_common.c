@@ -64,6 +64,15 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
      * gives the right slot size.  can_quantize is false -- f32_to_type packs it
      * explicitly via ds4q_pack_mxfp8_lt after a type-38 quantize pass. */
     [DS4Q_TYPE_MXFP8_LT] = { "mxfp8_lt", 32, 33, false, false },
+    /* IQ2_XXS_MMQ shares the type-16 {QK_K,66} geometry exactly -- it is the
+     * same bytes permuted into two planes, and the permutation is size-
+     * preserving whenever nblk%32==0 (true for every shipped expert shape), so
+     * ds4q_row_size gives the right slot size.  can_quantize is false: the
+     * expert path quantizes to raw IQ2_XXS first, then packs explicitly via
+     * ds4q_pack_iq2_xxs_mmq -- the same two-step f32_to_type does for
+     * MXFP8_LT.  Distinct permutation from IQ2_XXS_SOA (42); not
+     * interchangeable. */
+    [DS4Q_TYPE_IQ2_XXS_MMQ] = { "iq2_xxs_mmq", QK_K, 66, false, false },
 };
 
 float ds4q_f32_from_bits(uint32_t bits) {

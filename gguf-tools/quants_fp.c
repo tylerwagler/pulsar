@@ -252,3 +252,30 @@ void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
         }
     }
 }
+
+/* ---- IQ2_XXS_MMQ (type 43): llama.cpp-MMQ's aligned-SoA layout. ------------
+ * A pure permutation of the raw IQ2_XXS (16) block stream: same bytes, same
+ * count, same total size, reordered into a d plane and a 64 B-aligned q plane
+ * so the MMQ kernels can issue 32-bit loads instead of pairs of 16-bit ones.
+ * Byte-identical to gguf-tools/repack_iq2_mmq.py, which is the reference. ---- */
+size_t ds4q_iq2_xxs_mmq_bytes(int64_t nblk) {
+    return ds4q_pad((size_t)nblk * 2, 64) + (size_t)nblk * 64;
+}
+
+void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk) {
+    /* Size identity is what lets this be an in-place layout change: every
+     * tensor keeps its gguf data offset. It holds only when the d plane pads to
+     * nothing. Refuse rather than silently grow the tensor past its slot. */
+    if (nblk % 32 != 0) {
+        fprintf(stderr, "ds4-quantize: iq2_xxs_mmq nblk %lld is not a multiple of 32 "
+                "(would grow past the raw size)\n", (long long)nblk);
+        exit(1);
+    }
+    const size_t dq = ds4q_pad((size_t)nblk * 2, 64);
+    uint8_t *out = (uint8_t *)dst;
+    memset(out, 0, dq);                       /* d plane, then the alignment pad */
+    for (int64_t b = 0; b < nblk; b++)
+        memcpy(out + (size_t)b * 2, iq2_blocks + (size_t)b * 66, 2);
+    for (int64_t b = 0; b < nblk; b++)
+        memcpy(out + dq + (size_t)b * 64, iq2_blocks + (size_t)b * 66 + 2, 64);
+}

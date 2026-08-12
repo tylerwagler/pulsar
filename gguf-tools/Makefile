@@ -66,6 +66,22 @@ test-mxfp8-lt: quantize/tests/mxfp8_lt_emit
 	cmp /tmp/mxfp8lt-cb.bin /tmp/mxfp8lt-pyb.bin
 	@echo "mxfp8_lt byte-compare: OK"
 
+# IQ2_XXS (16) -> IQ2_XXS_MMQ (43) permutation proof. Same shape of test as
+# test-mxfp8-lt: the C packer and an independently-written Python reference are
+# run over identical raw bytes and diffed. 6291456 is the shipped per-tensor
+# block count (192 experts x 2048 x 4096 / 256).
+test-iq2-mmq: quantize/tests/iq2_mmq_emit
+	./quantize/tests/iq2_mmq_emit 32 /tmp/iq2mmq-16.bin /tmp/iq2mmq-c.bin
+	python3 quantize/tests/iq2_mmq_ref.py 32 /tmp/iq2mmq-16.bin /tmp/iq2mmq-py.bin
+	cmp /tmp/iq2mmq-c.bin /tmp/iq2mmq-py.bin
+	./quantize/tests/iq2_mmq_emit 8192 /tmp/iq2mmq-16b.bin /tmp/iq2mmq-cb.bin
+	python3 quantize/tests/iq2_mmq_ref.py 8192 /tmp/iq2mmq-16b.bin /tmp/iq2mmq-pyb.bin
+	cmp /tmp/iq2mmq-cb.bin /tmp/iq2mmq-pyb.bin
+	@echo "iq2_xxs_mmq byte-compare: OK"
+
+quantize/tests/iq2_mmq_emit: quantize/tests/iq2_mmq_emit.c $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $^ -lm -pthread
+
 # CUTLASS Sm120 block-scaled SFB/SFA layout proof (the artifact that pins the
 # swizzle to CUTLASS's own tile_atom_to_shape_SFB). Needs nvcc + the CUTLASS
 # pin; override CUTLASS_DIR if it lives elsewhere. Host-only run (no kernel).

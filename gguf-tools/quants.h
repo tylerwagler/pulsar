@@ -70,7 +70,16 @@ typedef enum {
                                  * so dims and byte accounting are unchanged --
                                  * this is a pure permutation, exactly as
                                  * MXFP8_LT (41) is to FP8_E4M3 (38). */
-    DS4Q_TYPE_COUNT   = 43,
+    DS4Q_TYPE_IQ2_XXS_MMQ = 43, /* the OTHER pre-stored twin of IQ2_XXS (16):
+                                 * llama.cpp-MMQ's aligned-SoA layout (d plane
+                                 * first, q plane 64 B-aligned).  Distinct from
+                                 * 42 -- different permutation of the same
+                                 * bytes, not interchangeable.  Matches the
+                                 * engine's PULSAR_TENSOR_IQ2_XXS_MMQ.  Was
+                                 * engine-only until 2026-08-12, which is why
+                                 * repack_iq2_mmq.py existed as a separate
+                                 * post-pass over the whole artifact. */
+    DS4Q_TYPE_COUNT   = 44,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {
@@ -129,6 +138,25 @@ size_t ds4q_mxfp8_lt_sf_bytes(int64_t nrows, int64_t ncols);
 size_t ds4q_mxfp8_lt_bytes(int64_t nrows, int64_t ncols);
 void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
                         int64_t nrows, int64_t ncols);
+
+/* IQ2_XXS_MMQ (type 43) helpers.  A pure permutation of the raw IQ2_XXS (16)
+ * block stream -- same 66 B/block of content, same total size -- into the two
+ * planes the vendored llama.cpp MMQ kernels read.  Raw blocks are
+ * [__half d][32 x uint16 qs] = 2 + 64 B, only 2-byte aligned, which costs MMQ
+ * two 16-bit loads per 32-bit weight word (measured 44.704 -> 18.654 ms per
+ * pair-call at the production shape, 2.40x).  Layout, nblk = ne/256:
+ *     dq = align_up(nblk*2, 64)
+ *     [0,  nblk*2)   d plane, block b's half at b*2
+ *     [.., dq)       zero pad to 64 B
+ *     [dq, +nblk*64) q plane, block b's 64 qs bytes at dq + b*64
+ * Size identity (and therefore an in-place layout change that preserves every
+ * gguf data offset) requires nblk % 32 == 0; the packer refuses otherwise.
+ * Byte-identical to gguf-tools/repack_iq2_mmq.py and to
+ * ds4_repack_iq2_aligned_device() in src/cuda/mmq/ds4_repack.cu.
+ * NOT interchangeable with IQ2_XXS_SOA (42), which is a different permutation
+ * (q plane first, no padding). */
+size_t ds4q_iq2_xxs_mmq_bytes(int64_t nblk);
+void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk);
 
 /* The canonical Blackwell 128x4 scale-factor swizzle, shared by the CUTLASS
  * MXFP4 and MXFP8_LT packers.  Byte-identical to the __device__ mx_sfoff in
