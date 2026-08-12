@@ -99,37 +99,75 @@ A reproduction uses the pinned `v5mx4-format-map.json` from §1. Re-derivation i
     (CACHE_HEADROOM_GB=90 REQUIRED for probe AND cost, or autoscale takes an
      ~86 GB layer cache and earlyoom kills the run, exit 137)
 
-The build proper, given a map:
+The build proper, given a map — run it with
+`gguf-tools/build/rebuild_collapsed.sh`:
 
-    1. build_main_template.py --hf DIR --out T.gguf --tokenizer-from-hf     5 MB
-    2. deepseek4-quantize --hf DIR --template T.gguf --format-map MAP       102 GB
-         [--imatrix ...] --threads N      -> FULL 256-expert intermediate
-    3. reap/trim_reap.py --oracle INTERMEDIATE --out COMPACT                 86 GB
-         stamps reap25-lcb50-survivors.json: expert tensors dense-trimmed to
-         the survivors, router/bias stay PADDED to 256 with pruned bias slots
-         set to -1e30 so they can never win top-k (see §3 and the tool header)
-    4. build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
+    1. build_main_template.py --hf DIR --out T.gguf --tokenizer-from-hf      5 MB
+         --reap-survivors SURV     -> REAP-SHAPED template (expert dim 192,
+                                      router/bias still 256)
+    2. deepseek4-quantize --hf DIR --template T.gguf --out COMPACT          81.5 GB
+         --format-map MAP-MMQ --reap-survivors SURV [--imatrix ...] --threads N
+         -> pruned AND pre-formatted in one pass
+    3. build_dspark_template.py     (drafter, from the checkpoint's mtp.* block)
+    4. deepseek4-quantize (drafter)                                          11 GB
          with the exact-name --tensor-type overrides in dspark_type_flags.txt
-    5. merge_dspark_gguf.py         (main bytes preserved verbatim)           92.5 GB
-    6. repack_iq2_mmq.py            (IQ2_XXS 16 -> IQ2_XXS_MMQ 43)            92.5 GB
+    5. merge_dspark_gguf.py         (main bytes preserved verbatim)         92.5 GB
 
-**Step 3 was missing from the first version of this document** — found on
-2026-08-12 by actually running the pipeline. REAP is a POST-quantize transplant,
-not part of quantization. Following the old text produced an unpruned 256-expert
-artifact ~16 GB too large, with no gate to say so.
+**Two stages collapsed into the quantizer on 2026-08-12** (see §Collapse below):
+the old step 3 (`trim_reap.py`) is now `--reap-survivors`, and the old step 6
+(`repack_iq2_mmq.py`) is now just a format map that names `IQ2_XXS_MMQ`. The
+102 GB full-256 intermediate is gone entirely.
 
-**Cost.** ~383 GB written for a 92.5 GB artifact (4.1x amplification), three
-full-size intermediates, and a disk peak that does not fit unless the 102 GB
-intermediate is deleted immediately after step 3. Steps 3, 5 and 6 are each a
-full-artifact copy; step 6 is a pure permutation the quantizer cannot emit
-directly only because `DS4Q_TYPE_*` stops at 42 while the engine's
-`PULSAR_TENSOR_IQ2_XXS_MMQ` is 43. Collapsing 3/5/6 into the quantizer would take
-this to template -> quantize; each collapse is byte-exactly verifiable against a
-reference artifact.
+**Cost.** ~185 GB written for a 92.5 GB artifact (2.0x amplification, was 4.1x),
+one full-size intermediate instead of three, and the peak now fits on the build
+disk without deleting anything mid-run. The old staged script
+(`build/rebuild_stages_3_7.sh`) is superseded and kept only as history.
 
-**Every stage here fails silently if skipped.** Missing step 6 costs 2.4x on the
-MMQ path with nothing going red; the drafter shipped 0.43 GiB of double-store for
-months because a repack was never run. Prefer fewer stages over better discipline.
+**Every stage here fails silently if skipped.** That is why they were collapsed
+rather than documented harder: the drafter shipped 0.43 GiB of double-store for
+months because a repack was never run, and skipping the REAP stage produces an
+unpruned artifact ~16 GB too large with nothing going red. Prefer fewer stages
+over better discipline.
+
+### Collapse: why the order was forced
+
+REAP had to collapse **first**, and that is not a preference:
+
+- `trim_reap.py` is a post-quantize transplant that re-slices whole tensors, so
+  it needs block geometry for every type in the file. Pointing the old pipeline
+  at an MMQ format map died with `KeyError: 43` in `tbytes()` — the repack stage
+  ran *after* trim, but trim had to parse the type trim itself never emits.
+- With REAP inside the quantizer there is no post-pass left to trip over, so
+  MMQ became emittable in the same step. `trim_reap.py` now refuses type 43
+  outright rather than growing a block-geometry entry that would re-enable the
+  broken ordering.
+
+Both collapses were verified byte-exact against the shipped v5mx4 artifact
+*before* replacing the staged script, using `--compare-tensor`:
+
+| check | tensor | result |
+|---|---|---|
+| REAP router permutation | `blk.5.ffn_gate_inp.weight` (f16) | byte-identical |
+| REAP bias sentinels | `blk.5.exp_probs_b.bias` (f32) | byte-identical |
+| REAP policy-1 control | `blk.0.ffn_gate_inp.weight` | byte-identical (untouched) |
+| REAP expert remap | `blk.5.ffn_gate_exps.weight` (cutlass_mxfp4, 855 MB) | byte-identical |
+| REAP + imatrix-by-original-id | `blk.12.ffn_down_exps.weight` (iq2_xxs, 415 MB) | byte-identical |
+| MMQ collapse | `blk.12.ffn_down_exps.weight` type 43 | == `repack(type 39)` |
+
+Layers 5 and 12 were chosen because their survivor lists deviate from identity
+at slot 0 and 1 respectively and run out to source experts 254/255 — an identity
+bug cannot pass there by luck. The negative control matters as much as the
+checks: re-running the router comparison **without** `--reap-survivors` fails at
+byte 0 with 2,038,329 mismatches, which is what proves the passing runs are
+testing anything at all.
+
+**`fnv1a64_bytes()` in `dsq_gguf_io.c` is not standard FNV-1a** — its offset
+basis is `1469598103934665603`, one digit short of the real
+`14695981039346656037`. It is a self-consistent checksum used only for
+diagnostics, and `--compare-tensor`'s OK/FAIL verdict comes from an actual
+bytewise comparison rather than the hash, so no result is affected. It does mean
+these hashes cannot be cross-checked against any external FNV implementation
+without reproducing the typo.
 
 `CACHE_HEADROOM_GB=90` must be set explicitly for the probe and cost stages or
 autoscale grabs an ~86 GB layer cache and earlyoom kills the run (exit 137).

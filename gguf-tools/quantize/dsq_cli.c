@@ -11,6 +11,7 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *reap_survivors;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -102,6 +103,8 @@ static params parse_args(int argc, char **argv) {
             p.probe_sample = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--reap-survivors") == 0) {
+            p.reap_survivors = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
@@ -161,7 +164,7 @@ static void free_gguf_file(gguf_file *g) {
 }
 
 static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
-                               const params *p, const imatrix_store *imatrix) {
+                               const params *p, const imatrix_store *imatrix, const reap_map *reap) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
         fprintf(stderr, "error: tensor not found in template: %s\n", p->compare_tensor);
@@ -170,7 +173,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix, reap);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -206,6 +209,8 @@ int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+    reap_map reap = {0};
+    if (p.reap_survivors) reap_load(&reap, p.reap_survivors);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
     if (p.n_experts <= 0) {
@@ -233,14 +238,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
+        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix, &reap);
         db_close(&db);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &reap);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

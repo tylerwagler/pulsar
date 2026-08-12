@@ -1,4 +1,15 @@
 #!/bin/bash
+# SUPERSEDED 2026-08-12 by rebuild_collapsed.sh -- use that instead.
+#
+# The trim_reap and repack_iq2_mmq stages below are now done by the quantizer
+# itself (--reap-survivors, plus a format map naming IQ2_XXS_MMQ), which drops
+# the 102 GB full-256 intermediate and takes write amplification from 4.1x to
+# 2.0x. Both collapses were verified byte-exact against the shipped artifact;
+# see docs/ARTIFACT_BUILD.md §Collapse.
+#
+# Kept only as the record of the staged ordering that execution proved out, and
+# because it is the fallback if a collapse ever has to be backed out.
+#
 # Stages 3-7 of the artifact rebuild, in the order execution proved they go.
 # Halts on the first failure: every stage here feeds the next, and a silent
 # continue would produce a plausible-looking wrong artifact.

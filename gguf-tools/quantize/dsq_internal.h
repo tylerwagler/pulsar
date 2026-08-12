@@ -174,6 +174,30 @@ typedef struct {
     bool strict;
 } imatrix_store;
 
+/* REAP survivor map (ds4-compact-v1). Lets the quantizer emit an already-pruned
+ * artifact instead of writing a full-256 intermediate for a downstream tool to
+ * re-slice. policy 1 = layer keeps every expert (hash-routed via tid2eid, which
+ * indexes experts by id and so structurally cannot be pruned); policy 2 = layer
+ * is trimmed to keep[L] survivors, listed in ascending ORIGINAL expert id.
+ * Router and bias stay padded to n_expert -- pruned bias slots get -1e30 so
+ * they can never win top-k. See gguf-tools/reap/trim_reap.py, which this
+ * replaces, and validate_reap_metadata() in the engine's weights.cpp. */
+typedef struct {
+    bool  enabled;
+    char *layout;
+    int   n_layers;
+    int  *keep;        /* [n_layers] survivor count */
+    int  *policy;      /* [n_layers] 1 = untouched, 2 = pruned */
+    int **survivors;   /* [n_layers][keep[L]] original expert ids; NULL if policy 1 */
+} reap_map;
+
+void reap_load(reap_map *rm, const char *path);
+void reap_free(reap_map *rm);
+/* Survivor count for a layer (n_expert when the layer is untouched or no map). */
+int reap_keep(const reap_map *rm, int layer, int n_expert);
+/* Original expert id backing dense slot `slot` (identity when untouched). */
+int reap_src_expert(const reap_map *rm, int layer, int slot);
+
 typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
 typedef struct {
@@ -313,7 +337,7 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
 size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims);
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                          ds4q_type target, int n_experts, int n_threads,
-                         const imatrix_store *imatrix);
+                         const imatrix_store *imatrix, const reap_map *reap);
 
 /* dsq_gguf_io.c */
 gguf_file load_gguf_metadata(const char *path);
@@ -323,7 +347,7 @@ output_context build_output_context(const gguf_file *tmpl, const quant_policy *p
                                     const imatrix_store *im);
 void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                      const char *out_path, int n_experts, int n_threads,
-                     const imatrix_store *imatrix);
+                     const imatrix_store *imatrix, const reap_map *reap);
 void print_plan(const gguf_file *tmpl, const output_context *out_ctx);
 
 /* dsq_probe.c */
