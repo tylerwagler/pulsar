@@ -2026,8 +2026,18 @@ bool gpu_graph_encode_layer_attention_batch(
             const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;
             const uint64_t ziq_row = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
             /* Hoisted for the same reason as the chunked branch above: the shadow
-             * depends only on (il, n_comp) and the span body only reads it. */
-            pulsar_gpu_tensor *zspan_comp_src = gpu_graph_attn_comp_read_cache(g, il, n_comp);
+             * depends only on (il, n_comp) and the span body only reads it.
+             *
+             * Also honour pk_native here, which this branch never did.  The
+             * chunked branch hands the packed cache straight to the backend when
+             * it reads packed rows natively; this one built the f32 shadow
+             * unconditionally, which is why it was the ONLY source of
+             * attn_pack_dequant launches in production (pk_native is on for every
+             * shipped configuration). Bit-exact: packed rows decode to exactly
+             * the values the shadow would hold. */
+            pulsar_gpu_tensor *zspan_comp_src =
+                pk_native ? g->layer_attn_comp_cache[il]
+                          : gpu_graph_attn_comp_read_cache(g, il, n_comp);
             for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
@@ -2102,7 +2112,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               g->layer_raw_cache[il],
                                                                               zspan_comp_src,
                                                                               0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
-                                                                              0 /* shadow is f32 */,
+                                                                              pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0,
                                                                               g->comp_selected,
                                                                               sn,
                                                                               spos0,
