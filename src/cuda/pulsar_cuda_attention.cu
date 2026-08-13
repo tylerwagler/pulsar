@@ -2078,7 +2078,7 @@ static int attention_decode_heads8_launch(
         if (hw > 1e-4f) {
             fprintf(stderr, "SPLITKV DIVERGE call=%llu worst_rel=%.3e  "
                     "nt=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
-                    "win=%u ratio=%u fp8=%u pack=%u rawf16=%d descr=%d nc=%u (%s)\n",
+                    "win=%u ratio=%u pack=%u rawf16=%d descr=%d nc=%u (%s)\n",
                     (unsigned long long)call_no, hw, n_tokens, pos0, n_raw,
                     raw_cap, raw_start, n_comp, window, ratio,
                     comp_kv_pack, raw_f16, positions != NULL, non_causal, what);
