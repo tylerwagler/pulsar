@@ -1123,23 +1123,16 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
         const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    static const int disable_fused = getenv("PULSAR_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") != NULL;
-    if (!disable_fused) {
-        return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
-                                                        model_map, model_size,
-                                                        weight_offset,
-                                                        in_dim, out_dim,
-                                                        x,
-                                                        NULL,
-                                                        residual_hc,
-                                                        split,
-                                                        n_embd, n_hc,
-                                                        "fp8_hc_expand");
-    }
-    return pulsar_gpu_matmul_mxfp8_tensor(block_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim, x, 1) &&
-           pulsar_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
-                                            split, n_embd, n_hc);
+    return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
+                                                    model_map, model_size,
+                                                    weight_offset,
+                                                    in_dim, out_dim,
+                                                    x,
+                                                    NULL,
+                                                    residual_hc,
+                                                    split,
+                                                    n_embd, n_hc,
+                                                    "fp8_hc_expand");
 }
 
 

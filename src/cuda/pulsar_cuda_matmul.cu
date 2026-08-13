@@ -678,13 +678,9 @@ struct mxfp8_act_cache_t {
 static thread_local mxfp8_act_cache_t g_act_cache;
 
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
-    /* Operational kill switch / A-B measurement handle. Read ONCE (this runs
-     * per layer, not per token), and disarming restores the exact pre-cache
-     * code path in the GEMMs below. */
-    static const int off = getenv("PULSAR_NO_MXFP8_ACT_CACHE") != NULL;
     g_act_cache.valid = 0;
     g_act_cache.valid_h = 0;
-    if (off || !x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
+    if (!x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
         g_act_cache.key_ptr = NULL;
         return;
     }
@@ -1354,8 +1350,7 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
      * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
      * otherwise defer to the per-weight path below. */
     static const int fp8_mmvq_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-    static const int no_pair_fuse = getenv("PULSAR_CUDA_NO_MXFP8_PAIR_FUSE") != NULL;
-    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw && !no_pair_fuse &&
+    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes0 = out0_dim * fblocks * 33;

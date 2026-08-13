@@ -961,9 +961,7 @@ static int indexer_scores_launch(
     const void * const *index_bank_ptrs_ptr =
         (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
-    static const int no_direct_one = getenv("PULSAR_CUDA_NO_INDEXER_DIRECT_ONE") != NULL;
-    static const int no_wmma = getenv("PULSAR_CUDA_NO_INDEXER_WMMA") != NULL;
-    if (n_tokens == 1u && head_dim == 128u && n_head == 64u && !no_direct_one) {
+    if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
@@ -1011,6 +1009,12 @@ static int indexer_scores_launch(
 
     /* The WMMA tier stays single-bank (like the reference design): banked
      * multi-token rows are forced onto the generic per-(comp,row) kernel. */
+    /* Kept deliberately: the Tier-2 banked/MULTISEQ gate pins this tier off to
+     * get a byte-exact comparison against classic decode (gpu_decode.cpp,
+     * gpu_graph_decode_descr_enabled).  Single-sequence benches never select a
+     * different path through it, so it looks inert unless banked rows are in
+     * play. */
+    static const int no_wmma = getenv("PULSAR_CUDA_NO_INDEXER_WMMA") != NULL;
     if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u && !no_wmma) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
@@ -1106,27 +1110,19 @@ int pulsar_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_topk1024 = getenv("PULSAR_CUDA_NO_TOPK1024") != NULL;
-    static const int no_topk2048 = getenv("PULSAR_CUDA_NO_TOPK2048") != NULL;
-    static const int no_topk8192 = getenv("PULSAR_CUDA_NO_TOPK8192") != NULL;
-    static const int no_topk_chunked = getenv("PULSAR_CUDA_NO_TOPK_CHUNKED") != NULL;
-    if (top_k == 512u && n_comp <= 1024u &&
-        !no_topk1024) {
+    if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
-    if (top_k == 512u && n_comp <= 2048u &&
-        !no_topk2048) {
+    if (top_k == 512u && n_comp <= 2048u) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
-    if (top_k == 512u && n_comp <= 4096u &&
-        !no_topk2048) {
+    if (top_k == 512u && n_comp <= 4096u) {
         if (n_comp == 4096u) {
             const int smem = indexer_topk_cub_smem();
             if (smem > 0) {
@@ -1141,9 +1137,7 @@ int pulsar_gpu_indexer_topk_tensor(
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
-    if (top_k == 512u && n_comp <= 8192u &&
-        !no_topk2048 &&
-        !no_topk8192) {
+    if (top_k == 512u && n_comp <= 8192u) {
         if (n_comp > 4096u) {
             const int smem = indexer_topk_cub_smem();
             if (smem > 0) {
@@ -1158,8 +1152,7 @@ int pulsar_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && !no_topk2048 &&
-        !no_topk_chunked) {
+    if (top_k == 512u) {
         /* Chunk width is chosen by batch shape, and ONLY by batch shape.
          *
          * A bitonic sort costs N*log2(N)*(log2(N)+1)/2 compare-exchanges, so

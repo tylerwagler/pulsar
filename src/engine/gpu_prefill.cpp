@@ -271,7 +271,6 @@ bool gpu_graph_warmup_prefill_kernels(
         uint32_t           n_tokens) {
     static bool warmed = false;
     if (warmed) return true;
-    if (getenv("PULSAR_CUDA_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 
     /*
      * The first batched F16 matmul can pay GPU's one-time pipeline execution

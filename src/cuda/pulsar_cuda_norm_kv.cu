@@ -1071,42 +1071,35 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps) {
-    static const int disable_qkv_rms_fused = getenv("PULSAR_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
-    if (!disable_qkv_rms_fused) {
-        if (!q_out || !q || !kv_out || !kv || !model_map ||
-            q_weight_offset > model_size ||
-            kv_weight_offset > model_size ||
-            model_size - q_weight_offset < (uint64_t)q_n * sizeof(float) ||
-            model_size - kv_weight_offset < (uint64_t)kv_n * sizeof(float) ||
-            q_out->bytes < (uint64_t)q_n * rows * sizeof(float) ||
-            q->bytes < (uint64_t)q_n * rows * sizeof(float) ||
-            kv_out->bytes < (uint64_t)kv_n * rows * sizeof(float) ||
-            kv->bytes < (uint64_t)kv_n * rows * sizeof(float)) {
-            return 0;
-        }
-        const float *q_w = (const float *)cuda_model_range_ptr(model_map,
-                q_weight_offset, (uint64_t)q_n * sizeof(float), "q_rms_weight");
-        const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
-                kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
-        if (!q_w || !kv_w) return 0;
-        dim3 grid(rows, 2u, 1u);
-        dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
-                (float *)q_out->ptr,
-                (const float *)q->ptr,
-                q_w,
-                q_n,
-                (float *)kv_out->ptr,
-                (const float *)kv->ptr,
-                kv_w,
-                kv_n,
-                rows,
-                eps);
-        return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
+    if (!q_out || !q || !kv_out || !kv || !model_map ||
+        q_weight_offset > model_size ||
+        kv_weight_offset > model_size ||
+        model_size - q_weight_offset < (uint64_t)q_n * sizeof(float) ||
+        model_size - kv_weight_offset < (uint64_t)kv_n * sizeof(float) ||
+        q_out->bytes < (uint64_t)q_n * rows * sizeof(float) ||
+        q->bytes < (uint64_t)q_n * rows * sizeof(float) ||
+        kv_out->bytes < (uint64_t)kv_n * rows * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_n * rows * sizeof(float)) {
+        return 0;
     }
-    return pulsar_gpu_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
-                                                 q_weight_offset, q_n, rows, eps) &&
-           pulsar_gpu_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
-                                                 kv_weight_offset, kv_n, rows, eps);
+    const float *q_w = (const float *)cuda_model_range_ptr(model_map,
+            q_weight_offset, (uint64_t)q_n * sizeof(float), "q_rms_weight");
+    const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
+            kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
+    if (!q_w || !kv_w) return 0;
+    dim3 grid(rows, 2u, 1u);
+    dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
+            (float *)q_out->ptr,
+            (const float *)q->ptr,
+            q_w,
+            q_n,
+            (float *)kv_out->ptr,
+            (const float *)kv->ptr,
+            kv_w,
+            kv_n,
+            rows,
+            eps);
+    return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
 }
 
 

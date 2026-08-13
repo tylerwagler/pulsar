@@ -346,11 +346,17 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
     const char *direct_env = getenv("PULSAR_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
-    if (getenv("PULSAR_CUDA_NO_FD_CACHE") == NULL) {
-        const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
-        if (fd_ptr) return fd_ptr;
-    }
+    const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
+    if (fd_ptr) return fd_ptr;
 
+    /* ⚠ On GB10 the fd route above is the ONLY one that works, so the two
+     * fallbacks below are a cliff, not a safety net: host registration reports
+     * "operation not supported", and the device copy fails with
+     * cudaErrorInvalidValue ("CUDA model range copy failed ... invalid
+     * argument"), which aborts model load.  Measured 2026-08-13 by forcing this
+     * path (the since-removed PULSAR_CUDA_NO_FD_CACHE): the server would not
+     * start.  They stay because they are correct on other hardware, but if
+     * fd_ptr ever returns NULL here on GB10, THIS is the reason. */
     const char *mapped = cuda_model_range_register_mapped(model_map, offset, bytes, what);
     if (mapped) return mapped;
 
@@ -486,8 +492,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("PULSAR_CUDA_NO_MODEL_PREFETCH") != NULL ||
-        getenv("PULSAR_CUDA_COPY_MODEL") != NULL ||
+    if (getenv("PULSAR_CUDA_COPY_MODEL") != NULL ||
         getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
         getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
@@ -952,8 +957,7 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("PULSAR_CUDA_NO_MODEL_COPY") != NULL ||
-        getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL ||
+    if (getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL ||
         getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
         getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
