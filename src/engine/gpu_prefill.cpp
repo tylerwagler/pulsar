@@ -1814,6 +1814,17 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t slice = gpu_graph_prefill_slice();
                 const uint32_t span = (slice != 0u && slice < n_tokens) ? slice : n_tokens;
                 const uint64_t iq_row = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
+                /* Hoisted out of the span loop.  This selects the comp source and,
+                 * on the non-native path, DEQUANTS all n_comp packed rows into the
+                 * shared f32 shadow.  Both inputs (il, n_comp) are loop-invariant
+                 * and the span body only READS the comp cache, so evaluating it per
+                 * span re-dequanted every row once per span for an identical
+                 * result.  Bit-exact: same rows, same kernel, same destination —
+                 * only the redundant repeats are gone. */
+                pulsar_gpu_tensor *span_comp_src =
+                    mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                         : (pk_native ? g->layer_attn_comp_cache[il]
+                                      : gpu_graph_attn_comp_read_cache(g, il, n_comp));
                 for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += span) {
                     const uint32_t sn = n_tokens - s0 < span ? n_tokens - s0 : span;
                     const uint32_t spos0 = pos0 + s0;
@@ -1919,9 +1930,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   sq_view,
                                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                                        : g->layer_raw_cache[il],
-                                                                                  mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                                       : (pk_native ? g->layer_attn_comp_cache[il]
-                                                                                                    : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
+                                                                                  span_comp_src,
                                                                                   0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                                   mseq ? gpu_graph_attn_comp_cache_is_pack()
                                                                                        : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
@@ -2016,6 +2025,9 @@ bool gpu_graph_encode_layer_attention_batch(
             const uint32_t zslice = gpu_graph_prefill_slice();
             const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;
             const uint64_t ziq_row = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
+            /* Hoisted for the same reason as the chunked branch above: the shadow
+             * depends only on (il, n_comp) and the span body only reads it. */
+            pulsar_gpu_tensor *zspan_comp_src = gpu_graph_attn_comp_read_cache(g, il, n_comp);
             for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
@@ -2088,7 +2100,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               sq_view,
                                                                               g->layer_raw_cache[il],
-                                                                              gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                              zspan_comp_src,
                                                                               0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                               0 /* shadow is f32 */,
                                                                               g->comp_selected,
