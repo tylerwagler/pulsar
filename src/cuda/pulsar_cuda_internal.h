@@ -115,9 +115,9 @@ static inline int pulsar_env_tier_on(const char *name) {
     return !(v && v[0] == '0' && v[1] == '\0');
 }
 
-/* e4m3 byte * scale by pure bit math — bit-identical to
- * pulsar_attn_e4m3_value(b & 0x7f) * scale with the sign applied (normals become the
- * exact float (1 + mant/8)*2^(exp-7) built directly from its bit pattern;
+/* e4m3 byte * scale by pure bit math — bit-identical to the textbook
+ * decode (1 + mant/8)*2^(exp-7) * scale with the sign applied (normals become
+ * that exact float built directly from its bit pattern;
  * subnormals use the same mant*2^-9 product; scale is an exact power of two,
  * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
 __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {

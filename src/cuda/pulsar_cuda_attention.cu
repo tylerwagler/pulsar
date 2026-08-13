@@ -25,19 +25,6 @@ __device__ static inline float4 raw_kv_ld4(const float *raw_kv, int f16, uint64_
     return ((const float4 *)(raw_kv + row_base))[c4];
 }
 
-__device__ static float pulsar_attn_e4m3_value(int i) {
-    int exp = (i >> 3) & 15;
-    int mant = i & 7;
-    if (exp == 0) return (float)mant * 0.001953125f;
-    return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-}
-
-__device__ static float pulsar_attn_fp8_kv_dequant(uint8_t byte, float scale) {
-    int idx = byte & 0x7f;
-    float val = pulsar_attn_e4m3_value(idx);
-    return (byte & 0x80) ? (-val * scale) : (val * scale);
-}
-
 /* comp_kv_pack: per-call flag — the comp cache operand is PULSAR_ATTN_PACK rows
  * (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h): [n_nope e4m3][n_nope/64 E8M0]
  * [pad][n_rot bf16 rope].  Nope dims decode e4m3_value * 2^(e8-127) — exactly
