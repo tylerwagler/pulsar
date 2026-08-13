@@ -97,8 +97,6 @@ int pulsar_gpu_end_commands(void);
  * captured (end replays it as one graph launch and syncs); 0 means graphs
  * are disabled (PULSAR_CUDA_NO_GRAPHS / unsupported) and the caller must use
  * the plain begin/end_commands pair instead. */
-int pulsar_gpu_decode_graph_begin(void);
-int pulsar_gpu_decode_graph_end(void);
 int pulsar_gpu_synchronize(void);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);

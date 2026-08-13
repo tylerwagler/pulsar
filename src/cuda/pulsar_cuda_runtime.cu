@@ -58,10 +58,6 @@ int g_cublas_ready;
 int g_quality_mode;
 
 
-static cudaGraphExec_t g_decode_graph_exec;
-static int g_decode_graph_capturing;
-static int g_decode_graphs_off = -1;
-static uint64_t g_decode_graph_updates, g_decode_graph_instantiates;
 
 
 
@@ -1133,10 +1129,6 @@ int pulsar_gpu_init(void) {
 
 void pulsar_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
-    if (g_decode_graph_exec) {
-        (void)cudaGraphExecDestroy(g_decode_graph_exec);
-        g_decode_graph_exec = NULL;
-    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -1452,77 +1444,6 @@ int pulsar_gpu_begin_commands(void) { return 1; }
 
 int pulsar_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 
-
-/* =========================================================================
- * Decode CUDA graph capture.
- *
- * The per-token decode tape re-encodes the same kernel sequence every step;
- * submitting it as ~500 individual launches pays a per-launch gap that adds
- * up to the measured ~3 ms/step floor. Capture the tape into a graph each
- * token (relaxed mode: the rare cuda_tmp_alloc growth and lazy weight-cache
- * mallocs execute immediately and are not part of the graph), then reuse one
- * instantiated exec via cudaGraphExecUpdate — instantiation only happens
- * again when the topology changes (context-tier boundaries). Opt-in via
- * PULSAR_CUDA_GRAPHS=1; see the note in pulsar_gpu_decode_graph_begin.
- * ========================================================================= */
-int pulsar_gpu_decode_graph_begin(void) {
-    /* Opt-in (PULSAR_CUDA_GRAPHS=1): capture-per-token measured ~2% SLOWER than
-     * direct submission (ExecUpdate on a ~500-node graph outweighs the
-     * launch-gap savings when the tape is re-encoded every token anyway).
-     * The capture path is kept as working infrastructure for the follow-up
-     * that reuses a stable tape with parameter-only updates. */
-    if (g_decode_graphs_off < 0)
-        g_decode_graphs_off = getenv("PULSAR_CUDA_GRAPHS") == NULL;
-    if (g_decode_graphs_off) return 0;
-    if (cudaStreamBeginCapture(cudaStreamPerThread,
-                               cudaStreamCaptureModeRelaxed) != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr,
-                "pulsar: CUDA decode graph capture unavailable; using direct submission\n");
-        g_decode_graphs_off = 1;
-        return 0;
-    }
-    g_decode_graph_capturing = 1;
-    return 1;
-}
-
-int pulsar_gpu_decode_graph_end(void) {
-    if (!g_decode_graph_capturing) return 0;
-    g_decode_graph_capturing = 0;
-    cudaGraph_t graph = NULL;
-    if (!cuda_ok(cudaStreamEndCapture(cudaStreamPerThread, &graph),
-                 "decode graph capture")) {
-        return 0;
-    }
-    int ok = 1;
-    if (g_decode_graph_exec) {
-        cudaGraphExecUpdateResultInfo info;
-        if (cudaGraphExecUpdate(g_decode_graph_exec, graph, &info) == cudaSuccess) {
-            g_decode_graph_updates++;
-        } else {
-            (void)cudaGetLastError();
-            (void)cudaGraphExecDestroy(g_decode_graph_exec);
-            g_decode_graph_exec = NULL;
-        }
-    }
-    if (!g_decode_graph_exec) {
-        ok = cuda_ok(cudaGraphInstantiate(&g_decode_graph_exec, graph, 0),
-                     "decode graph instantiate");
-        if (ok) g_decode_graph_instantiates++;
-    }
-    (void)cudaGraphDestroy(graph);
-    if (ok) ok = cuda_ok(cudaGraphLaunch(g_decode_graph_exec, cudaStreamPerThread),
-                         "decode graph launch");
-    if (ok) ok = cuda_ok(cudaStreamSynchronize(cudaStreamPerThread),
-                         "decode graph sync");
-    if (ok && getenv("PULSAR_CUDA_GRAPH_STATS") != NULL &&
-        (g_decode_graph_updates + g_decode_graph_instantiates) % 256 == 0) {
-        fprintf(stderr, "pulsar: decode graphs: %llu updates, %llu instantiates\n",
-                (unsigned long long)g_decode_graph_updates,
-                (unsigned long long)g_decode_graph_instantiates);
-    }
-    return ok;
-}
 
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();

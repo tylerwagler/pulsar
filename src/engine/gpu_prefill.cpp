@@ -2769,15 +2769,15 @@ bool gpu_graph_eval_token_raw_swa(
     const bool profile = gpu_graph_env_flag("PULSAR_CUDA_GRAPH_TOKEN_PROFILE", &profile_env);
     const double t0 = profile ? now_sec() : 0.0;
 
-    const int captured = pulsar_gpu_decode_graph_begin();
-    bool ok = captured != 0 || pulsar_gpu_begin_commands() != 0;
-    /* The split-flush prefix overlap is a direct-submission latency trick; a
-     * mid-tape device sync is illegal during graph capture (and unnecessary:
-     * the graph replays the whole tape in one launch). */
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    /* The last argument enables the split-flush prefix overlap, a
+     * direct-submission latency trick.  It used to be suppressed under decode
+     * CUDA-graph capture (a mid-tape device sync is illegal while capturing);
+     * that capture path was deleted in L027, so the overlap is always on. */
     if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL,
-                                                !captured);
+                                                true);
     const double t_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = (captured ? pulsar_gpu_decode_graph_end() : pulsar_gpu_end_commands()) != 0;
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
     const double t_done = profile ? now_sec() : 0.0;
 
     if (ok && logits) {
