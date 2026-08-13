@@ -807,6 +807,12 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     }
 
     bool ok_state = true;
+    /* Every path below leaves main_x projected from the LAST committed hidden:
+     * the two seeding loops go through dspark_seed_from_batch_row, which
+     * projects it itself, and the replay loop projects per token.  The only way
+     * it can be stale is a projection failure in the replay path, which is
+     * tolerated there — so track that instead of re-projecting to find out. */
+    bool main_x_ready = true;
     if (commit == (int)K) {
         /* Full accept: the batch advanced the target state by exactly the
          * committed tokens. Seed drafter rows for every committed position from
@@ -853,6 +859,8 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                 }
                 if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
                     gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
+                else
+                    main_x_ready = false;   /* stale main_x: skip drafting below */
             }
             /* Replay refreshed s->logits from the last committed token. */
         }
@@ -898,9 +906,14 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
      * NOTE: no seed here -- the committed positions' rows were seeded above
      * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
-     * processed as batch position 0. main_x is re-projected for clarity (the
-     * seeding loop left it at the same last-committed hidden). */
-    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
+     * processed as batch position 0.
+     *
+     * main_x is NOT re-projected here.  It used to be, "for clarity", after the
+     * seeding loop had already left it at exactly this value — 3 sync copies, a
+     * gemv and a norm per step for a value we already had.  The invariant is
+     * checked at main_x_ready above, and seed_draft_kv only reads main_x, so
+     * nothing between there and here can disturb it. */
+    if (!main_x_ready)
         return n_accept;   /* drafting is best-effort; the step already succeeded */
     int32_t draft_ids[16];
     draft_ids[0] = (int32_t)next_base;
