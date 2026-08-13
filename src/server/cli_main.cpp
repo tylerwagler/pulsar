@@ -1160,7 +1160,9 @@ int main(int argc, char **argv) {
             while (const struct dirent *de = readdir(sdp)) {
                 if (strncmp(de->d_name, "spill-bank-", 11) != 0) continue;
                 if (!strstr(de->d_name, ".kv.tmp.")) continue;
-                char opath[600];
+                /* spill_dir is 512 and d_name up to 255, so 600 can truncate
+                 * (sparky's gcc warns; the dev box's does not). */
+                char opath[sizeof(s.spill_dir) + 264];
                 snprintf(opath, sizeof opath, "%s/%s", s.spill_dir, de->d_name);
                 if (remove(opath) == 0) {
                     server_log(PULSAR_LOG_WARNING,
