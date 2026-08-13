@@ -25,6 +25,11 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 
 ## File inventory
 
+> ⚠ The `Status` column below is **as-imported and partly stale**: `mmq.cuh`,
+> `mmid.cu` and `mmid.cuh` are marked verbatim but carry ds4 patches.  See
+> **ds4 local modifications (measured 2026-08-13)** further down for the
+> figures that were actually diffed.
+
 | File                  | Origin in llama.cpp                          | Status                                                                   | Lines |
 |-----------------------|----------------------------------------------|--------------------------------------------------------------------------|-------|
 | `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | verbatim                                                                 |  4176 |
@@ -92,26 +97,85 @@ Symbols the vendored files reference, and how they resolve in this directory:
 - **The full `ggml_tensor` type.** No tensor introspection - shapes and strides come in via raw arguments to `ds4_mmq_*`.
 - **`ggml_op` graph evaluation.** We call kernels directly.
 
+## ds4 local modifications (measured 2026-08-13 against the pin)
+
+⚠ **The "verbatim" labels in the file inventory above are not all accurate.**
+Diffing every vendored file against pinned `5c0e946` shows we carry
+**+480 / −24 lines** of ds4 patches across five files.  Only the `mmvq`
+pair was previously documented; the `mmq.cuh` and `mmid` patches were not,
+which is exactly how a re-vendor turns into a surprise.
+
+| File            | ds4 delta vs pin | What it is |
+|-----------------|------------------|------------|
+| `mmq.cuh`       | +255 / −18 | **(a)** `load_tiles_q2_K_soa` and `load_tiles_iq2_xxs_soa` — aligned-SoA twins of upstream's `load_tiles_q2_K` / `load_tiles_iq2_xxs`, reading the weight-server artifact (P4 Inc3).  **(b)** the `x_soa` / `soa_blocks` fields on `mmq_args` plus the `if constexpr (type == …) { if (x_soa != nullptr) … }` dispatch that selects them.  **(c)** a `DS4_CUDA_MMQ_X_MAX` env clip (Step-4 experiment hook). |
+| `mmid.cu`       | +177 / −2  | ds4 expert-routing entries |
+| `mmvq.cu`       | +26 / −4   | `mul_mat_vec_q_switch_type` promoted from `static`; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` |
+| `mmvq.cuh`      | +18 / −0   | matching prototype exposure + the same gate |
+| `mmid.cuh`      | +4 / −0    | prototype exposure for the above |
+
+Byte-identical to the pin, and therefore free to replace outright:
+`mma.cuh`, `vecdotq.cuh`, `quantize.cuh`, `quantize.cu`, `unary.cuh`,
+`common.cuh`, `ggml-common.h`, `vendors/cuda.h`.
+
 ## Re-syncing with upstream
 
-When upstream lands a bugfix or perf improvement we want, the procedure is:
+> **Do NOT `cp` the files over.**  An earlier revision of this document
+> recommended exactly that.  It predates the patches above and would silently
+> discard all five of them — including the entire aligned-SoA path, which is
+> the type-43 performance work.  The `ds4_mmq.cu` side would fail to compile
+> (it references `x_soa`), but the `mmid`/`mmvq` patches can be lost quietly.
+
+Re-vendoring is a **patch-carrying merge**, not a copy.  The procedure:
 
 ```sh
-cd /tmp/llama-research && git fetch && git checkout <NEW_COMMIT>
-cd /Users/ent/code/ds4-mmq-lift/cuda/mmq
-cp /tmp/llama-research/ggml/src/ggml-cuda/{mmq.cuh,mma.cuh,vecdotq.cuh,quantize.cuh,quantize.cu,mmid.cuh,mmid.cu,common.cuh} .
-cp /tmp/llama-research/ggml/src/ggml-common.h .
-cp /tmp/llama-research/ggml/src/ggml-cuda/vendors/cuda.h vendors/
-# Verify the shim still covers all referenced symbols:
+# 1. Establish the three-way base: the pinned upstream revision.
+PIN=5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a
+# 2. For each patched file, extract our delta against the PIN (not master):
+#      diff <pinned copy> <our copy>  > ds4-<file>.patch
+# 3. Drop in the new upstream revision for every file.
+# 4. Re-apply each ds4 patch, re-homing it if upstream moved the code.
+# 5. Re-run the symbol sweep for shim gaps:
 grep -hoE 'GGML_[A-Z_]+|ggml_[a-z_]+' *.cuh *.cu *.h | sort -u > /tmp/symbols.new
-diff /tmp/symbols.last /tmp/symbols.new  # check for newly-introduced names
-# Update this VENDOR.md's commit pin and run `make cuda CUDA_ARCH=sm_120`.
+diff /tmp/symbols.last /tmp/symbols.new
+# 6. Update the pin in this file, rebuild, and run the bit-exactness gates
+#    (make cuda-prefill-gate) — a silently-dropped SoA path still produces
+#    plausible numbers, so compiling is not evidence of correctness.
 ```
 
-If the new symbols are minor (e.g., new `GGML_CUDA_CC_*` constants), they
-likely come from `common.cuh` which we vendor and don't need any shim
-changes. If they're new `ggml_*` host functions (rare, but possible if
-upstream adds a new helper), extend `ds4_ggml_stubs.h`.
+New `GGML_CUDA_CC_*`-style constants usually arrive via `common.cuh`, which we
+vendor, and need no shim change.  New `ggml_*` host helpers need
+`ds4_ggml_stubs.h` extended.
+
+### State of upstream as of 2026-08-13 (measured, master vs our pin)
+
+Upstream **split `mmq.cuh` apart**: our single 189,612-byte file corresponds to
+upstream's `mmq.cuh` (71,514 B) plus two extracted files, `mmq-load-tiles.cuh`
+(80,567 B) and `mmq-vec-dot.cuh` (49,070 B), plus eight per-architecture
+`mmq-config-*.cuh` headers.  All ten are `#include`d unconditionally by
+`mmq.cuh`, so all ten must be vendored even though the CDNA/RDNA ones are dead
+weight in a CUDA-only fork — patching the includes out would create fresh
+divergence and defeat the point.
+
+Two facts make this cheaper than the file count suggests:
+
+- **The adapter contract survives.**  `mul_mat_q_case<type>(ggml_backend_cuda_context&, const mmq_args&, cudaStream_t)`
+  still exists with an unchanged signature, so `ds4_mmq.cu`'s dispatch does not
+  need rewriting.  `mmq_args` itself did change: upstream dropped
+  `use_stream_k` and added `const float * y_scale`, so our two trailing fields
+  must be re-added and the adapter's initializers checked.
+- **Our patches partition along the seam upstream chose.**  Both SoA loaders
+  are twins of `load_tiles_*` functions that now live in `mmq-load-tiles.cuh`,
+  so patch (a) relocates to that file next to its counterparts and only the
+  `x_soa` dispatch hook (b) stays in `mmq.cuh`.  This is mechanical
+  re-homing, not a redesign.
+
+`mmq-config-blackwell.cuh` is new since our pin and is the reason to care about
+GB10 specifically — but note it configures **MXFP4 and NVFP4 only**, and falls
+back to `ggml_cuda_mmq_get_config_ampere` for everything else.  There is still
+**no upstream Blackwell tuning for 2-bit types** (IQ2_XXS, Q2_K), so this sync
+does not by itself move our dominant gate/up stage.  It does bring Blackwell
+MXFP4 config (we run MXFP4 on 13 of 43 layers) and NVFP4 support we do not
+have at all.
 
 ## Testing matrix
 
