@@ -268,6 +268,44 @@ bool kv_cache_incoming_supersedes_continued(
     return !strcmp(prefix_sha, e->sha);
 }
 
+/* Eviction score with the supersedes-continued decision SUPPLIED rather than
+ * derived.
+ *
+ * kv_cache_incoming_supersedes_continued SHA1s a prefix of the incoming text
+ * (up to ~100 KB), and evict() re-scores every surviving entry on every pass of
+ * its shrink loop — so deriving it inside the score made the cost
+ * passes x entries hashes. The decision depends only on (entry, incoming), and
+ * both are invariant for the whole evict() call, so the caller computes it once
+ * per entry and carries it. The prefix LENGTH is per entry (e->text_bytes), so
+ * there is no single hash to hoist — only the repetition to remove. */
+double kv_entry_eviction_score_with(const pulsar_kvstore_entry *e,
+                                    uint64_t now, bool supersedes) {
+    if (!e || e->file_size == 0) return 0.0;
+    double effective_hits = (double)e->hits;
+    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
+    if (used_at == 0) {
+        effective_hits = 0.0;
+    } else if (now > used_at) {
+        double elapsed = (double)(now - used_at);
+        effective_hits *= exp2(-elapsed / (double)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+    }
+    double score = (effective_hits + 1.0) *
+                   (double)e->tokens / (double)e->file_size;
+    if (e->reason == PULSAR_KVSTORE_REASON_SYS_PREFIX ||
+        e->reason == PULSAR_KVSTORE_REASON_AGENT_SYSTEM)
+        score *= KV_CACHE_SYS_PREFIX_SCORE_FACTOR;
+    else if (kv_cache_reason_is_anchor(e->reason))
+        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
+    if (supersedes) {
+        double h = effective_hits > 0.0 ?
+            effective_hits / (effective_hits + 1.0) : 0.0;
+        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
+                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+    }
+    return score;
+}
+
 bool kv_cache_file_text_matches(const char *path, const char sha[41],
                                 const char *text, size_t text_len) {
     if (text_len > UINT32_MAX) return false;
@@ -451,6 +489,10 @@ public:
 
     void evict(const pulsar_tokens *live, uint64_t extra_bytes,
                const pulsar_kvstore_eviction_context *incoming) {
+        /* `live` is part of the public evict signature but has never been used
+         * by the scorer (it did `(void)live` itself); the split below just moves
+         * where that is visible. */
+        (void)live;
         if (!kc_.enabled || kc_.budget_bytes == 0) return;
         if (extra_bytes > kc_.budget_bytes) return;
         refresh();
@@ -458,15 +500,28 @@ public:
         uint64_t total = 0;
         for (int i = 0; i < kc_.len; i++) total += kc_.entry[i].file_size;
         const uint64_t target = kc_.budget_bytes - extra_bytes;
+        /* Decide supersedes-continued ONCE per entry: it SHA1s a prefix of the
+         * incoming text, and the loop below re-scores every survivor on every
+         * pass, so deriving it per score made this passes x entries hashes of
+         * up to ~100 KB. Both inputs are invariant for this whole call. The
+         * flags travel with the entries through the removal memmove below. */
+        char *supersedes = kc_.len > 0
+            ? (char *)calloc((size_t)kc_.len, 1) : NULL;
+        if (supersedes) {
+            for (int i = 0; i < kc_.len; i++) {
+                supersedes[i] =
+                    kv_cache_incoming_supersedes_continued(&kc_.entry[i], incoming) ? 1 : 0;
+            }
+        }
         while (total > target && kc_.len > 0) {
             int victim = 0;
             double victim_score =
-                pulsar_kvstore_entry_eviction_score(&kc_.entry[0], live, now,
-                                                 incoming);
+                kv_entry_eviction_score_with(&kc_.entry[0], now,
+                                             supersedes && supersedes[0]);
             for (int i = 1; i < kc_.len; i++) {
                 double score =
-                    pulsar_kvstore_entry_eviction_score(&kc_.entry[i], live, now,
-                                                     incoming);
+                    kv_entry_eviction_score_with(&kc_.entry[i], now,
+                                                 supersedes && supersedes[i]);
                 if (score < victim_score ||
                     (score == victim_score &&
                      kc_.entry[i].last_used < kc_.entry[victim].last_used))
@@ -492,8 +547,13 @@ public:
             pulsar_kvstore_entry_free(&e);
             memmove(kc_.entry + victim, kc_.entry + victim + 1,
                     (size_t)(kc_.len - victim - 1) * sizeof(kc_.entry[0]));
+            if (supersedes) {
+                memmove(supersedes + victim, supersedes + victim + 1,
+                        (size_t)(kc_.len - victim - 1));
+            }
             kc_.len--;
         }
+        free(supersedes);
     }
 
     int store_len(int tokens) const {
@@ -1272,31 +1332,9 @@ double pulsar_kvstore_entry_eviction_score(
         const pulsar_tokens *live,
         uint64_t now,
         const pulsar_kvstore_eviction_context *incoming) {
-    if (!e || e->file_size == 0) return 0.0;
     (void)live;
-    double effective_hits = (double)e->hits;
-    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
-    if (used_at == 0) {
-        effective_hits = 0.0;
-    } else if (now > used_at) {
-        double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS);
-        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
-    }
-    double score = (effective_hits + 1.0) *
-                   (double)e->tokens / (double)e->file_size;
-    if (e->reason == PULSAR_KVSTORE_REASON_SYS_PREFIX ||
-        e->reason == PULSAR_KVSTORE_REASON_AGENT_SYSTEM)
-        score *= KV_CACHE_SYS_PREFIX_SCORE_FACTOR;
-    else if (pulsar::kv_cache_reason_is_anchor(e->reason))
-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
-    if (pulsar::kv_cache_incoming_supersedes_continued(e, incoming)) {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
-    }
-    return score;
+    return pulsar::kv_entry_eviction_score_with(
+        e, now, pulsar::kv_cache_incoming_supersedes_continued(e, incoming));
 }
 
 char *pulsar_kvstore_render_tokens_text(pulsar_engine *engine,

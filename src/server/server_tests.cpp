@@ -4410,6 +4410,51 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
 }
 
+/* The supersedes-continued demotion is the branch A6 refactored: evict() now
+ * decides it ONCE per entry and passes the result in, instead of re-deriving it
+ * (and re-SHA1ing a prefix of the incoming text) on every scoring pass. Pin the
+ * behaviour so the split cannot silently drop the demotion. */
+static void test_kv_cache_eviction_score_demotes_superseded_continued(void) {
+    const char *text = "the quick brown fox jumps over the lazy dog";
+    const size_t text_len = strlen(text);
+    const uint32_t prefix_bytes = 19;          /* "the quick brown fox" */
+
+    char prefix_sha[41];
+    sha1_bytes_hex(text, prefix_bytes, prefix_sha);
+
+    kv_entry cont = {.quant_bits = 2, .model_id = 1,
+                     .reason = KV_REASON_CONTINUED,
+                     .tokens = 1024, .hits = 0, .ctx_size = 4096,
+                     .last_used = 500, .text_bytes = prefix_bytes,
+                     .file_size = 4096};
+    memcpy(cont.sha, prefix_sha, sizeof(cont.sha));
+
+    pulsar_kvstore_eviction_context incoming = {};
+    incoming.text = text;
+    incoming.text_len = text_len;
+    incoming.model_id = 1;
+    incoming.quant_bits = 2;
+    incoming.ctx_size = 4096;
+    incoming.reject_different_quant = true;
+
+    const uint64_t now = 500;
+    const double plain = kv_entry_eviction_score(&cont, NULL, now, NULL);
+    const double demoted = kv_entry_eviction_score(&cont, NULL, now, &incoming);
+    /* The incoming checkpoint contains this one's whole text as a prefix, so
+     * this entry is redundant and must score strictly lower. */
+    TEST_ASSERT(demoted < plain);
+
+    /* A DIFFERENT model must not be treated as superseding, even byte-for-byte. */
+    pulsar_kvstore_eviction_context other = incoming;
+    other.model_id = 2;
+    TEST_ASSERT(kv_entry_eviction_score(&cont, NULL, now, &other) == plain);
+
+    /* Nor may a narrower context supersede a wider one. */
+    pulsar_kvstore_eviction_context narrower = incoming;
+    narrower.ctx_size = 8192;
+    TEST_ASSERT(kv_entry_eviction_score(&cont, NULL, now, &narrower) == plain);
+}
+
 
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -5467,6 +5512,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_score_demotes_superseded_continued();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
