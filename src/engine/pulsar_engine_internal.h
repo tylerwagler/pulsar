@@ -1063,6 +1063,12 @@ typedef struct {
      * cudaFree device-syncs, and the fused loop projects/seeds up to 5x/step). */
     pulsar_gpu_tensor *dspark_concat;       /* [3*N_EMBD] target_h concat */
     pulsar_gpu_tensor *dspark_proj_out;     /* [N_EMBD] pre-norm projection */
+    /* Confidence scoring scratch, persistent for the same reason as the two
+     * above: it is touched once per fused spec step and n_draft is clamped to
+     * 16, so a per-step alloc/free pair bought nothing but device
+     * serialization. */
+    pulsar_gpu_tensor *dspark_conf_scores;  /* [16] f32 per-draft confidence */
+    pulsar_gpu_tensor *dspark_conf_tokens;  /* [16] i32 refined draft ids   */
     pulsar_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
     pulsar_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
     pulsar_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */

@@ -1089,8 +1089,12 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     {
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f || dtree_stats) {
-            pulsar_gpu_tensor *conf_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
-            pulsar_gpu_tensor *tok_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            /* Persistent graph-owned scratch (n_draft is clamped to 16 above):
+             * the alloc/free pair here ran every fused spec step and each
+             * cudaMalloc/cudaFree serializes the device, which is exactly the
+             * pattern already retired in gpu_decode's dspark projection. */
+            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
+            pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
             if (conf_dev && tok_dev &&
                 pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
                 pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
@@ -1106,8 +1110,6 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                     keep = k;   /* 0 pending = next step is a plain n=1 forward */
                 }
             }
-            pulsar_gpu_tensor_free(conf_dev);
-            pulsar_gpu_tensor_free(tok_dev);
         }
     }
     s->spec.dspark_pending_base = (int32_t)next_base;
@@ -1389,8 +1391,11 @@ int pulsar_session::eval_speculative_block(int first_token,
     {
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f) {
-            pulsar_gpu_tensor *conf_dev = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(float));
-            pulsar_gpu_tensor *tok_dev  = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+            /* Persistent graph-owned scratch; see the twin above.  n_draft is
+             * bounded by e->dspark_draft_tokens, clamped to 16 in session.cpp,
+             * which is what sizes these buffers (and the conf[16] below). */
+            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
+            pulsar_gpu_tensor *tok_dev  = g->dspark_conf_tokens;
             if (conf_dev && tok_dev &&
                 pulsar_gpu_tensor_write(tok_dev, 0, refined_ids, (uint64_t)n_draft * sizeof(int32_t)) &&
                 pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
@@ -1411,8 +1416,6 @@ int pulsar_session::eval_speculative_block(int first_token,
                                 n_draft > 3 ? (double)conf[3] : 0.0, eff_draft, n_draft);
                 }
             }
-            pulsar_gpu_tensor_free(conf_dev);
-            pulsar_gpu_tensor_free(tok_dev);
         }
     }
 
