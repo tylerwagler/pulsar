@@ -1294,8 +1294,20 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
                 tool_schema_orders_add_json_wire(orders, special,
                                                  NULL, NULL, true);
             } else {
-                append_raw_json_line(&schemas, raw);
+                /* Anthropic-shaped tools ({name, description, input_schema})
+                 * have no "function" wrapper, so they never reached the
+                 * canonicalizer in openai_function_schema_from_tool and went
+                 * into the prompt with the CALLER's JSON spelling.  That is
+                 * Claude Code's surface.  Canonicalize here for the same
+                 * reasons (reference tokenization + warm-bank prefix
+                 * stability), failing OPEN to the verbatim bytes.  Schemas we
+                 * synthesize ourselves (web_search, responses namespaces) are
+                 * already deterministic and need no canonicalization — only
+                 * CLIENT-supplied spelling can vary. */
+                char *canon = json_prompt_value(raw);
+                append_raw_json_line(&schemas, canon ? canon : raw);
                 tool_schema_orders_add_json(orders, raw);
+                free(canon);
             }
             free(special);
         }

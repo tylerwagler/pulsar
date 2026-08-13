@@ -101,6 +101,35 @@ static void test_openai_tool_schema_json_spelling_is_canonical(void) {
 
 
 
+/* The canonical-spelling invariant must hold for ANTHROPIC-shaped tools too
+ * ({name, description, input_schema} — no "function" wrapper), because that is
+ * the surface Claude Code drives.  Two spellings of one schema must render
+ * identical prompt bytes, or a client's serializer still fragments warm-bank
+ * prefixes and drifts off the reference tokenization. */
+static void test_anthropic_tool_schema_json_spelling_is_canonical(void) {
+    const char *compact =
+        "[{\"name\":\"Bash\",\"description\":\"Run \\u2014 now\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}]";
+    const char *spaced =
+        "[ { \"name\" : \"Bash\", \"description\" : \"Run \xe2\x80\x94 now\", "
+        "\"input_schema\" : { \"type\" : \"object\", \"properties\" : { "
+        "\"command\" : { \"type\" : \"string\" } }, \"required\" : [ \"command\" ] } } ]";
+    char *a = NULL, *b = NULL;
+    tool_schema_orders oa = {0}, ob = {0};
+    const char *pa = compact, *pb = spaced;
+    TEST_ASSERT(parse_tools_value(&pa, &a, &oa, false, NULL));
+    TEST_ASSERT(parse_tools_value(&pb, &b, &ob, false, NULL));
+    TEST_ASSERT(a && b && !strcmp(a, b));
+    TEST_ASSERT(strstr(a, "\"name\": \"Bash\""));
+    TEST_ASSERT(!strstr(a, "\\u2014"));                  /* em-dash decoded */
+    free(a); free(b);
+    tool_schema_orders_free(&oa);
+    tool_schema_orders_free(&ob);
+}
+
+
+
 static void test_tool_schema_order_from_responses_tool_search(void) {
     const char *json =
         "[{\"type\":\"tool_search\",\"execution\":\"client\","
@@ -5277,6 +5306,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_openai_tool_schema_json_spelling_is_canonical();
+    test_anthropic_tool_schema_json_spelling_is_canonical();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
