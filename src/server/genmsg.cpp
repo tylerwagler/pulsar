@@ -86,6 +86,10 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
         w->failed = true;
         return false;
     }
+    /* Stamp BEFORE the fast path below, which can return early once the bytes
+     * go straight to the wire — stamping at the buf_append would miss exactly
+     * the case where the client is keeping up (the common one). */
+    w->last_write_ms = wall_ms();
     const char *s = (const char *)p;
     if (w->off == w->pending.len) {
         /* Nothing queued: try the wire directly so hard errors (EPIPE from a
@@ -115,6 +119,50 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
         w->stall_deadline_ms = wall_ms() + PULSAR_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return slot_writer_flush(w);
+}
+
+
+
+bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms) {
+    if (!w || w->failed || w->fd < 0) return false;
+    if (!w->last_write_ms) return false;   /* nothing sent yet: no clock to judge */
+    return now_ms - w->last_write_ms >= interval_ms;
+}
+
+
+
+/* Surface-appropriate keepalive for a slot that has gone quiet mid-request.
+ *
+ * Anthropic gets a REAL `ping` event: it is documented, and clients are told to
+ * ignore unknown/ping events, so it costs nothing.
+ *
+ * OpenAI-chat and Responses get an SSE COMMENT (": ping"). A comment is
+ * discarded by every conformant SSE parser before it reaches application code,
+ * so it cannot perturb the delta stream. NOTE this DIVERGES from upstream
+ * Entrpi 40ca8d5, which sends a real `response.in_progress` on the Responses
+ * surface. Deliberate: `response.in_progress` is a lifecycle event carrying a
+ * `sequence_number`, and our responses_stream hands out monotonic indices
+ * (st->next_output_index) — repeating it would either duplicate or advance the
+ * sequence for a non-event, which strict clients may reject. A comment keeps
+ * the socket warm with zero protocol surface. */
+bool gen_stream_heartbeat(gen_state *g) {
+    if (!g) return false;
+    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
+
+    const char *beat = NULL;
+    if (g->anthropic_live.active) {
+        beat = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+    } else if (g->responses_live.active || g->openai_live.active) {
+        beat = ": ping\n\n";
+    }
+    if (!beat) return false;   /* non-streaming request: nothing to keep alive */
+
+    /* Write through the slot's OWN writer, not send_all: send_all only becomes
+     * non-blocking when that writer is INSTALLED thread-locally, which it is
+     * not during the worker's sweep — it would block the single GPU worker on
+     * a slow client. slot_writer_send is non-blocking and re-stamps
+     * last_write_ms, so the next beat is one full interval away. */
+    return slot_writer_send(&g->writer, beat, strlen(beat));
 }
 
 

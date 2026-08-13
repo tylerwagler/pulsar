@@ -1947,6 +1947,12 @@ void *worker_main(void *arg) {
         int n_active = 0;
         for (int i = 0; i < s->n_slots; i++) {
             if (s->slots[i].active_job) n_active++;
+            /* L006 heartbeat: swept over ALL bound slots, not just the one
+             * about to get a quantum. The slot that most needs a keepalive is
+             * precisely the one starved behind another job's long prefill —
+             * which is never the slot being advanced. Non-blocking; a no-op
+             * unless that slot has been silent >= PULSAR_SERVER_HEARTBEAT_MS. */
+            if (s->slots[i].gen) (void)gen_stream_heartbeat(s->slots[i].gen);
         }
         if (n_active == 0) {
             /* With every slot free, choose_slot_for_job never returns NULL

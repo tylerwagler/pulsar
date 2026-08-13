@@ -1144,6 +1144,71 @@ static void test_openai_stream_keeps_text_when_tool_straddles_think_close(void) 
 
 
 
+/* L006: a streaming slot that has gone silent (long prefill, or starved behind
+ * another job) gets a surface-appropriate keepalive, and only then. */
+static void test_stream_heartbeat_only_fires_when_silent(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    gen_state g;
+    memset(&g, 0, sizeof(g));
+    slot_writer_init(&g.writer, sv[0]);
+    g.anthropic_live.active = true;
+
+    /* Clock unarmed (nothing ever sent): no beat — we do not know the client
+     * is idle rather than simply not started. */
+    TEST_ASSERT(!gen_stream_heartbeat(&g));
+
+    /* Arm the clock far in the past => silent => beat. */
+    g.writer.last_write_ms = 1;
+    TEST_ASSERT(gen_stream_heartbeat(&g));
+    /* The beat re-stamps the clock, so it must NOT fire again immediately. */
+    TEST_ASSERT(!gen_stream_heartbeat(&g));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "event: ping") != NULL);          /* real Anthropic event */
+    TEST_ASSERT(strstr(out, "\"type\": \"ping\"") != NULL);
+    free(out);
+    slot_writer_free(&g.writer);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
+/* OpenAI/Responses get an SSE COMMENT, which every conformant parser drops
+ * before it reaches application code — it cannot perturb the delta stream. */
+static void test_stream_heartbeat_openai_uses_sse_comment(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    gen_state g;
+    memset(&g, 0, sizeof(g));
+    slot_writer_init(&g.writer, sv[0]);
+    g.writer.last_write_ms = 1;
+
+    /* No stream projection active (non-streaming request): never beat. */
+    TEST_ASSERT(!gen_stream_heartbeat(&g));
+
+    g.openai_live.active = true;
+    TEST_ASSERT(gen_stream_heartbeat(&g));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, ": ping") != NULL);
+    TEST_ASSERT(strstr(out, "event:") == NULL);   /* comment only, no protocol event */
+    TEST_ASSERT(strstr(out, "data:") == NULL);
+    free(out);
+    slot_writer_free(&g.writer);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -5333,6 +5398,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_stream_keeps_text_when_tool_straddles_think_close();
+    test_stream_heartbeat_only_fires_when_silent();
+    test_stream_heartbeat_openai_uses_sse_comment();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();

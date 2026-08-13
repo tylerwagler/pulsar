@@ -619,11 +619,27 @@ typedef struct {
     size_t off;                  /* consumed prefix of pending */
     long long stall_deadline_ms; /* 0 = disarmed (nothing pending) */
     bool failed;
+    /* Wall clock of the last client bytes ACCEPTED by this writer (queued or
+     * sent), 0 until the first. Every streamed byte funnels through
+     * slot_writer_send, so this is the one honest "when did the client last
+     * hear from us" clock — the heartbeat below reads it. */
+    long long last_write_ms;
 } slot_writer;
+
+/* Decode-phase stream heartbeat (ledger L006, upstream Entrpi 406bf93).
+ * A long prefill (156 s cold re-prefill at depth is normal for us — see the
+ * KV-replay-divergence finding) sends the client NOTHING, so proxies and
+ * client-side idle timeouts can kill a request that is progressing fine.
+ * Every quantum boundary the worker asks whether a streaming slot has been
+ * silent for PULSAR_SERVER_HEARTBEAT_MS and, if so, emits a keepalive that is
+ * a NO-OP at the protocol level for the surface in question. */
+#define PULSAR_SERVER_HEARTBEAT_MS 5000
 
 void slot_writer_init(slot_writer *w, int fd);
 void slot_writer_install(slot_writer *w);   /* thread-local; NULL uninstalls */
 bool slot_writer_flush(slot_writer *w);     /* non-blocking best effort */
+/* True when this writer has an armed clock and has been silent >= interval. */
+bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
 bool slot_writer_drain(slot_writer *w);     /* blocking, stall-timeout bounded */
 void slot_writer_free(slot_writer *w);
 
@@ -1457,6 +1473,11 @@ struct gen_state {
     /* deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
 };
+
+/* Emit the surface-appropriate keepalive if this slot has gone quiet (see
+ * PULSAR_SERVER_HEARTBEAT_MS). Returns true if one was written. Non-blocking
+ * and idempotent-by-clock, so it is safe to call every worker pass. */
+bool gen_stream_heartbeat(gen_state *g);
 
 typedef struct {
     char method[8];
