@@ -1124,7 +1124,8 @@ static int sample_full_vocab(
         float        temperature,
         float        top_p,
         float        min_p,
-        uint64_t    *rng) {
+        uint64_t    *rng,
+        pulsar_sample_scratch *scratch) {
     float max_logit = PULSAR_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
@@ -1182,9 +1183,26 @@ static int sample_full_vocab(
      * tens-of-candidates sort at the default min_p. The cutoff loop below is
      * unchanged and trims the boundary byte-exactly, so this path's output
      * (token and rng stream) is bit-identical to the unfiltered build. */
-    sample_candidate *cand = (sample_candidate *)xmalloc((size_t)finite * sizeof(cand[0]));
-    uint64_t *keys = (uint64_t *)xmalloc((size_t)finite * sizeof(keys[0]));
-    uint64_t *tmp = (uint64_t *)xmalloc((size_t)finite * sizeof(tmp[0]));
+    /* Borrow the caller's reusable scratch when there is one.  These three
+     * buffers are ~5 MB at full vocab and were malloc/free'd PER SAMPLED TOKEN
+     * on this path — which is the plain sampler, reached whenever a client
+     * sends top_p < 1 without a top_k (a common shape).  pulsar_sample_dist_build
+     * already reuses exactly these buffers for the speculative walk; this path
+     * simply never did.  A NULL scratch keeps the original malloc behaviour for
+     * pulsar_sample_logits, which has no session to borrow from. */
+    sample_candidate *cand;
+    uint64_t *keys;
+    uint64_t *tmp;
+    if (scratch) {
+        sample_scratch_reserve(scratch, finite);
+        cand = scratch->cand;
+        keys = scratch->keys;
+        tmp  = scratch->tmp;
+    } else {
+        cand = (sample_candidate *)xmalloc((size_t)finite * sizeof(cand[0]));
+        keys = (uint64_t *)xmalloc((size_t)finite * sizeof(keys[0]));
+        tmp  = (uint64_t *)xmalloc((size_t)finite * sizeof(tmp[0]));
+    }
     uint32_t n = 0;
     float sum = 0.0f;
     const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
@@ -1200,9 +1218,11 @@ static int sample_full_vocab(
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        free(cand);
-        free(keys);
-        free(tmp);
+        if (!scratch) {
+            free(cand);
+            free(keys);
+            free(tmp);
+        }
         return best;
     }
 
@@ -1210,11 +1230,17 @@ static int sample_full_vocab(
      * requires. Stable over an ascending fill => ties keep ascending vocab id,
      * matching the qsort this replaces. */
     sample_radix_sort_desc(keys, tmp, n);
-    sample_candidate *sorted = (sample_candidate *)xmalloc((size_t)n * sizeof(sorted[0]));
+    /* The gather cannot run in place, so it needs a second buffer: scratch->cand2
+     * exists for exactly this (see its comment) and is reserved to the same cap. */
+    sample_candidate *sorted = scratch
+        ? scratch->cand2
+        : (sample_candidate *)xmalloc((size_t)n * sizeof(sorted[0]));
     for (uint32_t i = 0; i < n; i++) sorted[i] = cand[(uint32_t)keys[i]];
-    free(cand);
-    free(keys);
-    free(tmp);
+    if (!scratch) {
+        free(cand);
+        free(keys);
+        free(tmp);
+    }
     cand = sorted;
     const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
     float filtered_sum = 0.0f;
@@ -1227,7 +1253,7 @@ static int sample_full_vocab(
         if (filtered_sum / sum >= top_p) break;
     }
     if (filtered == 0) {
-        free(cand);
+        if (!scratch) free(cand);
         return best;
     }
 
@@ -1236,12 +1262,12 @@ static int sample_full_vocab(
         r -= cand[i].prob;
         if (r <= 0.0f) {
             const int id = cand[i].id;
-            free(cand);
+            if (!scratch) free(cand);
             return id;
         }
     }
     const int id = cand[filtered - 1].id;
-    free(cand);
+    if (!scratch) free(cand);
     return id;
 }
 
@@ -1612,11 +1638,12 @@ int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
-        uint64_t    *rng) {
+        uint64_t    *rng,
+        pulsar_sample_scratch *scratch) {
     if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
+    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng, scratch);
     if (top_k > 1024) top_k = 1024;
     if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
 

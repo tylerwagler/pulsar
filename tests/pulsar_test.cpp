@@ -2191,6 +2191,10 @@ static void test_sampler_dist_equivalence(void) {
     sampler_warn_if_flush_to_zero();
     pulsar_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
+    /* Separate scratch for the plain (sample_full_vocab) path, shared across
+     * every shape/config below so buffer REUSE is exercised, not just first use. */
+    pulsar_sample_scratch plain_scratch;
+    memset(&plain_scratch, 0, sizeof(plain_scratch));
 
     int checked = 0;
     for (int shape = 0; shape <= 11; shape++) {
@@ -2239,17 +2243,32 @@ static void test_sampler_dist_equivalence(void) {
             /* (c) the PLAIN sampling path (sample_full_vocab), pinned against
              * the pre-radix reference: same seed must draw the same token and
              * leave the rng in the same state. */
+            /* Run BOTH allocation modes against the same reference. The scratch
+             * path reuses session-owned buffers instead of malloc/freeing ~5 MB
+             * per token; it must draw the identical token and leave the rng in
+             * the identical state, or the reuse changed sampling. The scratch is
+             * deliberately shared across trials AND configs here, since that is
+             * how a session uses it — a stale-state bug would show up as a
+             * divergence on the second call, not the first. */
             for (int trial = 0; trial < 16; trial++) {
-                uint64_t r1 = 0xABCD0000u + (uint64_t)trial, r2 = r1;
+                uint64_t r1 = 0xABCD0000u + (uint64_t)trial, r2 = r1, r3 = r1;
                 const int want = ref_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
                                                  cfg->top_p, cfg->min_p, &r1);
                 const int got_tok = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                       cfg->top_p, cfg->min_p, &r2);
+                                                       cfg->top_p, cfg->min_p, &r2, NULL);
+                const int got_scr = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                       cfg->top_p, cfg->min_p, &r3,
+                                                       &plain_scratch);
                 if (want != got_tok)
                     fprintf(stderr, "sampler: shape=%s cfg=%s plain draw %d != %d\n",
                             sname, cfg->name, want, got_tok);
+                if (got_scr != got_tok)
+                    fprintf(stderr, "sampler: shape=%s cfg=%s scratch draw %d != malloc %d\n",
+                            sname, cfg->name, got_scr, got_tok);
                 TEST_ASSERT(want == got_tok);
+                TEST_ASSERT(got_scr == got_tok);
                 TEST_ASSERT(r1 == r2);
+                TEST_ASSERT(r3 == r2);
             }
 
             pulsar_sample_dist_free(&ref);
@@ -2282,6 +2301,7 @@ static void test_sampler_dist_equivalence(void) {
     }
 
     pulsar_sample_scratch_free(&scratch);
+    pulsar_sample_scratch_free(&plain_scratch);
     free(logits);
     printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference\n",
            checked);

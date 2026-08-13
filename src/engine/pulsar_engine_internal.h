@@ -2772,6 +2772,10 @@ int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q
 int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
                                   pulsar_sample_scratch *scratch, uint64_t *rng);
 
+/* `scratch` is optional reusable working memory for the full-vocab (top_k <= 0)
+ * path, which otherwise malloc/frees ~5 MB per sampled token. Pass the calling
+ * session's sample_scratch; NULL is valid and restores the malloc behaviour for
+ * callers with no session (pulsar_sample_logits). */
 int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -2779,7 +2783,8 @@ int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
-        uint64_t    *rng);
+        uint64_t    *rng,
+        pulsar_sample_scratch *scratch);
 int generate_gpu_graph_raw_swa(
         const pulsar_model   * model,
         const pulsar_vocab   * vocab,

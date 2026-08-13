@@ -1196,7 +1196,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
          * force greedy): redraw from the current distribution */
         s->spec.spec_carry_valid = false;
         first = sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k,
-                                   top_p, min_p, rng);
+                                   top_p, min_p, rng, &s->sample_scratch);
     }
     if (first == eos_token) {
         /* never forward EOS through the target (matches the old caller loops,
