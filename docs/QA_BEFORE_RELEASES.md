@@ -180,6 +180,39 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
+### Client-side serving gates
+
+These talk HTTP to an already-running `pulsar-server`, because they measure what
+a client experiences rather than what the engine reports about itself.  Start the
+server with `--no-kv-disk` for all three: a warm disk checkpoint skips prefill
+outright, so TTFT and wall-clock t/s from a warm run cannot be compared against a
+cold one.  Each writes a machine-readable JSON record — keep it with the release
+notes, since a number with no run record is not a baseline.
+
+- `make decode-floor-gate` — five workloads (Python, Rust, TypeScript, CUDA, Go)
+  at 512 tokens, concurrency 1.  **Scored on the worst workload, not the mean**:
+  averaging one bad prompt shape against four healthy ones produces a number that
+  still looks fine while the regression ships.  Fails (exit 1) when the worst
+  workload drops more than `--tolerance` (default 10%) below the recorded floor.
+
+  The floor is ours, captured with `make decode-floor-baseline` on a known-good
+  build — not a competitor's published figure, which was measured on a different
+  harness, depth and sampler and is therefore not a floor.  Re-record it
+  deliberately when a change is *expected* to move decode, and say so in the
+  release notes; never re-record it to make a red gate go green.
+
+- `make sse-decode-bench` — decode rate measured between SSE delta arrivals,
+  reported **alongside** the wall-clock rate rather than replacing it.  When the
+  two disagree the gap is the finding: a slot starved behind another job's
+  prefill shows a healthy inter-delta rate and a poor wall-clock one.
+
+- `make context-coherence-probe` — plants three facts at the beginning, middle
+  and end of a long context and asks for them back in free prose, with no grammar
+  mask or constrained decoding (under a mask a wrong answer still comes out
+  structurally perfect, so the probe cannot fail in the way that matters).  A
+  checksum question requiring all three values at once guards against partial
+  latching.  Fails (exit 1) if any depth misses a fact or the sum.
+
 ## 9. Release Sign-off
 
 Do not sign off until:
@@ -193,4 +226,6 @@ Do not sign off until:
 - Server API streaming was exercised.
 - Agent interruption and tool loops were exercised manually.
 - Speed is within expected variance for the same hardware and model.
+- `make decode-floor-gate` passed against the recorded floor, and its JSON run
+  record is filed with the release notes.
 - Any skipped item is written down with the reason.

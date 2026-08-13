@@ -76,7 +76,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way
+.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -94,6 +94,14 @@ help:
 	@echo "  make cuda-multiseq-gate-nodspark"
 	@echo "                           The same gate with speculation disabled"
 	@echo "                           (--no-dspark config; needs the model)"
+	@echo "  make decode-floor-gate   5-workload decode floor, scored on the WORST"
+	@echo "                           workload (needs a RUNNING server; see"
+	@echo "                           make decode-floor-baseline to record the floor)"
+	@echo "  make sse-decode-bench    Decode rate off the SSE stream, alongside"
+	@echo "                           wall-clock (needs a RUNNING server)"
+	@echo "  make context-coherence-probe"
+	@echo "                           Begin/middle/end fact recall at depth, free"
+	@echo "                           prose + checksum (needs a RUNNING server)"
 	@echo "  make cuda-prefill-gate   Prefill bit-exactness gate: full-vocab frontier"
 	@echo "                           logits byte-compared against a baseline build"
 	@echo "                           (needs the model + a baseline blob)"
@@ -226,6 +234,35 @@ warm-fork-3way: pulsar-server
 # plan-33 inc D: partial-prefix fork 3-way output-equality harness (server-level).
 warm-partial-fork-3way: pulsar-server
 	bash tests/warm_partial_fork_3way.sh $(FRONTIER_MODEL)
+
+# ---- client-side serving gates (stdlib Python; need a RUNNING pulsar-server) ----
+# These measure what a client experiences, so they talk HTTP to an already-started
+# server rather than linking the engine.  Start it with --no-kv-disk: a warm disk
+# checkpoint skips prefill outright, which makes TTFT and wall-clock t/s
+# incomparable between runs.  Override the endpoint with SERVE_HOST/SERVE_PORT.
+SERVE_HOST ?= 127.0.0.1
+SERVE_PORT ?= 8080
+
+# Decode rate as the stream delivers it, reported alongside wall-clock.
+sse-decode-bench:
+	python3 tests/sse_decode_bench.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
+	  --kv-disk-state disabled
+
+# Five workloads, 512 tokens, C1; scores the WORST one against a recorded floor.
+# Capture the floor once on a known-good build:
+#   make decode-floor-baseline
+decode-floor-gate:
+	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
+	  --kv-disk-state disabled
+
+decode-floor-baseline:
+	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
+	  --kv-disk-state disabled --write-baseline
+
+# Facts planted at begin/middle/end of a long context, asked back in free prose
+# (no grammar mask) plus a checksum that needs all three at once.
+context-coherence-probe:
+	python3 tests/context_coherence_probe.py --host $(SERVE_HOST) --port $(SERVE_PORT)
 
 # Prefill bit-exactness gate (the D2R acceptance gate; see the header of
 # tests/prefill_bitexact_gate.c).  MODEL-DEPENDENT — run manually on the GB10,
