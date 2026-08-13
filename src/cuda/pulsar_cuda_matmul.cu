@@ -1269,9 +1269,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
             }
         }
         /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
-         * through to the per-token mmvq kernel below. PULSAR_FP8_NO_MXCORE forces
-         * the mmvq path everywhere as an operational fallback. */
-        if (n_tok > 1 && getenv("PULSAR_FP8_NO_MXCORE") == NULL &&
+         * through to the per-token mmvq kernel below. */
+        if (n_tok > 1 &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
                 weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
         const unsigned wpb = 8;  /* output rows per block */
@@ -1750,8 +1749,7 @@ int pulsar_gpu_attention_output_batch_tensor(
      * warp8/nt kernels are per-token M-independent (bit-identical to the n=1
      * DEINT kernel), so a co-scheduled decode bank's attn-output row is invariant
      * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
-    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0 &&
-        getenv("PULSAR_FP8_NO_MXCORE") == NULL) {
+    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                                  group_dim, rank, n_groups, heads, n_tokens);
     }

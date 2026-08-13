@@ -363,8 +363,10 @@ int gpu_graph_raw_f16_enabled(void) {
  * banked multi-token attention/indexer with packed-native comp reads).
  * Banked multi-token rows force the generic kernel tiers (WMMA / indexed
  * heads8 stay single-bank), so level 2 is byte-exact vs classic ONLY when
- * both runs pin those tiers off (PULSAR_CUDA_NO_INDEXER_WMMA=1 and
- * PULSAR_CUDA_NO_INDEXED_HEADS8=1) — how the Tier-2 gate runs it. */
+ * both runs pin those tiers off.  PULSAR_CUDA_NO_INDEXED_HEADS8=1 still does
+ * that half; the WMMA opt-out was retired in L027 (nothing invoked it), so a
+ * byte-exact Tier-2 comparison now needs the indexer WMMA condition edited
+ * directly rather than an env flag. */
 int gpu_graph_decode_descr_enabled(void) {
     static int cached = -1;
     if (cached < 0) {

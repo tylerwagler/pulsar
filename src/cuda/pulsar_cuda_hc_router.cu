@@ -362,120 +362,6 @@ __device__ static float softplus_dev(float x) {
 
 
 
-__global__ static void router_select_kernel(
-        int32_t *selected,
-        float *weights,
-        float *probs,
-        const float *bias,
-        const int32_t *hash,
-        const float *logits,
-        const int32_t *tokens,
-        int32_t token_scalar,
-        uint32_t hash_rows,
-        uint32_t n_tokens,
-        int has_bias,
-        int hash_mode) {
-    uint32_t t = blockIdx.x;
-    if (t >= n_tokens || threadIdx.x != 0) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
-
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
-
-    if (hash_mode) {
-        int32_t tok = tokens ? tokens[t] : token_scalar;
-        if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int i = 0; i < 6; i++) sel[i] = row[i];
-    } else {
-        for (int i = 0; i < 6; i++) sel[i] = -1;
-        for (int i = 0; i < 256; i++) {
-            float score = prob[i] + (has_bias ? bias[i] : 0.0f);
-            for (int j = 0; j < 6; j++) {
-                if (sel[j] < 0 || score > prob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
-                    sel[j] = i;
-                    break;
-                }
-            }
-        }
-    }
-
-    float sum = 0.0f;
-    for (int i = 0; i < 6; i++) {
-        int e = sel[i];
-        float v = (e >= 0 && e < 256) ? prob[e] : 0.0f;
-        w[i] = v;
-        sum += v;
-    }
-    sum = fmaxf(sum, 6.103515625e-5f);
-    for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
-}
-
-
-
-__global__ static void router_select_parallel_kernel(
-        int32_t *selected,
-        float *weights,
-        float *probs,
-        const float *bias,
-        const int32_t *hash,
-        const float *logits,
-        const int32_t *tokens,
-        int32_t token_scalar,
-        uint32_t hash_rows,
-        uint32_t n_tokens,
-        int has_bias,
-        int hash_mode) {
-    uint32_t t = blockIdx.x;
-    uint32_t i = threadIdx.x;
-    if (t >= n_tokens || i >= 256u) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
-    __shared__ float sprob[256];
-
-    const float p = sqrtf(softplus_dev(log[i]));
-    sprob[i] = p;
-    prob[i] = p;
-    __syncthreads();
-
-    if (i != 0) return;
-    if (hash_mode) {
-        int32_t tok = tokens ? tokens[t] : token_scalar;
-        if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int j = 0; j < 6; j++) sel[j] = row[j];
-    } else {
-        for (int j = 0; j < 6; j++) sel[j] = -1;
-        for (int e = 0; e < 256; e++) {
-            float score = sprob[e] + (has_bias ? bias[e] : 0.0f);
-            for (int j = 0; j < 6; j++) {
-                if (sel[j] < 0 || score > sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
-                    sel[j] = e;
-                    break;
-                }
-            }
-        }
-    }
-
-    float sum = 0.0f;
-    for (int j = 0; j < 6; j++) {
-        int e = sel[j];
-        float v = (e >= 0 && e < 256) ? sprob[e] : 0.0f;
-        w[j] = v;
-        sum += v;
-    }
-    sum = fmaxf(sum, 6.103515625e-5f);
-    for (int j = 0; j < 6; j++) w[j] = w[j] / sum * 1.5f;
-}
-
-
-
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
@@ -733,24 +619,11 @@ int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tens
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
     }
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_warp_select = getenv("PULSAR_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
-    static const int no_parallel_select = getenv("PULSAR_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
     if (ok) {
-        if (!no_warp_select && !no_parallel_select) {
-            dim3 block(32, 4, 1);
-            router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                         bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                         has_bias && !hash_mode, hash_mode);
-        } else if (!no_parallel_select) {
-            router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                      bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                      has_bias && !hash_mode, hash_mode);
-        } else {
-            router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                          has_bias && !hash_mode, hash_mode);
-        }
+        dim3 block(32, 4, 1);
+        router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                     has_bias && !hash_mode, hash_mode);
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
     }
     return ok;
@@ -780,50 +653,19 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) return 0;
     }
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_warp_select = getenv("PULSAR_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
-    static const int no_parallel_select = getenv("PULSAR_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
-    if (!no_warp_select && !no_parallel_select) {
-        dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
-                                                                        (float *)weights->ptr,
-                                                                        (float *)probs->ptr,
-                                                                        bias,
-                                                                        hash,
-                                                                        (const float *)logits->ptr,
-                                                                        (const int32_t *)tokens->ptr,
-                                                                        0,
-                                                                        hash_rows,
-                                                                        n_tokens,
-                                                                        has_bias && !hash_mode,
-                                                                        hash_mode);
-    } else if (!no_parallel_select) {
-        router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
-                                                         (float *)weights->ptr,
-                                                         (float *)probs->ptr,
-                                                         bias,
-                                                         hash,
-                                                         (const float *)logits->ptr,
-                                                         (const int32_t *)tokens->ptr,
-                                                         0,
-                                                         hash_rows,
-                                                         n_tokens,
-                                                         has_bias && !hash_mode,
-                                                         hash_mode);
-    } else {
-        router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
-                                              (float *)weights->ptr,
-                                              (float *)probs->ptr,
-                                              bias,
-                                              hash,
-                                              (const float *)logits->ptr,
-                                              (const int32_t *)tokens->ptr,
-                                              0,
-                                              hash_rows,
-                                              n_tokens,
-                                              has_bias && !hash_mode,
-                                              hash_mode);
-    }
+    dim3 block(32, 4, 1);
+    router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
+                                                                    (float *)weights->ptr,
+                                                                    (float *)probs->ptr,
+                                                                    bias,
+                                                                    hash,
+                                                                    (const float *)logits->ptr,
+                                                                    (const int32_t *)tokens->ptr,
+                                                                    0,
+                                                                    hash_rows,
+                                                                    n_tokens,
+                                                                    has_bias && !hash_mode,
+                                                                    hash_mode);
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
 

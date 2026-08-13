@@ -1668,7 +1668,10 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
         }
 #if defined(__linux__) && defined(O_DIRECT)
-        if (getenv("PULSAR_CUDA_NO_DIRECT_IO") == NULL) {
+        /* O_DIRECT is best-effort: if the filesystem will not give it to us the
+         * open simply fails and we keep the buffered fd, so no opt-out flag is
+         * needed for filesystems that lack it. */
+        {
             char proc_path[64];
             snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
             int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);

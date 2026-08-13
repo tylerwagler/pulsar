@@ -1379,11 +1379,12 @@ __global__ static void f32_to_f16_kernel(__half *dst, const float *src, uint64_t
  * launched while the emulation is OFF, so the shipped path is untouched.
  *
  * This path is the one that actually runs for a compressed-KV prefill --
- * verified by dispatch-flag bisect: with PULSAR_CUDA_NO_CUBLAS_ATTENTION the
- * dump changes, with PULSAR_CUDA_NO_WINDOW_ATTENTION it is byte-identical. The
- * first version of this emulation instrumented the window kernel, which is
- * dead code here, and the giveaway was three different rounding modes all
- * returning bit-identical KL. */
+ * established in 2026-07 by a dispatch-flag bisect (forcing the cuBLAS route
+ * off changed the dump; forcing the window route off left it byte-identical).
+ * Those flags were retired in L027; the conclusion stands, but re-deriving it
+ * now means editing the dispatch conditions directly. The first version of this
+ * emulation instrumented the window kernel, which is dead code here, and the
+ * giveaway was three different rounding modes all returning bit-identical KL. */
 __global__ static void emul_round_array_kernel(float *dst, const float *src,
                                                uint64_t n, int mode, int is_p,
                                                unsigned long long *n_changed) {
@@ -2206,11 +2207,9 @@ int pulsar_gpu_attention_decode_heads_tensor(
      * restructuring the indexed decode carve-out shipped earlier ("~5x over
      * the generic per-(row,head) kernel").  NOT bit-exact vs the generic
      * kernel (online-softmax fold order; reassociation class, same as that
-     * carve-out) — this is a perplexity/eval-gated numerics change, and
-     * PULSAR_CUDA_NO_DECODE_HEADS8 restores the generic route. */
-    static const int no_decode_heads8 = getenv("PULSAR_CUDA_NO_DECODE_HEADS8") != NULL;
+     * carve-out) — this is a perplexity/eval-gated numerics change. */
     if (!cuda_attention_score_buffer_fits(n_comp) ||
-        (!no_decode_heads8 && !use_mask && head_dim == 512u)) {
+        (!use_mask && head_dim == 512u)) {
         if (!use_mask && head_dim == 512u) {
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
@@ -2318,10 +2317,6 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
-    static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     /* One-shot branch report, same as the mixed path. This is the RAW entry;
      * pulsar-bench showed real prefill never reaches the mixed launch, so this
      * is where production prefill attention is actually served. */
@@ -2329,20 +2324,18 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
     if (!raw_path_reported) {
         raw_path_reported = 1;
         const int takes_window = n_tokens > 1 && head_dim == 512 &&
-                !no_window_attn &&
-                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+                !g_quality_mode && n_tokens >= 128u;
         fprintf(stderr,
                 "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u quality=%d "
                 "-> %s\n",
                 n_tokens, head_dim, window, g_quality_mode,
                 takes_window ? "FUSED window kernel (no score matrix)"
-                             : (g_cublas_ready && !no_cublas_attn
+                             : (g_cublas_ready
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
     if (n_tokens > 1 && head_dim == 512 &&
-        !no_window_attn &&
-        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        !g_quality_mode && n_tokens >= 128u) {
         attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
                               n_tokens, n_head, head_dim, window, raw_f16);
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
@@ -2388,8 +2381,7 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
                                     0u);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
-    if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        !no_cublas_attn) {
+    if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -2587,12 +2579,8 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        !no_window_attn &&
-        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        !g_quality_mode && n_tokens >= 128u) {
         /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
@@ -2796,22 +2784,22 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         (descr && comp_bank_ptrs) ? (const void * const *)comp_bank_ptrs->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_indexed_topk_sort = getenv("PULSAR_CUDA_NO_INDEXED_TOPK_SORT") != NULL;
     static const int no_indexed_heads8 = getenv("PULSAR_CUDA_NO_INDEXED_HEADS8") != NULL;
     static const int twopass_requested = getenv("PULSAR_CUDA_INDEXED_TWOPASS") != NULL;
-    /* Kill-switch for the single-token (decode) heads8-online route added below;
-     * set it to restore the pre-change generic per-(row,head) decode kernel. */
-    static const int no_indexed_decode_heads8 =
-        getenv("PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8") != NULL;
-    /* The sort stays OFF for n_tokens == 1.  It is a pure locality optimization:
+    /* The sort stays OFF for n_tokens == 1.  It is a locality optimization:
      * attention_indexed_mixed_heads8_online_kernel reads topk[] in whatever order
      * it is given, clamps each id against visible_comp, and folds rows through an
      * online softmax that is correct for ANY permutation — there is no dedup, no
      * monotonicity assumption, and no binary search anywhere in it.  At decode the
      * whole 512-row compressed scan is L2-resident, so ascending row addresses buy
-     * nothing while the bitonic sort costs ~4.2 us per token. */
-    if (n_tokens > 1u && top_k == 512u &&
-        !no_indexed_topk_sort) {
+     * nothing while the bitonic sort costs ~4.2 us per token.
+     *
+     * It is NOT output-neutral, though: the online fold is order-dependent in
+     * floating point, so sorting changes the reduction order and the logits with
+     * it (measured 2026-08-13: max |Δlogit| 5.44 vs unsorted, for ~0% throughput
+     * at frontiers 4k..32k).  "Locality only" describes the memory access, not
+     * the arithmetic. */
+    if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
@@ -2853,7 +2841,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * tier was never reached to refuse. */
     const int f16_idx_ok = pulsar_gpu_attention_prefill_reads_packed_comp() &&
                            head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u;
-    if ((n_tokens > 1 || !no_indexed_decode_heads8) && head_dim == 512 && top_k <= 512u &&
+    if (head_dim == 512 && top_k <= 512u &&
         (descr || !comp_kv_pack || n_tokens == 1u || f16_idx_ok) &&
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
@@ -2997,10 +2985,6 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
-    static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     /* The fused online-softmax kernel can now carry the comp mask, so the
      * masked case no longer has to fall back to the unfused two-GEMM path that
      * materialises the whole score matrix. Gated while it is A/B'd against
@@ -3014,20 +2998,18 @@ static int attention_prefill_mixed_launch(
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
         const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
-                !no_window_attn &&
-                (force_window_attn || (!g_quality_mode && n_tokens >= 128u));
+                !g_quality_mode && n_tokens >= 128u;
         fprintf(stderr,
                 "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u "
                 "quality=%d -> %s\n",
                 n_tokens, n_comp, use_comp_mask, g_quality_mode,
                 takes_window ? "FUSED window kernel"
-                             : (g_cublas_ready && !no_cublas_attn
+                             : (g_cublas_ready
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
     if (allow_fused && n_tokens > 1 && head_dim == 512 &&
-        !no_window_attn &&
-        (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
+        !g_quality_mode && n_tokens >= 128u) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
@@ -3066,8 +3048,7 @@ static int attention_prefill_mixed_launch(
                                     use_comp_mask);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
-    if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        !no_cublas_attn) {
+    if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;

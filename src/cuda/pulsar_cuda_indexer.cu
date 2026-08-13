@@ -1009,13 +1009,7 @@ static int indexer_scores_launch(
 
     /* The WMMA tier stays single-bank (like the reference design): banked
      * multi-token rows are forced onto the generic per-(comp,row) kernel. */
-    /* Kept deliberately: the Tier-2 banked/MULTISEQ gate pins this tier off to
-     * get a byte-exact comparison against classic decode (gpu_decode.cpp,
-     * gpu_graph_decode_descr_enabled).  Single-sequence benches never select a
-     * different path through it, so it looks inert unless banked rows are in
-     * play. */
-    static const int no_wmma = getenv("PULSAR_CUDA_NO_INDEXER_WMMA") != NULL;
-    if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u && !no_wmma) {
+    if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,

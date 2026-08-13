@@ -65,7 +65,8 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
     m.size = (uint64_t)st.st_size;
     if (st.st_blksize > 1) m.direct_align = (uint64_t)st.st_blksize;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
+    /* Best-effort: a filesystem without O_DIRECT just fails the open below. */
+    {
         char proc_path[64];
         snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", m.fd);
         int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
