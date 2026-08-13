@@ -431,7 +431,6 @@ __global__ static void attention_decode_mixed_kernel(
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t non_causal,
-        uint32_t comp_kv_fp8,
         uint32_t comp_kv_pack,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -486,8 +485,6 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    const uint32_t comp_row_bytes = comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
-    if (comp_kv_fp8 && n_comp) { (void)comp_row_bytes; }
     __shared__ float scores[PULSAR_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
@@ -538,12 +535,7 @@ __global__ static void attention_decode_mixed_kernel(
             float s = -INFINITY;
             if (add > -1.0e20f) {
                 float dot = 0.0f;
-                if (comp_kv_fp8) {
-                    const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
-                    const float *sc = (const float *)(kv_u8 + head_dim);
-                    for (uint32_t d = 0; d < head_dim; d++)
-                        dot += qh[d] * pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
-                } else if (comp_kv_pack) {
+                if (comp_kv_pack) {
                     dot = attn_pack_dot_full(qh, comp_src, comp_base + c, head_dim, dot);
                 } else {
                     const float *kvrow = comp_src + (comp_base + c) * head_dim;
@@ -576,10 +568,6 @@ __global__ static void attention_decode_mixed_kernel(
                     if (row < raw_count) {
                         const uint64_t rbase = (uint64_t)raw_rows[row] * head_dim;
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, raw_f16, rbase + d);
-                    } else if (comp_kv_fp8) {
-                        const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c_idx) * comp_row_bytes;
-                        const float *sc = (const float *)(kv_u8 + head_dim);
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]);
                     } else if (comp_kv_pack) {
                         dot = attn_pack_dot_lane8(qh, comp_src, comp_base + c_idx, qlane, head_dim, dot);
                     } else {
@@ -635,12 +623,7 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            if (comp_kv_fp8) {
-                const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
-                const float *sc = (const float *)(kv_u8 + head_dim);
-                acc0 += pulsar_attn_fp8_kv_dequant(kv_u8[d0], sc[d0 >> 6]) * s;
-                acc1 += pulsar_attn_fp8_kv_dequant(kv_u8[d1], sc[d1 >> 6]) * s;
-            } else if (comp_kv_pack) {
+            if (comp_kv_pack) {
                 acc0 += attn_comp_pack_ld(comp_src, comp_base + c, d0, head_dim) * s;
                 acc1 += attn_comp_pack_ld(comp_src, comp_base + c, d1, head_dim) * s;
             } else {
@@ -656,11 +639,7 @@ __global__ static void attention_decode_mixed_kernel(
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, raw_f16, (uint64_t)raw_rows[r] * head_dim + d) * scores[r];
             for (uint32_t c = 0; c < visible_comp; c++) {
-                if (comp_kv_fp8) {
-                    const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + c) * comp_row_bytes;
-                    const float *sc = (const float *)(kv_u8 + head_dim);
-                    acc += pulsar_attn_fp8_kv_dequant(kv_u8[d], sc[d >> 6]) * scores[raw_count + c];
-                } else if (comp_kv_pack) {
+                if (comp_kv_pack) {
                     acc += attn_comp_pack_ld(comp_src, comp_base + c, d, head_dim) * scores[raw_count + c];
                 } else {
                     acc += comp_src[(comp_base + c) * head_dim + d] * scores[raw_count + c];
@@ -1684,7 +1663,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *raw_kv,
         const float *comp_kv,
         uint32_t non_causal,
-        uint32_t comp_kv_fp8,
         uint32_t comp_kv_pack,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -1833,7 +1811,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     uint32_t row_hi = row_lo + rows_per_split;
     if (row_hi > n_score) row_hi = n_score;
     const float scale = rsqrtf((float)head_dim);
-    const uint32_t comp_row_bytes = comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim) : head_dim * sizeof(float);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -1859,16 +1836,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t sr = row0 + rr;
             if (sr < raw_count) {
                 kv_shared[off] = raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4);
-            } else if (comp_kv_fp8) {
-                const uint8_t *kv_u8 = (const uint8_t *)comp_src + (comp_base + (sr - raw_count)) * comp_row_bytes;
-                const float *sc = (const float *)(kv_u8 + head_dim);
-                uint32_t base = c4 << 2;
-                float4 v;
-                v.x = pulsar_attn_fp8_kv_dequant(kv_u8[base + 0], sc[(base + 0) >> 6]);
-                v.y = pulsar_attn_fp8_kv_dequant(kv_u8[base + 1], sc[(base + 1) >> 6]);
-                v.z = pulsar_attn_fp8_kv_dequant(kv_u8[base + 2], sc[(base + 2) >> 6]);
-                v.w = pulsar_attn_fp8_kv_dequant(kv_u8[base + 3], sc[(base + 3) >> 6]);
-                kv_shared[off] = v;
             } else if (comp_kv_pack) {
                 const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
                 const uint8_t *pr = (const uint8_t *)comp_src +
@@ -2076,7 +2043,7 @@ __global__ static void attention_splitkv_debug_cmp_kernel(
 
 static int attention_decode_heads8_launch(
         float *heads, const float *sinks, const float *q, const float *raw_kv,
-        const float *comp_kv, uint32_t non_causal, uint32_t comp_kv_fp8,
+        const float *comp_kv, uint32_t non_causal,
         uint32_t comp_kv_pack, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
         uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
@@ -2098,7 +2065,7 @@ static int attention_decode_heads8_launch(
         /* reference: single walk into ref[] */
         dim3 g1(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(ref, sinks, q,
-                raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens,
+                raw_kv, comp_kv, non_causal, comp_kv_pack, n_tokens,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                 head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
                 n_banks, NULL, NULL);
@@ -2110,7 +2077,7 @@ static int attention_decode_heads8_launch(
         }
         dim3 gs(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(heads, sinks, q,
-                raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens,
+                raw_kv, comp_kv, non_causal, comp_kv_pack, n_tokens,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                 head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
                 n_banks, po, pml);
@@ -2125,7 +2092,7 @@ static int attention_decode_heads8_launch(
                     "nt=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
                     "win=%u ratio=%u fp8=%u pack=%u rawf16=%d descr=%d nc=%u (%s)\n",
                     (unsigned long long)call_no, hw, n_tokens, pos0, n_raw,
-                    raw_cap, raw_start, n_comp, window, ratio, comp_kv_fp8,
+                    raw_cap, raw_start, n_comp, window, ratio,
                     comp_kv_pack, raw_f16, positions != NULL, non_causal, what);
         }
         return cuda_ok(cudaGetLastError(), what);
@@ -2152,7 +2119,7 @@ static int attention_decode_heads8_launch(
         }
         dim3 sgrid(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
         attention_decode_mixed_heads8_online_kernel<<<sgrid, 256>>>(heads, sinks,
-                q, raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack,
+                q, raw_kv, comp_kv, non_causal, comp_kv_pack,
                 n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim, raw_f16, positions, seq_id, comp_bank_ptrs,
                 comp_cap, n_banks, part_o, part_ml);
@@ -2163,7 +2130,7 @@ static int attention_decode_heads8_launch(
     }
     dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
     attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(heads, sinks,
-            q, raw_kv, comp_kv, non_causal, comp_kv_fp8, comp_kv_pack,
+            q, raw_kv, comp_kv, non_causal, comp_kv_pack,
             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
             n_head, head_dim, raw_f16, positions, seq_id, comp_bank_ptrs,
             comp_cap, n_banks, NULL, NULL);
@@ -2261,7 +2228,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    0, 0u, comp_kv_pack, 1, 0, n_raw, raw_cap,
+                    0, comp_kv_pack, 1, 0, n_raw, raw_cap,
                     raw_start, n_comp, 0, 0, n_head, head_dim, raw_f16,
                     NULL, NULL, NULL, 0, 1,
                     "attention decode online launch");
@@ -2277,7 +2244,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
-                                                 0, 0u, comp_kv_pack,
+                                                 0, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim, raw_f16,
                                                  NULL, NULL, NULL, 0, 1);
@@ -2624,7 +2591,7 @@ static int attention_decode_batch_launch(
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    non_causal, 0u, comp_kv_pack, n_tokens, pos0,
+                    non_causal, comp_kv_pack, n_tokens, pos0,
                     n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                     head_dim, raw_f16, positions_ptr, seq_id_ptr,
                     comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
@@ -2671,7 +2638,7 @@ static int attention_decode_batch_launch(
         return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                 (const float *)q->ptr, (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                non_causal, 0u, comp_kv_pack, n_tokens, pos0,
+                non_causal, comp_kv_pack, n_tokens, pos0,
                 n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                 head_dim, raw_f16, positions_ptr, seq_id_ptr,
                 comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
@@ -2684,7 +2651,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_comp_mask, non_causal, 0u, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
+                                                 use_comp_mask, non_causal, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
                                                  positions_ptr, seq_id_ptr, comp_bank_ptrs_ptr, comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
