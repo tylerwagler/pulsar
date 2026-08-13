@@ -9,7 +9,6 @@ intermediate.
 | File | Purpose |
 |------|---------|
 | `reap25-lcb50-survivors.json` | The vendored artifact: per-layer list of surviving original expert ids (+ policy / keep_count / layout). This is the **only external input** the REAP stage needs. |
-| `trim_reap.py` | Path-B transplant: writes a `ds4-compact-v1` GGUF by dense-trimming expert tensors to the survivors and padding the router/bias back to 256. |
 | `recover_survivors.py` | Regenerates `reap25-lcb50-survivors.json` from the upstream GGUFs (range-fetches only the small router tensors, never the full weights). |
 
 ## Provenance & attribution
@@ -30,8 +29,8 @@ we vendor here is **derived integer index metadata** — *which* experts survive
 layer — recovered from the router tensors, containing **no model weights**. We
 redistribute it with attribution. If eouya2 later attaches restrictive terms, drop
 `reap25-lcb50-survivors.json` and run `recover_survivors.py` to regenerate it
-locally instead (see REPRODUCE.md, which documents the cite-as-dependency
-fallback).
+locally instead (see docs/ARTIFACT_BUILD.md §Upstream provenance, which
+documents the cite-as-dependency fallback).
 
 ## How the survivor ids were recovered
 
@@ -46,20 +45,21 @@ pruned layers matched 192/192 exactly.
 
 ## Usage
 
-```sh
-# Transplant onto the reproducible oracle-cutlass-mxfp4 intermediate (Path B).
-python3 gguf-tools/reap/trim_reap.py \
-  --oracle /path/to/oracle-cutlass-mxfp4.gguf \
-  --out    /path/to/oracle-reap25-compact.gguf
-# --survivors defaults to the vendored reap25-lcb50-survivors.json.
+The map is consumed directly by the quantizer, which trims expert tensors to
+the survivors as it generates them. There is no separate transplant step:
 
+```sh
+deepseek4-quantize ... --reap-survivors gguf-tools/reap/reap25-lcb50-survivors.json
+```
+
+The template must be built with the same map so the shapes agree
+(`build_main_template.py --reap-survivors ...`); the quantizer cross-checks the
+expert counts and refuses a mismatch.
+
+```sh
 # Regenerate the vendored map (needs network + curl; ~140 MB of router fetches):
 python3 gguf-tools/reap/recover_survivors.py
 ```
-
-`trim_reap.py --survivors` also accepts a REAP **GGUF** path directly, in which
-case it reads the KV and recovers the survivor ids on the fly by matching against
-the oracle's own full routers (the original method, kept as a fallback).
 
 ## Path-B layout note
 

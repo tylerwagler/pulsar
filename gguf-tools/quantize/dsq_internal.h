@@ -49,7 +49,10 @@
 #error "deepseek4-quantize.c currently targets POSIX systems"
 #endif
 
-#define DS4_KV_QUANTIZE_IMATRIX_FILE      "quantize.imatrix.file"
+/* Content hash, not a path: a path records where someone's disk was, a hash
+ * records WHICH imatrix it was. Replaced "quantize.imatrix.file" on 2026-08-12;
+ * nothing outside this tool ever read that key. */
+#define DS4_KV_QUANTIZE_IMATRIX_SHA256    "quantize.imatrix.sha256"
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
@@ -166,6 +169,7 @@ typedef struct {
 
 typedef struct {
     char *file;
+    char *sha256;      /* hex content hash; what identifies the imatrix */
     char *dataset;
     imatrix_entry *entries;
     int n_entries;
@@ -173,6 +177,30 @@ typedef struct {
     int chunks;
     bool strict;
 } imatrix_store;
+
+/* REAP survivor map (ds4-compact-v1). Lets the quantizer emit an already-pruned
+ * artifact instead of writing a full-256 intermediate for a downstream tool to
+ * re-slice. policy 1 = layer keeps every expert (hash-routed via tid2eid, which
+ * indexes experts by id and so structurally cannot be pruned); policy 2 = layer
+ * is trimmed to keep[L] survivors, listed in ascending ORIGINAL expert id.
+ * Router and bias stay padded to n_expert -- pruned bias slots get -1e30 so
+ * they can never win top-k. See validate_reap_metadata() in the engine's
+ * weights.cpp, which checks the reap.* KVs this shape implies. */
+typedef struct {
+    bool  enabled;
+    char *layout;
+    int   n_layers;
+    int  *keep;        /* [n_layers] survivor count */
+    int  *policy;      /* [n_layers] 1 = untouched, 2 = pruned */
+    int **survivors;   /* [n_layers][keep[L]] original expert ids; NULL if policy 1 */
+} reap_map;
+
+void reap_load(reap_map *rm, const char *path);
+void reap_free(reap_map *rm);
+/* Survivor count for a layer (n_expert when the layer is untouched or no map). */
+int reap_keep(const reap_map *rm, int layer, int n_expert);
+/* Original expert id backing dense slot `slot` (identity when untouched). */
+int reap_src_expert(const reap_map *rm, int layer, int slot);
 
 typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
@@ -229,6 +257,8 @@ typedef struct {
     size_t kv_raw_len;
     size_t alignment;
     int n_experts;
+    bool reap_enabled;      /* template was built REAP-shaped */
+    char *reap_sha256;      /* hex sha256 of the survivor map that shaped it */
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
@@ -245,6 +275,10 @@ typedef struct {
 } output_context;
 
 /* ===== Cross-TU declarations ===== */
+
+/* dsq_sha256.c */
+/* Hex SHA-256 of a whole file, streamed. Caller frees. Self-tests on first use. */
+char *sha256_file_hex(const char *path);
 
 /* dsq_util.c */
 void die(const char *msg);
@@ -313,17 +347,20 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
 size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims);
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                          ds4q_type target, int n_experts, int n_threads,
-                         const imatrix_store *imatrix);
+                         const imatrix_store *imatrix, const reap_map *reap);
 
 /* dsq_gguf_io.c */
 gguf_file load_gguf_metadata(const char *path);
+/* Append the drafter template's tensors + its required KVs to the main
+ * template, so one quantizer pass emits the merged artifact directly. */
+void gguf_append_dspark(gguf_file *g, const char *dspark_path);
 byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name);
 uint64_t fnv1a64_bytes(const uint8_t *data, size_t n);
 output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
                                     const imatrix_store *im);
 void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                      const char *out_path, int n_experts, int n_threads,
-                     const imatrix_store *imatrix);
+                     const imatrix_store *imatrix, const reap_map *reap);
 void print_plan(const gguf_file *tmpl, const output_context *out_ctx);
 
 /* dsq_probe.c */

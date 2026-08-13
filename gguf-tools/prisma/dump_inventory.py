@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """dump_inventory.py — emit tensors.json (name/shape/family/type) from a GGUF.
-Used as the structural input to prisma_alloc.py. Family buckets: routed_expert
+Structural tensor inventory (family buckets: routed_expert
 (the allocation lever) vs attn/shared_expert/output/embed/mla_aux/norm (pinned).
 Usage: python3 dump_inventory.py MODEL.gguf > tensors.json   (needs `gguf` pkg)
 """

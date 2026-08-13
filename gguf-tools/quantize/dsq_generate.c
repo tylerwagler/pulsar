@@ -105,8 +105,54 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, con
     }
 }
 
+/* ds4-compact-v1 router/bias convention. The expert WEIGHT tensors are trimmed
+ * to survivors, but the router (ffn_gate_inp) and its bias (exp_probs_b) stay
+ * PADDED to the architecture's full n_expert -- the CUDA router_select kernels
+ * hardcode 256 and score every slot. So survivor rows/biases move to dense
+ * positions 0..keep-1 and the tail is neutralised:
+ *   router : zero rows       (logit 0 -> a real probability, NOT harmless alone)
+ *   bias   : -1e30           (forces the top-k score to -1e30; THIS is what
+ *                             actually makes a pruned slot unselectable)
+ * Finite, not -inf, so a softmax over the biased scores cannot produce NaN.
+ * Skipping this leaves the router pointing at original expert ids while the
+ * weights are densely renumbered -- every token routes to the wrong expert,
+ * and nothing fails. */
+static void reap_permute_regular(const reap_map *reap, const char *gguf_name,
+                                 float *f32, int64_t n, int64_t ncols) {
+    if (!reap || !reap->enabled || !f32) return;
+    const bool is_router = str_ends(gguf_name, "ffn_gate_inp.weight");
+    const bool is_bias   = str_ends(gguf_name, "exp_probs_b.bias");
+    if (!is_router && !is_bias) return;
+    int L = -1;
+    if (sscanf(gguf_name, "blk.%d.", &L) != 1) return;
+    if (L < 0 || L >= reap->n_layers || reap->policy[L] != 2) return;
+    const int keep = reap->keep[L];
+
+    if (is_bias) {
+        if (n < keep) die("reap: exp_probs_b shorter than the survivor count");
+        float *tmp = xcalloc((size_t)n, sizeof(float));
+        for (int i = 0; i < keep; i++) tmp[i] = f32[reap_src_expert(reap, L, i)];
+        for (int64_t i = keep; i < n; i++) tmp[i] = -1e30f;
+        memcpy(f32, tmp, (size_t)n * sizeof(float));
+        free(tmp);
+        return;
+    }
+    /* Router: [n_expert, ncols] row-major; move survivor rows down, zero the tail. */
+    if (ncols <= 0 || n % ncols != 0) die("reap: router tensor is not a whole number of rows");
+    const int64_t rows = n / ncols;
+    if (rows < keep) die("reap: router has fewer rows than the survivor count");
+    float *tmp = xcalloc((size_t)n, sizeof(float));
+    for (int i = 0; i < keep; i++)
+        memcpy(tmp + (size_t)i * ncols,
+               f32 + (size_t)reap_src_expert(reap, L, i) * ncols,
+               (size_t)ncols * sizeof(float));
+    memcpy(f32, tmp, (size_t)n * sizeof(float));
+    free(tmp);
+}
+
 static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                 ds4q_type target, const imatrix_store *imatrix) {
+                                 ds4q_type target, const imatrix_store *imatrix,
+                                 const reap_map *reap) {
     char *hf_name = hf_name_for_regular(gguf_name);
     tensor_entry *te = db_tensor(db, hf_name, NULL);
     check_reversed_shape(gguf_name, &te->info, tmpl);
@@ -148,6 +194,7 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
     }
+    reap_permute_regular(reap, gguf_name, f32, n, tmpl->ne[0]);
     const char *names[2] = { gguf_name, hf_name };
     const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
@@ -161,8 +208,10 @@ typedef struct {
     const char *gguf_name;
     const tensor_meta *tmpl;
     ds4q_type target;
-    int n_experts;
+    int n_experts;      /* dense output slots for THIS tensor (post-REAP) */
+    int n_expert_orig;  /* architecture n_expert, for imatrix lookup */
     const imatrix_store *imatrix;
+    const reap_map *reap;
     expert_tensor expert;
     const char *wid;
     int64_t ncols;
@@ -175,11 +224,15 @@ typedef struct {
 } expert_job;
 
 static void generate_one_expert(expert_job *j, int xid) {
+    /* xid is the DENSE OUTPUT SLOT. Under a REAP map a pruned layer's slot i is
+     * backed by original expert survivors[L][i], so the HF read must use the
+     * original id while the write stays at slot i. Identity when unpruned. */
+    const int src_xid = reap_src_expert(j->reap, j->expert.layer, xid);
     char prefix[256];
     if (j->expert.is_mtp)
-        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, src_xid, j->wid);
     else
-        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, src_xid, j->wid);
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
@@ -204,7 +257,11 @@ static void generate_one_expert(expert_job *j, int xid) {
     int64_t n = 0;
     float *f32 = dequant_fp4_weight(&w, &s, &n);
     const char *names[3] = { j->gguf_name, weight_name, NULL };
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    /* The imatrix is keyed by ORIGINAL expert id against the ORIGINAL expert
+     * count -- it was collected on the unpruned model. Looking it up by dense
+     * slot would silently pair each survivor with another expert's statistics:
+     * quantization still succeeds, quality quietly degrades, no gate notices. */
+    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, src_xid, j->n_expert_orig);
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
@@ -235,7 +292,7 @@ static void *expert_worker(void *arg) {
 
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const reap_map *reap) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
@@ -249,6 +306,16 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const bool want_iq2_mmq = (target == DS4Q_TYPE_IQ2_XXS_MMQ);
     if (want_iq2_mmq) target = DS4Q_TYPE_IQ2_XXS;
     const char *wid = expert_part_name(e.part);
+    /* Under a REAP map this tensor holds only the layer's survivors. The
+     * template already declares that count in ne[2]; cross-check rather than
+     * trust one of them, since a mismatch would write past the declared slot. */
+    const int n_expert_orig = n_experts;
+    n_experts = reap_keep(reap, e.layer, n_experts);
+    if (tensor_n_dims(tmpl) >= 3 && tmpl->ne[2] != (int64_t)n_experts) {
+        fprintf(stderr, "ds4-quantize: %s: template declares %lld experts, survivor map says %d\n",
+                gguf_name, (long long)tmpl->ne[2], n_experts);
+        die("reap: template and survivor map disagree on expert count");
+    }
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
     const size_t per_expert = target == DS4Q_TYPE_CUTLASS_MXFP4
@@ -263,7 +330,7 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
             e.layer, wid, worker_count, worker_count == 1 ? "" : "s");
     expert_job job = {
         .db = db, .gguf_name = gguf_name, .tmpl = tmpl, .target = target,
-        .n_experts = n_experts, .imatrix = imatrix, .expert = e, .wid = wid,
+        .n_experts = n_experts, .n_expert_orig = n_expert_orig, .imatrix = imatrix, .reap = reap, .expert = e, .wid = wid,
         .ncols = ncols, .nrows = nrows, .per_expert = per_expert, .out = &out,
     };
     pthread_mutex_init(&job.lock, NULL);
@@ -289,10 +356,18 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
 
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const reap_map *reap) {
+    /* REAP describes the MAIN model's expert stacks only. The drafter carries
+     * its own dspark.N.ffn_*_exps tensors whose N collides with main layer
+     * indices, so handing the survivor map down would trim them against some
+     * unrelated layer's policy. It happens to be harmless today because
+     * dspark's layers 0-2 map onto the three policy-1 (untouched) layers --
+     * that is luck, not a design, and it becomes silent expert corruption the
+     * moment the survivor map changes. Cut it off by name instead. */
+    if (str_starts(name, "dspark.")) reap = NULL;
     if (parse_expert_tensor(name).is_expert) {
-        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
+        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix, reap);
     }
-    return generate_regular(db, name, tmpl, target, imatrix);
+    return generate_regular(db, name, tmpl, target, imatrix, reap);
 }
 

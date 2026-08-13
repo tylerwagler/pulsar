@@ -11,6 +11,8 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *reap_survivors;
+    char *dspark_template;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -48,6 +50,13 @@ static void usage(const char *argv0) {
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --format-map FILE      JSON manifest of per-tensor formats (prisma_alloc.py output)\n");
+    printf("  --dspark-template FILE emit the DSpark drafter into the SAME artifact:\n");
+    printf("                         its tensors are appended after the main ones and its\n");
+    printf("                         binding KVs merged in. Replaces merge_dspark_gguf.py.\n");
+    printf("  --reap-survivors JSON  REAP survivor map: emit an already-pruned artifact\n");
+    printf("                         (expert tensors trimmed to survivors, router/bias kept\n");
+    printf("                          padded with -1e30 sentinels).\n");
+    printf("                          the template must be built with the same map.\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q2_k, iq2_xxs, fp8_e4m3, mxfp4\n");
@@ -102,6 +111,10 @@ static params parse_args(int argc, char **argv) {
             p.probe_sample = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--reap-survivors") == 0) {
+            p.reap_survivors = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--dspark-template") == 0) {
+            p.dspark_template = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
@@ -161,7 +174,7 @@ static void free_gguf_file(gguf_file *g) {
 }
 
 static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
-                               const params *p, const imatrix_store *imatrix) {
+                               const params *p, const imatrix_store *imatrix, const reap_map *reap) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
         fprintf(stderr, "error: tensor not found in template: %s\n", p->compare_tensor);
@@ -170,7 +183,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix, reap);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -202,12 +215,49 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     free_gguf_file(&ref);
 }
 
+/* The template's reap.* arrays only carry per-layer counts and policies, so two
+ * survivor maps that keep the same NUMBER of experts per layer -- but different
+ * ones -- shape an identical template and pass the expert-count cross-check,
+ * while routing every token to a different expert. Nothing downstream notices:
+ * the artifact loads, generates, and is quietly wrong. The template therefore
+ * records the hash of the map that shaped it, and this refuses any other. */
+static void check_reap_binding(const gguf_file *tmpl, const char *map_path) {
+    if (tmpl->reap_sha256 && !map_path) {
+        fprintf(stderr, "error: template is REAP-shaped (reap.survivors.sha256 %s)"
+                " but no --reap-survivors was given\n", tmpl->reap_sha256);
+        exit(1);
+    }
+    if (!map_path) return;
+    if (!tmpl->reap_sha256) {
+        if (tmpl->reap_enabled)
+            die("template has reap.enabled but no reap.survivors.sha256; rebuild it "
+                "with build_main_template.py --reap-survivors so the two are bound");
+        die("--reap-survivors given but the template is not REAP-shaped");
+    }
+    char *have = sha256_file_hex(map_path);
+    if (strcmp(have, tmpl->reap_sha256) != 0) {
+        fprintf(stderr,
+                "error: survivor map does not match the one this template was built from\n"
+                "  template %s\n  supplied %s (%s)\n",
+                tmpl->reap_sha256, have, map_path);
+        exit(1);
+    }
+    fprintf(stderr, "reap: survivor map matches the template (sha256 %.16s...)\n", have);
+    free(have);
+}
+
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+    reap_map reap = {0};
+    if (p.reap_survivors) reap_load(&reap, p.reap_survivors);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    /* Before build_output_context: the drafter's tensors have to be part of the
+     * plan so they get offsets in the same data region. */
+    if (p.dspark_template) gguf_append_dspark(&tmpl, p.dspark_template);
+    check_reap_binding(&tmpl, p.reap_survivors);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -233,14 +283,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
+        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix, &reap);
         db_close(&db);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &reap);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

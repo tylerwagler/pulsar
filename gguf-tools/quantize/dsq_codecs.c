@@ -139,6 +139,9 @@ float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64_t *n_o
 void imatrix_load(imatrix_store *im, const char *path, bool strict) {
     memset(im, 0, sizeof(*im));
     im->file = xstrdup(path);
+    /* Hashed before parsing so the recorded identity covers the file as it was
+     * read, not just the parts this loader happens to understand. */
+    im->sha256 = sha256_file_hex(path);
     im->strict = strict;
     im->chunks = -1;
     FILE *fp = fopen(path, "rb");
@@ -239,8 +242,101 @@ void imatrix_free(imatrix_store *im) {
     }
     free(im->entries);
     free(im->file);
+    free(im->sha256);
     free(im->dataset);
     hmap_free(&im->map);
     memset(im, 0, sizeof(*im));
 }
 
+
+/* =====
+ * REAP survivor map (ds4-compact-v1) -- see reap_map in dsq_internal.h.
+ */
+
+static int *reap_int_array(const json_doc *d, int tok, int expect, const char *what) {
+    if (tok < 0 || d->v[tok].type != JT_ARRAY) die("reap survivor map: bad array");
+    const int n = d->v[tok].size;
+    if (expect > 0 && n != expect) die("reap survivor map: wrong array length");
+    int *out = xcalloc((size_t)(n > 0 ? n : 1), sizeof(int));
+    int i = tok + 1, k = 0;
+    while (i < d->len && d->v[i].parent == tok) {
+        out[k++] = (int)json_i64(d, i);
+        i = json_skip(d, i);
+    }
+    if (k != n) die("reap survivor map: truncated array");
+    (void)what;
+    return out;
+}
+
+void reap_load(reap_map *rm, const char *path) {
+    memset(rm, 0, sizeof(*rm));
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    if (d.len < 1 || d.v[0].type != JT_OBJECT) die("reap survivor map is not a JSON object");
+
+    const int t_layout = json_obj_get(&d, 0, "layout");
+    if (t_layout < 0) die("reap survivor map: missing layout");
+    rm->layout = json_strdup_tok(&d, t_layout);
+
+    const int t_keep = json_obj_get(&d, 0, "keep_count");
+    if (t_keep < 0 || d.v[t_keep].type != JT_ARRAY) die("reap survivor map: missing keep_count");
+    const int n_layers = d.v[t_keep].size;
+    rm->n_layers = n_layers;
+    rm->keep = reap_int_array(&d, t_keep, n_layers, "keep_count");
+    rm->policy = reap_int_array(&d, json_obj_get(&d, 0, "policy"), n_layers, "policy");
+
+    rm->survivors = xcalloc((size_t)n_layers, sizeof(int *));
+    const int t_surv = json_obj_get(&d, 0, "survivors");
+    if (t_surv < 0 || d.v[t_surv].type != JT_OBJECT)
+        die("reap survivor map: missing or malformed survivors");
+    for (int i = t_surv + 1; i < d.len && d.v[i].parent == t_surv;) {
+        char *lk = json_strdup_tok(&d, i);
+        const int L = atoi(lk);
+        free(lk);
+        const int v = i + 1;
+        if (L < 0 || L >= n_layers) die("reap survivor map: survivor layer out of range");
+        rm->survivors[L] = reap_int_array(&d, v, rm->keep[L], "survivors entry");
+        /* Ascending original ids: dense slot order must be deterministic, and
+         * the survivor map is generated in this order too. */
+        for (int j = 1; j < rm->keep[L]; j++)
+            if (rm->survivors[L][j] <= rm->survivors[L][j - 1])
+                die("reap survivor map: survivors are not strictly ascending");
+        i = json_skip(&d, v);
+    }
+    int n_pruned = 0;
+    for (int L = 0; L < n_layers; L++) {
+        if (rm->policy[L] == 2 && !rm->survivors[L])
+            die("reap survivor map: policy-2 layer has no survivor list");
+        if (rm->policy[L] == 1 && rm->survivors[L])
+            die("reap survivor map: policy-1 layer carries a survivor list");
+        if (rm->policy[L] == 2) n_pruned++;
+    }
+    rm->enabled = true;
+    json_free(&d);
+    free(text);
+    fprintf(stderr, "reap: %s, %d layers, %d pruned\n", rm->layout, n_layers, n_pruned);
+}
+
+void reap_free(reap_map *rm) {
+    if (!rm || !rm->enabled) return;
+    for (int L = 0; L < rm->n_layers; L++) free(rm->survivors[L]);
+    free(rm->survivors);
+    free(rm->keep);
+    free(rm->policy);
+    free(rm->layout);
+    memset(rm, 0, sizeof(*rm));
+}
+
+int reap_keep(const reap_map *rm, int layer, int n_expert) {
+    if (!rm || !rm->enabled || layer < 0 || layer >= rm->n_layers) return n_expert;
+    if (rm->policy[layer] != 2) return n_expert;
+    return rm->keep[layer];
+}
+
+int reap_src_expert(const reap_map *rm, int layer, int slot) {
+    if (!rm || !rm->enabled || layer < 0 || layer >= rm->n_layers) return slot;
+    if (rm->policy[layer] != 2 || !rm->survivors[layer]) return slot;
+    if (slot < 0 || slot >= rm->keep[layer]) die("reap: dense slot out of range");
+    return rm->survivors[layer][slot];
+}

@@ -94,7 +94,7 @@ def main():
 
     doc = {
         "_about": "REAP-25 (LiveCodeBench-50-calibrated) routed-expert survivor map for "
-                  "DeepSeek-V4-Flash, used by the ds4 v5mx Path-B REAP transplant (trim_reap.py).",
+                  "DeepSeek-V4-Flash, used by the ds4 v5mx REAP prune (quantizer --reap-survivors).",
         "_source": {
             "artifact": "eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4",
             "file": "DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf",

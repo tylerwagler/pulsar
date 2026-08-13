@@ -90,7 +90,7 @@ static bool is_imatrix_kv_key(const char *key) {
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
-    n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_FILE) + 4 + gguf_string_size(im->file);
+    n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_SHA256) + 4 + gguf_string_size(im->sha256);
     n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES) + 4 + 8;
     if (im->dataset) n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_DATASET) + 4 + gguf_string_size(im->dataset);
     if (im->chunks > 0) n += gguf_string_size(DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS) + 4 + 8;
@@ -104,9 +104,9 @@ static uint64_t extra_imatrix_kv_count(const imatrix_store *im) {
 
 static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     if (!imatrix_enabled(im)) return;
-    write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_FILE);
+    write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_SHA256);
     write_u32(fp, GGUF_TYPE_STRING);
-    write_gguf_string(fp, im->file);
+    write_gguf_string(fp, im->sha256);
 
     write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES);
     write_u32(fp, GGUF_TYPE_UINT64);
@@ -122,6 +122,120 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
         write_u32(fp, GGUF_TYPE_UINT64);
         write_u64(fp, (uint64_t)im->chunks);
     }
+}
+
+/* Raw bytes of the named KV records, concatenated in the order requested.
+ * Fails if any is missing: a merged artifact without dspark.target_layer_ids
+ * dies in dspark_weights_bind() at load, which is a long way from here. */
+static uint8_t *gguf_take_kvs(const char *path, const char *const *want, int n_want,
+                              size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open GGUF", path);
+    char magic[4];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) || memcmp(magic, "GGUF", 4) != 0)
+        die("bad GGUF template");
+    (void)read_u32_le_fp(fp, "GGUF version");
+    (void)read_u64_le_fp(fp, "GGUF tensor count");
+    const uint64_t n_kv = read_u64_le_fp(fp, "GGUF KV count");
+
+    byte_span *found = xcalloc((size_t)n_want, sizeof(found[0]));
+    bool *seen = xcalloc((size_t)n_want, sizeof(seen[0]));
+    const off_t kv_start = ftello(fp);
+    if (kv_start < 0) die("GGUF ftell failed");
+    for (uint64_t i = 0; i < n_kv; i++) {
+        const off_t rec_start = ftello(fp);
+        char *key = read_gguf_string_fp(fp);
+        const uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
+        skip_gguf_value_fp(fp, type);
+        const off_t rec_end = ftello(fp);
+        if (rec_start < 0 || rec_end < rec_start) die("GGUF ftell failed");
+        for (int k = 0; k < n_want; k++) {
+            if (strcmp(key, want[k]) != 0) continue;
+            if (seen[k]) die("duplicate KV key in dspark template");
+            seen[k] = true;
+            found[k] = (byte_span){ .start = (size_t)(rec_start - kv_start),
+                                    .end = (size_t)(rec_end - kv_start) };
+        }
+        free(key);
+    }
+    const off_t kv_end = ftello(fp);
+    if (kv_end < kv_start) die("GGUF ftell failed");
+    for (int k = 0; k < n_want; k++) {
+        if (!seen[k]) {
+            fprintf(stderr, "error: %s: missing required kv %s\n", path, want[k]);
+            exit(1);
+        }
+    }
+    const size_t blob_len = (size_t)(kv_end - kv_start);
+    uint8_t *blob = xmalloc(blob_len ? blob_len : 1);
+    if (fseeko(fp, kv_start, SEEK_SET) != 0) die("GGUF seek failed");
+    if (blob_len && fread(blob, 1, blob_len, fp) != blob_len) die("GGUF KV read failed");
+    fclose(fp);
+
+    size_t total = 0;
+    for (int k = 0; k < n_want; k++) total += found[k].end - found[k].start;
+    uint8_t *out = xmalloc(total ? total : 1);
+    size_t pos = 0;
+    for (int k = 0; k < n_want; k++) {
+        const size_t n = found[k].end - found[k].start;
+        memcpy(out + pos, blob + found[k].start, n);
+        pos += n;
+    }
+    free(blob);
+    free(found);
+    free(seen);
+    *out_len = total;
+    return out;
+}
+
+/* KVs the engine needs to bind the drafter; mirrors MERGE_KEYS in the
+ * merge_dspark_gguf.py this replaces. */
+static const char *const DSPARK_MERGE_KEYS[] = {
+    "deepseek_v4_dspark.embedding_length",
+    "dspark.target_layer_ids.0",
+    "dspark.target_layer_ids.1",
+    "dspark.target_layer_ids.2",
+};
+#define N_DSPARK_MERGE_KEYS ((int)(sizeof(DSPARK_MERGE_KEYS) / sizeof(DSPARK_MERGE_KEYS[0])))
+
+void gguf_append_dspark(gguf_file *g, const char *dspark_path) {
+    for (uint64_t i = 0; i < g->n_tensors; i++)
+        if (str_starts(g->tensors[i].name, "dspark."))
+            die("main template already contains dspark.* tensors");
+
+    gguf_file d = load_gguf_metadata(dspark_path);
+    if (d.alignment != g->alignment) die("dspark template alignment differs from main");
+
+    size_t kv_add_len = 0;
+    uint8_t *kv_add = gguf_take_kvs(dspark_path, DSPARK_MERGE_KEYS,
+                                    N_DSPARK_MERGE_KEYS, &kv_add_len);
+
+    g->tensors = xrealloc(g->tensors, (size_t)(g->n_tensors + d.n_tensors) * sizeof(g->tensors[0]));
+    for (uint64_t i = 0; i < d.n_tensors; i++) {
+        g->tensors[g->n_tensors + i] = d.tensors[i];   /* steals d's name pointers */
+        d.tensors[i].name = NULL;
+    }
+    g->n_tensors += d.n_tensors;
+
+    g->kv_raw = xrealloc(g->kv_raw, g->kv_raw_len + kv_add_len);
+    memcpy(g->kv_raw + g->kv_raw_len, kv_add, kv_add_len);
+    g->kv_raw_len += kv_add_len;
+    g->n_kv += N_DSPARK_MERGE_KEYS;
+    free(kv_add);
+
+    hmap_free(&g->tensor_map);
+    char **keys = xmalloc((size_t)g->n_tensors * sizeof(keys[0]));
+    for (uint64_t i = 0; i < g->n_tensors; i++) keys[i] = g->tensors[i].name;
+    hmap_build(&g->tensor_map, keys, (int)g->n_tensors);
+    free(keys);
+
+    free(d.path);
+    free(d.kv_raw);
+    free(d.tensors);
+    hmap_free(&d.tensor_map);
+
+    fprintf(stderr, "dspark: appended %" PRIu64 " tensors and %d kv from %s\n",
+            d.n_tensors, N_DSPARK_MERGE_KEYS, dspark_path);
 }
 
 gguf_file load_gguf_metadata(const char *path) {
@@ -156,6 +270,12 @@ gguf_file load_gguf_metadata(const char *path) {
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, "reap.enabled") == 0 && type == GGUF_TYPE_BOOL) {
+            uint8_t b = 0;
+            if (fread(&b, 1, 1, fp) != 1) die("GGUF reap.enabled read failed");
+            g.reap_enabled = b != 0;
+        } else if (strcmp(key, "reap.survivors.sha256") == 0 && type == GGUF_TYPE_STRING) {
+            g.reap_sha256 = read_gguf_string_fp(fp);
         } else {
             skip_gguf_value_fp(fp, type);
         }
@@ -283,7 +403,7 @@ static void write_padding(FILE *fp, size_t n) {
 
 void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix, const reap_map *reap) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -309,7 +429,7 @@ void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix, reap);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);

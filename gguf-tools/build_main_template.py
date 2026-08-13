@@ -37,7 +37,7 @@ just the model's tokenizer, not a layout choice).
 Usage:
   gguf-tools/build_main_template.py --hf HF_DIR --out main_template.gguf
 """
-import argparse, json, os, struct, sys
+import argparse, hashlib, json, os, struct, sys
 
 GGUF_MAGIC = b'GGUF'
 
@@ -197,12 +197,20 @@ def ne_reversed(hf_shape):
 # ---------------------------------------------------------------------------
 # Tensor manifest enumeration.
 # ---------------------------------------------------------------------------
-def build_tensor_list(ckpt):
+def build_tensor_list(ckpt, keep=None):
+    """keep: optional per-layer routed-expert count (the REAP survivor count).
+    When given, pruned layers declare their DENSE survivor count in the expert
+    tensors' trailing dim, so the quantizer fills an already-pruned manifest
+    instead of a downstream tool re-slicing a full-256 artifact. Router and bias
+    tensors stay padded to the full n_expert -- that is the ds4-compact-v1
+    convention the CUDA router kernels depend on."""
     cfg = ckpt.config
     L = cfg['num_hidden_layers']
     E = cfg['hidden_size']
     F = cfg['moe_intermediate_size']
     R = cfg['n_routed_experts']
+    if keep is not None and len(keep) < L:
+        raise SystemExit(f'survivor map covers {len(keep)} layers, model has {L}')
     tensors = []  # (ds4_name, ne, type)
 
     for ds4_name, hf_name in TOP_MAP.items():
@@ -229,9 +237,10 @@ def build_tensor_list(ckpt):
         # Routed experts: combined [in,out,R] stack, shape from config (the
         # per-expert HF tensors are individually MXFP4-packed, not a single
         # combined tensor -- same convention as build_dspark_template.py).
-        tensors.append((f'blk.{layer}.ffn_gate_exps.weight', [E, F, R], MXFP4))
-        tensors.append((f'blk.{layer}.ffn_up_exps.weight',   [E, F, R], MXFP4))
-        tensors.append((f'blk.{layer}.ffn_down_exps.weight', [F, E, R], MXFP4))
+        Rl = keep[layer] if keep is not None else R
+        tensors.append((f'blk.{layer}.ffn_gate_exps.weight', [E, F, Rl], MXFP4))
+        tensors.append((f'blk.{layer}.ffn_up_exps.weight',   [E, F, Rl], MXFP4))
+        tensors.append((f'blk.{layer}.ffn_down_exps.weight', [F, E, Rl], MXFP4))
 
     return tensors
 
@@ -239,7 +248,7 @@ def build_tensor_list(ckpt):
 # ---------------------------------------------------------------------------
 # deepseek4.*/general.* metadata, derived from config.json + generation_config.json.
 # ---------------------------------------------------------------------------
-def build_kvs(ckpt):
+def build_kvs(ckpt, reap=None, reap_sha=None):
     cfg = ckpt.config
     gen = ckpt.generation_config
     L = cfg['num_hidden_layers']
@@ -296,6 +305,29 @@ def build_kvs(ckpt):
         ('general.sampling.top_p', VAL_FLOAT32, float(gen.get('top_p', 1.0))),
         ('general.sampling.temp', VAL_FLOAT32, float(gen.get('temperature', 1.0))),
     ]
+    if reap is not None:
+        # The engine validates these at load (validate_reap_metadata in
+        # weights.cpp): the arrays must cover every layer and each entry must
+        # be in [1, n_expert], or it dies. policy 1 = hash-routed layers that
+        # keep all 256 (they route by a fixed tid2eid table and structurally
+        # cannot be pruned); policy 2 = biased top-k layers trimmed to
+        # keep_count, with the pruned bias slots set to -1e30 so they can never
+        # win selection.
+        kvs += [
+            ('reap.enabled', VAL_BOOL, True),
+            ('reap.layout', VAL_STRING, reap['layout']),
+            ('reap.layer.expert_count', VAL_ARRAY, (VAL_UINT32, [int(x) for x in reap['expert_count']])),
+            ('reap.layer.keep_count', VAL_ARRAY, (VAL_UINT32, [int(x) for x in reap['keep_count']])),
+            ('reap.layer.policy', VAL_ARRAY, (VAL_UINT32, [int(x) for x in reap['policy']])),
+        ]
+        # Binds this template to the EXACT survivor map it was shaped by. The
+        # arrays above only carry per-layer counts and policies, so two maps
+        # that keep the same NUMBER of experts per layer -- but different ones
+        # -- produce byte-identical templates and pass every shape check, while
+        # routing every token to a different expert. Nothing else in the build
+        # would notice. The quantizer refuses a map whose hash does not match.
+        if reap_sha:
+            kvs.append(('reap.survivors.sha256', VAL_STRING, reap_sha))
     return kvs
 
 
@@ -391,11 +423,23 @@ def main():
                     help='derive tokenizer.* KVs from the HF checkpoint (no prior GGUF needed)')
     ap.add_argument('--tokenizer-template', default=None,
                     help='chat template for --tokenizer-from-hf (default: gguf-tools/tokenizer/chat_template.jinja)')
+    ap.add_argument('--reap-survivors', metavar='JSON',
+                    help='REAP survivor map; declares pruned expert dims and emits the reap.* KVs')
     a = ap.parse_args()
 
     ckpt = HFCheckpoint(a.hf)
-    tensors = build_tensor_list(ckpt)
-    kvs = build_kvs(ckpt)
+    reap = None
+    reap_sha = None
+    if a.reap_survivors:
+        with open(a.reap_survivors, 'rb') as f:
+            reap_sha = hashlib.sha256(f.read()).hexdigest()
+        with open(a.reap_survivors, encoding='utf-8') as f:
+            reap = json.load(f)
+        for k in ('layout', 'expert_count', 'keep_count', 'policy', 'survivors'):
+            if k not in reap:
+                raise SystemExit(f'{a.reap_survivors}: survivor map is missing "{k}"')
+    tensors = build_tensor_list(ckpt, keep=reap['keep_count'] if reap else None)
+    kvs = build_kvs(ckpt, reap=reap, reap_sha=reap_sha)
 
     if a.tokenizer_from_hf:
         # Derive the tokenizer KVs from the checkpoint instead of copying them
