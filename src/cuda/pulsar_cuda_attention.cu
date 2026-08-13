@@ -2218,8 +2218,6 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
         const pulsar_gpu_tensor *comp_mask,
@@ -2227,20 +2225,18 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
+    if (        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
-        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= PULSAR_ATTN_PACK_NROT ||
+        (comp_kv_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
          ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
         (n_comp && comp_kv->bytes < (uint64_t)n_comp *
-         (comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim)
-                      : comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
-                                     : head_dim * sizeof(float))) ||
+         (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+                       : head_dim * sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
@@ -2265,7 +2261,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    0, comp_kv_fp8, comp_kv_pack, 1, 0, n_raw, raw_cap,
+                    0, 0u, comp_kv_pack, 1, 0, n_raw, raw_cap,
                     raw_start, n_comp, 0, 0, n_head, head_dim, raw_f16,
                     NULL, NULL, NULL, 0, 1,
                     "attention decode online launch");
@@ -2281,7 +2277,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
-                                                 0, comp_kv_fp8, comp_kv_pack,
+                                                 0, 0u, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim, raw_f16,
                                                  NULL, NULL, NULL, 0, 1);
@@ -2539,8 +2535,6 @@ static int attention_decode_batch_launch(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
@@ -2599,8 +2593,7 @@ static int attention_decode_batch_launch(
     const uint64_t comp_rows_min = (descr && comp_bank_ptrs) ? (uint64_t)comp_cap
                                  : descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
+    if (        !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         (!descr && (n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap)) ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -2608,12 +2601,11 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
-        (comp_kv_pack && (comp_kv_f16 || comp_kv_fp8 || head_dim <= PULSAR_ATTN_PACK_NROT ||
+        (comp_kv_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
          ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
         (n_comp && comp_kv->bytes < comp_rows_min *
-         (comp_kv_fp8 ? PULSAR_FP8_KV_ROWBYTES(head_dim)
-                      : comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
-                                     : head_dim * sizeof(float))) ||
+         (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+                       : head_dim * sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -2632,7 +2624,7 @@ static int attention_decode_batch_launch(
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0,
+                    non_causal, 0u, comp_kv_pack, n_tokens, pos0,
                     n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                     head_dim, raw_f16, positions_ptr, seq_id_ptr,
                     comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
@@ -2655,7 +2647,7 @@ static int attention_decode_batch_launch(
          * than approximated: comp-mask, non-causal, and FP8 comp rows.  A 0
          * from the launcher is a real failure and is reported, not demoted. */
         if (pulsar_gpu_attention_prefill_reads_packed_comp() &&
-            !non_causal && !comp_kv_fp8 && (n_head % 32u) == 0u) {
+            !non_causal && (n_head % 32u) == 0u) {
             static int announced_dc = 0;
             if (!announced_dc) {
                 announced_dc = 1;
@@ -2679,7 +2671,7 @@ static int attention_decode_batch_launch(
         return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                 (const float *)q->ptr, (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0,
+                non_causal, 0u, comp_kv_pack, n_tokens, pos0,
                 n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
                 head_dim, raw_f16, positions_ptr, seq_id_ptr,
                 comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
@@ -2692,7 +2684,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_comp_mask, non_causal, comp_kv_fp8, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
+                                                 use_comp_mask, non_causal, 0u, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
                                                  positions_ptr, seq_id_ptr, comp_bank_ptrs_ptr, comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
@@ -2722,7 +2714,7 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, 0, 0, 0, NULL, 0, non_causal, n_tokens, pos0,
+                                      q, raw_kv, NULL, 0, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim, raw_f16,
                                       positions, seq_id, NULL /* raw path: no comp */, comp_cap, n_banks);
@@ -2738,8 +2730,6 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         const pulsar_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
@@ -2760,9 +2750,8 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
-    if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_kv_fp8, comp_kv_pack, comp_mask, use_comp_mask, non_causal,
+                                      q, raw_kv, comp_kv, comp_kv_pack, comp_mask, use_comp_mask, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim, raw_f16,
                                       positions, seq_id, comp_bank_ptrs, comp_cap, n_banks);
@@ -2778,8 +2767,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         uint32_t                comp_kv_pack,
         const pulsar_gpu_tensor *topk,
         uint32_t                n_tokens,
@@ -2829,8 +2816,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     const uint64_t comp_rows_min = (descr && comp_bank_ptrs) ? (uint64_t)comp_cap
                                  : descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
-    if (comp_kv_f16 || comp_kv_fp8 ||
-        !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
+    if (        !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 ||
         (!descr && (n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap)) ||
         n_comp == 0 || top_k == 0 ||
@@ -3341,8 +3327,6 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -3350,7 +3334,6 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16) {
-    if (comp_kv_f16 || comp_kv_fp8) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim, raw_f16);
@@ -3366,8 +3349,6 @@ int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        uint32_t                comp_kv_fp8,
         const pulsar_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -3376,7 +3357,6 @@ int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim, raw_f16);

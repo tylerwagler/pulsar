@@ -1289,7 +1289,6 @@ bool gpu_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                     gpu_graph_attn_comp_cache_is_pack(),
                     comp_selected,
                     1,
@@ -1325,7 +1324,6 @@ bool gpu_graph_encode_decode_layer(
                     layer->attn_sinks->abs_offset,
                     g->q, raw_cache,
                     n_comp ? comp_cache : NULL,
-                    0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                     gpu_graph_attn_comp_cache_is_pack(),
                     NULL, 0,
                     1, pos,
@@ -1346,7 +1344,6 @@ bool gpu_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                          gpu_graph_attn_comp_cache_is_pack(),
                                                          n_comp,
                                                          NULL,

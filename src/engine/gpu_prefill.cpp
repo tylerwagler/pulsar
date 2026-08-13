@@ -1931,7 +1931,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                                        : g->layer_raw_cache[il],
                                                                                   span_comp_src,
-                                                                                  0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                                   mseq ? gpu_graph_attn_comp_cache_is_pack()
                                                                                        : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
                                                                                   g->comp_selected,
@@ -1978,7 +1977,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                                                                               : (pk_native ? g->layer_attn_comp_cache[il]
                                                                                            : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
-                                                                         0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                          mseq ? gpu_graph_attn_comp_cache_is_pack()
                                                                               : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
                                                                          NULL,
@@ -2111,7 +2109,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               sq_view,
                                                                               g->layer_raw_cache[il],
                                                                               zspan_comp_src,
-                                                                              0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                               pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0,
                                                                               g->comp_selected,
                                                                               sn,
@@ -2151,7 +2148,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        g->batch_q,
                                                                        g->batch_kv,
                                                                        gpu_graph_attn_comp_read_cache(g, il, n_comp),
-                                                                       0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -2262,7 +2258,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                * so the shadow was rebuilt for every token. */
                                                                               pk_native ? g->layer_attn_comp_cache[il]
                                                                                         : gpu_graph_attn_comp_read_cache(g, il, cur_comp),
-                                                                              0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                               pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0,
                                                                               g->comp_selected,
                                                                               1,
@@ -2291,7 +2286,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  cur_comp ? (pk_native ? g->layer_attn_comp_cache[il]
                                                                                        : gpu_graph_attn_comp_read_cache(g, il, cur_comp))
                                                                           : NULL,
-                                                                 0u, 0u, /* comp f32 (f16/fp8 comp modes removed) */
                                                                  (cur_comp && pk_native) ? gpu_graph_attn_comp_cache_is_pack() : 0,
                                                                  cur_comp,
                                                                  comp_mask,
