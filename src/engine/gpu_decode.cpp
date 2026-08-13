@@ -416,24 +416,6 @@ uint32_t gpu_graph_prefill_slice(void) {
     return (uint32_t)cached;
 }
 
-/* Diagnostic raw-ring row read as f32 regardless of the active storage format. */
-static int gpu_graph_read_raw_row_f32(pulsar_gpu_graph *g, uint32_t il, uint32_t phys, float *out) {
-    if (!gpu_graph_raw_f16_enabled()) {
-        return pulsar_gpu_tensor_read(g->layer_raw_cache[il],
-                                   (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(float),
-                                   out, (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-    }
-    uint16_t *tmp = (uint16_t *)xmalloc((size_t)PULSAR_N_HEAD_DIM * sizeof(uint16_t));
-    int ok = pulsar_gpu_tensor_read(g->layer_raw_cache[il],
-                                 (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
-                                 tmp, (uint64_t)PULSAR_N_HEAD_DIM * sizeof(uint16_t));
-    if (ok != 0) {
-        for (uint32_t d = 0; d < PULSAR_N_HEAD_DIM; d++) out[d] = f16_to_f32(tmp[d]);
-    }
-    free(tmp);
-    return ok;
-}
-
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
     if (gpu_graph_attn_pack_enabled()) return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
     return (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
