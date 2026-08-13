@@ -2741,7 +2741,11 @@ bool gpu_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
 
-    const bool profile = getenv("PULSAR_CUDA_GRAPH_TOKEN_PROFILE") != NULL;
+    /* Diagnostics read the environment ONCE (no-hot-path-flags): this runs per
+     * decoded token, so a getenv here is a per-token libc call and lookup for a
+     * switch that cannot change after start. */
+    static int profile_env = -1;
+    const bool profile = gpu_graph_env_flag("PULSAR_CUDA_GRAPH_TOKEN_PROFILE", &profile_env);
     const double t0 = profile ? now_sec() : 0.0;
 
     const int captured = pulsar_gpu_decode_graph_begin();

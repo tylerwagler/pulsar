@@ -1409,7 +1409,12 @@ static int routed_moe_launch(
      * exists.  `down` is still the per-pair output buffer, sized by the caller
      * checks above. */
     {
-        const uint32_t profile_moe = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
+        /* Read once (no-hot-path-flags): this runs on every MoE launch, i.e.
+         * every layer of every decode token, for a switch fixed at start.
+         * Same cached-static idiom the rest of this file already uses. */
+        static int profile_moe_env = -1;
+        if (profile_moe_env < 0) profile_moe_env = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_moe = (uint32_t)profile_moe_env;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {

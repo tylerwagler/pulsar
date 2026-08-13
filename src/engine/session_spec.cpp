@@ -372,11 +372,21 @@ static float dspark_base_top1_prob(const float *logits, int n) {
  * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
 static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
                              const int32_t *refined_ids, int n_draft) {
-    const char *path = getenv("PULSAR_DSPARK_DUMP");
-    if (!path || !path[0]) return;
+    /* Read once (no-hot-path-flags): this is called every spec step, and both
+     * switches are fixed at start.  The common case is "not dumping", which
+     * must cost a single cached load, not two getenv lookups. */
+    static const char *path = NULL;
+    static int max_steps = 8;
+    static int env_read = 0;
+    if (!env_read) {
+        env_read = 1;
+        const char *p = getenv("PULSAR_DSPARK_DUMP");
+        path = (p && p[0]) ? p : NULL;
+        const char *lim = getenv("PULSAR_DSPARK_DUMP_STEPS");
+        if (lim && lim[0]) max_steps = atoi(lim);
+    }
+    if (!path) return;
     static int dumped = 0;
-    const char *lim = getenv("PULSAR_DSPARK_DUMP_STEPS");
-    const int max_steps = lim ? atoi(lim) : 8;
     if (dumped >= max_steps) return;
 
     const uint64_t hcw = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
@@ -1004,8 +1014,17 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
             opsteps = e2 && e2[0] ? atoi(e2) : 0;
         }
         static int opdone = 0;
-        const char *oppath = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
-        if (opdone < opsteps && oppath && oppath[0]) {
+        /* Read once, and only if the already-cached step budget says this dump
+         * is live at all — the previous form called getenv every spec step even
+         * when opsteps was 0, i.e. always, for everyone. */
+        static const char *oppath = NULL;
+        static int oppath_read = 0;
+        if (opsteps > 0 && !oppath_read) {
+            oppath_read = 1;
+            const char *p = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
+            oppath = (p && p[0]) ? p : NULL;
+        }
+        if (opdone < opsteps && oppath) {
             FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
             if (f2) {
                 int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
