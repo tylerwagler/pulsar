@@ -135,9 +135,17 @@ show >0 spliced tokenizer KVs and an MB-scale file size.
 MEASURE, and re-measuring yields a new map — a different (also valid) exercise.
 A reproduction uses the pinned `v5mx4-format-map.json` from §1. Re-derivation is:
 
-    HF checkpoint -> sensitivity probe -> cost stage -> prisma_alloc.py -> map
+    HF checkpoint -> sensitivity_probe.py -> measure_quant_cost.py
+                  -> PrismaQuant allocator.py -> map
     (CACHE_HEADROOM_GB=90 REQUIRED for probe AND cost, or autoscale takes an
      ~86 GB layer cache and earlyoom kills the run, exit 137)
+
+The allocator is UPSTREAM PrismaQuant, not anything in this repo, and the two
+expensive stages do not need re-running: the 0731 probe/cost pickles survive at
+`/mnt/pve1-models/prisma-0731-run/` and still validate against PrismaQuant
+v0.11. Full provenance -- producing branch, invocation, why 7 layers are mixed,
+and a v0.11 cross-check that reproduces 127/129 allocation units -- is in
+`gguf-tools/prisma/README.md`.
 
 The build proper, given a map — run it with
 `gguf-tools/build/rebuild_collapsed.sh`:

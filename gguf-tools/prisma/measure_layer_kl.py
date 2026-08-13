@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""measure_layer_kl.py — measured per-layer expert-promotion KL for prisma_alloc.
+"""measure_layer_kl.py — measured per-layer expert-promotion KL (engine-side).
 
 For each MoE layer L, measures the real end-to-end KL divergence between the
 all-cheap base model and the same model with layer L's routed experts swapped
 (via ds4 --expert-overlay) to the all-rich donor's lossless MXFP4 tensors.
 That KL is the distortion layer L's cheap quantization contributes to the
 output distribution == the benefit of promoting it, which is exactly the
-objective prisma_alloc.py's knapsack trades against bytes.
+objective an allocator's knapsack trades against bytes.
 
 Method (AURA-era, measured-not-proxied): one --kl-ref-dump run on the base
 (the anchor), then one --kl-score run per layer with the overlay applied.
@@ -19,7 +19,8 @@ Usage:
       --out kl.json [--layers 0-42] [--tokens 2048] [--ctx 4096] [--stride 4]
 
 Output (--out): {"17": {"dkl_promote": 1.23e-3, "stderr": 4.5e-5}, ...}
-Feed to: prisma_alloc.py --kl kl.json
+NOTE: its consumer (the local prisma_alloc.py) was retired 2026-08-12;
+allocation now runs upstream from its own probe/cost stages. See README.md.
 """
 import argparse, json, os, re, subprocess, sys, tempfile, time
 

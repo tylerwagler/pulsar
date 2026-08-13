@@ -1,0 +1,39 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "ds4_engine",
+  "runtime": "ds4_engine",
+  "supports_per_role_expert_schemes": true,
+  "description": "DSv4-Flash pulsar engine, serveable TODAY (kernel inventory as of 2026-08-12, verified against weights.cpp:tensor_is_routed_expert_type and weights_tensor_type_supported). Routed-expert tensors run ONLY on CUTLASS_MXFP4 (type 40, grouped tensor-core) or IQ2_XXS_MMQ (type 43, MMQ arms). Attention, shared-expert and dense tensors run ONLY on the FP8 tensor-core path (MXFP8_LT, type 41). CHANGED since the 2026-07 revision: the dp4a kernels for Q2_K (10), plain IQ2_XXS (16), IQ2_XXS_SOA (42) and FP4_E2M1 (39) were DELETED, so Q2_K is no longer servable and must not be priced -- the previous spec still offered it. IQ2_XXS and MXFP4 are named here as the allocator-facing format identities; the artifact stores their pre-formatted twins (43 and 40), which are pure layout permutations at identical bits and therefore allocation-equivalent. Use the 'ds4' union profile to price what the CONTAINER could carry; use this profile to price what the engine can serve.",
+  "format_rules": [
+    {
+      "id": "routed_expert_kernels",
+      "when": {"regex": "\\.mlp\\.experts\\."},
+      "allow_formats": ["IQ2_XXS", "MXFP4", "CUTLASS_MXFP4"],
+      "reason": "profile_mismatch",
+      "detail": "routed-expert tensors: the only surviving expert kernels are CUTLASS_MXFP4 (40) and IQ2_XXS_MMQ (43). Q2_K/IQ2_XS/IQ2_S/Q3_K expert kernels do not exist -- the Q2_K dp4a path was removed, so pricing Q2_K here yields an artifact the engine refuses at load."
+    },
+    {
+      "id": "fp8_tensor_core_path",
+      "when": {"not_regex": "\\.mlp\\.experts\\."},
+      "allow_formats": ["MXFP8_E4M3"],
+      "reason": "profile_mismatch",
+      "detail": "attention / shared-expert / dense tensors are served only on the FP8 tensor-core path (MXFP8_E4M3 group-32, stored as MXFP8_LT type 41); no IQ/k-quant kernels exist for them"
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "kquant_superblock_shape",
+      "formats": ["IQ2_XXS"],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "256-element superblocks are packed along the input dim"
+    },
+    {
+      "id": "mx_group32_shape",
+      "formats": ["MXFP4", "CUTLASS_MXFP4", "MXFP8_E4M3"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "OCP MX formats scale 32-element groups (E8M0 per-group scale) along the input dim"
+    }
+  ]
+}
