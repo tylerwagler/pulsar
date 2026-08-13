@@ -1,0 +1,15 @@
+{
+  "schema": "pulsar.decode_floor_baseline.v1",
+  "min_sse_decode_tps": 22.557,
+  "min_workload": "typescript",
+  "max_tokens": 512,
+  "model": "deepseek-v4-flash",
+  "kv_disk_state": "disabled",
+  "per_workload": {
+    "python": 23.584,
+    "rust": 23.653,
+    "typescript": 22.557,
+    "cuda": 23.13,
+    "go": 24.231
+  }
+}
