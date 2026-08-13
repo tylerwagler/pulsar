@@ -1149,6 +1149,27 @@ int main(int argc, char **argv) {
         snprintf(s.spill_dir, sizeof s.spill_dir, "%s",
                  (sd && sd[0]) ? sd : "./ds4-spill");
         (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */
+        /* Reclaim orphaned spill temporaries.  spill_bank writes
+         * "spill-bank-<n>.kv.tmp.<pid>" and renames it into place, so a tmp file
+         * surviving here is from a process that died mid-spill — precisely the
+         * crash the atomic write exists to contain.  The exit sweep cannot do
+         * this (a crash never reaches it), and these are multi-GiB, so they must
+         * be collected at startup: no spill can be in flight in a fresh process,
+         * which makes every match here an orphan by construction. */
+        if (DIR *sdp = opendir(s.spill_dir)) {
+            while (const struct dirent *de = readdir(sdp)) {
+                if (strncmp(de->d_name, "spill-bank-", 11) != 0) continue;
+                if (!strstr(de->d_name, ".kv.tmp.")) continue;
+                char opath[600];
+                snprintf(opath, sizeof opath, "%s/%s", s.spill_dir, de->d_name);
+                if (remove(opath) == 0) {
+                    server_log(PULSAR_LOG_WARNING,
+                               "pulsar-server: guard: reclaimed orphaned spill temp %s",
+                               opath);
+                }
+            }
+            closedir(sdp);
+        }
         s.guard_enabled = (s.guard_touched_budget > 0);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 2b guard %s: touched budget %.2f GiB "

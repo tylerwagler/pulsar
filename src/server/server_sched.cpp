@@ -1443,21 +1443,49 @@ bool server::spill_bank(session_slot *victim) {
     (void)s->bank_switch((int)vb);         /* victim never spilled (pick excludes) → true */
     char path[600];
     snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
-    FILE *fp = fopen(path, "wb");
+    /* Durability: free_physical below drops the bank's only other copy, so this
+     * file must be COMPLETE on disk before we get there.  Plain fopen+fclose
+     * does not guarantee that — a crash or power loss can leave a truncated or
+     * zero-length spill sitting under the final name, and the restore path then
+     * refuses it, so that conversation 500s permanently.  Use the same
+     * write-tmp / fsync / rename contract the disk-KV store already uses
+     * (pulsar_kvstore.cpp): this path never inherited it. */
+    char tmp[672];
+    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+    FILE *fp = fopen(tmp, "wb");
     if (!fp) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: spill open %s failed: %s",
-                   path, strerror(errno));
+                   tmp, strerror(errno));
         return false;
     }
     char err[128];
     const double t0 = server_now_sec();
     const int rc = pulsar_session_bank_kv_save(pool, vb, fp, err, sizeof err);
+    /* fsync BEFORE the rename, or the rename can become visible while the
+     * contents are still only in page cache. */
+    const bool synced = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
     const int fc = fclose(fp);
-    if (rc != 0 || fc != 0) {
+    if (rc != 0 || !synced || fc != 0) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: kv_save bank %u failed: %s",
-                   vb, rc ? err : "close");
-        remove(path);
+                   vb, rc ? err : (synced ? "close" : "fsync"));
+        remove(tmp);
         return false;
+    }
+    if (rename(tmp, path) != 0) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: spill rename %s failed: %s",
+                   path, strerror(errno));
+        remove(tmp);
+        return false;
+    }
+    /* Persist the rename itself so the entry survives a crash.  Best-effort:
+     * some filesystems reject a directory fsync, and the contents are already
+     * durable above. */
+    {
+        int dfd = ::open(s->spill_dir, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            (void)fsync(dfd);
+            ::close(dfd);
+        }
     }
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
     if (!pulsar_session_bank_state_restore(pool, 0)) { remove(path); return false; }
