@@ -39,7 +39,20 @@
 // what the old helper returned on Turing-MMA hardware, so the scratch is the
 // same size as before.  Deliberately an upper bound: under-sizing this buffer
 // would be an overflow, over-sizing costs a few KiB once. (L008)
-static constexpr int ds4_mmq_x_max() { return 128; }
+// ⚠ 128 HERE WAS A BUG (fixed 2026-08-14): it undersized the q8_1 scratch and
+// produced 129280/129280 NON-FINITE logits at prefill depth 4102 (a 4096 chunk
+// plus a 6-token tail).  I had reasoned that 128 was "the top of the launcher's
+// J search loop" -- that is the TILING loop (`for J = 8; J <= 128`), not the
+// bound that sizes this buffer.  The real bound is
+// ggml_cuda_mmq_get_J_max = min(ne11, 512) rounded down to a multiple of 8, so
+// J reaches 512 and the quantize kernel wrote past the end.
+//
+// 512 is that hard cap, so it can never undersize regardless of type, cc or
+// ne11.  Upstream calls the accessor per-tensor to allocate exactly; we
+// deliberately take the constant instead -- the over-allocation is bounded by
+// 512*sizeof(block_q8_1_mmq) once per call, and a constant cannot be wrong the
+// next time upstream changes how J is chosen.
+static constexpr int ds4_mmq_x_max() { return 512; }
 
 static bool ds4_mmq_nvtx_requested() {
     static int enabled = -1;
@@ -494,6 +507,8 @@ int ds4_mmq_dense_impl(
         /*nsamples_x=*/1,    /*nsamples_y=*/1,
         /*stride_sample_x=*/0, /*stride_sample_y=*/s13, /*stride_sample_dst=*/0,
         /*ncols_max=*/ne11,
+            /*x_soa=*/nullptr,
+        /*soa_blocks=*/0,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -837,6 +852,8 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*ncols_max=*/ne_get_rows,
+        /*x_soa=*/x_soa,
+        /*soa_blocks=*/soa_blocks,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -1271,6 +1288,8 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*ncols_max=*/routed_ncols_max,
+        /*x_soa=*/xa_soa,
+        /*soa_blocks=*/soa_blocks,
     };
 
     {
@@ -1289,6 +1308,7 @@ int ds4_mmq_moe_pair_impl(
     // Second matmul over the same activation buffer and same routing map.
     args.x     = (const char *)W_b;
     args.dst   = out_b;
+    args.x_soa = xb_soa;
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_up",
@@ -1379,6 +1399,8 @@ int ds4_mmq_moe_pair_impl(
             /*stride_sample_y=*/ne_get_rows * down_s12,
             /*stride_sample_dst=*/0,
             /*ncols_max=*/routed_ncols_max,
+            /*x_soa=*/fused_down->W_soa,
+            /*soa_blocks=*/fused_down->soa_blocks,
         };
         bool down_done = false;
         if (fused_down->W_soa != nullptr && d2r_enabled() &&
