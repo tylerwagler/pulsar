@@ -66,7 +66,10 @@ CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
 # Vendored llama.cpp MMQ (plan 41b, see src/cuda/mmq/VENDOR.md).  The wildcard is
 # empty unless the tree has actually been vendored, in which case PULSAR_HAVE_MMQ
 # lights up the routed gate/up MMQ arm in pulsar_cuda_moe.cu.  No tree -> stock build.
-MMQ_SRCS = $(wildcard src/cuda/mmq/*.cu)
+# mmid.cu is deliberately NOT compiled on its own: ds4_mmid.cu #includes it so
+# that upstream's file-static launch_mm_ids_helper<N> is in scope (L008).
+# Compiling both would duplicate every symbol in it.
+MMQ_SRCS = $(filter-out src/cuda/mmq/mmid.cu,$(wildcard src/cuda/mmq/*.cu))
 MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
 ifneq ($(strip $(MMQ_SRCS)),)
 MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq

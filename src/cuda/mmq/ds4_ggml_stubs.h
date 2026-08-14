@@ -167,7 +167,8 @@ enum ggml_type {
     GGML_TYPE_MXFP4   = 39,
     GGML_TYPE_NVFP4   = 40,
     GGML_TYPE_Q1_0    = 41,
-    GGML_TYPE_COUNT   = 42,
+    GGML_TYPE_Q2_0    = 42,  // added upstream after the 5c0e946 pin (L008)
+    GGML_TYPE_COUNT   = 43,
 };
 
 enum ggml_glu_op {
@@ -257,6 +258,17 @@ inline size_t ggml_type_size(enum ggml_type t) {
         case GGML_TYPE_Q1_0:    return 36;
         default:                return 0;
     }
+}
+
+// ds4 (L008): needed by mmvq.cu's ggml_cuda_should_use_mmvq after the
+// post-5c0e946 re-sync.  "Quantized" here means block-quantized, i.e. anything
+// whose block size is greater than 1 element -- which is exactly what
+// ggml_blck_size already encodes, so derive it rather than keep a second list
+// that can drift from the first.
+inline int64_t ggml_blck_size(enum ggml_type t);
+
+inline bool ggml_is_quantized(enum ggml_type t) {
+    return ggml_blck_size(t) > 1;
 }
 
 inline int64_t ggml_blck_size(enum ggml_type t) {
