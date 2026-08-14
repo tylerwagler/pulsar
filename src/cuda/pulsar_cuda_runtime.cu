@@ -13,12 +13,10 @@ static uint64_t g_model_registered_size;
 static int g_model_registered;
 
 
-static int g_model_device_owned;
 
 
 
 
-static int g_model_hmm_direct;
 
 
 static int g_model_fd = -1;
@@ -200,14 +198,7 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
-        getenv("PULSAR_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") == NULL) {
-        return cuda_model_ptr(model_map, offset);
-    }
-    const char *direct_env = getenv("PULSAR_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (g_model_registered) return cuda_model_ptr(model_map, offset);
 
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
     if (fd_ptr) return fd_ptr;
@@ -225,8 +216,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
      *
      * The usual trigger is the weight-cache budget: cuda_model_range_ptr_from_fd
      * returns NULL once g_model_range_bytes exceeds the cache limit (it routes
-     * through cuda_model_direct_fallback_ptr, which yields NULL here because the
-     * model is neither device-owned, registered, nor ATS/HMM-direct). */
+     * through cuda_model_direct_fallback_ptr, which yields NULL here because
+     * host registration is unsupported on GB10). */
     static int reported = 0;
     if (!reported) {
         reported = 1;
@@ -251,7 +242,7 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+    if (g_model_registered) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -370,87 +361,6 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     while (g_model_load_progress_next <= cached_bytes) {
         g_model_load_progress_next += step;
     }
-}
-
-
-
-static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
-    if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("PULSAR_CUDA_COPY_MODEL") != NULL ||
-        getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
-        return 0;
-    }
-
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
-    }
-
-    int pageable = 0;
-    cudaError_t err = cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device);
-    if (err != cudaSuccess || !pageable) {
-        (void)cudaGetLastError();
-        return 0;
-    }
-    cudaMemLocation loc;
-    memset(&loc, 0, sizeof(loc));
-    loc.type = cudaMemLocationTypeDevice;
-    loc.id = device;
-
-    const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
-    const uintptr_t host_addr = (uintptr_t)((const char *)model_map + map_offset);
-    const uintptr_t pre_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
-    const uint64_t pre_delta = (uint64_t)(host_addr - pre_addr);
-    const uint64_t pre_bytes = (pre_delta + map_size + page_sz - 1u) & ~(page_sz - 1u);
-    void *pre_ptr = (void *)pre_addr;
-
-    const double t0 = cuda_wall_sec();
-    err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetReadMostly, loc);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "pulsar: CUDA model read-mostly advise skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    err = cudaMemAdvise(pre_ptr, (size_t)pre_bytes, cudaMemAdviseSetPreferredLocation, loc);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "pulsar: CUDA model preferred-location advise skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-
-    if (!g_model_prefetch_stream) {
-        err = cudaStreamCreateWithFlags(&g_model_prefetch_stream, cudaStreamNonBlocking);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "pulsar: CUDA model prefetch stream creation skipped: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-    }
-
-    err = cudaMemPrefetchAsync(pre_ptr, (size_t)pre_bytes, loc, 0, g_model_prefetch_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "pulsar: CUDA model prefetch skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    if (getenv("PULSAR_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
-        err = cudaStreamSynchronize(g_model_prefetch_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "pulsar: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-    }
-    const double t1 = cuda_wall_sec();
-    fprintf(stderr,
-            "pulsar: CUDA ATS/HMM prefetch queued %.2f GiB of model tensors in %.3fs\n",
-            (double)map_size / 1073741824.0,
-            t1 - t0);
-    g_model_hmm_direct = 1;
-    return 1;
 }
 
 
@@ -728,14 +638,13 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
 
 
-/* A raw host pointer is safe for kernels only after CUDA owns, registered, or
- * HMM-prefetched the mapping.  Otherwise let the caller try per-range mapping
- * or a device copy instead of surfacing an async illegal access later. */
+/* A raw host pointer is safe for kernels only once CUDA has registered the
+ * mapping.  Otherwise return NULL so the caller stops, rather than handing a
+ * kernel an address it cannot read and surfacing an async illegal access
+ * later.  On GB10 registration is unsupported, so this returns NULL and the
+ * staged fd path is the only route -- see cuda_model_range_ptr (L028/L030). */
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
-        getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL) {
-        return cuda_model_ptr(model_map, offset);
-    }
+    if (g_model_registered) return cuda_model_ptr(model_map, offset);
     return NULL;
 }
 
@@ -835,94 +744,6 @@ static const char *cuda_model_range_ptr_from_fd(
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
-}
-
-
-
-static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
-    if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL ||
-        getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
-        return 0;
-    }
-    if (g_model_device_owned || g_model_registered) return 1;
-
-    void *dev = NULL;
-    const double t0 = cuda_wall_sec();
-    cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "pulsar: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-
-    fprintf(stderr, "pulsar: CUDA chunk-copying %.2f GiB model image\n",
-            (double)model_size / 1073741824.0);
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    void *stage = NULL;
-    err = cudaMallocHost(&stage, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "pulsar: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
-        (void)cudaFree(dev);
-        (void)cudaGetLastError();
-        return 0;
-    }
-
-    if (map_offset > 0) {
-        uint64_t copied_header = 0;
-        while (copied_header < map_offset) {
-            const uint64_t n = (map_offset - copied_header < chunk) ? (map_offset - copied_header) : chunk;
-            memcpy(stage, (const char *)model_map + copied_header, (size_t)n);
-            err = cudaMemcpy((char *)dev + copied_header, stage, (size_t)n, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "pulsar: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
-                (void)cudaFreeHost(stage);
-                (void)cudaFree(dev);
-                (void)cudaGetLastError();
-                return 0;
-            }
-            copied_header += n;
-        }
-    }
-
-    uint64_t copied = 0;
-    double last_report = t0;
-    while (copied < map_size) {
-        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
-        const uint64_t off = map_offset + copied;
-        memcpy(stage, (const char *)model_map + off, (size_t)n);
-        err = cudaMemcpy((char *)dev + off, stage, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "pulsar: CUDA model chunk copy failed at %.2f GiB: %s\n",
-                    (double)copied / 1073741824.0, cudaGetErrorString(err));
-            (void)cudaFreeHost(stage);
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return 0;
-        }
-        cuda_model_discard_source_pages(model_map, model_size, off, n);
-        copied += n;
-        const double now = cuda_wall_sec();
-        if (getenv("PULSAR_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
-            fprintf(stderr, "pulsar: CUDA model chunk copy %.2f/%.2f GiB\n",
-                    (double)copied / 1073741824.0,
-                    (double)map_size / 1073741824.0);
-            last_report = now;
-        }
-    }
-
-    (void)cudaFreeHost(stage);
-    g_model_device_base = (const char *)dev;
-    g_model_device_owned = 1;
-    g_model_hmm_direct = 0;
-    const double t1 = cuda_wall_sec();
-    fprintf(stderr,
-            "pulsar: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
-            t1 - t0,
-            (double)map_size / 1073741824.0);
-    return 1;
 }
 
 
@@ -1050,9 +871,6 @@ void pulsar_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
     }
-    if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
-    }
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
     }
@@ -1060,8 +878,6 @@ void pulsar_gpu_cleanup(void) {
     g_model_device_base = NULL;
     g_model_registered_size = 0;
     g_model_registered = 0;
-    g_model_device_owned = 0;
-    g_model_hmm_direct = 0;
     g_model_fd = -1;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -1355,10 +1171,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
         cuda_model_load_progress_reset();
     }
     if (!same_backing_model) {
-        if (g_model_device_owned && g_model_device_base) {
-            (void)cudaFree((void *)g_model_device_base);
-            g_model_device_owned = 0;
-        }
         if (g_model_registered && g_model_host_base) {
             (void)cudaHostUnregister((void *)g_model_host_base);
             g_model_registered = 0;
@@ -1366,10 +1178,9 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
         g_model_host_base = model_map;
         g_model_device_base = (const char *)model_map;
         g_model_registered_size = model_size;
-    } else if (!g_model_device_owned && !g_model_registered) {
+    } else if (!g_model_registered) {
         g_model_device_base = (const char *)model_map;
     }
-    g_model_hmm_direct = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
@@ -1383,37 +1194,17 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
-    const char *copy_env = getenv("PULSAR_CUDA_COPY_MODEL");
-    if (copy_env && copy_env[0]) {
-        void *dev = NULL;
-        const double t0 = clock() / (double)CLOCKS_PER_SEC;
-        cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
-        if (err == cudaSuccess) {
-            fprintf(stderr, "pulsar: CUDA copying %.2f GiB model to device memory\n",
-                    (double)model_size / 1073741824.0);
-            err = cudaMemcpy(dev, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
-            if (err == cudaSuccess) {
-                g_model_device_base = (const char *)dev;
-                g_model_device_owned = 1;
-                const double t1 = clock() / (double)CLOCKS_PER_SEC;
-                fprintf(stderr, "pulsar: CUDA model copy complete in %.3fs\n", t1 - t0);
-                return 1;
-            }
-            fprintf(stderr, "pulsar: CUDA model copy failed: %s\n", cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-        } else {
-            fprintf(stderr, "pulsar: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-        }
-    }
-
-    unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
-    if (getenv("PULSAR_CUDA_HOST_REGISTER_PLAIN") != NULL) {
-        flags = cudaHostRegisterMapped;
-    }
+    /* One load strategy (L030, 2026-08-13): register the mapping if the platform
+     * allows it, otherwise resolve spans lazily through the staged fd path in
+     * cuda_model_range_ptr.  The whole-model cudaMalloc+copy and its chunked
+     * twin were deleted -- both measured -57% prefill, and on an 86 GiB model
+     * against 121 GiB of unified memory a full device copy is not a strategy so
+     * much as an OOM.  cudaHostRegisterReadOnly is not optional: dropping it
+     * (the old PULSAR_CUDA_HOST_REGISTER_PLAIN) let registration SUCCEED on GB10
+     * and then served -12% prefill / -26% decode with DIFFERENT LOGITS, i.e. the
+     * weights the GPU read did not match. */
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       flags);
+                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
@@ -1448,12 +1239,9 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
-    if (!pulsar_gpu_set_model_map(model_map, model_size)) return 0;
-    if (getenv("PULSAR_CUDA_COPY_MODEL_CHUNKED") != NULL &&
-        !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
-        (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
-    }
-    return 1;
+    (void)map_offset;
+    (void)map_size;
+    return pulsar_gpu_set_model_map(model_map, model_size);
 }
 
 

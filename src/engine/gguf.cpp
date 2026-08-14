@@ -778,10 +778,6 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
         fprintf(stderr, "pulsar: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
                 " (%llu pre-stored MXFP8_LT, zero-copy)\n",
                 (unsigned long long)n_fp8, (unsigned long long)n_fp8_lt);
-    if (getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL) {
-        return true;
-    }
-
     const double t0 = now_sec();
     uint64_t prepared = 0;
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, skip_prefix, &prepared)) {
