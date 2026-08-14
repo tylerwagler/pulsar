@@ -1375,6 +1375,11 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // ds4 (L008): the aligned row-pair-SoA artifact and its total pair count.
+    // NULL means "use the standard loader"; see ds4_mmq_soa_tiles.cuh.  The
+    // loader typedef upstream takes no extra argument, so the pair count has to
+    // ride here and be threaded down to the load call.
+    const char * x_soa; int64_t soa_blocks;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {

@@ -14,6 +14,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
 #include <cstdio>
@@ -29,6 +30,16 @@
 #ifndef DS4_MMQ_HAS_NVTX
 #define DS4_MMQ_HAS_NVTX 0
 #endif
+
+// Upstream deleted get_mmq_x_max_host in the post-5c0e946 restructure: the tile
+// width J is now an INPUT to ggml_cuda_mmq_get_config rather than something the
+// host derives.  We only ever used it to size the q8_1 scratch, and the bound
+// that matters is the largest J the launcher can pick, which is the top of its
+// search loop -- `for (int J = 8; J <= 128 ...)` in mmq.cuh.  128 also matches
+// what the old helper returned on Turing-MMA hardware, so the scratch is the
+// same size as before.  Deliberately an upper bound: under-sizing this buffer
+// would be an overflow, over-sizing costs a few KiB once. (L008)
+static constexpr int ds4_mmq_x_max() { return 128; }
 
 static bool ds4_mmq_nvtx_requested() {
     static int enabled = -1;
@@ -425,7 +436,7 @@ int ds4_mmq_dense_impl(
 
     const size_t nbytes_src1_q8_1 =
         ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
@@ -464,10 +475,6 @@ int ds4_mmq_dense_impl(
     const int64_t s12    = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13    = ne12 * s12;
 
-    const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
-
     if (out_memset_enabled()) {
         cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
@@ -479,14 +486,16 @@ int ds4_mmq_dense_impl(
         /*ids_dst=*/nullptr,
         /*expert_bounds=*/nullptr,
         /*dst=*/out_f32,
+        /*y_scale=*/nullptr,
         /*ncols_x=*/ne00,    /*nrows_x=*/(int64_t)M,    /*ncols_dst=*/ne11,
         /*stride_row_x=*/s01,/*ncols_y=*/ne11,          /*nrows_dst=*/s1,
         /*nchannels_x=*/1,   /*nchannels_y=*/1,
         /*stride_channel_x=*/0, /*stride_channel_y=*/s12, /*stride_channel_dst=*/0,
         /*nsamples_x=*/1,    /*nsamples_y=*/1,
         /*stride_sample_x=*/0, /*stride_sample_y=*/s13, /*stride_sample_dst=*/0,
-        /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne11,
+            /*x_soa=*/nullptr,
+        /*soa_blocks=*/0,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -540,7 +549,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
 
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     // Slack: the guarded last col tile reads up to 128 blocks past N*K/128.
-    const int64_t slack_blocks = std::max<int64_t>(get_mmq_x_max_host(cc), 128);
+    const int64_t slack_blocks = std::max<int64_t>(ds4_mmq_x_max(), 128);
     const size_t nbytes_src1_q8_1 =
         (int64_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         slack_blocks * sizeof(block_q8_1_mmq);
@@ -685,19 +694,13 @@ int ds4_mmq_moe_impl(
 
     // The smem mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory;
     // the down matmul reaches here with n_tokens = assignments (6x the forward
-    // width), so 8192-row prefill chunks pass 48384 "tokens" > cap.  P5: past
-    // the cap the launcher dispatches the bit-identical two-pass global
-    // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
-    // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
-    // expert-tile fallback, the W8192 prefill cliff.  DS4_MMID_LARGE=0
-    // restores the refusal.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
-                tag, n_tokens);
-        return -1;
-    }
-
-    ggml_cuda_launch_mm_ids_helper(
+    // width), so 8192-row prefill chunks pass 48384 "tokens" > cap.  The cap
+    // check now lives in ds4_launch_mm_ids_helper (ds4_mmid.cu), which past the
+    // cap dispatches the bit-identical two-pass global variant instead of
+    // asserting — refusing here used to throw the WHOLE MoE block (including
+    // gate/up mmq work) onto the legacy expert-tile fallback, the W8192 prefill
+    // cliff.  DS4_MMID_LARGE=0 restores the refusal.
+    ds4_launch_mm_ids_helper(
         ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
         n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
 
@@ -710,7 +713,7 @@ int ds4_mmq_moe_impl(
     // 2. Gather + quantize the activation into Q8_1.
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
@@ -755,10 +758,6 @@ int ds4_mmq_moe_impl(
     // but we set it consistently with upstream.
     const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_mmq = ne12 * s12_mmq;
-
-    const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
         cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
@@ -822,6 +821,7 @@ int ds4_mmq_moe_impl(
         /*ids_dst=*/ids_dst.get(),
         /*expert_bounds=*/expert_bounds.get(),
         /*dst=*/out_f32,
+        /*y_scale=*/nullptr,
         /*ncols_x=*/ne00,
         /*nrows_x=*/(int64_t)M,
         /*ncols_dst=*/ne_get_rows,
@@ -838,7 +838,6 @@ int ds4_mmq_moe_impl(
         /*stride_sample_x=*/0,
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
-        /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne_get_rows,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
@@ -1030,14 +1029,14 @@ int ds4_mmq_moe_pair_impl(
 
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
     size_t direct_down_q8_bytes = 0;
     if (direct_gateup_q8) {
         const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
         direct_down_q8_bytes =
             (size_t)ne_get_rows * (size_t)down_ne10_padded *
                 sizeof(block_q8_1) / QK8_1 +
-            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+            (size_t)ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
         const size_t gateup_work_bytes =
             ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
                 ne_get_rows, n_experts);
@@ -1088,15 +1087,7 @@ int ds4_mmq_moe_pair_impl(
     const int si1  = n_expert_used;
     const int sis1 = 1;
 
-    // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
-    // cap the launcher takes the bit-identical global variant (P5); only
-    // refuse with DS4_MMID_LARGE=0.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
-                tag, n_tokens);
-        return -1;
-    }
-
+    // Cap handling lives in ds4_launch_mm_ids_helper (see ds4_mmq_moe_impl).
     cudaError_t err = cudaSuccess;
     {
         ds4_mmq_nvtx_scope stage(
@@ -1107,7 +1098,7 @@ int ds4_mmq_moe_pair_impl(
         // so entries dropped by mm_ids_helper never expose stale pool memory.
         cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
         cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
-        ggml_cuda_launch_mm_ids_helper(
+        ds4_launch_mm_ids_helper(
             ids, ids_src1, ids_dst, expert_bounds,
             n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11,
             si1, sis1, stream);
@@ -1118,10 +1109,6 @@ int ds4_mmq_moe_pair_impl(
             return -2;
         }
     }
-
-    const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
     /* The fused target-prefill path receives a true top-k assignment: one
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
@@ -1270,6 +1257,7 @@ int ds4_mmq_moe_pair_impl(
         /*ids_dst=*/ids_dst,
         /*expert_bounds=*/expert_bounds,
         /*dst=*/out_a,
+        /*y_scale=*/nullptr,
         /*ncols_x=*/ne00,
         /*nrows_x=*/(int64_t)M,
         /*ncols_dst=*/ne_get_rows,
@@ -1286,7 +1274,6 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_x=*/0,
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
-        /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/routed_ncols_max,
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
@@ -1329,7 +1316,7 @@ int ds4_mmq_moe_pair_impl(
         const size_t logical_q8_bytes =
             (size_t)ne_get_rows * (size_t)down_ne10_padded * sizeof(block_q8_1) / QK8_1;
         const size_t tail_q8_bytes =
-            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+            (size_t)ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> down_q8_1(
             ctx->pool(), logical_q8_bytes + tail_q8_bytes);
 
@@ -1381,6 +1368,7 @@ int ds4_mmq_moe_pair_impl(
             /*ids_dst=*/ids_dst,
             /*expert_bounds=*/expert_bounds,
             /*dst=*/fused_down->out,
+            /*y_scale=*/nullptr,
             /*ncols_x=*/(int64_t)M,
             /*nrows_x=*/(int64_t)fused_down->out_dim,
             /*ncols_dst=*/ne_get_rows,
@@ -1397,7 +1385,6 @@ int ds4_mmq_moe_pair_impl(
             /*stride_sample_x=*/0,
             /*stride_sample_y=*/ne_get_rows * down_s12,
             /*stride_sample_dst=*/0,
-            /*use_stream_k=*/use_stream_k,
             /*ncols_max=*/routed_ncols_max,
             /*x_soa=*/fused_down->W_soa,
             /*soa_blocks=*/fused_down->soa_blocks,
@@ -1739,6 +1726,7 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
 // ----------------------------------------------------------------------------
 
 #include "mmvq.cuh"
+#include "ds4_mmvq.cuh"
 
 namespace {
 
