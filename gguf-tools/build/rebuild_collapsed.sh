@@ -27,10 +27,27 @@ set -euo pipefail
 
 R=${R:-/home/claude/rebuild}
 PY=${PY:-/home/claude/.venvs/pulsar-quant/bin/python}
-G=${G:-/home/claude/Projects/pulsar/.claude/worktrees/kv-rope-bf16/gguf-tools}
+G=${G:-/home/claude/Projects/pulsar/gguf-tools}
 HF=${HF:-/mnt/pve1-models/dsv4-flash-0731}
 IMATRIX=${IMATRIX:-/mnt/pve1-models/ds4-quant-archive/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat}
-THREADS=${THREADS:-16}
+# Measured 2026-08-13, not guessed. The 91 IQ2_XXS_MMQ expert stacks ARE the
+# run: 91 x 73 s at 16 threads ~= 111 min against a measured 109 min quantize
+# stage, so the 345 MXFP8_LT and 38 CUTLASS_MXFP4 tensors are noise beside
+# them. That path is CPU-bound and scales -- one 415 MB IQ2 stack took 130.9 s
+# at 8 threads, 72.9 s at 16 and 43.7 s at 48 (sublinear but real; a repeat at
+# 16 came back 73.0 s, so page cache is not confounding it). 36 leaves the box
+# headroom for a concurrent session.
+#
+# The CUTLASS path does NOT scale: warm 16 and warm 48 both hit 3.2 s on an
+# 855 MB stack, and its apparent speedup was entirely page cache. Probe BOTH
+# regimes before believing any thread number here.
+#
+# Staging the source weights on local disk was measured and rejected: local
+# reads 1.1 GB/s vs 575 MB/s from the NAS, but the run reads ~145 GB of source
+# once, so it saves ~2 min of a ~109 min stage -- and the dominant IQ2 path is
+# CPU-bound anyway (its cold and warm times are identical). It also would not
+# fit: 145 GB of source plus a 92.5 GB artifact against ~154 GB free.
+THREADS=${THREADS:-36}
 
 SURV=$G/reap/reap25-lcb50-survivors.json
 MAP=$G/prisma/v5mx4-format-map.json         # the only map: names IQ2_XXS_MMQ, not plain IQ2_XXS
