@@ -282,7 +282,22 @@ context-coherence-probe:
 # matched the shipped ds4flash.gguf ("baseline header mismatch — different
 # model") AND the 8aa9d35 engine cannot even run the repacked tensors. The
 # baseline now protects drift from the current shipped line.
-PREFILL_BASELINE_REF ?= 536466c
+#
+# Re-baselined again 2026-08-14 (L005), same failure mode one artifact later:
+# 536466c predates type-43 (IQ2_XXS_MMQ), so the baseline build cannot load the
+# shipped artifact and the gate could not run at all -- two releases went out
+# with it silently rotted.
+#
+# WHY df3a0d8 SPECIFICALLY, and not simply "something recent": it is the
+# EARLIEST commit whose prefill semantics match what we actually ship.  It is
+# the commit that flipped fp16 attention + MXFP4 indexer to default-on after the
+# suite-v1 KL gate, and it already contains type-43 (b774925, one day earlier).
+# Anything older fails on one of those two counts -- fp16-default-on is NOT
+# byte-stable against a pre-flip baseline, so an earlier ref would report a diff
+# that is a deliberate shipped change rather than a regression.  Choosing the
+# earliest valid commit rather than HEAD keeps ~100 commits of drift under the
+# gate instead of blessing everything up to today.
+PREFILL_BASELINE_REF ?= df3a0d8
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
