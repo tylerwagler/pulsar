@@ -668,6 +668,8 @@ struct mxfp8_act_cache_t {
     uint64_t       key_in_dim;
     int            valid;        /* xq/sx hold the MXFP8 quant of that (ptr,shape) */
     int            valid_h;      /* xh holds the f16 conversion of that (ptr,shape) */
+    int            f32_absent;   /* producer skipped the f32 store: xh is the ONLY
+                                  * copy, and any f32 read of key_ptr is a bug */
     __nv_fp8_e4m3 *xq;
     size_t         xq_cap;
     unsigned char *sx;
@@ -680,6 +682,7 @@ static thread_local mxfp8_act_cache_t g_act_cache;
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     g_act_cache.valid = 0;
     g_act_cache.valid_h = 0;
+    g_act_cache.f32_absent = 0;
     if (!x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
         g_act_cache.key_ptr = NULL;
         return;
@@ -690,9 +693,10 @@ void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, 
 }
 
 void pulsar_gpu_mxfp8_act_cache_disarm(void) {
-    g_act_cache.key_ptr = NULL;
-    g_act_cache.valid   = 0;
-    g_act_cache.valid_h = 0;
+    g_act_cache.key_ptr    = NULL;
+    g_act_cache.valid      = 0;
+    g_act_cache.valid_h    = 0;
+    g_act_cache.f32_absent = 0;
 }
 
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
@@ -728,6 +732,17 @@ void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim) {
  * cannot know what is in the slot; this says "the producer already filled it". */
 void pulsar_gpu_mxfp8_act_cache_note_f16(void) {
     if (g_act_cache.key_ptr) g_act_cache.valid_h = 1;
+}
+
+/* As note_f16(), but also records that the producer skipped the f32 store, so
+ * the f16 copy is the ONLY one.  Every f32 reader of this buffer below asserts
+ * against this rather than silently consuming a store that was never made. */
+void pulsar_gpu_mxfp8_act_cache_note_f16_only(void) {
+    if (g_act_cache.key_ptr) { g_act_cache.valid_h = 1; g_act_cache.f32_absent = 1; }
+}
+
+static int act_cache_f32_missing(const void *xp) {
+    return g_act_cache.key_ptr == xp && g_act_cache.f32_absent;
 }
 
 
@@ -1203,6 +1218,19 @@ void pulsar_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n
  * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
 int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
+
+/* True only when the plain-F16 matmul is GUARANTEED to take the cuBLAS branch
+ * that consumes the cached f16 activation.  Deliberately conservative: a mixed
+ * batch splits into a <=8-row decode prefix that runs the NT kernel straight
+ * off the f32 buffer, so any m-neutral split disqualifies the whole call. */
+int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok) {
+    if (!g_cublas_ready) return 0;
+    if (g_mneutral_rows > 0) return 0;   /* prefix/suffix split -> f32 NT path */
+    if (n_tok <= 8) return 0;            /* NT cap is 8; n_tok<=1 also f32 */
+    return 1;
+}
+
+
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     /* inc 4 prefix-split: 0<n_dec<n_tok => mixed decode+prefill batch. Run the
@@ -1502,6 +1530,16 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     if (weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    /* The producer may have skipped this buffer's f32 store because
+     * pulsar_gpu_matmul_plain_uses_f16_act() promised the cuBLAS branch below.
+     * If we are about to take any other branch, that promise was wrong: fail
+     * loudly rather than multiply whatever happens to be in the f32 buffer. */
+    if (act_cache_f32_missing(x->ptr) && !pulsar_gpu_matmul_plain_uses_f16_act(n_tok)) {
+        fprintf(stderr, "pulsar: matmul_f16 needs the f32 activation but the producer "
+                        "emitted f16 only (n_tok=%llu, mneutral=%d)\n",
+                (unsigned long long)n_tok, g_mneutral_rows);
+        return 0;
+    }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;

@@ -26,7 +26,7 @@ __global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pu
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const pulsar_hc_t *xr = x + (uint64_t)row * n;
-    float *orow = out + (uint64_t)row * n;
+    float *orow = out ? out + (uint64_t)row * n : NULL;
     __half *hrow = out_h ? out_h + (uint64_t)row * n : NULL;
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
@@ -58,14 +58,14 @@ __global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pu
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) {
             const float nv = v[u] * scale;
-            orow[i + u * BLK] = nv;
             if (hrow) hrow[i + u * BLK] = __float2half(nv);
+            if (orow) orow[i + u * BLK] = nv;
         }
     }
     for (; i < n; i += BLK) {
         const float nv = pulsar_hc_load(xr, i) * scale;
-        orow[i] = nv;
         if (hrow) hrow[i] = __float2half(nv);
+        if (orow) orow[i] = nv;
     }
 }
 
@@ -1031,17 +1031,22 @@ int pulsar_gpu_rms_norm_plain_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_te
 }
 
 
-int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
+int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h, int skip_f32, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
-    rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr, (__half *)out_h,
+    /* skip_f32 drops the f32 store entirely -- it is DEAD whenever the only
+     * consumer reads the f16 encoding we just wrote, and it is the widest
+     * store in the layer (4 B/elem over n_hc*n_embd).  Only honoured when an
+     * f16 destination exists to replace it. */
+    float *o = (skip_f32 && out_h) ? NULL : (float *)out->ptr;
+    rms_norm_plain_kernel<256, 8><<<rows, 256>>>(o, (__half *)out_h,
                                                  (const pulsar_hc_t *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
-    return pulsar_gpu_rms_norm_plain_rows_f16_tensor(out, NULL, x, n, rows, eps);
+    return pulsar_gpu_rms_norm_plain_rows_f16_tensor(out, NULL, 0, x, n, rows, eps);
 }
 
 

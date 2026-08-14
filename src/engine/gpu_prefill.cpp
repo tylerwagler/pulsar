@@ -494,14 +494,22 @@ bool gpu_graph_encode_layer_attention_batch(
      * the layer -- ~400 MB at a 4096-token prefill, twice per layer.  Emit the
      * f16 encoding from the norm's own epilogue instead. */
     void *flat_hc_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, hc_dim) : NULL;
+    /* ...and when the mix GEMM is guaranteed to read that f16, the f32 store is
+     * dead: nothing else reads batch_flat_hc.  It is the widest store in the
+     * layer, so dropping it is worth more than the conversion was. */
+    const int flat_hc_skip_f32 = flat_hc_f16 && pulsar_gpu_matmul_plain_uses_f16_act(n_tokens);
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_f16_tensor(g->batch_flat_hc,
                                                       flat_hc_f16,
+                                                      flat_hc_skip_f32,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_flat_hc, n_tokens, hc_dim);
-    if (ok && flat_hc_f16) pulsar_gpu_mxfp8_act_cache_note_f16();
+    if (ok && flat_hc_f16) {
+        if (flat_hc_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f16_only();
+        else                  pulsar_gpu_mxfp8_act_cache_note_f16();
+    }
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_attn_fn,
@@ -2444,14 +2452,19 @@ bool gpu_graph_encode_layer_ffn_batch(
                               !gpu_graph_use_reference_hc_decode() &&
                               gpu_graph_enable_batch_hc_norm_fusion();
     void *flat_hc_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, hc_dim) : NULL;
+    const int flat_hc_skip_f32 = flat_hc_f16 && pulsar_gpu_matmul_plain_uses_f16_act(n_tokens);
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_f16_tensor(g->batch_flat_hc,
                                                       flat_hc_f16,
+                                                      flat_hc_skip_f32,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_flat_hc, n_tokens, hc_dim);
-    if (ok && flat_hc_f16) pulsar_gpu_mxfp8_act_cache_note_f16();
+    if (ok && flat_hc_f16) {
+        if (flat_hc_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f16_only();
+        else                  pulsar_gpu_mxfp8_act_cache_note_f16();
+    }
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_ffn_fn,

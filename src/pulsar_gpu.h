@@ -423,8 +423,17 @@ int pulsar_gpu_rms_norm_plain_tensor(
  * narrowing pass it replaces moves ~400 MB per call at a 4096-token prefill.
  * Bit-exact: identical __float2half of the identical value.  out_h may be NULL. */
 int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h,
+                                              int skip_f32,
                                               const pulsar_gpu_tensor *x,
                                               uint32_t n, uint32_t rows, float eps);
+
+/* True only when the plain-F16 matmul is guaranteed to consume the CACHED f16
+ * activation, so the producer may skip its f32 store.  Conservative by design. */
+int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok);
+
+/* note_f16(), plus a record that the f32 store was skipped so f32 readers of
+ * that buffer fail loudly instead of consuming a store that never happened. */
+void pulsar_gpu_mxfp8_act_cache_note_f16_only(void);
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,
