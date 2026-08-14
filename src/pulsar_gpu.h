@@ -331,6 +331,8 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
  * results are bit-identical either way.
  */
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim);
+void pulsar_gpu_mxfp8_act_cache_note_f16(void);
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
 /* Optional fused GPU operations.
@@ -415,6 +417,14 @@ int pulsar_gpu_rms_norm_plain_tensor(
         const pulsar_gpu_tensor *x,
         uint32_t                n,
         float                   eps);
+
+/* Same, but also fills out_h (n*rows __half) from the registers that produce the
+ * f32 result.  batch_flat_hc feeds a 16384-wide F16 GEMM, so the separate
+ * narrowing pass it replaces moves ~400 MB per call at a 4096-token prefill.
+ * Bit-exact: identical __float2half of the identical value.  out_h may be NULL. */
+int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h,
+                                              const pulsar_gpu_tensor *x,
+                                              uint32_t n, uint32_t rows, float eps);
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,
@@ -1268,6 +1278,28 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps);
+
+/* Same, but also fills norm_out_h (n_embd*rows __half) from the same registers
+ * that produce the f32 norm_out, so the F16 GEMM consumers do not need a
+ * separate f32_to_f16 pass over the tensor.  Bit-exact: identical __float2half
+ * of the identical value.  norm_out_h may be NULL. */
+int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *norm_out,
+        void                    *norm_out_h,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
 
 int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
         pulsar_gpu_tensor       *out,

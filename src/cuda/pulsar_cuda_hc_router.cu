@@ -226,6 +226,7 @@ template <uint32_t BLK, uint32_t VEC>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
+        __half *norm_out_h,
         float *split,
         const float *mix,
         const pulsar_hc_t *residual_hc,
@@ -279,7 +280,11 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     #pragma unroll
     for (uint32_t u = 0; u < VEC; u++) {
         const uint32_t col = d + u * BLK;
-        if (col < n_embd) norm_out[obase + col] = accs[u] * norm_scale * norm_w[col];
+        if (col < n_embd) {
+            const float v = accs[u] * norm_scale * norm_w[col];
+            norm_out[obase + col] = v;
+            if (norm_out_h) norm_out_h[obase + col] = __float2half(v);
+        }
     }
 }
 
@@ -289,6 +294,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
 __global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
         float *out,
         float *norm_out,
+        __half *norm_out_h,
         float *split,
         const float *mix,
         const pulsar_hc_t *residual_hc,
@@ -330,7 +336,9 @@ __global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
     const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
-        norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+        const float nv = v * norm_scale * norm_w[col];
+        norm_out[(uint64_t)t * n_embd + col] = nv;
+        if (norm_out_h) norm_out_h[(uint64_t)t * n_embd + col] = __float2half(nv);
     }
 }
 
@@ -766,9 +774,10 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
 }
 
 
-int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
+int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
+        void                    *norm_out_h,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
@@ -818,6 +827,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
                 <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
                 (float *)out->ptr,
                 (float *)norm_out->ptr,
+                (__half *)norm_out_h,
                 (float *)split->ptr,
                 (const float *)mix->ptr,
                 (const pulsar_hc_t *)residual_hc->ptr,
@@ -830,6 +840,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
     hc_split_weighted_sum_norm_fused_generic_kernel<<<(uint32_t)n_rows, 256>>>(
             (float *)out->ptr,
             (float *)norm_out->ptr,
+            (__half *)norm_out_h,
             (float *)split->ptr,
             (const float *)mix->ptr,
             (const pulsar_hc_t *)residual_hc->ptr,
@@ -838,6 +849,29 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
             norm_w,
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+}
+
+
+int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
+        pulsar_gpu_tensor       *out,
+        pulsar_gpu_tensor       *norm_out,
+        pulsar_gpu_tensor       *split,
+        const pulsar_gpu_tensor *mix,
+        const pulsar_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    return pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+            out, norm_out, NULL, split, mix, residual_hc, model_map, model_size,
+            scale_offset, base_offset, norm_weight_offset, n_embd, n_hc,
+            sinkhorn_iters, eps, norm_eps);
 }
 
 

@@ -1369,7 +1369,7 @@ __device__ __forceinline__ static float emul_round_p(float x) {
  * (byte-identical) -- precisely because the GEMM was already truncating to
  * 10 bits. Feeding fp16 operands is therefore the same arithmetic precision
  * we already ship, at roughly double the tensor-core rate. */
-__global__ static void f32_to_f16_kernel(__half *dst, const float *src, uint64_t n) {
+__global__ static void attn_q_f32_to_f16_kernel(__half *dst, const float *src, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(src[i]);
 }
@@ -3123,7 +3123,7 @@ static int attention_prefill_mixed_launch(
             /* Q is the one operand with no producer kernel of its own to fold
              * this into -- but it is only n_tokens*n_head*head_dim, orders of
              * magnitude smaller than the score matrix. */
-            f32_to_f16_kernel<<<(q_count + 255) / 256, 256>>>(q_h, q_eff, q_count);
+            attn_q_f32_to_f16_kernel<<<(q_count + 255) / 256, 256>>>(q_h, q_eff, q_count);
             if (!cuda_ok(cudaGetLastError(), "attention fp16 q narrow")) return 0;
         }
         cublasStatus_t st;

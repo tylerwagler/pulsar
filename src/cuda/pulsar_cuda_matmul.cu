@@ -712,6 +712,25 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
 }
 
 
+/* Reserve the cache's f16 slot for (n_tok, in_dim) and hand back the device
+ * pointer, so a PRODUCER kernel can write that encoding straight out of its own
+ * epilogue.  Used with note_f16() below: reserve -> produce -> arm -> note. */
+void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim) {
+    if (n_tok == 0 || in_dim == 0) return NULL;
+    if (!mxfp8_act_cache_reserve((void **)&g_act_cache.xh, &g_act_cache.xh_cap,
+                                 (size_t)(n_tok * in_dim) * sizeof(__half), "act f16")) {
+        return NULL;
+    }
+    return g_act_cache.xh;
+}
+
+/* Declare the f16 encoding current.  arm() clears both validity bits because it
+ * cannot know what is in the slot; this says "the producer already filled it". */
+void pulsar_gpu_mxfp8_act_cache_note_f16(void) {
+    if (g_act_cache.key_ptr) g_act_cache.valid_h = 1;
+}
+
+
 static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
         uint64_t n_tok, const char *label) {
