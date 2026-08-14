@@ -1,6 +1,6 @@
 /* Split-KV decode attention gate: the split walk + softmax merge must agree
  * with the single-walk heads8-online kernel on the SAME inputs, across every
- * staging branch (raw f32/f16, comp f32/fp8), both descriptor modes
+ * staging branch (raw f32/f16, comp f32/pack), both descriptor modes
  * (single_all scalar decode; positions/seq_id banked with an evicted row),
  * and the edge shapes (n_score < n_split, comp_count == 0).
  *
@@ -71,7 +71,7 @@ struct Case {
     uint32_t n_tokens, n_raw, raw_cap, raw_start, n_comp, window, ratio;
     uint32_t pos_base;      /* positions[t] = pos_base + 3*t (descr mode) */
     int descr;              /* 0: single_all scalar decode; 1: banked */
-    int raw_f16, comp_fp8, comp_pack;
+    int raw_f16, comp_pack;
     uint32_t n_banks, comp_cap;
 };
 
@@ -81,15 +81,13 @@ int main() {
     std::normal_distribution<float> nd(0.f, 0.8f);
 
     const Case cases[] = {
-        {"single_all f32comp",  1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 0, 0, 1, 0},
-        {"single_all fp8comp",  1, 128, 4352, 90, 512, 0, 0, 0, 0, 0, 1, 0, 1, 0},
-        {"single_all raw-f16",  1, 128, 4352,  5, 640, 0, 0, 0, 0, 1, 0, 0, 1, 0},
-        {"single_all pack",     1, 128, 4352, 41, 600, 0, 0, 0, 0, 0, 0, 1, 1, 0},
-        {"banked 4tok",         4,  64,  64,  0, 200, 24, 4, 850, 1, 0, 0, 0, 2, 256},
-        {"banked evict+fp8",    6,  64,  64,  0, 220, 24, 4, 900, 1, 0, 1, 0, 2, 256},
-        {"banked pack",         4,  64,  64,  0, 200, 24, 4, 870, 1, 0, 0, 1, 2, 256},
-        {"tiny n_score",        1,   3,  64, 10,   1, 0, 0, 0, 0, 0, 0, 0, 1, 0},
-        {"comp empty",          2,  40,  64,  0,   0, 48, 4, 100, 1, 0, 0, 0, 1, 64},
+        {"single_all f32comp",  1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 0, 1, 0},
+        {"single_all raw-f16",  1, 128, 4352,  5, 640, 0, 0, 0, 0, 1, 0, 1, 0},
+        {"single_all pack",     1, 128, 4352, 41, 600, 0, 0, 0, 0, 0, 1, 1, 0},
+        {"banked 4tok",         4,  64,  64,  0, 200, 24, 4, 850, 1, 0, 0, 2, 256},
+        {"banked pack",         4,  64,  64,  0, 200, 24, 4, 870, 1, 0, 1, 2, 256},
+        {"tiny n_score",        1,   3,  64, 10,   1, 0, 0, 0, 0, 0, 0, 1, 0},
+        {"comp empty",          2,  40,  64,  0,   0, 48, 4, 100, 1, 0, 0, 1, 64},
     };
 
     double worst_all = 0.0;
@@ -108,24 +106,6 @@ int main() {
         for (auto &v : sinks) v = nd(rng);   /* sinks in-distribution: the merge
                                                 applies them once; a double- or
                                                 un-applied sink shifts outputs */
-
-        /* fp8 comp: build byte rows + per-64 scales; both kernels run the
-         * same dequant, agreement is what's under test. */
-        const uint32_t fp8_row = PULSAR_FP8_KV_ROWBYTES(D);
-        std::vector<uint8_t> comp8((size_t)(total_comp_rows ? total_comp_rows : 1) * fp8_row);
-        if (c.comp_fp8) {
-            std::uniform_int_distribution<int> bd(0, 255);
-            for (size_t r = 0; r < total_comp_rows; r++) {
-                uint8_t *row = &comp8[r * fp8_row];
-                for (uint32_t d = 0; d < D; d++) {
-                    int b = bd(rng);
-                    if ((b & 0x78) == 0x78) b &= ~0x40;      /* no NaN/Inf e4m3 */
-                    row[d] = (uint8_t)b;
-                }
-                float *sc = (float *)(row + D);
-                for (uint32_t s = 0; s < D / 64u; s++) sc[s] = 0.5f + 0.25f * (float)(s % 3);
-            }
-        }
 
         /* ATTN_PACK rows: 448 e4m3 bytes + 7 E8M0 scales + pad + 64 bf16 rope.
          * Random VALID bytes -- attn_pack_e4m3 is total (no NaN encodings in
@@ -163,17 +143,15 @@ int main() {
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
         cudaMalloc(&draw, c.raw_f16 ? rawh.size() * 2 : raw.size() * 4);
-        cudaMalloc(&dcomp, c.comp_fp8 ? comp8.size()
-                         : c.comp_pack ? compp.size() : comp.size() * 4);
+        cudaMalloc(&dcomp, c.comp_pack ? compp.size() : comp.size() * 4);
         cudaMalloc(&dq, q.size() * 4);
         cudaMalloc(&ds, sinks.size() * 4);
         cudaMalloc(&dgold, q.size() * 4);
         cudaMalloc(&dsplit, q.size() * 4);
         if (c.raw_f16) cudaMemcpy(draw, rawh.data(), rawh.size() * 2, cudaMemcpyHostToDevice);
         else           cudaMemcpy(draw, raw.data(), raw.size() * 4, cudaMemcpyHostToDevice);
-        if (c.comp_fp8)       cudaMemcpy(dcomp, comp8.data(), comp8.size(), cudaMemcpyHostToDevice);
-        else if (c.comp_pack) cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
-        else                  cudaMemcpy(dcomp, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice);
+        if (c.comp_pack) cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
+        else             cudaMemcpy(dcomp, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
         cudaMemset(dgold, 0xe5, q.size() * 4);
@@ -184,8 +162,7 @@ int main() {
             cudaMemcpy(dpos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(dseq, seq.data(), seq.size() * 4, cudaMemcpyHostToDevice);
             std::vector<const void *> hbp(c.n_banks);
-            const size_t bank_bytes = c.comp_fp8 ? (size_t)c.comp_cap * fp8_row
-                                    : c.comp_pack ? (size_t)c.comp_cap * pack_row
+            const size_t bank_bytes = c.comp_pack ? (size_t)c.comp_cap * pack_row
                                                   : (size_t)c.comp_cap * D * 4;
             for (uint32_t b = 0; b < c.n_banks; b++)
                 hbp[b] = (const uint8_t *)dcomp + b * bank_bytes;
@@ -197,7 +174,7 @@ int main() {
         /* golden: single walk (z=1, no partials) */
         dim3 g1(c.n_tokens, hg, 1);
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0, c.comp_fp8, c.comp_pack,
+                (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D, c.raw_f16,
                 dpos, dseq, (const void * const *)dbp,
@@ -209,7 +186,7 @@ int main() {
             return 1;
         dim3 gs(c.n_tokens, hg, PULSAR_DEC_SPLITKV_S);
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0, c.comp_fp8, c.comp_pack,
+                (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D, c.raw_f16,
                 dpos, dseq, (const void * const *)dbp,
