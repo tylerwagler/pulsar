@@ -16,7 +16,6 @@ static int g_model_registered;
 static int g_model_device_owned;
 
 
-static int g_model_range_mapping_supported = 1;
 
 
 static int g_model_hmm_direct;
@@ -174,162 +173,6 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 
 
-static const char *cuda_model_range_register_mapped(const void *model_map,
-                                                    uint64_t offset,
-                                                    uint64_t bytes,
-                                                    const char *what) {
-    if (!g_model_range_mapping_supported || bytes == 0) return NULL;
-
-    const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
-    const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
-    const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
-    const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
-    uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
-    if (model_map == g_model_host_base &&
-        g_model_registered_size >= 88ull * 1073741824ull &&
-        g_model_registered_size <= 96ull * 1073741824ull &&
-        g_model_range_bytes >= 80ull * 1073741824ull) {
-        const uintptr_t model_base = (uintptr_t)model_map;
-        const uintptr_t model_end = model_base + (uintptr_t)g_model_registered_size;
-        if (model_end > model_base && model_end > reg_addr) {
-            const uint64_t tail_bytes = (uint64_t)(model_end - reg_addr);
-            reg_bytes = (tail_bytes + page_sz - 1u) & ~(page_sz - 1u);
-        }
-    }
-    void *reg_dev = NULL;
-
-    unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
-    if (getenv("PULSAR_CUDA_HOST_REGISTER_PLAIN") != NULL) {
-        flags = cudaHostRegisterMapped;
-    }
-
-    cudaError_t err = cudaHostRegister((void *)reg_addr,
-                                       (size_t)reg_bytes,
-                                       flags);
-    if (err != cudaSuccess &&
-        (flags & cudaHostRegisterReadOnly) != 0 &&
-        (err == cudaErrorNotSupported || err == cudaErrorInvalidValue)) {
-        (void)cudaGetLastError();
-        err = cudaHostRegister((void *)reg_addr,
-                               (size_t)reg_bytes,
-                               cudaHostRegisterMapped);
-    }
-    if (err == cudaSuccess) {
-        err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
-        if (err == cudaSuccess && reg_dev) {
-            char *dev_ptr = (char *)reg_dev + reg_delta;
-            g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
-            g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-            if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                fprintf(stderr, "pulsar: CUDA mapped %s %.2f MiB\n",
-                        what ? what : "weights",
-                        (double)bytes / 1048576.0);
-            }
-            return dev_ptr;
-        }
-        fprintf(stderr, "pulsar: CUDA model range map pointer failed for %s: %s\n",
-                what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaHostUnregister((void *)reg_addr);
-        (void)cudaGetLastError();
-        return NULL;
-    }
-
-    if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
-        g_model_range_mapping_supported = 0;
-    }
-    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "pulsar: CUDA model range map skipped for %s: %s\n",
-                what ? what : "weights", cudaGetErrorString(err));
-    }
-    (void)cudaGetLastError();
-    return NULL;
-}
-
-
-
-/* Allocate a device-resident copy of [offset, offset+bytes) from model_map and
- * push it into g_model_ranges so future cuda_model_range_ptr lookups hit it.
- * Returns the device pointer on success, NULL on cudaMalloc/cudaMemcpy failure.
- * Caller is responsible for any policy gating (budget cap, env opt-out, etc.) */
-static const char *cuda_model_range_populate_device_copy(const void *model_map,
-                                                          uint64_t offset,
-                                                          uint64_t bytes,
-                                                          const char *what) {
-    const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "pulsar: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
-        return NULL;
-    }
-
-    void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "pulsar: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
-                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
-        return NULL;
-    }
-
-    const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
-
-    /* Bounce through a pinned buffer rather than copying straight from the
-     * model mmap.  cuda_model_range_register_mapped runs just before this and
-     * can leave the mapping PARTIALLY registered (it reports "part or all of
-     * the requested memory range is already mapped" when an overlapping span
-     * registered first); cudaMemcpy from a partially-registered host range
-     * fails with cudaErrorInvalidValue, which is what made this fallback abort
-     * model load on GB10 (L028).  The fd path never hit it because it already
-     * stages through a pinned pool.  A fresh mmap copies fine, which is why
-     * this reproduces only in-engine. */
-    void *bounce = NULL;
-    const uint64_t bounce_bytes = bytes < chunk ? bytes : chunk;
-    if (cudaMallocHost(&bounce, (size_t)bounce_bytes) != cudaSuccess) {
-        (void)cudaGetLastError();
-        bounce = NULL;  /* fall back to the direct copy below */
-    }
-
-    for (uint64_t done = 0; done < bytes; done += chunk) {
-        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        const void *csrc = src + done;
-        if (bounce) {
-            memcpy(bounce, src + done, (size_t)n);
-            csrc = bounce;
-        }
-        err = cudaMemcpy((char *)dev + done, csrc, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            if (bounce) (void)cudaFreeHost(bounce);
-            fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)done / 1048576.0,
-                    (double)bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return NULL;
-        }
-    }
-    if (bounce) (void)cudaFreeHost(bounce);
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-    g_model_range_bytes += bytes;
-    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "pulsar: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
-    return (const char *)dev;
-}
-
-
-
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
 
@@ -369,18 +212,39 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
     if (fd_ptr) return fd_ptr;
 
-    /* ⚠ On GB10 the fd route above is the ONLY one that works, so the two
-     * fallbacks below are a cliff, not a safety net: host registration reports
-     * "operation not supported", and the device copy fails with
-     * cudaErrorInvalidValue ("CUDA model range copy failed ... invalid
-     * argument"), which aborts model load.  Measured 2026-08-13 by forcing this
-     * path (the since-removed PULSAR_CUDA_NO_FD_CACHE): the server would not
-     * start.  They stay because they are correct on other hardware, but if
-     * fd_ptr ever returns NULL here on GB10, THIS is the reason. */
-    const char *mapped = cuda_model_range_register_mapped(model_map, offset, bytes, what);
-    if (mapped) return mapped;
-
-    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+    /* The staged fd route is the only SUPPORTED way to get model weights onto
+     * the GPU here, so failing it is fatal by design (L028, 2026-08-13).
+     *
+     * Two fallbacks used to live here -- cudaHostRegister-and-map, and a
+     * chunked device copy.  Host registration reports "operation not supported"
+     * on GB10, and the device copy was measured at HALF the prefill and a THIRD
+     * of the decode throughput of the fd route.  Silently degrading to that is
+     * worse than not starting: a server that comes up at a third of decode
+     * speed is a support ticket nobody files for weeks.  Both were deleted;
+     * this is a hard stop with an actionable message instead.
+     *
+     * The usual trigger is the weight-cache budget: cuda_model_range_ptr_from_fd
+     * returns NULL once g_model_range_bytes exceeds the cache limit (it routes
+     * through cuda_model_direct_fallback_ptr, which yields NULL here because the
+     * model is neither device-owned, registered, nor ATS/HMM-direct). */
+    static int reported = 0;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr,
+                "pulsar: FATAL: no supported route to place model weights on the GPU.\n"
+                "pulsar:   The staged fd path failed for %s (%.2f MiB at offset %llu).\n"
+                "pulsar:   Most likely the weight cache is exhausted: %.2f GiB already\n"
+                "pulsar:   cached against a %.2f GiB limit. Raise\n"
+                "pulsar:   PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB, or serve a smaller model.\n"
+                "pulsar:   Refusing to start rather than fall back to a path measured at\n"
+                "pulsar:   2x slower prefill and 3x slower decode.\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (unsigned long long)offset,
+                (double)g_model_range_bytes / 1073741824.0,
+                (double)cuda_model_cache_limit_bytes() / 1073741824.0);
+    }
+    return NULL;
 }
 
 
@@ -1197,7 +1061,6 @@ void pulsar_gpu_cleanup(void) {
     g_model_registered_size = 0;
     g_model_registered = 0;
     g_model_device_owned = 0;
-    g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_fd = -1;
     if (g_model_direct_fd >= 0) {
@@ -1506,7 +1369,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     } else if (!g_model_device_owned && !g_model_registered) {
         g_model_device_base = (const char *)model_map;
     }
-    g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
