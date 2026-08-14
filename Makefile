@@ -288,16 +288,20 @@ context-coherence-probe:
 # shipped artifact and the gate could not run at all -- two releases went out
 # with it silently rotted.
 #
-# WHY df3a0d8 SPECIFICALLY, and not simply "something recent": it is the
-# EARLIEST commit whose prefill semantics match what we actually ship.  It is
-# the commit that flipped fp16 attention + MXFP4 indexer to default-on after the
-# suite-v1 KL gate, and it already contains type-43 (b774925, one day earlier).
-# Anything older fails on one of those two counts -- fp16-default-on is NOT
-# byte-stable against a pre-flip baseline, so an earlier ref would report a diff
-# that is a deliberate shipped change rather than a regression.  Choosing the
-# earliest valid commit rather than HEAD keeps ~100 commits of drift under the
-# gate instead of blessing everything up to today.
-PREFILL_BASELINE_REF ?= df3a0d8
+# WHY 3324bf4 SPECIFICALLY: it is the LAST DELIBERATE NUMERICS CHANGE, which is
+# the only correct anchor for this gate.  "Earliest commit that can still load
+# the artifact" is the intuitive choice and it is WRONG -- measured 2026-08-14:
+# baselining at df3a0d8 (2026-08-08, the fp16-tier flip) makes the gate run but
+# FAIL at every depth with all 129280 logits differing, because e09563e
+# (2026-08-11) narrowed the ATTN_PACK rope tail from f32 to bf16 and 3324bf4
+# fixed that loader the same day.  Both are shipped-on-purpose precision
+# changes; a baseline older than them reports intended work as a regression and
+# the gate becomes noise you learn to ignore -- which is how it rotted before.
+#
+# So: re-baseline whenever a numerics change SHIPS, and only then.  Between such
+# changes the gate is a true bit-exactness assertion, which is what makes a FAIL
+# worth acting on.
+PREFILL_BASELINE_REF ?= 3324bf4
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
