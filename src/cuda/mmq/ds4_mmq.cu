@@ -494,8 +494,6 @@ int ds4_mmq_dense_impl(
         /*nsamples_x=*/1,    /*nsamples_y=*/1,
         /*stride_sample_x=*/0, /*stride_sample_y=*/s13, /*stride_sample_dst=*/0,
         /*ncols_max=*/ne11,
-            /*x_soa=*/nullptr,
-        /*soa_blocks=*/0,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -839,8 +837,6 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*ncols_max=*/ne_get_rows,
-        /*x_soa=*/x_soa,
-        /*soa_blocks=*/soa_blocks,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -1275,8 +1271,6 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*ncols_max=*/routed_ncols_max,
-        /*x_soa=*/xa_soa,
-        /*soa_blocks=*/soa_blocks,
     };
 
     {
@@ -1295,7 +1289,6 @@ int ds4_mmq_moe_pair_impl(
     // Second matmul over the same activation buffer and same routing map.
     args.x     = (const char *)W_b;
     args.dst   = out_b;
-    args.x_soa = xb_soa;
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_up",
@@ -1386,8 +1379,6 @@ int ds4_mmq_moe_pair_impl(
             /*stride_sample_y=*/ne_get_rows * down_s12,
             /*stride_sample_dst=*/0,
             /*ncols_max=*/routed_ncols_max,
-            /*x_soa=*/fused_down->W_soa,
-            /*soa_blocks=*/fused_down->soa_blocks,
         };
         bool down_done = false;
         if (fused_down->W_soa != nullptr && d2r_enabled() &&
