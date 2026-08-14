@@ -278,10 +278,33 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
 
     const char *src = (const char *)model_map + offset;
     const uint64_t chunk = 64ull * 1024ull * 1024ull;
+
+    /* Bounce through a pinned buffer rather than copying straight from the
+     * model mmap.  cuda_model_range_register_mapped runs just before this and
+     * can leave the mapping PARTIALLY registered (it reports "part or all of
+     * the requested memory range is already mapped" when an overlapping span
+     * registered first); cudaMemcpy from a partially-registered host range
+     * fails with cudaErrorInvalidValue, which is what made this fallback abort
+     * model load on GB10 (L028).  The fd path never hit it because it already
+     * stages through a pinned pool.  A fresh mmap copies fine, which is why
+     * this reproduces only in-engine. */
+    void *bounce = NULL;
+    const uint64_t bounce_bytes = bytes < chunk ? bytes : chunk;
+    if (cudaMallocHost(&bounce, (size_t)bounce_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        bounce = NULL;  /* fall back to the direct copy below */
+    }
+
     for (uint64_t done = 0; done < bytes; done += chunk) {
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        const void *csrc = src + done;
+        if (bounce) {
+            memcpy(bounce, src + done, (size_t)n);
+            csrc = bounce;
+        }
+        err = cudaMemcpy((char *)dev + done, csrc, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
+            if (bounce) (void)cudaFreeHost(bounce);
             fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
@@ -292,6 +315,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
             return NULL;
         }
     }
+    if (bounce) (void)cudaFreeHost(bounce);
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
