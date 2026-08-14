@@ -549,7 +549,14 @@ int pulsar_gpu_attention_f16_indexed(
     if (n_comp != 0u && !comp_kv) return 0;
     /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
     if ((positions != NULL) != (seq_id != NULL)) return 0;
-    if (positions && (n_banks == 0u || comp_cap == 0u)) return 0;
+    /* comp_cap is the PER-BANK comp-row stride, so it is only meaningful when
+     * there are compressed rows to address.  Requiring it unconditionally under
+     * descriptors rejected the legitimate n_comp == 0 case -- which is what
+     * broke mixed-batch continued prefill for three days (L032): the launcher
+     * returned 0, the caller correctly refused to fall through, and the whole
+     * mixed run died with 'multiseq step_end FAILED'.  A banked batch whose
+     * visible comp prefix is empty is normal, not a bug. */
+    if (positions && (n_banks == 0u || (n_comp != 0u && comp_cap == 0u))) return 0;
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
     if (n_tokens == 0u || raw_cap == 0u) return 0;
