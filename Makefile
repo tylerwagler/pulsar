@@ -79,7 +79,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -114,6 +114,9 @@ help:
 	@echo "  make cuda-spec-sampling-gate"
 	@echo "                           Speculative-sampling chi-square exactness"
 	@echo "                           oracle + acceptance alpha (needs the model)"
+	@echo "  make gates               Run EVERY release-blocking gate and print a"
+	@echo "                           pass/fail summary (needs the GB10 + model:"
+	@echo "                           make gates FRONTIER_MODEL=/srv/models/x.gguf)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -362,10 +365,53 @@ cuda-prefill-gate-baseline:
 # Proposal-agnostic, so it gates both the deterministic and the
 # temperature-matched (p/q) accept rules.  MODEL-DEPENDENT — same memory
 # discipline as the gates above; not part of `make test`.
-SPEC_GATE_MODEL ?= gguf/model.gguf
+# Defaults to FRONTIER_MODEL so one variable points every gate at the same
+# artifact.  It used to default to a different path, which is a trap: passing
+# FRONTIER_MODEL alone made this gate "fail" instantly on a missing file and
+# look like a real regression (hit 2026-08-14 during the L031 sweep).
+SPEC_GATE_MODEL ?= $(FRONTIER_MODEL)
 SPEC_GATE_ARGS ?= 0.95
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
+
+# Every release-blocking gate, in one command.
+#
+# WHY THIS EXISTS: gates are separate make targets, and a gate nobody invokes is
+# a gate that silently stops compiling.  On 2026-08-14 a sweep found the prefill
+# gate rotted (its baseline ref predated type-43, so it could not run at all),
+# two attention gates uncompilable since an API parameter was removed that
+# morning, and a REAL production bug -- fp16 attention breaking mixed-batch
+# prefill -- that had shipped six days earlier.  None of it was visible to the
+# product build.  "Run each and record pass/fail" in a checklist is not a
+# mechanism; this is.
+#
+# Continues past failures so one broken gate does not hide the rest, prints a
+# summary, and exits non-zero if any failed.  Needs the GB10 and the model:
+#   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
+GATE_TARGETS = cuda-regression cuda-attn-gates cuda-prefill-gate \
+               cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
+               cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
+               cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
+               cuda-mixed-neutrality-gate cuda-spec-sampling-gate
+
+gates:
+	@rc=0; passed=""; failed=""; \
+	for g in $(GATE_TARGETS); do \
+	  printf '\n\033[1m=== %s ===\033[0m\n' "$$g"; \
+	  if $(MAKE) --no-print-directory "$$g" CUDA_ARCH=sm_120f \
+	        FRONTIER_MODEL="$(FRONTIER_MODEL)" SPEC_GATE_MODEL="$(SPEC_GATE_MODEL)" \
+	        CUTLASS_DIR="$(CUTLASS_DIR)"; then \
+	    passed="$$passed $$g"; \
+	  else \
+	    failed="$$failed $$g"; rc=1; \
+	  fi; \
+	done; \
+	printf '\n===================== GATE SUMMARY =====================\n'; \
+	for g in $$passed; do printf '  PASS  %s\n' "$$g"; done; \
+	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
+	if [ $$rc -eq 0 ]; then printf '\nALL GATES PASS\n'; \
+	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
+	exit $$rc
 
 src/engine/%.o: src/engine/%.c src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<

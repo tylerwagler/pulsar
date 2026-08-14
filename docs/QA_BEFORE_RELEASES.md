@@ -43,9 +43,32 @@ and any non-default flags for every manual run.
 
 ### CUDA gates ledger
 
-These are the release-blocking engine gates.  All need the GB10 and (except
-the first two) the shipped model at `./ds4flash.gguf`.  Run each; record
-pass/fail against the release commit:
+**Run them with one command:**
+
+```
+make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
+```
+
+It runs every gate below, continues past failures so one break does not hide
+the rest, prints a PASS/FAIL summary, and exits non-zero if any failed.
+
+> ⚠ **Do not hand-run these individually and tick them off.** That is what this
+> checklist used to say, and on 2026-08-14 a sweep found the prefill gate
+> rotted (its baseline ref predated type-43, so it could not run *at all*), two
+> attention gates uncompilable since an API parameter was removed that morning,
+> and a real production bug — fp16 attention breaking mixed-batch prefill —
+> that had shipped six days earlier.  **None of it was visible to the product
+> build.**  A gate nobody invokes is a gate that silently stops compiling.
+>
+> Two rules that follow:
+> * After removing or changing any engine API parameter, run `make gates`.
+>   Gates are separate targets; the product build will not tell you.
+> * Re-baseline `PREFILL_BASELINE_REF` whenever a numerics change **ships**, and
+>   only then.  Anchoring it before a deliberate precision change makes the gate
+>   fail forever, and a gate that always fails is one you learn to ignore.
+
+The individual targets, all needing the GB10 and (except the first two) the
+model.  Record pass/fail against the release commit:
 
 - `make cuda-regression` — modelless kernel smokes.
 - `make cuda-attn-gates` — fp16 attention kernel oracle, banked cross-session
