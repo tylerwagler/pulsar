@@ -1224,10 +1224,6 @@ char *pulsar_kvstore_path_join(const char *dir, const char *name) {
     return b.take();
 }
 
-char *pulsar_kvstore_path_for_sha(pulsar_kvstore *kc, const char sha[41]) {
-    return KvStore(*kc).path_for_sha(sha);
-}
-
 void pulsar_kvstore_entry_free(pulsar_kvstore_entry *e) {
     free(e->path);
     memset(e, 0, sizeof(*e));
@@ -1400,10 +1396,6 @@ void pulsar_kvstore_close(pulsar_kvstore *kc) {
     KvStore(*kc).close();
 }
 
-void pulsar_kvstore_clear(pulsar_kvstore *kc) {
-    KvStore(*kc).clear();
-}
-
 int pulsar_kvstore_store_len(const pulsar_kvstore *kc, int tokens) {
     return KvStore(*const_cast<pulsar_kvstore *>(kc)).store_len(tokens);
 }
@@ -1495,25 +1487,6 @@ bool pulsar_kvstore_store_live_prefix(pulsar_kvstore *kc,
     return pulsar_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
                                               hooks, err, err_len);
-}
-
-bool pulsar_kvstore_maybe_store_continued(pulsar_kvstore *kc,
-                                       pulsar_engine *engine,
-                                       pulsar_session *session,
-                                       const pulsar_kvstore_trailer_hooks *hooks,
-                                       char *err,
-                                       size_t err_len) {
-    const pulsar_tokens *tokens = pulsar_session_tokens(session);
-    if (!tokens) return false;
-    const int target = pulsar_kvstore_continued_store_target(kc, tokens->len);
-    if (target == 0) return false;
-    if (pulsar_kvstore_store_live_prefix(kc, engine, session, tokens, target,
-                                      "continued", hooks, err, err_len))
-    {
-        pulsar_kvstore_note_store(kc, target);
-        return true;
-    }
-    return false;
 }
 
 int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,

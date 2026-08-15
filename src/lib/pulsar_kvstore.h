@@ -123,7 +123,6 @@ bool pulsar_kvstore_open(pulsar_kvstore *kc, const char *dir, uint64_t budget_mb
                       void (*log)(void *ud, pulsar_kvstore_log_type type, const char *msg),
                       void *log_ud);
 void pulsar_kvstore_close(pulsar_kvstore *kc);
-void pulsar_kvstore_clear(pulsar_kvstore *kc);
 void pulsar_kvstore_entry_free(pulsar_kvstore_entry *e);
 
 char *pulsar_kvstore_render_tokens_text(pulsar_engine *engine,
@@ -188,12 +187,6 @@ bool pulsar_kvstore_store_live_prefix(pulsar_kvstore *kc,
                                    const pulsar_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
-bool pulsar_kvstore_maybe_store_continued(pulsar_kvstore *kc,
-                                       pulsar_engine *engine,
-                                       pulsar_session *session,
-                                       const pulsar_kvstore_trailer_hooks *hooks,
-                                       char *err,
-                                       size_t err_len);
 int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,
                               pulsar_engine *engine,
                               pulsar_session *session,
@@ -218,7 +211,6 @@ bool pulsar_kvstore_touch_file(const char *path, uint32_t hits);
 bool pulsar_kvstore_sha_hex_name(const char *name, char sha[41]);
 void pulsar_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *pulsar_kvstore_path_join(const char *dir, const char *name);
-char *pulsar_kvstore_path_for_sha(pulsar_kvstore *kc, const char sha[41]);
 void pulsar_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t pulsar_kvstore_le_get32(const uint8_t *p);
 

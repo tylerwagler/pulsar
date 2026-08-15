@@ -124,41 +124,9 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
 
 
 
-__global__ static void moe_build_expert_tile_offsets_kernel(
-        uint32_t *tile_offsets,
-        uint32_t *tile_total,
-        const uint32_t *counts,
-        uint32_t expert_count,
-        uint32_t block_m) {
-    if (threadIdx.x == 0) {
-        uint32_t sum = 0;
-        for (uint32_t e = 0; e < expert_count; e++) {
-            tile_offsets[e] = sum;
-            sum += (counts[e] + block_m - 1u) / block_m;
-        }
-        tile_offsets[expert_count] = sum;
-        *tile_total = sum;
-    }
-}
 
 
 
-__global__ static void moe_build_expert_tiles_kernel(
-        uint32_t *tile_experts,
-        uint32_t *tile_starts,
-        const uint32_t *tile_offsets,
-        const uint32_t *counts,
-        uint32_t expert_count,
-        uint32_t block_m) {
-    uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (e >= expert_count) return;
-    uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
-    uint32_t off = tile_offsets[e];
-    for (uint32_t t = 0; t < ntiles; t++) {
-        tile_experts[off + t] = e;
-        tile_starts[off + t] = t * block_m;
-    }
-}
 
 
 
@@ -223,7 +191,8 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
  * Unlike the qwarp32/dp4a paths above, which process each (token,expert) pair independently on
  * device, CUTLASS's dense GemmUniversal interface needs one contiguous [T_e,in_dim] activation
  * matrix per expert with T_e known host-side at launch time. So this path: (1) sorts tokens by
- * expert exactly like use_sorted_pairs above, (2) reads the resulting per-expert offsets back to
+ * expert (it builds its own sorted pairs; the routed path's build was deleted), (2) reads the
+ * resulting per-expert offsets back to
  * host (the one sync point this path has that the others don't -- n_total_expert is small, so
  * this is a bounded single readback per CUTLASS layer per forward pass, not per expert), then
  * (3) for each active expert: gather its rows into a contiguous scratch buffer, run the CUTLASS
@@ -1360,21 +1329,17 @@ static int routed_moe_launch(
          * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
          * precisely why these stages are bit-exact and re-tileable.) */
         const uint32_t pair_count = n_tokens * n_expert;
-        /* The sorted-pair structures are not read by MMQ itself; they survive as
-         * the shape signal the batch arms are gated on (and the tile lists the
-         * deleted dp4a kernels used to consume).  n_tokens > 1 is the whole
-         * condition now that the both-mxfp4 special case is gone. */
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        /* n_tokens > 1 is the whole condition the batch arms are gated on, now
+         * that the both-mxfp4 special case and the sorted-pair build are gone. */
+        const uint32_t use_big_batch = n_tokens > 1u;
         /* 128 used to be a throughput heuristic for type 16, which could always
          * fall back to the dp4a chain below it.  Type 43 cannot, and the gate/up
          * _vec arm only serves n_tokens==1, so 2..127 had no reader at all: any
          * short CLI prompt is one small chunk and died with "MMQ declined".  The
          * batch arm is the only correct reader at n_tokens>1, so it takes every
          * such n.  With type 16 gone the threshold has no remaining meaning and
-         * use_big_batch is simply use_sorted_pairs; n_tokens==1 still routes to
-         * the _vec arms, which is what use_sorted_pairs excludes. */
-        const uint32_t use_big_batch = use_sorted_pairs;
-        const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
+         * use_big_batch is simply n_tokens > 1; n_tokens==1 still routes to
+         * the _vec arms. */
         /* The sorted-pair and expert-tile structures USED to be built here: a
          * scratch allocation plus six kernel launches (count, prefix, scatter,
          * two tile builders, and an 8/16-row pair) on every layer of every
@@ -1425,7 +1390,7 @@ static int routed_moe_launch(
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
          * q8_1, which is why there is no mid -> midq q8_K quantize left here. */
-        if (ok && use_big_batch && !use_direct_down_sum6) {
+        if (ok && use_big_batch) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
                                                     (const float *)mid->ptr,
                                                     down_w, selected_ptr,
@@ -1454,11 +1419,10 @@ static int routed_moe_launch(
 #endif
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        /* mmq_down_done means the MMQ arm wrote PER-PAIR results, so the
-         * reduction is still owed even on the direct-sum6 decode path (whose
-         * dp4a kernel would have summed in-kernel).  Without this the decode
-         * output would be a single slot instead of the 6-expert sum. */
-        if (ok && (!use_direct_down_sum6 || mmq_down_done)) {
+        /* The MMQ arms write PER-PAIR results, so the fixed-order reduction is
+         * always owed; the arms above are fail-closed, so reaching here with ok
+         * set means one of them ran. */
+        if (ok) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
