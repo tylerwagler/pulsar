@@ -913,28 +913,6 @@ bool gpu_graph_verify_suffix_tops(
     const double t_uploaded = timing ? now_sec() : 0.0;
     if (!ok) return false;
 
-    /* PULSAR_DECODE_DESCR level 2 (Tier-2 diagnostic): run this verify batch
-     * through the banked multiseq machinery as a one-bank batch over the
-     * current bank — per-bank frontiers, banked emit loop, banked kernels.
-     * Byte-gated vs classic with the generic kernel tiers pinned (see
-     * gpu_graph_decode_descr_enabled).  The spec rollback path restores the
-     * scalar counters; the per-bank ms counters are re-captured from them at
-     * every step_begin (capture_cur), so a partial-accept rollback between
-     * verifies cannot leave the mirrors stale. */
-    const bool mseq_diag = gpu_graph_decode_descr_enabled() >= 2;
-    if (mseq_diag) {
-        int32_t *dpos = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
-        int32_t *dseq = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
-        const int32_t bank = g->banks.n_banks ? (int32_t)g->banks.cur_bank : 0;
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            dpos[t] = (int32_t)(start + t);
-            dseq[t] = bank;
-        }
-        ok = gpu_graph_multiseq_step_begin(g, dpos, dseq, n_tokens, true);
-        free(dseq);
-        free(dpos);
-        if (!ok) return false;
-    }
 
     const double t_layers_encode0 = timing ? now_sec() : 0.0;
     ok = pulsar_gpu_begin_commands() != 0;
@@ -951,11 +929,6 @@ bool gpu_graph_verify_suffix_tops(
         ok = pulsar_gpu_end_commands() != 0;
     } else {
         (void)pulsar_gpu_synchronize();
-    }
-    if (mseq_diag) {
-        /* Disarm + frontier self-check even when the sweep failed. */
-        const bool end_ok = gpu_graph_multiseq_step_end(g);
-        if (ok) ok = end_ok;
     }
     const double t_layers_done = timing ? now_sec() : 0.0;
     if (!ok) return false;

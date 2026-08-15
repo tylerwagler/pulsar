@@ -171,60 +171,6 @@ int gpu_graph_raw_f16_enabled(void) {
     return cached;
 }
 
-/* PULSAR_DECODE_DESCR: Tier-2 A/B diagnostic level (env read once per process
- * and cached — never a per-token getenv).  Not a production mode.
- *
- * Level 1: single-token decode attention AND indexer scan route through the
- * descriptor (banked) entry points as an n_banks=1 pool over the installed
- * cache views (positions=[pos], seq_id=[0]).  At n_tokens==1 the banked
- * dispatch selects the SAME kernels as classic, so this level is byte-exact
- * vs classic under the default configuration — the descriptor-vs-classic
- * gate.
- *
- * Level 2: additionally arms the banked MULTISEQ machinery for the
- * spec-verify batch (imatrix.c: one-bank batch over the current bank —
- * per-bank frontier bookkeeping, banked emit loop, banked raw scatter,
- * banked multi-token attention/indexer with packed-native comp reads).
- * Banked multi-token rows force the generic kernel tiers (WMMA / indexed
- * heads8 stay single-bank), so level 2 is byte-exact vs classic ONLY when
- * both runs pin those tiers off.  PULSAR_CUDA_NO_INDEXED_HEADS8=1 still does
- * that half; the WMMA opt-out was retired in L027 (nothing invoked it), so a
- * byte-exact Tier-2 comparison now needs the indexer WMMA condition edited
- * directly rather than an env flag. */
-int gpu_graph_decode_descr_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("PULSAR_DECODE_DESCR");
-        if (v && strcmp(v, "2") == 0) cached = 2;
-        else cached = gpu_graph_env_default_flag("PULSAR_DECODE_DESCR", 0);
-    }
-    return cached;
-}
-
-/* Lazily allocate the 1-row descriptor arrays and refresh positions[0] = pos
- * (seq_id[0] stays 0: the single session lives in bank 0). */
-static bool gpu_graph_decode_descr_prepare(pulsar_gpu_graph *g, uint32_t pos) {
-    if (!g->descr_diag_pos) {
-        g->descr_diag_pos = pulsar_gpu_tensor_alloc(sizeof(int32_t));
-        g->descr_diag_seq = pulsar_gpu_tensor_alloc(sizeof(int32_t));
-        const int32_t bank0 = 0;
-        if (!g->descr_diag_pos || !g->descr_diag_seq ||
-            !pulsar_gpu_tensor_write(g->descr_diag_seq, 0, &bank0, sizeof(bank0))) {
-            fprintf(stderr, "pulsar: PULSAR_DECODE_DESCR descriptor alloc failed\n");
-            /* Release and reset BOTH so a later call retries the whole block
-             * instead of keying off a half-allocated descr_diag_pos and
-             * failing forever (descr_diag_seq NULL / unwritten). */
-            pulsar_gpu_tensor_free(g->descr_diag_pos);
-            pulsar_gpu_tensor_free(g->descr_diag_seq);
-            g->descr_diag_pos = NULL;
-            g->descr_diag_seq = NULL;
-            return false;
-        }
-    }
-    const int32_t p = (int32_t)pos;
-    return pulsar_gpu_tensor_write(g->descr_diag_pos, 0, &p, sizeof(p)) != 0;
-}
-
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
@@ -742,11 +688,6 @@ bool gpu_graph_encode_decode_layer(
     double decode_index_stage_t0 = 0.0;
     static int decode_index_stage_env = -1;
     const bool decode_index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
-    /* PULSAR_DECODE_DESCR diagnostic: refresh the 1-row descriptor arrays once
-     * per layer (both the banked indexer scan and the banked attention below
-     * read them). */
-    const int descr_diag = gpu_graph_decode_descr_enabled();
-    if (ok && descr_diag) ok = gpu_graph_decode_descr_prepare(g, pos);
     if (ok && compressed) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -1004,31 +945,7 @@ bool gpu_graph_encode_decode_layer(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok && descr_diag) {
-                    /* PULSAR_DECODE_DESCR: route the single-token indexer scan
-                     * through the banked entry (n_banks=1, bank 0 over the
-                     * installed views).  Dispatches the SAME direct-one fast
-                     * tier as score_one; the banked causal clamp (pos+1)/ratio
-                     * equals layer_n_index_comp here (emit-before-read), so
-                     * no row goes -INF and the scan is byte-exact vs classic
-                     * — gated in the Tier-2 harness. */
-                    ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                                g->indexer_q,
-                                                                g->indexer_weights,
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                1,
-                                                                pos,
-                                                                PULSAR_N_INDEXER_HEAD,
-                                                                PULSAR_N_INDEXER_HEAD_DIM,
-                                                                pulsar_layer_compress_ratio(il),
-                                                                index_scale,
-                                                                g->descr_diag_pos,
-                                                                g->descr_diag_seq,
-                                                                NULL, /* n_banks==1 diag: installed bank view */
-                                                                g->layer_comp_cap[il],
-                                                                1) != 0;
-                } else if (ok) {
+                if (ok) {
                     ok = pulsar_gpu_indexer_score_one_tensor(g->indexer_scores,
                                                                 g->indexer_q,
                                                                 g->indexer_weights,
@@ -1108,13 +1025,6 @@ bool gpu_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
-        /* PULSAR_DECODE_DESCR diagnostic (see gpu_graph_decode_descr_enabled):
-         * route this step through the banked entries as a 1-bank pool.  The
-         * per-row raw derivation (min(pos+1, raw_window) rows ending at pos)
-         * matches gpu_graph_raw_span_for_batch/raw_start_for_span exactly,
-         * and the per-row (pos+1)/ratio compressed visibility equals the
-         * n_comp this step just produced (emit-before-attention).  The
-         * descriptor arrays were refreshed once at the top of this layer. */
         if (!ok) {
             /* fall through with ok == false */
         } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
@@ -1140,10 +1050,10 @@ bool gpu_graph_encode_decode_layer(
                     PULSAR_N_HEAD,
                     PULSAR_N_HEAD_DIM,
                     raw_f16,
-                    descr_diag ? g->descr_diag_pos : NULL,
-                    descr_diag ? g->descr_diag_seq : NULL,
-                    NULL, /* n_banks==1 diag: installed bank view is the operand */
-                    descr_diag ? g->layer_comp_cap[il] : 0,
+                    NULL,
+                    NULL,
+                    NULL,
+                    0,
                     1) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
@@ -1153,26 +1063,6 @@ bool gpu_graph_encode_decode_layer(
                                                                 n_comp,
                                                                 &decode_index_stage_t0);
             }
-        } else if (descr_diag) {
-            /* Non-indexed single-token attention through the banked batch
-             * entry (scalar n_raw/raw_start are ignored in banked mode). */
-            ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->heads,
-                    model->map, model->size,
-                    layer->attn_sinks->abs_offset,
-                    g->q, raw_cache,
-                    n_comp ? comp_cache : NULL,
-                    gpu_graph_attn_comp_cache_is_pack(),
-                    NULL, 0,
-                    1, pos,
-                    0, raw_cap, 0, /* n_raw/raw_start unused (banked) */
-                    n_comp,
-                    g->raw_window,
-                    pulsar_layer_compress_ratio(il),
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                    0, raw_f16,
-                    g->descr_diag_pos, g->descr_diag_seq,
-                    NULL, /* n_banks==1 diag: installed bank view is the operand */
-                    g->layer_comp_cap[il], 1) != 0;
         } else {
             ok = pulsar_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,

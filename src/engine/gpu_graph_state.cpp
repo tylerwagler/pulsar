@@ -4,8 +4,6 @@
 
 /* Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(pulsar_gpu_graph *g) {
-    pulsar_gpu_tensor_free(g->descr_diag_pos);
-    pulsar_gpu_tensor_free(g->descr_diag_seq);
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);

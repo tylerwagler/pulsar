@@ -1099,14 +1099,6 @@ typedef struct {
      * pointers bank views into the slabs. */
     pulsar_bank_slabs banks;
 
-    /* PULSAR_DECODE_DESCR diagnostic (gpu_decode.c): 1-row device descriptor
-     * arrays (positions=[pos], seq_id=[0]) for routing single-token decode
-     * attention through the banked entry points as an n_banks=1 pool over the
-     * bank-0 cache views.  Lazily allocated on first diagnostic step; NULL
-     * in production (the env flag is read once per process, never per
-     * token). */
-    pulsar_gpu_tensor *descr_diag_pos;
-    pulsar_gpu_tensor *descr_diag_seq;
 
     /* Tier-2 banked multiseq step state (increment 2 — per-bank compressor
      * frontiers).  The authoritative per-bank compressed-row counters are
@@ -2258,9 +2250,6 @@ int gpu_graph_decode_multiseq_batch(
         float                 *logits,
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs);
-/* PULSAR_DECODE_DESCR=1 (env, read once): Tier-2 descriptor-vs-classic byte
- * diagnostic — see gpu_decode.c. */
-int gpu_graph_decode_descr_enabled(void);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control
  * single source of truth (see gpu_diag.c).  Includes the whole bank pool
