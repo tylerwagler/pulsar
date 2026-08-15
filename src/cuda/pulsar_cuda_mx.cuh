@@ -45,19 +45,38 @@ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) 
  * identical however the reduction is ordered.
  *
  * `stride` is the row pitch in ELEMENTS (the GEMM's in_dim), not bytes. */
+/* The shared power-of-two exponent for a block whose amax is already reduced.
+ * Split out because producers reduce over DIFFERENT lane groups -- a full warp
+ * when one warp owns the block, a 4-lane quad in the attention epilogue where
+ * one head's 32 values live in four lanes, a half-warp in the rope tail -- but
+ * the exponent arithmetic must stay identical to the standalone quantiser in
+ * every one of them. */
+__device__ __forceinline__ static int pulsar_mx_shared_exp(float amax) {
+    int se = -127;
+    if (amax > 0.f) { int e = (int)floorf(log2f(amax)); se = e - 7; }
+    if (se < -127) se = -127;
+    if (se >  127) se =  127;
+    return se;
+}
+
+__device__ __forceinline__ static __nv_fp8_e4m3 pulsar_mx_encode(float v, int se) {
+    return (__nv_fp8_e4m3)(v * exp2f((float)-se));
+}
+
+__device__ __forceinline__ static unsigned char pulsar_mx_scale_byte(int se) {
+    return (unsigned char)(se + 127);
+}
+
 __device__ __forceinline__ static void pulsar_mx_emit_block(
         float v, uint32_t col, uint32_t row, uint32_t stride, int KBp,
         __nv_fp8_e4m3 *data, unsigned char *scale) {
     float a = fabsf(v);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
-    int se = -127;
-    if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
-    if (se < -127) se = -127;
-    if (se >  127) se =  127;
-    data[(size_t)row * stride + col] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
+    const int se = pulsar_mx_shared_exp(a);
+    data[(size_t)row * stride + col] = pulsar_mx_encode(v, se);
     if ((threadIdx.x & 31u) == 0u) {
-        scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = (unsigned char)(se + 127);
+        scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
     }
 }
 

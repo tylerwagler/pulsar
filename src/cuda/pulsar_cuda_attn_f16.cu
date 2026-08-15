@@ -47,6 +47,7 @@
  * plausible attention, not an error.
  */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
 
 #include <cstdio>
 #include <cuda_fp16.h>
@@ -134,14 +135,23 @@ static void attn_f16_kernel(
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks, int comp_pack,
-        int ring) {                       /* ring/descriptor row plan; topk may
+        int ring,                         /* ring/descriptor row plan; topk may
                                            * be NULL -> visible comp prefix */
+        /* Grouped E4M3 activation slots for the attn-output "a" projection.
+         * NULL = f32 only.  This epilogue owns the NOPE blocks (head dims
+         * [0, n_nope)); rope_tail_kernel rewrites [n_nope, AF16_DIM) in place
+         * afterwards and owns those blocks -- see pulsar_gpu_mxfp8_gact_slot. */
+        __nv_fp8_e4m3 *__restrict__ gact_data,
+        unsigned char *__restrict__ gact_scale,
+        int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
     (void)comp_pack; (void)ring;
+    (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
+    (void)n_groups; (void)n_nope;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -470,6 +480,60 @@ static void attn_f16_kernel(
                 ob[nb + tg * 2u]      = acc[m][n][2] * ib;
                 ob[nb + tg * 2u + 1u] = acc[m][n][3] * ib;
             }
+            /* E4M3 for the attn-output "a" GEMM, straight out of the registers
+             * the f32 stores above just used.
+             *
+             * WHY THE REDUCTION IS ONLY 4 LANES WIDE: warp w owns head dims
+             * [32w, 32w+32) -- exactly one MX block -- but for 16 heads at once,
+             * and any ONE head's 32 values live in the quad of lanes sharing g
+             * (lane = g*4 + tg).  So the block amax is fmaxf over this lane's 8
+             * registers then two shuffles across tg, CHEAPER than the warp-wide
+             * reduction pulsar_mx_emit_block does.  The predicate is warp-
+             * uniform, so every lane reaches the shuffles.
+             *
+             * The GEMM wants the grouped/transposed layout that
+             * mxfp8_quant_act_grouped_kernel produces: data[g][tok][group_dim]
+             * with a per-group scale slab, where group g holds n_head/n_groups
+             * consecutive heads.  group_dim % 32 == 0 and AF16_DIM % 32 == 0, so
+             * a head's blocks never straddle a group boundary. */
+            if (gact_data && (warp * AF16_DPW) < n_nope) {
+                const uint32_t hpg = n_head / n_groups;      /* heads per group */
+                const uint32_t gd  = hpg * AF16_DIM;         /* == group_dim */
+                float aa = 0.0f, ab = 0.0f;
+                #pragma unroll
+                for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                    aa = fmaxf(aa, fabsf(acc[m][n][0] * ia));
+                    aa = fmaxf(aa, fabsf(acc[m][n][1] * ia));
+                    ab = fmaxf(ab, fabsf(acc[m][n][2] * ib));
+                    ab = fmaxf(ab, fabsf(acc[m][n][3] * ib));
+                }
+                aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 1));
+                aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 2));
+                ab = fmaxf(ab, __shfl_xor_sync(0xffffffffu, ab, 1));
+                ab = fmaxf(ab, __shfl_xor_sync(0xffffffffu, ab, 2));
+                const int sea = pulsar_mx_shared_exp(aa);
+                const int seb = pulsar_mx_shared_exp(ab);
+                const uint32_t gra = ha / hpg, hha = ha % hpg;
+                const uint32_t grb = hb / hpg, hhb = hb % hpg;
+                __nv_fp8_e4m3 *da = gact_data + ((size_t)gra * n_tokens + t) * gd + hha * AF16_DIM;
+                __nv_fp8_e4m3 *db = gact_data + ((size_t)grb * n_tokens + t) * gd + hhb * AF16_DIM;
+                #pragma unroll
+                for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                    const uint32_t nb = warp * AF16_DPW + n * 8u;
+                    da[nb + tg * 2u]      = pulsar_mx_encode(acc[m][n][0] * ia, sea);
+                    da[nb + tg * 2u + 1u] = pulsar_mx_encode(acc[m][n][1] * ia, sea);
+                    db[nb + tg * 2u]      = pulsar_mx_encode(acc[m][n][2] * ib, seb);
+                    db[nb + tg * 2u + 1u] = pulsar_mx_encode(acc[m][n][3] * ib, seb);
+                }
+                if (tg == 0u) {
+                    const uint32_t kba = hha * (AF16_DIM / 32u) + warp;
+                    const uint32_t kbb = hhb * (AF16_DIM / 32u) + warp;
+                    gact_scale[(size_t)gra * gact_slab +
+                               pulsar_mx_sfoff((int)t, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
+                    gact_scale[(size_t)grb * gact_slab +
+                               pulsar_mx_sfoff((int)t, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
+                }
+            }
         }
     }
 #endif
@@ -524,7 +588,8 @@ int pulsar_gpu_attention_f16_prefill(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, 0, 0);
+                                            NULL, NULL, NULL, 0u, 1u, 0, 0,
+                                            NULL, NULL, 0, 0u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -575,6 +640,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u, comp_pack, 1);
+                                            positions ? n_banks : 1u, comp_pack, 1,
+                                            NULL, NULL, 0, 0u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }

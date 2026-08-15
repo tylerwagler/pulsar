@@ -451,6 +451,19 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch);
 
+/* GROUPED activation slots for the attn-output "a" projection (batch_heads).
+ * Reserves per-group E4M3 data plus a per-group swizzled E8M0 scale slab and
+ * zeroes the scales, so the attention epilogue and rope_tail can emit the
+ * encoding between them and the GEMM's quantize pass disappears.  `scale_slab`
+ * returns the per-group stride the producers must index with.  Returns 0 on
+ * failure; note() only after BOTH producers have run. */
+int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                               uint32_t n_groups, uint64_t group_dim,
+                               void **data_out, void **scale_out,
+                               int *sf_pitch, uint64_t *scale_slab);
+void pulsar_gpu_mxfp8_gact_note(void);
+void pulsar_gpu_mxfp8_gact_disarm(void);
+
 /* Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 

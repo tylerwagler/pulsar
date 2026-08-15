@@ -819,6 +819,88 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
     return 1;
 }
 
+/* GROUPED activation cache -- the attn-output "a" projection only.
+ *
+ * Separate from the slot array above because the grouped encoding has a
+ * different shape (per-group data AND a per-group scale slab) and exactly ONE
+ * producer/consumer pair, so a single entry is enough.  The reason it needs a
+ * cache at all is the same as the non-grouped case: cuda_attention_output_a_mx_gemm
+ * carves xq/sx out of cuda_tmp_alloc, which is one shared scratch region that
+ * later callers freely overwrite -- a producer cannot fill a buffer that does
+ * not outlive the kernels between it and the GEMM. */
+struct mxfp8_gact_cache_t {
+    const void    *key_ptr;
+    uint32_t       key_ntok;
+    uint32_t       key_ngroups;
+    uint64_t       key_gdim;
+    int            valid;
+    __nv_fp8_e4m3 *xq;
+    size_t         xq_cap;
+    unsigned char *sx;
+    size_t         sx_cap;
+    size_t         scale_slab;
+    int            kbp;
+};
+static thread_local mxfp8_gact_cache_t g_gact;
+
+static mxfp8_gact_cache_t *gact_find(const void *ptr, uint32_t ntok,
+                                     uint32_t ngroups, uint64_t gdim) {
+    if (!ptr || g_gact.key_ptr != ptr || g_gact.key_ntok != ntok ||
+        g_gact.key_ngroups != ngroups || g_gact.key_gdim != gdim) {
+        return NULL;
+    }
+    return &g_gact;
+}
+
+int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                               uint32_t n_groups, uint64_t group_dim,
+                               void **data_out, void **scale_out,
+                               int *sf_pitch, uint64_t *scale_slab) {
+    if (!heads || !heads->ptr || n_tokens == 0 || n_groups == 0 ||
+        group_dim == 0 || (group_dim % 32) != 0 ||
+        !data_out || !scale_out || !sf_pitch || !scale_slab) {
+        return 0;
+    }
+    const int KBp = mx_rup((int)(group_dim / 32), 4);
+    const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
+    const size_t data_bytes  = (size_t)n_tokens * n_groups * group_dim;
+    const size_t scale_bytes = (size_t)n_groups * slab;
+    if (!mxfp8_act_cache_reserve((void **)&g_gact.xq, &g_gact.xq_cap, data_bytes, "gact data") ||
+        !mxfp8_act_cache_reserve((void **)&g_gact.sx, &g_gact.sx_cap, scale_bytes, "gact scale")) {
+        return 0;
+    }
+    /* Same reason as the non-grouped slot: mx_sfoff leaves holes, and the
+     * producers here fill only the (row, kb) pairs they own -- and they own
+     * them in TWO passes (attn_f16 the nope blocks, rope_tail the rope tail),
+     * so a stale byte between them would survive into the GEMM. */
+    if (cudaMemsetAsync(g_gact.sx, 0, scale_bytes, 0) != cudaSuccess) return 0;
+    g_gact.key_ptr     = heads->ptr;
+    g_gact.key_ntok    = n_tokens;
+    g_gact.key_ngroups = n_groups;
+    g_gact.key_gdim    = group_dim;
+    g_gact.scale_slab  = slab;
+    g_gact.kbp         = KBp;
+    g_gact.valid       = 0;
+    *data_out   = g_gact.xq;
+    *scale_out  = g_gact.sx;
+    *sf_pitch   = KBp;
+    *scale_slab = (uint64_t)slab;
+    return 1;
+}
+
+/* Declare the grouped encoding current.  BOTH producers must have run: the
+ * attention epilogue owns the nope blocks and rope_tail owns the rope tail it
+ * rewrites in place afterwards, so noting after only one leaves the GEMM
+ * reading zeroed scale bytes for the other half. */
+void pulsar_gpu_mxfp8_gact_note(void) {
+    if (g_gact.key_ptr) g_gact.valid = 1;
+}
+
+void pulsar_gpu_mxfp8_gact_disarm(void) {
+    g_gact.key_ptr = NULL;
+    g_gact.valid   = 0;
+}
+
 /* Declare the E4M3 encoding current (producer filled the slots above). */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
     if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid = 1;
@@ -1032,19 +1114,34 @@ static int cuda_attention_output_a_mx_gemm(
     const size_t data_bytes = (size_t)n_tokens * n_groups * group_dim;
     const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
     size_t wz = 32u << 20;
-    size_t off_sx = (data_bytes + 255) & ~(size_t)255;
-    size_t off_ws = (off_sx + scale_bytes + 255) & ~(size_t)255;
-    char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "attn_out_a mx scratch");
-    if (!scratch) return 0;
-    __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)scratch;
-    unsigned char *sx = (unsigned char *)(scratch + off_sx);
-    void *ws = scratch + off_ws;
-    cudaMemsetAsync(sx, 0, scale_bytes, 0);
-    int warps = (int)n_tokens * (int)n_groups * (int)KB;
-    mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
-            (const float *)heads->ptr, (int)n_tokens, (int)n_groups,
-            (int)group_dim, KBp, xq, sx, x_scale_slab);
-    if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
+    __nv_fp8_e4m3 *xq;
+    unsigned char *sx;
+    void *ws;
+    /* Producer-emitted grouped encoding (attn_f16 epilogue + rope_tail): the
+     * quantize pass is not moved, it is skipped entirely.  The slab geometry
+     * the producers wrote must match what this GEMM is about to describe to
+     * cuBLASLt, so check it rather than trust the key. */
+    mxfp8_gact_cache_t *gc = gact_find(heads->ptr, n_tokens, n_groups, group_dim);
+    if (gc && gc->valid && gc->kbp == KBp && gc->scale_slab == x_scale_slab) {
+        xq = gc->xq;
+        sx = gc->sx;
+        ws = cuda_tmp_alloc(wz, "attn_out_a mx scratch");
+        if (!ws) return 0;
+    } else {
+        size_t off_sx = (data_bytes + 255) & ~(size_t)255;
+        size_t off_ws = (off_sx + scale_bytes + 255) & ~(size_t)255;
+        char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "attn_out_a mx scratch");
+        if (!scratch) return 0;
+        xq = (__nv_fp8_e4m3 *)scratch;
+        sx = (unsigned char *)(scratch + off_sx);
+        ws = scratch + off_ws;
+        cudaMemsetAsync(sx, 0, scale_bytes, 0);
+        int warps = (int)n_tokens * (int)n_groups * (int)KB;
+        mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
+                (const float *)heads->ptr, (int)n_tokens, (int)n_groups,
+                (int)group_dim, KBp, xq, sx, x_scale_slab);
+        if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
+    }
     /* Same shape-keyed handle/algo cache as the main MXFP8 GEMM above (and
      * the same gotcha: the heuristic must see scale pointers on the desc or
      * it picks a non-MX algo). The per-group loop swaps only scale pointers,
