@@ -786,6 +786,10 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
+    /* qr_norm feeds the MXFP8 attn_q_b GEMV; emit its E4M3 too so no decode
+     * GEMV is left multiplying against f32.  Declared outside the branch
+     * because both arms produce qr_norm and the arm/note must see either. */
+    void *qn_q = NULL, *qn_sf = NULL; int qn_kbp = 0;
     if (qkv_rms_fused) {
         if (ok && !qkv_pair_projected) ok = pulsar_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
                                                   layer->attn_kv->abs_offset,
@@ -794,7 +798,11 @@ bool gpu_graph_encode_decode_layer(
         if (ok) {
             gpu_graph_debug_dump_tensor("KVraw", g->kv_raw, PULSAR_N_HEAD_DIM, il, pos);
         }
-        if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->qr_norm, 1, (uint64_t)q_rank,
+                                                        &qn_q, &qn_sf, &qn_kbp)) {
+            qn_q = NULL; qn_sf = NULL; qn_kbp = 0;
+        }
+        if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->qr_norm,
                                                              g->qr,
                                                              model->map,
                                                              model->size,
@@ -805,13 +813,21 @@ bool gpu_graph_encode_decode_layer(
                                                              layer->attn_kv_a_norm->abs_offset,
                                                              PULSAR_N_HEAD_DIM,
                                                              1,
-                                                             PULSAR_RMS_EPS) != 0;
+                                                             PULSAR_RMS_EPS,
+                                                             qn_q, qn_sf, qn_kbp) != 0;
     } else {
-        if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->qr_norm, 1, (uint64_t)q_rank,
+                                                        &qn_q, &qn_sf, &qn_kbp)) {
+            qn_q = NULL; qn_sf = NULL; qn_kbp = 0;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->qr_norm, g->qr,
                                                       model->map, model->size,
                                                       layer->attn_q_a_norm->abs_offset,
-                                                      (uint32_t)q_rank, PULSAR_RMS_EPS) != 0;
+                                                      (uint32_t)q_rank, PULSAR_RMS_EPS,
+                                                      qn_q, qn_sf, qn_kbp) != 0;
     }
+    if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->qr_norm, 1, (uint64_t)q_rank);
+    if (ok && qn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora_norm", g->qr_norm, q_rank, il, pos);
     }

@@ -72,7 +72,12 @@ __global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pu
 
 
 
-__global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+/* out_q/out_sf, when non-NULL, additionally emit the E4M3 + ue8m0 encoding, so
+ * a GEMM consuming this norm multiplies in the source's format instead of
+ * against f32.  Same contract as pulsar_cuda_mx.cuh: every lane of a warp must
+ * reach the emit, which the launcher guarantees by refusing n % 256 != 0. */
+__global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps,
+                                              __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float *xr = x + (uint64_t)row * n;
@@ -91,7 +96,9 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale * w[i];
+        const float v = xr[i] * scale * w[i];
+        orow[i] = v;
+        if (out_q) pulsar_mx_emit_block(v, i, row, n, out_kbp, out_q, out_sf);
     }
 }
 
@@ -1105,7 +1112,8 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, const pulsar_g
 }
 
 
-int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
+        void *out_q, void *out_sf, int out_kbp) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -1113,8 +1121,21 @@ int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_t
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    /* FAIL LOUD, not skip: the caller arms the activation cache off the same
+     * slot pointer, so a silently skipped emission leaves the GEMM reading a
+     * memset-zero E4M3 buffer -- a well-formed WRONG answer. */
+    if (out_q && (n % 256u) != 0u) {
+        fprintf(stderr, "pulsar: rms_norm_weight cannot emit MX for n=%u "
+                        "(needs a multiple of 256)\n", n);
+        return 0;
+    }
+    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+                                       (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+    return pulsar_gpu_rms_norm_weight_mx_tensor(out, x, model_map, model_size, weight_offset, n, eps, NULL, NULL, 0);
 }
 
 
@@ -1126,7 +1147,8 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                          NULL, NULL, 0);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
