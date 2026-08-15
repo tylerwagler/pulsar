@@ -121,7 +121,6 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 // floor(log2(amax)) - 7, data = v * 2^-se, SF byte = se+127; CUTLASS reconstructs v = data*2^(se-127+127-... )
 // i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
 // (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
-template<class TSFA>
 
 /* Vectorized twin (2026-07-26): the scalar kernel above is one thread per 32-block
  * doing 32 serial scalar LDG.32 for the amax + 32 scalar STG.8 — issue/latency
