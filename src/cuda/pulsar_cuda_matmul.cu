@@ -1611,6 +1611,15 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * ~out_dim x; see the kernel comment). */
             mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, n_tok, in_dim);
             if (ac8 && ac8->valid) {
+                /* Say it once.  A gate PASS cannot distinguish "the A8 path ran
+                 * and is correct" from "the A8 path never ran", and the second
+                 * is what a mis-keyed cache would silently produce. */
+                static int announced_a8 = 0;
+                if (!announced_a8) {
+                    announced_a8 = 1;
+                    fprintf(stderr, "pulsar: decode GEMV = W8A8 (E4M3 activations; "
+                                    "was W8A32 against f32)\n");
+                }
                 const int xKBp = mx_rup((int)(in_dim / 32), 4);
                 for (uint64_t t = 0; t < n_tok; t++)
                     mxfp8_mmvq_deint_a8_kernel<<<grid, wpb * 32>>>(
