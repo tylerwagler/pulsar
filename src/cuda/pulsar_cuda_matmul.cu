@@ -1123,6 +1123,18 @@ static int cuda_attention_output_a_mx_gemm(
      * cuBLASLt, so check it rather than trust the key. */
     mxfp8_gact_cache_t *gc = gact_find(heads->ptr, n_tokens, n_groups, group_dim);
     if (gc && gc->valid && gc->kbp == KBp && gc->scale_slab == x_scale_slab) {
+        /* Announce once per process, like the attention tier line.  Whether
+         * this path is TAKEN is the whole question for the fusion's value: it
+         * needs raw_prefix_tokens == n_tokens, and long prefills with
+         * compressed KV go through the per-token indexed loop instead.  A
+         * silent fallback is indistinguishable from a working fusion in every
+         * measurement except a kernel-count profile, so say so. */
+        static int announced_gact = 0;
+        if (!announced_gact) {
+            announced_gact = 1;
+            fprintf(stderr, "pulsar: attn-out 'a' activation = producer-emitted E4M3 "
+                            "(grouped quantise pass skipped)\n");
+        }
         xq = gc->xq;
         sx = gc->sx;
         ws = cuda_tmp_alloc(wz, "attn_out_a mx scratch");

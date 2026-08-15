@@ -2366,7 +2366,8 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
                     (const float *)raw_kv->ptr, NULL,
                     n_tokens, 0u, window, 1u, n_head, head_dim, (int)raw_f16,
-                    gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope)) {
+                    gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
+                    0u, n_tokens)) {
                 if (mx_out && gact_data) *mx_out = 1;
                 return 1;
             }

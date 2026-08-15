@@ -143,7 +143,14 @@ static void attn_f16_kernel(
          * afterwards and owns those blocks -- see pulsar_gpu_mxfp8_gact_slot. */
         __nv_fp8_e4m3 *__restrict__ gact_data,
         unsigned char *__restrict__ gact_scale,
-        int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope) {
+        int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
+        /* The grouped encoding is indexed by BATCH-ABSOLUTE token, but this
+         * kernel may be launched over a VIEW covering one token (the per-token
+         * indexed prefill loop).  gact_tok0 is this launch's offset into the
+         * batch and gact_ntok the batch's total row count -- they are the row
+         * and the stride the "a" GEMM will read with, and are NOT the kernel's
+         * own n_tokens unless the launch covers the whole batch. */
+        uint32_t gact_tok0, uint32_t gact_ntok) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
@@ -152,6 +159,7 @@ static void attn_f16_kernel(
     (void)comp_pack; (void)ring;
     (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
     (void)n_groups; (void)n_nope;
+    (void)gact_tok0; (void)gact_ntok;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -515,8 +523,9 @@ static void attn_f16_kernel(
                 const int seb = pulsar_mx_shared_exp(ab);
                 const uint32_t gra = ha / hpg, hha = ha % hpg;
                 const uint32_t grb = hb / hpg, hhb = hb % hpg;
-                __nv_fp8_e4m3 *da = gact_data + ((size_t)gra * n_tokens + t) * gd + hha * AF16_DIM;
-                __nv_fp8_e4m3 *db = gact_data + ((size_t)grb * n_tokens + t) * gd + hhb * AF16_DIM;
+                const uint32_t arow = gact_tok0 + t;   /* batch-absolute token */
+                __nv_fp8_e4m3 *da = gact_data + ((size_t)gra * gact_ntok + arow) * gd + hha * AF16_DIM;
+                __nv_fp8_e4m3 *db = gact_data + ((size_t)grb * gact_ntok + arow) * gd + hhb * AF16_DIM;
                 #pragma unroll
                 for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
                     const uint32_t nb = warp * AF16_DPW + n * 8u;
@@ -529,9 +538,9 @@ static void attn_f16_kernel(
                     const uint32_t kba = hha * (AF16_DIM / 32u) + warp;
                     const uint32_t kbb = hhb * (AF16_DIM / 32u) + warp;
                     gact_scale[(size_t)gra * gact_slab +
-                               pulsar_mx_sfoff((int)t, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
+                               pulsar_mx_sfoff((int)arow, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
                     gact_scale[(size_t)grb * gact_slab +
-                               pulsar_mx_sfoff((int)t, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
+                               pulsar_mx_sfoff((int)arow, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
                 }
             }
         }
@@ -577,7 +586,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim, int raw_f16,
         void *gact_data, void *gact_scale, int gact_kbp,
-        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope) {
+        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
+        uint32_t gact_tok0, uint32_t gact_ntok) {
     if (!heads || !sinks || !q || !raw_kv) return 0;
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
@@ -603,7 +613,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             NULL, NULL, NULL, 0u, 1u, 0, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
-                                            gact_kbp, gact_slab, n_groups, n_nope);
+                                            gact_kbp, gact_slab, n_groups, n_nope,
+                                            gact_tok0, gact_ntok);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -616,7 +627,7 @@ int pulsar_gpu_attention_f16_prefill(
     return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
                                                n_head, head_dim, raw_f16,
-                                               NULL, NULL, 0, 0u, 0u, 0u);
+                                               NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
 }
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
@@ -666,6 +677,6 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
                                             positions ? n_banks : 1u, comp_pack, 1,
-                                            NULL, NULL, 0, 0u, 0u, 0u);
+                                            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }

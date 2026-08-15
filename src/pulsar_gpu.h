@@ -210,7 +210,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim, int raw_f16,
         void *gact_data, void *gact_scale, int gact_kbp,
-        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope);
+        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
+        uint32_t gact_tok0, uint32_t gact_ntok);
 
 int pulsar_gpu_attention_f16_prefill(
         float                   *heads,
