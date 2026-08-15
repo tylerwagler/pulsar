@@ -205,22 +205,12 @@ static bool out_memset_enabled() {
     return cached != 0;
 }
 
-static int64_t d2r_min_cols() {
-    static int64_t cached = -1;
-    if (cached < 0) {
-        cached = 1024;
-        const char *env = getenv("DS4_MMQ_D2R_MIN_COLS");
-        if (env && env[0] != '\0') {
-            char *end = nullptr;
-            const long v = strtol(env, &end, 10);
-            if (end != env && v > 0) {
-                cached = (int64_t)v;
-            }
-        }
-    }
-    return cached;
-}
-
+/* d2r_min_cols() and DS4_MMQ_D2R_MIN_COLS are GONE.  The threshold selected a
+ * different KERNEL, and therefore a different ACTIVATION FORMAT, by batch size:
+ * under 1024 rows the expert GEMMs took generic MMQ on int8 q8_1, above it D2R
+ * on E4M3.  Do not reintroduce it.  If D2R is ever slower on small batches,
+ * that is a reason to fix D2R's small-batch path, not to silently swap the
+ * numerics underneath the model. */
 extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
     return g_q81_scratch_bytes;
 }
