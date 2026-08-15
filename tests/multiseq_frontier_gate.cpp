@@ -196,8 +196,7 @@ static bool read_bank_rows(pulsar_gpu_graph *g, int index_cache, uint32_t il,
 
 static uint64_t attn_row_bytes(void) { return gpu_graph_attn_comp_cache_row_bytes(); }
 static uint64_t index_row_bytes(void) {
-    return gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                                       : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    return PULSAR_ENGINE_IDXFP4_ROWBYTES;
 }
 
 /* Snapshot every compressed layer's rows [0, upto_rows) of one bank. */

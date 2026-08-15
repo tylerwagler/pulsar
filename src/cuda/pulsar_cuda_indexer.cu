@@ -5,9 +5,7 @@
  * + 4 E8M0 block-32 scales) instead of f32.  The cache rows are QAT-roundtripped
  * to exactly these values in both modes, so the scores are bit-identical; packed
  * mode only changes storage and read traffic.  head_dim must be 128. */
-static int g_indexer_fp4 = 0;
 
-void pulsar_gpu_indexer_set_fp4(int on) { g_indexer_fp4 = on ? 1 : 0; }
 
 __device__ static inline float idx_e2m1_value_dev(int i) {
     switch (i & 7) {
@@ -22,10 +20,10 @@ __device__ static inline float idx_e2m1_value_dev(int i) {
     }
 }
 
-__device__ static inline float idx_comp_load_dev(const float *index_comp, int fp4,
+__device__ static inline float idx_comp_load_dev(const float *index_comp,
                                                  uint64_t row, uint32_t d,
                                                  uint32_t head_dim) {
-    if (!fp4) return index_comp[row * head_dim + d];
+    (void)head_dim;   /* packed rows are always the 68-byte head_dim-128 layout */
     const uint8_t *r = (const uint8_t *)index_comp + row * PULSAR_MXKV_FP4_ROWBYTES(128u);
     /* 2^(e8-127) built directly as a float exponent — exact for e8 in [1,254],
      * and the pack amax floor (7e-38 -> e8 >= 2) rules out byte 0. ~20% cheaper
@@ -69,7 +67,6 @@ __global__ static void indexer_scores_kernel(
         uint32_t ratio,
         float scale,
         int causal,
-        int fp4,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
         const void * const * __restrict__ index_bank_ptrs,
@@ -102,7 +99,7 @@ __global__ static void indexer_scores_kernel(
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
-            dot += qh[d] * idx_comp_load_dev(index_src, fp4, comp_base + c, d, head_dim);
+            dot += qh[d] * idx_comp_load_dev(index_src, comp_base + c, d, head_dim);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -136,7 +133,6 @@ __global__ static void indexer_score_one_direct_kernel(
         uint32_t ratio,
         float scale,
         int causal,
-        int fp4,
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
         const void * const * __restrict__ index_bank_ptrs,
@@ -168,7 +164,7 @@ __global__ static void indexer_score_one_direct_kernel(
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_src, fp4, comp_base + c, tid, 128u);
+    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_src, comp_base + c, tid, 128u);
     __syncthreads();
 
     /* Per-warp accumulation: warp w owns heads w, w+4, ..., w+60 and keeps a
@@ -205,8 +201,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal,
-        int fp4) {
+        int causal) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
@@ -247,7 +242,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = idx_comp_load_dev(index_comp, fp4, comp, d, head_dim);
+        if (comp < n_comp) v = idx_comp_load_dev(index_comp, comp, d, head_dim);
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -916,7 +911,6 @@ static int indexer_scores_launch(
         const pulsar_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks) {
-    const int fp4 = g_indexer_fp4;
     /* Descriptor (banked) mode: both per-row arrays or neither; the comp
      * cache operand is the whole bank pool, so the byte bound scales by
      * n_banks * comp_cap rows and the uint32 row ABI (seq*cap + local) must
@@ -943,12 +937,10 @@ static int indexer_scores_launch(
     const uint64_t comp_rows_min = (descr && index_bank_ptrs) ? (uint64_t)comp_cap
                                  : descr ? (uint64_t)n_banks * comp_cap
                                          : (uint64_t)n_comp;
-    const uint64_t comp_bytes = fp4
-        ? comp_rows_min * PULSAR_MXKV_FP4_ROWBYTES(128u)
-        : comp_rows_min * head_dim * sizeof(float);
+    const uint64_t comp_bytes = comp_rows_min * PULSAR_MXKV_FP4_ROWBYTES(128u);
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        (fp4 && head_dim != 128u) ||
+        head_dim != 128u ||   /* packed rows are the 68-byte head_dim-128 layout */
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < comp_bytes ||
@@ -967,7 +959,7 @@ static int indexer_scores_launch(
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
                                                          n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0, fp4,
+                                                         scale, causal ? 1 : 0,
                                                          positions_ptr, seq_id_ptr,
                                                          index_bank_ptrs_ptr,
                                                          comp_cap, kernel_n_banks);
@@ -990,7 +982,7 @@ static int indexer_scores_launch(
      * slower kernel -- the same fail-open shape the type-tag dispatches keep
      * getting bitten by. */
     static const int use_mxfp4 = pulsar_env_tier_on("PULSAR_CUDA_INDEXER_MXFP4");
-    if (use_mxfp4 && !descr && !g_quality_mode && fp4 &&
+    if (use_mxfp4 && !descr && !g_quality_mode &&
         head_dim == 128u && n_head == 64u) {
         /* Say so once: this tier changes the numbers, so "did it engage" must
          * be answerable from a log rather than inferred from a timing delta. */
@@ -1004,7 +996,7 @@ static int indexer_scores_launch(
                 (float *)scores->ptr, (const float *)q->ptr,
                 (const float *)weights->ptr, index_comp->ptr,
                 n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
-                causal ? 1 : 0, fp4);
+                causal ? 1 : 0);
     }
 
     /* The WMMA tier stays single-bank (like the reference design): banked
@@ -1016,7 +1008,7 @@ static int indexer_scores_launch(
                                                      (const float *)weights->ptr,
                                                      (const float *)index_comp->ptr,
                                                      n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0, fp4);
+                                                     head_dim, ratio, scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
     }
     dim3 grid(n_comp, n_tokens, 1);
@@ -1025,7 +1017,7 @@ static int indexer_scores_launch(
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0, fp4,
+                                         head_dim, ratio, scale, causal ? 1 : 0,
                                          positions_ptr, seq_id_ptr,
                                          index_bank_ptrs_ptr,
                                          comp_cap, kernel_n_banks);

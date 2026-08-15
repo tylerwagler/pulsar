@@ -41,8 +41,7 @@ static char *read_file(const char *path, size_t *len_out) {
 static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);
     if (!buf) return 0;
@@ -318,8 +317,7 @@ int main(int argc, char **argv) {
         {
             pulsar_gpu_graph *g = &s->graph;
             const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-            const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-                ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+            const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
             uint8_t *ra = (uint8_t *)malloc((size_t)attn_row), *rb = (uint8_t *)malloc((size_t)attn_row);
             int diffc = 0, diffi = 0, checked = 0;
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

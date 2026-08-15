@@ -1375,9 +1375,7 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
 
     /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */
     const uint64_t attn_row_bytes  = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t index_row_bytes = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     m.compressed_bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);

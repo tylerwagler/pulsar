@@ -300,8 +300,7 @@ int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
     }
     gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint32_t hdr[4] = { PULSAR_BANK_KV_MAGIC, PULSAR_BANK_KV_VERSION, bank, (uint32_t)PULSAR_N_LAYER };
     if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -378,8 +377,7 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * failure the bank's ms counters stay 0 (from free_physical) so it advertises
      * an EMPTY frontier — no OOB — and the caller fails the request. */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;

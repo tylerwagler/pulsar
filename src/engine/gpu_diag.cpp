@@ -443,9 +443,7 @@ uint64_t gpu_graph_session_bytes_banked(
         total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
         total += (uint64_t)dz.comp_cap * PULSAR_N_HEAD_DIM * f32;            /* attn_comp_dequant */
     }
-    if (gpu_graph_idx_fp4_enabled()) {
-        total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
-    }
+    total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
     total += dz.indexer_q_dim * f32;                      /* indexer_q */
     total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
     total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
@@ -544,9 +542,7 @@ uint64_t gpu_graph_session_bytes_banked(
  * allocator in gpu_graph_bank_slabs_alloc. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -699,9 +695,7 @@ static bool gpu_graph_bank_slabs_alloc(
             const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
             const uint64_t index_rows = (uint64_t)coff * ratio;
             const uint64_t index_lane = index_width * index_rows * sizeof(float);
-            const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-                ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+            const uint64_t index_row_bytes = PULSAR_ENGINE_IDXFP4_ROWBYTES;
             b->index_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
                                       index_row_bytes;
             b->istate_bank_bytes[il] = index_lane;
@@ -727,8 +721,7 @@ static bool gpu_graph_bank_slabs_alloc(
      * one packed index row per (bank, layer); a few hundred KB total). */
     if (ok) {
         const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-        const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-            ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+        const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
         g->emit_stash_comp = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * attn_row);
         g->emit_stash_index = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * idx_row);
         ok = g->emit_stash_comp && g->emit_stash_index;
@@ -895,8 +888,7 @@ bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank
     pulsar_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
     if (!stash) return true;
     const uint64_t row_bytes = indexer
-        ? (gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                                       : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float))
+        ? (PULSAR_ENGINE_IDXFP4_ROWBYTES)
         : gpu_graph_attn_comp_cache_row_bytes();
     const uint32_t keep4 = keep - 1u;              /* the boundary row index R/4 */
     pulsar_gpu_tensor *cache = indexer ? gpu_graph_bank_index_comp_view(g, il, bank)
@@ -940,8 +932,7 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
     if ((uint64_t)R < oldest + g->raw_window) return false;   /* scrolled out */
     if (!g->emit_stash_comp || !g->emit_stash_index) return false;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     const uint32_t keep4 = R / 4u;
     const uint64_t raw_row_bytes = b->raw_bank_bytes / rcap;
     bool ok = true;
@@ -1021,8 +1012,7 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
     if (gpu_graph_bank_is_evicted(g, dst) && !gpu_graph_bank_alloc_physical(g, dst)) return false;
     pulsar_bank_slabs *b = &g->banks;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1288,9 +1278,7 @@ uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t ban
     const uint32_t nb = gpu_graph_bank_pool_count(g);
     if (bank >= nb) return 0;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -1323,8 +1311,7 @@ uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g) {
  * n_live_growing_banks × this. */
 uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1747,9 +1734,7 @@ bool gpu_graph_alloc_raw_cap(
             if (ratio == 4) {
                 const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
-                const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-                    ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                    : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+                const uint64_t index_row_bytes = PULSAR_ENGINE_IDXFP4_ROWBYTES;
                 if (banked) {
                     g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
                             g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
@@ -1792,7 +1777,7 @@ bool gpu_graph_alloc_raw_cap(
         g->attn_comp_dequant = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                     PULSAR_N_HEAD_DIM * sizeof(float));
     }
-    if (gpu_graph_idx_fp4_enabled()) {
+    {
         if (PULSAR_N_INDEXER_HEAD_DIM != 128u) {
             /* The packed loader and QAT+pack kernels hard-code the 68-byte
              * head_dim-128 row; fail loud here instead of deep in a launch. */
@@ -1806,7 +1791,6 @@ bool gpu_graph_alloc_raw_cap(
          * the compressor writers can keep their absolute row indices. */
         g->idx_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                  PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-        pulsar_gpu_indexer_set_fp4(1);
     }
     g->indexer_q = pulsar_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD * sizeof(float));
@@ -1907,7 +1891,7 @@ bool gpu_graph_alloc_raw_cap(
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
-                             (!gpu_graph_idx_fp4_enabled() || g->idx_comp_stage != NULL) &&
+                             g->idx_comp_stage != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
                              (!enable_spec ||

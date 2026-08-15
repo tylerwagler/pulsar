@@ -159,12 +159,6 @@ int gpu_graph_attn_pack_enabled(void) {
     return cached;
 }
 
-int gpu_graph_idx_fp4_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_IDX_FP4", 1);
-    return cached;
-}
-
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
@@ -831,13 +825,11 @@ bool gpu_graph_encode_decode_layer(
                                                               g->attn_norm, 1);
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
-            const int idx_fp4 = gpu_graph_idx_fp4_enabled();
             if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                             g->comp_sc_cur,
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
-                                                            idx_fp4 ? g->idx_comp_stage
-                                                                    : g->layer_index_comp_cache[il],
+                                                            g->idx_comp_stage,
                                                             model->map,
                                                             model->size,
                                                             layer->indexer_compressor_ape->abs_offset,
@@ -859,22 +851,17 @@ bool gpu_graph_encode_decode_layer(
                                                             PULSAR_RMS_EPS) != 0;
             if (ok && emit) {
                 pulsar_gpu_tensor *index_row_view = pulsar_gpu_tensor_view(
-                        idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
+                        g->idx_comp_stage,
                         (uint64_t)index_row * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
                         (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
                 if (!index_row_view) {
                     ok = false;
-                } else if (idx_fp4) {
+                } else {
                     ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
                                                                g->layer_index_comp_cache[il],
                                                                index_row,
                                                                1,
                                                                PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                    pulsar_gpu_tensor_free(index_row_view);
-                } else {
-                    ok = pulsar_gpu_dsv4_indexer_qat_tensor(index_row_view,
-                                                          1,
-                                                          PULSAR_N_INDEXER_HEAD_DIM) != 0;
                     pulsar_gpu_tensor_free(index_row_view);
                 }
                 /* plan-33 inc C: boundary-row restore (decode-fallback site). */

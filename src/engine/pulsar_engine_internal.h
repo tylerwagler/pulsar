@@ -2296,7 +2296,6 @@ uint32_t gpu_graph_prefill_slice(void);
  * 7.5x smaller than f32) and the indexer score kernels read it packed.  The
  * cache rows are QAT-roundtripped to exactly these fp4 values in both modes,
  * so scores and outputs are bit-identical; only storage and traffic change. */
-int gpu_graph_idx_fp4_enabled(void);
 /* Comp-cache row stride in bytes for the active storage format (pack-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
 /* Returns the comp-cache tensor to hand to the f32 prefill attention consumers

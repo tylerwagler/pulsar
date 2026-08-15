@@ -230,7 +230,7 @@ static int payload_write_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                     char *err, size_t errlen) {
     const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
     pulsar_gpu_tensor *src = g->layer_index_comp_cache[il];
-    if (gpu_graph_idx_fp4_enabled() && n_rows != 0) {
+    if (n_rows != 0) {
         if (!g->idx_comp_stage ||
             pulsar_gpu_mxkv_dequant_tensor(g->layer_index_comp_cache[il],
                                         g->idx_comp_stage,
@@ -249,7 +249,7 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                    uint32_t n_rows, uint8_t *buf, size_t cap,
                                    uint64_t *remaining, char *err, size_t errlen) {
     const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    if (!gpu_graph_idx_fp4_enabled() || n_rows == 0) {
+    if (n_rows == 0) {
         return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
                                         buf, cap, remaining, err, errlen);
     }

@@ -1471,10 +1471,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     fprintf(stderr, "pulsar: GPU layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                 if (ok) {
-                    ok = pulsar_gpu_compressor_prefill_tensor(idx_fp4 ? g->idx_comp_stage
-                                                                   : g->layer_index_comp_cache[il],
+                    ok = pulsar_gpu_compressor_prefill_tensor(g->idx_comp_stage,
                                                              g->layer_index_state_kv[il],
                                                              g->layer_index_state_score[il],
                                                              g->batch_comp_kv,
@@ -1501,15 +1499,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              PULSAR_RMS_EPS) != 0;
                 }
                 if (ok && n_comp != 0) {
-                    ok = idx_fp4
-                        ? pulsar_gpu_dsv4_indexer_qat_pack_tensor(g->idx_comp_stage,
+                    ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(g->idx_comp_stage,
                                                                 g->layer_index_comp_cache[il],
                                                                 0,
                                                                 n_comp,
-                                                                PULSAR_N_INDEXER_HEAD_DIM) != 0
-                        : pulsar_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
-                                                          n_comp,
-                                                          PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                PULSAR_N_INDEXER_HEAD_DIM) != 0;
                     /* plan-33 inc C: boundary-row restore (whole-prefill site). */
                     if (ok) ok = gpu_graph_emit_keep_restore(g, il,
                             g->banks.n_banks ? g->banks.cur_bank : 0u, 0, n_comp, true);
@@ -1534,8 +1528,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (n_comp != 0) {
                         gpu_graph_debug_dump_tensor("indexer_KVcompress",
-                                                      idx_fp4 ? g->idx_comp_stage
-                                                              : g->layer_index_comp_cache[il],
+                                                      g->idx_comp_stage,
                                                       (uint64_t)n_comp * PULSAR_N_INDEXER_HEAD_DIM,
                                                       il,
                                                       pos0);
@@ -1567,11 +1560,10 @@ bool gpu_graph_encode_layer_attention_batch(
                         fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
-                    const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                     pulsar_gpu_tensor *index_view = NULL;
                     if (ok) {
                         index_view = pulsar_gpu_tensor_view(
-                                idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
+                                g->idx_comp_stage,
                                 (uint64_t)index_before * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
                                 (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
                         ok = index_view != NULL;
@@ -1604,15 +1596,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                 PULSAR_RMS_EPS) != 0;
                     }
                     if (ok && index_chunk != 0) {
-                        ok = idx_fp4
-                            ? pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
+                        ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
                                                                     g->layer_index_comp_cache[il],
                                                                     index_before,
                                                                     index_chunk,
-                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0
-                            : pulsar_gpu_dsv4_indexer_qat_tensor(index_view,
-                                                              index_chunk,
-                                                              PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
                         /* plan-33 inc C: boundary-row restore (chunked emit site —
                          * the replay-from-R path that recomputes row R/4). */
                         if (ok) ok = gpu_graph_emit_keep_restore(g, il,
@@ -1667,7 +1655,6 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t bank = run_bank;
                     const uint32_t index_before = g->ms_n_index_comp[bank][il];
                     const uint32_t index_chunk = n_tokens / ratio;
-                    const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                     pulsar_gpu_tensor *bank_idx = NULL, *bank_ist_kv = NULL, *bank_ist_sc = NULL;
                     pulsar_gpu_tensor *index_view = NULL;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
@@ -1681,11 +1668,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         ok = bank_idx && bank_ist_kv && bank_ist_sc;
                     }
                     if (ok) {
-                        index_view = idx_fp4
-                            ? pulsar_gpu_tensor_view(g->idx_comp_stage,
-                                    (uint64_t)index_before * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
-                                    (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float))
-                            : pulsar_gpu_tensor_view(bank_idx,
+                        index_view = pulsar_gpu_tensor_view(g->idx_comp_stage,
                                     (uint64_t)index_before * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
                                     (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
                         ok = index_view != NULL;
@@ -1706,15 +1689,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                 PULSAR_RMS_EPS) != 0;
                     }
                     if (ok && index_chunk != 0) {
-                        ok = idx_fp4
-                            ? pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
+                        ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
                                                                     bank_idx,
                                                                     index_before,
                                                                     index_chunk,
-                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0
-                            : pulsar_gpu_dsv4_indexer_qat_tensor(index_view,
-                                                              index_chunk,
-                                                              PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
                         if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank,
                                 index_before, index_chunk, true);
                     }
@@ -1759,7 +1738,6 @@ bool gpu_graph_encode_layer_attention_batch(
                         pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         const uint32_t index_row = *n_index_slot;
-                        const int idx_fp4 = gpu_graph_idx_fp4_enabled();
                         pulsar_gpu_tensor *ms_st_kv = mseq
                             ? gpu_graph_bank_index_state_kv_view(g, il, bank) : NULL;
                         pulsar_gpu_tensor *ms_st_sc = mseq
@@ -1773,9 +1751,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 sc_view,
                                                                 mseq ? ms_st_kv : g->layer_index_state_kv[il],
                                                                 mseq ? ms_st_sc : g->layer_index_state_score[il],
-                                                                idx_fp4 ? g->idx_comp_stage
-                                                                        : (mseq ? ms_cache
-                                                                                : g->layer_index_comp_cache[il]),
+                                                                g->idx_comp_stage,
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -1798,24 +1774,18 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         if (ok && emit) {
                             pulsar_gpu_tensor *index_row_view = pulsar_gpu_tensor_view(
-                                    idx_fp4 ? g->idx_comp_stage
-                                            : (mseq ? ms_cache : g->layer_index_comp_cache[il]),
+                                    g->idx_comp_stage,
                                     (uint64_t)index_row * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
                                     (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
                             if (!index_row_view) {
                                 ok = false;
-                            } else if (idx_fp4) {
+                            } else {
                                 ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
                                                                            mseq ? ms_cache
                                                                                 : g->layer_index_comp_cache[il],
                                                                            index_row,
                                                                            1,
                                                                            PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                                pulsar_gpu_tensor_free(index_row_view);
-                            } else {
-                                ok = pulsar_gpu_dsv4_indexer_qat_tensor(index_row_view,
-                                                                      1,
-                                                                      PULSAR_N_INDEXER_HEAD_DIM) != 0;
                                 pulsar_gpu_tensor_free(index_row_view);
                             }
                             /* plan-33 inc C: boundary-row restore (banked emit). */

@@ -1060,7 +1060,6 @@ static int check_multibank_indexer(void) {
                 mb_rng_state = mb_rng_state * 1664525u + 1013904223u;
                 host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
             }
-            pulsar_gpu_indexer_set_fp4(1);
             if (pulsar_gpu_tensor_write(slab, 0, host, total)) {
                 case_rc = mb_idx_run_case("fp4", rows, 4, slab, comp_cap,
                                           n_comp_sup, ratio, n_banks, 4, head_dim,
@@ -1078,33 +1077,12 @@ static int check_multibank_indexer(void) {
                                               bank_bytes, 8);
                 }
             }
-            pulsar_gpu_indexer_set_fp4(0);
         }
         pulsar_gpu_tensor_free(slab);
         free(host);
         if (case_rc != 0) goto done;
     }
 
-    /* f32 cache format. */
-    {
-        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
-        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
-        float *host = (float *)malloc(count * sizeof(float));
-        pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count * sizeof(float));
-        int case_rc = 1;
-        if (host && slab) {
-            mb_rng_state = 0x0f320f3u;
-            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
-            if (pulsar_gpu_tensor_write(slab, 0, host, count * sizeof(float))) {
-                case_rc = mb_idx_run_case("f32", rows, 4, slab, comp_cap,
-                                          n_comp_sup, ratio, n_banks, 4, head_dim,
-                                          bank_bytes, 8);
-            }
-        }
-        pulsar_gpu_tensor_free(slab);
-        free(host);
-        if (case_rc != 0) goto done;
-    }
 
     /* Direct-one fast tier (n_tokens == 1, n_head 64): the banked entry must
      * keep the classic single-token reduction order — reference is the SAME

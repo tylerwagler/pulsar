@@ -60,9 +60,7 @@ static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t
     uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
 
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;

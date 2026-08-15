@@ -263,7 +263,7 @@ int pulsar_gpu_attention_f16_indexed(
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or
  * failure; the caller checks the shape conditions itself so a 0 is always a
- * real failure.  Requires n_head == 64, head_dim == 128 and fp4 rows. */
+ * real failure.  Requires n_head == 64 and head_dim == 128. */
 int pulsar_gpu_indexer_scores_mxfp4(
         float                   *scores,
         const float             *q,
@@ -276,8 +276,7 @@ int pulsar_gpu_indexer_scores_mxfp4(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        int                     causal,
-        int                     fp4);
+        int                     causal);
 
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
@@ -649,7 +648,6 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
 
 /* Tell the indexer score kernels the indexer compressed cache is stored
  * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
-void pulsar_gpu_indexer_set_fp4(int on);
 
 /* raw_f16 parameter convention (attention readers / raw KV writers below):
  * the flag describes the STORAGE FORMAT OF THE PASSED raw tensor for THIS

@@ -480,10 +480,9 @@ int pulsar_gpu_indexer_scores_mxfp4(
         float *scores, const float *q, const float *weights, const void *comp,
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t n_head, uint32_t head_dim, uint32_t ratio,
-        float scale, int causal, int fp4) {
+        float scale, int causal) {
     /* Shape gate, evaluated once per launch -- never per token or per layer. */
     if (!scores || !q || !weights || !comp) return 0;
-    if (!fp4) return 0;                       /* packed rows only */
     if (n_head != IDX_HEADS || head_dim != IDX_HEAD_DIM) return 0;
     if (n_comp == 0u || n_tokens == 0u) return 0;
 

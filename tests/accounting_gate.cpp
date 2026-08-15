@@ -101,8 +101,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "
                     "attn_row=%" PRIu64 " idx_row=%" PRIu64 "\n",
             pool, ctx, peak, gpu_graph_attn_comp_cache_row_bytes(),
-            gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                                        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
+            PULSAR_ENGINE_IDXFP4_ROWBYTES);
     if (pool < 2) {
         fprintf(stderr, "accounting_gate: WARNING pool<2 — comp/index may be "
                         "device-resident (not demand-paged); set PULSAR_MSEQ_BANKS>=2\n");
