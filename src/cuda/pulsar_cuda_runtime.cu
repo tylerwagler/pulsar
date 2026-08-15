@@ -913,11 +913,7 @@ int pulsar_gpu_init(void) {
          * --default-stream per-thread) so the decode tape is capturable into
          * a CUDA graph; cuBLAS must launch onto the same stream. */
         (void)cublasSetStream(g_cublas, cudaStreamPerThread);
-        const cublasMath_t math_mode =
-            getenv("PULSAR_CUDA_NO_TF32") != NULL
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
+        (void)cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
         g_cublas_ready = 1;
     }
     return 1;

@@ -1177,7 +1177,6 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, PULSAR_N_EXPERT_USED, il, pos);
     }
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
-    const bool fuse_shared_gate_up = true;
     const bool fuse_shared_down_hc = !keep_ffn_out;
     if (ok) ok = pulsar_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_up,
@@ -1215,7 +1214,7 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, PULSAR_N_EMBD, il, pos);
     }
-    if (ok && fuse_shared_gate_up) {
+    if (ok) {
         ok = pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -1227,17 +1226,6 @@ bool gpu_graph_encode_decode_layer(
                                                          shared_dim,
                                                          g->ffn_norm,
                                                          PULSAR_SWIGLU_CLAMP_EXP) != 0;
-    } else {
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_gate, model->map, model->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
-                                                  PULSAR_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_up, model->map, model->size,
-                                                  layer->ffn_up_shexp->abs_offset,
-                                                  PULSAR_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = pulsar_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                                           shared_dim, PULSAR_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
     if (ok && fuse_shared_down_hc) {

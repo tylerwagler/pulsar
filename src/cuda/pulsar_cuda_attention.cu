@@ -1137,8 +1137,7 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 /* f32 -> fp16 narrowing for the tensor-core attention GEMM operands.
  *
  * The prefill attention pair already runs on tensor cores at TF32
- * (CUBLAS_TF32_TENSOR_OP_MATH is the default; only PULSAR_CUDA_NO_TF32
- * disables it), and TF32 carries the SAME 10 explicit
+ * (CUBLAS_TF32_TENSOR_OP_MATH, unconditional), and TF32 carries the SAME 10 explicit
  * mantissa bits as fp16. Measured 2026-08-05: TF32 costs 5.806e-03 exact
  * full-vocab KL against true FP32, while rounding Q/P to fp16 costs ZERO
  * (byte-identical) -- precisely because the GEMM was already truncating to

@@ -236,8 +236,8 @@ typedef struct {
 static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
 
-/* The engine reads ~90 PULSAR_* env knobs; many of them change prefill numerics
- * (PULSAR_CUDA_NO_TF32 flips cuBLAS off the TF32 tensor-op math mode) or delete
+/* The engine reads many PULSAR_* env knobs; some of them change prefill numerics
+ * or delete
  * kernel coverage outright (PULSAR_MOE_FP4_TILED=0 sends every type-39 layer down
  * the per-pair qwarp32 path).  A knob set DIFFERENTLY between the dump and the
  * check fails loud, which is the safe direction; the danger is the SAME wrong
@@ -268,8 +268,8 @@ static const char *const g_env_keep[] = {
  * the gate certifies:
  *   - NVIDIA_TF32_OVERRIDE=0 disables TF32 GLOBALLY, overriding the driver's
  *     default regardless of what cublasSetMathMode() asks for.  That is the same
- *     effect as PULSAR_CUDA_NO_TF32, one namespace over — the very knob this scrub
- *     was written to close.
+ *     effect the retired PULSAR_CUDA_NO_TF32 knob used to have, one namespace
+ *     over, and out of reach of this scrub.
  *   - CUBLAS_WORKSPACE_CONFIG changes cuBLAS workspace sizing and with it
  *     reduction split/determinism.
  * Exported identically to both the dump and the check, either makes the gate
