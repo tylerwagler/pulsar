@@ -307,56 +307,6 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
 
 /* Generic fallback for n_embd > BLK*VEC (byte-identical to the pre-2026-07-21
  * kernel: same column order, same tree, same global round trip). */
-__global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
-        float *out,
-        float *norm_out,
-        __half *norm_out_h,
-        float *split,
-        const float *mix,
-        const pulsar_hc_t *residual_hc,
-        const float *scale,
-        const float *base,
-        const float *norm_w,
-        uint32_t n_embd,
-        uint32_t n_hc,
-        uint32_t n_rows,
-        uint32_t sinkhorn_iters,
-        float epsv,
-        float norm_eps) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t d = threadIdx.x;
-    if (t >= n_rows || n_hc != 4) return;
-    const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    __shared__ float hc4_c[16];
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
-    __syncthreads();
-
-    float sum = 0.0f;
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
-        }
-        out[(uint64_t)t * n_embd + col] = acc;
-        sum += acc * acc;
-    }
-
-    __shared__ float partial[256];
-    partial[d] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (d < stride) partial[d] += partial[d + stride];
-        __syncthreads();
-    }
-    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        const float v = out[(uint64_t)t * n_embd + col];
-        const float nv = v * norm_scale * norm_w[col];
-        norm_out[(uint64_t)t * n_embd + col] = nv;
-        if (norm_out_h) norm_out_h[(uint64_t)t * n_embd + col] = __float2half(nv);
-    }
-}
 
 
 
@@ -872,7 +822,18 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
     if (!scale || !base || !norm_w) return 0;
 #define PULSAR_HCFUSED_BLK 256u
 #define PULSAR_HCFUSED_VEC 16u
-    if (n_embd <= PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC) {
+    /* Flash is n_embd == 4096 == BLK*VEC exactly, so the templated kernel always
+     * applies.  There WAS a generic fallback for wider models; it is deleted.
+     * It could not emit E4M3 at all -- its parameter list had no norm_out_q --
+     * while the caller still marked the activation slot valid, so every MXFP8
+     * consumer downstream read the previous layer's data against zeroed scales.
+     * Fail loud rather than ever silently skip the emit again. */
+    if (n_embd > PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC) {
+        fprintf(stderr, "pulsar: hc fused norm cannot handle n_embd=%u (max %u)\n",
+                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC);
+        return 0;
+    }
+    {
         hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC>
                 <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
                 (float *)out->ptr,
@@ -890,18 +851,6 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
         return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
     }
-    hc_split_weighted_sum_norm_fused_generic_kernel<<<(uint32_t)n_rows, 256>>>(
-            (float *)out->ptr,
-            (float *)norm_out->ptr,
-            (__half *)norm_out_h,
-            (float *)split->ptr,
-            (const float *)mix->ptr,
-            (const pulsar_hc_t *)residual_hc->ptr,
-            scale,
-            base,
-            norm_w,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-    return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
 }
 
 

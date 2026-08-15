@@ -252,7 +252,6 @@ enum {
 
 typedef enum {
     PULSAR_VARIANT_FLASH = 0,
-    PULSAR_VARIANT_PRO   = 1,
 } pulsar_variant;
 
 typedef struct {
@@ -1732,7 +1731,6 @@ void spec_quench_reset(pulsar_session *s);
 /* ---- shared globals ---- */
 
 extern const pulsar_shape PULSAR_SHAPE_FLASH;
-extern const pulsar_shape PULSAR_SHAPE_PRO;
 extern pulsar_shape g_pulsar_shape;
 extern uint32_t g_pulsar_compress_ratios[PULSAR_MAX_LAYER];
 /* REAP ds4-compact-v1: per-layer count of physically-present routed experts.

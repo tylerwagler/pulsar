@@ -616,17 +616,6 @@ static void pulsar_select_shape_from_metadata(
         g_pulsar_shape = PULSAR_SHAPE_FLASH;
         return;
     }
-    if (pulsar_shape_matches_metadata(&PULSAR_SHAPE_PRO,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_pulsar_shape = PULSAR_SHAPE_PRO;
-        return;
-    }
 
     fprintf(stderr,
             "pulsar: unsupported DeepSeek4 shape: layers=%u embd=%u heads=%u "

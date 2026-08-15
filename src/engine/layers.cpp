@@ -28,7 +28,7 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-            cap = PULSAR_MODEL_VARIANT == PULSAR_VARIANT_PRO ? 8192u : 4096u;
+            cap = 4096u;
         }
     }
 

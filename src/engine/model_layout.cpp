@@ -46,15 +46,6 @@ bool pulsar_engine::is_pruned() const {
 uint32_t pulsar_expected_layer_compress_ratio(uint32_t il) {
     if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
 
-    switch (PULSAR_MODEL_VARIANT) {
-    case PULSAR_VARIANT_FLASH:
-        if (il < 2) return 0;
-        return (il & 1u) == 0 ? 4u : 128u;
-    case PULSAR_VARIANT_PRO:
-        if (il < 2) return 128u;
-        return (il & 1u) == 0 ? 4u : 128u;
-    default:
-        pulsar_die("unsupported DeepSeek4 model variant");
-    }
-    return 0;
+    if (il < 2) return 0;
+    return (il & 1u) == 0 ? 4u : 128u;
 }
