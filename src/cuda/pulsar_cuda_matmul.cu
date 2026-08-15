@@ -1481,7 +1481,23 @@ void cuda_fp8_weight_cache_clear(void) {
  * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
  * emits at that width. No kernel logic is duplicated. */
 static int g_mneutral_rows = 0;
-void pulsar_gpu_matmul_set_batch_mneutral(int n) { g_mneutral_rows = (n > 0) ? n : 0; }
+void pulsar_gpu_matmul_set_batch_mneutral(int n) {
+    /* The neutrality caps below are hard 8s.  PULSAR_MSEQ_MAX is 16, so a wider
+     * batched step would quietly take a different kernel for the rows past 8 --
+     * exactly the "same op, two numerics, chosen by width" shape this codebase
+     * keeps getting bitten by.  Not reachable at today's session limits; say so
+     * if it ever becomes reachable rather than discovering it in a divergence. */
+    if (n > 8) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "pulsar: WARNING batched step of %d rows exceeds the "
+                            "m-neutral cap of 8 -- rows past 8 take a different "
+                            "GEMM and neutrality is not guaranteed\n", n);
+        }
+    }
+    g_mneutral_rows = (n > 0) ? n : 0;
+}
 /* Queried cross-TU by the MoE dispatch (pulsar_cuda_moe.cu): the number of leading
  * decode rows that must take the M-independent per-token expert path (the trailing
  * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
@@ -1539,7 +1555,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * tensor-core tile path which is latency-bound at these shapes (the
          * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
          * token). Bit-identical per token to the n=1 deint mmvq, so verify logits
-         * match the decode path's numerics. PULSAR_FP8_GEMV_MAX_N=1 restores the
+         * match the decode path's numerics.  (The env override that used to
          * tensor-core dispatch for all n_tok>1. */
         /* 2026-07-21: raising this default 4 -> 8 was TRIED and REVERTED. The
          * "bit-identical" claim above is GEMV-n vs GEMV-1 -- it does NOT extend to
@@ -1550,19 +1566,24 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * exact remainder, so a 4102-token prompt at chunk 4096 ends on n_tok=6 and
          * its logits move (4100 -> n_tok=4 is byte-identical, control). The
          * prefill byte-exact gate pins chunk 4096 with depths 512/2048/4096/6144
-         * and never lands a 5..8 remainder, so it does NOT cover this. Keep 4.
+         * DID once never land a 5..8 remainder -- depth 4102 was added precisely
+         * to cover it (4102 = 4096 + 6), and it is the depth that moves whenever
+         * this cap or the MoE kernel choice changes. Keep 4.
          * The width-6 verify win is real but belongs entirely to moe_gemv_cap
          * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
-        static const int gemv_max_n = []{ const char *e = getenv("PULSAR_FP8_GEMV_MAX_N");
-                return e ? atoi(e) : 4; }();
-        static const int nt_fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-        /* inc 2: raise the custom-nt cap to PULSAR_MSEQ_MAX (8) for a batched step so
+        static const int gemv_max_n = 4;
+        /* inc 2: raise the custom-nt cap to 8 for a batched step so
          * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
          * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
          * decode-only lane (n_tok<=4), which take the identical cases 2/3/4 below. */
+        /* ⚠ 8 IS NOT PULSAR_MSEQ_MAX.  It was, when this was written; the
+         * constant is now 16 (pulsar_engine_internal.h) and this cap did not
+         * follow.  A batched step wider than 8 rows silently leaves the
+         * M-independent kernel for cuBLASLt, i.e. mixed-batch neutrality stops
+         * holding above 8 -- see the warning in pulsar_gpu_matmul_set_batch_mneutral. */
         const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)gemv_max_n;
         if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= 8 &&
-            in_dim % 128 == 0 && !nt_fp8_raw) {
+            in_dim % 128 == 0) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
             if (bw) {
@@ -1595,9 +1616,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
          * loads, vs the raw 33B-interleaved kernel's misaligned 1-byte/thread reads).
          * Bit-exact vs the raw kernel (verified: rel 0 across all workhorse shapes);
-         * ~+8% decode. PULSAR_FP8_MMVQ_RAW forces the raw path as an operational fallback. */
-        static const int fp8_mmvq_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-        const fp8_mx_weight *w = (in_dim % 128 == 0 && !fp8_mmvq_raw)
+         * ~+8% decode. */
+        const fp8_mx_weight *w = (in_dim % 128 == 0 )
                 ? cuda_fp8_mx_weight(model_map, weight_offset, fbytes, in_dim, out_dim, label)
                 : NULL;
         if (w) {
@@ -1639,12 +1659,13 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * MXFP8_LT weight is already de-interleaved, so it must NEVER reach this
          * path — fail closed (rather than run the deint path's `w == NULL`
          * fallthrough on LT bytes, which would be garbage). This also means
-         * PULSAR_FP8_MMVQ_RAW (which forces w == NULL above) is incompatible with an
-         * MXFP8_LT gguf. */
+         * (This is also why PULSAR_FP8_MMVQ_RAW is gone: it forced w == NULL,
+         * so on our MXFP8_LT artifact it could only ever reach this hard error.
+         * An override whose sole effect is a fail-closed abort is not an
+         * operational fallback.) */
         if (g_mxfp8_lt_offsets.count(weight_offset)) {
             fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu cannot use the raw "
-                    "interleaved mmvq path (PULSAR_FP8_MMVQ_RAW must not be set with a "
-                    "pre-stored MXFP8_LT gguf)\n", (unsigned long long)weight_offset);
+                    "interleaved mmvq path\n", (unsigned long long)weight_offset);
             return 0;
         }
         const unsigned char *wfp8 = (const unsigned char *)cuda_model_range_ptr(
@@ -1692,8 +1713,7 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
      * de-interleaved mmvq launches into one. Only when both are registered
      * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
      * otherwise defer to the per-weight path below. */
-    static const int fp8_mmvq_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-    if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw &&
+    if (n_tok == 1 && in_dim % 128 == 0 &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes0 = out0_dim * fblocks * 33;
@@ -1770,9 +1790,8 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     if (!wptr) return 0;
 
     /* Decode uses the de-interleaved cached weight (coalesced vectorized loads); raw
-     * 33B path retained as PULSAR_FP8_MMVQ_RAW fallback. Same weight buffers as mmvq. */
-    static const int fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-    const fp8_mx_weight *dw = (in_dim % 32 == 0 && !fp8_raw)
+     * 33B path is reached only when the dims rule out de-interleaving. */
+    const fp8_mx_weight *dw = (in_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim,
                                  label ? label : "fp8_hc_expand")
             : NULL;
@@ -1843,13 +1862,12 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     /* Small batches (spec-decode verify, n_tok 2..4): batched f16 GEMV. One
      * weight-row read serves all tokens and there is no f32->f16 activation
      * convert or tmp alloc; per-token output is bit-identical to the n=1
-     * matmul_f16_kernel. PULSAR_F16_GEMV_MAX_N=1 restores the cuBLAS dispatch. */
+     * matmul_f16_kernel. */
     /* 2026-07-21: raising to 8 was TRIED and REVERTED, same as the mxfp8 twin
      * above. This one is the clearest case: the cuBLAS side converts activations
      * to __half for cublasGemmEx while the GEMV stays f32, so the two dispatches
      * were never going to agree. Measured non-bit-exact at widths 6 and 8. */
-    static const int f16_gemv_max_n = []{ const char *e = getenv("PULSAR_F16_GEMV_MAX_N");
-            return e ? atoi(e) : 4; }();
+    static const int f16_gemv_max_n = 4;
     /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
      * mxfp8 twin). Default cap 4 for prefill / decode-only (identical cases 2/3/4). */
     const uint64_t f16_nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)f16_gemv_max_n;
@@ -1984,14 +2002,13 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 
 
 /* Decode grouped "a" projection: prefer the de-interleaved cached weight (vectorized
- * coalesced loads) over the raw 33B kernel. Bit-exact; PULSAR_FP8_MMVQ_RAW forces raw. */
+ * coalesced loads) over the raw 33B kernel. Bit-exact. */
 static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t out_a_offset,
         uint64_t out_a_bytes, const unsigned char *out_a, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
         const float *heads, const char *label) {
     const dim3 grid_a(((unsigned)low_dim + 31u) / 32u, (unsigned)n_tokens, 1);
-    static const int fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
-    const fp8_mx_weight *dw = (group_dim % 32 == 0 && !fp8_raw)
+    const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
     /* Small verify batches: one nt launch, weight blocks L1-shared across tokens;
@@ -2088,13 +2105,12 @@ int pulsar_gpu_attention_output_batch_tensor(
      * GEMMs; decode and small verify batches (n_tokens<=4) take the
      * register-blocked GEMV path (launch_grouped_fp8mx_a dispatches the nt
      * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
-     * token to decode's kernel). PULSAR_FP8_GEMV_MAX_N=1 restores the tensor-core
+     * token to decode's kernel).  (The env override that used to restore the
      * dispatch for all n_tokens>1, same as the dense-matmul gate. */
     /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
-     * for the measurement). Shares PULSAR_FP8_GEMV_MAX_N with that gate, so the two
+     * for the measurement).  It shared its cap with that gate, so the two
      * defaults must move together. */
-    static const int a_gemv_max_n = []{ const char *e = getenv("PULSAR_FP8_GEMV_MAX_N");
-            return e ? atoi(e) : 4; }();
+    static const int a_gemv_max_n = 4;
     int a_done = 0;
     /* plan-34 inc 2: a batched multiseq/mixed step must NOT take the M-dependent
      * tensor-core (cuBLASLt) 'a' GEMM -- fall to launch_grouped_fp8mx_a, whose

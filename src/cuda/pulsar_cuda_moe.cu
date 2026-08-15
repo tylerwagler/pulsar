@@ -795,7 +795,8 @@ static int routed_moe_launch_mixed40(
      * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
      * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
     /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
-     * per-token (non-grouped) path across the whole row range (<=PULSAR_MSEQ_MAX=8):
+     * per-token (non-grouped) path across the whole row range (<=8 rows; note
+     * PULSAR_MSEQ_MAX is 16, so this bound is the cap, not the constant):
      * the grouped path's per-expert group sizes depend on the batch composition,
      * so a co-scheduled decode bank's expert output would shift with the batch
      * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
