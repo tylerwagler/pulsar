@@ -1905,7 +1905,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
