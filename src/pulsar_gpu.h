@@ -1039,6 +1039,23 @@ int pulsar_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+/* As above, but the result's E4M3 + E8M0 block-scale encoding is emitted from
+ * the SwiGLU epilogue into the activation-cache slots, so the MXFP8 shared_down
+ * GEMM never runs a separate quantize pass over the mid tensor.  `mid_dim` is
+ * the row width (the launch is flat over n = rows * mid_dim, so the MX row/col
+ * must be recovered by division).  NULL slots give the plain behaviour. */
+int pulsar_gpu_swiglu_mx_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *gate,
+        const pulsar_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight,
+        void                   *out_q,
+        void                   *out_sf,
+        int                     out_kbp,
+        uint32_t                mid_dim);
+
 int pulsar_gpu_add_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *a,

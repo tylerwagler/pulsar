@@ -2661,12 +2661,22 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
         PULSAR_CUDA_PROFILE_FFN_STAGE("shared_gate_up"); \
-        if (ok) ok = pulsar_gpu_swiglu_tensor(g->batch_shared_mid, \
+        void *shmid_q = NULL, *shmid_sf = NULL; int shmid_kbp = 0; \
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
+                                                        (uint64_t)shared_dim, \
+                                                        &shmid_q, &shmid_sf, &shmid_kbp)) { \
+            shmid_q = NULL; shmid_sf = NULL; shmid_kbp = 0; \
+        } \
+        if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
                                              (uint32_t)((uint64_t)n_tokens * shared_dim), \
                                              PULSAR_SWIGLU_CLAMP_EXP, \
-                                             1.0f) != 0; \
+                                             1.0f, \
+                                             shmid_q, shmid_sf, shmid_kbp, \
+                                             (uint32_t)shared_dim) != 0; \
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, (uint64_t)shared_dim); \
+        if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \

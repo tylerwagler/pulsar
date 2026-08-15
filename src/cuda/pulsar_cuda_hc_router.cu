@@ -505,7 +505,17 @@ __global__ static void router_select_warp_topk_kernel(
 
 
 
-__global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
+/* out_q/out_sf, when non-NULL, receive the E4M3 + E8M0 encoding of the SwiGLU
+ * result straight from this epilogue, so the MXFP8 shared_down GEMM does not
+ * wait on a separate quantize pass over batch_shared_mid.  The launcher only
+ * supplies them when n is a multiple of the 256-thread block, so no lane takes
+ * the `i >= n` exit before the warp-wide shuffle in pulsar_mx_emit_block.
+ *
+ * This kernel is launched FLAT over n = rows * mid_dim, so the MX (row, col)
+ * has to be recovered by division.  mid_dim is a multiple of 32, so a warp's
+ * 32 consecutive i never straddle a row and are 32-aligned within it. */
+__global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight,
+                                     __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g = gate[i];
@@ -515,7 +525,11 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
         u = fminf(fmaxf(u, -clamp), clamp);
     }
     float s = g / (1.0f + expf(-g));
-    out[i] = s * u * weight;
+    const float v = s * u * weight;
+    out[i] = v;
+    if (out_q) {
+        pulsar_mx_emit_block(v, i % mid_dim, i / mid_dim, mid_dim, out_kbp, out_q, out_sf);
+    }
 }
 
 
@@ -560,13 +574,30 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
-int pulsar_gpu_swiglu_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
+                                uint32_t n, float clamp, float weight,
+                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    /* FAIL LOUD rather than silently skip the emission: the caller arms the
+     * activation cache off the same slot pointer, so a skipped emission leaves
+     * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
+     * n must fill whole blocks (no lane exits before the warp shuffle) and
+     * mid_dim must be a whole number of MX blocks. */
+    if (out_q && ((n % 256u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
+        fprintf(stderr, "pulsar: swiglu cannot emit MX for n=%u mid_dim=%u "
+                        "(need n %% 256 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
+        return 0;
+    }
+    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
+                                            (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
+}
+
+int pulsar_gpu_swiglu_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+    return pulsar_gpu_swiglu_mx_tensor(out, gate, up, n, clamp, weight, NULL, NULL, 0, 0);
 }
 
 
