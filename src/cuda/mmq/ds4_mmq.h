@@ -57,33 +57,9 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_q8_0_dense(
-    const void  * W_q8_0,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
 
 
-int ds4_mmq_iq2_xxs_dense(
-    const void  * W_iq2_xxs,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
 
-int ds4_mmq_q4_K_dense(
-    const void  * W_q4_K,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
 
 // MoE matmul entry points. For each (token, slot-within-token's-top-k) pair
 // the kernel computes:
@@ -113,17 +89,6 @@ int ds4_mmq_q4_K_dense(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_q8_0_moe(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 
 // Same Q2_K MMQ operation, but omits the standalone nonfinite cleanup pass.
@@ -142,17 +107,6 @@ int ds4_mmq_q8_0_moe(
 // with guard_nonfinite=1) sanitize at read, so the standalone whole-buffer
 // pass is skipped.  New callers must sanitize at consumption.
 
-int ds4_mmq_q4_K_moe(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Paired MoE entries. Compute gate AND up over the same activation in a
 // single call so the Q8_1 quantize of X (and the mm_ids_helper bookkeeping)
@@ -200,19 +154,6 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_expert_used,
     cudaStream_t    stream);
 
-int ds4_mmq_q4_K_moe_pair(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_a,
-    float         * out_b,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // MoE vector matmul entries (Step 6). Same signature and semantics as the
 // ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
@@ -234,42 +175,9 @@ int ds4_mmq_q4_K_moe_pair(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_q8_0_moe_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 
-int ds4_mmq_iq2_xxs_moe_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
-int ds4_mmq_q4_K_moe_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
 //
@@ -290,18 +198,6 @@ int ds4_mmq_q4_K_moe_vec(
 // the caller can fall back).
 uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts);
 
-// M1-Inc2b: exact inverse of the weight-server repack.  Fills raw_out
-// (nblk * 66 bytes, raw block_iq2_xxs byte stream) from an aligned artifact,
-// device->device on `stream`.  Lets the batched/mmq raw-layout consumers run
-// from a device scratch instead of the client mmap when the raw spans were
-// excluded from the upload.
-int ds4_mmq_iq2_xxs_aligned_derepack(
-    const void    * W_aligned,
-    void          * raw_out,
-    int             M,
-    int             K,
-    int             n_experts,
-    cudaStream_t    stream);
 
 // M2 moe-down: aligned row-pair-SoA Q2_K routed-expert decode matvec.  Twin
 // of mul_mat_vec_q_moe<GGML_TYPE_Q2_K, 2> at the down-leg call shape
@@ -328,13 +224,6 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
 // `stream`, for the batched/mmq raw-layout consumers (same role as
 // ds4_mmq_iq2_xxs_aligned_derepack).
 
-// M1-Inc3: aligned-SoA Q8_0 dense decode matvec.  Artifact layout
-// [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]], nblk = M * (K/32), block
-// order equal to the raw tensor byte order (weight server
-// --repack-q8-aligned; raw spans stay served — dense artifacts duplicate,
-// they do not replace).  n_tokens == 1 and K % 1024 == 0 only; other shapes
-// return non-zero so the caller can fall back to ds4_mmq_q8_0_dense_vec.
-uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K);
 
 int ds4_mmq_q8_0_aligned_dense_vec(
     const void  * W_aligned,
@@ -357,28 +246,6 @@ int ds4_mmq_iq2_xxs_aligned_moe_vec(
     int             n_expert_used,
     cudaStream_t    stream);
 
-// M1-Inc2 variants over the same aligned artifacts (n_tokens == 1 only).
-//
-// _pair_vec: one activation quantize + one launch computes both raw gate and
-// up outputs (nonfinite zeroed in-kernel; no sanitize pass needed).  The
-// caller still runs its clamp-aware SwiGLU.
-//
-// _gate_up_mid_vec: additionally folds the clamp/SwiGLU/router-weight
-// epilogue (identical semantics to ds4_mmq_moe_gate_up_mid_q8_1_qwarp32) and
-// writes mid[slot * M + row] directly.
-int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
-    const void    * W_gate_aligned,
-    const void    * W_up_aligned,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * gate_out,
-    float         * up_out,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const void    * W_gate_aligned,
@@ -416,17 +283,6 @@ int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
 // Returns 0 on success, non-zero on validation or launch failure.
 
 
-int ds4_mmq_q4_K_moe_down_sum6_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Fused gate+up+SwiGLU vector entries for routed MoE with top_k=6. These use
 // canonical Q8_1 activation quantization and compute weighted mid directly:
@@ -452,35 +308,7 @@ int ds4_mmq_q4_K_moe_down_sum6_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
-    const void    * W_gate,
-    const void    * W_up,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * weights,
-    float         * mid_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
 
-int ds4_mmq_q4_K_moe_gate_up_mid_vec(
-    const void    * W_gate,
-    const void    * W_up,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * weights,
-    float         * mid_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
 
 // Pair-fused MoE vector matmul entries (Step 6). Computes
 //
@@ -502,29 +330,7 @@ int ds4_mmq_q4_K_moe_gate_up_mid_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_iq2_xxs_moe_pair_vec(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_silu,
-    int             M,
-    int             K,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
-int ds4_mmq_q4_K_moe_pair_vec(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_silu,
-    int             M,
-    int             K,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Raw pair MoE vector entries. They quantize X to canonical Q8_1 once, then
 // run the same mmvq matvec kernel twice to produce the unfused gate and up
@@ -536,33 +342,7 @@ int ds4_mmq_q4_K_moe_pair_vec(
 //   out_[token * n_expert_used + slot, row]
 //   K must be a multiple of 256.
 
-int ds4_mmq_iq2_xxs_moe_pair_raw_vec(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_a,
-    float         * out_b,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
-int ds4_mmq_q4_K_moe_pair_raw_vec(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_a,
-    float         * out_b,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Dense vector matmul entry (Step 6). Same shape semantics as
 // ds4_mmq_q8_0_dense but routed through mmvq for batch counts that
@@ -570,14 +350,6 @@ int ds4_mmq_q4_K_moe_pair_raw_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_q8_0_dense_vec(
-    const void  * W_q8_0,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
 
 // Set the thread-local stream that the internal cuda pool uses for
 // cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
