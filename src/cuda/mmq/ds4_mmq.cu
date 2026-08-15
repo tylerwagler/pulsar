@@ -796,8 +796,16 @@ int ds4_mmq_moe_impl(
      * tensors are IQ2, not Q2_K, so without this an aligned IQ2 down still ran
      * stock mul_mat_q.  Same gating, same scratch contract; the launcher pins
      * the pair kernel's leg to 0 so it computes one tensor. */
+    /* ⚠ NO d2r_min_cols() HERE, deliberately.  It used to read
+     * `ne_get_rows >= d2r_min_cols()`, which sent every batch under 1024 rows to
+     * the generic MMQ kernel below -- i.e. the SAME GEMM ran E4M3 activations on
+     * long prompts and int8 q8_1 on short ones, chosen by batch size.  That is
+     * the A8 invariant broken by a threshold, and it hid the down conversion
+     * completely: a 26-token prompt gives 156 rows, so the arm never engaged and
+     * two days of cross-arm measurements came back bit-identical.
+     * One path, one activation format, every batch size. */
     if (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr && d2r_enabled() &&
-        d2r_iq2_enabled() && K % 256 == 0 && ne_get_rows >= d2r_min_cols()) {
+        d2r_iq2_enabled() && K % 256 == 0) {
         static int d2r_iq2s_cc = -1;
         static int d2r_iq2s_avail = 0;
         if (d2r_iq2s_cc != cc) {
@@ -875,6 +883,21 @@ int ds4_mmq_moe_impl(
         /*soa_blocks=*/soa_blocks,
     };
 
+    /* Reaching here with IQ2 means D2R declined the work, so this GEMM runs int8
+     * q8_1 activations while every other expert GEMM runs E4M3.  That is a
+     * FORMAT change, not just a speed change, and it must never be silent
+     * again -- a size-thresholded version of exactly this is what hid the down
+     * conversion.  One-shot, off the hot path. */
+    if (type == GGML_TYPE_IQ2_XXS) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "pulsar: WARNING %s fell back to generic MMQ -- these expert "
+                    "activations are int8 q8_1, NOT E4M3 (rows=%lld)\n",
+                    tag, (long long)ne_get_rows);
+        }
+    }
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
@@ -897,13 +920,6 @@ struct ds4_mmq_fused_down {
     float       * out;
     int           out_dim;
     float         clamp;
-    bool          direct_gateup_q8;
-    void        * input_q8_scratch;
-    size_t        input_q8_scratch_bytes;
-    void        * q8_scratch;
-    size_t        q8_scratch_bytes;
-    void        * work_scratch;
-    size_t        work_scratch_bytes;
 };
 
 static bool ds4_mmq_take_scratch(
@@ -986,10 +1002,7 @@ int ds4_mmq_moe_pair_impl(
         bool            sanitize_out = true,
         const ds4_mmq_fused_down *fused_down = nullptr) {
 
-    const bool direct_gateup_q8 =
-        fused_down != nullptr && fused_down->direct_gateup_q8;
-    if (!W_a || !W_b || !X_f32 || !ids ||
-        (!direct_gateup_q8 && (!out_a || !out_b))) {
+    if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -1008,14 +1021,7 @@ int ds4_mmq_moe_pair_impl(
     }
     if (fused_down &&
         (type != GGML_TYPE_IQ2_XXS || !fused_down->W ||
-         !fused_down->router_weights ||
-         (!direct_gateup_q8 && !fused_down->mid_f32) ||
-         (direct_gateup_q8 &&
-          (!xa_soa || !xb_soa || !fused_down->W_soa ||
-           !fused_down->input_q8_scratch ||
-           fused_down->input_q8_scratch_bytes == 0 ||
-           !fused_down->q8_scratch || fused_down->q8_scratch_bytes == 0 ||
-           !fused_down->work_scratch || fused_down->work_scratch_bytes == 0)) ||
+         !fused_down->router_weights || !fused_down->mid_f32 ||
          !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
         fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
         return -1;
@@ -1056,65 +1062,13 @@ int ds4_mmq_moe_pair_impl(
     int32_t *ids_src1 = nullptr;
     int32_t *ids_dst = nullptr;
     int32_t *expert_bounds = nullptr;
-    void *direct_work = nullptr;
-    size_t direct_work_bytes = 0;
 
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
-    size_t direct_down_q8_bytes = 0;
-    if (direct_gateup_q8) {
-        const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
-        direct_down_q8_bytes =
-            (size_t)ne_get_rows * (size_t)down_ne10_padded *
-                sizeof(block_q8_1) / QK8_1 +
-            (size_t)ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
-        const size_t gateup_work_bytes =
-            ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
-                ne_get_rows, n_experts);
-        const size_t down_work_bytes =
-            ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
-        if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1) return -91;
-        if (fused_down->q8_scratch_bytes < direct_down_q8_bytes) return -92;
-        if (gateup_work_bytes == 0 || down_work_bytes == 0) return -93;
-        if (!d2r_enabled() || !d2r_iq2_enabled()) return -94;
-        if (ne_get_rows < d2r_min_cols()) return -95;
-        if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
-            !ds4_mmq_q2_K_moe_d2r_available(cc)) {
-            return -96;
-        }
-
-        size_t offset = 0;
-        void *ids_src1_raw = nullptr;
-        void *ids_dst_raw = nullptr;
-        void *expert_bounds_raw = nullptr;
-        direct_work_bytes = gateup_work_bytes > down_work_bytes
-            ? gateup_work_bytes : down_work_bytes;
-        if (!ds4_mmq_take_scratch(
-                fused_down->work_scratch, fused_down->work_scratch_bytes,
-                &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
-                &ids_src1_raw) ||
-            !ds4_mmq_take_scratch(
-                fused_down->work_scratch, fused_down->work_scratch_bytes,
-                &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
-                &ids_dst_raw) ||
-            !ds4_mmq_take_scratch(
-                fused_down->work_scratch, fused_down->work_scratch_bytes,
-                &offset, (size_t)(n_experts + 1) * sizeof(int32_t), 256,
-                &expert_bounds_raw) ||
-            !ds4_mmq_take_scratch(
-                fused_down->work_scratch, fused_down->work_scratch_bytes,
-                &offset, direct_work_bytes, 256, &direct_work)) {
-            return -97;
-        }
-        ids_src1 = (int32_t *)ids_src1_raw;
-        ids_dst = (int32_t *)ids_dst_raw;
-        expert_bounds = (int32_t *)expert_bounds_raw;
-    } else {
-        ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
-        ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
-        expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
-    }
+    ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+    ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+    expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
@@ -1156,9 +1110,7 @@ int ds4_mmq_moe_pair_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
     ggml_cuda_pool_alloc<char> src1_e4m3_alloc;
     char *src1_e4m3 = nullptr;
-    char *src1_q8_1 = direct_gateup_q8
-        ? (char *)fused_down->input_q8_scratch
-        : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+    char *src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1166,18 +1118,16 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
-    /* ⚠ THIS WAS GATED ON direct_gateup_q8, WHICH IS A DEAD FIELD -- declared at
-     * :881, read at eight sites, ASSIGNED NOWHERE.  So e4m3_staging was always 0
-     * and the MXFP8 arm was a silent no-op from 99e5645 until now, which is why
-     * perplexity and both frontier-logit dumps came back bit-identical across
-     * arms.  Do not reintroduce a condition on it.
+    /* Do NOT gate this on anything narrower than the arm.  It was once gated on
+     * direct_gateup_q8 -- a field assigned nowhere -- so the MXFP8 arm was a
+     * silent no-op and every cross-arm measurement came back bit-identical.
      *
-     * The reason a condition existed at all was that src1_q8_1 has THREE
-     * consumers and only some of them understand e4m3 (the generic MMQ kernel
-     * under `if (!gate_up_done)` does not).  The right answer is not a narrower
-     * predicate but a SEPARATE BUFFER: q8_1 stays exactly as it was for every
-     * existing consumer, and the D2R IQ2 path gets its own e4m3 staging.  That
-     * is correct by construction rather than by a condition that can rot. */
+     * The reason a condition existed at all was that src1_q8_1 has more than one
+     * consumer and only some understand e4m3 (the generic MMQ kernel under
+     * `if (!gate_up_done)` does not).  The answer is not a narrower predicate but
+     * a SEPARATE BUFFER: q8_1 stays as-is for every existing consumer and the
+     * D2R IQ2 path gets its own e4m3 staging -- correct by construction rather
+     * than by a condition that can rot. */
     const int e4m3_staging = ds4_d2r_iq2_arm() ? 1 : 0;
     {
         ds4_mmq_nvtx_scope stage(
@@ -1185,17 +1135,14 @@ int ds4_mmq_moe_pair_impl(
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
         cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
-        /* ⚠ src1_q8_1 has THREE possible consumers: the fused D2R launcher, the
-         * D2R pair launcher, and -- when neither claims the work -- the GENERIC
-         * MMQ kernel at `if (!gate_up_done)` below, which only understands q8_1.
-         * Staging e4m3 on the arm alone fed that generic path e4m3 bytes as
-         * q8_1 and produced token soup (measured 2026-08-15).
-         *
-         * Only the FUSED path is a guaranteed sole consumer: direct_gateup_q8
-         * means the D2R fused launcher does gate/up AND down and returns, so
-         * nothing else reads the buffer.  Hence the staging decision is made
-         * ONCE here and PASSED to the consumer, rather than both sides reading
-         * ds4_d2r_iq2_arm() independently and being able to disagree. */
+        /* ⚠ src1_q8_1 has TWO possible consumers: the D2R pair launcher, and --
+         * when it declines the work -- the GENERIC MMQ kernel at
+         * `if (!gate_up_done)` below, which only understands q8_1.  Staging
+         * e4m3 into this buffer on the arm alone fed that generic path e4m3
+         * bytes as q8_1 and produced token soup (measured 2026-08-15).  So this
+         * buffer stays q8_1 unconditionally and the arm gets src1_e4m3; the
+         * decision is made ONCE and PASSED to the consumer, never re-read from
+         * ds4_d2r_iq2_arm() on the other side where the two could disagree. */
         quantize_mmq_q8_1_cuda(
             X_f32, ids_src1, (void *)src1_q8_1,
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
@@ -1222,65 +1169,6 @@ int ds4_mmq_moe_pair_impl(
         }
     }
 
-    if (direct_gateup_q8) {
-        err = cudaMemsetAsync(
-            fused_down->q8_scratch, 0, direct_down_q8_bytes, stream);
-        if (err != cudaSuccess) {
-            return -9;
-        }
-        const size_t gateup_work_bytes =
-            ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
-                ne_get_rows, n_experts);
-        if (gateup_work_bytes == 0) {
-            return -9;
-        }
-        {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/iq2_gate_up_swiglu_q8_d2r",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
-                    nvtx_prefill);
-            const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
-                    xa_soa, xb_soa, soa_blocks,
-                    (e4m3_staging ? src1_e4m3 : src1_q8_1), ids_dst, expert_bounds,
-                    fused_down->router_weights, fused_down->q8_scratch,
-                    M, K, ne_get_rows, n_experts, fused_down->clamp,
-                    direct_work, gateup_work_bytes, e4m3_staging, stream);
-            if (d2r_rc != 0) {
-                return -10;
-            }
-        }
-
-        if (out_memset_enabled()) {
-            cudaMemsetAsync(fused_down->out, 0,
-                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
-                    stream);
-        }
-        const size_t down_work_bytes =
-            ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
-        if (down_work_bytes == 0) {
-            return -11;
-        }
-        {
-            ds4_mmq_nvtx_scope stage(
-                    "ds4/prefill/moe/q2_down_d2r",
-                    ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
-                                         (uint32_t)fused_down->out_dim),
-                    nvtx_prefill);
-            const int down_rc = ds4_mmq_q2_K_moe_d2r_launch(
-                    fused_down->W_soa,
-                    fused_down->soa_blocks,
-                    fused_down->q8_scratch,
-                    ids_dst, expert_bounds,
-                    fused_down->out,
-                    fused_down->out_dim, M, ne_get_rows, n_experts,
-                    direct_work, down_work_bytes, stream);
-            if (down_rc != 0) {
-                return -12;
-            }
-        }
-        return 0;
-    }
-
     const int64_t s1      = (int64_t)M;
     const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_mmq = ne12 * s12_mmq;
@@ -1291,9 +1179,11 @@ int ds4_mmq_moe_pair_impl(
     }
 
     bool gate_up_done = false;
+    /* No d2r_min_cols() -- see the note on the single-tensor guard in
+     * ds4_mmq_moe_impl.  A size threshold here means one activation format for
+     * long prompts and another for short ones. */
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
-        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
-        ne_get_rows >= d2r_min_cols()) {
+        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0) {
         static int d2r_iq2_avail_cc = -1;
         static int d2r_iq2_avail = 0;
         if (d2r_iq2_avail_cc != cc) {
@@ -1351,6 +1241,18 @@ int ds4_mmq_moe_pair_impl(
         /*soa_blocks=*/soa_blocks,
     };
 
+    /* See the matching note in ds4_mmq_moe_impl: an IQ2 batch that lands here
+     * multiplies against int8 q8_1 while the D2R path uses E4M3.  Say so. */
+    if (type == GGML_TYPE_IQ2_XXS) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "pulsar: WARNING %s gate/up fell back to generic MMQ -- these "
+                    "expert activations are int8 q8_1, NOT E4M3 (rows=%lld)\n",
+                    tag, (long long)ne_get_rows);
+        }
+    }
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_gate",
@@ -1617,13 +1519,6 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused(
         down,
         out_dim,
         clamp,
-        false,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        0,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused",
@@ -1659,13 +1554,6 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         down,
         out_dim,
         clamp,
-        false,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        0,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_soa",
@@ -1676,17 +1564,16 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         /*sanitize_out=*/false, &fused_down);
 }
 
-/* ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa REMOVED 2026-08-15.
- * It was the ONLY thing that ever set ds4_mmq_fused_down::direct_gateup_q8
- * to true, and it had NO CALLERS in the tree -- an exported entry point
- * nothing invoked.  A path trace (one-shot markers, one prefill) confirmed
- * d2r_fused_launch never executes; this is why gating the E4M3 arm on
- * direct_gateup_q8 silently disabled it (dead field guarding an unreachable
- * branch).  With this gone, direct_gateup_q8 is false by construction at
- * every remaining initializer, so the `if (direct_gateup_q8)` branches, the
- * field itself, ds4_mmq_iq2_xxs_moe_d2r_fused_launch and
- * gateup_iq2_swiglu_q8_d2r_kernel are all now unreachable and should follow.
- * Removed one at a time so each step stays gateable. */
+/* THE WHOLE "direct gate/up" FUSED PATH IS GONE (2026-08-15).
+ * ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa was an exported entry point with no
+ * callers, and the only thing that ever set direct_gateup_q8 true.  A path trace
+ * confirmed its launcher never executed.  Because the field was ALSO the gate on
+ * the E4M3 staging, it silently disabled the MXFP8 arm and made every cross-arm
+ * measurement come back bit-identical -- a dead flag guarding an unreachable
+ * branch, costing more than the branch was ever worth.
+ * Removed with it: the field, its four `if` branches, the caller-owned scratch
+ * members, ds4_mmq_iq2_xxs_moe_d2r_fused_launch and the fused SwiGLU kernel.
+ * gate/up now has exactly one shape: D2R pair launch, else generic MMQ. */
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
  * artifacts (weight server --repack-iq2-aligned); same contract as
