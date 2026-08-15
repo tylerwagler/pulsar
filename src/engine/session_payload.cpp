@@ -406,33 +406,22 @@ static PULSAR_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, pul
     return 0;
 }
 
-/* Raw-ring row spans: session files always store f32 rows.  Under PULSAR_RAW_F16
- * the ring holds __half containers, so save expands f16->f32 and load packs
- * f32->f16 — bit-exact both ways because the values are f16-rounded at store
- * time in both modes. */
+/* Raw-ring row spans: session files always store f32 rows, while the ring
+ * holds __half containers, so save expands f16->f32 and load packs f32->f16 --
+ * bit-exact both ways because the values are f16-rounded at store time. */
 static int payload_write_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    if (gpu_graph_raw_f16_enabled()) {
-        return payload_write_tensor_span_f16_as_f32(fp, g->layer_raw_cache[il],
-                (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
-                (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, err, errlen);
-    }
-    return payload_write_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(float),
-            (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float), buf, cap, err, errlen);
+    return payload_write_tensor_span_f16_as_f32(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
+            (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, err, errlen);
 }
 
 static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                 char *err, size_t errlen) {
-    if (gpu_graph_raw_f16_enabled()) {
-        return payload_read_tensor_span_f32_as_f16(fp, g->layer_raw_cache[il],
-                (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
-                (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, remaining, err, errlen);
-    }
-    return payload_read_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(float),
-            (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float), buf, cap, remaining, err, errlen);
+    return payload_read_tensor_span_f32_as_f16(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
+            (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, remaining, err, errlen);
 }
 
 uint64_t pulsar_session::payload_bytes() {

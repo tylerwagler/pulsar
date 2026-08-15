@@ -852,7 +852,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     pos0,
                                                                     n_tokens,
                                                                     PULSAR_N_HEAD_DIM,
-                                                                    (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                    1u,
                                                                     NULL, NULL, 1) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
@@ -891,27 +891,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                  pos0,
                                                  n_tokens,
                                                  PULSAR_N_HEAD_DIM,
-                                                 (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                 1u,
                                                  mseq ? g->batch_positions : NULL,
                                                  mseq ? g->batch_seq_id : NULL,
                                                  mseq ? nb : 1) != 0;
-        if (ok && !gpu_graph_raw_f16_enabled()) {
-            /* diag-only dump; the dumper reads f32 and would misinterpret a
-             * __half ring — skip it under PULSAR_RAW_F16.  Under mseq the store
-             * above scattered through the WHOLE bank pool while this classic
-             * view shows only the current bank — annotate rather than let
-             * the dump masquerade as the stored bytes (the tag itself is a
-             * filename/filter key, so it stays "raw_cache"). */
-            if (mseq && gpu_graph_debug_wants("raw_cache", il, pos0)) {
-                fprintf(stderr, "pulsar: raw_cache dump layer %u pos %u: cur-bank "
-                                "view; banked stores not shown\n", il, pos0);
-            }
-            gpu_graph_debug_dump_tensor("raw_cache",
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)n_raw * PULSAR_N_HEAD_DIM,
-                                          il,
-                                          pos0);
-        }
         if (ok) {
             ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    model->map,
@@ -929,7 +912,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     PULSAR_N_HEAD,
                                                                     PULSAR_N_HEAD_DIM,
                                                                     0,
-                                                                    (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                    1u,
                                                                     mseq ? g->batch_positions : NULL,
                                                                     mseq ? g->batch_seq_id : NULL,
                                                                     0,
@@ -1870,7 +1853,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      PULSAR_N_HEAD_DIM,
-                                                     (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                     1u,
                                                      mseq ? g->batch_positions : NULL,
                                                      mseq ? g->batch_seq_id : NULL,
                                                      mseq ? nb : 1) != 0;
@@ -2017,7 +2000,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   ratio,
                                                                                   PULSAR_N_HEAD,
                                                                                   PULSAR_N_HEAD_DIM,
-                                                                                  (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                                  1u,
                                                                                   sp_view, ss_view,
                                                                                   mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
                                                                                   mseq ? g->layer_comp_cap[il] : 0,
@@ -2064,7 +2047,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           PULSAR_N_HEAD,
                                                                           PULSAR_N_HEAD_DIM,
                                                                           0,
-                                                                          (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                          1u,
                                                                           mseq ? g->batch_positions : NULL,
                                                                           mseq ? g->batch_seq_id : NULL,
                                                                           mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
@@ -2194,7 +2177,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               PULSAR_N_HEAD,
                                                                               PULSAR_N_HEAD_DIM,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                              1u,
                                                                               NULL, NULL, NULL, 0, 1) != 0;
                     if (ok && index_stage_profile) {
                         ok = gpu_graph_indexer_stage_profile_boundary("attention",
@@ -2340,7 +2323,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        g->raw_cap,
                                                        pos % g->raw_cap,
                                                        PULSAR_N_HEAD_DIM,
-                                                       (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                       1u) != 0;
                 }
                 if (ok && comp_mask != NULL && n_selected != 0) {
                     ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
@@ -2367,7 +2350,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               PULSAR_N_HEAD,
                                                                               PULSAR_N_HEAD_DIM,
-                                                                              (uint32_t)gpu_graph_raw_f16_enabled(),
+                                                                              1u,
                                                                               NULL, NULL, NULL, 0, 1) != 0;
                 } else if (ok) {
                     ok = pulsar_gpu_attention_decode_heads_tensor(heads_view,
@@ -2388,7 +2371,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  n_selected,
                                                                  PULSAR_N_HEAD,
                                                                  PULSAR_N_HEAD_DIM,
-                                                                 (uint32_t)gpu_graph_raw_f16_enabled()) != 0;
+                                                                 1u) != 0;
                 }
                 pulsar_gpu_tensor_free(heads_view);
                 pulsar_gpu_tensor_free(kv_cache_view);

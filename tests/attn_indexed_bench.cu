@@ -87,8 +87,8 @@ int main(int argc, char **argv) {
      * blew the calibration gate by 7.70x -- the gate caught it. */
     uint32_t n_comp_rt      = argc > 3 ? (uint32_t)atoi(argv[3]) : 32u;
     const uint32_t ratio    = 4u;
-    /* PRODUCTION DEFAULT IS f16.  gpu_decode.cpp: PULSAR_RAW_F16 defaults to 1
-     * (as does PULSAR_IDX_FP4).  This was 0 for the first calibration runs, i.e.
+    /* PRODUCTION IS ALWAYS f16 (the raw ring has no f32 mode; PULSAR_IDX_FP4
+     * likewise defaults on).  This was 0 for the first calibration runs, i.e.
      * the harness staged f32 raw KV -- twice production's traffic -- while the
      * stall breakdown was read off it.  argv[5] overrides. */
     const int      raw_f16  = argc > 5 ? atoi(argv[5]) : 1;

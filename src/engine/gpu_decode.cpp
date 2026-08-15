@@ -165,12 +165,6 @@ int gpu_graph_idx_fp4_enabled(void) {
     return cached;
 }
 
-int gpu_graph_raw_f16_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_RAW_F16", 1);
-    return cached;
-}
-
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
@@ -424,7 +418,7 @@ bool gpu_graph_encode_decode_layer(
         int                     token) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    const uint32_t raw_f16 = (uint32_t)gpu_graph_raw_f16_enabled();
+    const uint32_t raw_f16 = 1u;   /* the raw KV ring is always __half */
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
     const uint32_t n_groups = PULSAR_N_OUT_GROUP;

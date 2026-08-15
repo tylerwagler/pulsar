@@ -2297,12 +2297,6 @@ uint32_t gpu_graph_prefill_slice(void);
  * cache rows are QAT-roundtripped to exactly these fp4 values in both modes,
  * so scores and outputs are bit-identical; only storage and traffic change. */
 int gpu_graph_idx_fp4_enabled(void);
-/* True when PULSAR_RAW_F16 is set (cached). When on, the raw KV ring stores
- * __half rows (half the bytes) instead of f32 containers.  The stored values
- * are ALREADY f16-rounded in both modes (the store kernels roundtrip through
- * __float2half, and the fp8-roundtripped nope dims are exactly
- * f16-representable), so reads are bit-identical; only storage changes. */
-int gpu_graph_raw_f16_enabled(void);
 /* Comp-cache row stride in bytes for the active storage format (pack-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
 /* Returns the comp-cache tensor to hand to the f32 prefill attention consumers

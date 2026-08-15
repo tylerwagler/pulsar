@@ -1369,9 +1369,8 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
 
     const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    /* Raw SWA ring: f16 rows under PULSAR_RAW_F16 (default on), else f32. */
-    const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
-                                                                 : sizeof(float);
+    /* Raw SWA ring: always f16 rows. */
+    const uint64_t raw_elem_bytes = sizeof(uint16_t);   /* raw KV ring is __half */
     m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_N_HEAD_DIM * raw_elem_bytes;
 
     /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */

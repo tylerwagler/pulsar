@@ -56,8 +56,7 @@ static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t
      * indexer) — an f32-priced estimate overshoots ~3x under the default-on
      * packed formats and needlessly trips the managed-KV (demand-paged) path
      * at the 512k+ contexts where performance matters most. */
-    const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
-                                                          : sizeof(float);
+    const uint64_t raw_elem = sizeof(uint16_t);   /* raw KV ring is __half */
     uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
 
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
