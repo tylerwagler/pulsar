@@ -8,6 +8,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "ds4_mxfp8_mma.cuh"
+#include "cuda/pulsar_cuda_mx.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1092,6 +1093,102 @@ __device__ __forceinline__ void make_iq2_A_tile(
     const int ls1 = (int)(code1.y >> 27) | 1;
     dA0 = d0 * (float)ls0 * 0.125f;
     dA1 = d1 * (float)ls1 * 0.125f;
+}
+
+/* A8 (gap B): the same tile, but as MXFP8 operands for the block-scaled MMA.
+ *
+ * This is NOT new numerics.  The block-amax -> shared-exponent -> e4m3 encode is
+ * exactly what mxfp8_quant_act_kernel does on the dense activation path; it is
+ * called here through pulsar_cuda_mx.cuh so there is ONE definition of the
+ * exponent arithmetic rather than a fourth copy.  What differs from the dense
+ * case is only where the values come from (IQ2 codes dequantised in-register,
+ * not f32 in memory) and where they go (MMA fragment registers plus the sfa
+ * scale register, not an mx_sfoff-swizzled slab).
+ *
+ * REDUCTION WIDTH.  Per lane, x[0]/x[2] hold 8 of row `group`'s 32 k-values and
+ * x[1]/x[3] hold 8 of row `group+8`'s, so a row's 32 values live in the 4 lanes
+ * sharing `group` (d2r_group() = lane>>2, d2r_tig() = lane&3 -- consecutive).
+ * The block amax is therefore a QUAD reduction, xor 1 and 2, not a warp-wide
+ * one -- the same narrowing the attention epilogue uses.
+ *
+ * SCALE REGISTER.  Each lane supplies ONE byte, and which row it belongs to
+ * follows the layout the hardware expects: lanes with tig == 1 supply row
+ * group+8, every other lane supplies row group.  Copied from the working
+ * instance in pulsar_cuda_indexer_mxfp4.cu:420 -- a wrong guess here is a
+ * silent wrong-operand bug, since the GEMM would read a well-formed scale
+ * belonging to the wrong row.
+ *
+ * The effective weight is grid_value * d * ls * 0.125 (the IQ2 grid is 8x: the
+ * {8,25,43} magnitudes are 8x the real {1, 3.125, 5.375}).  That PRODUCT is
+ * what gets MX-quantised -- there is no scale left to fold afterwards, which is
+ * the point: the hardware applies it.
+ *
+ * NOT YET WIRED: the B tile still stages q8_1, so nothing calls this. */
+__device__ __forceinline__ static uint32_t iq2_pack_e4m3_quad(
+        uint32_t signed4, float scale) {
+    uint32_t out = 0;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const float v = (float)(int8_t)((signed4 >> (8 * b)) & 0xFFu) * scale;
+        const __nv_fp8_e4m3 e = (__nv_fp8_e4m3)v;
+        out |= ((uint32_t)*(const uint8_t *)&e) << (8 * b);
+    }
+    return out;
+}
+
+template <int T, typename TileA>
+__device__ __forceinline__ void make_iq2_A_tile_e4m3(
+        TileA &A, uint32_t &sfa,
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        int warp, int raw_stage, bool row0_ok, bool row1_ok,
+        int group, int tig) {
+    const IQ2RawWarpStage &raw = s_raw[warp][raw_stage];
+    constexpr int pair = T;
+    const int row0 = group;
+    const int row1 = group + 8;
+    const uint2 code0 = row0_ok ? raw.qs[row0][pair] : make_uint2(0, 0);
+    const uint2 code1 = row1_ok ? raw.qs[row1][pair] : make_uint2(0, 0);
+
+    const uint32_t w0a = row0_ok ? iq2_decode_signed_half(code0, s_grid, tig)     : 0u;
+    const uint32_t w1a = row1_ok ? iq2_decode_signed_half(code1, s_grid, tig)     : 0u;
+    const uint32_t w0b = row0_ok ? iq2_decode_signed_half(code0, s_grid, tig + 4) : 0u;
+    const uint32_t w1b = row1_ok ? iq2_decode_signed_half(code1, s_grid, tig + 4) : 0u;
+
+    const float d0 = row0_ok ? __half2float(raw.dq[row0]) : 0.0f;
+    const float d1 = row1_ok ? __half2float(raw.dq[row1]) : 0.0f;
+    const int ls0 = (int)(code0.y >> 27) | 1;
+    const int ls1 = (int)(code1.y >> 27) | 1;
+    const float dA0 = d0 * (float)ls0 * 0.125f;
+    const float dA1 = d1 * (float)ls1 * 0.125f;
+
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        a0 = fmaxf(a0, fabsf((float)(int8_t)((w0a >> (8 * b)) & 0xFFu)));
+        a0 = fmaxf(a0, fabsf((float)(int8_t)((w0b >> (8 * b)) & 0xFFu)));
+        a1 = fmaxf(a1, fabsf((float)(int8_t)((w1a >> (8 * b)) & 0xFFu)));
+        a1 = fmaxf(a1, fabsf((float)(int8_t)((w1b >> (8 * b)) & 0xFFu)));
+    }
+    a0 *= fabsf(dA0);
+    a1 *= fabsf(dA1);
+    /* quad reduction: lanes group*4 + 0..3 hold this row's whole 32-block */
+    a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, 1));
+    a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, 2));
+    a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, 1));
+    a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, 2));
+
+    const int se0 = pulsar_mx_shared_exp(a0);
+    const int se1 = pulsar_mx_shared_exp(a1);
+    const float r0 = dA0 * exp2f(-(float)se0);
+    const float r1 = dA1 * exp2f(-(float)se1);
+
+    A.x[0] = (int)iq2_pack_e4m3_quad(w0a, r0);
+    A.x[1] = (int)iq2_pack_e4m3_quad(w1a, r1);
+    A.x[2] = (int)iq2_pack_e4m3_quad(w0b, r0);
+    A.x[3] = (int)iq2_pack_e4m3_quad(w1b, r1);
+
+    sfa = (uint32_t)pulsar_mx_scale_byte((tig == 1) ? se1 : se0);
 }
 
 template <int NFrag>
