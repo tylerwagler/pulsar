@@ -1392,6 +1392,42 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         const uint32_t sfb0 = (uint32_t)s_q8[q8_stage][nf][group].d4[T0 & 3];
         const uint32_t sfb1 = (uint32_t)s_q8[q8_stage][nf][group].d4[T1 & 3];
 
+#ifdef DS4_IQ2_ARM_CROSSCHECK
+        /* Localise the arm-1 divergence: run ONE MMA both ways on the same
+         * tile and report the first disagreement.  The integer arm is the
+         * reference (it is what ships).  Build with -DDS4_IQ2_ARM_CROSSCHECK;
+         * never on by default -- it serialises and prints from device code. */
+        {
+            TileA Aq;
+            float dq0 = 0.f, dq1 = 0.f;
+            make_iq2_A_tile<T0>(Aq, dq0, dq1, s_raw, s_grid, warp, raw_stage,
+                                raw_row0_ok, raw_row1_ok, group, tig);
+            TileC Cq;
+            ggml_cuda_mma::mma(Cq, Aq, B0);
+            const Q8D4K64PairF32 dBq = load_q8_d4_k64_pair<T0>(s_q8, q8_stage, nf,
+                                                               TileC::get_j(0), TileC::get_j(1));
+            float ref[4];
+            ref[0] = (float)Cq.x[0] * dq0 * q8_d4_k64_slot<T0>(dBq.c0);
+            ref[1] = (float)Cq.x[1] * dq0 * q8_d4_k64_slot<T0>(dBq.c1);
+            ref[2] = (float)Cq.x[2] * dq1 * q8_d4_k64_slot<T0>(dBq.c0);
+            ref[3] = (float)Cq.x[3] * dq1 * q8_d4_k64_slot<T0>(dBq.c1);
+
+            float mx[4] = {0.f, 0.f, 0.f, 0.f};
+            ds4_mma_m16n8k32_e4m3(mx[0], mx[1], mx[2], mx[3],
+                                  (uint32_t)A0.x[0], (uint32_t)A0.x[1],
+                                  (uint32_t)A0.x[2], (uint32_t)A0.x[3],
+                                  (uint32_t)B0.x[0], (uint32_t)B0.x[1], sfa0, sfb0);
+            if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+                nf == 0 && d2r_warp() == 0 && d2r_lane() == 0) {
+                printf("XCHK T0=%d ref %.5f %.5f %.5f %.5f | mx %.5f %.5f %.5f %.5f "
+                       "| sfa0=%u sfb0=%u dq0=%.6g dB=%.6g\n",
+                       (int)T0, ref[0], ref[1], ref[2], ref[3],
+                       mx[0], mx[1], mx[2], mx[3],
+                       (unsigned)sfa0, (unsigned)sfb0, dq0,
+                       q8_d4_k64_slot<T0>(dBq.c0));
+            }
+        }
+#endif
         ds4_mma_m16n8k32_e4m3(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3],
                               (uint32_t)A0.x[0], (uint32_t)A0.x[1],
                               (uint32_t)A0.x[2], (uint32_t)A0.x[3],
