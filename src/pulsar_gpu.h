@@ -534,20 +534,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         void                   *q_out_sf,
         int                     q_out_kbp);
 
-int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
-        pulsar_gpu_tensor       *q_out,
-        const pulsar_gpu_tensor *q,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                q_weight_offset,
-        uint32_t                q_n,
-        pulsar_gpu_tensor       *kv_out,
-        const pulsar_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
-        uint32_t                kv_n,
-        uint32_t                rows,
-        float                   eps);
-
 int pulsar_gpu_head_rms_norm_tensor(
         pulsar_gpu_tensor *x,
         uint32_t          n_tok,
@@ -589,14 +575,7 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-int pulsar_gpu_dsv4_fp8_kv_pack_tensor(
-        const pulsar_gpu_tensor *x,
-        pulsar_gpu_tensor       *packed,
-        pulsar_gpu_tensor       *scales,
-        uint32_t               n_tok,
-        uint32_t               head_dim);
-
-/* Microscaling (MX) compressed-KV pack/dequant. fmt is PULSAR_MXKV_FMT_FP8/FP4.
+/* Microscaling (MX) compressed-KV pack. fmt is PULSAR_MXKV_FMT_FP4.
  * Row layout [data][E8M0 scales], block 32; head_dim must be a multiple of 32.
  * `out` (pack) / `in` (dequant) is sized n_tok * PULSAR_MXKV_ROWBYTES(fmt,head_dim). */
 int pulsar_gpu_mxkv_pack_tensor(
@@ -653,16 +632,6 @@ int pulsar_gpu_attn_pack_repack_tensor(
 /* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
  * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
  * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */
-int pulsar_gpu_mxkv_gather_dequant_tensor(
-        const pulsar_gpu_tensor *cache,
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *rows,
-        uint32_t               n_sel,
-        uint32_t               cap_rows,
-        uint32_t               head_dim,
-        uint32_t               fmt,
-        uint32_t               transpose);
-
 int pulsar_gpu_dsv4_indexer_qat_tensor(
         pulsar_gpu_tensor *x,
         uint32_t          n_rows,

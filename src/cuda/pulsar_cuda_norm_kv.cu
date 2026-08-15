@@ -541,32 +541,6 @@ __device__ static float dsv4_e4m3fn_decode_dev(uint8_t byte, float scale) {
 #define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
 #define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
 
-__global__ static void pack_fp8_kv_kernel(const float *x, uint8_t *packed, float *scales, uint32_t n_tok, uint32_t head_dim) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (row >= n_tok) return;
-    const float *xr = x + (uint64_t)row * head_dim;
-    uint8_t *pr = packed + (uint64_t)row * head_dim;
-    float *sr = scales + (uint64_t)row * PULSAR_FP8_KV_NBLK(head_dim);
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < head_dim; off += PULSAR_FP8_KV_BLOCK) {
-        float v = 0.0f;
-        if (off + tid < head_dim) v = xr[off + tid];
-        scratch[tid] = off + tid < head_dim ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
-        uint32_t blk = off / PULSAR_FP8_KV_BLOCK;
-        if (tid == 0) sr[blk] = scale;
-        if (off + tid < head_dim) {
-            pr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
-        }
-        __syncthreads();
-    }
-}
 
 /* Fused decode KV store: fake-quant the nope dims of the single kv row IN
  * PLACE (same 64-thread block, same reduction and scale math as
@@ -1214,23 +1188,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
     return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
 }
 
-int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
-        pulsar_gpu_tensor       *q_out,
-        const pulsar_gpu_tensor *q,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                q_weight_offset,
-        uint32_t                q_n,
-        pulsar_gpu_tensor       *kv_out,
-        const pulsar_gpu_tensor *kv,
-        uint64_t                kv_weight_offset,
-        uint32_t                kv_n,
-        uint32_t                rows,
-        float                   eps) {
-    return pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
-            q_out, q, model_map, model_size, q_weight_offset, q_n,
-            kv_out, kv, kv_weight_offset, kv_n, rows, eps, NULL, NULL, 0);
-}
 
 
 int pulsar_gpu_head_rms_norm_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
@@ -1256,20 +1213,6 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(pulsar_gpu_tensor *x, uint32_t n_tok,
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 
-int pulsar_gpu_dsv4_fp8_kv_pack_tensor(
-        const pulsar_gpu_tensor *x,
-        pulsar_gpu_tensor       *packed,
-        pulsar_gpu_tensor       *scales,
-        uint32_t               n_tok,
-        uint32_t               head_dim) {
-    uint32_t nblk = PULSAR_FP8_KV_NBLK(head_dim);
-    if (!x || !packed || !scales || n_tok == 0 ||
-        x->bytes < (uint64_t)n_tok * head_dim * sizeof(float) ||
-        packed->bytes < (uint64_t)n_tok * head_dim ||
-        scales->bytes < (uint64_t)n_tok * nblk * sizeof(float)) return 0;
-    pack_fp8_kv_kernel<<<n_tok, 64>>>((const float *)x->ptr, (uint8_t *)packed->ptr, (float *)scales->ptr, n_tok, head_dim);
-    return cuda_ok(cudaGetLastError(), "fp8_kv_pack launch");
-}
 
 
 /*
@@ -1339,7 +1282,7 @@ __global__ static void mxkv_dequant_kernel(const uint8_t *in, float *out,
 int pulsar_gpu_mxkv_pack_tensor(const pulsar_gpu_tensor *x, pulsar_gpu_tensor *out,
                                         uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
     if (!x || !out || n_tok == 0 || (head_dim % PULSAR_MXKV_BLOCK) != 0 ||
-        (fmt != PULSAR_MXKV_FMT_FP8 && fmt != PULSAR_MXKV_FMT_FP4) ||
+        fmt != PULSAR_MXKV_FMT_FP4 ||
         x->bytes < (uint64_t)n_tok * head_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tok * PULSAR_MXKV_ROWBYTES(fmt, head_dim)) return 0;
     mxkv_pack_kernel<<<n_tok, 32>>>((const float *)x->ptr, (uint8_t *)out->ptr, n_tok, head_dim, fmt);
@@ -1349,7 +1292,7 @@ int pulsar_gpu_mxkv_pack_tensor(const pulsar_gpu_tensor *x, pulsar_gpu_tensor *o
 int pulsar_gpu_mxkv_dequant_tensor(const pulsar_gpu_tensor *in, pulsar_gpu_tensor *out,
                                            uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
     if (!in || !out || n_tok == 0 || (head_dim % PULSAR_MXKV_BLOCK) != 0 ||
-        (fmt != PULSAR_MXKV_FMT_FP8 && fmt != PULSAR_MXKV_FMT_FP4) ||
+        fmt != PULSAR_MXKV_FMT_FP4 ||
         in->bytes < (uint64_t)n_tok * PULSAR_MXKV_ROWBYTES(fmt, head_dim) ||
         out->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     mxkv_dequant_kernel<<<n_tok, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr, n_tok, head_dim, fmt);
@@ -1418,61 +1361,7 @@ int pulsar_gpu_attn_pack_repack_tensor(const pulsar_gpu_tensor *x,
     return cuda_ok(cudaGetLastError(), "attn_pack_repack launch");
 }
 
-/*
- * Gathered dequant: dequant n_sel rows selected by rows[i] from an MX KV cache
- * (row stride cap_rows) into a contiguous f32 [n_sel][head_dim] buffer.  This is
- * the attention gather primitive — it materializes the top-K compressed rows
- * (and, with an identity index, a raw window) that a query attends to, ready to
- * pack into a GEMM operand.  Optional out_stride lets V be written transposed
- * ([head_dim][n_sel]) by the caller assembling the PV operand.
- */
-__global__ static void mxkv_gather_dequant_kernel(const uint8_t *cache, float *out,
-                                                  const int32_t *rows, uint32_t n_sel,
-                                                  uint32_t cap_rows,
-                                                  uint32_t head_dim, uint32_t fmt,
-                                                  uint32_t out_row_stride, uint32_t out_col_stride) {
-    uint32_t i = blockIdx.x;
-    if (i >= n_sel) return;
-    int32_t r = rows[i];
-    if (r < 0 || (uint32_t)r >= cap_rows) return;
-    const uint32_t nblk = head_dim / PULSAR_MXKV_BLOCK;
-    const uint32_t data_bytes = (fmt == PULSAR_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
-    const uint32_t rowbytes = data_bytes + nblk;
-    const uint8_t *inr = cache + (uint64_t)r * rowbytes;
-    const uint8_t *scales = inr + data_bytes;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        const float scale = dsv4_e8m0_decode_scale_dev(scales[d / PULSAR_MXKV_BLOCK]);
-        float v;
-        if (fmt == PULSAR_MXKV_FMT_FP4) {
-            const uint8_t byte = inr[d >> 1];
-            const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-            v = dsv4_e2m1fn_decode_dev(nib, scale);
-        } else {
-            v = dsv4_e4m3fn_decode_dev(inr[d], scale);
-        }
-        out[(uint64_t)i * out_row_stride + (uint64_t)d * out_col_stride] = v;
-    }
-}
 
-/* out is [n_sel][head_dim] contiguous when transpose==0, or [head_dim][n_sel]
- * (column i strided) when transpose!=0 — the latter builds a PV V^T operand. */
-int pulsar_gpu_mxkv_gather_dequant_tensor(const pulsar_gpu_tensor *cache, pulsar_gpu_tensor *out,
-                                                  const pulsar_gpu_tensor *rows, uint32_t n_sel,
-                                                  uint32_t cap_rows, uint32_t head_dim, uint32_t fmt,
-                                                  uint32_t transpose) {
-    if (!cache || !out || !rows || n_sel == 0 || (head_dim % PULSAR_MXKV_BLOCK) != 0 ||
-        (fmt != PULSAR_MXKV_FMT_FP8 && fmt != PULSAR_MXKV_FMT_FP4) ||
-        cache->bytes < (uint64_t)cap_rows * PULSAR_MXKV_ROWBYTES(fmt, head_dim) ||
-        rows->bytes < (uint64_t)n_sel * sizeof(int32_t) ||
-        out->bytes < (uint64_t)n_sel * head_dim * sizeof(float)) return 0;
-    const uint32_t out_row_stride = transpose ? 1u : head_dim;      /* stride between rows i */
-    const uint32_t out_col_stride = transpose ? n_sel : 1u;         /* stride between dims d */
-    mxkv_gather_dequant_kernel<<<n_sel, 256>>>((const uint8_t *)cache->ptr, (float *)out->ptr,
-                                               (const int32_t *)rows->ptr, n_sel, cap_rows,
-                                               head_dim, fmt,
-                                               out_row_stride, out_col_stride);
-    return cuda_ok(cudaGetLastError(), "mxkv_gather_dequant launch");
-}
 
 
 int pulsar_gpu_dsv4_indexer_qat_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {

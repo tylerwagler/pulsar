@@ -417,87 +417,11 @@ static int check_dspark_confidence_head(void) {
     return rc;
 }
 
-static int check_dspark_fp8_kv_pack(void) {
-    const uint32_t head_dim = 512;
-    const uint32_t nblk = (head_dim + 63) / 64;
-    float *src = (float *)calloc(head_dim, sizeof(float));
-    if (!src) return 1;
-    for (uint32_t i = 0; i < head_dim; i++) src[i] = ((float)i - 256.0f) * 0.5f;
-
-    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc(head_dim * sizeof(float));
-    pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc(head_dim);
-    pulsar_gpu_tensor *scales = pulsar_gpu_tensor_alloc(nblk * sizeof(float));
-    if (!x || !packed || !scales) { free(src); return 1; }
-    if (!pulsar_gpu_tensor_write(x, 0, src, head_dim * sizeof(float))) { free(src); return 1; }
-
-    int rc = 0;
-    if (!pulsar_gpu_dsv4_fp8_kv_pack_tensor(x, packed, scales, 1, head_dim)) {
-        fprintf(stderr, "pulsar: fp8 kv pack failed\n");
-        rc = 1;
-    }
-    if (rc == 0) {
-        uint8_t *packed_host = (uint8_t *)malloc(head_dim);
-        float *scales_host = (float *)malloc(nblk * sizeof(float));
-        if (!packed_host || !scales_host) rc = 1;
-        else {
-            if (!pulsar_gpu_tensor_read(packed, 0, packed_host, head_dim))
-                rc = 1;
-            if (!pulsar_gpu_tensor_read(scales, 0, scales_host, nblk * sizeof(float)))
-                rc = 1;
-            if (rc == 0) {
-                for (uint32_t i = 0; i < head_dim; i++) {
-                    float scale = scales_host[i >> 6];
-                    int idx = packed_host[i] & 0x7f;
-                    float val = 0.0f;
-                    int exp = (idx >> 3) & 15;
-                    int mant = idx & 7;
-                    if (exp == 0) val = (float)mant * 0.001953125f;
-                    else val = (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-                    if (packed_host[i] & 0x80) val = -val;
-                    float recon = val * scale;
-                    float diff = fabsf(recon - src[i]);
-                    float tol = fmaxf(fabsf(src[i]) * 0.3f + 1e-5f, 1e-4f);
-                    if (diff > tol) {
-                        fprintf(stderr, "pulsar: fp8 packing error at %u: src=%.6f recon=%.6f\n",
-                                i, (double)src[i], (double)recon);
-                        rc = 1;
-                        break;
-                    }
-                }
-            }
-            free(packed_host);
-            free(scales_host);
-        }
-    }
-
-    pulsar_gpu_tensor_free(scales);
-    pulsar_gpu_tensor_free(packed);
-    pulsar_gpu_tensor_free(x);
-    free(src);
-    return rc;
-}
 
 /* ---- Stage 1: MX (microscaling) compressed-KV pack/dequant round-trip ---- */
-#define MXKV_FP8 1u
 #define MXKV_FP4 2u
 #define MXKV_BLK 32u
 
-static float mxkv_e4m3_value(int i) {
-    int exp = (i >> 3) & 15, mant = i & 7;
-    if (exp == 0) return (float)mant * 0.001953125f;
-    return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-}
-static float mxkv_e4m3_snap(float x) { /* returns dequantized magnitude, mirrors device */
-    float ax = fminf(fabsf(x), 448.0f);
-    int lo = 0, hi = 126;
-    while (lo < hi) { int mid = (lo + hi + 1) >> 1; if (mxkv_e4m3_value(mid) <= ax) lo = mid; else hi = mid - 1; }
-    int best = lo;
-    if (best < 126) {
-        float bd = fabsf(ax - mxkv_e4m3_value(best)), nd = fabsf(ax - mxkv_e4m3_value(best + 1));
-        if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
-    }
-    return (x < 0.0f ? -1.0f : 1.0f) * mxkv_e4m3_value(best);
-}
 static float mxkv_e2m1_value(int i) {
     static const float t[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     return t[i & 7];
@@ -519,8 +443,8 @@ static float mxkv_ref_scale(float amax, float max_repr) {
 
 static int mxkv_run_case(uint32_t fmt, uint32_t n_tok, uint32_t head_dim, const float *src) {
     const uint32_t nblk = head_dim / MXKV_BLK;
-    const uint32_t rowbytes = (fmt == MXKV_FP4 ? head_dim / 2 : head_dim) + nblk;
-    const float max_repr = (fmt == MXKV_FP4) ? 6.0f : 448.0f;
+    const uint32_t rowbytes = head_dim / 2 + nblk;
+    const float max_repr = 6.0f;
 
     pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)n_tok * head_dim * sizeof(float));
     pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc((uint64_t)n_tok * rowbytes);
@@ -542,7 +466,7 @@ static int mxkv_run_case(uint32_t fmt, uint32_t n_tok, uint32_t head_dim, const 
                 for (uint32_t j = 0; j < MXKV_BLK; j++) {
                     uint32_t d = b * MXKV_BLK + j;
                     float in = src[r * head_dim + d];
-                    float ref = (fmt == MXKV_FP4 ? mxkv_e2m1_snap(in / scale) : mxkv_e4m3_snap(in / scale)) * scale;
+                    float ref = mxkv_e2m1_snap(in / scale) * scale;
                     float got = gpu_deq[r * head_dim + d];
                     if (fabsf(got - ref) > 1e-3f) {
                         fprintf(stderr, "mxkv fmt=%u mismatch @row%u d%u: gpu=%.6f ref=%.6f (in=%.6f scale=%.6g)\n",
@@ -558,7 +482,7 @@ static int mxkv_run_case(uint32_t fmt, uint32_t n_tok, uint32_t head_dim, const 
         if (rc == 0) {
             double rel = sum_ref > 0 ? sum_abs / sum_ref : 0.0;
             /* FP8 ~<3% mean rel error, FP4 much coarser but bounded. */
-            double bound = (fmt == MXKV_FP4) ? 0.20 : 0.05;
+            double bound = 0.20;
             printf("  mxkv fmt=%u rowbytes=%u mean_rel_err=%.4f worst_abs=%.4f -> %s\n",
                    fmt, rowbytes, rel, (double)worst, rel <= bound ? "OK" : "HIGH");
             if (rel > bound) rc = 1;
@@ -581,65 +505,11 @@ static int check_mxkv_roundtrip(void) {
             src[r * head_dim + d] = v;
         }
     int rc = 0;
-    if (mxkv_run_case(MXKV_FP8, n_tok, head_dim, src) != 0) rc = 1;
     if (mxkv_run_case(MXKV_FP4, n_tok, head_dim, src) != 0) rc = 1;
     free(src);
     return rc;
 }
 
-/* MXKV gather primitive: dequant selected rows (contiguous and transposed). */
-static int check_mxkv_gather(void) {
-    const uint32_t n_cap = 100, n_sel = 32, head_dim = 512, nblk = head_dim / MXKV_BLK;
-    const uint32_t rowbytes = head_dim + nblk;   /* MXFP8 */
-    float *src = (float *)malloc((size_t)n_cap * head_dim * sizeof(float));
-    int32_t *rows = (int32_t *)malloc(n_sel * sizeof(int32_t));
-    if (!src || !rows) return 1;
-    for (uint32_t r = 0; r < n_cap; r++)
-        for (uint32_t d = 0; d < head_dim; d++)
-            src[r * head_dim + d] = sinf((float)(r * 5 + d) * 0.02f) * (1.0f + 0.05f * (float)r);
-    for (uint32_t i = 0; i < n_sel; i++) rows[i] = (int32_t)((i * 37 + 11) % n_cap);   /* scattered picks */
-
-    pulsar_gpu_tensor *xf = pulsar_gpu_tensor_alloc((uint64_t)n_cap * head_dim * sizeof(float));
-    pulsar_gpu_tensor *cache = pulsar_gpu_tensor_alloc((uint64_t)n_cap * rowbytes);
-    pulsar_gpu_tensor *idx = pulsar_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
-    pulsar_gpu_tensor *g0 = pulsar_gpu_tensor_alloc((uint64_t)n_sel * head_dim * sizeof(float));
-    pulsar_gpu_tensor *g1 = pulsar_gpu_tensor_alloc((uint64_t)n_sel * head_dim * sizeof(float));
-    float *out0 = (float *)malloc((size_t)n_sel * head_dim * sizeof(float));
-    float *out1 = (float *)malloc((size_t)n_sel * head_dim * sizeof(float));
-    int rc = 1;
-    if (xf && cache && idx && g0 && g1 && out0 && out1 &&
-        pulsar_gpu_tensor_write(xf, 0, src, (uint64_t)n_cap * head_dim * sizeof(float)) &&
-        pulsar_gpu_tensor_write(idx, 0, rows, (uint64_t)n_sel * sizeof(int32_t)) &&
-        pulsar_gpu_mxkv_pack_tensor(xf, cache, MXKV_FP8, n_cap, head_dim) &&
-        pulsar_gpu_mxkv_gather_dequant_tensor(cache, g0, idx, n_sel, n_cap, head_dim, MXKV_FP8, 0) &&
-        pulsar_gpu_mxkv_gather_dequant_tensor(cache, g1, idx, n_sel, n_cap, head_dim, MXKV_FP8, 1) &&
-        pulsar_gpu_tensor_read(g0, 0, out0, (uint64_t)n_sel * head_dim * sizeof(float)) &&
-        pulsar_gpu_tensor_read(g1, 0, out1, (uint64_t)n_sel * head_dim * sizeof(float))) {
-        rc = 0;
-        for (uint32_t i = 0; i < n_sel && rc == 0; i++) {
-            const float *sr = src + (size_t)rows[i] * head_dim;
-            for (uint32_t b = 0; b < nblk; b++) {
-                float amax = 0.0f;
-                for (uint32_t j = 0; j < MXKV_BLK; j++) amax = fmaxf(amax, fabsf(sr[b * MXKV_BLK + j]));
-                float scale = mxkv_ref_scale(amax, 448.0f);
-                for (uint32_t j = 0; j < MXKV_BLK; j++) {
-                    uint32_t d = b * MXKV_BLK + j;
-                    float ref = mxkv_e4m3_snap(sr[d] / scale) * scale;
-                    if (fabsf(out0[(size_t)i * head_dim + d] - ref) > 1e-3f ||    /* contiguous */
-                        fabsf(out1[(size_t)d * n_sel + i] - ref) > 1e-3f) {       /* transposed */
-                        fprintf(stderr, "mxkv gather mismatch row%u d%u\n", i, d);
-                        rc = 1; break;
-                    }
-                }
-            }
-        }
-        if (rc == 0) printf("  mxkv gather n_sel=%u (contiguous + transposed) -> OK\n", n_sel);
-    }
-    pulsar_gpu_tensor_free(g1); pulsar_gpu_tensor_free(g0); pulsar_gpu_tensor_free(idx);
-    pulsar_gpu_tensor_free(cache); pulsar_gpu_tensor_free(xf);
-    free(src); free(rows); free(out0); free(out1);
-    return rc;
-}
 
 /* ---------------------------------------------------------------------------
  * Multi-bank descriptor attention smoke (Tier-2 step 2).
@@ -1399,8 +1269,6 @@ int main(void) {
     if (!pulsar_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_mxkv_roundtrip() != 0) rc = 1;
-    if (check_mxkv_gather() != 0) rc = 1;
-    if (check_dspark_fp8_kv_pack() != 0) rc = 1;
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;

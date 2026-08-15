@@ -66,15 +66,12 @@ enum {
  */
 #define PULSAR_MXKV_BLOCK 32u
 #define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
-#define PULSAR_MXKV_FP8_ROWBYTES(HD) ((HD) + PULSAR_MXKV_NBLK(HD))
 #define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
 /* KV cache storage format selector (compile/runtime). */
 #define PULSAR_MXKV_FMT_NONE 0u
-#define PULSAR_MXKV_FMT_FP8  1u
 #define PULSAR_MXKV_FMT_FP4  2u
 #define PULSAR_MXKV_ROWBYTES(FMT, HD) \
     ((FMT) == PULSAR_MXKV_FMT_FP4 ? PULSAR_MXKV_FP4_ROWBYTES(HD) \
-   : (FMT) == PULSAR_MXKV_FMT_FP8 ? PULSAR_MXKV_FP8_ROWBYTES(HD) \
    : (HD) * sizeof(float))
 
 /*
