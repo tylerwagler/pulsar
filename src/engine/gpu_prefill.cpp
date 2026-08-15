@@ -484,7 +484,6 @@ bool gpu_graph_encode_layer_attention_batch(
     }
     uint32_t *comp_counts = compressed ? (uint32_t *)xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
     uint32_t *index_counts = ratio == 4 ? (uint32_t *)xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
-    const bool qkv_rms_fused = true;   /* the unfused reference arm is gone */
     pulsar_gpu_tensor *hc_mix_view = pulsar_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
@@ -494,7 +493,6 @@ bool gpu_graph_encode_layer_attention_batch(
     pulsar_gpu_tensor *after_attn_hc_view = pulsar_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
-    const bool fuse_hc_norm = PULSAR_N_HC == 4;
     /* batch_flat_hc is hc_dim (= n_hc * n_embd) wide, so the F16 narrowing the
      * mix GEMM below would otherwise do is the single largest memory pass in
      * the layer -- ~400 MB at a 4096-token prefill, twice per layer.  Emit the
@@ -531,7 +529,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
-    if (fuse_hc_norm) {
+    {
         /* Emit the F16 encoding of batch_attn_norm straight out of this kernel's
          * epilogue, into the activation cache's f16 slot.  Otherwise the first
          * F16 projection below pays a full f32_to_f16_kernel pass over
@@ -566,35 +564,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  PULSAR_N_HC_SINKHORN_ITER,
                                                                  PULSAR_HC_EPS,
                                                                  PULSAR_RMS_EPS) != 0;
-    } else {
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(attn_cur_view,
-                                                            hc_split_view,
-                                                            hc_mix_view,
-                                                            g->batch_cur_hc,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->hc_attn_scale->abs_offset,
-                                                            layer->hc_attn_base->abs_offset,
-                                                            PULSAR_N_EMBD,
-                                                            PULSAR_N_HC,
-                                                            PULSAR_N_HC_SINKHORN_ITER,
-                                                            PULSAR_HC_EPS) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_attn_pre", g->batch_attn_cur,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
     PULSAR_CUDA_PROFILE_ATTN_STAGE("hc_pre");
-    if (ok && !fuse_hc_norm) {
-        ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
-                                                  g->batch_attn_cur,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_norm->abs_offset,
-                                                  PULSAR_N_EMBD,
-                                                  n_tokens,
-                                                  PULSAR_RMS_EPS) != 0;
-    }
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
@@ -628,7 +603,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     PULSAR_CUDA_PROFILE_Q_STAGE("q_a");
-    if (qkv_rms_fused) {
+    {
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
                                                           il,
                                                           pos0,
@@ -675,21 +650,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              qr_norm_kbp) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_tokens, (uint64_t)q_rank);
         if (ok && qr_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-    } else {
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
-                                                           g->batch_qr,
-                                                           model->map,
-                                                           model->size,
-                                                           layer->attn_q_a_norm->abs_offset,
-                                                           (uint32_t)q_rank,
-                                                           n_tokens,
-                                                           PULSAR_RMS_EPS) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora_norm", g->batch_qr_norm,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
-    if (qkv_rms_fused && ok) {
+    if (ok) {
         gpu_graph_debug_dump_tensor("KVnorm", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
@@ -782,34 +748,6 @@ bool gpu_graph_encode_layer_attention_batch(
         PULSAR_CUDA_PROFILE_Q_STAGE("rope");
     }
     PULSAR_CUDA_PROFILE_ATTN_STAGE("q_path");
-    if (!qkv_rms_fused) {
-        if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
-                                                          il,
-                                                          pos0,
-                                                          g->batch_kv_raw,
-                                                          model,
-                                                          layer->attn_kv,
-                                                          PULSAR_N_EMBD,
-                                                          PULSAR_N_HEAD_DIM,
-                                                          g->batch_attn_norm,
-                                                          n_tokens);
-        if (ok) {
-            gpu_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
-                                          (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
-        }
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->batch_kv,
-                                                           g->batch_kv_raw,
-                                                           model->map,
-                                                           model->size,
-                                                           layer->attn_kv_a_norm->abs_offset,
-                                                           PULSAR_N_HEAD_DIM,
-                                                           n_tokens,
-                                                           PULSAR_RMS_EPS) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("KVnorm", g->batch_kv,
-                                          (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
-        }
-    }
     if (ok) ok = pulsar_gpu_rope_tail_tensor(g->batch_kv,
                                             n_tokens,
                                             PULSAR_N_HEAD_KV,
@@ -2439,7 +2377,6 @@ bool gpu_graph_encode_layer_ffn_batch(
     pulsar_gpu_tensor *next_hc_view = pulsar_gpu_tensor_view(
             g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
-    const bool fuse_hc_norm = PULSAR_N_HC == 4;
     void *ffn_norm_f16 = NULL;
     void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
     void *flat_hc_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(g->batch_flat_hc, n_tokens, hc_dim) : NULL;
@@ -2465,7 +2402,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
-    if (fuse_hc_norm) {
+    {
         /* Same f16 epilogue as the attention norm above: batch_ffn_norm feeds
          * the router-logits F16 GEMM, which would otherwise narrow the whole
          * [n_tokens x n_embd] tensor in a separate bandwidth-bound pass. */
@@ -2494,35 +2431,12 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  PULSAR_N_HC_SINKHORN_ITER,
                                                                  PULSAR_HC_EPS,
                                                                  PULSAR_RMS_EPS) != 0;
-    } else {
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
-                                                            hc_split_view,
-                                                            hc_mix_view,
-                                                            g->batch_after_attn_hc,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->hc_ffn_scale->abs_offset,
-                                                            layer->hc_ffn_base->abs_offset,
-                                                            PULSAR_N_EMBD,
-                                                            PULSAR_N_HC,
-                                                            PULSAR_N_HC_SINKHORN_ITER,
-                                                            PULSAR_HC_EPS) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
     PULSAR_CUDA_PROFILE_FFN_STAGE("hc_pre");
-    if (ok && !fuse_hc_norm) {
-        ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
-                                                  g->batch_ffn_cur,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->ffn_norm->abs_offset,
-                                                  PULSAR_N_EMBD,
-                                                  n_tokens,
-                                                  PULSAR_RMS_EPS) != 0;
-    }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
