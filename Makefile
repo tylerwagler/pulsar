@@ -161,13 +161,13 @@ cuda-regression: tests/cuda_long_context_smoke
 # arch; pin it so the default can never decide whether a gate is honest.
 ATTN_GATE_ARCH ?= sm_120f
 
-tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu
+tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu
+tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-tests/attn_decode_split_test: tests/attn_decode_split_test.cu
+tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
