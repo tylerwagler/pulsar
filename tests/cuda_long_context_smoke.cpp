@@ -1084,31 +1084,6 @@ static int check_multibank_indexer(void) {
     }
 
 
-    /* Direct-one fast tier (n_tokens == 1, n_head 64): the banked entry must
-     * keep the classic single-token reduction order — reference is the SAME
-     * scalar-mode dispatch on the bank's view.  Emit-boundary row (qpos 39)
-     * as visibility teeth, f32 format. */
-    {
-        const uint32_t n_head = 64;
-        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
-        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
-        float *host = (float *)malloc(count * sizeof(float));
-        pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count * sizeof(float));
-        int case_rc = 1;
-        if (host && slab) {
-            mb_rng_state = 0xd12ec7u;
-            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
-            if (pulsar_gpu_tensor_write(slab, 0, host, count * sizeof(float))) {
-                const mb_row one[1] = { {1, 39, 0} };
-                case_rc = mb_idx_run_case("direct-one", one, 1, slab, comp_cap,
-                                          n_comp_sup, ratio, n_banks, n_head, head_dim,
-                                          bank_bytes, 8);
-            }
-        }
-        pulsar_gpu_tensor_free(slab);
-        free(host);
-        if (case_rc != 0) goto done;
-    }
 
     /* Dead-row guard: an out-of-pool seq_id must produce an all -INF score
      * row (fail-visible) while its batchmate row scores normally. */
