@@ -728,6 +728,21 @@ bool gpu_graph_encode_layer_attention_batch(
         }
         PULSAR_CUDA_PROFILE_Q_STAGE("q_b");
         const bool prefill_q_norm_debug = gpu_graph_debug_wants("Qnorm", il, pos0);
+    if (prefill_q_norm_debug) {
+        /* ⚠ A DUMP REQUEST IS CHANGING THE KERNEL PATH.  Asking for "Qnorm"
+         * forces the separate norm and rope kernels because the fused one never
+         * materialises the intermediate.  The numbers you are about to dump are
+         * therefore NOT the numbers production computes.  Say so -- diagnosing a
+         * numeric problem with a dump produced by a different kernel is how an
+         * afternoon disappears. */
+        static int warned_qnorm_prefill = 0;
+        if (!warned_qnorm_prefill) {
+            warned_qnorm_prefill = 1;
+            fprintf(stderr,
+                    "pulsar: WARNING Qnorm dump disables the fused norm+rope "
+                    "kernel -- dumped prefill values differ from a normal run\n");
+        }
+    }
         bool prefill_q_norm_rope_fused = false;
         if (ok && !prefill_q_norm_debug) {
             prefill_q_norm_rope_fused =
