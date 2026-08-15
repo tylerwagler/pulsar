@@ -314,28 +314,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
 // down output is materialized. The caller-owned input/work/down scratch keeps
 // this hot path free of stream-ordered allocations; all three ranges must be
 // distinct and remain live until the function returns.
-int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
-    const void    * W_gate_soa,
-    const void    * W_up_soa,
-    const void    * W_down_soa,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * router_weights,
-    void          * input_q8_scratch,
-    size_t          input_q8_scratch_bytes,
-    void          * down_q8_scratch,
-    size_t          down_q8_scratch_bytes,
-    void          * work_scratch,
-    size_t          work_scratch_bytes,
-    float         * down_f32,
-    int             expert_mid_dim,
-    int             expert_in_dim,
-    int             out_dim,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
+/* ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa removed: no callers (see .cu) */
 
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see

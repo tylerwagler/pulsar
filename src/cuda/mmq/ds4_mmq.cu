@@ -1676,73 +1676,17 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         /*sanitize_out=*/false, &fused_down);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
-        const void * W_gate, const void * W_up, const void * W_down,
-        const float * X, const int32_t * ids, const float * router_weights,
-        void * input_q8_scratch, size_t input_q8_scratch_bytes,
-        void * down_q8_scratch, size_t down_q8_scratch_bytes,
-        void * work_scratch, size_t work_scratch_bytes, float * down,
-        int expert_mid_dim, int expert_in_dim, int out_dim,
-        int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
-    if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
-        n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
-        n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
-        expert_mid_dim % 256 != 0 || out_dim % 2 != 0 ||
-        !input_q8_scratch || input_q8_scratch_bytes == 0 ||
-        !down_q8_scratch || down_q8_scratch_bytes == 0 ||
-        !work_scratch || work_scratch_bytes == 0 || !down) {
-        return -1;
-    }
-    const size_t down_bytes =
-        (size_t)n_tokens * (size_t)n_expert_used *
-        (size_t)out_dim * sizeof(float);
-    if (ds4_mmq_scratch_overlaps(
-            input_q8_scratch, input_q8_scratch_bytes,
-            down_q8_scratch, down_q8_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
-            input_q8_scratch, input_q8_scratch_bytes,
-            work_scratch, work_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
-            down_q8_scratch, down_q8_scratch_bytes,
-            work_scratch, work_scratch_bytes) ||
-        ds4_mmq_scratch_overlaps(
-            input_q8_scratch, input_q8_scratch_bytes, down, down_bytes) ||
-        ds4_mmq_scratch_overlaps(
-            down_q8_scratch, down_q8_scratch_bytes, down, down_bytes) ||
-        ds4_mmq_scratch_overlaps(
-            work_scratch, work_scratch_bytes, down, down_bytes)) {
-        return -1;
-    }
-    const int64_t iq2_blocks =
-        (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
-    const int64_t q2_pairs =
-        (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
-    const ds4_mmq_fused_down fused_down = {
-        W_down,
-        (const char *)W_down,
-        q2_pairs,
-        router_weights,
-        nullptr,
-        down,
-        out_dim,
-        clamp,
-        true,
-        input_q8_scratch,
-        input_q8_scratch_bytes,
-        down_q8_scratch,
-        down_q8_scratch_bytes,
-        work_scratch,
-        work_scratch_bytes,
-    };
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
-        "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",
-        W_gate, W_up, X, ids, nullptr, nullptr,
-        expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
-        stream,
-        (const char *)W_gate, (const char *)W_up, iq2_blocks,
-        /*sanitize_out=*/false, &fused_down);
-}
+/* ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa REMOVED 2026-08-15.
+ * It was the ONLY thing that ever set ds4_mmq_fused_down::direct_gateup_q8
+ * to true, and it had NO CALLERS in the tree -- an exported entry point
+ * nothing invoked.  A path trace (one-shot markers, one prefill) confirmed
+ * d2r_fused_launch never executes; this is why gating the E4M3 arm on
+ * direct_gateup_q8 silently disabled it (dead field guarding an unreachable
+ * branch).  With this gone, direct_gateup_q8 is false by construction at
+ * every remaining initializer, so the `if (direct_gateup_q8)` branches, the
+ * field itself, ds4_mmq_iq2_xxs_moe_d2r_fused_launch and
+ * gateup_iq2_swiglu_q8_d2r_kernel are all now unreachable and should follow.
+ * Removed one at a time so each step stays gateable. */
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
  * artifacts (weight server --repack-iq2-aligned); same contract as
