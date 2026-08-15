@@ -1299,7 +1299,104 @@ __device__ __forceinline__ void mma_fold_iq2_k32_pair_t(
     }
 }
 
+/* MXFP8 arm of the k32 pair: same decomposition as mma_fold_iq2_k32_pair_t, but
+ * both operands are E4M3 and the HARDWARE applies the ue8m0 scales, so there is
+ * NO fold -- the accumulator is f32 and the MMA reads/writes it in place.
+ *
+ * WHERE THE SCALES COME FROM, which is the easy thing to get wrong:
+ *   sfa -- from make_iq2_A_tile_e4m3, keyed on `tig` (tig == 1 supplies row
+ *          group+8, every other lane supplies row group).
+ *   sfb -- from the COLUMN GROUP, i.e. s_q8[stage][nf][group], NOT from the
+ *          accumulator columns c0/c1 that load_q8_d4_k64_pair serves.  For
+ *          m16n8k32 the B fragment's 8 columns map one per 4-lane group, so
+ *          lane group g carries column g's scale.  Using the c0/c1 pair here
+ *          would hand the MMA a well-formed scale for the WRONG column.
+ * The ue8m0 byte is stored as a float by ds4_quantize_mmq_e4m3 (which reuses
+ * block_q8_1_mmq's d4 slot to keep the staging layout identical), hence the
+ * cast back on read.
+ *
+ * GUARDED (!FullTile) CASE: out-of-range ROWS are already zeroed inside the A
+ * tile, and out-of-range COLUMNS accumulate values the output store never
+ * writes, since it bounds-checks each fragment element.  So no masking fold is
+ * needed, unlike the integer path which had to mask after the MMA. */
 template <bool FullTile, typename TileA, typename TileB, typename TileC,
+          int T0, int T1, int NFrag>
+__device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
+        float (&acc)[NFrag][TileC::ne],
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        const block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        int raw_stage, int q8_stage, bool raw_row0_ok, bool raw_row1_ok,
+        int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
+    static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
+    static_assert(TileC::ne == 4, "expected m16n8 accumulator fragment");
+    TileA A0;
+    TileA A1;
+    uint32_t sfa0 = 0;
+    uint32_t sfa1 = 0;
+    make_iq2_A_tile_e4m3<T0>(A0, sfa0, s_raw, s_grid, warp, raw_stage,
+                             raw_row0_ok, raw_row1_ok, group, tig);
+    make_iq2_A_tile_e4m3<T1>(A1, sfa1, s_raw, s_grid, warp, raw_stage,
+                             raw_row0_ok, raw_row1_ok, group, tig);
+
+    constexpr int k_in_q8_0 = (T0 & 3) * 32;
+    constexpr int k_in_q8_1 = (T1 & 3) * 32;
+
+    int nf_live = NFrag;
+    if constexpr (!FullTile) {
+        nf_live = (s_inv.col_count + 7) >> 3;
+    }
+
+#pragma unroll
+    for (int nf = 0; nf < NFrag; ++nf) {
+        if constexpr (!FullTile) {
+            if (nf >= nf_live) {
+                break;
+            }
+        }
+        TileB B0;
+        TileB B1;
+        load_B_tile(B0, s_q8, q8_stage, nf, k_in_q8_0);
+        load_B_tile(B1, s_q8, q8_stage, nf, k_in_q8_1);
+        const uint32_t sfb0 = (uint32_t)s_q8[q8_stage][nf][group].d4[T0 & 3];
+        const uint32_t sfb1 = (uint32_t)s_q8[q8_stage][nf][group].d4[T1 & 3];
+
+        ds4_mma_m16n8k32_e4m3(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3],
+                              (uint32_t)A0.x[0], (uint32_t)A0.x[1],
+                              (uint32_t)A0.x[2], (uint32_t)A0.x[3],
+                              (uint32_t)B0.x[0], (uint32_t)B0.x[1], sfa0, sfb0);
+        ds4_mma_m16n8k32_e4m3(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3],
+                              (uint32_t)A1.x[0], (uint32_t)A1.x[1],
+                              (uint32_t)A1.x[2], (uint32_t)A1.x[3],
+                              (uint32_t)B1.x[0], (uint32_t)B1.x[1], sfa1, sfb1);
+    }
+}
+
+/* Selects the arm for one k32 pair.  Both are instantiated so the comparison is
+ * a runtime choice on a kernel argument, uniform across the block -- not a
+ * per-element branch.  When the comparison concludes, the losing arm is DELETED
+ * rather than left behind as a flag. */
+template <bool UseE4M3, bool FullTile, typename TileA, typename TileB,
+          typename TileC, int T0, int T1, int NFrag>
+__device__ __forceinline__ void mma_iq2_k32_pair_arm(
+        float (&acc)[NFrag][TileC::ne],
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        const block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        int raw_stage, int q8_stage, bool raw_row0_ok, bool raw_row1_ok,
+        int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
+    if constexpr (UseE4M3) {
+        mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, T0, T1>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            raw_row0_ok, raw_row1_ok, warp, group, tig, s_inv);
+    } else {
+        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, T0, T1>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            raw_row0_ok, raw_row1_ok, warp, group, tig, s_inv);
+    }
+}
+
+template <bool UseE4M3, bool FullTile, typename TileA, typename TileB, typename TileC,
           int NFrag>
 __device__ __forceinline__ void mma_fold_iq2_k128(
         float (&acc)[NFrag][TileC::ne],
@@ -1325,23 +1422,23 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
     const int half_pair_base = (k128_iter & 1) ? 4 : 0;
 
     if (half_pair_base == 0) {
-        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 0, 1>(
+        mma_iq2_k32_pair_arm<UseE4M3, FullTile, TileA, TileB, TileC, 0, 1>(
             acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
-        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 2, 3>(
+        mma_iq2_k32_pair_arm<UseE4M3, FullTile, TileA, TileB, TileC, 2, 3>(
             acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     } else {
-        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 4, 5>(
+        mma_iq2_k32_pair_arm<UseE4M3, FullTile, TileA, TileB, TileC, 4, 5>(
             acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
-        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 6, 7>(
+        mma_iq2_k32_pair_arm<UseE4M3, FullTile, TileA, TileB, TileC, 6, 7>(
             acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     }
 }
 
-template <bool FullTile, typename TileA, typename TileB, typename TileC>
+template <bool UseE4M3, bool FullTile, typename TileA, typename TileB, typename TileC>
 __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[kNFrag][TileC::ne],
         block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
@@ -1395,10 +1492,10 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
         }
 
         if constexpr (FullTile) {
-            mma_fold_iq2_k128<true, TileA, TileB, TileC>(
+            mma_fold_iq2_k128<UseE4M3, true, TileA, TileB, TileC>(
                 acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
         } else {
-            mma_fold_iq2_k128<false, TileA, TileB, TileC>(
+            mma_fold_iq2_k128<UseE4M3, false, TileA, TileB, TileC>(
                 acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
         }
 
@@ -1440,7 +1537,7 @@ __device__ __forceinline__ void issue_fused_iq2_raw_prefetch(
     }
 }
 
-template <bool FullTile, int TileN,
+template <bool UseE4M3, bool FullTile, int TileN,
           typename TileA, typename TileB, typename TileC>
 __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         float (&gate_acc)[TileN / 8][TileC::ne],
@@ -1467,9 +1564,9 @@ __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         }
 
         const int even_k128 = 2 * k256_iter;
-        mma_fold_iq2_k128<FullTile, TileA, TileB, TileC>(
+        mma_fold_iq2_k128<UseE4M3, FullTile, TileA, TileB, TileC>(
             gate_acc, s.raw[0], s.grid, s.q8, even_k128, s.inv[0]);
-        mma_fold_iq2_k128<FullTile, TileA, TileB, TileC>(
+        mma_fold_iq2_k128<UseE4M3, FullTile, TileA, TileB, TileC>(
             up_acc, s.raw[1], s.grid, s.q8, even_k128, s.inv[1]);
 
         __syncthreads();
@@ -1480,9 +1577,9 @@ __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         }
 
         const int odd_k128 = even_k128 + 1;
-        mma_fold_iq2_k128<FullTile, TileA, TileB, TileC>(
+        mma_fold_iq2_k128<UseE4M3, FullTile, TileA, TileB, TileC>(
             gate_acc, s.raw[0], s.grid, s.q8, odd_k128, s.inv[0]);
-        mma_fold_iq2_k128<FullTile, TileA, TileB, TileC>(
+        mma_fold_iq2_k128<UseE4M3, FullTile, TileA, TileB, TileC>(
             up_acc, s.raw[1], s.grid, s.q8, odd_k128, s.inv[1]);
 
         __syncthreads();
@@ -2545,6 +2642,41 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
 #endif
 }
 
+/* Which IQ2 dequant arm the expert GEMM runs.  Read ONCE per process, not per
+ * token or per layer -- diagnostics may read env, hot paths may not
+ * ([[no-hot-path-flags]]).  This exists ONLY to run the MXFP8-vs-f16 comparison;
+ * when that concludes the losing arm is deleted and this goes with it.
+ *   PULSAR_MOE_IQ2_ARM=0 (default) : q8_1 int8 + integer MMA + scale fold
+ *   PULSAR_MOE_IQ2_ARM=1           : E4M3 + block-scaled MXFP8 MMA, no fold */
+/* ⚠ The E4M3 arm consumes activations STAGED as e4m3 + ue8m0
+ * (ds4_quantize_mmq_e4m3).  The MoE path still stages q8_1, so until that is
+ * switched, enabling the arm would reinterpret int8 bytes as e4m3 and multiply
+ * garbage -- silently, since the shapes all still fit.  REFUSE until the
+ * staging is wired; flip this to 1 in the same commit that switches it. */
+#define DS4_IQ2_E4M3_STAGING_READY 0
+
+static int ds4_d2r_iq2_arm() {
+    static int arm = -1;
+    if (arm < 0) {
+        const char *e = getenv("PULSAR_MOE_IQ2_ARM");
+        const int want = (e && e[0] == '1') ? 1 : 0;
+        if (want && !DS4_IQ2_E4M3_STAGING_READY) {
+            fprintf(stderr, "pulsar: PULSAR_MOE_IQ2_ARM=1 REFUSED -- expert activations "
+                            "are still staged as q8_1 int8, so the E4M3 MMA would read "
+                            "int8 bytes as e4m3 and return well-formed garbage. "
+                            "Running the int8 arm.\n");
+            arm = 0;
+        } else {
+            arm = want;
+            if (arm) {
+                fprintf(stderr, "pulsar: MoE IQ2 experts = E4M3 x E4M3 block-scaled MMA "
+                                "(PULSAR_MOE_IQ2_ARM=1)\n");
+            }
+        }
+    }
+    return arm;
+}
+
 __global__ __launch_bounds__(kThreads, 2)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,
@@ -2555,7 +2687,14 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const int * __restrict__ n_items_ptr,
                                 float * __restrict__ out_gate,
                                 float * __restrict__ out_up,
-                                int M, int K, int n_assign, int E) {
+                                int M, int K, int n_assign, int E,
+                                /* A8 comparison arm.  0 = q8_1 int8 operands with
+                                 * the integer MMA and a scale fold (today); 1 =
+                                 * E4M3 operands with the block-scaled MXFP8 MMA,
+                                 * hardware-applied ue8m0, no fold.  Uniform across
+                                 * the block -- a kernel argument, never a
+                                 * per-element branch. */
+                                int use_e4m3) {
 #if defined(TURING_MMA_AVAILABLE)
     const int n_items = *n_items_ptr;
     if ((int)blockIdx.y >= n_items) {
@@ -2630,12 +2769,22 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 
     float acc[kNFrag][tile_C::ne] = {};
 
-    if (full_warp_tile) {
-        iq2_d2r_mainloop<true, tile_A, tile_B, tile_C>(
-            acc, s_q8, s_raw, s_grid, s_inv);
+    if (use_e4m3) {
+        if (full_warp_tile) {
+            iq2_d2r_mainloop<true, true, tile_A, tile_B, tile_C>(
+                acc, s_q8, s_raw, s_grid, s_inv);
+        } else {
+            iq2_d2r_mainloop<true, false, tile_A, tile_B, tile_C>(
+                acc, s_q8, s_raw, s_grid, s_inv);
+        }
     } else {
-        iq2_d2r_mainloop<false, tile_A, tile_B, tile_C>(
-            acc, s_q8, s_raw, s_grid, s_inv);
+        if (full_warp_tile) {
+            iq2_d2r_mainloop<false, true, tile_A, tile_B, tile_C>(
+                acc, s_q8, s_raw, s_grid, s_inv);
+        } else {
+            iq2_d2r_mainloop<false, false, tile_A, tile_B, tile_C>(
+                acc, s_q8, s_raw, s_grid, s_inv);
+        }
     }
 
     const int out_col_lo = s_inv.col_lo;
@@ -2657,6 +2806,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         }
     }
 #else
+    (void)use_e4m3;
     (void)gate_soa;
     (void)up_soa;
     (void)q8;
@@ -2685,7 +2835,9 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
         const int * __restrict__ work,
         const int * __restrict__ n_items_ptr,
         block_q8_1_mmq * __restrict__ down_q8,
-        int M, int K, int n_assign, int E, float clamp) {
+        int M, int K, int n_assign, int E, float clamp,
+        /* A8 comparison arm; see ds4_d2r_iq2_arm(). */
+        int use_e4m3) {
 #if defined(TURING_MMA_AVAILABLE)
     const int n_items = *n_items_ptr;
     if ((int)blockIdx.y >= n_items) {
@@ -2771,12 +2923,22 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
 
     float gate_acc[NFrag][tile_C::ne] = {};
     float up_acc[NFrag][tile_C::ne] = {};
-    if (full_tile) {
-        iq2_gateup_fused_mainloop<true, TileN, tile_A, tile_B, tile_C>(
-            gate_acc, up_acc, s);
+    if (use_e4m3) {
+        if (full_tile) {
+            iq2_gateup_fused_mainloop<true, true, TileN, tile_A, tile_B, tile_C>(
+                gate_acc, up_acc, s);
+        } else {
+            iq2_gateup_fused_mainloop<true, false, TileN, tile_A, tile_B, tile_C>(
+                gate_acc, up_acc, s);
+        }
     } else {
-        iq2_gateup_fused_mainloop<false, TileN, tile_A, tile_B, tile_C>(
-            gate_acc, up_acc, s);
+        if (full_tile) {
+            iq2_gateup_fused_mainloop<false, true, TileN, tile_A, tile_B, tile_C>(
+                gate_acc, up_acc, s);
+        } else {
+            iq2_gateup_fused_mainloop<false, false, TileN, tile_A, tile_B, tile_C>(
+                gate_acc, up_acc, s);
+        }
     }
 
     /* The MMA rings are dead now. Reuse the same shared allocation as a
@@ -3110,7 +3272,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
         gate_soa, up_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
-        out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
+        out_gate, out_up, M, K, (int)ne_get_rows, n_experts, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -3196,7 +3358,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, full_work, counts + 0,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp);
+        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n",
@@ -3208,7 +3370,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail8_work, counts + 1,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp);
+        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail8 kernel launch failed: %s\n",
@@ -3219,7 +3381,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail16_work, counts + 2,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp);
+        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail16 kernel launch failed: %s\n",
@@ -3230,7 +3392,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail32_work, counts + 3,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp);
+        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail32 kernel launch failed: %s\n",
@@ -3654,7 +3816,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
         W_soa, W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
-        out, out, M, K, (int)ne_get_rows, n_experts);
+        out, out, M, K, (int)ne_get_rows, n_experts, ds4_d2r_iq2_arm());
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
