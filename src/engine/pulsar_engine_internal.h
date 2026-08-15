@@ -1009,7 +1009,6 @@ typedef struct {
     pulsar_gpu_tensor *router_probs;
     pulsar_gpu_tensor *router_selected;
     pulsar_gpu_tensor *router_weights;
-    pulsar_gpu_tensor *routed_gate;
     pulsar_gpu_tensor *routed_up;
     pulsar_gpu_tensor *routed_mid;
     pulsar_gpu_tensor *routed_down;
@@ -1120,7 +1119,6 @@ typedef struct {
     pulsar_gpu_tensor *batch_router_probs;
     pulsar_gpu_tensor *batch_router_selected;
     pulsar_gpu_tensor *batch_router_weights;
-    pulsar_gpu_tensor *batch_routed_gate;
     pulsar_gpu_tensor *batch_routed_up;
     pulsar_gpu_tensor *batch_routed_mid;
     pulsar_gpu_tensor *batch_routed_down;

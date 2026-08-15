@@ -18,7 +18,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_routed_down);
     pulsar_gpu_tensor_free(g->batch_routed_mid);
     pulsar_gpu_tensor_free(g->batch_routed_up);
-    pulsar_gpu_tensor_free(g->batch_routed_gate);
     pulsar_gpu_tensor_free(g->batch_router_weights);
     pulsar_gpu_tensor_free(g->batch_router_selected);
     pulsar_gpu_tensor_free(g->batch_router_probs);
@@ -85,7 +84,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->routed_down);
     pulsar_gpu_tensor_free(g->routed_mid);
     pulsar_gpu_tensor_free(g->routed_up);
-    pulsar_gpu_tensor_free(g->routed_gate);
     pulsar_gpu_tensor_free(g->router_weights);
     pulsar_gpu_tensor_free(g->router_selected);
     pulsar_gpu_tensor_free(g->router_probs);

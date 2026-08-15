@@ -747,7 +747,7 @@ static int routed_moe_try_mmq_down(float *down_out, const float *mid_f32,
 #endif
 
 static int routed_moe_launch_mixed40(
-        pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *out, pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -772,13 +772,12 @@ static int routed_moe_launch_mixed40(
      * this file has produced came from such a chain ACCEPTING an unknown tag and
      * reading its bytes as the last arm's format.  An allowlist cannot do that. */
     if ((caseA ? down_type : gate_type) != 43u) return 0;
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
     if (mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
-        gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
@@ -1330,7 +1329,6 @@ static int routed_moe_try_mmq_down(
 
 static int routed_moe_launch(
         pulsar_gpu_tensor *out,
-        pulsar_gpu_tensor *gate,
         pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid,
         pulsar_gpu_tensor *down,
@@ -1356,14 +1354,13 @@ static int routed_moe_launch(
         const pulsar_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens) {
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
         x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
-        gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
@@ -1648,7 +1645,7 @@ static int routed_moe_launch(
 
 
 
-int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
+int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
     if (gate_type == 40u && down_type == 40u) {
         /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
          * 4 launches with no host round-trip, vs the grouped path's BLOCKING
@@ -1711,13 +1708,13 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed --
          * routed_moe_launch is 43/43 only and cannot read the type-40 swizzle,
          * so a mixed layer must never fall through to it. */
-        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
+        return routed_moe_launch_mixed40(out, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x, 1);
     }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+    return routed_moe_launch(out, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
@@ -1740,7 +1737,7 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
-static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
@@ -1764,17 +1761,16 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
             pulsar_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
             pulsar_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
             pulsar_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
-            pulsar_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
-            const int r1 = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+            const int r1 = routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                     gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
                     n_total_expert, n_expert, clamp, x, layer_index, n_dec, mid_is_f16);
             pulsar_gpu_matmul_set_batch_mneutral(0);
-            const int r2 = routed_moe_batch_impl(&out_s, &gate_s, &up_s, &mid_s, &down_s,
+            const int r2 = routed_moe_batch_impl(&out_s, &up_s, &mid_s, &down_s,
                     model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
@@ -1890,13 +1886,13 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
     }
     if ((gate_type == 40u) != (down_type == 40u)) {
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
-        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
+        return routed_moe_launch_mixed40(out, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
     }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+    return routed_moe_launch(out, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
@@ -1938,11 +1934,11 @@ static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
     }
 }
 
-int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     static int time_moe = -1;
     if (time_moe < 0) time_moe = getenv("PULSAR_MOE_TIME") != NULL ? 1 : 0;
     if (!time_moe) {
-        return routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+        return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_type, down_type,
                 gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim, selected, weights,
@@ -1950,7 +1946,7 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
     }
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
     cudaEventRecord(s, 0);
-    int r = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+    int r = routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_type, down_type,
             gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim, selected, weights,

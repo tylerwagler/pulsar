@@ -54,6 +54,8 @@ struct range_acc {
     double amax = 0.0, amin = 0.0;
     double n_over = 0, n_sub = 0, n_inf = 0, n_nan = 0;
     unsigned long long calls = 0;
+    unsigned long long n_elem = 0;   /* elements per call (the buffer's live extent) */
+    double int8_vs_e4m3 = -1.0;      /* relative L2, our int8 acts vs the source's E4M3 */
 };
 std::map<std::string, range_acc> g_range;
 
@@ -67,11 +69,15 @@ void range_sweep_report(void) {
     fprintf(stderr, "\n=== f16 RANGE SWEEP (f16 max 65504, min normal 6.1035e-05) ===\n");
     fprintf(stderr, "%-26s %12s %12s %10s %12s %10s %8s %6s\n",
             "tensor", "max|v|", "min|v|!=0", "n>65504", "n<6.1e-5", "n_inf", "n_NaN", "calls");
+    fprintf(stderr, "%-26s %12s %10s\n", "", "MiB/call", "elems");
     for (const auto &kv : g_range) {
         const range_acc &a = kv.second;
         fprintf(stderr, "%-26s %12.4g %12.4g %10.0f %12.0f %10.0f %8.0f %6llu%s\n",
                 kv.first.c_str(), a.amax, a.amin, a.n_over, a.n_sub, a.n_inf, a.n_nan, a.calls,
                 (a.n_over > 0 || a.n_nan > 0) ? "   <-- F16 UNSAFE" : "");
+        fprintf(stderr, "%-26s %12.2f %10llu   int8-vs-E4M3 relL2 %7.3f%%\n", "",
+                (double)a.n_elem * 4.0 / (1024.0 * 1024.0), a.n_elem,
+                a.int8_vs_e4m3 >= 0.0 ? 100.0 * a.int8_vs_e4m3 : -1.0);
     }
     fprintf(stderr, "=== END RANGE SWEEP ===\n");
 }
@@ -90,6 +96,9 @@ void gpu_graph_debug_dump_tensor(
         static bool hooked = false;
         if (!hooked) { atexit(range_sweep_report); hooked = true; }
         range_acc &a = g_range[name];
+        a.n_elem = n_f32;
+        const double dv = pulsar_gpu_tensor_int8_vs_e4m3(t, n_f32);
+        if (dv >= 0.0 && dv > a.int8_vs_e4m3) a.int8_vs_e4m3 = dv;
         if (s5[0] > a.amax) a.amax = s5[0];
         if (s5[1] > 0.0 && (a.amin == 0.0 || s5[1] < a.amin)) a.amin = s5[1];
         a.n_over += s5[2]; a.n_sub += s5[3]; a.n_inf += s5[4]; a.n_nan += s5[5];
@@ -450,7 +459,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += (uint64_t)PULSAR_N_EMBD * f32;                  /* shared_out */
     total += 2ull * PULSAR_N_EXPERT * f32;                   /* router_logits, router_probs */
     total += (uint64_t)PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* router_selected/weights */
-    total += 3ull * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_gate/up/mid */
+    total += 2ull * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_up/mid */
     total += (uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;     /* routed_down */
     total += (uint64_t)PULSAR_N_EMBD * f32;                  /* routed_out */
     total += dz.hc_dim * hc;                              /* after_ffn_hc (carrier) */
@@ -488,7 +497,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_shared_out */
     total += 2ull * pc * PULSAR_N_EXPERT * f32;              /* batch_router_logits/probs */
     total += pc * PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
-    total += 3ull * pc * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* batch_routed_gate/up/mid */
+    total += 2ull * pc * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* batch_routed_up/mid */
     total += pc * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;   /* batch_routed_down */
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_routed_out */
 
@@ -1832,7 +1841,6 @@ bool gpu_graph_alloc_raw_cap(
      * routed_moe_*_impl rejects NULL gate/up (moe.cu ~2597/2908) and the batch
      * path REUSES gate->ptr as cuda_block_q8_K staging for quantized mid
      * (moe.cu ~2957). Keep them allocated unconditionally. */
-    g->routed_gate = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
@@ -1882,7 +1890,6 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_router_probs = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT * sizeof(float));
     g->batch_router_selected = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * sizeof(int));
     g->batch_router_weights = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * sizeof(float));
-    g->batch_routed_gate = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_down = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
@@ -1926,7 +1933,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->shared_gate && g->shared_up && g->shared_mid &&
                     g->shared_out &&
                     g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
-                    g->routed_gate && g->routed_up && g->routed_mid &&
+                    g->routed_up && g->routed_mid &&
                     g->routed_down && g->routed_out &&
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
@@ -1946,7 +1953,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_shared_mid && g->batch_shared_out &&
                     g->batch_router_logits && g->batch_router_probs &&
                     g->batch_router_selected && g->batch_router_weights &&
-                    g->batch_routed_gate && g->batch_routed_up &&
+                    g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
     if (!ok) gpu_graph_free(g);

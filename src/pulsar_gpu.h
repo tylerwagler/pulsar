@@ -424,6 +424,11 @@ int pulsar_gpu_rms_norm_plain_tensor(
  * Bit-exact: identical __float2half of the identical value.  out_h may be NULL. */
 /* Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
  * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
+/* Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
+ * i.e. how far our int8 activations sit from the source's own format.  <0 on
+ * failure. */
+double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
+
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
 
 int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h,
@@ -1056,7 +1061,6 @@ int pulsar_gpu_router_select_batch_tensor(
 
 int pulsar_gpu_routed_moe_one_tensor(
         pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *gate,
         pulsar_gpu_tensor       *up,
         pulsar_gpu_tensor       *mid,
         pulsar_gpu_tensor       *experts,
@@ -1084,7 +1088,6 @@ int pulsar_gpu_routed_moe_one_tensor(
 
 int pulsar_gpu_routed_moe_batch_tensor(
         pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *gate,
         pulsar_gpu_tensor       *up,
         pulsar_gpu_tensor       *mid,
         pulsar_gpu_tensor       *experts,

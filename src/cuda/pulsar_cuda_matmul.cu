@@ -755,6 +755,15 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
+    /* This path quantizes FROM the f32 activation.  A producer that skipped its
+     * f32 store (see pulsar_gpu_matmul_plain_uses_f16_act) would be quantized
+     * from memory nobody wrote -- refuse loudly instead. */
+    if (act_cache_f32_missing(x->ptr)) {
+        fprintf(stderr, "pulsar: mxfp8 matmul '%s' needs the f32 activation but the "
+                        "producer emitted f16 only (n_tok=%llu, in_dim=%llu)\n",
+                label ? label : "?", (unsigned long long)n_tok, (unsigned long long)in_dim);
+        return 0;
+    }
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
     size_t sx_bytes = (size_t)mx_rup(ntok, 128) * KBp;
     size_t wz = 32u << 20;

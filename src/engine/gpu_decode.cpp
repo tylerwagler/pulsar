@@ -1505,7 +1505,6 @@ bool gpu_graph_encode_decode_layer(
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
     if (ok) ok = pulsar_gpu_routed_moe_one_tensor(g->routed_out,
-                                                 g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
                                                  g->routed_down,
@@ -1527,8 +1526,6 @@ bool gpu_graph_encode_decode_layer(
                                                  il) != 0;
     PULSAR_CUDA_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
-                                      (uint64_t)PULSAR_N_EXPERT_USED * down_in_dim, il, pos);
         gpu_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
                                       (uint64_t)PULSAR_N_EXPERT_USED * down_in_dim, il, pos);
     }
@@ -2087,6 +2084,12 @@ bool gpu_graph_encode_output_head_batch(
     output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm,
                                         0,
                                         (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+    /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
+     * and in_dim the layer encodes armed it with, so an activation cache that
+     * outlived a layer would hit here and quantize the vocab GEMM from stale
+     * activations.  The FFN encode disarms at its exit; this is the second lock
+     * on the same door, and it is free. */
+    pulsar_gpu_mxfp8_act_cache_disarm();
     logits = pulsar_gpu_tensor_view(g->spec_logits,
                                    0,
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
@@ -2159,6 +2162,12 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_tensor *output_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+    /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
+     * and in_dim the layer encodes armed it with, so an activation cache that
+     * outlived a layer would hit here and quantize the vocab GEMM from stale
+     * activations.  The FFN encode disarms at its exit; this is the second lock
+     * on the same door, and it is free. */
+    pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = output_pre && output_weights && output_embd && output_norm && logits;
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,

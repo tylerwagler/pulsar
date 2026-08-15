@@ -1894,6 +1894,80 @@ __global__ static void range_stats_kernel(const float *x, uint64_t n,
     if (ln) atomicAdd(&out->n_nan, ln);
 }
 
+/* ---- int8-vs-E4M3 activation divergence (diagnostic) ---------------------
+ *
+ * Settles a question analysis cannot: for the expert GEMMs we quantize
+ * activations to q8_1 int8, while the SOURCE computes in E4M3.  Which is closer
+ * to the source depends entirely on the tail of the real activation
+ * distribution -- on a Gaussian the two are a wash, on a heavy-tailed one int8
+ * loses ~4x because its uniform grid is pinned to the block max and one outlier
+ * per 32 craters the resolution for the rest.
+ *
+ * Reports the RELATIVE L2 ||q8(x) - e4m3(x)|| / ||e4m3(x)||, which is the right
+ * measure for a dot product: for y = sum(w_i x_i) over many terms the relative
+ * error of y goes as sigma_delta/sigma, not as the per-element relative error
+ * (which near-zero entries dominate while contributing nothing to y). */
+__device__ static inline float dev_to_e4m3(float v) {
+    if (v == 0.0f || !isfinite(v)) return v;
+    const float a = fabsf(v);
+    float e = floorf(log2f(a));
+    if (e < -6.0f) e = -6.0f;
+    if (e >  8.0f) e =  8.0f;
+    const float step = exp2f(e - 3.0f);          /* 3 mantissa bits */
+    float q = rintf(a / step) * step;
+    if (q > 448.0f) q = 448.0f;
+    return v < 0.0f ? -q : q;
+}
+
+/* One warp per 32-element block: block max -> q8_1 scale, then accumulate
+ * sum((q8-e4m3)^2) and sum(e4m3^2). */
+__global__ static void act_int8_vs_e4m3_kernel(const float *x, uint64_t n,
+                                               double *acc_num, double *acc_den) {
+    const uint64_t blk = (uint64_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    const uint32_t lane = threadIdx.x & 31;
+    const uint64_t i = blk * 32 + lane;
+    const float v = (i < n) ? x[i] : 0.0f;
+    float a = fabsf(v);
+    if (!isfinite(a)) a = 0.0f;
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const float scale = (a > 0.0f) ? (a / 127.0f) : 1.0f;
+    const float vq8   = isfinite(v) ? rintf(v / scale) * scale : 0.0f;
+    const float ve4   = isfinite(v) ? dev_to_e4m3(v) : 0.0f;
+    const float d     = vq8 - ve4;
+    double num = (i < n) ? (double)d * (double)d : 0.0;
+    double den = (i < n) ? (double)ve4 * (double)ve4 : 0.0;
+    for (int o = 16; o > 0; o >>= 1) {
+        num += __shfl_xor_sync(0xffffffffu, num, o);
+        den += __shfl_xor_sync(0xffffffffu, den, o);
+    }
+    if (lane == 0) { atomicAdd(acc_num, num); atomicAdd(acc_den, den); }
+}
+
+/* Returns relative L2 of q8_1 vs E4M3 for this tensor, or -1 on failure. */
+double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n) {
+    if (!t || !t->ptr || n == 0) return -1.0;
+    double *dev = NULL;
+    if (cudaMalloc((void **)&dev, 2 * sizeof(double)) != cudaSuccess) return -1.0;
+    const double zero[2] = { 0.0, 0.0 };
+    if (cudaMemcpy(dev, zero, sizeof(zero), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev); return -1.0;
+    }
+    const uint64_t warps = (n + 31) / 32;
+    const unsigned wpb = 8;
+    unsigned blocks = (unsigned)((warps + wpb - 1) / wpb);
+    if (blocks == 0) blocks = 1;
+    act_int8_vs_e4m3_kernel<<<blocks, wpb * 32>>>((const float *)t->ptr, n, dev, dev + 1);
+    double host[2] = { 0.0, 0.0 };
+    if (cudaDeviceSynchronize() != cudaSuccess ||
+        cudaMemcpy(host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaFree(dev); return -1.0;
+    }
+    cudaFree(dev);
+    if (host[1] <= 0.0) return -1.0;
+    return sqrt(host[0] / host[1]);
+}
+
+
 /* Fills six doubles: max|v|, min nonzero |v|, n_over, n_subnormal, n_inf, n_nan. */
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5) {
     if (!t || !t->ptr || n == 0 || !out5) return 0;

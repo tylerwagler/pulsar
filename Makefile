@@ -79,7 +79,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: gates all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -338,6 +338,18 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 # deliberately OUT OF SCOPE here (this Makefile is shared with a parallel branch;
 # restructuring it would collide).  Until it lands, -B is what keeps the gate
 # honest.
+# DIAGNOSTIC, deliberately NOT in GATE_TARGETS.  Spec-vs-greedy byte equality is
+# NOT an invariant of this engine: measured 2026-08-14 on clean dev, the set of
+# diverging draft depths is stable across generation LENGTH but changes with the
+# PROMPT -- one prompt gives {4,5}, another gives all of {1..8}.  Not even depth 1
+# is safe, because spec verify uses the batch output head while non-spec decode
+# uses the single-row head.  So a fixed known-diverging list would fail on main.
+# Still the right tool for an A/B against a known-good binary (it is what proved
+# the L035 act-cache bug); making it a gate needs a recorded per-depth baseline
+# blob from a reference commit, on the cuda-prefill-gate pattern.
+cuda-spec-width-gate: pulsar
+	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
+
 cuda-prefill-gate:
 	$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
@@ -393,6 +405,36 @@ GATE_TARGETS = cuda-regression cuda-attn-gates cuda-prefill-gate \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
                cuda-mixed-neutrality-gate cuda-spec-sampling-gate
+
+# The numerics-critical subset, for the ITERATION loop.  `make gates` is a
+# pre-merge instrument -- 14 gates, each loading ~76 GiB of weights, with
+# spec_sampling alone running 2x2500 trajectories; it is the wrong tool to sit
+# and watch after every edit.  These four are the ones that actually catch a
+# numerics or dispatch regression:
+#   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
+#   cuda-frontier-gate       frontier logits across banks
+#   cuda-mixed-neutrality-gate  the small-n_tok / m-neutral split shapes
+#   cuda-attn-gates          attention kernel + bank isolation
+# SPEC_TRAJ shortens the sampling gate's chi-square when it is included; the
+# full TRAJ is required for statistical power, so quick mode leaves it out
+# rather than run it under-powered and call it a pass.
+# NOT a substitute for `make gates` before a merge.
+GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-frontier-gate \
+                      cuda-mixed-neutrality-gate
+
+gates-quick:
+	@rc=0; passed=""; failed=""; \
+	for g in $(GATES_QUICK_TARGETS); do \
+	  printf '\n\033[1m=== %s ===\033[0m\n' "$$g"; \
+	  if $(MAKE) --no-print-directory $$g; then passed="$$passed $$g"; \
+	  else rc=1; failed="$$failed $$g"; fi; \
+	done; \
+	printf '\n\033[1m=== gates-quick summary ===\033[0m\n'; \
+	for g in $$passed; do printf '  \033[32mPASS\033[0m  %s\n' "$$g"; done; \
+	for g in $$failed; do printf '  \033[31mFAIL\033[0m  %s\n' "$$g"; done; \
+	if [ $$rc -eq 0 ]; then printf '\nQUICK GATES PASS (not a substitute for `make gates`)\n'; \
+	else printf '\nQUICK GATES FAILED\n'; fi; \
+	exit $$rc
 
 gates:
 	@rc=0; passed=""; failed=""; \
