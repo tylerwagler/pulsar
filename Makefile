@@ -538,7 +538,7 @@ tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.cpp src/pulsar.h
 tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/spec_sampling_gate.cpp
 
-src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc
+src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc src/cuda/pulsar_cuda_mx.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_CPPFLAGS) -Isrc -c -o $@ $<
 
 # Vendored llama.cpp MMQ TUs: templated C++17, own include root, and they do not

@@ -482,6 +482,28 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
+ * the norm's own epilogue into the activation-cache slots, so the MXFP8
+ * attn_q_b GEMM never runs a separate quantize pass over batch_qr_norm.  Pass
+ * NULL slots for the plain behaviour.  Bit-exact: same value, same rounding the
+ * standalone quantiser would have applied. */
+int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
+        pulsar_gpu_tensor       *q_out,
+        const pulsar_gpu_tensor *q,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                q_weight_offset,
+        uint32_t                q_n,
+        pulsar_gpu_tensor       *kv_out,
+        const pulsar_gpu_tensor *kv,
+        uint64_t                kv_weight_offset,
+        uint32_t                kv_n,
+        uint32_t                rows,
+        float                   eps,
+        void                   *q_out_q,
+        void                   *q_out_sf,
+        int                     q_out_kbp);
+
 int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
         pulsar_gpu_tensor       *q_out,
         const pulsar_gpu_tensor *q,

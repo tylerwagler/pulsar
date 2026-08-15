@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
 
 
 
@@ -222,34 +223,10 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
  *
  * `residual_hc` is an HC CARRIER (BF16 storage under task #62) and is read
  * through pulsar_hc_load exactly as the generic kernel below does. */
-/* MUST match pulsar_cuda_matmul.cu's mx_sfoff / mxfp8_quant_act_kernel exactly:
- * this epilogue REPLACES that pass, so any divergence in the swizzle or in the
- * exponent arithmetic is a silent wrong-operand bug, not a rounding difference. */
-__device__ __forceinline__ static int hc_mx_sfoff(int row, int kb, int KBp) {
-    return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
-           + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
-}
-
-/* One warp owns one 32-element MX block: shuffle-max |v| to the block amax, then
- * the shared power-of-two exponent, then each lane stores its E4M3 value and
- * lane 0 the E8M0 byte.  Bit-exact against the standalone quantiser -- fmaxf is
- * exact and max is order-independent, so the amax, se and E4M3 bytes are
- * identical however the reduction is ordered. */
-__device__ __forceinline__ static void hc_emit_mx_block(
-        float v, uint32_t col, uint32_t row, uint32_t n_embd, int KBp,
-        __nv_fp8_e4m3 *data, unsigned char *scale) {
-    float a = fabsf(v);
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
-    int se = -127;
-    if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
-    if (se < -127) se = -127;
-    if (se >  127) se =  127;
-    data[(size_t)row * n_embd + col] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
-    if ((threadIdx.x & 31u) == 0u) {
-        scale[hc_mx_sfoff((int)row, (int)(col >> 5), KBp)] = (unsigned char)(se + 127);
-    }
-}
+/* The MX emit helpers moved to pulsar_cuda_mx.cuh so the swizzle has ONE
+ * definition to keep in step with pulsar_cuda_matmul.cu's quantiser -- a second
+ * producer (dsv4_qkv_rms_norm_rows_kernel) needs the same code, and a divergent
+ * copy is a silent wrong-operand bug rather than a rounding difference. */
 
 
 template <uint32_t BLK, uint32_t VEC>
@@ -322,7 +299,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
          * 32 and columns are contiguous within a warp, so a warp spans exactly
          * one MX block and lanes past n_embd contribute 0 to the max. */
         if (norm_out_q) {
-            hc_emit_mx_block(v, col, t, n_embd, norm_out_kbp, norm_out_q, norm_out_sf);
+            pulsar_mx_emit_block(v, col, t, n_embd, norm_out_kbp, norm_out_q, norm_out_sf);
         }
     }
 }

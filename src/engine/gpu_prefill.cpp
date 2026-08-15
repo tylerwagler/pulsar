@@ -652,7 +652,22 @@ bool gpu_graph_encode_layer_attention_batch(
             gpu_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
         }
-        if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(g->batch_qr_norm,
+        /* batch_qr_norm feeds the MXFP8 attn_q_b (and the indexer's q_b) as
+         * E4M3, so the norm emits that encoding itself instead of leaving a
+         * whole-tensor quantize pass for the GEMM to wait on.  This is the
+         * second live E4M3 buffer in the layer -- batch_attn_norm is still
+         * armed -- which is why the activation cache had to grow per-buffer
+         * slots first (647a606); with one slot this arm would have silently
+         * invalidated batch_attn_norm and its later consumers would have
+         * re-quantized from f32. */
+        void *qr_norm_q = NULL, *qr_norm_sf = NULL; int qr_norm_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_qr_norm, n_tokens,
+                                                        (uint64_t)q_rank,
+                                                        &qr_norm_q, &qr_norm_sf,
+                                                        &qr_norm_kbp)) {
+            qr_norm_q = NULL; qr_norm_sf = NULL; qr_norm_kbp = 0;
+        }
+        if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
                                                              model->map,
                                                              model->size,
@@ -663,7 +678,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              layer->attn_kv_a_norm->abs_offset,
                                                              PULSAR_N_HEAD_DIM,
                                                              n_tokens,
-                                                             PULSAR_RMS_EPS) != 0;
+                                                             PULSAR_RMS_EPS,
+                                                             qr_norm_q,
+                                                             qr_norm_sf,
+                                                             qr_norm_kbp) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_tokens, (uint64_t)q_rank);
+        if (ok && qr_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     } else {
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
                                                            g->batch_qr,

@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
 #include <cuda_fp8.h>
 
 
@@ -96,6 +97,13 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
 
 
 
+/* q_out_q/q_out_sf, when non-NULL, receive the E4M3 + E8M0 encoding of the Q
+ * half straight from this epilogue, so the MXFP8 attn_q_b GEMM does not wait on
+ * a separate quantize pass over batch_qr_norm.  Q ONLY: batch_kv is not a GEMM
+ * input, it goes to the KV cache.  See pulsar_cuda_mx.cuh for the contract --
+ * in particular every lane must reach pulsar_mx_emit_block(), which is why the
+ * host only supplies the slots when q_n is a multiple of the block size (then
+ * the strided loop runs the same number of times on every thread). */
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -106,7 +114,10 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         const float *kv_w,
         uint32_t kv_n,
         uint32_t rows,
-        float eps) {
+        float eps,
+        __nv_fp8_e4m3 *q_out_q,
+        unsigned char *q_out_sf,
+        int q_out_kbp) {
     const uint32_t row = blockIdx.x;
     const uint32_t which = blockIdx.y;
     if (row >= rows || which > 1u) return;
@@ -127,8 +138,13 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         __syncthreads();
     }
     const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const int emit_mx = (q_out_q != NULL) && (which == 0u);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale * w[i];
+        const float v = xr[i] * scale * w[i];
+        orow[i] = v;
+        if (emit_mx) {
+            pulsar_mx_emit_block(v, i, row, n, q_out_kbp, q_out_q, q_out_sf);
+        }
     }
 }
 
@@ -1076,7 +1092,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
 }
 
 
-int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
+int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         pulsar_gpu_tensor       *q_out,
         const pulsar_gpu_tensor *q,
         const void             *model_map,
@@ -1088,7 +1104,10 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        void                   *q_out_q,
+        void                   *q_out_sf,
+        int                     q_out_kbp) {
     if (!q_out || !q || !kv_out || !kv || !model_map ||
         q_weight_offset > model_size ||
         kv_weight_offset > model_size ||
@@ -1105,6 +1124,17 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
     const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
             kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
     if (!q_w || !kv_w) return 0;
+    /* The strided epilogue keeps every lane of a warp live only when the row
+     * divides evenly by the 256-thread block; otherwise some lanes exit before
+     * the warp-wide shuffle in pulsar_mx_emit_block.  FAIL LOUD rather than
+     * silently skip the emission: the caller arms the activation cache off the
+     * same slot pointer, so a skipped emission would leave the GEMM reading a
+     * memset-zero E4M3 buffer -- a well-formed WRONG answer, not an error. */
+    if (q_out_q && ((q_n % 256u) != 0u || (q_n % 32u) != 0u)) {
+        fprintf(stderr, "pulsar: qkv rms norm cannot emit MX for q_n=%u "
+                        "(needs a multiple of 256)\n", q_n);
+        return 0;
+    }
     dim3 grid(rows, 2u, 1u);
     dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
             (float *)q_out->ptr,
@@ -1116,8 +1146,29 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
             kv_w,
             kv_n,
             rows,
-            eps);
+            eps,
+            (__nv_fp8_e4m3 *)q_out_q,
+            (unsigned char *)q_out_sf,
+            q_out_kbp);
     return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
+}
+
+int pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(
+        pulsar_gpu_tensor       *q_out,
+        const pulsar_gpu_tensor *q,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                q_weight_offset,
+        uint32_t                q_n,
+        pulsar_gpu_tensor       *kv_out,
+        const pulsar_gpu_tensor *kv,
+        uint64_t                kv_weight_offset,
+        uint32_t                kv_n,
+        uint32_t                rows,
+        float                   eps) {
+    return pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
+            q_out, q, model_map, model_size, q_weight_offset, q_n,
+            kv_out, kv, kv_weight_offset, kv_n, rows, eps, NULL, NULL, 0);
 }
 
 
