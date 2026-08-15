@@ -147,14 +147,28 @@ cuda-regression: tests/cuda_long_context_smoke
 # for the default-on fp16 tier), and split-KV decode merge vs the single-walk
 # golden across every staging branch.  Each file's header documents its scope;
 # these were previously build-by-hand only.
+# ARCH MUST BE PINNED HERE, and the failure mode if it is not is a LIE rather
+# than an error.  pulsar_cuda_attn_f16.cu compiles its whole MMA body behind
+# `__CUDA_ARCH__ >= 800`; below that the kernel is a no-op stub that voids its
+# arguments and writes nothing.  NVCC_ARCH_FLAGS is EMPTY unless CUDA_ARCH is
+# passed (see the top of this file), so these three built for nvcc's DEFAULT
+# arch, the stub ran, and the oracle graded a kernel that never executed --
+# reporting FAIL with `never-written = 655360` and every value at the -12345
+# fill sentinel.  Measured 2026-08-15 on clean cf33e3e: FAIL without the flag,
+# PASS (never-written = 0, rel L2 5.2e-04) with it, i.e. the gate had been
+# red for reasons that had nothing to do with the code under test.
+# Presumed introduced by the sparky nvcc 13.0 -> 13.3 bump moving the default
+# arch; pin it so the default can never decide whether a gate is honest.
+ATTN_GATE_ARCH ?= sm_120f
+
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu
-	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu
-	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_decode_split_test: tests/attn_decode_split_test.cu
-	$(NVCC) -O3 $(NVCC_ARCH_FLAGS) -Isrc -Isrc/cuda -o $@ $<
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 	./tests/attn_f16_kernel_test
