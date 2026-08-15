@@ -45,54 +45,9 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
 
 
 
-/* Collapse final HC streams into the ordinary embedding vector before the
- * output norm and vocabulary projection. */
-static void output_hc_head_one(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_weights * weights,
-        const float       * inp_hc) {
-    const uint32_t n_hc = PULSAR_N_HC;
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_EMBD * n_hc;
-    float *flat = (float *)xmalloc((size_t)hc_dim * sizeof(flat[0]));
-    float *pre = (float *)xmalloc((size_t)n_hc * sizeof(pre[0]));
-    float *w = (float *)xmalloc((size_t)n_hc * sizeof(w[0]));
-
-    rms_norm_no_weight(flat, inp_hc, hc_dim, PULSAR_RMS_EPS);
-    matvec_f16(pre, model, weights->output_hc_fn, flat);
-
-    const float *scale = (const float *)tensor_data(model, weights->output_hc_scale);
-    const float *base = (const float *)tensor_data(model, weights->output_hc_base);
-    for (uint32_t i = 0; i < n_hc; i++) {
-        w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + PULSAR_HC_EPS;
-    }
-
-    hc_weighted_sum_one(out, inp_hc, w, PULSAR_N_EMBD, n_hc);
-
-    free(w);
-    free(pre);
-    free(flat);
-}
 
 
 
-/* Final language-model head: HC collapse, RMSNorm, and Q8_0 vocab projection. */
-void output_logits_one(
-        float             * logits,
-        const pulsar_model   * model,
-        const pulsar_weights * weights,
-        const float       * inp_hc) {
-    float *embd = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(embd[0]));
-    float *norm = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(norm[0]));
-
-    output_hc_head_one(embd, model, weights, inp_hc);
-    rms_norm_weight(norm, embd, (const float *)tensor_data(model, weights->output_norm), PULSAR_N_EMBD, PULSAR_RMS_EPS);
-
-    matvec_q8_0(logits, model, weights->output, norm);
-
-    free(norm);
-    free(embd);
-}
 
 
 

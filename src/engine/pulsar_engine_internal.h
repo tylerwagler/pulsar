@@ -731,44 +731,8 @@ typedef struct {
     uint64_t out_dim;
 } sum_down_pairs_ctx;
 
-typedef struct {
-    float       *out_hc;
-    const float *block_out;
-    const float *residual_hc;
-    const float *post;
-    const float *comb;
-    uint64_t     hc_dim;
-    uint32_t     n_embd;
-    uint32_t     n_hc;
-} hc_post_batch_ctx;
 
-typedef struct {
-    float       *out_hc;
-    const float *moe;
-    const float *shared;
-    const float *residual_hc;
-    const float *post;
-    const float *comb;
-    uint64_t     hc_dim;
-    uint32_t     n_embd;
-    uint32_t     n_hc;
-} hc_post_sum_batch_ctx;
 
-typedef struct {
-    const pulsar_model *model;
-    const pulsar_tensor *fn;
-    const pulsar_tensor *scale;
-    const pulsar_tensor *base;
-    const pulsar_tensor *norm_w;
-    const float *inp_hc;
-    float *residual_hc;
-    float *cur;
-    float *norm;
-    float *post;
-    float *comb;
-    uint64_t hc_dim;
-    uint32_t n_hc;
-} hc_pre_norm_batch_ctx;
 
 typedef struct {
     float            *x;
@@ -1965,99 +1929,6 @@ void matvec_expert_down(
         const pulsar_tensor *w,
         const float      *x,
         uint32_t          expert);
-void hc_split_sinkhorn_one(
-        float       * out,
-        const float * mix,
-        const float * scale,
-        const float * base,
-        int           n_hc,
-        int           iters,
-        float         eps);
-void hc_weighted_sum_one(
-        float       * out,
-        const float * x,
-        const float * weights,
-        uint32_t      n_embd,
-        uint32_t      n_hc);
-void hc_pre_from_state_one_scratch(
-        const pulsar_model   * model,
-        const pulsar_tensor  * fn,
-        const pulsar_tensor  * scale_tensor,
-        const pulsar_tensor  * base_tensor,
-        const float       * residual_hc,
-        float             * out,
-        float             * post,
-        float             * comb,
-        float             * flat,
-        bool                serial_fn);
-void hc_pre_from_state_one(
-        const pulsar_model   * model,
-        const pulsar_tensor  * fn,
-        const pulsar_tensor  * scale_tensor,
-        const pulsar_tensor  * base_tensor,
-        const float       * residual_hc,
-        float             * out,
-        float             * post,
-        float             * comb);
-void layer_attn_pre_one(
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * token_embd,
-        float             * out,
-        float             * residual_hc,
-        float             * post,
-        float             * comb);
-void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc);
-void hc_post_one(
-        float       * out_hc,
-        const float * block_out,
-        const float * residual_hc,
-        const float * post,
-        const float * comb,
-        uint32_t      n_embd,
-        uint32_t      n_hc);
-void hc_post_batch(
-        float       * out_hc,
-        const float * block_out,
-        const float * residual_hc,
-        const float * post,
-        const float * comb,
-        uint32_t      n_tok,
-        uint32_t      n_embd,
-        uint32_t      n_hc);
-void hc_post_sum_batch(
-        float       * out_hc,
-        const float * moe,
-        const float * shared,
-        const float * residual_hc,
-        const float * post,
-        const float * comb,
-        uint32_t      n_tok,
-        uint32_t      n_embd,
-        uint32_t      n_hc);
-void hc_pre_norm_batch(
-        const pulsar_model  * model,
-        const pulsar_tensor * fn,
-        const pulsar_tensor * scale,
-        const pulsar_tensor * base,
-        const pulsar_tensor * norm_w,
-        const float      * inp_hc,
-        float            * residual_hc,
-        float            * cur,
-        float            * norm,
-        float            * post,
-        float            * comb,
-        uint32_t           n_tok);
-void layer_attn_norm_one(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * x);
-void layer_q_projection_normed_one(
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * norm,
-        float             * q);
 void layer_q_projection_with_lora_one(
         const pulsar_model   * model,
         const pulsar_layer_weights * layer,
@@ -2203,11 +2074,6 @@ void layer_ffn_tokens_parallel(
 uint32_t pulsar_default_raw_cap(uint32_t ctx_size);
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-void output_logits_one(
-        float             * logits,
-        const pulsar_model   * model,
-        const pulsar_weights * weights,
-        const float       * inp_hc);
 float max_abs_diff(const float *a, const float *b, uint64_t n);
 float rms_abs_diff(const float *a, const float *b, uint64_t n);
 uint64_t argmax_f32(const float *x, uint64_t n);
