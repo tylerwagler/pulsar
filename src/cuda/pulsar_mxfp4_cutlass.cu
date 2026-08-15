@@ -122,18 +122,6 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 // i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
 // (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
 template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
-  int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
-  int m=(int)(idx/nblk), kb=(int)(idx%nblk);
-  const float *x=act+(size_t)m*K+(size_t)kb*32;
-  float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(x[i]));
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
-  float inv=exp2f((float)-se);
-  cutlass::float_e4m3_t *outb=reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32;
-  for(int i=0;i<32;i++) outb[i]=cutlass::float_e4m3_t(x[i]*inv);
-  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
-}
 
 /* Vectorized twin (2026-07-26): the scalar kernel above is one thread per 32-block
  * doing 32 serial scalar LDG.32 for the amax + 32 scalar STG.8 — issue/latency
@@ -145,7 +133,7 @@ __global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *
  * byte the same conversion on the same float. Only the load/store WIDTH changes.
  * Alignment: per-expert K is a 128-multiple, kb*32 floats = 128 B, so
  * act+m*K+kb*32 is 16-B aligned (float4) and the e4m3 out is 16-B aligned (int4).
- * PULSAR_ACT_PACK_SCALAR=1 selects the scalar path for the bit-exact A/B. */
+ * Also the fallback when K is not a 128-multiple (see can_warp). */
 template<class TSFA>
 __global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
   int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
@@ -244,19 +232,11 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  /* Warp-per-4-blocks is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar
-   * twin and =2 the thread-per-block vec twin, both bit-exact, for the A/B.
-   * Env read ONCE (init-time static), not per launch. */
-  static int mode = -1;
-  if (mode < 0) { const char *e = getenv("PULSAR_ACT_PACK_SCALAR");
-                  mode = (e && e[0]=='1') ? 1 : (e && e[0]=='2') ? 2 : 0; }
   /* The warp kernel gives a warp four consecutive 32-blocks, so they must not
    * straddle a row.  Fall back rather than mis-index if K is ever not a
    * 128-multiple (per-expert K is, but this is the only thing guaranteeing it). */
   const int can_warp = ((K/32) % 4) == 0;
-  if (mode == 1)            pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
-  else if (mode == 2 || !can_warp)
-                            pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
+  if (!can_warp) pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
   else {
     const long groups = (long)M*(K/32)/4;          /* one warp per group */
     const long thr = groups*32, bw = (thr+t-1)/t;

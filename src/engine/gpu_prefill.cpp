@@ -2568,8 +2568,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                PULSAR_SWIGLU_CLAMP_EXP,
                                                g->batch_ffn_norm,
                                                il,
-                                               n_tokens,
-                                               &g->batch_routed_mid_is_f16) != 0;
+                                               n_tokens) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_up_clamped", g->batch_routed_up,
@@ -2577,13 +2576,8 @@ bool gpu_graph_encode_layer_ffn_batch(
     }
     if (ok) {
         const uint64_t routed_mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim;
-        if (g->batch_routed_mid_is_f16) {
-            gpu_graph_debug_dump_f16_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
-                                              routed_mid_elems, il, pos0);
-        } else {
-            gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
-                                          routed_mid_elems, il, pos0);
-        }
+        gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
+                                      routed_mid_elems, il, pos0);
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,

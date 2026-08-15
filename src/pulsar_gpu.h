@@ -149,17 +149,6 @@ int pulsar_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
-int pulsar_gpu_indexer_scores_prefill_tensor(
-        pulsar_gpu_tensor       *scores,
-        const pulsar_gpu_tensor *q,
-        const pulsar_gpu_tensor *weights,
-        const pulsar_gpu_tensor *index_comp,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        float                   scale);
 
 /* Banked (multi-session) mode: positions/seq_id are per-row int32 device
  * arrays (row t's absolute position and TRUE bank id), comp_cap the per-bank
@@ -1175,8 +1164,7 @@ int pulsar_gpu_routed_moe_batch_tensor(
         float                   clamp,
         const pulsar_gpu_tensor *x,
         uint32_t                layer_index,
-        uint32_t                n_tokens,
-        bool                   *mid_is_f16);
+        uint32_t                n_tokens);
 
 /* CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (PULSAR_TENSOR_CUTLASS_MXFP4, type 40).
  * out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T for T tokens ALL ROUTED TO ONE EXPERT
@@ -1325,12 +1313,6 @@ int pulsar_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-int pulsar_gpu_hc_weighted_sum_split_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
 
 /* Release decode fused HC pre-sublayer operation: split the HC mixer and
  * immediately reduce four HC streams into the active 4096-wide sublayer row. */

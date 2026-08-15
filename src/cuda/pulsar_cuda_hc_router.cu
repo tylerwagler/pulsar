@@ -3,53 +3,6 @@
 
 
 
-__device__ static void hc4_split_one(float *out, const float *mix, const float *scale, const float *base, uint32_t sinkhorn_iters, float epsv) {
-    const float pre_scale = scale[0];
-    const float post_scale = scale[1];
-    const float comb_scale = scale[2];
-    for (int i = 0; i < 4; i++) {
-        float z = mix[i] * pre_scale + base[i];
-        out[i] = 1.0f / (1.0f + expf(-z)) + epsv;
-    }
-    for (int i = 0; i < 4; i++) {
-        float z = mix[4 + i] * post_scale + base[4 + i];
-        out[4 + i] = 2.0f / (1.0f + expf(-z));
-    }
-    float c[16];
-    for (int r = 0; r < 4; r++) {
-        float m = -INFINITY;
-        for (int col = 0; col < 4; col++) {
-            float v = mix[8 + r * 4 + col] * comb_scale + base[8 + r * 4 + col];
-            c[r * 4 + col] = v;
-            m = fmaxf(m, v);
-        }
-        float s = 0.0f;
-        for (int col = 0; col < 4; col++) {
-            float v = expf(c[r * 4 + col] - m);
-            c[r * 4 + col] = v;
-            s += v;
-        }
-        for (int col = 0; col < 4; col++) c[r * 4 + col] = c[r * 4 + col] / s + epsv;
-    }
-    for (int col = 0; col < 4; col++) {
-        float s = epsv;
-        for (int r = 0; r < 4; r++) s += c[r * 4 + col];
-        for (int r = 0; r < 4; r++) c[r * 4 + col] /= s;
-    }
-    for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
-        for (int r = 0; r < 4; r++) {
-            float s = epsv;
-            for (int col = 0; col < 4; col++) s += c[r * 4 + col];
-            for (int col = 0; col < 4; col++) c[r * 4 + col] /= s;
-        }
-        for (int col = 0; col < 4; col++) {
-            float s = epsv;
-            for (int r = 0; r < 4; r++) s += c[r * 4 + col];
-            for (int r = 0; r < 4; r++) c[r * 4 + col] /= s;
-        }
-    }
-    for (int i = 0; i < 16; i++) out[8 + i] = c[i];
-}
 
 
 
@@ -687,18 +640,6 @@ int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_t
 }
 
 
-int pulsar_gpu_hc_weighted_sum_split_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
-    uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
-    /* Bound the carrier input as well as the output (see the sibling above). */
-    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE ||
-        split->bytes < (uint64_t)n_tokens * stride * sizeof(float)) return 0;
-    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
-        n_embd, n_hc, n_tokens, stride);
-    return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
-}
 
 
 int pulsar_gpu_hc_split_weighted_sum_tensor(

@@ -178,13 +178,12 @@ __global__ static void attention_prefill_mixed_kernel(
         local_max = fmaxf(local_max, scores[r]);
     }
     for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
-        float add = 0.0f;
         float s = -INFINITY;
-        if (add > -1.0e20f) {
+        {
             const float *kvrow = comp_kv + (uint64_t)c * head_dim;
             float dot = 0.0f;
             for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
-            s = dot * scale + add;
+            s = dot * scale;
         }
         scores[raw_count + c] = s;
         local_max = fmaxf(local_max, s);
@@ -300,8 +299,7 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
         } else {
             uint32_t c = k - n_tokens;
             if (c < n_comp && c < visible_comp) {
-                float add = 0.0f;
-                if (add > -1.0e20f) s = row[k] + add;
+                s = row[k];
             }
         }
         row[k] = s;
@@ -512,9 +510,8 @@ __global__ static void attention_decode_mixed_kernel(
             local_max = fmaxf(local_max, scores[r]);
         }
         for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
-            float add = 0.0f;
             float s = -INFINITY;
-            if (add > -1.0e20f) {
+            {
                 float dot = 0.0f;
                 if (comp_kv_pack) {
                     dot = attn_pack_dot_full(qh, comp_src, comp_base + c, head_dim, dot);
@@ -522,7 +519,7 @@ __global__ static void attention_decode_mixed_kernel(
                     const float *kvrow = comp_src + (comp_base + c) * head_dim;
                     for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
                 }
-                s = dot * scale + add;
+                s = dot * scale;
             }
             scores[raw_count + c] = s;
             local_max = fmaxf(local_max, s);
@@ -533,16 +530,8 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
-                float add = 0.0f;
-                bool have_row = false;
-                uint32_t c_idx = 0;
-                if (row < raw_count) {
-                    have_row = true;
-                } else {
-                    uint32_t c = row - raw_count;
-                    add = 0.0f;
-                    if (add > -1.0e20f) { have_row = true; c_idx = c; }
-                }
+                bool have_row = true;
+                uint32_t c_idx = row < raw_count ? 0u : row - raw_count;
                 float s = -INFINITY;
                 if (have_row) {
                     float dot = 0.0f;
@@ -559,7 +548,7 @@ __global__ static void attention_decode_mixed_kernel(
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
                     }
-                    s = dot * scale + add;
+                    s = dot * scale;
                 }
                 if (qlane == 0) scores[row] = s;
             }
@@ -1132,145 +1121,8 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 /* The release line's occupancy cap (__launch_bounds__, +8.9% prefill,
  * bit-exact -- 1d2ef4f). */
 __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
-static void attention_static_mixed_heads8_online_kernel(
-        float *heads,
-        const float *sinks,
-        const float *q,
-        const float *raw_kv,
-        const float *comp_kv,
-        uint32_t n_tokens,
-        uint32_t n_comp,
-        uint32_t window,
-        uint32_t ratio,
-        uint32_t n_head,
-        uint32_t head_dim,
-        int raw_f16) {
-    uint32_t t = blockIdx.x;
-    uint32_t head_group = blockIdx.y;
-    if (t >= n_tokens || head_dim != 512u) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
-
-    __shared__ float4 kv_shared[4 * 128];
-
-    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
-    const uint32_t raw_start = t + 1u - raw_count;
-    uint32_t comp_count = 0;
-    if (n_comp != 0u && ratio != 0u) {
-        comp_count = (t + 1u) / ratio;
-        if (comp_count > n_comp) comp_count = n_comp;
-    }
-    const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
-        : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q4[lane +  0u];
-        q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u];
-        q3 = q4[lane + 96u];
-    }
-
-    float max_s = -INFINITY;
-    float sum_s = 0.0f;
-    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0, o2 = o0, o3 = o0;
-
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
-            kv_shared[off] = sr < raw_count
-                ? raw_kv_ld4(raw_kv, raw_f16, (uint64_t)(raw_start + sr) * head_dim, c4)
-                : ((const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim))[c4];
-        }
-        __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
-
-                /* Compressed rows carry the additive mask; a masked entry goes
-                 * to -inf, which the online softmax absorbs as a zero-weight
-                 * row (expf(-inf - m) == 0). Safe because row 0 is always a RAW
-                 * row -- raw_count >= 1 -- so max_s is finite before any comp
-                 * row folds in and old_scale never evaluates expf(-inf + inf).
-                 * Mirrors attention_prefill_mixed_softmax_kernel exactly: same
-                 * index, same -1.0e20f cutoff, mask added AFTER the scale. */
-
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
-                sum_s = sum_s * old_scale + row_scale;
-                o0.x = o0.x * old_scale + k0.x * row_scale;
-                o0.y = o0.y * old_scale + k0.y * row_scale;
-                o0.z = o0.z * old_scale + k0.z * row_scale;
-                o0.w = o0.w * old_scale + k0.w * row_scale;
-                o1.x = o1.x * old_scale + k1.x * row_scale;
-                o1.y = o1.y * old_scale + k1.y * row_scale;
-                o1.z = o1.z * old_scale + k1.z * row_scale;
-                o1.w = o1.w * old_scale + k1.w * row_scale;
-                o2.x = o2.x * old_scale + k2.x * row_scale;
-                o2.y = o2.y * old_scale + k2.y * row_scale;
-                o2.z = o2.z * old_scale + k2.z * row_scale;
-                o2.w = o2.w * old_scale + k2.w * row_scale;
-                o3.x = o3.x * old_scale + k3.x * row_scale;
-                o3.y = o3.y * old_scale + k3.y * row_scale;
-                o3.z = o3.z * old_scale + k3.z * row_scale;
-                o3.w = o3.w * old_scale + k3.w * row_scale;
-                max_s = new_m;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (valid_head) {
-        const float sink = sinks[head];
-        const float new_m = fmaxf(max_s, sink);
-        const float old_scale = expf(max_s - new_m);
-        const float sink_scale = expf(sink - new_m);
-        sum_s = sum_s * old_scale + sink_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
-
-        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
-        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
-        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
-        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
-        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
-        out4[lane +  0u] = o0;
-        out4[lane + 32u] = o1;
-        out4[lane + 64u] = o2;
-        out4[lane + 96u] = o3;
-    }
-}
 
 
-/* Direct launch of the shipped prefill window kernel. */
-#define PULSAR_ATTN_ONLINE_DISPATCH(grid_, blk_, ...)                          \
-    do {                                                                       \
-        attention_static_mixed_heads8_online_kernel                            \
-                <<<(grid_), (blk_)>>>(__VA_ARGS__);                            \
-    } while (0)
 
 
 __global__ static void attention_decode_mixed_heads8_online_kernel(
@@ -1630,33 +1482,6 @@ static __device__ float g_dec_splitkv_part_o[PULSAR_DEC_SPLITKV_MAX_TOKENS *
 static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *
         PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 2u];
 
-/* One entry point for every heads8-online launch site.  Small-batch decode
- * (n_tokens <= 8) is the latency regime where the classic grid is 8-64
- * blocks on a 48-SM chip and the per-row serial chain IS the wall time
- * (docs/engine-perf-map.md, "2k decode deficit"), so it routes to the
- * split-KV walk + softmax merge; larger batches keep the single walk whose
- * grid already fills the machine.  A 0 return is a real launch failure. */
-/* Debug A/B (PULSAR_SPLITKV_DEBUG=1): run BOTH walks per call and report the
- * first call whose outputs differ beyond reassociation tolerance, with its
- * full parameter set.  Diagnostic only -- massively slow. */
-__global__ static void attention_splitkv_debug_cmp_kernel(
-        const float *a, const float *b, uint32_t n, float *worst) {
-    __shared__ float wsh[256];
-    float w = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float d = fabsf(a[i] - b[i]);
-        const float m = fmaxf(fabsf(a[i]), 1e-3f);
-        const float r = d / m;
-        if (r > w) w = r;
-    }
-    wsh[threadIdx.x] = w;
-    __syncthreads();
-    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) wsh[threadIdx.x] = fmaxf(wsh[threadIdx.x], wsh[threadIdx.x + s]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) *worst = wsh[0];
-}
 
 static int attention_decode_heads8_launch(
         float *heads, const float *sinks, const float *q, const float *raw_kv,
@@ -1668,52 +1493,6 @@ static int attention_decode_heads8_launch(
         const void * const *comp_bank_ptrs, uint32_t comp_cap, uint32_t n_banks,
         const char *what) {
     static const int use_split = pulsar_env_tier_on("PULSAR_CUDA_DECODE_SPLITKV");
-    static const int dbg = getenv("PULSAR_SPLITKV_DEBUG") != NULL;
-    if (dbg && use_split && n_tokens <= PULSAR_DEC_SPLITKV_MAX_TOKENS &&
-        n_head <= PULSAR_DEC_SPLITKV_MAX_HEADS && head_dim == 512u) {
-        static float *ref = NULL, *dworst = NULL;
-        static uint64_t call_no = 0;
-        const uint32_t n = n_tokens * n_head * head_dim;
-        if (!ref) {
-            cudaMalloc(&ref, (size_t)PULSAR_DEC_SPLITKV_MAX_TOKENS * n_head * head_dim * 4);
-            cudaMalloc(&dworst, 4);
-        }
-        call_no++;
-        /* reference: single walk into ref[] */
-        dim3 g1(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(ref, sinks, q,
-                raw_kv, comp_kv, non_causal, comp_kv_pack, n_tokens,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
-                head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
-                n_banks, NULL, NULL);
-        /* candidate: split+merge into heads (production result) */
-        static float *po = NULL, *pml = NULL;
-        if (!po) {
-            cudaGetSymbolAddress((void **)&po, g_dec_splitkv_part_o);
-            cudaGetSymbolAddress((void **)&pml, g_dec_splitkv_part_ml);
-        }
-        dim3 gs(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
-        attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(heads, sinks, q,
-                raw_kv, comp_kv, non_causal, comp_kv_pack, n_tokens,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
-                head_dim, raw_f16, positions, seq_id, comp_bank_ptrs, comp_cap,
-                n_banks, po, pml);
-        dim3 gm(n_tokens, n_head, 1);
-        attention_decode_split_merge_kernel<<<gm, 128>>>(heads, sinks, po, pml,
-                PULSAR_DEC_SPLITKV_S, n_head, head_dim);
-        attention_splitkv_debug_cmp_kernel<<<1, 256>>>(ref, heads, n, dworst);
-        float hw = 0.0f;
-        cudaMemcpy(&hw, dworst, 4, cudaMemcpyDeviceToHost);
-        if (hw > 1e-4f) {
-            fprintf(stderr, "SPLITKV DIVERGE call=%llu worst_rel=%.3e  "
-                    "nt=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
-                    "win=%u ratio=%u pack=%u rawf16=%d descr=%d nc=%u (%s)\n",
-                    (unsigned long long)call_no, hw, n_tokens, pos0, n_raw,
-                    raw_cap, raw_start, n_comp, window, ratio,
-                    comp_kv_pack, raw_f16, positions != NULL, non_causal, what);
-        }
-        return cuda_ok(cudaGetLastError(), what);
-    }
     if (use_split && n_tokens <= PULSAR_DEC_SPLITKV_MAX_TOKENS &&
         n_head <= PULSAR_DEC_SPLITKV_MAX_HEADS && head_dim == 512u) {
         static int announced = 0;
@@ -1864,72 +1643,6 @@ int pulsar_gpu_attention_decode_heads_tensor(
 
 
 
-/* One-shot dump of a REAL attention input set, for the operand-precision study
- * in tests/attn_precision_fidelity.cc.  A measurement hook, not a feature: it
- * is env-gated, fires once per process, and synchronises the stream.
- *
- * Real activations rather than synthetic ones because the whole question is
- * dynamic range -- Q/K outlier channels and the spread of the latent kv vector
- * are exactly what a Gaussian sample would not reproduce, and they decide
- * whether an 8-bit format survives.
- *
- * q is dumped for a WINDOW of tokens (all heads); kv is dumped whole, since a
- * token's window reaches backwards and the rows are cheap (n_tokens x 512).
- * tok0 is recorded so the reader can rebuild the causal/window bounds. */
-static void attn_dump_inputs_once(const float *q, const void *kv, const float *sinks,
-                                  uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
-                                  uint32_t window, uint32_t raw_f16) {
-    static int done = 0, seen = 0;
-    const char *path = getenv("PULSAR_DUMP_ATTN");
-    if (done || !path || !path[0]) return;
-    /* PULSAR_DUMP_ATTN_SKIP=N dumps the N+1'th call instead of the first, so the
-     * study can sample more than one layer -- outlier channels are not uniform
-     * across depth and a single layer is not evidence about the model. */
-    {
-        const char *sk = getenv("PULSAR_DUMP_ATTN_SKIP");
-        const int want = sk ? atoi(sk) : 0;
-        if (seen++ < want) return;
-    }
-    done = 1;
-
-    /* A middle slice sees full windows; the first tokens do not. */
-    const uint32_t ndump = n_tokens < 256u ? n_tokens : 256u;
-    const uint32_t tok0 = (n_tokens > ndump) ? (n_tokens - ndump) : 0u;
-
-    const size_t qn = (size_t)ndump * n_head * head_dim;
-    const size_t kvn = (size_t)n_tokens * head_dim;
-    const size_t kvesz = raw_f16 ? 2u : 4u;
-    float *hq = (float *)malloc(qn * sizeof(float));
-    void *hkv = malloc(kvn * kvesz);
-    float *hs = (float *)malloc((size_t)n_head * sizeof(float));
-    if (!hq || !hkv || !hs) { free(hq); free(hkv); free(hs); return; }
-
-    const float *qsrc = q + (size_t)tok0 * n_head * head_dim;
-    int ok = cudaMemcpy(hq, qsrc, qn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
-             cudaMemcpy(hkv, kv, kvn * kvesz, cudaMemcpyDeviceToHost) == cudaSuccess &&
-             cudaMemcpy(hs, sinks, (size_t)n_head * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
-    if (ok) {
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            const uint32_t hdr[8] = { 0x41545444u /*"ATTD"*/, n_tokens, n_head, head_dim,
-                                      window, raw_f16, tok0, ndump };
-            ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
-                 fwrite(hq, sizeof(float), qn, f) == qn &&
-                 fwrite(hkv, kvesz, kvn, f) == kvn &&
-                 fwrite(hs, sizeof(float), n_head, f) == n_head;
-            if (fclose(f) != 0) ok = 0;
-            fprintf(stderr, "pulsar: attention dump %s %s (tok0=%u ndump=%u n_tokens=%u "
-                            "n_head=%u head_dim=%u window=%u raw_f16=%u)\n",
-                    ok ? "wrote" : "FAILED writing", path, tok0, ndump, n_tokens,
-                    n_head, head_dim, window, raw_f16);
-        } else {
-            fprintf(stderr, "pulsar: attention dump could not open %s\n", path);
-        }
-    } else {
-        fprintf(stderr, "pulsar: attention dump readback failed\n");
-    }
-    free(hq); free(hkv); free(hs);
-}
 
 int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out) {
@@ -1960,8 +1673,6 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                     : "generic per-token kernel"));
     }
     if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
-        attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
-                              n_tokens, n_head, head_dim, window, raw_f16);
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
          * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
          * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
@@ -1997,20 +1708,6 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                             "fall through to the f32 kernel\n");
             return 0;
         }
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
-                                    sinks,
-                                    (const float *)q->ptr,
-                                    (const float *)raw_kv->ptr,
-                                    (const float *)raw_kv->ptr,
-                                    n_tokens,
-                                    0,
-                                    window,
-                                    1,
-                                    n_head,
-                                    head_dim,
-                                    raw_f16);
-        return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens;
@@ -2638,20 +2335,6 @@ static int attention_prefill_mixed_launch(
                             "fall through to the f32 kernel\n");
             return 0;
         }
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        PULSAR_ATTN_ONLINE_DISPATCH(grid, 256, (float *)heads->ptr,
-                                    sinks,
-                                    (const float *)q->ptr,
-                                    (const float *)raw_kv->ptr,
-                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                    n_tokens,
-                                    n_comp,
-                                    window,
-                                    ratio,
-                                    n_head,
-                                    head_dim,
-                                    raw_f16);
-        return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens + n_comp;

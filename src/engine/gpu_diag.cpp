@@ -163,37 +163,6 @@ void gpu_graph_debug_dump_hc_tensor(
 
 
 
-void gpu_graph_debug_dump_f16_tensor(
-        const char       *name,
-        pulsar_gpu_tensor *t,
-        uint64_t          n_f16,
-        uint32_t          il,
-        uint32_t          pos) {
-    if (!t || n_f16 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
-
-    if (pulsar_gpu_synchronize() == 0) {
-        fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
-        return;
-    }
-
-    uint16_t *hbuf = (uint16_t *)xmalloc((size_t)n_f16 * sizeof(hbuf[0]));
-    float *fbuf = (float *)xmalloc((size_t)n_f16 * sizeof(fbuf[0]));
-    if (pulsar_gpu_tensor_read(t, 0, hbuf, n_f16 * sizeof(hbuf[0])) != 0) {
-        for (uint64_t i = 0; i < n_f16; i++) fbuf[i] = f16_to_f32(hbuf[i]);
-        char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
-        if (write_f32_binary_file(path, fbuf, n_f16)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
-        }
-    }
-    free(fbuf);
-    free(hbuf);
-
-    if (pulsar_gpu_begin_commands() == 0) {
-        fprintf(stderr, "pulsar: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
-    }
-}
 
 
 

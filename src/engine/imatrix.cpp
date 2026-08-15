@@ -12,11 +12,10 @@ bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, co
     c->down_sum2 = (float *)xcalloc(down_n, sizeof(c->down_sum2[0]));
     c->ffn_norm_buf = (float *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EMBD * sizeof(c->ffn_norm_buf[0]));
     c->routed_mid_buf = (float *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
-    c->routed_mid_f16_buf = (uint16_t *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
     c->selected_buf = (int *)xmalloc((size_t)c->cap_tokens * PULSAR_N_EXPERT_USED * sizeof(c->selected_buf[0]));
     c->sq_tmp = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(c->sq_tmp[0]));
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
-           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
+           c->routed_mid_buf && c->selected_buf && c->sq_tmp;
 }
 
 
@@ -27,7 +26,6 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
     free(c->down_sum2);
     free(c->ffn_norm_buf);
     free(c->routed_mid_buf);
-    free(c->routed_mid_f16_buf);
     free(c->selected_buf);
     free(c->sq_tmp);
     memset(c, 0, sizeof(*c));
@@ -57,11 +55,9 @@ static bool imatrix_collect_layer_batch(
 
     const uint64_t norm_bytes = (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float);
     const uint64_t mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems * (g->batch_routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t mid_bytes = mid_elems * sizeof(float);
     const uint64_t sel_bytes = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * sizeof(int);
-    void *mid_dst = g->batch_routed_mid_is_f16
-        ? (void *)c->routed_mid_f16_buf
-        : (void *)c->routed_mid_buf;
+    void *mid_dst = (void *)c->routed_mid_buf;
     if (pulsar_gpu_tensor_read(g->batch_ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
         pulsar_gpu_tensor_read(g->batch_routed_mid, 0, mid_dst, mid_bytes) == 0 ||
         pulsar_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
@@ -83,16 +79,8 @@ static bool imatrix_collect_layer_batch(
 
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
             const size_t mid_off = ((size_t)t * PULSAR_N_EXPERT_USED + slot) * PULSAR_N_FF_EXP;
-            if (g->batch_routed_mid_is_f16) {
-                const uint16_t *mid = c->routed_mid_f16_buf + mid_off;
-                for (uint32_t i = 0; i < PULSAR_N_FF_EXP; i++) {
-                    const float v = f16_to_f32(mid[i]);
-                    down[i] += v * v;
-                }
-            } else {
-                const float *mid = c->routed_mid_buf + mid_off;
-                for (uint32_t i = 0; i < PULSAR_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
-            }
+            const float *mid = c->routed_mid_buf + mid_off;
+            for (uint32_t i = 0; i < PULSAR_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
             c->down_count[il][expert]++;
             c->observed_routes++;
         }

@@ -1085,7 +1085,6 @@ typedef struct {
     pulsar_gpu_tensor *batch_routed_mid;
     pulsar_gpu_tensor *batch_routed_down;
     pulsar_gpu_tensor *batch_routed_out;
-    bool batch_routed_mid_is_f16;
     pulsar_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
     pulsar_gpu_tensor *directional_steering_dirs;
@@ -1179,7 +1178,6 @@ typedef struct {
     uint32_t down_count[PULSAR_MAX_LAYER][PULSAR_MAX_EXPERT];
     float *ffn_norm_buf;
     float *routed_mid_buf;
-    uint16_t *routed_mid_f16_buf;
     int   *selected_buf;
     float *sq_tmp;
     uint32_t cap_tokens;
@@ -2106,12 +2104,6 @@ void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_f32,
-        uint32_t          il,
-        uint32_t          pos);
-void gpu_graph_debug_dump_f16_tensor(
-        const char       *name,
-        pulsar_gpu_tensor *t,
-        uint64_t          n_f16,
         uint32_t          il,
         uint32_t          pos);
 void gpu_graph_debug_dump_i32_tensor(

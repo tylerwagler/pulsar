@@ -893,21 +893,6 @@ int pulsar_gpu_indexer_score_one_tensor(
 
 
 
-int pulsar_gpu_indexer_scores_prefill_tensor(
-        pulsar_gpu_tensor       *scores,
-        const pulsar_gpu_tensor *q,
-        const pulsar_gpu_tensor *weights,
-        const pulsar_gpu_tensor *index_comp,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
-                                 n_head, head_dim, ratio, scale, 1,
-                                 NULL, NULL, NULL, 0, 1);
-}
 
 
 
