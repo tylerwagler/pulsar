@@ -397,8 +397,7 @@ bool gpu_graph_encode_decode_layer(
     } while (0)
     if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_attn_fn,
                                           hc_dim, mix_hc, g->cur_hc, g->hc_mix);
-    const bool fuse_hc_norm = PULSAR_N_HC == 4;
-    if (ok && fuse_hc_norm) {
+    if (ok) {
         /* A8 on the decode path: emit the E4M3 + ue8m0 encoding from the norm
          * epilogue so the mmvq GEMVs multiply in the format the SOURCE uses
          * (dynamic e4m3) instead of against f32.  Decode was the last place
@@ -448,10 +447,6 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, PULSAR_N_EMBD, il, pos);
     }
-    if (ok && !fuse_hc_norm) ok = pulsar_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
-                                                                   model->map, model->size,
-                                                                   layer->attn_norm->abs_offset,
-                                                                   PULSAR_N_EMBD, PULSAR_RMS_EPS) != 0;
     PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_norm", g->attn_norm, PULSAR_N_EMBD, il, pos);
@@ -1079,7 +1074,7 @@ bool gpu_graph_encode_decode_layer(
     }
     if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_ffn_fn,
                                           hc_dim, mix_hc, g->after_attn_hc, g->hc_mix);
-    if (ok && fuse_hc_norm) {
+    if (ok) {
         /* Same A8 emission as the attention norm above: batch_ffn_norm feeds
          * the router logits and the shared gate/up GEMVs. */
         void *fn_q = NULL, *fn_sf = NULL; int fn_kbp = 0;
@@ -1126,10 +1121,6 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_pre", g->ffn_cur, PULSAR_N_EMBD, il, pos);
     }
-    if (ok && !fuse_hc_norm) ok = pulsar_gpu_rms_norm_weight_tensor(g->ffn_norm, g->ffn_cur,
-                                                                   model->map, model->size,
-                                                                   layer->ffn_norm->abs_offset,
-                                                                   PULSAR_N_EMBD, PULSAR_RMS_EPS) != 0;
     PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, PULSAR_N_EMBD, il, pos);

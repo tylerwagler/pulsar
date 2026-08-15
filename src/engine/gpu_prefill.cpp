@@ -2553,41 +2553,6 @@ bool gpu_graph_eval_token_raw_swa(
 
 
 
-/* Greedy verifier helper.  Speculative decoding only needs the target model's
- * top token after most accepted draft rows; the full vocabulary row is needed
- * once, for the final committed state that normal sampling will continue from.
- * Keeping intermediate rows device-resident avoids turning verification into a
- * sequence of large CPU readbacks. */
-bool gpu_graph_eval_token_raw_swa_top(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        int                   *top_id,
-        float                 *logits) {
-    if (!top_id) return false;
-
-    bool ok = pulsar_gpu_begin_commands() != 0;
-    if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights,
-                                                  token, pos, true, true);
-    if (ok) {
-        ok = pulsar_gpu_argmax_tensor(g->comp_selected,
-                                   g->logits,
-                                   PULSAR_N_VOCAB) != 0;
-    }
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    if (ok) ok = pulsar_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
-    if (ok && logits) {
-        ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (!ok) {
-        if (pulsar_gpu_synchronize() == 0) {
-            fprintf(stderr, "pulsar: GPU synchronize after top-only graph eval failure also failed\n");
-        }
-    }
-    return ok;
-}
 
 
 
