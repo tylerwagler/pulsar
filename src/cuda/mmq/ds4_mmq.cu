@@ -1151,11 +1151,23 @@ int ds4_mmq_moe_pair_impl(
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
         cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
-        quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1, (void *)src1_q8_1,
-            type, /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-            stream);
+        /* This buffer feeds BOTH IQ2 D2R launchers (fused swiglu and the pair
+         * kernel), so its format must follow the same arm they run.  A mismatch
+         * is silently wrong rather than an error: the byte counts are identical
+         * and only the INTERPRETATION differs. */
+        if (ds4_d2r_iq2_arm()) {
+            ds4_quantize_mmq_e4m3_cuda(
+                X_f32, ids_src1, (void *)src1_q8_1,
+                /*ne00=*/K, s11_src, s12_src, s13_src,
+                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+                /*n_expert_used=*/0, /*scatter=*/false, stream);
+        } else {
+            quantize_mmq_q8_1_cuda(
+                X_f32, ids_src1, (void *)src1_q8_1,
+                type, /*ne00=*/K, s11_src, s12_src, s13_src,
+                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+                stream);
+        }
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {

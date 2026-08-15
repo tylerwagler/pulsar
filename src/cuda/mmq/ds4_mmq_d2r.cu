@@ -17,6 +17,37 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+
+/* The MoE input staging now follows this selector (ds4_mmq.cu picks
+ * ds4_quantize_mmq_e4m3_cuda when the arm is 1), so the arm is usable.  The
+ * macro stays as the interlock: if the staging is ever decoupled from the
+ * selector again, set it back to 0 so the arm REFUSES rather than reading int8
+ * bytes as e4m3 -- which would be silently wrong, since every shape still
+ * fits. */
+#define DS4_IQ2_E4M3_STAGING_READY 1
+
+int ds4_d2r_iq2_arm() {
+    static int arm = -1;
+    if (arm < 0) {
+        const char *e = getenv("PULSAR_MOE_IQ2_ARM");
+        const int want = (e && e[0] == '1') ? 1 : 0;
+        if (want && !DS4_IQ2_E4M3_STAGING_READY) {
+            fprintf(stderr, "pulsar: PULSAR_MOE_IQ2_ARM=1 REFUSED -- expert activations "
+                            "are still staged as q8_1 int8, so the E4M3 MMA would read "
+                            "int8 bytes as e4m3 and return well-formed garbage. "
+                            "Running the int8 arm.\n");
+            arm = 0;
+        } else {
+            arm = want;
+            if (arm) {
+                fprintf(stderr, "pulsar: MoE IQ2 experts = E4M3 x E4M3 block-scaled MMA "
+                                "(PULSAR_MOE_IQ2_ARM=1)\n");
+            }
+        }
+    }
+    return arm;
+}
 
 namespace {
 
@@ -2648,35 +2679,6 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
  * when that concludes the losing arm is deleted and this goes with it.
  *   PULSAR_MOE_IQ2_ARM=0 (default) : q8_1 int8 + integer MMA + scale fold
  *   PULSAR_MOE_IQ2_ARM=1           : E4M3 + block-scaled MXFP8 MMA, no fold */
-/* ⚠ The E4M3 arm consumes activations STAGED as e4m3 + ue8m0
- * (ds4_quantize_mmq_e4m3).  The MoE path still stages q8_1, so until that is
- * switched, enabling the arm would reinterpret int8 bytes as e4m3 and multiply
- * garbage -- silently, since the shapes all still fit.  REFUSE until the
- * staging is wired; flip this to 1 in the same commit that switches it. */
-#define DS4_IQ2_E4M3_STAGING_READY 0
-
-static int ds4_d2r_iq2_arm() {
-    static int arm = -1;
-    if (arm < 0) {
-        const char *e = getenv("PULSAR_MOE_IQ2_ARM");
-        const int want = (e && e[0] == '1') ? 1 : 0;
-        if (want && !DS4_IQ2_E4M3_STAGING_READY) {
-            fprintf(stderr, "pulsar: PULSAR_MOE_IQ2_ARM=1 REFUSED -- expert activations "
-                            "are still staged as q8_1 int8, so the E4M3 MMA would read "
-                            "int8 bytes as e4m3 and return well-formed garbage. "
-                            "Running the int8 arm.\n");
-            arm = 0;
-        } else {
-            arm = want;
-            if (arm) {
-                fprintf(stderr, "pulsar: MoE IQ2 experts = E4M3 x E4M3 block-scaled MMA "
-                                "(PULSAR_MOE_IQ2_ARM=1)\n");
-            }
-        }
-    }
-    return arm;
-}
-
 __global__ __launch_bounds__(kThreads, 2)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,

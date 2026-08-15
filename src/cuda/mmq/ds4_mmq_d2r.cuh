@@ -8,6 +8,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Which IQ2 dequant arm the expert GEMMs run; read once per process.
+ *   0 = q8_1 int8 operands, integer MMA, scale fold (default)
+ *   1 = E4M3 operands, block-scaled MXFP8 MMA, hardware ue8m0, no fold
+ * ⚠ The INPUT STAGING must match: arm 1 requires ds4_quantize_mmq_e4m3_cuda.
+ * They are selected off this same function in ds4_mmq.cu; keep them together. */
+int ds4_d2r_iq2_arm();
+
+/* Stage MMQ activations as E4M3 + ue8m0 instead of q8_1 int8.  Same
+ * block_q8_1_mmq layout: qs[] holds e4m3 bit patterns, d4[i] carries the ue8m0
+ * byte as a float. */
+void ds4_quantize_mmq_e4m3_cuda(
+        const float *x, const int32_t *ids, void *vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        int n_expert_used, bool scatter, cudaStream_t stream);
+
 bool ds4_mmq_q2_K_moe_d2r_available(int cc);
 bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc);
 
