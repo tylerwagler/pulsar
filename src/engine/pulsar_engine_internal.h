@@ -2433,9 +2433,6 @@ uint32_t gpu_graph_raw_start_for_span(
         uint32_t               n_raw);
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
-bool gpu_graph_use_reference_hc_decode(void);
-bool gpu_graph_use_reference_qkv_norm(void);
-bool gpu_graph_enable_batch_hc_norm_fusion(void);
 uint32_t gpu_graph_attn_comp_cache_is_pack(void);
 int gpu_graph_attn_pack_enabled(void);
 uint32_t gpu_graph_prefill_slice(void);

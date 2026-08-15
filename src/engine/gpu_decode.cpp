@@ -62,65 +62,28 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 
 
-bool gpu_graph_use_reference_hc_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_FUSION", &cache);
-}
 
 
 
-static bool gpu_graph_use_reference_kv_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_KV_FUSION", &cache);
-}
 
 
 
-bool gpu_graph_use_reference_qkv_norm(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_QKV_NORM_FUSION", &cache);
-}
 
 
 
-static bool gpu_graph_use_reference_compressor_pair_proj(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
-}
 
 
 
-static bool gpu_graph_use_reference_hc_norm_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_NORM_FUSION", &cache);
-}
 
 
 
-bool gpu_graph_enable_batch_hc_norm_fusion(void) {
-    return !gpu_graph_use_reference_hc_norm_decode();
-}
 
 
 
-static bool gpu_graph_use_reference_shared_down_hc(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
-}
 
 
 
-static bool gpu_graph_use_reference_attn_out_hc(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
-}
 
-/* Evaluated every layer on the decode path; cache the flag reads (like the
- * fusion toggles above) instead of scanning environ per layer. */
-static bool gpu_graph_disable_shared_gate_up_swiglu(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION", &cache);
-}
 
 
 
@@ -133,22 +96,6 @@ static bool gpu_graph_decode_hc_pre(
         const pulsar_model        *model,
         uint64_t                scale_offset,
         uint64_t                base_offset) {
-    if (gpu_graph_use_reference_hc_decode()) {
-        return pulsar_gpu_hc_split_sinkhorn_tensor(split,
-                                                  mix,
-                                                  model->map,
-                                                  model->size,
-                                                  scale_offset,
-                                                  base_offset,
-                                                  PULSAR_N_HC,
-                                                  PULSAR_N_HC_SINKHORN_ITER,
-                                                  PULSAR_HC_EPS) != 0 &&
-               pulsar_gpu_hc_weighted_sum_tensor(out,
-                                                 residual_hc,
-                                                 split,
-                                                 PULSAR_N_EMBD,
-                                                 PULSAR_N_HC) != 0;
-    }
 
     return pulsar_gpu_hc_split_weighted_sum_tensor(out,
                                                   split,
@@ -166,131 +113,12 @@ static bool gpu_graph_decode_hc_pre(
 
 
 
-static bool gpu_graph_hc_norm_fusion_check_enabled(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_HC_NORM_FUSION_CHECK", &cache);
-}
 
 
 
-static float gpu_graph_hc_norm_fusion_check_tolerance(void) {
-    static int initialized;
-    static float tolerance;
-    if (initialized) return tolerance;
-    tolerance = 2.0e-4f;
-    const char *env = getenv("PULSAR_CUDA_HC_NORM_FUSION_CHECK_TOL");
-    if (env && env[0]) {
-        char *end = NULL;
-        const float v = strtof(env, &end);
-        if (end != env && isfinite(v) && v > 0.0f) tolerance = v;
-    }
-    initialized = 1;
-    return tolerance;
-}
 
 
 
-static bool gpu_graph_check_hc_norm_fusion(
-        const char            *label,
-        pulsar_gpu_tensor        *fused_out,
-        pulsar_gpu_tensor        *fused_norm,
-        const pulsar_gpu_tensor  *mix,
-        const pulsar_gpu_tensor  *residual_hc,
-        const pulsar_model       *model,
-        uint64_t               scale_offset,
-        uint64_t               base_offset,
-        uint64_t               norm_weight_offset,
-        uint32_t               il,
-        uint32_t               pos) {
-    if (!gpu_graph_hc_norm_fusion_check_enabled()) return true;
-    if (!fused_out || !fused_norm || !mix || !residual_hc || !model) return false;
-
-    const uint64_t n_embd = PULSAR_N_EMBD;
-    const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    pulsar_gpu_tensor *ref_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
-    pulsar_gpu_tensor *ref_out = pulsar_gpu_tensor_alloc(n_embd * sizeof(float));
-    pulsar_gpu_tensor *ref_norm = pulsar_gpu_tensor_alloc(n_embd * sizeof(float));
-    bool ok = ref_split && ref_out && ref_norm;
-
-    if (ok) {
-        ok = pulsar_gpu_hc_split_sinkhorn_tensor(ref_split,
-                                              mix,
-                                              model->map,
-                                              model->size,
-                                              scale_offset,
-                                              base_offset,
-                                              PULSAR_N_HC,
-                                              PULSAR_N_HC_SINKHORN_ITER,
-                                              PULSAR_HC_EPS) != 0 &&
-             pulsar_gpu_hc_weighted_sum_tensor(ref_out,
-                                            residual_hc,
-                                            ref_split,
-                                            PULSAR_N_EMBD,
-                                            PULSAR_N_HC) != 0 &&
-             pulsar_gpu_rms_norm_weight_tensor(ref_norm,
-                                            ref_out,
-                                            model->map,
-                                            model->size,
-                                            norm_weight_offset,
-                                            PULSAR_N_EMBD,
-                                            PULSAR_RMS_EPS) != 0;
-    }
-
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-
-    float *fused_out_cpu = NULL;
-    float *ref_out_cpu = NULL;
-    float *fused_norm_cpu = NULL;
-    float *ref_norm_cpu = NULL;
-    if (ok) {
-        fused_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ref_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        fused_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ref_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ok = pulsar_gpu_tensor_read(fused_out, 0, fused_out_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(ref_out, 0, ref_out_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(fused_norm, 0, fused_norm_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(ref_norm, 0, ref_norm_cpu, n_embd * sizeof(float)) != 0;
-    }
-
-    if (ok) {
-        const float out_max = max_abs_diff(fused_out_cpu, ref_out_cpu, n_embd);
-        const float out_rms = rms_abs_diff(fused_out_cpu, ref_out_cpu, n_embd);
-        const float norm_max = max_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
-        const float norm_rms = rms_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
-        const float tol = gpu_graph_hc_norm_fusion_check_tolerance();
-        fprintf(stderr,
-                "pulsar: GPU HC norm fusion check %s layer=%u pos=%u "
-                "out_max=%g out_rms=%g norm_max=%g norm_rms=%g tol=%g\n",
-                label ? label : "hc",
-                il,
-                pos,
-                out_max,
-                out_rms,
-                norm_max,
-                norm_rms,
-                tol);
-        if (out_max > tol || norm_max > tol) {
-            fprintf(stderr,
-                    "pulsar: GPU HC norm fusion check failed for %s layer=%u pos=%u\n",
-                    label ? label : "hc",
-                    il,
-                    pos);
-            ok = false;
-        }
-    }
-
-    free(fused_out_cpu);
-    free(ref_out_cpu);
-    free(fused_norm_cpu);
-    free(ref_norm_cpu);
-    pulsar_gpu_tensor_free(ref_norm);
-    pulsar_gpu_tensor_free(ref_out);
-    pulsar_gpu_tensor_free(ref_split);
-
-    const bool restart_ok = pulsar_gpu_begin_commands() != 0;
-    return ok && restart_ok;
-}
 
 
 
@@ -300,10 +128,6 @@ static bool gpu_graph_decode_kv_store(
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          raw_f16) {
-    if (gpu_graph_use_reference_kv_decode()) {
-        return pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0 &&
-               pulsar_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, PULSAR_N_HEAD_DIM, raw_f16) != 0;
-    }
 
     return pulsar_gpu_kv_fp8_store_raw_tensor(kv,
                                              raw_cache,
@@ -675,7 +499,7 @@ bool gpu_graph_encode_decode_layer(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    const bool qkv_rms_fused = !gpu_graph_use_reference_qkv_norm();
+    const bool qkv_rms_fused = true;   /* the unfused reference arm is gone */
 
     bool ok = true;
     const bool decode_stage_profile = gpu_graph_decode_stage_profile_enabled(il);
@@ -687,10 +511,7 @@ bool gpu_graph_encode_decode_layer(
     } while (0)
     if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_attn_fn,
                                           hc_dim, mix_hc, g->cur_hc, g->hc_mix);
-    const bool fuse_hc_norm =
-        PULSAR_N_HC == 4 &&
-        !gpu_graph_use_reference_hc_decode() &&
-        !gpu_graph_use_reference_hc_norm_decode();
+    const bool fuse_hc_norm = PULSAR_N_HC == 4;
     if (ok && fuse_hc_norm) {
         /* A8 on the decode path: emit the E4M3 + ue8m0 encoding from the norm
          * epilogue so the mmvq GEMVs multiply in the format the SOURCE uses
@@ -721,19 +542,6 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_RMS_EPS) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->attn_norm, 1, PULSAR_N_EMBD);
         if (ok && an_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-        if (ok) {
-            ok = gpu_graph_check_hc_norm_fusion("attn",
-                                                  g->attn_cur,
-                                                  g->attn_norm,
-                                                  g->hc_mix,
-                                                  g->cur_hc,
-                                                  model,
-                                                  layer->hc_attn_scale->abs_offset,
-                                                  layer->hc_attn_base->abs_offset,
-                                                  layer->attn_norm->abs_offset,
-                                                  il,
-                                                  pos);
-        }
     } else if (ok) {
         ok = gpu_graph_decode_hc_pre(g->attn_cur,
                                        g->hc_split,
@@ -959,7 +767,7 @@ bool gpu_graph_encode_decode_layer(
             fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
-        if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
+        if (ok) {
             if (layer->attn_compressor_kv->type == PULSAR_TENSOR_F16) {
                 ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
                                                       g->comp_sc_cur,
@@ -1055,7 +863,7 @@ bool gpu_graph_encode_decode_layer(
                 fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
+            if (ok) {
                 if (layer->indexer_compressor_kv->type == PULSAR_TENSOR_F16) {
                     ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
                                                           g->comp_sc_cur,
@@ -1400,9 +1208,7 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
-    const bool fuse_attn_out_hc =
-        !gpu_graph_directional_steering_attn_enabled(g) &&
-        !gpu_graph_use_reference_attn_out_hc();
+    const bool fuse_attn_out_hc = !gpu_graph_directional_steering_attn_enabled(g);
     if (ok && fuse_attn_out_hc) {
         ok = pulsar_gpu_attention_output_low_tensor(g->attn_low,
                                                    model->map,
@@ -1484,19 +1290,6 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_RMS_EPS) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->ffn_norm, 1, PULSAR_N_EMBD);
         if (ok && fn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-        if (ok) {
-            ok = gpu_graph_check_hc_norm_fusion("ffn",
-                                                  g->ffn_cur,
-                                                  g->ffn_norm,
-                                                  g->hc_mix,
-                                                  g->after_attn_hc,
-                                                  model,
-                                                  layer->hc_ffn_scale->abs_offset,
-                                                  layer->hc_ffn_base->abs_offset,
-                                                  layer->ffn_norm->abs_offset,
-                                                  il,
-                                                  pos);
-        }
     } else if (ok) {
         ok = gpu_graph_decode_hc_pre(g->ffn_cur,
                                        g->hc_split,
@@ -1555,11 +1348,8 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, PULSAR_N_EXPERT_USED, il, pos);
     }
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
-    const bool fuse_shared_gate_up =
-        !g->quality &&
-        !gpu_graph_disable_shared_gate_up_swiglu();
-    const bool fuse_shared_down_hc =
-        !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
+    const bool fuse_shared_gate_up = !g->quality;
+    const bool fuse_shared_down_hc = !keep_ffn_out;
     if (ok) ok = pulsar_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_up,
                                                  g->routed_mid,

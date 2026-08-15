@@ -118,11 +118,6 @@ __device__ static void hc4_split_par(float *out, const float *mix, const float *
 }
 
 
-__global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, const float *scale, const float *base, uint32_t n_rows, uint32_t sinkhorn_iters, float epsv) {
-    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_rows) return;
-    hc4_split_one(out + (uint64_t)row * 24, mix + (uint64_t)row * 24, scale, base, sinkhorn_iters, epsv);
-}
 
 
 
@@ -675,24 +670,6 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
 }
 
 
-int pulsar_gpu_hc_split_sinkhorn_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
-    if (!out || !mix || !model_map || n_hc != 4) return 0;
-    const uint64_t mix_bytes = 24ull * sizeof(float);
-    if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
-        base_offset > model_size || model_size - base_offset < mix_bytes ||
-        mix->bytes < mix_bytes || out->bytes < mix_bytes) return 0;
-    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
-    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
-    if (!scale || !base) return 0;
-    uint32_t n_rows = (uint32_t)(mix->bytes / mix_bytes);
-    if (out->bytes / mix_bytes < n_rows) n_rows = (uint32_t)(out->bytes / mix_bytes);
-    hc_split_sinkhorn_kernel<<<(n_rows + 255) / 256, 256>>>(
-        (float *)out->ptr, (const float *)mix->ptr,
-        scale,
-        base,
-        n_rows, sinkhorn_iters, eps);
-    return cuda_ok(cudaGetLastError(), "hc_split_sinkhorn launch");
-}
 
 
 int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
@@ -854,27 +831,6 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 }
 
 
-int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *norm_out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint64_t                norm_weight_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps,
-        float                   norm_eps) {
-    return pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
-            out, norm_out, NULL, NULL, NULL, 0, split, mix, residual_hc, model_map, model_size,
-            scale_offset, base_offset, norm_weight_offset, n_embd, n_hc,
-            sinkhorn_iters, eps, norm_eps);
-}
 
 
 int pulsar_gpu_output_hc_weights_tensor(

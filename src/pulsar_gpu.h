@@ -1377,16 +1377,6 @@ void   pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W,
  * sublayer output back into four streams afterward.
  */
 
-int pulsar_gpu_hc_split_sinkhorn_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *mix,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps);
 
 int pulsar_gpu_hc_weighted_sum_tensor(
         pulsar_gpu_tensor       *out,
@@ -1443,22 +1433,6 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         float                   eps,
         float                   norm_eps);
 
-int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *norm_out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint64_t                norm_weight_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps,
-        float                   norm_eps);
 
 /* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
  * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
