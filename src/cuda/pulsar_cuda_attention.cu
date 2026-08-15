@@ -1662,8 +1662,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     static int raw_path_reported = 0;
     if (!raw_path_reported) {
         raw_path_reported = 1;
-        const int takes_window = n_tokens > 1 && head_dim == 512 &&
-                n_tokens >= 128u;
+        const int takes_window = n_tokens > 1 && head_dim == 512;
         fprintf(stderr,
                 "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> %s\n",
                 n_tokens, head_dim, window,
@@ -1672,7 +1671,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
          * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
          * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
@@ -1905,7 +1904,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
@@ -2303,8 +2302,7 @@ static int attention_prefill_mixed_launch(
     static int mixed_path_reported = 0;
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
-        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
-                n_tokens >= 128u;
+        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512;
         fprintf(stderr,
                 "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> %s\n",
                 n_tokens, n_comp,
@@ -2313,7 +2311,7 @@ static int attention_prefill_mixed_launch(
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (allow_fused && n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (allow_fused && n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
