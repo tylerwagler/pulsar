@@ -545,7 +545,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                         &attn_norm_kbp)) {
             attn_norm_q = NULL; attn_norm_sf = NULL; attn_norm_kbp = 0;
         }
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(attn_cur_view,
+        /* The pre-norm carrier is a dead store unless a dump wants it -- see
+         * the kernel's `out` note. */
+        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                                                                 gpu_graph_debug_wants("hc_attn_pre", il, pos0)
+                                                                     ? attn_cur_view : NULL,
                                                                  g->batch_attn_norm,
                                                                  attn_norm_f16,
                                                                  attn_norm_q,
@@ -2412,7 +2416,9 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                         &ffn_norm_kbp)) {
             ffn_norm_q = NULL; ffn_norm_sf = NULL; ffn_norm_kbp = 0;
         }
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(ffn_cur_view,
+        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                                                                 gpu_graph_debug_wants("hc_ffn_pre", il, pos0)
+                                                                     ? ffn_cur_view : NULL,
                                                                  g->batch_ffn_norm,
                                                                  ffn_norm_f16,
                                                                  ffn_norm_q,
@@ -2457,7 +2463,8 @@ bool gpu_graph_encode_layer_ffn_batch(
 
     if (ok) ok = pulsar_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
-                                                      g->batch_router_probs,
+                                                      gpu_graph_debug_wants("ffn_moe_probs", il, pos0)
+                                                          ? g->batch_router_probs : NULL,
                                                       model->map,
                                                       model->size,
                                                       layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,

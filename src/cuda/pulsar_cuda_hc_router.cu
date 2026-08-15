@@ -219,7 +219,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
             for (uint32_t h = 0; h < 4; h++) {
                 acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * sp[h];
             }
-            out[obase + col] = acc;
+            if (out) out[obase + col] = acc;
             accs[u] = acc;
             sum += acc * acc;
         } else {
@@ -309,7 +309,7 @@ __global__ static void router_select_warp_topk_kernel(
     if (t >= n_tokens || lane >= 32u) return;
 
     const float *log = logits + (uint64_t)t * 256u;
-    float *prob = probs + (uint64_t)t * 256u;
+    float *prob = probs ? probs + (uint64_t)t * 256u : NULL;
     int32_t *sel = selected + (uint64_t)t * 6u;
     float *w = weights + (uint64_t)t * 6u;
     __shared__ float sprob[4][256];
@@ -323,7 +323,7 @@ __global__ static void router_select_warp_topk_kernel(
         local_prob[j] = p;
         local_score[j] = p + (has_bias ? bias[e] : 0.0f);
         sprob[row_in_block][e] = p;
-        prob[e] = p;
+        if (prob) prob[e] = p;
     }
     __syncwarp();
 
@@ -555,7 +555,7 @@ int pulsar_gpu_directional_steering_project_tensor(
 
 
 int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits) {
-    if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
+    if (!selected || !weights || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
@@ -574,7 +574,7 @@ int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tens
     }
     if (ok) {
         dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+        router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, probs ? (float *)probs->ptr : NULL,
                                                      bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                      has_bias && !hash_mode, hash_mode);
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
@@ -585,10 +585,10 @@ int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tens
 
 int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
-    if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
+    if (!selected || !weights || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
+        (probs && probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float)) ||
         selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
         return 0;
@@ -609,7 +609,7 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
     dim3 block(32, 4, 1);
     router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
                                                                     (float *)weights->ptr,
-                                                                    (float *)probs->ptr,
+                                                                    probs ? (float *)probs->ptr : NULL,
                                                                     bias,
                                                                     hash,
                                                                     (const float *)logits->ptr,
@@ -709,7 +709,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
-    if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
+    /* `out` is OPTIONAL: it is the pre-norm carrier, which nothing reads except
+     * a debug dump, so callers pass NULL unless a dump was requested. */
+    if (!norm_out || !split || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
         return 0;
     }
@@ -717,15 +719,15 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
-    if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
-        norm_out->bytes < out->bytes ||
+    if (norm_out->bytes < out_row_bytes || norm_out->bytes % out_row_bytes != 0 ||
+        (out && out->bytes < norm_out->bytes) ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset ||
         norm_weight_offset > model_size ||
         (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
         return 0;
     }
-    const uint64_t n_rows = out->bytes / out_row_bytes;
+    const uint64_t n_rows = norm_out->bytes / out_row_bytes;
     if (mix->bytes < n_rows * mix_bytes ||
         split->bytes < n_rows * mix_bytes ||
         residual_hc->bytes < n_rows * residual_row_bytes) {
@@ -754,7 +756,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
     {
         hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC>
                 <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
-                (float *)out->ptr,
+                out ? (float *)out->ptr : NULL,
                 (float *)norm_out->ptr,
                 (__half *)norm_out_h,
                 (__nv_fp8_e4m3 *)norm_out_q,
