@@ -645,8 +645,6 @@ static server_config parse_options(int argc, char **argv) {
             c.web_search_url = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

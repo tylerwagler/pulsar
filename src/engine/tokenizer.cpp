@@ -1743,7 +1743,6 @@ int generate_gpu_graph_raw_swa(
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
-        bool                quality,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
         float               directional_steering_attn,
@@ -1776,7 +1775,6 @@ int generate_gpu_graph_raw_swa(
         fprintf(stderr, "pulsar: failed to allocate GPU graph runtime\n");
         return 1;
     }
-    g.quality = quality;
     if (!gpu_graph_load_directional_steering(&g,
                                                directional_steering_file,
                                                directional_steering_attn,

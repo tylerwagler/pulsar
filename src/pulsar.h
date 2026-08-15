@@ -81,7 +81,6 @@ typedef struct {
     float directional_steering_attn;
     float directional_steering_ffn;
     bool warm_weights;
-    bool quality;
     bool inspect_only;
 } pulsar_engine_options;
 

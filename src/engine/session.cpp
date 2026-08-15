@@ -176,7 +176,6 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
         free(dataset);
         return 1;
     }
-    g.quality = e->quality;
 
     pulsar_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
@@ -304,7 +303,7 @@ int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
             return 1;
         }
         return generate_gpu_graph_raw_swa(model, vocab, weights, prompt,
-                                            n_predict, ctx_size, e->quality,
+                                            n_predict, ctx_size,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
@@ -331,7 +330,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->model.fd = -1;
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
-    e->quality = opt->quality;
     e->prefill_chunk = opt->prefill_chunk;
     /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
      * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
@@ -453,7 +451,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        pulsar_gpu_set_quality(e->quality);
         (void)pulsar_gpu_set_model_fd(e->model.fd);
         const int model_map_ok =
             pulsar_gpu_set_model_map_range(e->model.map,
@@ -740,7 +737,6 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
         free(s);
         return 1;
     }
-    s->graph.quality = e->quality;
     if (!gpu_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,

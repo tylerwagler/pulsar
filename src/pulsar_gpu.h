@@ -106,7 +106,6 @@ int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, u
 int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, uint64_t offset, uint64_t bytes, const char *label);
 int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
-void pulsar_gpu_set_quality(bool quality);
 void pulsar_gpu_print_memory_report(const char *label);
 /* cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
 void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);

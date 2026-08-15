@@ -41,7 +41,6 @@ int cuda_ok(cudaError_t err, const char *what) {
  * executes.  Stubs satisfy the linker; any accidental call fails loudly. */
 cublasHandle_t g_cublas;
 int g_cublas_ready = 0;
-int g_quality_mode = 0;
 cublasLtHandle_t g_cublaslt;
 void *cuda_tmp_alloc(uint64_t, const char *what) {
     fprintf(stderr, "stub cuda_tmp_alloc hit (%s)\n", what); exit(97);

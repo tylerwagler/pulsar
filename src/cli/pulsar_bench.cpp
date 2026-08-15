@@ -38,7 +38,6 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     bool warm_weights;
-    bool quality;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -189,8 +188,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warm-weights")) {
@@ -295,13 +292,12 @@ static int write_frontier_logits_json(
     fprintf(fp, "{\n  \"source\":\"pulsar-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            ",\n  \"backend\":\"%s\",\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             pulsar_backend_name(cfg->backend),
-            cfg->quality ? "true" : "false",
             pulsar_engine_routed_quant_bits(engine),
             frontier,
             frontier,
@@ -370,7 +366,6 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) return 1;

@@ -52,7 +52,6 @@ cublasHandle_t g_cublas;
 int g_cublas_ready;
 
 
-int g_quality_mode;
 
 
 
@@ -915,7 +914,7 @@ int pulsar_gpu_init(void) {
          * a CUDA graph; cuBLAS must launch onto the same stream. */
         (void)cublasSetStream(g_cublas, cudaStreamPerThread);
         const cublasMath_t math_mode =
-            (g_quality_mode || getenv("PULSAR_CUDA_NO_TF32") != NULL)
+            getenv("PULSAR_CUDA_NO_TF32") != NULL
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
@@ -1492,16 +1491,6 @@ void pulsar_gpu_print_memory_report(const char *label) {
 
 
 
-void pulsar_gpu_set_quality(bool quality) {
-    g_quality_mode = quality ? 1 : 0;
-    if (g_cublas_ready) {
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("PULSAR_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
-    }
-}
 
 
 

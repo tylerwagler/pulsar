@@ -162,7 +162,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
             opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
         }
-        opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
     }
     fputc('\n', fp);

@@ -265,8 +265,6 @@ agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

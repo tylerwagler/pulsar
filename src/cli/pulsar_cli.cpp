@@ -1619,8 +1619,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

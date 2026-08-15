@@ -198,7 +198,6 @@ struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; 
 
 extern cublasHandle_t g_cublas;
 extern int g_cublas_ready;
-extern int g_quality_mode;
 extern cublasLtHandle_t g_cublaslt;
 extern std::unordered_set<uint64_t> g_fp8_offsets;
 

@@ -1092,7 +1092,6 @@ typedef struct {
     pulsar_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
-    bool quality;
 
     /* Tier-2 bank pool (see pulsar_bank_slabs above).  banks.n_banks == 0 keeps
      * the classic single-session layout; >= 2 makes the per-layer cache
@@ -1261,7 +1260,6 @@ struct pulsar_engine {
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     uint32_t prefill_chunk;
-    bool quality;
     bool gpu_ready;
     bool dspark_ready;
     bool dspark_external;   /* drafter opened from its own GGUF (own map/fd) */
@@ -2637,7 +2635,6 @@ int generate_gpu_graph_raw_swa(
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
-        bool                quality,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
         float               directional_steering_attn,

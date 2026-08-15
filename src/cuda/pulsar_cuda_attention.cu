@@ -1137,8 +1137,8 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 /* f32 -> fp16 narrowing for the tensor-core attention GEMM operands.
  *
  * The prefill attention pair already runs on tensor cores at TF32
- * (CUBLAS_TF32_TENSOR_OP_MATH is the default; only --quality or
- * PULSAR_CUDA_NO_TF32 disables it), and TF32 carries the SAME 10 explicit
+ * (CUBLAS_TF32_TENSOR_OP_MATH is the default; only PULSAR_CUDA_NO_TF32
+ * disables it), and TF32 carries the SAME 10 explicit
  * mantissa bits as fp16. Measured 2026-08-05: TF32 costs 5.806e-03 exact
  * full-vocab KL against true FP32, while rounding Q/P to fp16 costs ZERO
  * (byte-identical) -- precisely because the GEMM was already truncating to
@@ -1992,18 +1992,16 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     if (!raw_path_reported) {
         raw_path_reported = 1;
         const int takes_window = n_tokens > 1 && head_dim == 512 &&
-                !g_quality_mode && n_tokens >= 128u;
+                n_tokens >= 128u;
         fprintf(stderr,
-                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u quality=%d "
-                "-> %s\n",
-                n_tokens, head_dim, window, g_quality_mode,
+                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> %s\n",
+                n_tokens, head_dim, window,
                 takes_window ? "FUSED window kernel (no score matrix)"
                              : (g_cublas_ready
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (n_tokens > 1 && head_dim == 512 &&
-        !g_quality_mode && n_tokens >= 128u) {
+    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
         attn_dump_inputs_once((const float *)q->ptr, raw_kv->ptr, sinks,
                               n_tokens, n_head, head_dim, window, raw_f16);
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
@@ -2256,8 +2254,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        !g_quality_mode && n_tokens >= 128u) {
+    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
         /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
@@ -2661,18 +2658,16 @@ static int attention_prefill_mixed_launch(
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
         const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
-                !g_quality_mode && n_tokens >= 128u;
+                n_tokens >= 128u;
         fprintf(stderr,
-                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u "
-                "quality=%d -> %s\n",
-                n_tokens, n_comp, use_comp_mask, g_quality_mode,
+                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u -> %s\n",
+                n_tokens, n_comp, use_comp_mask,
                 takes_window ? "FUSED window kernel"
                              : (g_cublas_ready
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (allow_fused && n_tokens > 1 && head_dim == 512 &&
-        !g_quality_mode && n_tokens >= 128u) {
+    if (allow_fused && n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */

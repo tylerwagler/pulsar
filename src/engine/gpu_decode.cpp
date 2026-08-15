@@ -1177,7 +1177,7 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, PULSAR_N_EXPERT_USED, il, pos);
     }
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
-    const bool fuse_shared_gate_up = !g->quality;
+    const bool fuse_shared_gate_up = true;
     const bool fuse_shared_down_hc = !keep_ffn_out;
     if (ok) ok = pulsar_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_up,

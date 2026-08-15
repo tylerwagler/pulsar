@@ -982,8 +982,7 @@ static int indexer_scores_launch(
      * slower kernel -- the same fail-open shape the type-tag dispatches keep
      * getting bitten by. */
     static const int use_mxfp4 = pulsar_env_tier_on("PULSAR_CUDA_INDEXER_MXFP4");
-    if (use_mxfp4 && !descr && !g_quality_mode &&
-        head_dim == 128u && n_head == 64u) {
+    if (use_mxfp4 && !descr && head_dim == 128u && n_head == 64u) {
         /* Say so once: this tier changes the numbers, so "did it engage" must
          * be answerable from a log rather than inferred from a timing delta. */
         static int announced = 0;
@@ -1001,7 +1000,7 @@ static int indexer_scores_launch(
 
     /* The WMMA tier stays single-bank (like the reference design): banked
      * multi-token rows are forced onto the generic per-(comp,row) kernel. */
-    if (!descr && !g_quality_mode && head_dim == 128u && n_head == 64u) {
+    if (!descr && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,

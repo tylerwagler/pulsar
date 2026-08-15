@@ -1311,7 +1311,6 @@ typedef struct {
     pulsar_think_mode think_mode;
     bool plain;
     bool warm_weights;
-    bool quality;
     bool self_test_extractors;
 } eval_config;
 
@@ -1625,8 +1624,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -4114,7 +4111,6 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
         .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) {

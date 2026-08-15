@@ -25,8 +25,7 @@
 #include "../src/pulsar_gpu.h"
 #include <math.h>
 
-static pulsar_engine *test_engine_fast;
-static pulsar_engine *test_engine_quality;
+static pulsar_engine *test_engine;
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("PULSAR_TEST_MODEL");
@@ -53,36 +52,24 @@ static void test_restore_env(const char *name, char *saved) {
     }
 }
 
-static pulsar_engine *test_open_engine(bool quality) {
+static pulsar_engine *test_open_engine(void) {
     pulsar_engine *engine = NULL;
     pulsar_engine_options opt = {
         .model_path = test_model_path(),
         .backend = PULSAR_BACKEND_CUDA,
-        .quality = quality,
     };
     TEST_ASSERT(pulsar_engine_open(&engine, &opt) == 0);
     return engine;
 }
 
-static pulsar_engine *test_get_engine(bool quality) {
-    pulsar_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    if (*slot) return *slot;
-
-    *slot = test_open_engine(quality);
-    return *slot;
+static pulsar_engine *test_get_engine(void) {
+    if (!test_engine) test_engine = test_open_engine();
+    return test_engine;
 }
 
 static void test_close_engines(void) {
-    pulsar_engine_close(test_engine_fast);
-    pulsar_engine_close(test_engine_quality);
-    test_engine_fast = NULL;
-    test_engine_quality = NULL;
-}
-
-static void test_close_engine(bool quality) {
-    pulsar_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
-    pulsar_engine_close(*slot);
-    *slot = NULL;
+    pulsar_engine_close(test_engine);
+    test_engine = NULL;
 }
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
@@ -197,7 +184,6 @@ static void test_f16_matvec_fast_nr0_4(void) {
 
     TEST_ASSERT(pulsar_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
     TEST_ASSERT(pulsar_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    pulsar_gpu_set_quality(false);
     TEST_ASSERT(pulsar_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                             in_dim, out_dim, x, 1) != 0);
     TEST_ASSERT(pulsar_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
@@ -280,7 +266,6 @@ static void test_f16_prefill_matmul(void) {
     TEST_ASSERT(pulsar_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
     TEST_ASSERT(pulsar_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
     TEST_ASSERT(pulsar_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    pulsar_gpu_set_quality(false);
     TEST_ASSERT(pulsar_gpu_matmul_f16_tensor(out, weights_raw, weight_alloc, 0,
                                           in_dim, out_dim, x, n_tok) != 0);
     TEST_ASSERT(pulsar_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
@@ -318,7 +303,7 @@ static void test_f16_kernel_group(void) {
 }
 
 static void test_short_prefill_ratio4(void) {
-    pulsar_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine();
     if (!engine) return;
 
     const int tokens[] = {
@@ -513,7 +498,7 @@ static void test_long_story_fact_recall(void) {
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    pulsar_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine();
     if (!engine) {
         free(prompt_text);
         return;
@@ -752,7 +737,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
 
     char *saved_prefill_chunk = test_save_env("PULSAR_CUDA_PREFILL_CHUNK");
     setenv("PULSAR_CUDA_PREFILL_CHUNK", "2048", 1);
-    pulsar_engine *engine = test_open_engine(false);
+    pulsar_engine *engine = test_open_engine();
     if (!engine) {
         test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -980,7 +965,7 @@ static void test_local_golden_vectors(void) {
     char *saved_prefill_chunk = test_save_env("PULSAR_CUDA_PREFILL_CHUNK");
     setenv("PULSAR_CUDA_PREFILL_CHUNK", "4096", 1);
 
-    pulsar_engine *engine = test_open_engine(false);
+    pulsar_engine *engine = test_open_engine();
     if (!engine) {
         test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
@@ -1352,7 +1337,7 @@ static void test_run_mpp_candidate(const char *label,
     fprintf(stderr, "pulsar-test: Tensor equivalence candidate route=%s\n", label);
     test_mpp_eq_summary summary;
     test_mpp_summary_init(&summary, label);
-    pulsar_engine *cand_engine = test_open_engine(false);
+    pulsar_engine *cand_engine = test_open_engine();
     if (cand_engine) {
         const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
         float *cand_logits = (float *)malloc((size_t)vocab_size * sizeof(cand_logits[0]));
@@ -1395,7 +1380,7 @@ static void test_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    pulsar_engine *ref_engine = test_open_engine(false);
+    pulsar_engine *ref_engine = test_open_engine();
     if (!ref_engine) {
         return;
     }
@@ -1485,8 +1470,8 @@ static void test_think_tool_recovery(void) {
     buf_free(&text);
 }
 
-static void test_tool_call_quality_one(bool quality) {
-    pulsar_engine *engine = test_get_engine(quality);
+static void test_tool_call_quality_one(void) {
+    pulsar_engine *engine = test_get_engine();
     if (!engine) return;
 
     request r;
@@ -1541,12 +1526,9 @@ static void test_tool_call_quality_one(bool quality) {
 }
 
 static void test_tool_call_quality(void) {
-    fprintf(stderr, "pulsar-test: tool-call quality fast path\n");
-    test_tool_call_quality_one(false);
-    test_close_engine(false);
-    fprintf(stderr, "pulsar-test: tool-call quality exact path\n");
-    test_tool_call_quality_one(true);
-    test_close_engine(true);
+    fprintf(stderr, "pulsar-test: tool-call DSML emission\n");
+    test_tool_call_quality_one();
+    test_close_engines();
 }
 
 
@@ -2696,7 +2678,7 @@ static void test_spec_pq_math(void) {
  * (gen_resolve_sampling in generate.c) can distinguish "explicitly 1.0" from
  * "absent". Parse-only; the engine is used just to tokenize the prompt. */
 static void test_api_sampling_presence_flags(void) {
-    pulsar_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine();
     if (!engine) return;
     char err[160];
     request r;
@@ -2762,7 +2744,7 @@ static void test_api_sampling_presence_flags(void) {
  * identically, more conversation counts strictly more, and advertising tools
  * grows the rendered prompt. Parse-only; engine used just to tokenize. */
 static void test_anthropic_count_tokens_parse(void) {
-    pulsar_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine();
     if (!engine) return;
     char err[160];
     request r;
@@ -2812,7 +2794,7 @@ static void test_anthropic_count_tokens_parse(void) {
  * think-mode defaulting must not re-assert PULSAR_DEFAULT_MIN_P).  Covers
  * both surfaces that parse min_p (OpenAI chat + legacy completions). */
 static void test_api_min_p_range_validation(void) {
-    pulsar_engine *engine = test_get_engine(false);
+    pulsar_engine *engine = test_get_engine();
     if (!engine) return;
     char err[160];
     request r;
@@ -2877,7 +2859,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long prefill", test_local_golden_vectors},
     {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
     {"--f16-kernels", "f16-kernels", "isolated F16 matmul kernel numeric regressions", test_f16_kernel_group},
-    {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
+    {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
     {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
