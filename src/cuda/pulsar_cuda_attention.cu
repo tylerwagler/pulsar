@@ -866,179 +866,6 @@ __global__ static void attention_indexed_mixed_kernel(
 
 
 
-__global__ static void attention_indexed_mixed_heads8_rb4_kernel(
-        float *heads,
-        const float *sinks,
-        const float *q,
-        const float *raw_kv,
-        const float *comp_kv,
-        const int32_t *topk,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_raw,
-        uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
-        uint32_t top_k,
-        uint32_t window,
-        uint32_t ratio,
-        uint32_t n_head,
-        uint32_t head_dim,
-        int raw_f16) {
-    uint32_t t = blockIdx.x;
-    uint32_t head_group = blockIdx.y;
-    if (t >= n_tokens || head_dim != 512u) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
-
-    __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t comp_rows[512];
-    __shared__ uint32_t raw_count;
-    __shared__ uint32_t raw_first_idx;
-    __shared__ uint32_t comp_count;
-    __shared__ float4 kv_shared[4 * 128];
-    __shared__ float scores[8 * 768];
-
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
-    uint32_t visible_comp = n_comp;
-    if (ratio != 0) {
-        visible_comp = (qpos + 1u) / ratio;
-        if (visible_comp > n_comp) visible_comp = n_comp;
-    }
-
-    if (threadIdx.x == 0) {
-        raw_count = 0;
-        raw_first_idx = 0;
-        comp_count = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
-            if (qpos >= first_raw_pos) {
-                uint32_t lo = first_raw_pos;
-                if (window != 0 && qpos + 1u > window) {
-                    const uint32_t wlo = qpos + 1u - window;
-                    if (wlo > lo) lo = wlo;
-                }
-                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
-                if (hi >= lo) {
-                    raw_first_idx = lo - first_raw_pos;
-                    raw_count = hi - lo + 1u;
-                    if (raw_count > 256u) raw_count = 256u;
-                }
-            }
-        }
-    }
-    __syncthreads();
-    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
-    }
-    if (threadIdx.x == 0) {
-        for (uint32_t i = 0; i < top_k && comp_count < 512u; i++) {
-            int32_t c = topk[(uint64_t)t * top_k + i];
-            if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[comp_count++] = (uint32_t)c;
-        }
-    }
-    __syncthreads();
-
-    const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
-        : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q4[lane +  0u];
-        q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u];
-        q3 = q4[lane + 96u];
-    }
-
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
-            kv_shared[off] = sr < raw_count
-                ? raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4)
-                : ((const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim))[c4];
-        }
-        __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float dot = dot4_f32(q0, kv4[lane +  0u]) +
-                            dot4_f32(q1, kv4[lane + 32u]) +
-                            dot4_f32(q2, kv4[lane + 64u]) +
-                            dot4_f32(q3, kv4[lane + 96u]);
-                dot = warp_sum_f32(dot);
-                if (lane == 0) scores[warp * 768u + row0 + rr] = dot * scale;
-            }
-        }
-        __syncthreads();
-    }
-
-    float max_s = valid_head ? sinks[head] : -INFINITY;
-    if (valid_head) {
-        const float *score_row = scores + warp * 768u;
-        for (uint32_t i = lane; i < n_score; i += 32u) max_s = fmaxf(max_s, score_row[i]);
-        max_s = warp_max_f32(max_s);
-        max_s = __shfl_sync(0xffffffffu, max_s, 0);
-    }
-    float den = 0.0f;
-    if (valid_head) {
-        float *score_row = scores + warp * 768u;
-        for (uint32_t i = lane; i < n_score; i += 32u) {
-            float p = expf(score_row[i] - max_s);
-            score_row[i] = p;
-            den += p;
-        }
-        den = warp_sum_f32(den);
-        den += expf(sinks[head] - max_s);
-        den = __shfl_sync(0xffffffffu, den, 0);
-    }
-
-    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0, o2 = o0, o3 = o0;
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
-            kv_shared[off] = sr < raw_count
-                ? raw_kv_ld4(raw_kv, raw_f16, (uint64_t)raw_rows[sr] * head_dim, c4)
-                : ((const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim))[c4];
-        }
-        __syncthreads();
-        if (valid_head) {
-            const float *score_row = scores + warp * 768u;
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float p = den == 0.0f ? 0.0f : score_row[row0 + rr] / den;
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                o0.x += k0.x * p; o0.y += k0.y * p; o0.z += k0.z * p; o0.w += k0.w * p;
-                o1.x += k1.x * p; o1.y += k1.y * p; o1.z += k1.z * p; o1.w += k1.w * p;
-                o2.x += k2.x * p; o2.y += k2.y * p; o2.z += k2.z * p; o2.w += k2.w * p;
-                o3.x += k3.x * p; o3.y += k3.y * p; o3.z += k3.z * p; o3.w += k3.w * p;
-            }
-        }
-        __syncthreads();
-    }
-    if (valid_head) {
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
-        out4[lane +  0u] = o0;
-        out4[lane + 32u] = o1;
-        out4[lane + 64u] = o2;
-        out4[lane + 96u] = o3;
-    }
-}
 
 
 
@@ -2802,7 +2629,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     /* Launch-path dispatch flags: read the environment once per process. */
     static const int no_indexed_heads8 = getenv("PULSAR_CUDA_NO_INDEXED_HEADS8") != NULL;
-    static const int twopass_requested = getenv("PULSAR_CUDA_INDEXED_TWOPASS") != NULL;
     /* The sort stays OFF for n_tokens == 1.  It is a locality optimization:
      * attention_indexed_mixed_heads8_online_kernel reads topk[] in whatever order
      * it is given, clamps each id against visible_comp, and folds rows through an
@@ -2892,7 +2718,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                             "fall through to the f32 kernel\n");
             return 0;
         }
-        if (descr || comp_kv_pack || !twopass_requested) {
+        {   /* the two-pass rb4 alternative is gone; this is the only arm */
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
@@ -2920,26 +2746,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                descr ? n_banks : 1u);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                 sinks,
-                                                                 (const float *)q->ptr,
-                                                                 (const float *)raw_kv->ptr,
-                                                                 (const float *)comp_kv->ptr,
-                                                                 topk_ptr,
-                                                                 n_tokens,
-                                                                 pos0,
-                                                                 n_raw,
-                                                                 raw_cap,
-                                                                 raw_start,
-                                                                 n_comp,
-                                                                 top_k,
-                                                                 window,
-                                                                 ratio,
-                                                                 n_head,
-                                                                 head_dim,
-                                                                 raw_f16);
-        return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -3007,8 +2813,9 @@ static int attention_prefill_mixed_launch(
      * materialises the whole score matrix. Gated while it is A/B'd against
      * that path; the fused kernel reassociates the softmax (online rescale vs
      * batch max/sum), so it is NOT bit-identical to the GEMM path. */
-    static const int fused_comp_env = getenv("PULSAR_ATTN_FUSED_COMP") != NULL;
-    const int allow_fused = !use_comp_mask || fused_comp_env;
+    /* PULSAR_ATTN_FUSED_COMP is gone -- no setter anywhere, so the masked case
+     * never took the fused kernel and the A/B it gated never ran. */
+    const int allow_fused = !use_comp_mask;
     /* One-shot: which branch actually serves this workload. Guessing at this
      * has been wrong twice; print it rather than infer it. */
     static int mixed_path_reported = 0;
