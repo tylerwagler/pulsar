@@ -156,21 +156,9 @@ static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
 // actual roots were fixed in the same commit (stream-K fixup write_back goes
 // dense + tmp_fixup zeroed + ncols_max=ne_get_rows), after which every
 // element a consumer reads is stored by the GEMM itself and the zeroing was
-// ~1.0 s/12k-admission of pure memset tax.  Default OFF (2026-07-09 gated
+// ~1.0 s/12k-admission of pure memset tax.  REMOVED (2026-07-09 gated
 // increment: L42 deep tensors BIT-IDENTICAL with/without, same-boot ABBA
 // 641.5 -> 678 tok/s @12k, gsm8k 119/120 / mbpp 36/40 / canary=[]).
-// DS4_MMQ_OUT_MEMSET=1 restores the zeroing.
-static bool out_memset_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_OUT_MEMSET");
-        cached = (env && env[0] == '1') ? 1 : 0;
-        if (cached) {
-            fprintf(stderr, "ds4: DS4_MMQ_OUT_MEMSET=1 - blanket GEMM output zeroing restored\n");
-        }
-    }
-    return cached != 0;
-}
 
 
 extern "C" int ds4_mmq_init(int device) {
@@ -553,9 +541,6 @@ int ds4_mmq_moe_impl(
     const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_mmq = ne12 * s12_mmq;
 
-    if (out_memset_enabled()) {
-        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-    }
 
     /* pulsar (plan 41b): IQ2_XXS twin of the Q2_K block below.  Our v5mx down
      * tensors are IQ2, not Q2_K, so without this an aligned IQ2 down still ran
@@ -845,10 +830,6 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_mmq = ne12 * s12_mmq;
 
-    if (out_memset_enabled()) {
-        cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-        cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-    }
 
     bool gate_up_done = false;
     /* No d2r_min_cols() -- see the note on the single-tensor guard in

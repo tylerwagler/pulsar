@@ -1349,6 +1349,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint64_t                norm_weight_offset,
+        uint32_t                n_rows,
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,

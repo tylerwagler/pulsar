@@ -704,6 +704,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint64_t                norm_weight_offset,
+        uint32_t                n_rows_in,
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
@@ -719,15 +720,16 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
-    if (norm_out->bytes < out_row_bytes || norm_out->bytes % out_row_bytes != 0 ||
-        (out && out->bytes < norm_out->bytes) ||
+    if (n_rows_in == 0 ||
+        norm_out->bytes < (uint64_t)n_rows_in * out_row_bytes ||
+        (out && out->bytes < (uint64_t)n_rows_in * out_row_bytes) ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset ||
         norm_weight_offset > model_size ||
         (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
         return 0;
     }
-    const uint64_t n_rows = norm_out->bytes / out_row_bytes;
+    const uint64_t n_rows = n_rows_in;
     if (mix->bytes < n_rows * mix_bytes ||
         split->bytes < n_rows * mix_bytes ||
         residual_hc->bytes < n_rows * residual_row_bytes) {

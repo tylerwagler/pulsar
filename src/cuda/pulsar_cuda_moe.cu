@@ -598,8 +598,8 @@ static int routed_moe_launch_cutlass_grouped(
     return cuda_ok(cudaGetLastError(), "moe_grouped sum launch");
 }
 
-/* A/B dispatcher: PULSAR_MOE_FP4_GROUPED=0 forces the legacy per-expert loop (routed_moe_launch_cutlass);
- * default (unset or !=0) uses the grouped single-launch path. Same result, bit-exact. */
+/* Grouped single-launch path, with the legacy per-expert loop kept as the
+ * fallback when it fails. Same result, bit-exact. */
 static int routed_moe_launch_cutlass_dispatch(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -608,12 +608,7 @@ static int routed_moe_launch_cutlass_dispatch(
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    static int grouped = -1;
-    if (grouped < 0) {
-        const char *e = getenv("PULSAR_MOE_FP4_GROUPED");
-        grouped = !(e && e[0] == '0');
-    }
-    if (grouped) {
+    {
         int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
                 down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
@@ -628,15 +623,14 @@ static int routed_moe_launch_cutlass_dispatch(
         }
         if (rc) return rc;   /* any failure falls through to the legacy loop (safety net) */
     }
-    /* Reached only when the grouped path was disabled or failed -> the ~4x
-     * slower per-expert loop.  Announce once, unconditionally (was gated behind
-     * the unset PULSAR_MOE_GROUPED_LOG), so this slow tier is never silent. */
+    /* Reached only when the grouped path FAILED -> the ~4x slower per-expert
+     * loop.  Announce once, unconditionally, so this slow tier is never silent. */
     {
         static int fb_logged = 0;
         if (!fb_logged) { fb_logged = 1;
             fprintf(stderr,
-                    "pulsar: WARNING MoE grouped GEMM %s -> per-expert loop (~4x slower prefill)\n",
-                    grouped ? "failed" : "disabled");
+                    "pulsar: WARNING MoE grouped GEMM failed -> per-expert loop "
+                    "(~4x slower prefill)\n");
         }
     }
     return routed_moe_launch_cutlass(out, down, model_map, model_size,
@@ -1459,14 +1453,8 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
          * per-layer offsets readback -- required for CUDA graph capture of the
          * decode tape, and computes the exact same function (see the batch
          * path's comment; bit-exact oracle in temp/fp4gemv_test.cu covers
-         * n_tokens>=1). PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
-        static int fp4_gemv = -1;
-        if (fp4_gemv < 0) {
-            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
-            fp4_gemv = !(e && e[0] == '0');
-        }
-        if (fp4_gemv &&
-            mid && mid->ptr && down && down->ptr && out && out->ptr &&
+         * n_tokens>=1). */
+        if (            mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
             mid->bytes >= (uint64_t)n_expert * expert_mid_dim * sizeof(float) &&
             down->bytes >= (uint64_t)n_expert * out_dim * sizeof(float) &&
@@ -1603,12 +1591,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * on-model. Measured verify(3) step 118.2 -> 116.5 ms; the bigger win is
          * removing the per-rich-layer host sync from the verify path (CUDA-graph
          * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
-         * PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
-        static int fp4_gemv = -1;
-        if (fp4_gemv < 0) {
-            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
-            fp4_gemv = !(e && e[0] == '0');
-        }
+         */
         static int path_log = -1;
         if (path_log < 0) path_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 400 : 0;
         if (path_log > 0) {
@@ -1634,7 +1617,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * sibling caps in pulsar_cuda_matmul.cu were tried alongside this and are NOT
          * bit-exact -- they stay at 4; do not re-couple them to this one. */
         const uint32_t moe_gemv_cap = 8u;
-        if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
+        if (n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
             mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
@@ -1675,7 +1658,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * fallback, so it is deliberately NOT flagged here. */
         {
             static int gemv_batch_logged = 0;
-            if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
+            if (n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
                 gemv_batch_logged = 1;
                 fprintf(stderr,
                         "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
