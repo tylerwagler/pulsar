@@ -1219,13 +1219,6 @@ extern "C" int ds4_mmq_q8_0_moe(
 
 
 
-extern "C" int ds4_mmq_iq2_xxs_moe(
-        const void * W, const float * X, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
-    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
-                                               n_tokens, n_experts, n_expert_used, stream);
-}
 
 /* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
  * (weight server --repack-q2k-aligned) -- no raw-layout weights and no

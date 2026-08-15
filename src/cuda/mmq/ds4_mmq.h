@@ -145,17 +145,6 @@ int ds4_mmq_q8_0_moe(
 // nonfinite values to zero. This avoids a full extra read/write of the large
 // routed-down buffer during prefill.
 
-int ds4_mmq_iq2_xxs_moe(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
 // row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in

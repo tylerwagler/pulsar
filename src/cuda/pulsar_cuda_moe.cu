@@ -1056,59 +1056,13 @@ static int routed_moe_launch_mixed40(
  *   off  = pair * mid_dim + row,  pair = tok * n_expert + slot
  *   so weights[tok * n_expert + slot] == weights[pair].
  */
-/* Aligned IQ2 artifact cache.  Keyed by the raw weight pointer, which is stable
- * for the life of the model map, so one repack per tensor for the whole run.
- * Budget-capped: when it is exhausted a tensor is marked raw-forever (entry with
- * a NULL buffer) and never retried, so there is no per-launch allocation churn.
- * Populated lazily on first use -- the alternative, repacking at model load,
- * needs loader surgery; this gets the same steady state after the first chunk.
- */
-#define PULSAR_MMQ_ALIGN_MAX_TENSORS 256
-struct pulsar_mmq_aligned_entry { const void *raw; void *aligned; };
-static pulsar_mmq_aligned_entry g_mmq_aligned[PULSAR_MMQ_ALIGN_MAX_TENSORS];
-static int g_mmq_aligned_n = 0;
-static uint64_t g_mmq_aligned_budget = 0;
-static int g_mmq_aligned_init = 0;
-
-static const void *mmq_aligned_for(const void *raw, uint32_t in_dim, uint32_t mid_dim,
-                                   uint32_t n_experts) {
-    for (int i = 0; i < g_mmq_aligned_n; i++) {
-        if (g_mmq_aligned[i].raw == raw) return g_mmq_aligned[i].aligned;
-    }
-    if (g_mmq_aligned_n >= PULSAR_MMQ_ALIGN_MAX_TENSORS) return NULL;
-
-    if (!g_mmq_aligned_init) {
-        g_mmq_aligned_init = 1;
-        size_t freeb = 0, totalb = 0;
-        if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {
-            /* leave headroom for KV growth and activations */
-            const uint64_t reserve = 6ull << 30;
-            g_mmq_aligned_budget = (freeb > reserve) ? (uint64_t)(freeb - reserve) : 0ull;
-        }
-        fprintf(stderr, "pulsar: MMQ aligned-IQ2 cache budget %.1f GiB\n",
-                g_mmq_aligned_budget / 1073741824.0);
-    }
-
-    const uint64_t need = ds4_mmq_iq2_xxs_aligned_bytes((int)mid_dim, (int)in_dim, (int)n_experts);
-    void *buf = NULL;
-    if (need && need <= g_mmq_aligned_budget && cudaMalloc(&buf, need) == cudaSuccess) {
-        if (ds4_repack_iq2_aligned_device(buf, raw, in_dim, mid_dim, n_experts,
-                                          cudaStreamPerThread)) {
-            g_mmq_aligned_budget -= need;
-        } else {
-            (void)cudaFree(buf);
-            buf = NULL;
-        }
-    } else if (buf) {
-        (void)cudaFree(buf);
-        buf = NULL;
-    }
-    /* record either way: a NULL entry pins this tensor to the raw path */
-    g_mmq_aligned[g_mmq_aligned_n].raw = raw;
-    g_mmq_aligned[g_mmq_aligned_n].aligned = buf;
-    g_mmq_aligned_n++;
-    return buf;
-}
+/* The runtime aligned-IQ2 repack cache is GONE (2026-08-15).  It existed to
+ * lazily repack raw IQ2_XXS (type 16) into the MMQ aligned layout under a
+ * memory budget.  The loader now accepts only IQ2_XXS_MMQ (43) and
+ * CUTLASS_MXFP4 (40) for routed experts (weights.cpp tensor_is_routed_expert
+ * _type), and 43 is ALREADY aligned in the gguf -- so every tensor took the
+ * prealigned branch and the cache never repacked anything.  With it go the
+ * 256-entry table, the budget probe, and the raw-forever pinning. */
 
 /* The vendored adapter references this ds4-engine hook from its q8-fold vec
  * (decode) path: given an activation pointer it may hand back pre-quantized
@@ -1217,8 +1171,7 @@ static int routed_moe_try_mmq_gate_up(
      *      repack, no budget, and every tensor gets the fast path instead of
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
-    const int gate_prealigned = (gate_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
-    if (gate_type != 16u && !gate_prealigned) return 0;
+    if (gate_type != 43u) return 0;   /* PULSAR_TENSOR_IQ2_XXS_MMQ, the only one */
     /* One-shot: the adapter allocates its persistent q8_1 scratch here.  Without
      * it every call falls back to per-call async allocation, which cost 6x
      * (78 vs 477 t/s) the first time this was wired.  One-shot, not per-token. */
@@ -1244,28 +1197,15 @@ static int routed_moe_try_mmq_gate_up(
      * We cannot hold an aligned copy of every IQ2 tensor (30 layers x 3 x
      * 0.39 GiB ~ 35 GB on top of an 86 GB model in 121 GB), so cache what fits
      * under a budget and leave the rest on the raw path. */
-    const void *gate_a, *up_a;
-    if (gate_prealigned) {
-        gate_a = gate_w;   /* the gguf already holds the aligned layout */
-        up_a = up_w;
-    } else {
-        gate_a = mmq_aligned_for(gate_w, expert_in_dim, expert_mid_dim, n_total_expert);
-        up_a = gate_a ? mmq_aligned_for(up_w, expert_in_dim, expert_mid_dim, n_total_expert) : NULL;
-    }
-
+    /* Type 43 is stored aligned IN THE GGUF, so the weight pointer IS the SoA
+     * entry.  There is no raw arm and no repack. */
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
     float *up_raw = mid_out;          /* folded in place below */
-    const int rc = (gate_a && up_a)
-        ? ds4_mmq_iq2_xxs_moe_pair_soa(gate_a, up_a, x_f32, selected_ptr,
-                                       gate_raw, up_raw,
-                                       (int)expert_mid_dim, (int)expert_in_dim,
-                                       (int)n_tokens, (int)n_total_expert,
-                                       (int)n_expert, cudaStreamPerThread)
-        : ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
-                                   gate_raw, up_raw,
-                                   (int)expert_mid_dim, (int)expert_in_dim,
-                                   (int)n_tokens, (int)n_total_expert,
-                                   (int)n_expert, cudaStreamPerThread);
+    const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
+        gate_w, up_w, x_f32, selected_ptr, gate_raw, up_raw,
+        (int)expert_mid_dim, (int)expert_in_dim,
+        (int)n_tokens, (int)n_total_expert,
+        (int)n_expert, cudaStreamPerThread);
     if (rc != 0) return 0;
     const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
     const uint32_t threads = 256u;
@@ -1300,32 +1240,17 @@ static int routed_moe_try_mmq_down(
         uint32_t out_dim,
         uint32_t n_total_expert,
         uint64_t pairs) {
-    const int down_prealigned = (down_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
-    if (down_type != 16u && !down_prealigned) return 0;
+    if (down_type != 43u) return 0;   /* PULSAR_TENSOR_IQ2_XXS_MMQ, the only one */
     if (pairs > (uint64_t)INT32_MAX) return 0;
     if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
     /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
      * runtime cache could never afford -- letting down compete for a 22.9 GiB
      * budget just starved late layers of gate/up (measured 566.46 vs 590.77).
      * With the layout on disk there is no budget to compete for. */
-    if (down_prealigned) {
-        return ds4_mmq_iq2_xxs_moe_soa(down_w, mid_f32, selected_ptr, down_out,
-                                       (int)out_dim, (int)expert_mid_dim,
-                                       (int)pairs, (int)n_total_expert, 1,
-                                       cudaStreamPerThread) == 0;
-    }
-    /* DOWN DELIBERATELY STAYS ON RAW while the aligned cache is capacity-bound.
-     * ds4_mmq_iq2_xxs_moe_soa (added to the vendored adapter, upstream has only
-     * q2_K single-soa and iq2 pair-soa) works and gives down the same 2.40x --
-     * but the cache holds ~58 tensors against 90 (30 layers x gate/up/down), so
-     * letting down compete just starves late layers of gate/up alignment.
-     * MEASURED: down-aligned 566.46 vs gate/up-only 588.77 @4k, a net LOSS.
-     * Re-enable the moment the gguf stores IQ2 aligned (byte-identical size, so
-     * the cache disappears and all 90 tensors are aligned for free). */
-    return ds4_mmq_iq2_xxs_moe(down_w, mid_f32, selected_ptr, down_out,
-                               (int)out_dim, (int)expert_mid_dim,
-                               (int)pairs, (int)n_total_expert, 1,
-                               cudaStreamPerThread) == 0;
+    return ds4_mmq_iq2_xxs_moe_soa(down_w, mid_f32, selected_ptr, down_out,
+                                   (int)out_dim, (int)expert_mid_dim,
+                                   (int)pairs, (int)n_total_expert, 1,
+                                   cudaStreamPerThread) == 0;
 }
 #endif /* PULSAR_HAVE_MMQ */
 
