@@ -2303,8 +2303,7 @@ static int attention_prefill_mixed_launch(
     static int mixed_path_reported = 0;
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
-        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
-                n_tokens >= 128u;
+        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512;
         fprintf(stderr,
                 "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> %s\n",
                 n_tokens, n_comp,
@@ -2313,7 +2312,7 @@ static int attention_prefill_mixed_launch(
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (allow_fused && n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (allow_fused && n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
