@@ -204,6 +204,14 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a
  * multiple of 16.  Operand format chosen by measurement, not preference --
  * see tests/attn_precision_fidelity.cc and docs/engine-perf-map.md. */
+int pulsar_gpu_attention_f16_prefill_mx(
+        float *heads, const float *sinks, const float *q,
+        const float *raw_kv, const float *comp_kv,
+        uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, int raw_f16,
+        void *gact_data, void *gact_scale, int gact_kbp,
+        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope);
+
 int pulsar_gpu_attention_f16_prefill(
         float                   *heads,
         const float             *sinks,
@@ -674,6 +682,34 @@ void pulsar_gpu_indexer_set_fp4(int on);
  * the specific buffer they hand in (the persistent layer ring may be __half
  * while e.g. batch/drafter buffers stay f32). */
 
+/* As below, but also emits the grouped E4M3 encoding for the MX blocks this
+ * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
+ * half of the attn-output "a" activation: the fp16 attention epilogue emits
+ * [0, head_dim - n_rot) and this emits the rest, because this kernel rewrites
+ * that range IN PLACE after attention has already run.  Pass NULL slots for
+ * the plain behaviour. */
+int pulsar_gpu_rope_tail_mx_tensor(
+        pulsar_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        const pulsar_gpu_tensor *positions,
+        void             *gact_data,
+        void             *gact_scale,
+        int               gact_kbp,
+        uint32_t          gact_slab,
+        uint32_t          n_groups);
+
 int pulsar_gpu_rope_tail_tensor(
         pulsar_gpu_tensor *x,
         uint32_t          n_tok,
@@ -862,6 +898,20 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16);
+
+/* As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
+ * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if
+ * that tier actually ran and slots were supplied -- any other tier leaves it 0,
+ * and the caller must not note() the activation cache in that case.  Note that
+ * rope_tail rewrites the rope tail afterwards and must emit those blocks too;
+ * both halves are required before the encoding is complete. */
+int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(
+        pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window,
+        uint32_t n_head, uint32_t head_dim, uint32_t raw_f16,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, int *mx_out);
 
 int pulsar_gpu_attention_prefill_raw_heads_tensor(
         pulsar_gpu_tensor       *heads,

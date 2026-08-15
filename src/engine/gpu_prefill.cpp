@@ -428,6 +428,14 @@ bool gpu_graph_encode_layer_attention_batch(
     const uint32_t rank = PULSAR_N_LORA_O;
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
+    /* Grouped E4M3 for the attn-output "a" projection, emitted by the fp16
+     * attention epilogue (head dims [0, n_nope)) and rope_tail (the rest).
+     * Declared here because the two producers sit in different scopes below
+     * and the note() must see both.  Left NULL unless every precondition
+     * holds -- see the eligibility comment at the attention call. */
+    void    *gact_data = NULL, *gact_scale = NULL;
+    int      gact_kbp = 0, gact_emitted = 0;
+    uint64_t gact_slab = 0;
     /* Banked multiseq step (Tier-2): rows are independent sessions — per-row
      * position/bank from the host mirrors (gpu_graph_multiseq_step_begin),
      * per-bank compressor frontiers, banked kernel operands (whole pool +
@@ -2242,8 +2250,27 @@ bool gpu_graph_encode_layer_attention_batch(
             }
         }
 
+        /* ELIGIBILITY.  batch_heads is written by this call for the raw
+         * PREFIX and by the per-token loop below for the rest, so the fused
+         * encoding is only complete when the whole batch went through here.
+         * Anything less and part of the E4M3 buffer is never written -- a
+         * wrong answer, not a slow one -- so the fusion is refused rather
+         * than partially applied.  (Threading the indexed per-token path is
+         * the follow-up that lifts this restriction.) */
+        /* ⚠ DISARM FIRST, UNCONDITIONALLY.  batch_heads keeps the SAME
+         * (ptr, n_tokens, n_groups, group_dim) key on every layer, so a layer
+         * that takes the ineligible path below would otherwise inherit the
+         * previous layer's `valid` and hand the "a" GEMM layer N-1's
+         * activations.  That is the [[L035]] / C1 stale-cache failure exactly:
+         * a hit that is well-formed, current-shaped, and wrong. */
+        pulsar_gpu_mxfp8_gact_disarm();
+        if (ok && raw_prefix_tokens == n_tokens &&
+            !pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
+                                        &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
+            gact_data = NULL; gact_scale = NULL; gact_kbp = 0; gact_slab = 0;
+        }
         if (raw_prefix_tokens != 0) {
-            ok = pulsar_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
+            ok = pulsar_gpu_attention_prefill_raw_heads_mx_tensor(g->batch_heads,
                                                               model->map,
                                                               model->size,
                                                               layer->attn_sinks->abs_offset,
@@ -2253,8 +2280,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               g->raw_window,
                                                               PULSAR_N_HEAD,
                                                               PULSAR_N_HEAD_DIM,
-                                                              0 /* batch_kv is f32 */) != 0;
+                                                              0 /* batch_kv is f32 */,
+                                                              gact_data, gact_scale, gact_kbp,
+                                                              (uint32_t)gact_slab, n_groups,
+                                                              PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
+                                                              &gact_emitted) != 0;
         }
+        if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
         if (raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
                 const uint32_t pos = pos0 + t;
@@ -2372,7 +2404,11 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = pulsar_gpu_rope_tail_tensor(g->batch_heads,
+    /* Second half of the grouped encoding: this rewrites head dims
+     * [n_nope, head_dim) in place, so it owns exactly the MX blocks the
+     * attention epilogue deliberately skipped.  Only reached with slots when
+     * that epilogue actually ran (gact_emitted). */
+    if (ok) ok = pulsar_gpu_rope_tail_mx_tensor(g->batch_heads,
                                             n_tokens,
                                             PULSAR_N_HEAD,
                                             PULSAR_N_HEAD_DIM,
@@ -2386,7 +2422,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                             attn_factor,
                                             PULSAR_ROPE_YARN_BETA_FAST,
                                             PULSAR_ROPE_YARN_BETA_SLOW,
-                                            mseq ? g->batch_positions : NULL) != 0;
+                                            mseq ? g->batch_positions : NULL,
+                                            gact_data, gact_scale, gact_kbp,
+                                            (uint32_t)gact_slab, n_groups) != 0;
+    /* BOTH producers have now run: the encoding is complete and the "a" GEMM
+     * may consume it instead of running its own quantise pass. */
+    if (ok && gact_data) pulsar_gpu_mxfp8_gact_note();
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);

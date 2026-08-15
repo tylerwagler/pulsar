@@ -2307,7 +2307,9 @@ static void attn_dump_inputs_once(const float *q, const void *kv, const float *s
     free(hq); free(hkv); free(hs);
 }
 
-int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
+int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out) {
+    if (mx_out) *mx_out = 0;
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -2355,11 +2357,19 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
                 fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
                                 "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
             }
-            if (pulsar_gpu_attention_f16_prefill(
+            /* Only the fp16 tier can emit the grouped E4M3 encoding.  If it
+             * declines the batch we fall through WITHOUT setting *mx_out, so
+             * the caller does not note() and the "a" GEMM runs its own
+             * quantiser -- a half-written encoding would be a wrong answer,
+             * not a slow one. */
+            if (pulsar_gpu_attention_f16_prefill_mx(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
                     (const float *)raw_kv->ptr, NULL,
-                    n_tokens, 0u, window, 1u, n_head, head_dim, (int)raw_f16))
+                    n_tokens, 0u, window, 1u, n_head, head_dim, (int)raw_f16,
+                    gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope)) {
+                if (mx_out && gact_data) *mx_out = 1;
                 return 1;
+            }
             fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
                             "fall through to the f32 kernel\n");
             return 0;
@@ -2633,6 +2643,12 @@ static int attention_decode_batch_launch(
 }
 
 
+
+int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim, uint32_t raw_f16) {
+    return pulsar_gpu_attention_prefill_raw_heads_mx_tensor(heads, model_map, model_size, sinks_offset,
+                                                            q, raw_kv, n_tokens, window, n_head, head_dim,
+                                                            raw_f16, NULL, NULL, 0, 0u, 0u, 0u, NULL);
+}
 
 int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,

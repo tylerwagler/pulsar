@@ -571,17 +571,29 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     return on;
 }
 
-int pulsar_gpu_attention_f16_prefill(
+int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int raw_f16) {
+        uint32_t n_head, uint32_t head_dim, int raw_f16,
+        void *gact_data, void *gact_scale, int gact_kbp,
+        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope) {
     if (!heads || !sinks || !q || !raw_kv) return 0;
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
     if (n_tokens == 0u) return 0;
     if (n_comp != 0u && !comp_kv) return 0;
     if (!af16_device_supported()) return 0;
+    /* The epilogue's grouped index math assumes whole heads per group and that
+     * the nope/rope split falls on an MX block boundary (so rope_tail can own
+     * the tail blocks without either side touching the other's).  Refuse the
+     * emission rather than write a partial encoding the GEMM would then read. */
+    if (gact_data && (n_groups == 0u || (n_head % n_groups) != 0u ||
+                      (n_nope % 32u) != 0u || n_nope > AF16_DIM)) {
+        fprintf(stderr, "pulsar: attn f16 cannot emit MX for n_head=%u n_groups=%u "
+                        "n_nope=%u\n", n_head, n_groups, n_nope);
+        return 0;
+    }
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
@@ -589,9 +601,22 @@ int pulsar_gpu_attention_f16_prefill(
                                             n_tokens, n_comp, window, ratio,
                                             n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
                                             NULL, NULL, NULL, 0u, 1u, 0, 0,
-                                            NULL, NULL, 0, 0u, 0u, 0u);
+                                            (__nv_fp8_e4m3 *)gact_data,
+                                            (unsigned char *)gact_scale,
+                                            gact_kbp, gact_slab, n_groups, n_nope);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
+}
+
+int pulsar_gpu_attention_f16_prefill(
+        float *heads, const float *sinks, const float *q,
+        const float *raw_kv, const float *comp_kv,
+        uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, int raw_f16) {
+    return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
+                                               n_tokens, n_comp, window, ratio,
+                                               n_head, head_dim, raw_f16,
+                                               NULL, NULL, 0, 0u, 0u, 0u);
 }
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
