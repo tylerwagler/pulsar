@@ -176,7 +176,7 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
     (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 1u) / 2u + \
      (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 31u) / 32u))
 
-/* PULSAR_ATTN_PACK (runtime env, see gpu_graph_attn_pack_enabled()): VALUE-
+/* Packed attention comp-cache row (the only comp-cache format): VALUE-
  * PRESERVING packed attn comp cache.  One row = [448 e4m3 nope bytes][7 E8M0
  * block-64 scale bytes][1 pad][64 bf16 rope] = 584 B (vs 2048 f32), which is
  * byte-identical to vLLM's fp8_ds_mla DSv4 cache line.  The nope dims store
@@ -2288,8 +2288,6 @@ uint32_t gpu_graph_raw_start_for_span(
         uint32_t               n_raw);
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
-uint32_t gpu_graph_attn_comp_cache_is_pack(void);
-int gpu_graph_attn_pack_enabled(void);
 uint32_t gpu_graph_prefill_slice(void);
 /* True when PULSAR_IDX_FP4 is set (cached). When on, the ratio-4 indexer
  * compressed cache is stored MXKV-FP4-packed (PULSAR_ENGINE_IDXFP4_ROWBYTES/row,

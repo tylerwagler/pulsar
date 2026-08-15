@@ -24,7 +24,7 @@
  * The first differing float index + the two values are printed so a real algo
  * divergence (large, systematic) is never hidden behind a pass/fail bit.
  *
- * Run pack on/off + idx-fp4 on/off (PULSAR_ATTN_PACK / PULSAR_IDX_FP4) via the harness.
+ * The comp caches have one format each (packed attn / MXFP4 indexer).
  * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=8. Run under GPU discipline.
  *   usage: PULSAR_MSEQ_BANKS=8 ./tests/algo_stability_gate MODEL
  */
@@ -116,9 +116,7 @@ int main(int argc, char **argv) {
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
     if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    printf("CONFIG: PULSAR_ATTN_PACK=%s PULSAR_IDX_FP4=%s\n",
-           getenv("PULSAR_ATTN_PACK") ? getenv("PULSAR_ATTN_PACK") : "(unset)",
-           getenv("PULSAR_IDX_FP4") ? getenv("PULSAR_IDX_FP4") : "(unset)");
+    printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats)\n");
 
     size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }

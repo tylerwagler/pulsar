@@ -439,10 +439,8 @@ uint64_t gpu_graph_session_bytes_banked(
     total += dz.q_dim * f32;                              /* q */
     total += 2ull * PULSAR_N_HEAD_DIM * f32;                 /* kv_raw, kv */
     total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
-    if (gpu_graph_attn_pack_enabled()) {
-        total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
-        total += (uint64_t)dz.comp_cap * PULSAR_N_HEAD_DIM * f32;            /* attn_comp_dequant */
-    }
+    total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
+    total += (uint64_t)dz.comp_cap * PULSAR_N_HEAD_DIM * f32;            /* attn_comp_dequant */
     total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
     total += dz.indexer_q_dim * f32;                      /* indexer_q */
     total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
@@ -1595,21 +1593,18 @@ bool gpu_graph_alloc_raw_cap(
          * Refuse loudly instead of silently running a different format. */
         fprintf(stderr,
                 "pulsar: PULSAR_ATTN_MX has been removed (superseded by PULSAR_ATTN_PACK); "
-                "unset PULSAR_ATTN_MX (use PULSAR_ATTN_PACK=0 for the classic f32 comp cache)\n");
+                "unset PULSAR_ATTN_MX\n");
         return false;
     }
-    if (gpu_graph_attn_pack_enabled() &&
-        (PULSAR_N_ROT != 64u || ((PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % 64u) != 0u)) {
+    if (PULSAR_N_ROT != 64u || ((PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % 64u) != 0u) {
         fprintf(stderr,
-                "pulsar: PULSAR_ATTN_PACK requires n_rot 64 and 64-aligned nope dims "
+                "pulsar: the packed comp cache requires n_rot 64 and 64-aligned nope dims "
                 "(head_dim %u / n_rot %u)\n",
                 (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT);
         return false;
     }
     g->comp_cap = dz.comp_cap;
-    if (gpu_graph_attn_pack_enabled()) {
-        g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
-    }
+    g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_comp_cap[il] = dz.layer_comp_cap[il];
     }
@@ -1766,17 +1761,14 @@ bool gpu_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (gpu_graph_attn_pack_enabled()) {
-        /* f32 staging: the compressor writes real f32 rows here, then the commit
-         * step packs them to the persistent PULSAR_ATTN_PACK comp cache. */
-        g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
-                                                  PULSAR_N_HEAD_DIM * sizeof(float));
-        /* f32 shadow the prefill attention consumers (and session save) read
-         * after the persistent packed comp cache is dequantized (see
-         * gpu_graph_attn_comp_read_cache). */
-        g->attn_comp_dequant = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
-                                                    PULSAR_N_HEAD_DIM * sizeof(float));
-    }
+    /* f32 staging: the compressor writes real f32 rows here, then the commit
+     * step packs them to the persistent packed comp cache. */
+    g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
+                                              PULSAR_N_HEAD_DIM * sizeof(float));
+    /* f32 shadow read by session load, and by the prefill attention consumers
+     * when the fp16 tier is off (see gpu_graph_attn_comp_read_cache). */
+    g->attn_comp_dequant = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
+                                                PULSAR_N_HEAD_DIM * sizeof(float));
     {
         if (PULSAR_N_INDEXER_HEAD_DIM != 128u) {
             /* The packed loader and QAT+pack kernels hard-code the 68-byte
@@ -1906,8 +1898,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    (!gpu_graph_attn_pack_enabled() ||
-                     (g->attn_comp_stage && g->attn_comp_dequant)) &&
+                    g->attn_comp_stage && g->attn_comp_dequant &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&

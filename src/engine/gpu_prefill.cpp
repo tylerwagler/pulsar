@@ -442,7 +442,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * device descriptor arrays), scalar counters = read-only supersets.
      * step_begin rejects position-0 rows, so zero_prefix is never multiseq. */
     const bool mseq = g->batch_multiseq;
-    /* Single-sequence prefill has been dequantising the PULSAR_ATTN_PACK comp
+    /* Single-sequence prefill has been dequantising the packed comp
      * cache into an f32 shadow and reading that: 2048 B/row instead of 584, on
      * the rows that dominate the attention tile, plus a whole dequant pass.
      * The multi-sequence path already hands the packed pool over directly.
@@ -973,8 +973,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 fprintf(stderr, "pulsar: GPU layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && gpu_graph_attn_pack_enabled() &&
-                n_comp > g->attn_comp_stage_cap) {
+            if (ok && n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "pulsar: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
@@ -999,11 +998,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          PULSAR_N_ROT,
                                                          compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                         /* Under PULSAR_ATTN_PACK the commit's pack-store kernel
-                                                          * is the single fp8 quantizer (same recipe); a second
-                                                          * quantize is NOT bit-idempotent for borderline block
-                                                          * amax (scale can shift, re-rounding small values). */
-                                                         !gpu_graph_attn_pack_enabled(),
+                                                         /* The commit's pack-store kernel is the single fp8
+                                                          * quantizer; a second quantize is NOT bit-idempotent
+                                                          * for borderline block amax (the scale can shift,
+                                                          * re-rounding small values). */
+                                                         false,
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -1081,8 +1080,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && gpu_graph_attn_pack_enabled() &&
-                    comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
@@ -1107,8 +1105,8 @@ bool gpu_graph_encode_layer_attention_batch(
                             n_tokens,
                             PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            /* pack: quantize once, in the commit (see above) */
-                            !gpu_graph_attn_pack_enabled(),
+                            /* quantize once, in the commit (see above) */
+                            false,
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -1135,8 +1133,8 @@ bool gpu_graph_encode_layer_attention_batch(
                             n_tokens,
                             PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            /* pack: quantize once, in the commit (see above) */
-                            !gpu_graph_attn_pack_enabled(),
+                            /* quantize once, in the commit (see above) */
+                            false,
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -1189,19 +1187,17 @@ bool gpu_graph_encode_layer_attention_batch(
                 /* LEVER 2: batched banked attn-compressor emit for the single
                  * same-bank aligned run.  Mirrors the classic aligned branch
                  * above, keyed at the bank's frontier / bank state lanes /
-                 * bank comp cache.  quantize_fp8 = !pack (the pack commit is the
-                 * single fp8 quantizer, as in the classic path). */
+                 * bank comp cache.  quantize_fp8 is false: the pack commit is
+                 * the single fp8 quantizer, as in the classic path. */
                 const uint32_t bank = run_bank;
                 const uint32_t comp_before = g->ms_n_comp[bank][il];
                 const uint32_t comp_chunk = n_tokens / ratio;
-                const bool pack = gpu_graph_attn_pack_enabled();
-                pulsar_gpu_tensor *bank_comp = NULL;
                 pulsar_gpu_tensor *bank_st_kv = NULL, *bank_st_sc = NULL, *comp_target = NULL;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && pack && comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
@@ -1211,17 +1207,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     ok = bank_st_kv && bank_st_sc;
                 }
                 if (ok) {
-                    if (pack) {
-                        comp_target = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
-                                (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM * sizeof(float));
-                    } else {
-                        bank_comp = gpu_graph_bank_attn_comp_view(g, il, bank);
-                        if (bank_comp) {
-                            comp_target = pulsar_gpu_tensor_view(bank_comp,
-                                    (uint64_t)comp_before * PULSAR_N_HEAD_DIM * sizeof(float),
-                                    (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM * sizeof(float));
-                        }
-                    }
+                    comp_target = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
+                            (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM * sizeof(float));
                     ok = comp_target != NULL;
                 }
                 if (ok && ratio == 4) {
@@ -1235,7 +1222,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             layer->attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, pos0, n_tokens, PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            !pack, freq_base, freq_scale, ext_factor, attn_factor,
+                            false, freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
                 } else if (ok) {
@@ -1249,7 +1236,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             layer->attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, ratio, pos0, n_tokens, PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            !pack, freq_base, freq_scale, ext_factor, attn_factor,
+                            false, freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
                 }
@@ -1272,7 +1259,6 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                 }
                 pulsar_gpu_tensor_free(comp_target);
-                pulsar_gpu_tensor_free(bank_comp);
                 pulsar_gpu_tensor_free(bank_st_sc);
                 pulsar_gpu_tensor_free(bank_st_kv);
             } else {
@@ -1304,14 +1290,11 @@ bool gpu_graph_encode_layer_attention_batch(
                         ? gpu_graph_bank_attn_state_kv_view(g, il, bank) : NULL;
                     pulsar_gpu_tensor *ms_st_sc = mseq
                         ? gpu_graph_bank_attn_state_score_view(g, il, bank) : NULL;
-                    /* f32 storage writes the persistent cache directly, so it
-                     * needs the bank's comp view; pack mode stages in the
-                     * shared f32 row and commits bank-aware below. */
-                    pulsar_gpu_tensor *ms_target = (mseq && !gpu_graph_attn_pack_enabled())
-                        ? gpu_graph_bank_attn_comp_view(g, il, bank) : NULL;
+                    /* Packing stages in the shared f32 row and commits
+                     * bank-aware below, so no per-bank comp view is needed. */
+                    pulsar_gpu_tensor *ms_target = NULL;
                     ok = kv_view && sc_view &&
-                         (!mseq || (ms_st_kv && ms_st_sc &&
-                                    (gpu_graph_attn_pack_enabled() || ms_target)));
+                         (!mseq || (ms_st_kv && ms_st_sc));
                     if (ok) {
                         ok = pulsar_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -1345,31 +1328,16 @@ bool gpu_graph_encode_layer_attention_batch(
                                                   (uint64_t)comp_row * PULSAR_N_HEAD_DIM * sizeof(float),
                                                   (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float))
                             : gpu_graph_attn_comp_row_view(g, il, comp_row);
-                        if (gpu_graph_attn_pack_enabled()) {
-                            /* comp_row_view aliases the f32 stage; commit below
-                             * quantizes+packs and roundtrips the stage in place
-                             * — dump after commit to match f32-mode values. */
-                            ok = comp_row_view != NULL;
-                        } else {
-                            ok = comp_row_view &&
-                                 pulsar_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                      1,
-                                                                      PULSAR_N_HEAD_DIM,
-                                                                      PULSAR_N_ROT) != 0;
-                        }
-                        if (ok && !gpu_graph_attn_pack_enabled()) {
-                            gpu_graph_debug_dump_tensor("KVcompress",
-                                                          comp_row_view,
-                                                          PULSAR_N_HEAD_DIM,
-                                                          il,
-                                                          pos);
-                        }
+                        /* comp_row_view aliases the f32 stage; the commit
+                         * below quantizes+packs and roundtrips the stage in
+                         * place, so the dump happens after it. */
+                        ok = comp_row_view != NULL;
                         if (ok) {
                             ok = mseq
                                 ? gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_row, 1)
                                 : gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
                         }
-                        if (ok && gpu_graph_attn_pack_enabled()) {
+                        if (ok) {
                             gpu_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
                                                           PULSAR_N_HEAD_DIM,
@@ -1956,8 +1924,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                   mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                                        : g->layer_raw_cache[il],
                                                                                   span_comp_src,
-                                                                                  mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                                       : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
+                                                                                  mseq ? 1u
+                                                                                       : (pk_native ? 1u : 0),
                                                                                   g->comp_selected,
                                                                                   sn,
                                                                                   spos0,
@@ -2002,8 +1970,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                                                                               : (pk_native ? g->layer_attn_comp_cache[il]
                                                                                            : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
-                                                                         mseq ? gpu_graph_attn_comp_cache_is_pack()
-                                                                              : (pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0),
+                                                                         mseq ? 1u
+                                                                              : (pk_native ? 1u : 0),
                                                                          NULL,
                                                                          0,
                                                                          n_tokens,
@@ -2134,7 +2102,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               sq_view,
                                                                               g->layer_raw_cache[il],
                                                                               zspan_comp_src,
-                                                                              pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0,
+                                                                              pk_native ? 1u : 0,
                                                                               g->comp_selected,
                                                                               sn,
                                                                               spos0,
@@ -2307,7 +2275,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                * so the shadow was rebuilt for every token. */
                                                                               pk_native ? g->layer_attn_comp_cache[il]
                                                                                         : gpu_graph_attn_comp_read_cache(g, il, cur_comp),
-                                                                              pk_native ? gpu_graph_attn_comp_cache_is_pack() : 0,
+                                                                              pk_native ? 1u : 0,
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -2335,7 +2303,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  cur_comp ? (pk_native ? g->layer_attn_comp_cache[il]
                                                                                        : gpu_graph_attn_comp_read_cache(g, il, cur_comp))
                                                                           : NULL,
-                                                                 (cur_comp && pk_native) ? gpu_graph_attn_comp_cache_is_pack() : 0,
+                                                                 (cur_comp && pk_native) ? 1u : 0,
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,

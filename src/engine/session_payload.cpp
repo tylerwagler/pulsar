@@ -593,23 +593,12 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (gpu_graph_attn_pack_enabled()) {
             rc = payload_write_attn_comp_pack(fp, g, il,
                                               g->layer_n_comp[il],
                                               buf,
                                               PULSAR_SESSION_IO_CHUNK,
                                               err,
                                               errlen);
-        } else {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_comp[il] * PULSAR_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           PULSAR_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
-        }
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
@@ -780,7 +769,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (gpu_graph_attn_pack_enabled()) {
             rc = payload_read_attn_comp_pack(fp, g, il,
                                              n_comp[il],
                                              buf,
@@ -788,17 +776,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
                                              &remaining,
                                              err,
                                              errlen);
-        } else {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_comp[il] * PULSAR_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          PULSAR_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-        }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                    0,

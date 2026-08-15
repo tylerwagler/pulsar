@@ -19,7 +19,7 @@
  *    prefill suffix), BOTH row classes are correct — gate 4 proves the decode prefix,
  *    gate 2 proves the prefill suffix, and the split lands at row n_dec (asserted).
  *
- * Run pack on/off x idx-fp4 on/off (PULSAR_ATTN_PACK / PULSAR_IDX_FP4). CONFIG surfaced.
+ * The comp caches have one format each (packed attn / MXFP4 indexer).
  * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS >= n_dec+1. Run under GPU discipline.
  *   usage: PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate MODEL
  */
@@ -169,9 +169,8 @@ int main(int argc, char **argv) {
     pulsar_engine_options o; memset(&o, 0, sizeof o);
     o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
     if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    printf("CONFIG: PULSAR_ATTN_PACK=%s PULSAR_IDX_FP4=%s  (n_dec=%d K=%d)\n",
-           getenv("PULSAR_ATTN_PACK") ? getenv("PULSAR_ATTN_PACK") : "(unset,default 1)",
-           getenv("PULSAR_IDX_FP4") ? getenv("PULSAR_IDX_FP4") : "(unset,default 1)", N_DEC, K_PRE);
+    printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only "
+           "formats)  (n_dec=%d K=%d)\n", N_DEC, K_PRE);
 
     size_t tl = 0; char *txt = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!txt) { fprintf(stderr, "prompt read failed\n"); return 1; }

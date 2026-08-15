@@ -153,12 +153,6 @@ static int gpu_graph_env_default_flag(const char *name, int def) {
     return 1;
 }
 
-int gpu_graph_attn_pack_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_ATTN_PACK", 1);
-    return cached;
-}
-
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffers (indexer_scores, comp_mask) are allocated with only N token
@@ -175,18 +169,16 @@ uint32_t gpu_graph_prefill_slice(void) {
 }
 
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
-    if (gpu_graph_attn_pack_enabled()) return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-    return (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
+    return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 }
 
-/* Comp cache to hand the f32 prefill attention consumers. Normally the
- * persistent cache itself; under PULSAR_ATTN_PACK storage, dequantize the first
- * n_rows packed rows into the f32 shadow and return that.  The dequant is
+/* Comp cache to hand the f32 prefill attention consumers (used when the fp16
+ * attention tier is off): the dequantized first n_rows packed rows in the f32
+ * shadow.  The dequant is
  * bit-exact: packed rows decode to exactly the values the f32 cache would
  * hold. */
 pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t il, uint32_t n_rows) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
-    if (!gpu_graph_attn_pack_enabled()) return g->layer_attn_comp_cache[il];
     if (!g->attn_comp_dequant) return NULL;
     if (n_rows == 0) return g->attn_comp_dequant;
     if (n_rows > g->layer_comp_cap[il]) return NULL;
@@ -197,12 +189,6 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t 
     return g->attn_comp_dequant;
 }
 
-/* Format flag for consumers reading the PERSISTENT comp cache natively (the
- * single-token decode attention).  The prefill/batch consumers read the f32
- * shadow instead (gpu_graph_attn_comp_read_cache) and pass 0. */
-uint32_t gpu_graph_attn_comp_cache_is_pack(void) {
-    return gpu_graph_attn_pack_enabled() ? 1u : 0u;
-}
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
     return w->type == PULSAR_TENSOR_F16 || w->type == PULSAR_TENSOR_FP8_E4M3;
 }
@@ -213,15 +199,15 @@ static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
 pulsar_gpu_tensor *gpu_graph_attn_comp_update_target(
         pulsar_gpu_graph *g,
         uint32_t       il) {
-    return gpu_graph_attn_pack_enabled()
-        ? g->attn_comp_stage
-        : g->layer_attn_comp_cache[il];
+    (void)il;
+    return g->attn_comp_stage;
 }
 
 
 
 uint32_t gpu_graph_attn_comp_update_row(uint32_t row) {
-    return gpu_graph_attn_pack_enabled() ? 0u : row;
+    (void)row;
+    return 0u;
 }
 
 
@@ -231,7 +217,7 @@ bool gpu_graph_commit_attn_comp_stage(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (gpu_graph_attn_pack_enabled()) {
+    {
         /* Quantize+pack the `rows` f32 rows staged in attn_comp_stage into the
          * packed comp cache at first_row.  The kernel also fp8-roundtrips the
          * stage rows in place (identical to the plain quantize the f32 path
@@ -259,11 +245,6 @@ bool gpu_graph_commit_attn_comp_stage(
         return gpu_graph_emit_keep_restore(g, il,
                 g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
     }
-    /* Classic f32 storage: the compressor wrote the persistent cache directly
-     * (gpu_graph_attn_comp_update_target returned it), nothing to commit — but
-     * the fork boundary restore still applies to the rows it just wrote. */
-    return gpu_graph_emit_keep_restore(g, il,
-            g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
 }
 
 
@@ -274,12 +255,6 @@ bool gpu_graph_commit_attn_comp_stage_bank(
         uint32_t       bank,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (!gpu_graph_attn_pack_enabled()) {
-        /* f32 storage: the multiseq emit loop pointed the compressor at the
-         * bank's comp view directly; nothing to commit (mirrors the classic
-         * helper). */
-        return true;
-    }
     if (rows == 0) return true;
     if (!g || il >= PULSAR_N_LAYER || !g->attn_comp_stage) return false;
     if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
@@ -301,13 +276,9 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_row_view(
         pulsar_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
-    if (gpu_graph_attn_pack_enabled()) {
-        return pulsar_gpu_tensor_view(g->attn_comp_stage,
-                                   0,
-                                   (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-    }
-    return pulsar_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)row * PULSAR_N_HEAD_DIM * sizeof(float),
+    (void)il; (void)row;
+    return pulsar_gpu_tensor_view(g->attn_comp_stage,
+                               0,
                                (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
 }
 
@@ -318,23 +289,16 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (gpu_graph_attn_pack_enabled()) {
-        return g->attn_comp_stage;
-    }
-    const uint32_t view_rows = rows ? rows : 1u;
-    return pulsar_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)first_row * PULSAR_N_HEAD_DIM * sizeof(float),
-                               (uint64_t)view_rows * PULSAR_N_HEAD_DIM * sizeof(float));
+    (void)il; (void)first_row; (void)rows;
+    return g->attn_comp_stage;
 }
 
 
 
 void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t) {
-    /* Only the pure-f32 path returns a fresh view; the staged pack path
-     * returns the persistent attn_comp_stage, which must not be freed. */
-    if (!gpu_graph_attn_pack_enabled()) {
-        pulsar_gpu_tensor_free(t);
-    }
+    /* The target is always the persistent attn_comp_stage, which must not be
+     * freed. Kept as a named no-op so the call sites still read as paired. */
+    (void)t;
 }
 
 
@@ -755,20 +719,14 @@ bool gpu_graph_encode_decode_layer(
                                                         PULSAR_RMS_EPS) != 0;
         if (ok && emit) {
             pulsar_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
+            /* comp_row_view aliases the f32 stage; the commit below quantizes,
+             * packs and roundtrips the stage in place, so the KVcompress dump
+             * happens after it. */
             if (!comp_row_view) {
                 ok = false;
-            } else if (gpu_graph_attn_pack_enabled()) {
-                /* comp_row_view aliases the f32 stage; commit below quantizes,
-                 * packs, and roundtrips the stage in place — dump afterwards so
-                 * KVcompress shows the same post-roundtrip values as f32 mode. */
-            } else {
-                ok = pulsar_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
-                if (ok) {
-                    gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, PULSAR_N_HEAD_DIM, il, pos);
-                }
             }
             if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
-            if (ok && comp_row_view && gpu_graph_attn_pack_enabled()) {
+            if (ok && comp_row_view) {
                 gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, PULSAR_N_HEAD_DIM, il, pos);
             }
             pulsar_gpu_tensor_free(comp_row_view);
@@ -1017,7 +975,7 @@ bool gpu_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    gpu_graph_attn_comp_cache_is_pack(),
+                    1u,
                     comp_selected,
                     1,
                     pos,
@@ -1052,7 +1010,7 @@ bool gpu_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         gpu_graph_attn_comp_cache_is_pack(),
+                                                         1u,
                                                          n_comp,
                                                          NULL,
                                                          0,
