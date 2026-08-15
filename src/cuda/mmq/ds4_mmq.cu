@@ -728,6 +728,13 @@ int ds4_mmq_moe_impl(
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    /* The IQ2 D2R single-tensor path (the DOWN projection on this artifact)
+     * consumes E4M3 when the arm is on.  Separate buffer, same reasoning as in
+     * ds4_mmq_moe_pair_impl: src1_q8_1 also feeds the generic MMQ kernel below,
+     * which only understands q8_1, so the two formats must not share storage. */
+    const int moe_e4m3 = ds4_d2r_iq2_arm() ? 1 : 0;
+    ggml_cuda_pool_alloc<char> src1_e4m3;
+    char *src1_e4m3_p = nullptr;
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
     // kernel's tail-tile reads and ne_get_rows columns need not fill the final mmq
@@ -749,6 +756,15 @@ int ds4_mmq_moe_impl(
         type, /*ne00=*/K, s11_src, s12_src, s13_src,
         /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
         stream);
+    if (moe_e4m3) {
+        src1_e4m3_p = src1_e4m3.alloc(ctx->pool(), nbytes_src1_q8_1);
+        cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
+        ds4_quantize_mmq_e4m3_cuda(
+            X_f32, ids_src1.get(), (void *)src1_e4m3_p,
+            /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            /*n_expert_used=*/0, /*scatter=*/false, stream);
+    }
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -794,8 +810,11 @@ int ds4_mmq_moe_impl(
             if (w_bytes != 0) {
                 ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), w_bytes);
                 const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
-                    x_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
-                    out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes, stream);
+                    x_soa, soa_blocks,
+                    (moe_e4m3 ? src1_e4m3_p : src1_q8_1.get()),
+                    ids_dst.get(), expert_bounds.get(),
+                    out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes,
+                    moe_e4m3, stream);
                 if (rc == 0) {
                     return 0;
                 }

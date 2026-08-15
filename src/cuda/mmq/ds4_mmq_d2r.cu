@@ -3812,7 +3812,8 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
                                           int n_experts,
                                           void *worklist_scratch,
                                           size_t worklist_scratch_bytes,
-                                          cudaStream_t stream) {
+                                          int use_e4m3,
+                                           cudaStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_single_launch";
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
@@ -3863,7 +3864,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
          * the arm-1 garbage, and the SIXTH site of the same one-evaluation
          * rule.  If this path ever gains E4M3 staging, thread the flag in as a
          * parameter like the fused launcher does; do not re-read the env. */
-        out, out, M, K, (int)ne_get_rows, n_experts, /*use_e4m3=*/0);
+        out, out, M, K, (int)ne_get_rows, n_experts, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
