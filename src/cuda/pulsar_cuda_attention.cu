@@ -1134,58 +1134,6 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 #define PULSAR_ATTN_STATIC_MIN_BLOCKS 4
 #endif
 
-/* ---- Attention numeric emulation (plan 90 B1 variant pricing) -------------
- *
- * Rounds exactly the values a tensor-core attention path WOULD round, inside
- * our exact SIMT kernel, so each B1 variant's fidelity cost can be MEASURED
- * against the work-rig reference before anyone spends weeks porting a kernel.
- * This is the method that priced the fp16-HMMA question in task #65; that
- * apparatus was never committed and is lost, so this is a rebuild — but now
- * aimed at divergence-from-SOURCE rather than divergence-from-ourselves.
- *
- * Q and P are the only NEW roundings a TC path adds on our stack: the raw ring
- * is already __float2half-rounded and the comp cache is e4m3 (ATTN_PACK), so
- * K/V precision is not ours to lose a second time here. In this kernel k0..k3
- * carry BOTH K and V (MLA shares the latent), which is why only Q and P are
- * touched below.
- *
- * What this deliberately does NOT model (same caveat the #65 measurement
- * carried, and the reason its numbers were a FLOOR): a real port also changes
- * k-dim reassociation and online-softmax rescale ordering. Treat any result
- * here as a lower bound on the true divergence.
- *
- * Modes (PULSAR_ATTN_EMUL, read once at launch dispatch per no-hot-path-flags):
- *   0 OFF   byte-identical -- the template collapses to the shipped code
- *   1 FP16  Q,P -> __half            (the fp16-HMMA variant)
- *   2 BF16  Q,P -> __nv_bfloat16     (bf16 QK/PV, expected cheapest divergence)
- *   3 QONLY Q -> bf16, P left f32    (isolates the Q-side cost alone)
- *   4 CTRL  no rounding at all       (must come back byte-identical to OFF;
- *                                     proves the apparatus itself is inert)
- */
-enum {
-    PULSAR_EMUL_OFF = 0,
-    PULSAR_EMUL_FP16 = 1,
-    PULSAR_EMUL_BF16 = 2,
-    PULSAR_EMUL_QONLY = 3,
-    PULSAR_EMUL_CTRL = 4,
-    PULSAR_EMUL_MODES = 5
-};
-
-template <int EMUL>
-__device__ __forceinline__ static float emul_round_q(float x) {
-    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
-    if constexpr (EMUL == PULSAR_EMUL_BF16 || EMUL == PULSAR_EMUL_QONLY)
-        return __bfloat162float(__float2bfloat16(x));
-    return x;
-}
-
-template <int EMUL>
-__device__ __forceinline__ static float emul_round_p(float x) {
-    if constexpr (EMUL == PULSAR_EMUL_FP16) return __half2float(__float2half(x));
-    if constexpr (EMUL == PULSAR_EMUL_BF16) return __bfloat162float(__float2bfloat16(x));
-    return x;
-}
-
 /* f32 -> fp16 narrowing for the tensor-core attention GEMM operands.
  *
  * The prefill attention pair already runs on tensor cores at TF32
@@ -1201,61 +1149,8 @@ __global__ static void attn_q_f32_to_f16_kernel(__half *dst, const float *src, u
     if (i < n) dst[i] = __float2half(src[i]);
 }
 
-/* Elementwise rounding for the cuBLAS attention path, where Q and P are GEMM
- * operands in memory rather than values in registers. Diagnostic-only: never
- * launched while the emulation is OFF, so the shipped path is untouched.
- *
- * This path is the one that actually runs for a compressed-KV prefill --
- * established in 2026-07 by a dispatch-flag bisect (forcing the cuBLAS route
- * off changed the dump; forcing the window route off left it byte-identical).
- * Those flags were retired in L027; the conclusion stands, but re-deriving it
- * now means editing the dispatch conditions directly. The first version of this
- * emulation instrumented the window kernel, which is dead code here, and the
- * giveaway was three different rounding modes all returning bit-identical KL. */
-__global__ static void emul_round_array_kernel(float *dst, const float *src,
-                                               uint64_t n, int mode, int is_p,
-                                               unsigned long long *n_changed) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float in = src[i];
-    float v = in;
-    switch (mode) {
-    case PULSAR_EMUL_FP16:
-        v = __half2float(__float2half(v));
-        break;
-    case PULSAR_EMUL_BF16:
-        v = __bfloat162float(__float2bfloat16(v));
-        break;
-    case PULSAR_EMUL_QONLY:
-        if (!is_p) v = __bfloat162float(__float2bfloat16(v));
-        break;
-    default:
-        break;
-    }
-    /* Count elements the rounding actually moved. A variant reporting zero
-     * divergence is ambiguous between "this precision is free here" and "the
-     * rounding never happened"; this separates them at the source. */
-    if (n_changed && v != in) atomicAdd(n_changed, 1ull);
-    dst[i] = v;
-}
-
-template <int EMUL>
-__device__ __forceinline__ static void emul_round_q4(float4 &v) {
-    if constexpr (EMUL != PULSAR_EMUL_OFF && EMUL != PULSAR_EMUL_CTRL) {
-        v.x = emul_round_q<EMUL>(v.x);
-        v.y = emul_round_q<EMUL>(v.y);
-        v.z = emul_round_q<EMUL>(v.z);
-        v.w = emul_round_q<EMUL>(v.w);
-    }
-}
-
-/* Merge 2026-08-11: both sides land on this declaration. The release line's
- * occupancy cap (__launch_bounds__, +8.9% prefill, bit-exact — 1d2ef4f) and the
- * B1 emulation template are independent and both wanted. launch_bounds binds
- * per instantiation, so the EMUL=OFF instantiation — the only one the shipped
- * path ever launches — keeps exactly the register budget the cap was measured
- * with. */
-template <int EMUL>
+/* The release line's occupancy cap (__launch_bounds__, +8.9% prefill,
+ * bit-exact -- 1d2ef4f). */
 __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
 static void attention_static_mixed_heads8_online_kernel(
         float *heads,
@@ -1281,7 +1176,6 @@ static void attention_static_mixed_heads8_online_kernel(
          * Pure bandwidth win: no precision is traded. */
         const float *comp_mask,
         uint32_t use_comp_mask) {
-    /* EMUL: see the emulation block above. OFF is the shipped path. */
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1311,12 +1205,6 @@ static void attention_static_mixed_heads8_online_kernel(
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
         q3 = q4[lane + 96u];
-        /* Q-side emulation: once per block, before any dot product. Compiles
-         * to zero instructions when EMUL is OFF/CTRL. */
-        emul_round_q4<EMUL>(q0);
-        emul_round_q4<EMUL>(q1);
-        emul_round_q4<EMUL>(q2);
-        emul_round_q4<EMUL>(q3);
     }
 
     float max_s = -INFINITY;
@@ -1342,15 +1230,6 @@ static void attention_static_mixed_heads8_online_kernel(
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
-                /* K-side emulation. A real MMA port narrows every operand, not
-                 * just Q and P, so price K too -- otherwise the estimate is a
-                 * floor of a floor. k0..k3 double as V here (MLA shares the
-                 * latent), so this narrows the PV operand as well, which is
-                 * what an MMA value stage would do. */
-                emul_round_q4<EMUL>(k0);
-                emul_round_q4<EMUL>(k1);
-                emul_round_q4<EMUL>(k2);
-                emul_round_q4<EMUL>(k3);
                 float score = dot4_f32(q0, k0) +
                               dot4_f32(q1, k1) +
                               dot4_f32(q2, k2) +
@@ -1374,11 +1253,7 @@ static void attention_static_mixed_heads8_online_kernel(
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
-                /* P-side emulation: row_scale IS the unnormalized
-                 * probability a TC path would carry in reduced
-                 * precision. f32 when EMUL is OFF/CTRL/QONLY. */
-                const float row_scale =
-                        emul_round_p<EMUL>(expf(score - new_m));
+                const float row_scale = expf(score - new_m);
                 sum_s = sum_s * old_scale + row_scale;
                 o0.x = o0.x * old_scale + k0.x * row_scale;
                 o0.y = o0.y * old_scale + k0.y * row_scale;
@@ -1426,48 +1301,12 @@ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
-/* Emulation mode, resolved ONCE per process (no getenv on a hot path). An
- * unset or unrecognised value means OFF, so a typo can never silently ship
- * altered numerics; an active mode announces itself loudly because it is a
- * measurement apparatus, never a release path. */
-static int pulsar_attn_emul_mode(void) {
-    static const int mode = []() -> int {
-        const char *e = getenv("PULSAR_ATTN_EMUL");
-        int m = e && e[0] ? atoi(e) : PULSAR_EMUL_OFF;
-        if (m <= 0 || m >= PULSAR_EMUL_MODES) return PULSAR_EMUL_OFF;
-        fprintf(stderr, "pulsar: ATTENTION NUMERIC EMULATION ACTIVE (mode %d) "
-                        "-- diagnostic apparatus, NOT a release path\n", m);
-        return m;
-    }();
-    return mode;
-}
 
-/* Dispatch the shipped prefill window kernel through its emulation template.
- * OFF instantiates code identical to the pre-emulation kernel. */
+/* Direct launch of the shipped prefill window kernel. */
 #define PULSAR_ATTN_ONLINE_DISPATCH(grid_, blk_, ...)                          \
     do {                                                                       \
-        switch (pulsar_attn_emul_mode()) {                                     \
-        case PULSAR_EMUL_FP16:                                                 \
-            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_FP16>      \
-                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
-            break;                                                             \
-        case PULSAR_EMUL_BF16:                                                 \
-            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_BF16>      \
-                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
-            break;                                                             \
-        case PULSAR_EMUL_QONLY:                                                \
-            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_QONLY>     \
-                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
-            break;                                                             \
-        case PULSAR_EMUL_CTRL:                                                 \
-            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_CTRL>      \
-                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
-            break;                                                             \
-        default:                                                               \
-            attention_static_mixed_heads8_online_kernel<PULSAR_EMUL_OFF>       \
-                    <<<(grid_), (blk_)>>>(__VA_ARGS__);                        \
-            break;                                                             \
-        }                                                                      \
+        attention_static_mixed_heads8_online_kernel                            \
+                <<<(grid_), (blk_)>>>(__VA_ARGS__);                            \
     } while (0)
 
 
@@ -2881,16 +2720,8 @@ static int attention_prefill_mixed_launch(
         const uint64_t score_offset = (kv_bytes + 255u) & ~255ull;
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_offset = score_offset + ((score_bytes + 255u) & ~255ull);
-        /* Emulation needs a rounded copy of Q; Q is a const GEMM operand here,
-         * so it cannot be rounded in place. Costs nothing when OFF -- the
-         * region is not reserved and no kernel is launched. */
-        const int emul_mode = pulsar_attn_emul_mode();
         const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
-        const uint64_t out_end = out_offset + out_count * sizeof(float);
-        const uint64_t qr_offset = (out_end + 255u) & ~255ull;
-        uint64_t tmp_bytes = emul_mode
-                ? qr_offset + q_count * sizeof(float)
-                : out_end;
+        uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
         /* fp16 tensor-core operands: same 10-bit mantissa as the TF32 we
          * already run, ~2x the rate. Read once; OFF reserves nothing. */
         static int fp16_gemm_env = -1;
@@ -2910,19 +2741,6 @@ static int attention_prefill_mixed_launch(
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
         const float *q_eff = (const float *)q->ptr;
-        static unsigned long long *emul_ctr = NULL;
-        static int emul_reported = 0;
-        if (emul_mode && !emul_ctr) cudaMalloc(&emul_ctr, 2 * sizeof(unsigned long long));
-        if (emul_mode && emul_ctr && !emul_reported)
-            cudaMemset(emul_ctr, 0, 2 * sizeof(unsigned long long));
-        if (emul_mode) {
-            float *q_round = (float *)((char *)tmp + qr_offset);
-            emul_round_array_kernel<<<(q_count + 255) / 256, 256>>>(
-                    q_round, (const float *)q->ptr, q_count, emul_mode, 0,
-                    emul_reported ? NULL : emul_ctr);
-            if (!cuda_ok(cudaGetLastError(), "attention emul q round")) return 0;
-            q_eff = q_round;
-        }
         __half *kv_h = NULL, *q_h = NULL, *sc_h = NULL;
         if (fp16_gemm) {
             kv_h = (__half *)((char *)tmp + kvh_off);
@@ -3001,25 +2819,6 @@ static int attention_prefill_mixed_launch(
                 n_keys,
                 sc_h);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
-        /* P-side emulation: `scores` now holds the normalized probabilities a
-         * tensor-core path would carry in reduced precision into the PV GEMM.
-         * Rounded in place; QONLY deliberately leaves P alone. */
-        if (emul_mode) {
-            emul_round_array_kernel<<<(score_count + 255) / 256, 256>>>(
-                    scores, scores, score_count, emul_mode, 1,
-                    emul_reported ? NULL : (emul_ctr ? emul_ctr + 1 : NULL));
-            if (!cuda_ok(cudaGetLastError(), "attention emul p round")) return 0;
-            if (!emul_reported && emul_ctr) {
-                unsigned long long h[2] = {0, 0};
-                cudaMemcpy(h, emul_ctr, sizeof h, cudaMemcpyDeviceToHost);
-                fprintf(stderr,
-                        "pulsar: EMUL mode %d rounded Q %llu/%llu elements, "
-                        "P %llu/%llu elements (first call)\n",
-                        emul_mode, h[0], (unsigned long long)q_count,
-                        h[1], (unsigned long long)score_count);
-                emul_reported = 1;
-            }
-        }
         const float one = 1.0f;
         if (fp16_gemm) {
             /* No narrowing pass here: the softmax already stored fp16. */
