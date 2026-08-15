@@ -1449,101 +1449,16 @@ static int routed_moe_launch(
          * the _vec arms, which is what use_sorted_pairs excludes. */
         const uint32_t use_big_batch = use_sorted_pairs;
         const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
-        uint32_t *sorted_pairs = NULL;
-        uint32_t *sorted_offsets = NULL;
-        uint32_t *sorted_counts = NULL;
-        uint32_t *tile_total = NULL;
-        uint32_t *tile_experts = NULL;
-        uint32_t *tile_starts = NULL;
-        uint32_t *tile16_total = NULL;
-        uint32_t *tile16_experts = NULL;
-        uint32_t *tile16_starts = NULL;
-        uint32_t tile_capacity = 0;
-        uint32_t tile16_capacity = 0;
-        if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
-        if (ok && use_sorted_pairs) {
-            const uint32_t sort_expert_count = n_total_expert;
-            if (sort_expert_count == 0) ok = 0;
-            const uint64_t counts_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
-            const uint64_t offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
-            const uint64_t cursors_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
-            const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-            tile_capacity = (pair_count + 7u) / 8u + sort_expert_count;
-            tile16_capacity = use_big_batch ? ((pair_count + 15u) / 16u + sort_expert_count) : 0u;
-            const uint64_t tile_offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
-            const uint64_t tile_total_bytes = sizeof(uint32_t);
-            const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_big_batch ? ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t) : 0u;
-            const uint64_t tile16_total_bytes = use_big_batch ? sizeof(uint32_t) : 0u;
-            const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
-            const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
-            const uint64_t tile_offsets_off = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
-            const uint64_t tile_total_off = tile_offsets_off + tile_offsets_bytes;
-            const uint64_t tile_experts_off = tile_total_off + tile_total_bytes;
-            const uint64_t tile_starts_off = tile_experts_off + tile_experts_bytes;
-            const uint64_t tile16_offsets_off = tile_starts_off + tile_starts_bytes;
-            const uint64_t tile16_total_off = tile16_offsets_off + tile16_offsets_bytes;
-            const uint64_t tile16_experts_off = tile16_total_off + tile16_total_bytes;
-            const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
-            const uint64_t scratch_bytes = tile16_starts_off + tile16_starts_bytes;
-            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes,
-                                                         "routed_moe sorted pairs");
-            if (!scratch) {
-                ok = 0;
-            } else {
-                uint32_t *counts = (uint32_t *)scratch;
-                uint32_t *offsets = (uint32_t *)(scratch + counts_bytes);
-                uint32_t *cursors = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
-                sorted_pairs = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes);
-                sorted_offsets = offsets;
-                sorted_counts = counts;
-                uint32_t *tile_offsets = (uint32_t *)(scratch + tile_offsets_off);
-                tile_total = (uint32_t *)(scratch + tile_total_off);
-                tile_experts = (uint32_t *)(scratch + tile_experts_off);
-                tile_starts = (uint32_t *)(scratch + tile_starts_off);
-                uint32_t *tile16_offsets = use_big_batch ? (uint32_t *)(scratch + tile16_offsets_off) : NULL;
-                tile16_total = use_big_batch ? (uint32_t *)(scratch + tile16_total_off) : NULL;
-                tile16_experts = use_big_batch ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
-                tile16_starts = use_big_batch ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
-                if (ok) {
-                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-                        counts,
-                        selected_ptr,
-                        pair_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
-                }
-                if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, sort_expert_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
-                }
-                if (ok) {
-                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-                        sorted_pairs,
-                        cursors,
-                        selected_ptr,
-                        pair_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
-                }
-                if (ok) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, sort_expert_count, 8u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
-                }
-                if (ok) {
-                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile_experts, tile_starts, tile_offsets, counts, sort_expert_count, 8u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
-                }
-                if (ok && use_big_batch) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, sort_expert_count, 16u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
-                }
-                if (ok && use_big_batch) {
-                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, sort_expert_count, 16u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
-                }
-            }
-        }
+        /* The sorted-pair and expert-tile structures USED to be built here: a
+         * scratch allocation plus six kernel launches (count, prefix, scatter,
+         * two tile builders, and an 8/16-row pair) on every layer of every
+         * prefill chunk.  Nothing read them.  MMQ takes selected_ptr directly,
+         * and the only surviving use of the result was `sorted_pairs != NULL`
+         * as a stand-in for `n_tokens > 1` -- which use_big_batch already is.
+         * The file said so itself: "not read by MMQ itself; they survive as
+         * the shape signal the batch arms are gated on".  A shape signal does
+         * not need six kernels to compute.
+         * (The CUTLASS dispatchers above build their own and DO read them.) */
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
         /* MMQ is now the ONLY reader here: this function is type-43-on-both-
          * sides, and the dp4a chains that used to follow each arm are gone with
@@ -1554,7 +1469,7 @@ static int routed_moe_launch(
         int mmq_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time decision, evaluated once per launch -- not per token. */
-        if (ok && sorted_pairs && use_big_batch) {
+        if (ok && use_big_batch) {
             mmq_done = routed_moe_try_mmq_gate_up(
                 (float *)mid->ptr, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
@@ -1584,7 +1499,7 @@ static int routed_moe_launch(
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
          * q8_1, which is why there is no mid -> midq q8_K quantize left here. */
-        if (ok && sorted_pairs && use_big_batch && !use_direct_down_sum6) {
+        if (ok && use_big_batch && !use_direct_down_sum6) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
                                                     (const float *)mid->ptr,
                                                     down_w, selected_ptr,
