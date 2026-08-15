@@ -1233,15 +1233,6 @@ extern "C" int ds4_mmq_q4_K_moe(
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
-extern "C" int ds4_mmq_iq2_xxs_moe_pair(
-        const void * W_a, const void * W_b,
-        const float * X, const int32_t * ids, float * out_a, float * out_b,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
-        M, K, n_tokens, n_experts, n_expert_used, stream);
-}
 
 extern "C" int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
         const void * W_a, const void * W_b,

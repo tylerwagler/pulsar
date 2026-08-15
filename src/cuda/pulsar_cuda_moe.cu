@@ -1188,15 +1188,15 @@ static int routed_moe_try_mmq_gate_up(
      * silently declined every pre-aligned layer. */
     if (!ds4_mmq_should_use(16, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
-    /* Aligned-artifact cache.  block_iq2_xxs is 66 B with qs[] at offset 2, so a
-     * raw stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
-     * weight-read-bound, so that costs a LOT more than it does on our dp4a
-     * kernel: microbenched at the production shape (tests/mmq_align_bench.cu),
-     * raw 44.70 vs aligned 18.65 ms/pair-call = 2.40x, against a one-time
-     * repack of 4.81 ms/tensor.
-     * We cannot hold an aligned copy of every IQ2 tensor (30 layers x 3 x
-     * 0.39 GiB ~ 35 GB on top of an 86 GB model in 121 GB), so cache what fits
-     * under a budget and leave the rest on the raw path. */
+    /* Why the artifact stores IQ2 pre-aligned, recorded because the code that
+     * proved it is gone: block_iq2_xxs is 66 B with qs[] at offset 2, so a raw
+     * stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
+     * weight-read-bound, so at the production shape raw measured 44.70 vs
+     * aligned 18.65 ms/pair-call = 2.40x, against a one-time repack of
+     * 4.81 ms/tensor.  That settled it: the gguf now ships type 43 aligned, the
+     * runtime repack cache is deleted, and tests/mmq_align_bench.cu with it --
+     * a closed question does not need a live A/B keeping the losing arm
+     * compiled. */
     /* Type 43 is stored aligned IN THE GGUF, so the weight pointer IS the SoA
      * entry.  There is no raw arm and no repack. */
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
