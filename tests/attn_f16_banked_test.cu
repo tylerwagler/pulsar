@@ -159,9 +159,26 @@ int main(int argc, char **argv) {
     cudaMalloc(&dbp, n_banks * sizeof(void *));
     cudaMemcpy(dbp, hbp.data(), n_banks * sizeof(void *), cudaMemcpyHostToDevice);
 
+    /* Two selection modes share this kernel and BOTH must be bank-isolated:
+     *   topk != NULL  a top-k selection      (the indexed prefill/decode path)
+     *   topk == NULL  visible-prefix sweep   (attention_decode_batch_launch's
+     *                                         continued-prefill call)
+     * Only the first was covered until 2026-08-15; the second is the mode a
+     * banked continued-prefill batch actually takes.  Every comp row in bank b
+     * holds v_b, so both modes must return v_b for a correctly isolated read. */
+    int overall = 1;
+    for (int mode = 0; mode < 2; mode++) {
+        const int32_t *use_tk = mode ? NULL : dtk;
+        const uint32_t use_topk = mode ? 0u : top_k;
+        const char *label = mode ? "visible-prefix sweep (topk=NULL)" : "top-k selection";
+        printf("---- %s ----\n", label);
+        cudaMemset(dout, 0, out.size() * 4);
+        std::fill(out.begin(), out.end(), -12345.f);
+        cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
+
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, draw, packed ? (const float *)dpk : dcomp, dtk, n_tokens,
-        /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, top_k, window, ratio,
+        dout, ds, dq, draw, packed ? (const float *)dpk : dcomp, use_tk, n_tokens,
+        /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
         n_head, D, /*raw_f16*/0, dpos, dseq, dbp, comp_cap, n_banks, packed);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
@@ -190,9 +207,13 @@ int main(int argc, char **argv) {
     printf("NaN = %zu, never-written = %zu\n", nan, untouched);
     printf("  bank constants: ");
     for (uint32_t b = 0; b < n_banks; b++) printf("v%u=%.2f ", b, vb(b));
-    printf("\n  a cross-bank read moves the answer by >= %.2f\n", 0.25f);
+    printf("  a cross-bank read moves the answer by >= %.2f\n", 0.25f);
 
     const int pass = (nan == 0 && untouched == 0 && evict_bad == 0 && worst_leak < 1e-2);
-    printf("\nATTN F16 BANK ISOLATION: %s\n", pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+    printf("  %s: %s\n\n", label, pass ? "PASS" : "FAIL");
+    if (!pass) overall = 0;
+    }
+
+    printf("ATTN F16 BANK ISOLATION: %s\n", overall ? "PASS" : "FAIL");
+    return overall ? 0 : 1;
 }
