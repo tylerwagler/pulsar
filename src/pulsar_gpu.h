@@ -291,12 +291,6 @@ int pulsar_gpu_argmax_tensor(
         const pulsar_gpu_tensor *logits,
         uint32_t                n_vocab);
 
-int pulsar_gpu_dsv4_topk_mask_tensor(
-        pulsar_gpu_tensor       *mask,
-        const pulsar_gpu_tensor *topk,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                top_k);
 
 /* =========================================================================
  * Dense Projections, Norms, RoPE, and KV Rounding.
@@ -868,8 +862,6 @@ int pulsar_gpu_attention_decode_heads_tensor(
         const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16);
@@ -956,8 +948,6 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_pack,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -1020,22 +1010,6 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16);
 
-int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
-        pulsar_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const pulsar_gpu_tensor *q,
-        const pulsar_gpu_tensor *raw_kv,
-        const pulsar_gpu_tensor *comp_kv,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                raw_f16);
 
 int pulsar_gpu_attention_output_batch_tensor(
         pulsar_gpu_tensor       *out,

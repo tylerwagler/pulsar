@@ -727,21 +727,6 @@ __launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kern
 
 
 
-__global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * n_comp;
-    if (gid >= n) return;
-    uint32_t t = gid / n_comp;
-    uint32_t c = gid - (uint64_t)t * n_comp;
-    float v = -INFINITY;
-    for (uint32_t k = 0; k < top_k; k++) {
-        if (topk[(uint64_t)t * top_k + k] == c) {
-            v = 0.0f;
-            break;
-        }
-    }
-    mask[gid] = v;
-}
 
 /* Configure indexer_topk_8192_cub_kernel's opt-in dynamic shared memory ONCE and
  * cache the result. The device, its max-optin-smem, and the per-function attribute
@@ -1136,25 +1121,6 @@ int pulsar_gpu_argmax_tensor(
 
 
 
-int pulsar_gpu_dsv4_topk_mask_tensor(
-        pulsar_gpu_tensor       *mask,
-        const pulsar_gpu_tensor *topk,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                top_k) {
-    if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
-        mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
-        return 0;
-    }
-    uint64_t n = (uint64_t)n_tokens * n_comp;
-    uint64_t nk = (uint64_t)n_tokens * top_k;
-    uint64_t blocks = ((n > nk ? n : nk) + 255) / 256;
-    topk_mask_kernel<<<blocks, 256>>>((float *)mask->ptr,
-                                      (const uint32_t *)topk->ptr,
-                                      n_comp, n_tokens, top_k);
-    return cuda_ok(cudaGetLastError(), "topk mask launch");
-}
 
 
 /* ===== MXFP8 (E4M3 + per-32 E8M0) weight matmul via cuBLASLt block-scaling.

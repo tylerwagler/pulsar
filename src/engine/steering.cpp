@@ -90,7 +90,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
     if (comp_cap < 2u) comp_cap = 2u;
     const uint64_t kv_cache_bytes = gpu_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
-    /* indexer_scores/comp_mask token rows shrink to the slice size under
+    /* indexer_scores token rows shrink to the slice size under
      * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */
     uint64_t score_rows = (uint64_t)prefill_cap;
     if (gpu_graph_prefill_slice() != 0u && (uint64_t)gpu_graph_prefill_slice() < score_rows) {

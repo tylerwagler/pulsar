@@ -155,7 +155,7 @@ static int gpu_graph_env_default_flag(const char *name, int def) {
 
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
- * work buffers (indexer_scores, comp_mask) are allocated with only N token
+ * work buffer (indexer_scores) is allocated with only N token
  * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
  * 0 restores the historical full-chunk buffers. */
 uint32_t gpu_graph_prefill_slice(void) {
@@ -1012,8 +1012,6 @@ bool gpu_graph_encode_decode_layer(
                                                          n_comp ? comp_cache : NULL,
                                                          1u,
                                                          n_comp,
-                                                         NULL,
-                                                         0,
                                                          PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
                                                          raw_f16) != 0;
         }

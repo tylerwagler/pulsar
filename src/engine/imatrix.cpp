@@ -1302,7 +1302,7 @@ pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        /* indexer_scores/comp_mask token rows shrink to the slice size under
+        /* indexer_scores token rows shrink to the slice size under
          * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / gpu_diag alloc). */
         uint64_t score_rows = (uint64_t)m.prefill_cap;
         if (gpu_graph_prefill_slice() != 0u &&

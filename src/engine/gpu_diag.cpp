@@ -402,7 +402,7 @@ uint64_t gpu_graph_session_bytes_banked(
     const uint64_t hc = PULSAR_HC_ELT_SIZE;   /* HC residual carrier element (BF16); task #62 */
 
     /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
-     * indexer_scores/comp_mask working pair — shared with the managed-vs-device
+     * indexer_scores working buffer — shared with the managed-vs-device
      * KV placement policy the allocator itself uses.  In bank-pool mode the
      * persistent KV slabs (and the per-bank compressor state lanes below)
      * scale with the pool size; everything else is shared by all banks. */
@@ -1793,7 +1793,6 @@ bool gpu_graph_alloc_raw_cap(
                                  (uint64_t)gpu_graph_prefill_slice() < pc)
         ? (uint64_t)gpu_graph_prefill_slice() : pc;
     g->indexer_scores = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
-    g->comp_mask = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
     g->heads = pulsar_gpu_tensor_alloc(q_dim * sizeof(float));
@@ -1900,7 +1899,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->comp_kv_cur && g->comp_sc_cur &&
                     g->attn_comp_stage && g->attn_comp_dequant &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
-                    g->comp_mask && g->comp_selected &&
+                    g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&
                     g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
                     g->shared_gate && g->shared_up && g->shared_mid &&

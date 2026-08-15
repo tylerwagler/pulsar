@@ -956,7 +956,6 @@ typedef struct {
     pulsar_gpu_tensor *indexer_q;
     pulsar_gpu_tensor *indexer_weights;
     pulsar_gpu_tensor *indexer_scores;
-    pulsar_gpu_tensor *comp_mask;
     pulsar_gpu_tensor *comp_selected;
     pulsar_gpu_tensor *heads;
     pulsar_gpu_tensor *attn_low;

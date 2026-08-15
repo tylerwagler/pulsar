@@ -1972,8 +1972,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                            : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
                                                                          mseq ? 1u
                                                                               : (pk_native ? 1u : 0),
-                                                                         NULL,
-                                                                         0,
                                                                          n_tokens,
                                                                          pos0,
                                                                          mseq ? 0 : n_raw,
@@ -2214,7 +2212,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t cur_comp = comp_counts ? comp_counts[t] : 0u;
                 const uint32_t cur_index = index_counts ? index_counts[t] : 0u;
                 uint32_t n_selected = 0;
-                pulsar_gpu_tensor *comp_mask = NULL;
+                bool have_topk = false;
 
                 if (ratio == 4 && cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
@@ -2235,16 +2233,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        g->indexer_scores,
                                                        cur_index,
                                                        1,
-                                                       PULSAR_N_INDEXER_TOP_K) != 0 &&
-                         pulsar_gpu_dsv4_topk_mask_tensor(g->comp_mask,
-                                                         g->comp_selected,
-                                                         cur_index,
-                                                         1,
-                                                         PULSAR_N_INDEXER_TOP_K) != 0;
+                                                       PULSAR_N_INDEXER_TOP_K) != 0;
                     pulsar_gpu_tensor_free(indexer_w_view);
                     pulsar_gpu_tensor_free(indexer_q_view);
                     if (ok) {
-                        comp_mask = g->comp_mask;
+                        have_topk = true;
                         n_selected = PULSAR_N_INDEXER_TOP_K < cur_index
                             ? PULSAR_N_INDEXER_TOP_K
                             : cur_index;
@@ -2263,7 +2256,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        PULSAR_N_HEAD_DIM,
                                                        1u) != 0;
                 }
-                if (ok && comp_mask != NULL && n_selected != 0) {
+                if (ok && have_topk && n_selected != 0) {
                     ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
                                                                               model->map,
                                                                               model->size,
@@ -2305,8 +2298,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           : NULL,
                                                                  (cur_comp && pk_native) ? 1u : 0,
                                                                  cur_comp,
-                                                                 comp_mask,
-                                                                 n_selected,
                                                                  PULSAR_N_HEAD,
                                                                  PULSAR_N_HEAD_DIM,
                                                                  1u) != 0;

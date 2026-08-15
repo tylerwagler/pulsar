@@ -148,8 +148,6 @@ __global__ static void attention_prefill_mixed_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
-        const float *comp_mask,
-        uint32_t use_comp_mask,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -180,7 +178,7 @@ __global__ static void attention_prefill_mixed_kernel(
         local_max = fmaxf(local_max, scores[r]);
     }
     for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
-        float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+        float add = 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
             const float *kvrow = comp_kv + (uint64_t)c * head_dim;
@@ -273,8 +271,6 @@ __global__ static void attention_prefill_raw_softmax_kernel(
 __global__ static void attention_prefill_mixed_softmax_kernel(
         float *scores,
         const float *sinks,
-        const float *comp_mask,
-        uint32_t use_comp_mask,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -304,7 +300,7 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
         } else {
             uint32_t c = k - n_tokens;
             if (c < n_comp && c < visible_comp) {
-                float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+                float add = 0.0f;
                 if (add > -1.0e20f) s = row[k] + add;
             }
         }
@@ -415,8 +411,6 @@ __global__ static void attention_decode_mixed_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
-        const float *comp_mask,
-        uint32_t use_comp_mask,
         uint32_t non_causal,
         uint32_t comp_kv_pack,
         uint32_t n_tokens,
@@ -518,7 +512,7 @@ __global__ static void attention_decode_mixed_kernel(
             local_max = fmaxf(local_max, scores[r]);
         }
         for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
-            float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+            float add = 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
                 float dot = 0.0f;
@@ -546,7 +540,7 @@ __global__ static void attention_decode_mixed_kernel(
                     have_row = true;
                 } else {
                     uint32_t c = row - raw_count;
-                    add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+                    add = 0.0f;
                     if (add > -1.0e20f) { have_row = true; c_idx = c; }
                 }
                 float s = -INFINITY;
@@ -1163,18 +1157,7 @@ static void attention_static_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        int raw_f16,
-        /* Compressed-KV additive mask. Previously this fused kernel was gated
-         * OFF whenever a comp mask was in play (`!use_comp_mask`), so every
-         * compressed-KV prefill fell back to the UNFUSED two-GEMM cuBLAS path
-         * -- which materialises the whole n_head*n_tokens*n_keys score matrix
-         * to memory and reads it back. That round-trip is the real prefill
-         * attention cost; the GEMM datatype is worth only ~1% (measured
-         * 2026-08-05). Carrying the mask here lets the fused online-softmax
-         * path serve the masked case and never materialise scores at all.
-         * Pure bandwidth win: no precision is traded. */
-        const float *comp_mask,
-        uint32_t use_comp_mask) {
+        int raw_f16) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1243,12 +1226,6 @@ static void attention_static_mixed_heads8_online_kernel(
                  * row folds in and old_scale never evaluates expf(-inf + inf).
                  * Mirrors attention_prefill_mixed_softmax_kernel exactly: same
                  * index, same -1.0e20f cutoff, mask added AFTER the scale. */
-                const uint32_t sr_i = row0 + rr;
-                if (use_comp_mask && sr_i >= raw_count) {
-                    const uint32_t c_i = sr_i - raw_count;
-                    const float add = comp_mask[(uint64_t)t * n_comp + c_i];
-                    score = add > -1.0e20f ? score + add : -INFINITY;
-                }
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -1840,13 +1817,11 @@ int pulsar_gpu_attention_decode_heads_tensor(
         const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                raw_f16) {
     if (        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
-        raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
+        raw_start >= raw_cap || (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
@@ -1857,7 +1832,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
         (n_comp && comp_kv->bytes < (uint64_t)n_comp *
          (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
                        : head_dim * sizeof(float))) ||
-        (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
+        false) {
         return 0;
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
@@ -1873,9 +1848,8 @@ int pulsar_gpu_attention_decode_heads_tensor(
      * the generic per-(row,head) kernel").  NOT bit-exact vs the generic
      * kernel (online-softmax fold order; reassociation class, same as that
      * carve-out) — this is a perplexity/eval-gated numerics change. */
-    if (!cuda_attention_score_buffer_fits(n_comp) ||
-        (!use_mask && head_dim == 512u)) {
-        if (!use_mask && head_dim == 512u) {
+    if (!cuda_attention_score_buffer_fits(n_comp) || head_dim == 512u) {
+        if (head_dim == 512u) {
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
@@ -1893,8 +1867,6 @@ int pulsar_gpu_attention_decode_heads_tensor(
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                 use_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_mask,
                                                  0, comp_kv_pack,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim, raw_f16,
@@ -2050,9 +2022,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                     1,
                                     n_head,
                                     head_dim,
-                                    raw_f16,
-                                    NULL,
-                                    0u);
+                                    raw_f16);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
@@ -2156,8 +2126,6 @@ static int attention_decode_batch_launch(
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_pack,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_comp_mask,
         uint32_t                non_causal,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -2215,7 +2183,7 @@ static int attention_decode_batch_launch(
                                          : (uint64_t)n_comp;
     if (        !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         (!descr && (n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap)) ||
-        (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
+        (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -2226,7 +2194,7 @@ static int attention_decode_batch_launch(
         (n_comp && comp_kv->bytes < comp_rows_min *
          (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
                        : head_dim * sizeof(float))) ||
-        (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
+        false) {
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
@@ -2240,7 +2208,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_comp_mask && head_dim == 512u) {
+        if (head_dim == 512u) {
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
@@ -2253,7 +2221,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
+    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
         /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
@@ -2298,8 +2266,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                 use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                 use_comp_mask, non_causal, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
+                                                 non_causal, comp_kv_pack, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim, raw_f16,
                                                  positions_ptr, seq_id_ptr, comp_bank_ptrs_ptr, comp_cap, kernel_n_banks);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
@@ -2335,7 +2302,7 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, 0, NULL, 0, non_causal, n_tokens, pos0,
+                                      q, raw_kv, NULL, 0, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim, raw_f16,
                                       positions, seq_id, NULL /* raw path: no comp */, comp_cap, n_banks);
@@ -2352,8 +2319,6 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
         uint32_t                comp_kv_pack,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -2372,7 +2337,7 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_pack, comp_mask, use_comp_mask, non_causal,
+                                      q, raw_kv, comp_kv, comp_kv_pack, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim, raw_f16,
                                       positions, seq_id, comp_bank_ptrs, comp_cap, n_banks);
@@ -2620,8 +2585,6 @@ static int attention_prefill_mixed_launch(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                use_comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -2630,14 +2593,14 @@ static int attention_prefill_mixed_launch(
         uint32_t                head_dim,
         uint32_t                raw_f16) {
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
-        (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
+        (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
         (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
-        (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
+        false) {
         return 0;
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
@@ -2650,7 +2613,7 @@ static int attention_prefill_mixed_launch(
      * batch max/sum), so it is NOT bit-identical to the GEMM path. */
     /* PULSAR_ATTN_FUSED_COMP is gone -- no setter anywhere, so the masked case
      * never took the fused kernel and the A/B it gated never ran. */
-    const int allow_fused = !use_comp_mask;
+    const int allow_fused = 1;
     /* One-shot: which branch actually serves this workload. Guessing at this
      * has been wrong twice; print it rather than infer it. */
     static int mixed_path_reported = 0;
@@ -2659,8 +2622,8 @@ static int attention_prefill_mixed_launch(
         const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512 &&
                 n_tokens >= 128u;
         fprintf(stderr,
-                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u use_comp_mask=%u -> %s\n",
-                n_tokens, n_comp, use_comp_mask,
+                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> %s\n",
+                n_tokens, n_comp,
                 takes_window ? "FUSED window kernel"
                              : (g_cublas_ready
                                     ? "unfused cuBLAS two-GEMM"
@@ -2700,9 +2663,7 @@ static int attention_prefill_mixed_launch(
                                     ratio,
                                     n_head,
                                     head_dim,
-                                    raw_f16,
-                                    use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                    use_comp_mask);
+                                    raw_f16);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
@@ -2804,8 +2765,6 @@ static int attention_prefill_mixed_launch(
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
                 scores,
                 sinks,
-                use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                use_comp_mask,
                 n_tokens,
                 n_comp,
                 window,
@@ -2863,8 +2822,7 @@ static int attention_prefill_mixed_launch(
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                  use_comp_mask, n_tokens, n_comp, window, ratio,
+                                                  n_tokens, n_comp, window, ratio,
                                                   n_head, head_dim, raw_f16);
     return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
 }
@@ -2887,30 +2845,10 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                head_dim,
         uint32_t                raw_f16) {
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, NULL, 0, n_tokens,
+                                       q, raw_kv, comp_kv, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim, raw_f16);
 }
 
 
 
-int pulsar_gpu_attention_prefill_masked_mixed_heads_tensor(
-        pulsar_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const pulsar_gpu_tensor *q,
-        const pulsar_gpu_tensor *raw_kv,
-        const pulsar_gpu_tensor *comp_kv,
-        const pulsar_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                raw_f16) {
-    return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim, raw_f16);
-}
 
