@@ -557,7 +557,14 @@ src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src
 
 # Vendored llama.cpp MMQ TUs: templated C++17, own include root, and they do not
 # depend on the pulsar CUDA headers -- keep them off the generic src/cuda rule.
-src/cuda/mmq/%.o: src/cuda/mmq/%.cu
+# The vendored MMQ objects listed NO header prerequisites at all, so any .cuh
+# edit left every one of them stale -- the same hazard the prefill gate solves
+# with -B ("an acceptance gate must never certify stale objects") and the same
+# one that made 6d41502's arch pin appear not to work.  A wildcard over the
+# vendored headers is cheap here: these rebuild in seconds relative to a gate run.
+MMQ_HDRS := $(wildcard src/cuda/mmq/*.cuh) $(wildcard src/cuda/mmq/*.h)
+
+src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda \
 		-diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda/mmq -c -o $@ $<
 

@@ -7,6 +7,7 @@
 
 #include "common.cuh"
 #include "mmq.cuh"
+#include "ds4_mxfp8_mma.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
