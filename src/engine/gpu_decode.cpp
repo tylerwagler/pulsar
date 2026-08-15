@@ -140,18 +140,6 @@ static bool gpu_graph_decode_kv_store(
 
 
 
-/* The validated packed storage formats and the prefill work-buffer slice
- * default ON (2026-07-09: each proven bit-exact by golden byte-compare; see
- * commits 0647621, 34f6a95, 87f8374, 39c6526).  Their env vars are
- * OFF-switches: unset or "1"/"on" enables, "0"/"off"/"false" restores the
- * classic f32 containers — the escape hatch for regression bisects. */
-static int gpu_graph_env_default_flag(const char *name, int def) {
-    const char *v = getenv(name);
-    if (!v || !v[0]) return def;
-    if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
-        strcasecmp(v, "false") == 0) return 0;
-    return 1;
-}
 
 /* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32

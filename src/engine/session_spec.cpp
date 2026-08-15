@@ -356,13 +356,6 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     return ok;
 }
 
-static float dspark_base_top1_prob(const float *logits, int n) {
-    float m = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > m) m = logits[i];
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += exp((double)(logits[i] - m));
-    return sum > 0.0 ? (float)(1.0 / sum) : 1.0f;
-}
 
 /* Diagnostic: dump the DSpark drafter's per-step inputs (target_h[3], main_x)
  * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
