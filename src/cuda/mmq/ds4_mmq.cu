@@ -163,26 +163,12 @@ static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
     return (char *)(uintptr_t)p;
 }
 
-// Default ON (2026-07-09 gated increment: same-boot ABBA 427->493 tok/s @12k,
-// gsm8k 97.5 / mbpp 90). DS4_MMQ_D2R=0 is the kill switch back to the
-// mul_mat_q SoA-tile down path.
-static bool d2r_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_D2R");
-        cached = (env && env[0] == '0') ? 0 : 1;
-    }
-    return cached != 0;
-}
-
-static bool d2r_iq2_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MMQ_D2R_IQ2");
-        cached = (env && env[0] == '0') ? 0 : 1;
-    }
-    return cached != 0;
-}
+/* DS4_MMQ_D2R and DS4_MMQ_D2R_IQ2 are GONE (2026-08-15).  Both were
+ * default-ON kill switches back to the mul_mat_q SoA-tile path, and a
+ * repo-wide grep found ZERO setters -- no test, no script, no Makefile, no
+ * caller.  Per [[no-hot-path-flags]] an opt-out with no real user is deleted
+ * along with the arm it selected; a comment is not a user.  D2R is simply what
+ * IQ2 experts do. */
 
 // Blanket output zeroing on the dense/MoE-down/pair GEMM entries.  Added by
 // 82b2622 as belt-and-suspenders while root-causing the cont BOS spam; the
@@ -724,8 +710,7 @@ int ds4_mmq_moe_impl(
         d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
     const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr &&
-                          d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
-                          d2r_iq2s_avail != 0);
+                          K % 256 == 0 && d2r_iq2s_avail != 0);
 
     ggml_cuda_pool_alloc<char> src1_q8_1;
     char *src1_q8_1_p = nullptr;
@@ -1060,8 +1045,7 @@ int ds4_mmq_moe_pair_impl(
         d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
     const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr &&
-                          xb_soa != nullptr && d2r_enabled() &&
-                          d2r_iq2_enabled() && K % 256 == 0 &&
+                          xb_soa != nullptr && K % 256 == 0 &&
                           d2r_iq2_avail != 0);
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
