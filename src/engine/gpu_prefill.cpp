@@ -1374,12 +1374,38 @@ bool gpu_graph_encode_layer_attention_batch(
                 const bool mseq_aligned_run = mseq &&
                     (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank &&
                     (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
-                if (aligned_chunk) {
-                    const uint32_t index_before = g->layer_n_index_comp[il];
+                if (aligned_chunk || mseq_aligned_run) {
+                    /* One batched aligned-run indexer emit, keyed either at the
+                     * single session's frontier/state lanes or at a bank's
+                     * (LEVER 2, plan-34).  fp4 stages in the shared
+                     * idx_comp_stage -- one bank per step, so no aliasing --
+                     * and packs into the destination index cache. */
+                    const bool banked = mseq_aligned_run;
+                    const uint32_t bank = banked ? run_bank
+                                                 : (g->banks.n_banks ? g->banks.cur_bank : 0u);
+                    const uint32_t index_before = banked ? g->ms_n_index_comp[bank][il]
+                                                         : g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
                         fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
+                    }
+                    /* Banked views are OWNED and must be freed; the
+                     * single-session pointers are borrowed and must not be. */
+                    pulsar_gpu_tensor *bank_idx = NULL;
+                    pulsar_gpu_tensor *ist_kv = NULL, *ist_sc = NULL, *idx_dst = NULL;
+                    if (ok) {
+                        if (banked) {
+                            bank_idx = gpu_graph_bank_index_comp_view(g, il, bank);
+                            ist_kv = gpu_graph_bank_index_state_kv_view(g, il, bank);
+                            ist_sc = gpu_graph_bank_index_state_score_view(g, il, bank);
+                            idx_dst = bank_idx;
+                            ok = bank_idx && ist_kv && ist_sc;
+                        } else {
+                            ist_kv = g->layer_index_state_kv[il];
+                            ist_sc = g->layer_index_state_score[il];
+                            idx_dst = g->layer_index_comp_cache[il];
+                        }
                     }
                     pulsar_gpu_tensor *index_view = NULL;
                     if (ok) {
@@ -1391,112 +1417,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (ok) {
                         ok = pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
-                                index_view,
-                                g->layer_index_state_kv[il],
-                                g->layer_index_state_score[il],
-                                g->batch_comp_kv,
-                                g->batch_comp_sc,
-                                model->map,
-                                model->size,
-                                layer->indexer_compressor_ape->abs_offset,
-                                layer->indexer_compressor_ape->type,
-                                layer->indexer_compressor_norm->abs_offset,
-                                layer->indexer_compressor_norm->type,
-                                PULSAR_N_INDEXER_HEAD_DIM,
-                                pos0,
-                                n_tokens,
-                                PULSAR_N_ROT,
-                                compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                false,
-                                freq_base,
-                                freq_scale,
-                                ext_factor,
-                                attn_factor,
-                                PULSAR_ROPE_YARN_BETA_FAST,
-                                PULSAR_ROPE_YARN_BETA_SLOW,
-                                PULSAR_RMS_EPS) != 0;
-                    }
-                    if (ok && index_chunk != 0) {
-                        ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
-                                                                    g->layer_index_comp_cache[il],
-                                                                    index_before,
-                                                                    index_chunk,
-                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                        /* plan-33 inc C: boundary-row restore (chunked emit site —
-                         * the replay-from-R path that recomputes row R/4). */
-                        if (ok) ok = gpu_graph_emit_keep_restore(g, il,
-                                g->banks.n_banks ? g->banks.cur_bank : 0u,
-                                index_before, index_chunk, true);
-                    }
-                    if (ok) {
-                        ok = gpu_graph_refresh_ratio4_compressor_state(g,
-                                                                         model,
-                                                                         g->layer_index_state_kv[il],
-                                                                         g->layer_index_state_score[il],
-                                                                         layer->indexer_compressor_kv,
-                                                                         layer->indexer_compressor_gate,
-                                                                         layer->indexer_compressor_ape,
-                                                                         PULSAR_N_INDEXER_HEAD_DIM,
-                                                                         index_width,
-                                                                         pos0,
-                                                                         n_tokens);
-                    }
-                    if (ok) {
-                        g->layer_n_index_comp[il] = index_before + index_chunk;
-                        if (index_counts) {
-                            for (uint32_t t = 0; t < n_tokens; t++) {
-                                index_counts[t] = (pos0 + t + 1u) / ratio;
-                            }
-                        }
-                        gpu_graph_debug_dump_tensor("indexer_KVcompress",
-                                                      index_view,
-                                                      (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM,
-                                                      il,
-                                                      pos0);
-                        gpu_graph_debug_dump_tensor("indexer_state_kv",
-                                                      g->layer_index_state_kv[il],
-                                                      (uint64_t)index_width * coff * ratio,
-                                                      il,
-                                                      pos0);
-                        gpu_graph_debug_dump_tensor("indexer_state_score",
-                                                      g->layer_index_state_score[il],
-                                                      (uint64_t)index_width * coff * ratio,
-                                                      il,
-                                                      pos0);
-                    }
-                    pulsar_gpu_tensor_free(index_view);
-                } else if (mseq_aligned_run) {
-                    /* LEVER 2: batched banked indexer-compressor emit for the
-                     * single same-bank aligned run — mirrors the classic aligned
-                     * indexer path, keyed at the bank frontier / bank index
-                     * state lanes / bank index comp cache.  fp4 stages in the
-                     * shared idx_comp_stage (one bank per step, no aliasing) and
-                     * packs into the bank cache; f32 quantizes the bank cache in
-                     * place. */
-                    const uint32_t bank = run_bank;
-                    const uint32_t index_before = g->ms_n_index_comp[bank][il];
-                    const uint32_t index_chunk = n_tokens / ratio;
-                    pulsar_gpu_tensor *bank_idx = NULL, *bank_ist_kv = NULL, *bank_ist_sc = NULL;
-                    pulsar_gpu_tensor *index_view = NULL;
-                    if (index_before + index_chunk > g->layer_comp_cap[il]) {
-                        fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
-                        ok = false;
-                    }
-                    if (ok) {
-                        bank_idx = gpu_graph_bank_index_comp_view(g, il, bank);
-                        bank_ist_kv = gpu_graph_bank_index_state_kv_view(g, il, bank);
-                        bank_ist_sc = gpu_graph_bank_index_state_score_view(g, il, bank);
-                        ok = bank_idx && bank_ist_kv && bank_ist_sc;
-                    }
-                    if (ok) {
-                        index_view = pulsar_gpu_tensor_view(g->idx_comp_stage,
-                                    (uint64_t)index_before * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
-                                    (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-                        ok = index_view != NULL;
-                    }
-                    if (ok) {
-                        ok = pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
-                                index_view, bank_ist_kv, bank_ist_sc,
+                                index_view, ist_kv, ist_sc,
                                 g->batch_comp_kv, g->batch_comp_sc,
                                 model->map, model->size,
                                 layer->indexer_compressor_ape->abs_offset,
@@ -1511,32 +1432,43 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (ok && index_chunk != 0) {
                         ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
-                                                                    bank_idx,
+                                                                    idx_dst,
                                                                     index_before,
                                                                     index_chunk,
                                                                     PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                        /* plan-33 inc C: boundary-row restore (chunked emit site —
+                         * the replay-from-R path that recomputes row R/4). */
                         if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank,
                                 index_before, index_chunk, true);
                     }
                     if (ok) {
                         ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
-                                bank_ist_kv, bank_ist_sc,
+                                ist_kv, ist_sc,
                                 layer->indexer_compressor_kv, layer->indexer_compressor_gate,
                                 layer->indexer_compressor_ape, PULSAR_N_INDEXER_HEAD_DIM,
                                 index_width, pos0, n_tokens);
                     }
                     if (ok) {
-                        g->ms_n_index_comp[bank][il] = index_before + index_chunk;
+                        if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
+                        else        g->layer_n_index_comp[il]    = index_before + index_chunk;
                         if (index_counts) {
                             for (uint32_t t = 0; t < n_tokens; t++) {
                                 index_counts[t] = (pos0 + t + 1u) / ratio;
                             }
                         }
+                        gpu_graph_debug_dump_tensor("indexer_KVcompress", index_view,
+                                                      (uint64_t)index_chunk * PULSAR_N_INDEXER_HEAD_DIM, il, pos0);
+                        gpu_graph_debug_dump_tensor("indexer_state_kv", ist_kv,
+                                                      (uint64_t)index_width * coff * ratio, il, pos0);
+                        gpu_graph_debug_dump_tensor("indexer_state_score", ist_sc,
+                                                      (uint64_t)index_width * coff * ratio, il, pos0);
                     }
                     pulsar_gpu_tensor_free(index_view);
-                    pulsar_gpu_tensor_free(bank_ist_sc);
-                    pulsar_gpu_tensor_free(bank_ist_kv);
-                    pulsar_gpu_tensor_free(bank_idx);
+                    if (banked) {
+                        pulsar_gpu_tensor_free(ist_sc);
+                        pulsar_gpu_tensor_free(ist_kv);
+                        pulsar_gpu_tensor_free(bank_idx);
+                    }
                 } else {
                     /* Per-row indexer compressor loop; multiseq semantics as
                      * in the attn emit loop above (bank state lanes, bank
