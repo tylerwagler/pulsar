@@ -712,12 +712,23 @@ int ds4_mmq_moe_impl(
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
-    /* The IQ2 D2R single-tensor path (the DOWN projection on this artifact)
-     * consumes E4M3 when the arm is on.  Separate buffer, same reasoning as in
-     * ds4_mmq_moe_pair_impl: src1_q8_1 also feeds the generic MMQ kernel below,
-     * which only understands q8_1, so the two formats must not share storage. */
-    const int moe_e4m3 = ds4_d2r_iq2_arm() ? 1 : 0;
+    /* ONE decision, made once, BEFORE staging: does the D2R E4M3 path take this
+     * call?  Staging then follows the decision, instead of writing both formats
+     * on every call and letting the consumer pick.  IQ2 experts are E4M3-only
+     * now -- there is no int8 arm -- so q8_1 is staged solely for the generic
+     * MMQ fallback: another quant type, or D2R declining at launch. */
+    static int d2r_iq2s_cc = -1;
+    static int d2r_iq2s_avail = 0;
+    if (d2r_iq2s_cc != cc) {
+        d2r_iq2s_cc = cc;
+        d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
+    }
+    const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr &&
+                          d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
+                          d2r_iq2s_avail != 0);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    char *src1_q8_1_p = nullptr;
     ggml_cuda_pool_alloc<char> src1_e4m3;
     char *src1_e4m3_p = nullptr;
 
@@ -728,20 +739,26 @@ int ds4_mmq_moe_impl(
     // tail from stale pool memory -> allocator-perturbation-dependent garbage in the
     // (write_back-masked) tail lanes -> non-deterministic batched-forward output.
     // Zero it so the masked-out tail is a deterministic zero.
-    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
-
     // src1 logical [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost, then
     // one row per channel, channels = tokens.
     const int64_t s11_src = (int64_t)K;                                 // stride between rows of a channel
     const int64_t s12_src = (int64_t)K * ne11;                          // stride between channels = K*1
     const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
 
-    quantize_mmq_q8_1_cuda(
-        X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
-        type, /*ne00=*/K, s11_src, s12_src, s13_src,
-        /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-        stream);
-    if (moe_e4m3) {
+    auto stage_q8_1 = [&]() {
+        if (src1_q8_1_p) {
+            return;
+        }
+        src1_q8_1_p = src1_q8_1.alloc(ctx->pool(), nbytes_src1_q8_1);
+        cudaMemsetAsync(src1_q8_1_p, 0, nbytes_src1_q8_1, stream);
+        quantize_mmq_q8_1_cuda(
+            X_f32, ids_src1.get(), (void *)src1_q8_1_p,
+            type, /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            stream);
+    };
+
+    if (d2r_iq2) {
         src1_e4m3_p = src1_e4m3.alloc(ctx->pool(), nbytes_src1_q8_1);
         cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
         ds4_quantize_mmq_e4m3_cuda(
@@ -749,6 +766,8 @@ int ds4_mmq_moe_impl(
             /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             /*n_expert_used=*/0, /*scatter=*/false, stream);
+    } else {
+        stage_q8_1();
     }
 
     err = cudaGetLastError();
@@ -789,25 +808,18 @@ int ds4_mmq_moe_impl(
      * completely: a 26-token prompt gives 156 rows, so the arm never engaged and
      * two days of cross-arm measurements came back bit-identical.
      * One path, one activation format, every batch size. */
-    if (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr && d2r_enabled() &&
-        d2r_iq2_enabled() && K % 256 == 0) {
-        static int d2r_iq2s_cc = -1;
-        static int d2r_iq2s_avail = 0;
-        if (d2r_iq2s_cc != cc) {
-            d2r_iq2s_cc = cc;
-            d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
-        }
-        if (d2r_iq2s_avail) {
+    if (d2r_iq2) {
+        {
             const size_t w_bytes =
                 ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
             if (w_bytes != 0) {
                 ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), w_bytes);
                 const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
                     x_soa, soa_blocks,
-                    (moe_e4m3 ? src1_e4m3_p : src1_q8_1.get()),
+                    src1_e4m3_p,
                     ids_dst.get(), expert_bounds.get(),
                     out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes,
-                    moe_e4m3, stream);
+                    stream);
                 if (rc == 0) {
                     return 0;
                 }
@@ -816,10 +828,15 @@ int ds4_mmq_moe_impl(
     }
 
 
+    /* Only reachable when D2R did not take the work (another quant type, or the
+     * launcher declined).  Stage q8_1 here so the common IQ2 path never pays
+     * for a format it does not use. */
+    stage_q8_1();
+
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1.get(),
+        /*y=*/(const int *)src1_q8_1_p,
         /*ids_dst=*/ids_dst.get(),
         /*expert_bounds=*/expert_bounds.get(),
         /*dst=*/out_f32,
@@ -1030,7 +1047,22 @@ int ds4_mmq_moe_pair_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
     ggml_cuda_pool_alloc<char> src1_e4m3_alloc;
     char *src1_e4m3 = nullptr;
-    char *src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+    char *src1_q8_1 = nullptr;
+
+    /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only now;
+     * q8_1 exists solely for the generic MMQ fallback (another quant type, or
+     * D2R declining at launch) and is staged lazily below, so the common IQ2
+     * path never writes a format it does not use. */
+    static int d2r_iq2_avail_cc = -1;
+    static int d2r_iq2_avail = 0;
+    if (d2r_iq2_avail_cc != cc) {
+        d2r_iq2_avail_cc = cc;
+        d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
+    }
+    const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr &&
+                          xb_soa != nullptr && d2r_enabled() &&
+                          d2r_iq2_enabled() && K % 256 == 0 &&
+                          d2r_iq2_avail != 0);
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1038,41 +1070,24 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
-    /* Do NOT gate this on anything narrower than the arm.  It was once gated on
-     * direct_gateup_q8 -- a field assigned nowhere -- so the MXFP8 arm was a
-     * silent no-op and every cross-arm measurement came back bit-identical.
-     *
-     * The reason a condition existed at all was that src1_q8_1 has more than one
-     * consumer and only some understand e4m3 (the generic MMQ kernel under
-     * `if (!gate_up_done)` does not).  The answer is not a narrower predicate but
-     * a SEPARATE BUFFER: q8_1 stays as-is for every existing consumer and the
-     * D2R IQ2 path gets its own e4m3 staging -- correct by construction rather
-     * than by a condition that can rot. */
-    const int e4m3_staging = ds4_d2r_iq2_arm() ? 1 : 0;
-    {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/input_quant_q8_1",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
-                nvtx_prefill);
+    auto stage_q8_1 = [&]() {
+        if (src1_q8_1) {
+            return;
+        }
+        src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
         cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
-        /* ⚠ src1_q8_1 has TWO possible consumers: the D2R pair launcher, and --
-         * when it declines the work -- the GENERIC MMQ kernel at
-         * `if (!gate_up_done)` below, which only understands q8_1.  Staging
-         * e4m3 into this buffer on the arm alone fed that generic path e4m3
-         * bytes as q8_1 and produced token soup (measured 2026-08-15).  So this
-         * buffer stays q8_1 unconditionally and the arm gets src1_e4m3; the
-         * decision is made ONCE and PASSED to the consumer, never re-read from
-         * ds4_d2r_iq2_arm() on the other side where the two could disagree. */
         quantize_mmq_q8_1_cuda(
             X_f32, ids_src1, (void *)src1_q8_1,
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
-        if (e4m3_staging) {
-            /* Second staging of the SAME activations in E4M3 + ue8m0, for the
-             * D2R IQ2 consumers only.  One extra buffer and one extra pass
-             * while the two arms coexist; when the comparison concludes, the
-             * losing format's staging is deleted along with its arm. */
+    };
+    {
+        ds4_mmq_nvtx_scope stage(
+                "ds4/prefill/moe/input_quant",
+                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
+                nvtx_prefill);
+        if (d2r_iq2) {
             src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
             cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
             ds4_quantize_mmq_e4m3_cuda(
@@ -1080,6 +1095,8 @@ int ds4_mmq_moe_pair_impl(
                 /*ne00=*/K, s11_src, s12_src, s13_src,
                 /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
                 /*n_expert_used=*/0, /*scatter=*/false, stream);
+        } else {
+            stage_q8_1();
         }
 
         err = cudaGetLastError();
@@ -1102,15 +1119,8 @@ int ds4_mmq_moe_pair_impl(
     /* No d2r_min_cols() -- see the note on the single-tensor guard in
      * ds4_mmq_moe_impl.  A size threshold here means one activation format for
      * long prompts and another for short ones. */
-    if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
-        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0) {
-        static int d2r_iq2_avail_cc = -1;
-        static int d2r_iq2_avail = 0;
-        if (d2r_iq2_avail_cc != cc) {
-            d2r_iq2_avail_cc = cc;
-            d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
-        }
-        if (d2r_iq2_avail) {
+    if (d2r_iq2) {
+        {
             const size_t d2r_work_bytes =
                 ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
             if (d2r_work_bytes != 0) {
@@ -1121,9 +1131,9 @@ int ds4_mmq_moe_pair_impl(
                         nvtx_prefill);
                 const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks,
-                        (e4m3_staging ? src1_e4m3 : src1_q8_1), ids_dst,
+                        src1_e4m3, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
-                        d2r_work.get(), d2r_work_bytes, e4m3_staging, stream);
+                        d2r_work.get(), d2r_work_bytes, stream);
                 if (d2r_rc == 0) {
                     gate_up_done = true;
                 }
@@ -1132,6 +1142,7 @@ int ds4_mmq_moe_pair_impl(
     }
 
     if (!gate_up_done) {
+    stage_q8_1();
     mmq_args args = {
         /*x=*/(const char *)W_a,
         /*type_x=*/type,

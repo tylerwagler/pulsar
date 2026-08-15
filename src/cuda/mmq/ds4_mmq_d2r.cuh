@@ -13,7 +13,6 @@
  *   1 = E4M3 operands, block-scaled MXFP8 MMA, hardware ue8m0, no fold
  * ⚠ The INPUT STAGING must match: arm 1 requires ds4_quantize_mmq_e4m3_cuda.
  * They are selected off this same function in ds4_mmq.cu; keep them together. */
-int ds4_d2r_iq2_arm();
 
 /* Stage MMQ activations as E4M3 + ue8m0 instead of q8_1 int8.  Same
  * block_q8_1_mmq layout: qs[] holds e4m3 bit patterns, d4[i] carries the ue8m0
@@ -58,11 +57,10 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     int             n_experts,
     void          * worklist_scratch,
     size_t          worklist_scratch_bytes,
-    int             use_e4m3,
     cudaStream_t    stream);
 
 // Complete target-prefill gate/up path: both IQ2_XXS projections share one
 // activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
 // directly into the expert-major Q8_1 D2S6 input consumed by Q2_K down.
 
-int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *q8, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, int use_e4m3, cudaStream_t stream);
+int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *q8, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, cudaStream_t stream);
