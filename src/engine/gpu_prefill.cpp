@@ -1016,8 +1016,18 @@ bool gpu_graph_encode_layer_attention_batch(
             const bool mseq_aligned_run = mseq &&
                 (uint32_t)g->ms_seq_id[n_tokens - 1u] == run_bank &&
                 (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
-            if (aligned_chunk) {
-                const uint32_t comp_before = g->layer_n_comp[il];
+            if (aligned_chunk || mseq_aligned_run) {
+                /* One batched aligned-run emit, keyed either at the single
+                 * session's frontier/state lanes or at a bank's.  LEVER 2
+                 * (plan-34) is the banked case: a step whose whole batch is one
+                 * same-bank contiguous ratio-aligned run reuses these same
+                 * batched kernels instead of the per-row loop's N launches
+                 * (measured 13.835 -> 3.354 ms/layer at K=2048).  quantize_fp8
+                 * is false in both: the pack commit is the single fp8 quantizer. */
+                const bool banked = mseq_aligned_run;
+                const uint32_t bank = banked ? run_bank : 0u;
+                const uint32_t comp_before = banked ? g->ms_n_comp[bank][il]
+                                                    : g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
@@ -1026,137 +1036,26 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok && comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
+                }
+                /* Banked state lanes are OWNED views and must be freed; the
+                 * single-session ones are borrowed and must not be. */
+                pulsar_gpu_tensor *st_kv = NULL, *st_sc = NULL;
+                if (ok) {
+                    if (banked) {
+                        st_kv = gpu_graph_bank_attn_state_kv_view(g, il, bank);
+                        st_sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
+                        ok = st_kv && st_sc;
+                    } else {
+                        st_kv = g->layer_attn_state_kv[il];
+                        st_sc = g->layer_attn_state_score[il];
+                    }
                 }
                 pulsar_gpu_tensor *attn_comp_target =
                     ok ? gpu_graph_attn_comp_prefill_target(g, il, comp_before, comp_chunk) : NULL;
                 if (ok && !attn_comp_target) ok = false;
                 if (ok && ratio == 4) {
                     ok = pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
-                            attn_comp_target,
-                            g->layer_attn_state_kv[il],
-                            g->layer_attn_state_score[il],
-                            g->batch_comp_kv,
-                            g->batch_comp_sc,
-                            model->map,
-                            model->size,
-                            layer->attn_compressor_ape->abs_offset,
-                            layer->attn_compressor_ape->type,
-                            layer->attn_compressor_norm->abs_offset,
-                            layer->attn_compressor_norm->type,
-                            PULSAR_N_HEAD_DIM,
-                            pos0,
-                            n_tokens,
-                            PULSAR_N_ROT,
-                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            /* quantize once, in the commit (see above) */
-                            false,
-                            freq_base,
-                            freq_scale,
-                            ext_factor,
-                            attn_factor,
-                            PULSAR_ROPE_YARN_BETA_FAST,
-                            PULSAR_ROPE_YARN_BETA_SLOW,
-                            PULSAR_RMS_EPS) != 0;
-                } else if (ok) {
-                    ok = pulsar_gpu_compressor_prefill_tensor(
-                            attn_comp_target,
-                            g->layer_attn_state_kv[il],
-                            g->layer_attn_state_score[il],
-                            g->batch_comp_kv,
-                            g->batch_comp_sc,
-                            model->map,
-                            model->size,
-                            layer->attn_compressor_ape->abs_offset,
-                            layer->attn_compressor_ape->type,
-                            layer->attn_compressor_norm->abs_offset,
-                            layer->attn_compressor_norm->type,
-                            PULSAR_N_HEAD_DIM,
-                            ratio,
-                            pos0,
-                            n_tokens,
-                            PULSAR_N_ROT,
-                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            /* quantize once, in the commit (see above) */
-                            false,
-                            freq_base,
-                            freq_scale,
-                            ext_factor,
-                            attn_factor,
-                            PULSAR_ROPE_YARN_BETA_FAST,
-                            PULSAR_ROPE_YARN_BETA_SLOW,
-                            PULSAR_RMS_EPS) != 0;
-                }
-                if (ok && comp_chunk != 0) {
-                    ok = gpu_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
-                }
-                if (ok && ratio == 4) {
-                    ok = gpu_graph_refresh_ratio4_compressor_state(g,
-                                                                     model,
-                                                                     g->layer_attn_state_kv[il],
-                                                                     g->layer_attn_state_score[il],
-                                                                     layer->attn_compressor_kv,
-                                                                     layer->attn_compressor_gate,
-                                                                     layer->attn_compressor_ape,
-                                                                     PULSAR_N_HEAD_DIM,
-                                                                     comp_width,
-                                                                     pos0,
-                                                                     n_tokens);
-                }
-                if (ok) {
-                    g->layer_n_comp[il] = comp_before + comp_chunk;
-                    if (comp_counts) {
-                        for (uint32_t t = 0; t < n_tokens; t++) {
-                            comp_counts[t] = (pos0 + t + 1u) / ratio;
-                        }
-                    }
-                    gpu_graph_debug_dump_tensor("KVcompress",
-                                                  attn_comp_target,
-                                                  (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM,
-                                                  il,
-                                                  pos0);
-                    gpu_graph_debug_dump_tensor("attn_state_kv",
-                                                  g->layer_attn_state_kv[il],
-                                                  (uint64_t)comp_width * coff * ratio,
-                                                  il,
-                                                  pos0);
-                    gpu_graph_debug_dump_tensor("attn_state_score",
-                                                  g->layer_attn_state_score[il],
-                                                  (uint64_t)comp_width * coff * ratio,
-                                                  il,
-                                                  pos0);
-                }
-                gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
-            } else if (mseq_aligned_run) {
-                /* LEVER 2: batched banked attn-compressor emit for the single
-                 * same-bank aligned run.  Mirrors the classic aligned branch
-                 * above, keyed at the bank's frontier / bank state lanes /
-                 * bank comp cache.  quantize_fp8 is false: the pack commit is
-                 * the single fp8 quantizer, as in the classic path. */
-                const uint32_t bank = run_bank;
-                const uint32_t comp_before = g->ms_n_comp[bank][il];
-                const uint32_t comp_chunk = n_tokens / ratio;
-                pulsar_gpu_tensor *bank_st_kv = NULL, *bank_st_sc = NULL, *comp_target = NULL;
-                if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
-                    fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
-                    ok = false;
-                }
-                if (ok && comp_chunk > g->attn_comp_stage_cap) {
-                    fprintf(stderr, "pulsar: GPU graph compressed KV staging capacity exceeded at layer %u\n", il);
-                    ok = false;
-                }
-                if (ok) {
-                    bank_st_kv = gpu_graph_bank_attn_state_kv_view(g, il, bank);
-                    bank_st_sc = gpu_graph_bank_attn_state_score_view(g, il, bank);
-                    ok = bank_st_kv && bank_st_sc;
-                }
-                if (ok) {
-                    comp_target = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
-                            (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM * sizeof(float));
-                    ok = comp_target != NULL;
-                }
-                if (ok && ratio == 4) {
-                    ok = pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
-                            comp_target, bank_st_kv, bank_st_sc,
+                            attn_comp_target, st_kv, st_sc,
                             g->batch_comp_kv, g->batch_comp_sc,
                             model->map, model->size,
                             layer->attn_compressor_ape->abs_offset,
@@ -1170,7 +1069,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             PULSAR_RMS_EPS) != 0;
                 } else if (ok) {
                     ok = pulsar_gpu_compressor_prefill_tensor(
-                            comp_target, bank_st_kv, bank_st_sc,
+                            attn_comp_target, st_kv, st_sc,
                             g->batch_comp_kv, g->batch_comp_sc,
                             model->map, model->size,
                             layer->attn_compressor_ape->abs_offset,
@@ -1184,26 +1083,37 @@ bool gpu_graph_encode_layer_attention_batch(
                             PULSAR_RMS_EPS) != 0;
                 }
                 if (ok && comp_chunk != 0) {
-                    ok = gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_before, comp_chunk);
+                    ok = banked
+                        ? gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_before, comp_chunk)
+                        : gpu_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
                 }
                 if (ok && ratio == 4) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
-                            bank_st_kv, bank_st_sc,
+                            st_kv, st_sc,
                             layer->attn_compressor_kv, layer->attn_compressor_gate,
                             layer->attn_compressor_ape, PULSAR_N_HEAD_DIM, comp_width,
                             pos0, n_tokens);
                 }
                 if (ok) {
-                    g->ms_n_comp[bank][il] = comp_before + comp_chunk;
+                    if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
+                    else        g->layer_n_comp[il]    = comp_before + comp_chunk;
                     if (comp_counts) {
                         for (uint32_t t = 0; t < n_tokens; t++) {
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
                         }
                     }
+                    gpu_graph_debug_dump_tensor("KVcompress", attn_comp_target,
+                                                  (uint64_t)comp_chunk * PULSAR_N_HEAD_DIM, il, pos0);
+                    gpu_graph_debug_dump_tensor("attn_state_kv", st_kv,
+                                                  (uint64_t)comp_width * coff * ratio, il, pos0);
+                    gpu_graph_debug_dump_tensor("attn_state_score", st_sc,
+                                                  (uint64_t)comp_width * coff * ratio, il, pos0);
                 }
-                pulsar_gpu_tensor_free(comp_target);
-                pulsar_gpu_tensor_free(bank_st_sc);
-                pulsar_gpu_tensor_free(bank_st_kv);
+                gpu_graph_attn_comp_prefill_target_free(attn_comp_target);
+                if (banked) {
+                    pulsar_gpu_tensor_free(st_sc);
+                    pulsar_gpu_tensor_free(st_kv);
+                }
             } else {
                 /* Per-row compressor loop.  Multiseq: row t belongs to bank
                  * ms_seq_id[t] at absolute position ms_positions[t] — the
