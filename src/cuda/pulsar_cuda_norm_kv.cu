@@ -1848,3 +1848,73 @@ int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
 
+
+
+/* ---- f16-viability range stats (diagnostic) ------------------------------
+ *
+ * Answers the one question that decides whether the f32 staging buffers can
+ * simply BE f16: does any of them carry a magnitude outside what f16 can
+ * represent?  f16 holds max 65504 and min normal 6.1035e-5; below that it goes
+ * subnormal and loses mantissa bits fast.  Reduced on-device -- a host-side
+ * sweep of every named tensor at every layer would move hundreds of GB. */
+static inline float __uint_as_float_host(unsigned int b) {
+    float f; memcpy(&f, &b, sizeof(f)); return f;
+}
+
+struct pulsar_range_stats_dev {
+    unsigned int amax_bits;      /* __float_as_uint of max|v| (monotonic for >=0) */
+    unsigned int amin_bits;      /* ... of min nonzero |v| */
+    unsigned long long n_over;   /* |v| > 65504 */
+    unsigned long long n_sub;    /* 0 < |v| < 6.1035e-5 */
+    unsigned long long n_inf;    /* +/-inf (representable in f16) */
+    unsigned long long n_nan;    /* NaN (a different problem entirely) */
+};
+
+__global__ static void range_stats_kernel(const float *x, uint64_t n,
+                                          pulsar_range_stats_dev *out) {
+    unsigned int lmax = 0u, lmin = 0xffffffffu;
+    unsigned long long lo = 0, ls = 0, lb = 0, ln = 0;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (uint64_t)gridDim.x * blockDim.x) {
+        const float v = x[i];
+        if (isnan(v)) { ln++; continue; }
+        if (isinf(v)) { lb++; continue; }
+        const float a = fabsf(v);
+        if (a > 65504.0f) lo++;
+        if (a > 0.0f && a < 6.103515625e-5f) ls++;
+        const unsigned int b = __float_as_uint(a);
+        if (b > lmax) lmax = b;
+        if (a > 0.0f && b < lmin) lmin = b;
+    }
+    atomicMax(&out->amax_bits, lmax);
+    if (lmin != 0xffffffffu) atomicMin(&out->amin_bits, lmin);
+    if (lo) atomicAdd(&out->n_over, lo);
+    if (ls) atomicAdd(&out->n_sub, ls);
+    if (lb) atomicAdd(&out->n_inf, lb);
+    if (ln) atomicAdd(&out->n_nan, ln);
+}
+
+/* Fills six doubles: max|v|, min nonzero |v|, n_over, n_subnormal, n_inf, n_nan. */
+int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5) {
+    if (!t || !t->ptr || n == 0 || !out5) return 0;
+    pulsar_range_stats_dev host = { 0u, 0xffffffffu, 0, 0, 0, 0 };
+    pulsar_range_stats_dev *dev = NULL;
+    if (cudaMalloc((void **)&dev, sizeof(host)) != cudaSuccess) return 0;
+    if (cudaMemcpy(dev, &host, sizeof(host), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev); return 0;
+    }
+    const unsigned int blocks = (unsigned int)((n + 255) / 256 > 1024 ? 1024 : (n + 255) / 256);
+    range_stats_kernel<<<blocks ? blocks : 1u, 256>>>((const float *)t->ptr, n, dev);
+    if (cudaDeviceSynchronize() != cudaSuccess ||
+        cudaMemcpy(&host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaFree(dev); return 0;
+    }
+    cudaFree(dev);
+    out5[0] = (double)__uint_as_float_host(host.amax_bits);
+    out5[1] = host.amin_bits == 0xffffffffu ? 0.0 : (double)__uint_as_float_host(host.amin_bits);
+    out5[2] = (double)host.n_over;
+    out5[3] = (double)host.n_sub;
+    out5[4] = (double)host.n_inf;
+    out5[5] = (double)host.n_nan;
+    return 1;
+}

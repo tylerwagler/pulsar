@@ -422,6 +422,10 @@ int pulsar_gpu_rms_norm_plain_tensor(
  * f32 result.  batch_flat_hc feeds a 16384-wide F16 GEMM, so the separate
  * narrowing pass it replaces moves ~400 MB per call at a 4096-token prefill.
  * Bit-exact: identical __float2half of the identical value.  out_h may be NULL. */
+/* Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
+ * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
+int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
+
 int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h,
                                               int skip_f32,
                                               const pulsar_gpu_tensor *x,

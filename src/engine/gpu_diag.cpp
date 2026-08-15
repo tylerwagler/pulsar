@@ -1,4 +1,6 @@
 #include "pulsar_engine_internal.h"
+#include <map>
+#include <string>
 
 
 
@@ -42,12 +44,58 @@ void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 
 
+/* ---- f16-viability range sweep (diagnostic) -----------------------------
+ *
+ * PULSAR_CUDA_RANGE_SWEEP=1 turns every debug-dump point into a range probe
+ * instead of a file dump, so one prefill answers "can this f32 staging buffer
+ * be f16?" for every named tensor at every layer.  Env is read once. */
+namespace {
+struct range_acc {
+    double amax = 0.0, amin = 0.0;
+    double n_over = 0, n_sub = 0, n_inf = 0, n_nan = 0;
+    unsigned long long calls = 0;
+};
+std::map<std::string, range_acc> g_range;
+
+bool range_sweep_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PULSAR_CUDA_RANGE_SWEEP"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on != 0;
+}
+
+void range_sweep_report(void) {
+    fprintf(stderr, "\n=== f16 RANGE SWEEP (f16 max 65504, min normal 6.1035e-05) ===\n");
+    fprintf(stderr, "%-26s %12s %12s %10s %12s %10s %8s %6s\n",
+            "tensor", "max|v|", "min|v|!=0", "n>65504", "n<6.1e-5", "n_inf", "n_NaN", "calls");
+    for (const auto &kv : g_range) {
+        const range_acc &a = kv.second;
+        fprintf(stderr, "%-26s %12.4g %12.4g %10.0f %12.0f %10.0f %8.0f %6llu%s\n",
+                kv.first.c_str(), a.amax, a.amin, a.n_over, a.n_sub, a.n_inf, a.n_nan, a.calls,
+                (a.n_over > 0 || a.n_nan > 0) ? "   <-- F16 UNSAFE" : "");
+    }
+    fprintf(stderr, "=== END RANGE SWEEP ===\n");
+}
+}  /* namespace */
+
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
+    if (range_sweep_on()) {
+        if (!t || n_f32 == 0) return;
+        double s5[6] = {0,0,0,0,0,0};
+        if (!pulsar_gpu_tensor_range_stats(t, n_f32, s5)) return;
+        static bool hooked = false;
+        if (!hooked) { atexit(range_sweep_report); hooked = true; }
+        range_acc &a = g_range[name];
+        if (s5[0] > a.amax) a.amax = s5[0];
+        if (s5[1] > 0.0 && (a.amin == 0.0 || s5[1] < a.amin)) a.amin = s5[1];
+        a.n_over += s5[2]; a.n_sub += s5[3]; a.n_inf += s5[4]; a.n_nan += s5[5];
+        a.calls++;
+        return;
+    }
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
     const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
 
