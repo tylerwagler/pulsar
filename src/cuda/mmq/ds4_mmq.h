@@ -300,17 +300,6 @@ int ds4_mmq_q8_0_moe_vec(
     int             n_expert_used,
     cudaStream_t    stream);
 
-int ds4_mmq_q2_K_moe_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe_vec(
     const void    * W,
@@ -382,46 +371,16 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
 // keyed to the kernel's rows_per_block == 2 (see ds4_mmq.cu for the exact
 // field packing).  Use ds4_mmq_q2_k_aligned_bytes to size or validate an
 // artifact.  Unsupported shapes return non-zero so the caller can fall back.
-uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts);
 
-int ds4_mmq_q2_K_aligned_moe_vec(
-    const void    * W_aligned,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 /* Deterministic top-6 down projection for decode/verifier rows. The six
  * assignment contributions are reduced in slot order directly into out_f32;
  * no [token,slot,out_dim] intermediate is materialized. */
-int ds4_mmq_q2_K_aligned_moe_down_sum6_vec(
-    const void    * W_aligned,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Exact inverse of the weight-server repack: fills raw_out (nblk * 84 bytes,
 // raw block_q2_K stream) from an aligned artifact, device->device on
 // `stream`, for the batched/mmq raw-layout consumers (same role as
 // ds4_mmq_iq2_xxs_aligned_derepack).
-int ds4_mmq_q2_K_aligned_derepack(
-    const void    * W_aligned,
-    void          * raw_out,
-    int             M,
-    int             K,
-    int             n_experts,
-    cudaStream_t    stream);
 
 // M1-Inc3: aligned-SoA Q8_0 dense decode matvec.  Artifact layout
 // [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]], nblk = M * (K/32), block
@@ -510,17 +469,6 @@ int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
-int ds4_mmq_q2_K_moe_down_sum6_vec(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 int ds4_mmq_q4_K_moe_down_sum6_vec(
     const void    * W,
