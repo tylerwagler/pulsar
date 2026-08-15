@@ -1145,17 +1145,27 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
+    /* The single source of truth for "are the expert activations E4M3?".  See
+     * the staging comment below for why it is narrower than the arm itself. */
+    const int e4m3_staging = (ds4_d2r_iq2_arm() && direct_gateup_q8) ? 1 : 0;
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/input_quant_q8_1",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
         cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
-        /* This buffer feeds BOTH IQ2 D2R launchers (fused swiglu and the pair
-         * kernel), so its format must follow the same arm they run.  A mismatch
-         * is silently wrong rather than an error: the byte counts are identical
-         * and only the INTERPRETATION differs. */
-        if (ds4_d2r_iq2_arm()) {
+        /* ⚠ src1_q8_1 has THREE possible consumers: the fused D2R launcher, the
+         * D2R pair launcher, and -- when neither claims the work -- the GENERIC
+         * MMQ kernel at `if (!gate_up_done)` below, which only understands q8_1.
+         * Staging e4m3 on the arm alone fed that generic path e4m3 bytes as
+         * q8_1 and produced token soup (measured 2026-08-15).
+         *
+         * Only the FUSED path is a guaranteed sole consumer: direct_gateup_q8
+         * means the D2R fused launcher does gate/up AND down and returns, so
+         * nothing else reads the buffer.  Hence the staging decision is made
+         * ONCE here and PASSED to the consumer, rather than both sides reading
+         * ds4_d2r_iq2_arm() independently and being able to disagree. */
+        if (e4m3_staging) {
             ds4_quantize_mmq_e4m3_cuda(
                 X_f32, ids_src1, (void *)src1_q8_1,
                 /*ne00=*/K, s11_src, s12_src, s13_src,
@@ -1198,7 +1208,7 @@ int ds4_mmq_moe_pair_impl(
                     src1_q8_1, ids_dst, expert_bounds,
                     fused_down->router_weights, fused_down->q8_scratch,
                     M, K, ne_get_rows, n_experts, fused_down->clamp,
-                    direct_work, gateup_work_bytes, stream);
+                    direct_work, gateup_work_bytes, e4m3_staging, stream);
             if (d2r_rc != 0) {
                 return -10;
             }
@@ -1266,7 +1276,7 @@ int ds4_mmq_moe_pair_impl(
                 const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks, src1_q8_1, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
-                        d2r_work.get(), d2r_work_bytes, stream);
+                        d2r_work.get(), d2r_work_bytes, /*use_e4m3=*/0, stream);
                 if (d2r_rc == 0) {
                     gate_up_done = true;
                 }

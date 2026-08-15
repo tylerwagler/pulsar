@@ -131,8 +131,11 @@ int main() {
         for (int n = 0; n < N; ++n) sfb[n] = 127;
         if (probe == 1) for (int m = 0; m < M; ++m) for (int k = 0; k < K; ++k) A[m * K + k] = (float)(m + 1);
         if (probe == 2) for (int n = 0; n < N; ++n) for (int k = 0; k < K; ++k) B[n * K + k] = (float)(n + 1);
-        if (probe == 3) for (int m = 0; m < M; ++m) sfa[m] = (unsigned char)(127 + (m % 4));
-        if (probe == 4) for (int n = 0; n < N; ++n) sfb[n] = (unsigned char)(127 + (n % 4));
+        /* MUST distinguish row m from row m+8, or every sfa convention ties and
+         * the probe proves nothing: (m % 4) gives rows m and m+8 the SAME scale
+         * because 8 % 4 == 0.  (m % 3) does not (8 % 3 == 2). */
+        if (probe == 3) for (int m = 0; m < M; ++m) sfa[m] = (unsigned char)(127 + (m % 3));
+        if (probe == 4) for (int n = 0; n < N; ++n) sfb[n] = (unsigned char)(127 + (n % 3));
 
         for (int sm = 0; sm < 4; ++sm) {
             for (int m = 0; m < M * N; ++m) out[m] = -1.0f;

@@ -3230,6 +3230,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
                                          int n_experts,
                                          void *worklist_scratch,
                                          size_t worklist_scratch_bytes,
+                                         int use_e4m3,
                                          cudaStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_pair_launch";
     const int dev = ggml_cuda_get_device();
@@ -3274,7 +3275,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
         gate_soa, up_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
-        out_gate, out_up, M, K, (int)ne_get_rows, n_experts, ds4_d2r_iq2_arm());
+        out_gate, out_up, M, K, (int)ne_get_rows, n_experts, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -3299,6 +3300,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         float clamp,
         void *worklist_scratch,
         size_t worklist_scratch_bytes,
+        int use_e4m3,
         cudaStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_fused_launch";
     const int dev = ggml_cuda_get_device();
@@ -3360,7 +3362,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, full_work, counts + 0,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
+        M, K, (int)ne_get_rows, n_experts, clamp, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n",
@@ -3372,7 +3374,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail8_work, counts + 1,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
+        M, K, (int)ne_get_rows, n_experts, clamp, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail8 kernel launch failed: %s\n",
@@ -3383,7 +3385,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail16_work, counts + 2,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
+        M, K, (int)ne_get_rows, n_experts, clamp, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail16 kernel launch failed: %s\n",
@@ -3394,7 +3396,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         gate_soa, up_soa, (const block_q8_1_mmq *)input_q8,
         ids_dst, expert_bounds, router_weights, tail32_work, counts + 3,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp, ds4_d2r_iq2_arm());
+        M, K, (int)ne_get_rows, n_experts, clamp, use_e4m3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: tail32 kernel launch failed: %s\n",
