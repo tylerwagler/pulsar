@@ -3856,7 +3856,14 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
         W_soa, W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
-        out, out, M, K, (int)ne_get_rows, n_experts, ds4_d2r_iq2_arm());
+        /* ⚠ ds4_mmq_iq2_xxs_moe_d2r_single_launch does NOT control its input
+         * staging -- its caller stages q8_1 -- so this launch is PINNED to the
+         * integer arm.  It previously read ds4_d2r_iq2_arm() directly, which
+         * made it run the E4M3 MMA against q8_1 bytes whenever the env was set:
+         * the arm-1 garbage, and the SIXTH site of the same one-evaluation
+         * rule.  If this path ever gains E4M3 staging, thread the flag in as a
+         * parameter like the fused launcher does; do not re-read the env. */
+        out, out, M, K, (int)ne_get_rows, n_experts, /*use_e4m3=*/0);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
