@@ -1274,9 +1274,11 @@ static int routed_moe_try_mmq_gate_up(
         mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
     return 1;
 }
-/* Routed DOWN through MMQ.  The adapter has no IQ2 prefill down entry (only
- * _vec decode ones); Palaferri's down rides inside ds4_mmq_iq2_xxs_q2_K_moe_fused,
- * which is Q2_K-specific and so useless for v5mx (our down is IQ2).
+/* Routed DOWN through MMQ.  Upstream's down rode inside a Q2_K-specific fused
+ * kernel, useless for v5mx whose down is IQ2 -- and that whole Q2_K expert
+ * family has since been deleted, because the loader accepts only types 43 and
+ * 40 for routed experts (weights.cpp: tensor_is_routed_expert_type), so no
+ * Q2_K expert tensor can reach the engine at all.
  *
  * But down does not need a fused kernel here: `mid` is ALREADY materialized f32
  * per (token,slot), and `selected` is ALREADY the flat per-pair expert id

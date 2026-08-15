@@ -80,14 +80,6 @@ int ds4_mmq_q8_0_dense_d2r(
     int           K,
     cudaStream_t  stream);
 
-int ds4_mmq_q2_K_dense(
-    const void  * W_q2_K,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
 
 int ds4_mmq_iq2_xxs_dense(
     const void  * W_iq2_xxs,
@@ -147,33 +139,11 @@ int ds4_mmq_q8_0_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
-int ds4_mmq_q2_K_moe(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 // Same Q2_K MMQ operation, but omits the standalone nonfinite cleanup pass.
 // Every output element must be consumed immediately by a kernel that maps
 // nonfinite values to zero. This avoids a full extra read/write of the large
 // routed-down buffer during prefill.
-int ds4_mmq_q2_K_moe_consumer_sanitizes(
-    const void    * W,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe(
     const void    * W,
@@ -196,17 +166,6 @@ int ds4_mmq_iq2_xxs_moe(
 // nonfinite-sanitized; the routed-MoE consumers (moe_mmq_swiglu / moe_sum
 // with guard_nonfinite=1) sanitize at read, so the standalone whole-buffer
 // pass is skipped.  New callers must sanitize at consumption.
-int ds4_mmq_q2_K_moe_soa(
-    const void    * W_soa,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
 
 int ds4_mmq_q4_K_moe(
     const void    * W,
@@ -266,48 +225,10 @@ int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
 // quantizes those rows for the Q2_K down MMQ through the same ids_dst and
 // expert_bounds. No second mm_ids_helper is launched; gate/up/mid/down keep
 // the standard pair-major output layout.
-int ds4_mmq_iq2_xxs_q2_K_moe_fused(
-    const void    * W_gate,
-    const void    * W_up,
-    const void    * W_down,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * router_weights,
-    float         * gate_f32,
-    float         * up_f32,
-    float         * mid_f32,
-    float         * down_f32,
-    int             expert_mid_dim,
-    int             expert_in_dim,
-    int             out_dim,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
 
 /* Same fused target-prefill pipeline over byte-neutral aligned-SoA IQ2_XXS
  * and Q2_K replacement artifacts. Gate/up and down automatically dispatch
  * to the native D2R kernels on SM121. */
-int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
-    const void    * W_gate_soa,
-    const void    * W_up_soa,
-    const void    * W_down_soa,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * router_weights,
-    float         * gate_f32,
-    float         * up_f32,
-    float         * mid_f32,
-    float         * down_f32,
-    int             expert_mid_dim,
-    int             expert_in_dim,
-    int             out_dim,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
 
 // Aligned-artifact production fast path. Gate/up stay in registers, weighted
 // SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
