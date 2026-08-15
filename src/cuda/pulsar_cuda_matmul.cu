@@ -1291,6 +1291,58 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
 }
 
 
+/* W8A8 twin of the de-interleaved mmvq: the activation arrives as E4M3 + a
+ * swizzled E8M0 block scale instead of f32, so both operands are in the format
+ * the SOURCE model computes with (dynamic e4m3, ue8m0 scale).  Weights are
+ * unchanged.
+ *
+ * ⚠ THIS IS A FIDELITY CHANGE, NOT A SPEED ONE, AND THE DISTINCTION WAS GOT
+ * WRONG ONCE ALREADY.  L044 argued a W8A8 GEMV "reads 1 B/elem instead of 4, so
+ * it should be FASTER".  That counts the wrong bytes: in a GEMV the weight
+ * matrix is out_dim x in_dim and is streamed once with no reuse, while the
+ * activation is a single in_dim vector shared by every output warp and served
+ * from cache.  At in_dim=4096, out_dim=1024 that is 4 MB of weights against
+ * 16 KB of activations -- 0.4%.  Narrowing the activation saves in_dim*3 bytes
+ * IN TOTAL, not per row, and costs a dequant per element.  Expect neutral to
+ * slightly slower; the reason to do it is that f32 activations here are
+ * OVER-PRECISION against the reference, not that they are expensive.
+ *
+ * Lane k-range: k = base + lane*4 with base stepping 128, so a lane's 4
+ * elements always sit inside ONE 32-element MX block and both scales are
+ * loaded once per lane per step.  The activation is a single row, so its
+ * scale row is xrow -- the cache holds the whole (n_tok, in_dim) block, so a
+ * per-token launch must say which row it is reading. */
+__global__ static void mxfp8_mmvq_deint_a8_kernel(float *out, const __nv_fp8_e4m3 *data,
+                                                  const unsigned char *scale,
+                                                  const __nv_fp8_e4m3 *xq,
+                                                  const unsigned char *xs,
+                                                  int in_dim, int out_dim, int KBp, int xKBp,
+                                                  int xrow) {
+    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
+    float acc = 0.f;
+    for (int base = 0; base < in_dim; base += 128) {
+        int k = base + lane * 4;
+        uint32_t wpk = *(const uint32_t *)(row + k);
+        uint32_t apk = *(const uint32_t *)(xq + k);
+        int kb = k >> 5;
+        float sw = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        float sa = __int_as_float((uint32_t)xs[mx_sfoff(xrow, kb, xKBp)] << 23);
+        const float s = sw * sa;
+        const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
+        const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            acc += __half2float((__half)qw[j]) * __half2float((__half)qa[j]) * s;
+        }
+    }
+    for (int s2 = 16; s2 > 0; s2 >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s2);
+    if (lane == 0) out[o] = acc;
+}
+
+
 /* Fused pair of the de-interleaved mmvq: two weights (out0,out1) sharing one
  * activation x and in_dim, computed in a single launch. Each warp owns one
  * global output row -- rows [0,out0_dim) go to weight0/out0, the rest to
@@ -1550,6 +1602,24 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 : NULL;
         if (w) {
             const int KBp = mx_rup((int)(in_dim / 32), 4);
+            /* A8: if the producer already emitted this activation as E4M3 +
+             * ue8m0, multiply in that format rather than against f32.  This is
+             * the decode/spec path -- the ONLY place W8A32 still existed -- and
+             * it is a FIDELITY change: the source computes with dynamic e4m3
+             * activations, so f32 here is over-precision, not accuracy.  It is
+             * NOT a speed win (the weight matrix dominates GEMV traffic by
+             * ~out_dim x; see the kernel comment). */
+            mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, n_tok, in_dim);
+            if (ac8 && ac8->valid) {
+                const int xKBp = mx_rup((int)(in_dim / 32), 4);
+                for (uint64_t t = 0; t < n_tok; t++)
+                    mxfp8_mmvq_deint_a8_kernel<<<grid, wpb * 32>>>(
+                            (float *)out->ptr + t * out_dim,
+                            w->data, w->scale,
+                            ac8->xq + t * in_dim, ac8->sx,
+                            (int)in_dim, (int)out_dim, KBp, xKBp, (int)t);
+                return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint a8");
+            }
             for (uint64_t t = 0; t < n_tok; t++)
                 mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim,
                         w->data, w->scale, (const float *)x->ptr + t * in_dim,

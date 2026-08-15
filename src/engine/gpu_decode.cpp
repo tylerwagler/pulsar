@@ -692,8 +692,20 @@ bool gpu_graph_encode_decode_layer(
         !gpu_graph_use_reference_hc_decode() &&
         !gpu_graph_use_reference_hc_norm_decode();
     if (ok && fuse_hc_norm) {
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
+        /* A8 on the decode path: emit the E4M3 + ue8m0 encoding from the norm
+         * epilogue so the mmvq GEMVs multiply in the format the SOURCE uses
+         * (dynamic e4m3) instead of against f32.  Decode was the last place
+         * W8A32 survived.  FIDELITY, not speed -- a GEMV's traffic is dominated
+         * by the weight matrix, not the shared activation vector. */
+        void *an_q = NULL, *an_sf = NULL; int an_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->attn_norm, 1, PULSAR_N_EMBD,
+                                                        &an_q, &an_sf, &an_kbp)) {
+            an_q = NULL; an_sf = NULL; an_kbp = 0;
+        }
+        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->attn_cur,
                                                          g->attn_norm,
+                                                         NULL,
+                                                         an_q, an_sf, an_kbp,
                                                          g->hc_split,
                                                          g->hc_mix,
                                                          g->cur_hc,
@@ -707,6 +719,8 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_N_HC_SINKHORN_ITER,
                                                          PULSAR_HC_EPS,
                                                          PULSAR_RMS_EPS) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->attn_norm, 1, PULSAR_N_EMBD);
+        if (ok && an_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
         if (ok) {
             ok = gpu_graph_check_hc_norm_fusion("attn",
                                                   g->attn_cur,
@@ -1413,8 +1427,17 @@ bool gpu_graph_encode_decode_layer(
     if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_ffn_fn,
                                           hc_dim, mix_hc, g->after_attn_hc, g->hc_mix);
     if (ok && fuse_hc_norm) {
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
+        /* Same A8 emission as the attention norm above: batch_ffn_norm feeds
+         * the router logits and the shared gate/up GEMVs. */
+        void *fn_q = NULL, *fn_sf = NULL; int fn_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->ffn_norm, 1, PULSAR_N_EMBD,
+                                                        &fn_q, &fn_sf, &fn_kbp)) {
+            fn_q = NULL; fn_sf = NULL; fn_kbp = 0;
+        }
+        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->ffn_cur,
                                                          g->ffn_norm,
+                                                         NULL,
+                                                         fn_q, fn_sf, fn_kbp,
                                                          g->hc_split,
                                                          g->hc_mix,
                                                          g->after_attn_hc,
@@ -1428,6 +1451,8 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_N_HC_SINKHORN_ITER,
                                                          PULSAR_HC_EPS,
                                                          PULSAR_RMS_EPS) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->ffn_norm, 1, PULSAR_N_EMBD);
+        if (ok && fn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
         if (ok) {
             ok = gpu_graph_check_hc_norm_fusion("ffn",
                                                   g->ffn_cur,
