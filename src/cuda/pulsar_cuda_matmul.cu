@@ -662,6 +662,25 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * both are filled lazily -- a layer pays for only the encodings it actually
  * uses.  On a ratio-4 layer that is 1 quantization + 1 conversion instead of
  * 2 + 5. */
+/* MULTI-SLOT.  One armed buffer sufficed while only batch_attn_norm and
+ * batch_ffn_norm carried producer-emitted encodings, because those two never
+ * had to be live at the same instant.  Driving every activation to E4M3 breaks
+ * that: a layer holds several at once -- batch_attn_norm (4096) feeds q_a/kv
+ * while batch_qr_norm (1024) feeds q_b, and batch_ffn_norm (4096) feeds the
+ * router while batch_shared_mid (2048) feeds shared_down.  With a single slot,
+ * arming the second silently invalidated the first, and its later consumers
+ * re-quantized from f32: a performance loss today, and a WRONG-OPERAND bug the
+ * moment that f32 store goes away.
+ *
+ * ⚠ The single-slot design had an ACCIDENTAL safety property -- arming anything
+ * invalidated everything else, so a buffer rewritten with no arm could never
+ * serve a stale hit.  Slots keyed independently lose that, so disarm() still
+ * clears ALL of them.  That is what the disarms at the encode exits are for
+ * (gpu_prefill.cpp:2416/2764, gpu_decode.cpp:2092/2170): batch_ffn_norm is
+ * scratch that the output head legitimately reuses under the same (ptr, n_tok,
+ * in_dim) key, which is exactly how the C1 stale-logits bug happened. */
+#define PULSAR_ACT_SLOTS 6
+
 struct mxfp8_act_cache_t {
     const void    *key_ptr;      /* armed activation buffer (NULL = disarmed) */
     uint64_t       key_ntok;
@@ -676,27 +695,59 @@ struct mxfp8_act_cache_t {
     size_t         sx_cap;
     __half        *xh;
     size_t         xh_cap;
+    uint64_t       lru;          /* eviction stamp; 0 = never used */
 };
-static thread_local mxfp8_act_cache_t g_act_cache;
+static thread_local mxfp8_act_cache_t g_act_slots[PULSAR_ACT_SLOTS];
+static thread_local uint64_t g_act_clock;
+/* Slot most recently armed.  The note_*() calls always follow their arm() with
+ * no intervening arm, so they act on this rather than re-deriving the key. */
+static thread_local mxfp8_act_cache_t *g_act_cur;
+
+static mxfp8_act_cache_t *act_slot_find(const void *ptr, uint64_t n_tok, uint64_t in_dim) {
+    if (!ptr) return NULL;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (s->key_ptr == ptr && s->key_ntok == n_tok && s->key_in_dim == in_dim) {
+            s->lru = ++g_act_clock;
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/* Find this key's slot, or take over the least-recently-used one.  Acquiring
+ * RESETS the validity bits: the caller is about to (re)write that buffer, so
+ * whatever the slot held is stale by definition.  Buffers are grow-only and
+ * survive eviction -- only the key and the validity bits are reassigned. */
+static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint64_t in_dim) {
+    if (!ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) return NULL;
+    mxfp8_act_cache_t *s = act_slot_find(ptr, n_tok, in_dim);
+    if (!s) {
+        s = &g_act_slots[0];
+        for (int i = 1; i < PULSAR_ACT_SLOTS; i++) {
+            if (g_act_slots[i].lru < s->lru) s = &g_act_slots[i];
+        }
+        s->key_ptr    = ptr;
+        s->key_ntok   = n_tok;
+        s->key_in_dim = in_dim;
+        s->lru        = ++g_act_clock;
+    }
+    s->valid = 0; s->valid_h = 0; s->f32_absent = 0;
+    return s;
+}
 
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
-    g_act_cache.valid = 0;
-    g_act_cache.valid_h = 0;
-    g_act_cache.f32_absent = 0;
-    if (!x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
-        g_act_cache.key_ptr = NULL;
-        return;
-    }
-    g_act_cache.key_ptr    = x->ptr;
-    g_act_cache.key_ntok   = n_tok;
-    g_act_cache.key_in_dim = in_dim;
+    g_act_cur = x ? act_slot_acquire(x->ptr, n_tok, in_dim) : NULL;
 }
 
 void pulsar_gpu_mxfp8_act_cache_disarm(void) {
-    g_act_cache.key_ptr    = NULL;
-    g_act_cache.valid      = 0;
-    g_act_cache.valid_h    = 0;
-    g_act_cache.f32_absent = 0;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        g_act_slots[i].key_ptr    = NULL;
+        g_act_slots[i].valid      = 0;
+        g_act_slots[i].valid_h    = 0;
+        g_act_slots[i].f32_absent = 0;
+    }
+    g_act_cur = NULL;
 }
 
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
@@ -719,13 +770,16 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
 /* Reserve the cache's f16 slot for (n_tok, in_dim) and hand back the device
  * pointer, so a PRODUCER kernel can write that encoding straight out of its own
  * epilogue.  Used with note_f16() below: reserve -> produce -> arm -> note. */
-void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim) {
-    if (n_tok == 0 || in_dim == 0) return NULL;
-    if (!mxfp8_act_cache_reserve((void **)&g_act_cache.xh, &g_act_cache.xh_cap,
+void *pulsar_gpu_mxfp8_act_cache_f16_slot(const pulsar_gpu_tensor *x,
+                                          uint64_t n_tok, uint64_t in_dim) {
+    if (!x || n_tok == 0 || in_dim == 0) return NULL;
+    mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
+    if (!s) return NULL;
+    if (!mxfp8_act_cache_reserve((void **)&s->xh, &s->xh_cap,
                                  (size_t)(n_tok * in_dim) * sizeof(__half), "act f16")) {
         return NULL;
     }
-    return g_act_cache.xh;
+    return s->xh;
 }
 
 /* Reserve the cache's E4M3 slots for (n_tok, in_dim) and hand back BOTH device
@@ -736,52 +790,61 @@ void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim) {
  * The quantize pass this replaces is not moved, it is eliminated: the producer
  * already holds the value in a register, and its warp already spans exactly one
  * 32-element MX block, so the block max is a shuffle it can do for free. */
-int pulsar_gpu_mxfp8_act_cache_e4m3_slot(uint64_t n_tok, uint64_t in_dim,
+int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
+                                         uint64_t n_tok, uint64_t in_dim,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch) {
-    if (n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0 ||
+    if (!x || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0 ||
         !data_out || !scale_out || !sf_pitch) {
         return 0;
     }
+    mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
+    if (!s) return 0;
     const int ntok = (int)n_tok;
     const int KBp  = mx_rup((int)(in_dim / 32), 4);
     const size_t sx_bytes = (size_t)mx_rup(ntok, 128) * (size_t)KBp;
-    if (!mxfp8_act_cache_reserve((void **)&g_act_cache.xq, &g_act_cache.xq_cap,
+    if (!mxfp8_act_cache_reserve((void **)&s->xq, &s->xq_cap,
                                  (size_t)(n_tok * in_dim), "act data") ||
-        !mxfp8_act_cache_reserve((void **)&g_act_cache.sx, &g_act_cache.sx_cap,
+        !mxfp8_act_cache_reserve((void **)&s->sx, &s->sx_cap,
                                  sx_bytes, "act scale")) {
         return 0;
     }
     /* The quantizer memsets the scale slab because mx_sfoff leaves holes when
      * rows/blocks are not multiples of 128/4; a producer filling only the live
      * (row, kb) pairs must do the same or the GEMM reads stale swizzle slots. */
-    if (cudaMemsetAsync(g_act_cache.sx, 0, sx_bytes, 0) != cudaSuccess) return 0;
-    *data_out  = g_act_cache.xq;
-    *scale_out = g_act_cache.sx;
+    if (cudaMemsetAsync(s->sx, 0, sx_bytes, 0) != cudaSuccess) return 0;
+    *data_out  = s->xq;
+    *scale_out = s->sx;
     *sf_pitch  = KBp;
     return 1;
 }
 
 /* Declare the E4M3 encoding current (producer filled the slots above). */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
-    if (g_act_cache.key_ptr) g_act_cache.valid = 1;
+    if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid = 1;
 }
 
 /* Declare the f16 encoding current.  arm() clears both validity bits because it
  * cannot know what is in the slot; this says "the producer already filled it". */
 void pulsar_gpu_mxfp8_act_cache_note_f16(void) {
-    if (g_act_cache.key_ptr) g_act_cache.valid_h = 1;
+    if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid_h = 1;
 }
 
 /* As note_f16(), but also records that the producer skipped the f32 store, so
  * the f16 copy is the ONLY one.  Every f32 reader of this buffer below asserts
  * against this rather than silently consuming a store that was never made. */
 void pulsar_gpu_mxfp8_act_cache_note_f16_only(void) {
-    if (g_act_cache.key_ptr) { g_act_cache.valid_h = 1; g_act_cache.f32_absent = 1; }
+    if (g_act_cur && g_act_cur->key_ptr) { g_act_cur->valid_h = 1; g_act_cur->f32_absent = 1; }
 }
 
+/* Any slot claiming this buffer has no f32 copy makes an f32 read a bug --
+ * scan them all, not just the last armed one. */
 static int act_cache_f32_missing(const void *xp) {
-    return g_act_cache.key_ptr == xp && g_act_cache.f32_absent;
+    if (!xp) return 0;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        if (g_act_slots[i].key_ptr == xp && g_act_slots[i].f32_absent) return 1;
+    }
+    return 0;
 }
 
 
@@ -813,16 +876,14 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     /* Armed activation cache (see mxfp8_act_cache_t above): reuse the E4M3 data
      * and E8M0 scales this activation was already quantized into, and take only
      * the cuBLASLt workspace from the shared tmp region. */
-    mxfp8_act_cache_t *ac = NULL;
-    if (g_act_cache.key_ptr == x->ptr && g_act_cache.key_ntok == n_tok &&
-        g_act_cache.key_in_dim == in_dim) {
-        if (mxfp8_act_cache_reserve((void **)&g_act_cache.xq, &g_act_cache.xq_cap,
-                                    in_dim * (size_t)ntok, "act data") &&
-            mxfp8_act_cache_reserve((void **)&g_act_cache.sx, &g_act_cache.sx_cap,
-                                    sx_bytes, "act scale")) {
-            ac = &g_act_cache;
-        } else {
-            g_act_cache.valid = 0;   /* fall back to the per-GEMM quantization */
+    mxfp8_act_cache_t *ac = act_slot_find(x->ptr, n_tok, in_dim);
+    if (ac) {
+        if (!mxfp8_act_cache_reserve((void **)&ac->xq, &ac->xq_cap,
+                                     in_dim * (size_t)ntok, "act data") ||
+            !mxfp8_act_cache_reserve((void **)&ac->sx, &ac->sx_cap,
+                                     sx_bytes, "act scale")) {
+            ac->valid = 0;   /* fall back to the per-GEMM quantization */
+            ac = NULL;
         }
     }
     __nv_fp8_e4m3 *xq;
@@ -1627,12 +1688,10 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
          * mxfp8_act_cache_t -- and note the cached copy must live outside the
          * shared cuda_tmp scratch, which unrelated kernels overwrite between
          * those calls). */
-        mxfp8_act_cache_t *hc = NULL;
-        if (g_act_cache.key_ptr == x->ptr && g_act_cache.key_ntok == n_tok &&
-            g_act_cache.key_in_dim == in_dim &&
-            mxfp8_act_cache_reserve((void **)&g_act_cache.xh, &g_act_cache.xh_cap,
-                                    xh_count * sizeof(__half), "act f16")) {
-            hc = &g_act_cache;
+        mxfp8_act_cache_t *hc = act_slot_find(x->ptr, n_tok, in_dim);
+        if (hc && !mxfp8_act_cache_reserve((void **)&hc->xh, &hc->xh_cap,
+                                           xh_count * sizeof(__half), "act f16")) {
+            hc = NULL;
         }
         __half *xh = hc ? hc->xh
                         : (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");

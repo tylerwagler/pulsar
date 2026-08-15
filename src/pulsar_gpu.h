@@ -331,7 +331,8 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
  * results are bit-identical either way.
  */
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
-void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim);
+void *pulsar_gpu_mxfp8_act_cache_f16_slot(const pulsar_gpu_tensor *x,
+                                          uint64_t n_tok, uint64_t in_dim);
 void pulsar_gpu_mxfp8_act_cache_note_f16(void);
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
@@ -445,7 +446,8 @@ int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok);
 /* Reserve the activation cache's E4M3 slots and hand back both device pointers
  * plus the scale pitch, so a producer can emit the MX encoding from its own
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
-int pulsar_gpu_mxfp8_act_cache_e4m3_slot(uint64_t n_tok, uint64_t in_dim,
+int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
+                                         uint64_t n_tok, uint64_t in_dim,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch);
 
