@@ -54,16 +54,6 @@
 // next time upstream changes how J is chosen.
 static constexpr int ds4_mmq_x_max() { return 512; }
 
-static bool ds4_mmq_nvtx_requested() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *nvtx = getenv("DS4_CUDA_NVTX");
-        const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
-        enabled = (nvtx != nullptr && std::strcmp(nvtx, "1") == 0) ||
-                  (capture != nullptr && capture[0] != '\0');
-    }
-    return enabled != 0;
-}
 
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
@@ -823,32 +813,7 @@ int ds4_mmq_moe_impl(
 }
 
 
-static bool ds4_mmq_take_scratch(
-        void *base, size_t capacity, size_t *offset,
-        size_t bytes, size_t alignment, void **result) {
-    if (!base || !offset || !result || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0) {
-        return false;
-    }
-    if (*offset > capacity) return false;
-    const uintptr_t address = (uintptr_t)base + *offset;
-    const size_t padding = (size_t)(-(uintptr_t)address) & (alignment - 1);
-    if (padding > capacity - *offset) return false;
-    const size_t aligned = *offset + padding;
-    if (bytes > capacity - aligned) return false;
-    *result = (char *)base + aligned;
-    *offset = aligned + bytes;
-    return true;
-}
 
-static bool ds4_mmq_scratch_overlaps(
-        const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
-    const uintptr_t a_addr = (uintptr_t)a;
-    const uintptr_t b_addr = (uintptr_t)b;
-    return a_addr <= b_addr
-        ? b_addr - a_addr < a_bytes
-        : a_addr - b_addr < b_bytes;
-}
 
 // Produce the weighted SwiGLU rows in their canonical pair-major order. The
 // proven upstream quantizer below gathers them through the already available
@@ -1181,18 +1146,6 @@ extern "C" int ds4_mmq_q4_K_moe(
 }
 
 
-extern "C" int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
-        const void * W_a, const void * W_b,
-        const float * X, const int32_t * ids, float * out_a, float * out_b,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes",
-        W_a, W_b, X, ids, out_a, out_b,
-        M, K, n_tokens, n_experts, n_expert_used, stream,
-        /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
-        /*sanitize_out=*/false);
-}
 
 
 

@@ -165,22 +165,6 @@ int ds4_mmq_q4_K_moe(
 // Returns 0 on success; on error neither output is guaranteed valid.
 
 
-// Raw-GGUF paired IQ2_XXS MMQ without standalone nonfinite cleanup. The
-// immediate SwiGLU consumer must sanitize both gate and up values at read.
-int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
-    const void    * W_a,
-    const void    * W_b,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_a,
-    float         * out_b,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
-
 // Target-prefill pipeline for the V4 Flash routed MoE. It builds the
 // expert-major assignment map once, runs the paired IQ2_XXS gate/up MMQs,
 // computes clamp + SwiGLU + router weighting in mid_f32, then gathers and
