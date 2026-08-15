@@ -222,11 +222,44 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
  *
  * `residual_hc` is an HC CARRIER (BF16 storage under task #62) and is read
  * through pulsar_hc_load exactly as the generic kernel below does. */
+/* MUST match pulsar_cuda_matmul.cu's mx_sfoff / mxfp8_quant_act_kernel exactly:
+ * this epilogue REPLACES that pass, so any divergence in the swizzle or in the
+ * exponent arithmetic is a silent wrong-operand bug, not a rounding difference. */
+__device__ __forceinline__ static int hc_mx_sfoff(int row, int kb, int KBp) {
+    return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
+           + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
+}
+
+/* One warp owns one 32-element MX block: shuffle-max |v| to the block amax, then
+ * the shared power-of-two exponent, then each lane stores its E4M3 value and
+ * lane 0 the E8M0 byte.  Bit-exact against the standalone quantiser -- fmaxf is
+ * exact and max is order-independent, so the amax, se and E4M3 bytes are
+ * identical however the reduction is ordered. */
+__device__ __forceinline__ static void hc_emit_mx_block(
+        float v, uint32_t col, uint32_t row, uint32_t n_embd, int KBp,
+        __nv_fp8_e4m3 *data, unsigned char *scale) {
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    int se = -127;
+    if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
+    if (se < -127) se = -127;
+    if (se >  127) se =  127;
+    data[(size_t)row * n_embd + col] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
+    if ((threadIdx.x & 31u) == 0u) {
+        scale[hc_mx_sfoff((int)row, (int)(col >> 5), KBp)] = (unsigned char)(se + 127);
+    }
+}
+
+
 template <uint32_t BLK, uint32_t VEC>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
         __half *norm_out_h,
+        __nv_fp8_e4m3 *norm_out_q,
+        unsigned char *norm_out_sf,
+        int norm_out_kbp,
         float *split,
         const float *mix,
         const pulsar_hc_t *residual_hc,
@@ -280,10 +313,16 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     #pragma unroll
     for (uint32_t u = 0; u < VEC; u++) {
         const uint32_t col = d + u * BLK;
+        const float v = (col < n_embd) ? (accs[u] * norm_scale * norm_w[col]) : 0.0f;
         if (col < n_embd) {
-            const float v = accs[u] * norm_scale * norm_w[col];
             norm_out[obase + col] = v;
             if (norm_out_h) norm_out_h[obase + col] = __float2half(v);
+        }
+        /* Warp-uniform: every lane must reach the shuffle.  BLK is a multiple of
+         * 32 and columns are contiguous within a warp, so a warp spans exactly
+         * one MX block and lanes past n_embd contribute 0 to the max. */
+        if (norm_out_q) {
+            hc_emit_mx_block(v, col, t, n_embd, norm_out_kbp, norm_out_q, norm_out_sf);
         }
     }
 }
@@ -778,6 +817,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
         void                    *norm_out_h,
+        void                    *norm_out_q,
+        void                    *norm_out_sf,
+        int                      norm_out_kbp,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
@@ -828,6 +870,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 (float *)out->ptr,
                 (float *)norm_out->ptr,
                 (__half *)norm_out_h,
+                (__nv_fp8_e4m3 *)norm_out_q,
+                (unsigned char *)norm_out_sf,
+                norm_out_kbp,
                 (float *)split->ptr,
                 (const float *)mix->ptr,
                 (const pulsar_hc_t *)residual_hc->ptr,
@@ -869,7 +914,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps) {
     return pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
-            out, norm_out, NULL, split, mix, residual_hc, model_map, model_size,
+            out, norm_out, NULL, NULL, NULL, 0, split, mix, residual_hc, model_map, model_size,
             scale_offset, base_offset, norm_weight_offset, n_embd, n_hc,
             sinkhorn_iters, eps, norm_eps);
 }

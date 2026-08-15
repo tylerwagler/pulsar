@@ -728,6 +728,45 @@ void *pulsar_gpu_mxfp8_act_cache_f16_slot(uint64_t n_tok, uint64_t in_dim) {
     return g_act_cache.xh;
 }
 
+/* Reserve the cache's E4M3 slots for (n_tok, in_dim) and hand back BOTH device
+ * pointers, so a PRODUCER kernel can emit the MX encoding from its own epilogue
+ * instead of a separate pass reading the f32 back.  `sf_pitch` returns the KBp
+ * the swizzle was sized with -- the producer must use the same one.
+ *
+ * The quantize pass this replaces is not moved, it is eliminated: the producer
+ * already holds the value in a register, and its warp already spans exactly one
+ * 32-element MX block, so the block max is a shuffle it can do for free. */
+int pulsar_gpu_mxfp8_act_cache_e4m3_slot(uint64_t n_tok, uint64_t in_dim,
+                                         void **data_out, void **scale_out,
+                                         int *sf_pitch) {
+    if (n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0 ||
+        !data_out || !scale_out || !sf_pitch) {
+        return 0;
+    }
+    const int ntok = (int)n_tok;
+    const int KBp  = mx_rup((int)(in_dim / 32), 4);
+    const size_t sx_bytes = (size_t)mx_rup(ntok, 128) * (size_t)KBp;
+    if (!mxfp8_act_cache_reserve((void **)&g_act_cache.xq, &g_act_cache.xq_cap,
+                                 (size_t)(n_tok * in_dim), "act data") ||
+        !mxfp8_act_cache_reserve((void **)&g_act_cache.sx, &g_act_cache.sx_cap,
+                                 sx_bytes, "act scale")) {
+        return 0;
+    }
+    /* The quantizer memsets the scale slab because mx_sfoff leaves holes when
+     * rows/blocks are not multiples of 128/4; a producer filling only the live
+     * (row, kb) pairs must do the same or the GEMM reads stale swizzle slots. */
+    if (cudaMemsetAsync(g_act_cache.sx, 0, sx_bytes, 0) != cudaSuccess) return 0;
+    *data_out  = g_act_cache.xq;
+    *scale_out = g_act_cache.sx;
+    *sf_pitch  = KBp;
+    return 1;
+}
+
+/* Declare the E4M3 encoding current (producer filled the slots above). */
+void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
+    if (g_act_cache.key_ptr) g_act_cache.valid = 1;
+}
+
 /* Declare the f16 encoding current.  arm() clears both validity bits because it
  * cannot know what is in the slot; this says "the producer already filled it". */
 void pulsar_gpu_mxfp8_act_cache_note_f16(void) {

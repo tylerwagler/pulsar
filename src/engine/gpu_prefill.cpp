@@ -494,6 +494,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * the layer -- ~400 MB at a 4096-token prefill, twice per layer.  Emit the
      * f16 encoding from the norm's own epilogue instead. */
     void *attn_norm_f16 = NULL;
+    void *attn_norm_q = NULL, *attn_norm_sf = NULL; int attn_norm_kbp = 0;
     void *flat_hc_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, hc_dim) : NULL;
     /* ...and when the mix GEMM is guaranteed to read that f16, the f32 store is
      * dead: nothing else reads batch_flat_hc.  It is the widest store in the
@@ -547,9 +548,20 @@ bool gpu_graph_encode_layer_attention_batch(
          * cannot be made cheaper, only removed.  Bit-exact: same value, same
          * __float2half f32_to_f16_kernel would have applied. */
         attn_norm_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, PULSAR_N_EMBD) : NULL;
+        /* ...and the E4M3 encoding too: batch_attn_norm feeds seven MXFP8
+         * projections, every one of which would otherwise wait on a separate
+         * quantize pass over the whole tensor. */
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(n_tokens, PULSAR_N_EMBD,
+                                                        &attn_norm_q, &attn_norm_sf,
+                                                        &attn_norm_kbp)) {
+            attn_norm_q = NULL; attn_norm_sf = NULL; attn_norm_kbp = 0;
+        }
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(attn_cur_view,
                                                                  g->batch_attn_norm,
                                                                  attn_norm_f16,
+                                                                 attn_norm_q,
+                                                                 attn_norm_sf,
+                                                                 attn_norm_kbp,
                                                                  hc_split_view,
                                                                  hc_mix_view,
                                                                  g->batch_cur_hc,
@@ -607,6 +619,7 @@ bool gpu_graph_encode_layer_attention_batch(
     /* arm() invalidates both encodings; the f16 one the hc-fused norm already
      * wrote into the cache's slot IS current for this exact tensor. */
     if (ok && attn_norm_f16) pulsar_gpu_mxfp8_act_cache_note_f16();
+    if (ok && attn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     PULSAR_CUDA_PROFILE_ATTN_STAGE("norm");
     PULSAR_CUDA_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
@@ -2459,6 +2472,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                               !gpu_graph_use_reference_hc_decode() &&
                               gpu_graph_enable_batch_hc_norm_fusion();
     void *ffn_norm_f16 = NULL;
+    void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
     void *flat_hc_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, hc_dim) : NULL;
     const int flat_hc_skip_f32 = flat_hc_f16 &&
                                  layer->hc_ffn_fn->type == PULSAR_TENSOR_F16 &&
@@ -2502,9 +2516,17 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the router-logits F16 GEMM, which would otherwise narrow the whole
          * [n_tokens x n_embd] tensor in a separate bandwidth-bound pass. */
         ffn_norm_f16 = ok ? pulsar_gpu_mxfp8_act_cache_f16_slot(n_tokens, PULSAR_N_EMBD) : NULL;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(n_tokens, PULSAR_N_EMBD,
+                                                        &ffn_norm_q, &ffn_norm_sf,
+                                                        &ffn_norm_kbp)) {
+            ffn_norm_q = NULL; ffn_norm_sf = NULL; ffn_norm_kbp = 0;
+        }
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(ffn_cur_view,
                                                                  g->batch_ffn_norm,
                                                                  ffn_norm_f16,
+                                                                 ffn_norm_q,
+                                                                 ffn_norm_sf,
+                                                                 ffn_norm_kbp,
                                                                  hc_split_view,
                                                                  hc_mix_view,
                                                                  g->batch_after_attn_hc,
@@ -2556,6 +2578,7 @@ bool gpu_graph_encode_layer_ffn_batch(
      * activation cache onto ffn_norm cannot strand a live attn_norm encoding. */
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && ffn_norm_f16) pulsar_gpu_mxfp8_act_cache_note_f16();
+    if (ok && ffn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_router_logits,
                                               model,
                                               layer->ffn_gate_inp,

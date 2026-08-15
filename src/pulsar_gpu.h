@@ -442,6 +442,16 @@ int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok);
 
 /* note_f16(), plus a record that the f32 store was skipped so f32 readers of
  * that buffer fail loudly instead of consuming a store that never happened. */
+/* Reserve the activation cache's E4M3 slots and hand back both device pointers
+ * plus the scale pitch, so a producer can emit the MX encoding from its own
+ * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
+int pulsar_gpu_mxfp8_act_cache_e4m3_slot(uint64_t n_tok, uint64_t in_dim,
+                                         void **data_out, void **scale_out,
+                                         int *sf_pitch);
+
+/* Declare the E4M3 encoding current after a producer filled those slots. */
+void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
+
 void pulsar_gpu_mxfp8_act_cache_note_f16_only(void);
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
@@ -1303,6 +1313,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
         void                    *norm_out_h,
+        void                    *norm_out_q,
+        void                    *norm_out_sf,
+        int                      norm_out_kbp,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
