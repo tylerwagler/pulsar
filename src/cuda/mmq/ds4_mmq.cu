@@ -1135,6 +1135,8 @@ int ds4_mmq_moe_pair_impl(
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
+    ggml_cuda_pool_alloc<char> src1_e4m3_alloc;
+    char *src1_e4m3 = nullptr;
     char *src1_q8_1 = direct_gateup_q8
         ? (char *)fused_down->input_q8_scratch
         : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
@@ -1145,9 +1147,19 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
-    /* The single source of truth for "are the expert activations E4M3?".  See
-     * the staging comment below for why it is narrower than the arm itself. */
-    const int e4m3_staging = (ds4_d2r_iq2_arm() && direct_gateup_q8) ? 1 : 0;
+    /* ⚠ THIS WAS GATED ON direct_gateup_q8, WHICH IS A DEAD FIELD -- declared at
+     * :881, read at eight sites, ASSIGNED NOWHERE.  So e4m3_staging was always 0
+     * and the MXFP8 arm was a silent no-op from 99e5645 until now, which is why
+     * perplexity and both frontier-logit dumps came back bit-identical across
+     * arms.  Do not reintroduce a condition on it.
+     *
+     * The reason a condition existed at all was that src1_q8_1 has THREE
+     * consumers and only some of them understand e4m3 (the generic MMQ kernel
+     * under `if (!gate_up_done)` does not).  The right answer is not a narrower
+     * predicate but a SEPARATE BUFFER: q8_1 stays exactly as it was for every
+     * existing consumer, and the D2R IQ2 path gets its own e4m3 staging.  That
+     * is correct by construction rather than by a condition that can rot. */
+    const int e4m3_staging = ds4_d2r_iq2_arm() ? 1 : 0;
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/input_quant_q8_1",
@@ -1165,18 +1177,23 @@ int ds4_mmq_moe_pair_impl(
          * nothing else reads the buffer.  Hence the staging decision is made
          * ONCE here and PASSED to the consumer, rather than both sides reading
          * ds4_d2r_iq2_arm() independently and being able to disagree. */
+        quantize_mmq_q8_1_cuda(
+            X_f32, ids_src1, (void *)src1_q8_1,
+            type, /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            stream);
         if (e4m3_staging) {
+            /* Second staging of the SAME activations in E4M3 + ue8m0, for the
+             * D2R IQ2 consumers only.  One extra buffer and one extra pass
+             * while the two arms coexist; when the comparison concludes, the
+             * losing format's staging is deleted along with its arm. */
+            src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+            cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
             ds4_quantize_mmq_e4m3_cuda(
-                X_f32, ids_src1, (void *)src1_q8_1,
+                X_f32, ids_src1, (void *)src1_e4m3,
                 /*ne00=*/K, s11_src, s12_src, s13_src,
                 /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
                 /*n_expert_used=*/0, /*scatter=*/false, stream);
-        } else {
-            quantize_mmq_q8_1_cuda(
-                X_f32, ids_src1, (void *)src1_q8_1,
-                type, /*ne00=*/K, s11_src, s12_src, s13_src,
-                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-                stream);
         }
 
         err = cudaGetLastError();
@@ -1205,7 +1222,7 @@ int ds4_mmq_moe_pair_impl(
                     nvtx_prefill);
             const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
                     xa_soa, xb_soa, soa_blocks,
-                    src1_q8_1, ids_dst, expert_bounds,
+                    (e4m3_staging ? src1_e4m3 : src1_q8_1), ids_dst, expert_bounds,
                     fused_down->router_weights, fused_down->q8_scratch,
                     M, K, ne_get_rows, n_experts, fused_down->clamp,
                     direct_work, gateup_work_bytes, e4m3_staging, stream);
@@ -1274,9 +1291,10 @@ int ds4_mmq_moe_pair_impl(
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
                 const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
-                        xa_soa, xb_soa, soa_blocks, src1_q8_1, ids_dst,
+                        xa_soa, xb_soa, soa_blocks,
+                        (e4m3_staging ? src1_e4m3 : src1_q8_1), ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
-                        d2r_work.get(), d2r_work_bytes, /*use_e4m3=*/0, stream);
+                        d2r_work.get(), d2r_work_bytes, e4m3_staging, stream);
                 if (d2r_rc == 0) {
                     gate_up_done = true;
                 }
