@@ -409,6 +409,150 @@ static bool gpu_graph_q_stage_profile_boundary(
 
 
 
+
+/* One indexed-attention span: indexer score -> top-k -> indexed attention over
+ * rows [s0, s0+sn) of the batch.  Shared by the chunked and zero-prefix loops,
+ * which ran identical bodies over different operand sets.
+ *
+ * `mseq` controls only whether per-span descriptor views are built; every other
+ * multiseq difference is already resolved into `op` by the caller. */
+struct gpu_graph_span_ops {
+    pulsar_gpu_tensor       *comp_src;      /* attention comp-cache operand   */
+    pulsar_gpu_tensor       *raw_src;       /* raw KV cache operand           */
+    pulsar_gpu_tensor       *index_src;     /* indexer comp-cache operand     */
+    const pulsar_gpu_tensor *index_bases;   /* per-bank base table, or NULL   */
+    const pulsar_gpu_tensor *comp_bases;    /* per-bank base table, or NULL   */
+    uint32_t                 comp_pack;     /* comp rows are packed           */
+    uint32_t                 comp_cap;      /* per-bank stride, 0 when scalar */
+    uint32_t                 n_banks;       /* 1 when scalar                  */
+    bool                     mseq;
+};
+
+static bool gpu_graph_indexed_attention_span(
+        pulsar_gpu_graph           *g,
+        const pulsar_model         *model,
+        const pulsar_layer_weights *layer,
+        uint32_t                    il,
+        uint32_t                    s0,
+        uint32_t                    sn,
+        uint32_t                    spos0,
+        uint64_t                    iq_row,
+        uint64_t                    q_dim,
+        uint32_t                    n_comp,
+        uint32_t                    ratio,
+        float                       index_scale,
+        uint32_t                    n_raw,
+        uint32_t                    raw_start,
+        const struct gpu_graph_span_ops *op,
+        bool                        stage_profile,
+        bool                        pre_boundary,
+        double                     *stage_t0) {
+    pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_q,
+            (uint64_t)s0 * iq_row * sizeof(float),
+            (uint64_t)sn * iq_row * sizeof(float));
+    pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
+            (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
+            (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
+    pulsar_gpu_tensor *sq_view = pulsar_gpu_tensor_view(g->batch_q,
+            (uint64_t)s0 * q_dim * sizeof(float),
+            (uint64_t)sn * q_dim * sizeof(float));
+    pulsar_gpu_tensor *sh_view = pulsar_gpu_tensor_view(g->batch_heads,
+            (uint64_t)s0 * q_dim * sizeof(float),
+            (uint64_t)sn * q_dim * sizeof(float));
+    /* Multiseq: per-span descriptor views (rows s0..s0+sn).  The scalar raw
+     * span/start are ignored in banked mode -- they are derived per row. */
+    pulsar_gpu_tensor *sp_view = op->mseq
+        ? pulsar_gpu_tensor_view(g->batch_positions,
+                              (uint64_t)s0 * sizeof(int32_t),
+                              (uint64_t)sn * sizeof(int32_t))
+        : NULL;
+    pulsar_gpu_tensor *ss_view = op->mseq
+        ? pulsar_gpu_tensor_view(g->batch_seq_id,
+                              (uint64_t)s0 * sizeof(int32_t),
+                              (uint64_t)sn * sizeof(int32_t))
+        : NULL;
+    bool ok = iq_view && iw_view && sq_view && sh_view &&
+              (!op->mseq || (sp_view && ss_view));
+
+    if (ok && stage_profile && pre_boundary) {
+        ok = gpu_graph_indexer_stage_profile_boundary(NULL, il, spos0, sn, n_comp, stage_t0);
+    }
+    if (ok) ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                                                              iq_view,
+                                                              iw_view,
+                                                              op->index_src,
+                                                              n_comp,
+                                                              sn,
+                                                              spos0,
+                                                              PULSAR_N_INDEXER_HEAD,
+                                                              PULSAR_N_INDEXER_HEAD_DIM,
+                                                              ratio,
+                                                              index_scale,
+                                                              sp_view, ss_view,
+                                                              op->index_bases,
+                                                              op->comp_cap,
+                                                              op->n_banks) != 0;
+    if (ok && stage_profile) {
+        ok = gpu_graph_indexer_stage_profile_boundary("score", il, spos0, sn, n_comp, stage_t0);
+    }
+    if (ok) {
+        gpu_graph_debug_dump_tensor("indexer_scores", g->indexer_scores,
+                                      (uint64_t)n_comp * sn, il, spos0);
+    }
+    if (ok) {
+        ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
+                                           g->indexer_scores,
+                                           n_comp,
+                                           sn,
+                                           PULSAR_N_INDEXER_TOP_K) != 0;
+        if (ok && stage_profile) {
+            ok = gpu_graph_indexer_stage_profile_boundary("topk", il, spos0, sn, n_comp, stage_t0);
+        }
+        if (ok) {
+            gpu_graph_debug_dump_i32_tensor("indexer_topk", g->comp_selected,
+                                              (uint64_t)sn * PULSAR_N_INDEXER_TOP_K, il, spos0);
+        }
+    }
+    if (ok) {
+        ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
+                                                                  model->map,
+                                                                  model->size,
+                                                                  layer->attn_sinks->abs_offset,
+                                                                  sq_view,
+                                                                  op->raw_src,
+                                                                  op->comp_src,
+                                                                  op->comp_pack,
+                                                                  g->comp_selected,
+                                                                  sn,
+                                                                  spos0,
+                                                                  n_raw,
+                                                                  g->raw_cap,
+                                                                  raw_start,
+                                                                  n_comp,
+                                                                  PULSAR_N_INDEXER_TOP_K,
+                                                                  g->raw_window,
+                                                                  ratio,
+                                                                  PULSAR_N_HEAD,
+                                                                  PULSAR_N_HEAD_DIM,
+                                                                  1u,
+                                                                  sp_view, ss_view,
+                                                                  op->comp_bases,
+                                                                  op->comp_cap,
+                                                                  op->n_banks) != 0;
+        if (ok && stage_profile) {
+            ok = gpu_graph_indexer_stage_profile_boundary("attention", il, spos0, sn, n_comp, stage_t0);
+        }
+    }
+    pulsar_gpu_tensor_free(ss_view);
+    pulsar_gpu_tensor_free(sp_view);
+    pulsar_gpu_tensor_free(sh_view);
+    pulsar_gpu_tensor_free(sq_view);
+    pulsar_gpu_tensor_free(iw_view);
+    pulsar_gpu_tensor_free(iq_view);
+    return ok;
+}
+
+
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -1603,6 +1747,18 @@ bool gpu_graph_encode_layer_attention_batch(
                     mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                          : (pk_native ? g->layer_attn_comp_cache[il]
                                       : gpu_graph_attn_comp_read_cache(g, il, n_comp));
+                const struct gpu_graph_span_ops sop = {
+                    /* comp_src   */ span_comp_src,
+                    /* raw_src    */ mseq ? gpu_graph_bank_raw_pool(g, il) : g->layer_raw_cache[il],
+                    /* index_src  */ mseq ? gpu_graph_bank_index_comp_pool(g, il)
+                                          : g->layer_index_comp_cache[il],
+                    /* index_bases*/ mseq ? gpu_graph_bank_index_comp_bases(g, il) : NULL,
+                    /* comp_bases */ mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
+                    /* comp_pack  */ (uint32_t)(mseq || pk_native ? 1u : 0u),
+                    /* comp_cap   */ mseq ? g->layer_comp_cap[il] : 0u,
+                    /* n_banks    */ mseq ? nb : 1u,
+                    /* mseq       */ mseq,
+                };
                 for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += span) {
                     const uint32_t sn = n_tokens - s0 < span ? n_tokens - s0 : span;
                     const uint32_t spos0 = pos0 + s0;
@@ -1610,139 +1766,10 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t s_raw_start = gpu_graph_raw_start_for_span(g,
                                                                                 spos0 + sn - 1u,
                                                                                 s_n_raw);
-                    pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_q,
-                            (uint64_t)s0 * iq_row * sizeof(float),
-                            (uint64_t)sn * iq_row * sizeof(float));
-                    pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
-                            (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
-                            (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
-                    pulsar_gpu_tensor *sq_view = pulsar_gpu_tensor_view(g->batch_q,
-                            (uint64_t)s0 * q_dim * sizeof(float),
-                            (uint64_t)sn * q_dim * sizeof(float));
-                    pulsar_gpu_tensor *sh_view = pulsar_gpu_tensor_view(g->batch_heads,
-                            (uint64_t)s0 * q_dim * sizeof(float),
-                            (uint64_t)sn * q_dim * sizeof(float));
-                    /* Multiseq: per-span descriptor views (rows s0..s0+sn),
-                     * whole-pool cache operands, packed comp reads (decode
-                     * semantics — bit-identical to the f32 shadow by the
-                     * pack-dot contract in pulsar_cuda_attention.cu), and the
-                     * scalar raw span/start ignored (per-row derived). */
-                    pulsar_gpu_tensor *sp_view = mseq
-                        ? pulsar_gpu_tensor_view(g->batch_positions,
-                                              (uint64_t)s0 * sizeof(int32_t),
-                                              (uint64_t)sn * sizeof(int32_t))
-                        : NULL;
-                    pulsar_gpu_tensor *ss_view = mseq
-                        ? pulsar_gpu_tensor_view(g->batch_seq_id,
-                                              (uint64_t)s0 * sizeof(int32_t),
-                                              (uint64_t)sn * sizeof(int32_t))
-                        : NULL;
-                    ok = iq_view && iw_view && sq_view && sh_view &&
-                         (!mseq || (sp_view && ss_view));
-                    if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary(NULL,
-                                                                        il,
-                                                                        spos0,
-                                                                        sn,
-                                                                        n_comp,
-                                                                        &index_stage_t0);
-                    }
-                    if (ok) ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                                              iq_view,
-                                                                              iw_view,
-                                                                              mseq ? gpu_graph_bank_index_comp_pool(g, il)
-                                                                                   : g->layer_index_comp_cache[il],
-                                                                              n_comp,
-                                                                              sn,
-                                                                              spos0,
-                                                                              PULSAR_N_INDEXER_HEAD,
-                                                                              PULSAR_N_INDEXER_HEAD_DIM,
-                                                                              ratio,
-                                                                              index_scale,
-                                                                              sp_view, ss_view,
-                                                                              mseq ? gpu_graph_bank_index_comp_bases(g, il) : NULL,
-                                                                              mseq ? g->layer_comp_cap[il] : 0,
-                                                                              mseq ? nb : 1) != 0;
-                    if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary("score",
-                                                                        il,
-                                                                        spos0,
-                                                                        sn,
-                                                                        n_comp,
-                                                                        &index_stage_t0);
-                    }
-                    if (ok) {
-                        gpu_graph_debug_dump_tensor("indexer_scores",
-                                                      g->indexer_scores,
-                                                      (uint64_t)n_comp * sn,
-                                                      il,
-                                                      spos0);
-                    }
-                    if (ok) {
-                        ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
-                                                           g->indexer_scores,
-                                                           n_comp,
-                                                           sn,
-                                                           PULSAR_N_INDEXER_TOP_K) != 0;
-                        if (ok && index_stage_profile) {
-                            ok = gpu_graph_indexer_stage_profile_boundary("topk",
-                                                                            il,
-                                                                            spos0,
-                                                                            sn,
-                                                                            n_comp,
-                                                                            &index_stage_t0);
-                        }
-                        if (ok) {
-                            gpu_graph_debug_dump_i32_tensor("indexer_topk",
-                                                              g->comp_selected,
-                                                              (uint64_t)sn * PULSAR_N_INDEXER_TOP_K,
-                                                              il,
-                                                              spos0);
-                        }
-                    }
-                    if (ok) {
-                        ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
-                                                                                  model->map,
-                                                                                  model->size,
-                                                                                  layer->attn_sinks->abs_offset,
-                                                                                  sq_view,
-                                                                                  mseq ? gpu_graph_bank_raw_pool(g, il)
-                                                                                       : g->layer_raw_cache[il],
-                                                                                  span_comp_src,
-                                                                                  mseq ? 1u
-                                                                                       : (pk_native ? 1u : 0),
-                                                                                  g->comp_selected,
-                                                                                  sn,
-                                                                                  spos0,
-                                                                                  mseq ? 0 : s_n_raw,
-                                                                                  g->raw_cap,
-                                                                                  mseq ? 0 : s_raw_start,
-                                                                                  n_comp,
-                                                                                  PULSAR_N_INDEXER_TOP_K,
-                                                                                  g->raw_window,
-                                                                                  ratio,
-                                                                                  PULSAR_N_HEAD,
-                                                                                  PULSAR_N_HEAD_DIM,
-                                                                                  1u,
-                                                                                  sp_view, ss_view,
-                                                                                  mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
-                                                                                  mseq ? g->layer_comp_cap[il] : 0,
-                                                                                  mseq ? nb : 1) != 0;
-                        if (ok && index_stage_profile) {
-                            ok = gpu_graph_indexer_stage_profile_boundary("attention",
-                                                                            il,
-                                                                            spos0,
-                                                                            sn,
-                                                                            n_comp,
-                                                                            &index_stage_t0);
-                        }
-                    }
-                    pulsar_gpu_tensor_free(ss_view);
-                    pulsar_gpu_tensor_free(sp_view);
-                    pulsar_gpu_tensor_free(sh_view);
-                    pulsar_gpu_tensor_free(sq_view);
-                    pulsar_gpu_tensor_free(iw_view);
-                    pulsar_gpu_tensor_free(iq_view);
+                    ok = gpu_graph_indexed_attention_span(g, model, layer, il,
+                            s0, sn, spos0, iq_row, q_dim, n_comp, ratio, index_scale,
+                            mseq ? 0u : s_n_raw, mseq ? 0u : s_raw_start,
+                            &sop, index_stage_profile, true, &index_stage_t0);
                 }
             } else if (ok) {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
@@ -1812,107 +1839,24 @@ bool gpu_graph_encode_layer_attention_batch(
             pulsar_gpu_tensor *zspan_comp_src =
                 pk_native ? g->layer_attn_comp_cache[il]
                           : gpu_graph_attn_comp_read_cache(g, il, n_comp);
+            const struct gpu_graph_span_ops zsop = {
+                /* comp_src   */ zspan_comp_src,
+                /* raw_src    */ g->layer_raw_cache[il],
+                /* index_src  */ g->layer_index_comp_cache[il],
+                /* index_bases*/ NULL,
+                /* comp_bases */ NULL,
+                /* comp_pack  */ (uint32_t)(pk_native ? 1u : 0u),
+                /* comp_cap   */ 0u,
+                /* n_banks    */ 1u,
+                /* mseq       */ false,
+            };
             for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
-                pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_q,
-                        (uint64_t)s0 * ziq_row * sizeof(float),
-                        (uint64_t)sn * ziq_row * sizeof(float));
-                pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
-                        (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
-                        (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
-                pulsar_gpu_tensor *sq_view = pulsar_gpu_tensor_view(g->batch_q,
-                        (uint64_t)s0 * q_dim * sizeof(float),
-                        (uint64_t)sn * q_dim * sizeof(float));
-                pulsar_gpu_tensor *sh_view = pulsar_gpu_tensor_view(g->batch_heads,
-                        (uint64_t)s0 * q_dim * sizeof(float),
-                        (uint64_t)sn * q_dim * sizeof(float));
-                ok = iq_view && iw_view && sq_view && sh_view;
-                if (ok) ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                                          iq_view,
-                                                                          iw_view,
-                                                                          g->layer_index_comp_cache[il],
-                                                                          n_comp,
-                                                                          sn,
-                                                                          spos0,
-                                                                          PULSAR_N_INDEXER_HEAD,
-                                                                          PULSAR_N_INDEXER_HEAD_DIM,
-                                                                          ratio,
-                                                                          index_scale,
-                                                                          NULL, NULL, NULL, 0, 1) != 0;
-                if (ok && index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("score",
-                                                                    il,
-                                                                    spos0,
-                                                                    sn,
-                                                                    n_comp,
-                                                                    &index_stage_t0);
-                }
-                if (ok) {
-                    gpu_graph_debug_dump_tensor("indexer_scores",
-                                                  g->indexer_scores,
-                                                  (uint64_t)n_comp * sn,
-                                                  il,
-                                                  spos0);
-                }
-                if (ok) {
-                    ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
-                                                       g->indexer_scores,
-                                                       n_comp,
-                                                       sn,
-                                                       PULSAR_N_INDEXER_TOP_K) != 0;
-                    if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary("topk",
-                                                                        il,
-                                                                        spos0,
-                                                                        sn,
-                                                                        n_comp,
-                                                                        &index_stage_t0);
-                    }
-                    if (ok) {
-                        gpu_graph_debug_dump_i32_tensor("indexer_topk",
-                                                          g->comp_selected,
-                                                          (uint64_t)sn * PULSAR_N_INDEXER_TOP_K,
-                                                          il,
-                                                          spos0);
-                    }
-                }
-                if (ok) {
-                    ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(sh_view,
-                                                                              model->map,
-                                                                              model->size,
-                                                                              layer->attn_sinks->abs_offset,
-                                                                              sq_view,
-                                                                              g->layer_raw_cache[il],
-                                                                              zspan_comp_src,
-                                                                              pk_native ? 1u : 0,
-                                                                              g->comp_selected,
-                                                                              sn,
-                                                                              spos0,
-                                                                              s0 + sn,
-                                                                              g->raw_cap,
-                                                                              0,
-                                                                              n_comp,
-                                                                              PULSAR_N_INDEXER_TOP_K,
-                                                                              g->raw_window,
-                                                                              ratio,
-                                                                              PULSAR_N_HEAD,
-                                                                              PULSAR_N_HEAD_DIM,
-                                                                              1u,
-                                                                              NULL, NULL, NULL, 0, 1) != 0;
-                    if (ok && index_stage_profile) {
-                        ok = gpu_graph_indexer_stage_profile_boundary("attention",
-                                                                        il,
-                                                                        spos0,
-                                                                        sn,
-                                                                        n_comp,
-                                                                        &index_stage_t0);
-                    }
-                }
-                pulsar_gpu_tensor_free(sh_view);
-                pulsar_gpu_tensor_free(sq_view);
-                pulsar_gpu_tensor_free(iw_view);
-                pulsar_gpu_tensor_free(iq_view);
+                ok = gpu_graph_indexed_attention_span(g, model, layer, il,
+                        s0, sn, spos0, ziq_row, q_dim, n_comp, ratio, index_scale,
+                        s0 + sn, 0u,
+                        &zsop, index_stage_profile, false, &index_stage_t0);
             }
             if (ok) batch_attention_done = true;
         }
