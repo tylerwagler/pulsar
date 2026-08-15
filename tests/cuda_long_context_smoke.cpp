@@ -129,8 +129,6 @@ static int check_decode_attention_overflow_path(void) {
                                               comp,
                                               0,          /* comp_kv_pack */
                                               n_comp,
-                                              NULL,
-                                              0,
                                               n_head,
                                               head_dim,
                                               0) &&
@@ -605,7 +603,7 @@ static int mb_run_case(const char *label,
             ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                     heads, sinks, (uint64_t)n_head * sizeof(float), 0,
                     q, raw_slab, n_comp_superset ? comp_slab : NULL, 0,
-                    NULL, 0, n_rows, 0, window, raw_cap, 0,
+                    n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, window, ratio, n_head, head_dim, 0, 0,
                     positions, seq_id, NULL, comp_cap, n_banks);
         }
@@ -681,7 +679,7 @@ static int mb_run_case(const char *label,
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                         h_ref, sinks, (uint64_t)n_head * sizeof(float), 0,
                         q_ref, raw_view, row->ref_n_comp ? comp_view : NULL,
-                        0, NULL, 0,
+                        0,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, window, ratio, n_head, head_dim, 0, 0,
                         NULL, NULL, NULL, 0, 1);
@@ -852,7 +850,7 @@ static int check_multibank_decode_attention(void) {
                 pulsar_gpu_tensor_write(s2, 0, sid_host2, sizeof(sid_host2)) &&
                 pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                         h2, sinks, (uint64_t)n_head * sizeof(float), 0,
-                        q2, raw_slab, comp_slab, 0, NULL, 0,
+                        q2, raw_slab, comp_slab, 0,
                         2, 0, window, raw_cap, 0,
                         25, window, ratio, n_head, head_dim, 0, 0,
                         p2, s2, NULL, comp_cap, n_banks) &&
