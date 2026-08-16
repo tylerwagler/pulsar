@@ -428,8 +428,10 @@ static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *w
     }
     if (!equal) {
         fprintf(stderr, "  %s: WORST VALUE |delta| = %.3e"
-                        "   [~1e-3 => numeric drift, same data via a different"
-                        " kernel path;  O(1) => different data]\n",
+                        "   [magnitude does NOT separate drift from a leak here:"
+                        " a layer-0 perturbation changes MoE expert ROUTING, so the"
+                        " documented-benign batch-shape variance is O(1) too."
+                        " Localize by intervention, not by this number.]\n",
                 what, worst_value);
     }
     return equal;
