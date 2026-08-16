@@ -603,6 +603,11 @@ bool gpu_graph_encode_layer_attention_batch(
         return false;
     }
     const bool zero_prefix = pos0 == 0;
+    /* DIAGNOSTIC, REMOVE: disarm the grouped-activation cache at EVERY layer,
+     * not only inside the per-token fallback.  batch_heads keeps the same
+     * (ptr, n_tokens, n_groups, group_dim) key on every layer, so a layer that
+     * skips the fallback inherits the previous layer's `valid`. */
+    pulsar_gpu_mxfp8_gact_disarm();
     static int index_stage_env = -1, q_stage_env = -1;
     const bool index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
     const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
