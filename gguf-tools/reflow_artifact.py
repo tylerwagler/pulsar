@@ -216,6 +216,13 @@ def main():
     ap.add_argument('--verify', action='store_true',
                     help='re-read the output and check every tensor')
     ap.add_argument('--limit', type=int, help='stop after N tensors (smoke test)')
+    ap.add_argument('--pin', action='append', default=[], metavar='FAMILY',
+                    help='hold this family at its CURRENT type instead of the '
+                         'policy target. Repeatable. Used to build one-variable '
+                         'variants for bisecting a gate failure: pinning a '
+                         'family makes it byte-copy from the input, so the '
+                         'variant differs from the full reflow in exactly that '
+                         'family and nothing else.')
     a = ap.parse_args()
 
     ck = HFCheckpoint(a.hf)
@@ -245,6 +252,12 @@ def main():
                 want = TY.get(suffix_type(nm, len(t['dims'])))
             except Exception:
                 want = None
+        fam_now = nm.split('.', 2)[-1] if nm.startswith('blk.') else nm
+        if nm.startswith('dspark.'):
+            pp = nm.split('.')
+            fam_now = 'dspark.' + ('.'.join(pp[2:]) if pp[1].isdigit() else '.'.join(pp[1:]))
+        if fam_now in a.pin or nm in a.pin:
+            want = cur          # hold it where it is; falls into byte-copy below
         if want is None or want == cur:
             plan.append((t, None, t['in_span']))
             n_copied += 1
@@ -270,6 +283,8 @@ def main():
         new_off.append(total)
         total += nb + pad(nb)
 
+    if a.pin:
+        print('-- PINNED (held at their current type): %s' % ', '.join(a.pin))
     print('-- %d tensors: %d byte-copied, %d repacked in place, '
           '%d regenerated from source'
           % (len(plan), n_copied, n_repack, n_changed))
