@@ -1000,8 +1000,15 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulHeuristicResult_t h;
     };
-    static lt_shape_cache cache[16];
-    static int cache_next;
+    /* thread_local for the same reason as the dspark reduce buffers: round-robin
+     * eviction below DESTROYS the cuBLASLt descriptors in the slot it takes, so
+     * as a process global a second submitting thread could destroy handles this
+     * one is about to hand to cublasLtMatmul -- and `cache_next` is a plain
+     * non-atomic counter two threads would both advance onto the same slot.
+     * Per-thread costs one heuristic search per thread per shape; the entries
+     * are small metadata objects, not device memory. */
+    static thread_local lt_shape_cache cache[16];
+    static thread_local int cache_next;
     lt_shape_cache *e = NULL;
     for (int i = 0; i < 16; i++) {
         if (cache[i].valid && cache[i].in_dim == in_dim &&
@@ -1153,8 +1160,9 @@ static int cuda_attention_output_a_mx_gemm(
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulHeuristicResult_t h;
     };
-    static lt_group_cache cache[8];
-    static int cache_next;
+    /* thread_local -- same destroy-on-evict hazard as the shape cache above. */
+    static thread_local lt_group_cache cache[8];
+    static thread_local int cache_next;
     lt_group_cache *e = NULL;
     for (int i = 0; i < 8; i++) {
         if (cache[i].valid && cache[i].group_dim == group_dim && cache[i].rank == rank &&

@@ -235,17 +235,39 @@ int pulsar_gpu_dspark_markov_step_model(
     const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
 
-    /* Process-persistent reduce buffers, grown on demand: grid_dim is fixed for a
-     * given vocab, and this runs once per draft position per spec step -- per-call
-     * cudaMalloc/cudaFree pairs were 2 device-serializing allocs each. Single
-     * submission thread. Grouped into one struct (Pulsar C++ port, plan-70 TU
-     * dspark) -- same alloc sizes, free order, and grow-on-demand logic as the
-     * prior loose statics, so the launches are byte-identical. */
+    /* Persistent reduce buffers, grown on demand: grid_dim is fixed for a given
+     * vocab, and this runs once per draft position per spec step -- per-call
+     * cudaMalloc/cudaFree pairs were 2 device-serializing allocs each. Grouped
+     * into one struct (Pulsar C++ port, plan-70 TU dspark) -- same alloc sizes,
+     * free order, and grow-on-demand logic as the prior loose statics, so the
+     * launches are byte-identical.
+     *
+     * ⚠ THREAD_LOCAL, NOT STATIC, AND THAT IS THE WHOLE POINT.  As a process
+     * global this carried three separate hazards the moment a second thread
+     * submitted:
+     *   - the grow path is a read-modify-write on shared state, so two threads
+     *     both seeing grid_dim > rb.cap both free and both allocate: one set of
+     *     pointers is double-freed and the other leaks;
+     *   - a thread growing the buffers frees storage another thread's launched
+     *     kernel may still be reading;
+     *   - and worst because it does not crash: with NO growth at all, two
+     *     threads share the same reduction scratch and silently overwrite each
+     *     other's intermediates, i.e. wrong drafter output, not a fault.
+     * The old comment held this together with the words "Single submission
+     * thread" -- true today (cli_main.cpp creates exactly one worker), but an
+     * assumption, not a guarantee, and invisible from any call site.
+     *
+     * A mutex would be the wrong fix: guarding only the grow leaves the third
+     * hazard, and guarding the whole reduction serialises the drafter across
+     * sessions. Removing the sharing costs ~8 KB per submitting thread
+     * (grid_dim ~505 at vocab 129280) and makes the property structural.
+     * Same reason and same shape as the thread_local activation cache in
+     * pulsar_cuda_matmul.cu. */
     struct DsparkReduceBufs {
         pulsar_gpu_tensor *id, *val, *id2, *val2, *out;
         uint32_t cap;
     };
-    static DsparkReduceBufs rb = {};
+    static thread_local DsparkReduceBufs rb = {};
     if (grid_dim > rb.cap) {
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
