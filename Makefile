@@ -321,7 +321,17 @@ context-coherence-probe:
 # So: re-baseline whenever a numerics change SHIPS, and only then.  Between such
 # changes the gate is a true bit-exactness assertion, which is what makes a FAIL
 # worth acting on.
-PREFILL_BASELINE_REF ?= 3324bf4
+#
+# MOVED 3324bf4 -> 26e7569 on 2026-08-15.  Sixteen numerics changes shipped
+# between them and the gate was RED at every depth throughout, so it asserted
+# nothing -- exactly the rot the note above warns about, arrived at from the
+# other direction (not a too-old anchor, but a too-long deferral).  The shipped
+# changes: MXFP8 expert activations as the only arm, the E4M3 norm epilogues,
+# one comp-cache format each for attention (packed 584 B) and the indexer
+# (MXFP4 68 B), --quality and its five slow paths gone, TF32 unconditional,
+# and the n_tokens >= 128 attention floor removed at all three sites once the
+# stale-gact bug it was hiding was fixed (26e7569 itself).
+PREFILL_BASELINE_REF ?= 26e7569
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
