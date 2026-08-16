@@ -13,13 +13,23 @@ E2M1+E8M0 source):
     --experts cutlass_mxfp4 $(cat gguf-tools/dspark_type_flags.txt)
 Then splice into the main model with gguf-tools/merge_dspark_gguf.py.
 
-The dspark_type_flags.txt overrides are REQUIRED: the engine's
-dspark_weights_bind() expects exactly f32 norms/gates, fp8_e4m3 attention and
-shared-expert weights, and cutlass_mxfp4 routed experts. The quantizer's
-current defaults (native MXFP8_LT rework) produce mxfp8_lt/bf16/type-39 for
-these tensors and the resulting drafter will not load ("has type bf16,
-expected f32"). Gate every drafter build on a type-parity diff of 0 against a
-known-good drafter before merging.
+The dspark_type_flags.txt overrides are REQUIRED, but as of 2026-08-15 they no
+longer force f32 on the norms and gates. The engine reads bf16 for those now, so
+the pin was the wrong half: this template already emitted type 30 natively and
+the flags were overriding it back to f32 -- which cost 132 MB on the markov head
+alone, and the markov step streams all of markov_w2 every draft position, so it
+cost bandwidth too. The overrides that remain are the ones that carry real
+information: mxfp8_lt attention and shared experts, cutlass_mxfp4 routed
+experts, and f32 for the tensors that genuinely ARE f32 upstream (attn_sinks,
+hc_*_base/fn/scale).
+
+Which tensors are which was read from the checkpoint's own mtp.* dtypes, not
+assumed -- our dspark.* IS the source's mtp module.
+
+A drafter built with bf16 norms will NOT load on an engine older than that
+change; it fails with "has type bf16, expected f32". Gate every drafter build on
+a type-parity diff against a known-good drafter before merging, and expect
+exactly the 20 bf16 flips if you are comparing across that boundary.
 """
 import json, os, struct, sys
 

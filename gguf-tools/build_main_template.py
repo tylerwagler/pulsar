@@ -181,10 +181,26 @@ BF16_GROUP = {
 # item and an engine change, not a template type flip.
 
 
+# 1-D tensors the checkpoint holds in BF16. The rest of the 1-D set --
+# hc_*_base, hc_*_scale, attn_sinks, exp_probs_b -- really is f32 upstream and
+# stays F32, so this cannot be a blanket rule on ndim.
+#
+# Storing these f32 was never a fidelity question (f32 represents every bf16
+# value exactly); it just spent 0.95 MB carrying nothing. They are cheap to
+# move only because the engine reads bf16 norm weights directly -- widening
+# them back to f32 at load would cost more VRAM than the file saves.
+NORM_BF16 = {
+    'attn_norm.weight', 'ffn_norm.weight',
+    'attn_q_a_norm.weight', 'attn_kv_a_norm.weight',
+    'attn_compressor_norm.weight', 'indexer_compressor_norm.weight',
+    'output_norm.weight',
+}
+
+
 def suffix_type(ds4_name, ndim):
     suffix = ds4_name.split('.', 2)[-1] if ds4_name.startswith('blk.') else ds4_name
     if ndim <= 1:
-        return F32
+        return BF16 if suffix in NORM_BF16 else F32
     if suffix in DENSE_FP8:
         return FP8_E4M3
     if suffix in BF16_GROUP:
@@ -192,9 +208,14 @@ def suffix_type(ds4_name, ndim):
     if suffix == 'ffn_gate_tid2eid.weight':
         return I32
     if suffix == 'indexer.attn_q_b.weight':
-        # F8_E4M3 upstream; F16 holds every e4m3 value exactly, so this is
-        # lossless and only costs bytes. See the note above BF16_GROUP.
-        return F16
+        # F8_E4M3 upstream. Held F16 until 2026-08-15, which was lossless (f16
+        # represents every e4m3 code exactly) but cost 352 MB to store 181 MB of
+        # information -- the single largest above-source item in the model.
+        # ds4's FP8_E4M3 is MXFP8: E4M3 + a per-32 E8M0 scale. The source's
+        # scales are 128x128 blocks and 128 is a multiple of 32, so every per-32
+        # group lies wholly inside one source block and inherits its scale --
+        # the mantissas copy verbatim and the round trip is exact.
+        return FP8_E4M3
     if ds4_name == 'token_embd.weight':
         # Also BF16 upstream, but the engine pins this one to F16 on a separate
         # path (weights.cpp tensor_expect_layout(..., PULSAR_TENSOR_F16, ...)),
