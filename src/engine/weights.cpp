@@ -53,23 +53,16 @@ static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, u
 
 
 
-static void tensor_expect_layout(
+/* Shape half of the layout validators. Both callers check the TYPE their own
+ * way and then need exactly this; keeping one copy stops the two drifting, which
+ * is a live failure mode in this file (two banked emit blocks had silently
+ * stopped emitting dumps their classic twins still emitted). */
+static void tensor_expect_dims(
         const pulsar_tensor *t,
-        uint32_t          type,
         uint32_t          ndim,
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != type) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected %s\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type),
-                tensor_type_name(type));
-        exit(1);
-    }
     if (t->ndim != ndim) {
         fprintf(stderr,
                 "pulsar: tensor %.*s has %u dimensions, expected %u\n",
@@ -92,6 +85,27 @@ static void tensor_expect_layout(
                 want[i]);
         exit(1);
     }
+}
+
+
+static void tensor_expect_layout(
+        const pulsar_tensor *t,
+        uint32_t          type,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) pulsar_die("internal error: missing tensor while validating layout");
+    if (t->type != type) {
+        fprintf(stderr,
+                "pulsar: tensor %.*s has type %s, expected %s\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type),
+                tensor_type_name(type));
+        exit(1);
+    }
+    tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
 
@@ -350,28 +364,7 @@ static void tensor_expect_routed_expert(
                 tensor_type_name(t->type));
         exit(1);
     }
-    if (t->ndim != ndim) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
-    }
-
-    const uint64_t want[3] = { d0, d1, d2 };
-    for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "pulsar: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
-    }
+    tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
 

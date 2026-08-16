@@ -737,14 +737,25 @@ __global__ static void attn_pack_repack_kernel(const float *x, uint8_t *out, uin
 
 
 
-__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+/* The QAT transform both indexer FP4 kernels run before they diverge: the
+ * 128-point Hadamard butterfly, the 1/sqrt(128) scaling, and the per-32-block
+ * absmax left in absbuf[block_base].  Returns this thread's transformed value.
+ *
+ * The packing kernel's contract is that it writes a BIT-IDENTICAL f32 result to
+ * the unpacked one, and two hand-kept copies of this code is exactly how such a
+ * contract rots silently.  One copy makes it structural.
+ *
+ * Called by all 128 threads of the block, after the kernels' own bounds check --
+ * the __syncthreads() below are as uniform here as they were when inlined. */
+struct indexer_had_t {
+    float    v;           /* this thread's transformed value */
+    uint32_t fp4_block;   /* which 32-wide FP4 block it lands in */
+    uint32_t lane;        /* its lane within that block */
+    uint32_t block_base;  /* absbuf[block_base] holds the block's absmax */
+};
 
-    __shared__ float vals[128];
-    __shared__ float absbuf[128];
-    float *xr = x + (uint64_t)row * head_dim;
+__device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
+        const float *xr, uint32_t tid, float *vals, float *absbuf) {
     vals[tid] = xr[tid];
     __syncthreads();
 
@@ -773,10 +784,23 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
         }
         __syncthreads();
     }
+    return { v, fp4_block, lane, block_base };
+}
 
-    float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
+
+__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
+    uint32_t row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+
+    __shared__ float vals[128];
+    __shared__ float absbuf[128];
+    float *xr = x + (uint64_t)row * head_dim;
+    indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
+
+    float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
     float scale = exp2f(ceilf(log2f(amax / 6.0f)));
-    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale))) * scale;
 }
 
 /* Same QAT transform as indexer_hadamard_fp4_kernel (bit-identical f32 result
@@ -795,47 +819,20 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
     __shared__ float absbuf[128];
     __shared__ uint8_t nib_sh[128];
     float *xr = x + (uint64_t)row * head_dim;
-    vals[tid] = xr[tid];
-    __syncthreads();
+    indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
 
-    for (uint32_t stride = 1u; stride < 128u; stride <<= 1u) {
-        if ((tid & stride) == 0u) {
-            uint32_t base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
-            float a = vals[base];
-            float b = vals[base + stride];
-            vals[base] = a + b;
-            vals[base + stride] = a - b;
-        }
-        __syncthreads();
-    }
-
-    float v = vals[tid] * 0.08838834764831845f;
-    uint32_t fp4_block = tid >> 5u;
-    uint32_t lane = tid & 31u;
-    uint32_t block_base = fp4_block * 32u;
-    absbuf[tid] = fabsf(v);
-    __syncthreads();
-
-    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            absbuf[block_base + lane] = fmaxf(absbuf[block_base + lane],
-                                              absbuf[block_base + lane + stride]);
-        }
-        __syncthreads();
-    }
-
-    float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
+    float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
     int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
     e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
     float scale = exp2f((float)(e8 - 127));
-    uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, v / scale)));
+    uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
     xr[tid] = dsv4_e2m1fn_decode_dev(nib, scale);
     nib_sh[tid] = nib;
     __syncthreads();
 
     uint8_t *outr = out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u);
     if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
-    if (lane == 0u) outr[64u + fp4_block] = (uint8_t)e8;
+    if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
 }
 
 

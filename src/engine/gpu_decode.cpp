@@ -659,9 +659,9 @@ bool gpu_graph_encode_decode_layer(
         }
         if (ok) {
             /* The F16 pair fast path is gone with the last F16 weight. It was
-             * never a fusion -- two sequential matmul_f16 calls, and
-             * matmul_f16_kernel is structurally identical to the bf16 one, so
-             * this costs nothing measurable. */
+             * never a fusion -- two sequential calls, and the f16 and bf16
+             * kernels were structurally identical, so this costs nothing
+             * measurable. */
             ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
                                                 layer->attn_compressor_kv,
                                                 PULSAR_N_EMBD, comp_width,

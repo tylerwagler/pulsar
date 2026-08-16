@@ -926,6 +926,9 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
  * The decode graph ran, three times per token per layer-pair:
  *     rms_norm_plain_tensor(flat_hc, cur_hc, hc_dim)      // grid 1  x 256
  *     matmul_f16_tensor(hc_mix, hc_attn_fn, flat_hc, 1)   // grid 24 x 256
+ * (that second call is the GEMV of the day; the f16 weight path was deleted in
+ * the F16 sweep and the entry point is now pulsar_gpu_matmul_bf16_tensor.  The
+ * argument shape and the reduction it performs are unchanged.)
  * On a 48-SM GB10 that is one SM followed by 24 SMs, with a 64 KB f32 store and
  * a 24-way re-read of it in between, for 24 (or 4, at the output head) dot
  * products.  The nsys profile put the pair at ~5.4% of decode; the GEMV alone
@@ -950,7 +953,11 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
  *     the register that held that same f32.  Store/load of an f32 is the
  *     identity, so the multiplicand is bit-identical.
  *   - The dot product keeps the same 256 partials over the same index subsets
- *     in the same order and the same pairwise tree as matmul_f16_kernel.
+ *     in the same order and the same pairwise tree as the generic GEMV --
+ *     matmul_f16_kernel when this was written, matmul_bf16_kernel and
+ *     matmul_f32_kernel today.  All of them stride thread t over
+ *     {t, t+BLK, ...}, land in a 256-entry shared partial[], and fold it with
+ *     the same halving tree, so the contract survived the f16 deletion.
  * There is no split-K, no atomic, and no cross-thread re-association anywhere.
  * ------------------------------------------------------------------------- */
 template <uint32_t BLK, uint32_t UNROLL, typename WT>
@@ -989,7 +996,7 @@ __global__ static void hc_norm_mix_kernel(
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     __syncthreads();   /* partial[] is reused below */
 
-    /* stage 2: dot(w[row], normed x) -- same order as matmul_f16_kernel */
+    /* stage 2: dot(w[row], normed x) -- same order as the generic GEMV */
     const WT *wr = w + (uint64_t)row * n;
     float dot = 0.0f;
     i = tid;
@@ -1001,7 +1008,7 @@ __global__ static void hc_norm_mix_kernel(
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) wv[u] = pulsar_wt_load(wr, i + u * BLK);
         /* pinned roundings: __fmul_rn reproduces the f32 that rms_norm_plain
-         * stored into flat_hc, __fmaf_rn reproduces matmul_f16_kernel's
+         * stored into flat_hc, __fmaf_rn reproduces the generic GEMV's
          * contracted `sum += w * x`.  Written explicitly so no future
          * contraction/reassociation decision by nvcc can silently move this
          * off byte-identical. */

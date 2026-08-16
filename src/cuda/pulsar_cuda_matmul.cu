@@ -778,10 +778,6 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
 }
 
 
-/* Reserve the cache's f16 slot for (n_tok, in_dim) and hand back the device
- * pointer, so a PRODUCER kernel can write that encoding straight out of its own
- * epilogue.  Used with note_f16() below: reserve -> produce -> arm -> note. */
-
 /* Reserve the cache's E4M3 slots for (n_tok, in_dim) and hand back BOTH device
  * pointers, so a PRODUCER kernel can emit the MX encoding from its own epilogue
  * instead of a separate pass reading the f32 back.  `sf_pitch` returns the KBp
@@ -905,13 +901,6 @@ void pulsar_gpu_mxfp8_gact_disarm(void) {
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
     if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid = 1;
 }
-
-/* Declare the f16 encoding current.  arm() clears both validity bits because it
- * cannot know what is in the slot; this says "the producer already filled it". */
-
-/* As note_f16(), but also records that the producer skipped the f32 store, so
- * the f16 copy is the ONLY one.  Every f32 reader of this buffer below asserts
- * against this rather than silently consuming a store that was never made. */
 
 
 
@@ -1048,11 +1037,6 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
 }
 
 
-int pulsar_gpu_matmul_fp8_mx_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
-                                             in_dim, out_dim, x, n_tok, "fp8_mx");
-}
 
 
 
