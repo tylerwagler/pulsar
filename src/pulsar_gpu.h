@@ -126,9 +126,7 @@ int pulsar_gpu_embed_token_hc_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd,
-        uint32_t          n_hc,
-        /* token_embd storage: 1 = bf16 (source), 0 = f16 */
-        int w_bf16);
+        uint32_t          n_hc);
 
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
@@ -139,8 +137,7 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc,
-        int                    w_bf16);
+        uint32_t                n_hc);
 
 int pulsar_gpu_indexer_score_one_tensor(
         pulsar_gpu_tensor       *scores,
@@ -324,9 +321,6 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
  * results are bit-identical either way.
  */
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
-void *pulsar_gpu_mxfp8_act_cache_f16_slot(const pulsar_gpu_tensor *x,
-                                          uint64_t n_tok, uint64_t in_dim);
-void pulsar_gpu_mxfp8_act_cache_note_f16(void);
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
 /* Optional fused GPU operations.
@@ -361,15 +355,6 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         const pulsar_gpu_tensor *x,
         float                   clamp);
 
-int pulsar_gpu_matmul_f16_tensor(
-        pulsar_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
 
 /* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
  * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
@@ -394,17 +379,6 @@ int pulsar_gpu_matmul_bf16_tensor(
         uint64_t                n_tok);
 
 
-int pulsar_gpu_matmul_f16_pair_tensor(
-        pulsar_gpu_tensor       *out_a,
-        pulsar_gpu_tensor       *out_b,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_a_offset,
-        uint64_t                weight_b_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
 
 int pulsar_gpu_matmul_f32_tensor(
         pulsar_gpu_tensor       *out,
@@ -442,7 +416,6 @@ int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_
 
 /* True only when the plain-F16 matmul is guaranteed to consume the CACHED f16
  * activation, so the producer may skip its f32 store.  Conservative by design. */
-int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok);
 
 /* note_f16(), plus a record that the f32 store was skipped so f32 readers of
  * that buffer fail loudly instead of consuming a store that never happened. */
@@ -470,7 +443,6 @@ void pulsar_gpu_mxfp8_gact_disarm(void);
 /* Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 
-void pulsar_gpu_mxfp8_act_cache_note_f16_only(void);
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,

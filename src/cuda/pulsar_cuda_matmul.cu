@@ -2,30 +2,26 @@
 
 
 
-/* WBF16: token_embd storage, F16 or BF16 -- NOT f32. Both are 2 bytes, so every
- * size check around this is right for either and only the decode differs, which
- * is why this must use the f16_or_bf16 loader. It briefly used the f32_or_bf16
- * one: same bf16 branch, but a false branch that reads 4 bytes per element off a
- * 2-byte table, walking a gigabyte past the end. It faulted asynchronously, so
- * the error surfaced in the next unrelated CUDA call and looked like an
- * out-of-memory failure rather than a bad read. */
-template <bool WBF16>
-__global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const void *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+/* token_embd is BF16 (source format). It was F16 until 2026-08-16, and briefly
+ * read through a loader whose non-bf16 branch decoded F32 -- 4 bytes per element
+ * off a 2-byte table, a gigabyte past the end, faulting asynchronously so the
+ * error surfaced in an unrelated CUDA call. Typed pointer now: a width mismatch
+ * is a compile error. */
+__global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const __nv_bfloat16 *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
     uint32_t e = i % n_embd;
     uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
-    pulsar_hc_store(out, i, pulsar_w_load_f16_or_bf16<WBF16>(w, (uint64_t)tok * n_embd + e));
+    pulsar_hc_store(out, i, pulsar_wt_load(w, (uint64_t)tok * n_embd + e));
 }
 
 
 
-template <bool WBF16>
 __global__ static void embed_tokens_hc_kernel(
         pulsar_hc_t *out,
         const int32_t *tokens,
-        const void *w,
+        const __nv_bfloat16 *w,
         uint32_t n_vocab,
         uint32_t n_tokens,
         uint32_t n_embd,
@@ -39,45 +35,18 @@ __global__ static void embed_tokens_hc_kernel(
     int32_t tok_i = tokens[t];
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
-    pulsar_hc_store(out, gid, pulsar_w_load_f16_or_bf16<WBF16>(w, (uint64_t)tok * n_embd + d));
+    pulsar_hc_store(out, gid, pulsar_wt_load(w, (uint64_t)tok * n_embd + d));
 }
 
 
 
-__global__ static void matmul_f16_kernel(
-        float *out,
-        const __half *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-
-    float sum = 0.0f;
-    const __half *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += __half2float(wr[i]) * xr[i];
-    }
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
-}
 
 
 /* Small-batch (2..4 token) f16 GEMV: one weight-row read serves all NT tokens,
  * replacing the cuBLAS GemmEx path which is latency-bound at these shapes and
  * needs an f32->f16 activation convert + tmp alloc per call. Per-token loop
- * structure and shared-memory reduction match matmul_f16_kernel exactly, so each
- * token's output is bit-identical to the n=1 kernel run on that token alone. */
+ * structure and shared-memory reduction match the n=1 kernel exactly, so each
+ * token's output is bit-identical to that kernel run on the token alone. */
 /* Weight load for the nt kernel, one overload per storage. Overloads rather
  * than a bool template: the pointer type IS the contract, so a mismatched
  * width cannot be passed silently (which is exactly how the embed kernels came
@@ -148,10 +117,6 @@ __global__ static void matmul_f32_kernel(
 
 
 
-__global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2half(x[i]);
-}
 
 
 
@@ -471,7 +436,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 
 
-int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc, int w_bf16) {
+int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
     /* The kernel writes n_embd*n_hc carrier samples; validate like the batched
      * sibling does. Before the BF16 narrowing an undersized out_hc still had 2x
@@ -482,10 +447,8 @@ int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    if (w_bf16)
-        embed_token_hc_kernel<true><<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, wptr, token, n_vocab, n_embd, n_hc);
-    else
-        embed_token_hc_kernel<false><<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, wptr, token, n_vocab, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+            (const __nv_bfloat16 *)wptr, token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -500,8 +463,7 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc,
-        int                     w_bf16) {
+        uint32_t                n_hc) {
     if (!out_hc || !tokens_t || !model_map ||
         weight_offset > model_size ||
         (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
@@ -514,15 +476,11 @@ int pulsar_gpu_embed_tokens_hc_tensor(
                                             "token_embd");
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-#define PULSAR_EMBED_LAUNCH(NW)                             \
-    embed_tokens_hc_kernel<NW><<<(n + 255) / 256, 256>>>(   \
-        (pulsar_hc_t *)out_hc->ptr,                         \
-        (const int32_t *)tokens_t->ptr,                     \
-        wptr,                                               \
-        n_vocab, n_tokens, n_embd, n_hc)
-    if (w_bf16) PULSAR_EMBED_LAUNCH(true);
-    else        PULSAR_EMBED_LAUNCH(false);
-#undef PULSAR_EMBED_LAUNCH
+    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+        (pulsar_hc_t *)out_hc->ptr,
+        (const int32_t *)tokens_t->ptr,
+        (const __nv_bfloat16 *)wptr,
+        n_vocab, n_tokens, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 
@@ -713,7 +671,6 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  *
  * TWO ENCODINGS, ONE ARMING.  The same activation also feeds F16 cuBLAS GEMMs
  * (this model stores the compressor/indexer projections as F16 while q_a/kv are
- * MXFP8), and pulsar_gpu_matmul_f16_tensor re-runs f32_to_f16_kernel over the whole
  * activation on every call for exactly the same reason.  That conversion is
  * likewise pure, so the cache carries an f16 copy alongside the MXFP8 one and
  * both are filled lazily -- a layer pays for only the encodings it actually
@@ -743,15 +700,10 @@ struct mxfp8_act_cache_t {
     uint64_t       key_ntok;
     uint64_t       key_in_dim;
     int            valid;        /* xq/sx hold the MXFP8 quant of that (ptr,shape) */
-    int            valid_h;      /* xh holds the f16 conversion of that (ptr,shape) */
-    int            f32_absent;   /* producer skipped the f32 store: xh is the ONLY
-                                  * copy, and any f32 read of key_ptr is a bug */
     __nv_fp8_e4m3 *xq;
     size_t         xq_cap;
     unsigned char *sx;
     size_t         sx_cap;
-    __half        *xh;
-    size_t         xh_cap;
     int            valid_b;      /* xb holds the bf16 conversion of that (ptr,shape) */
     __nv_bfloat16 *xb;
     size_t         xb_cap;
@@ -792,7 +744,7 @@ static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint
         s->key_in_dim = in_dim;
         s->lru        = ++g_act_clock;
     }
-    s->valid = 0; s->valid_h = 0; s->valid_b = 0; s->f32_absent = 0;
+    s->valid = 0; s->valid_b = 0;
     return s;
 }
 
@@ -804,9 +756,7 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void) {
     for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
         g_act_slots[i].key_ptr    = NULL;
         g_act_slots[i].valid      = 0;
-        g_act_slots[i].valid_h    = 0;
         g_act_slots[i].valid_b    = 0;
-        g_act_slots[i].f32_absent = 0;
     }
     g_act_cur = NULL;
 }
@@ -831,17 +781,6 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
 /* Reserve the cache's f16 slot for (n_tok, in_dim) and hand back the device
  * pointer, so a PRODUCER kernel can write that encoding straight out of its own
  * epilogue.  Used with note_f16() below: reserve -> produce -> arm -> note. */
-void *pulsar_gpu_mxfp8_act_cache_f16_slot(const pulsar_gpu_tensor *x,
-                                          uint64_t n_tok, uint64_t in_dim) {
-    if (!x || n_tok == 0 || in_dim == 0) return NULL;
-    mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
-    if (!s) return NULL;
-    if (!mxfp8_act_cache_reserve((void **)&s->xh, &s->xh_cap,
-                                 (size_t)(n_tok * in_dim) * sizeof(__half), "act f16")) {
-        return NULL;
-    }
-    return s->xh;
-}
 
 /* Reserve the cache's E4M3 slots for (n_tok, in_dim) and hand back BOTH device
  * pointers, so a PRODUCER kernel can emit the MX encoding from its own epilogue
@@ -969,26 +908,11 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
 
 /* Declare the f16 encoding current.  arm() clears both validity bits because it
  * cannot know what is in the slot; this says "the producer already filled it". */
-void pulsar_gpu_mxfp8_act_cache_note_f16(void) {
-    if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid_h = 1;
-}
 
 /* As note_f16(), but also records that the producer skipped the f32 store, so
  * the f16 copy is the ONLY one.  Every f32 reader of this buffer below asserts
  * against this rather than silently consuming a store that was never made. */
-void pulsar_gpu_mxfp8_act_cache_note_f16_only(void) {
-    if (g_act_cur && g_act_cur->key_ptr) { g_act_cur->valid_h = 1; g_act_cur->f32_absent = 1; }
-}
 
-/* Any slot claiming this buffer has no f32 copy makes an f32 read a bug --
- * scan them all, not just the last armed one. */
-static int act_cache_f32_missing(const void *xp) {
-    if (!xp) return 0;
-    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
-        if (g_act_slots[i].key_ptr == xp && g_act_slots[i].f32_absent) return 1;
-    }
-    return 0;
-}
 
 
 static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -1000,15 +924,6 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
-    /* This path quantizes FROM the f32 activation.  A producer that skipped its
-     * f32 store (see pulsar_gpu_matmul_plain_uses_f16_act) would be quantized
-     * from memory nobody wrote -- refuse loudly instead. */
-    if (act_cache_f32_missing(x->ptr)) {
-        fprintf(stderr, "pulsar: mxfp8 matmul '%s' needs the f32 activation but the "
-                        "producer emitted f16 only (n_tok=%llu, in_dim=%llu)\n",
-                label ? label : "?", (unsigned long long)n_tok, (unsigned long long)in_dim);
-        return 0;
-    }
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
     size_t sx_bytes = (size_t)mx_rup(ntok, 128) * KBp;
     size_t wz = 32u << 20;
@@ -1570,12 +1485,6 @@ int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
  * that consumes the cached f16 activation.  Deliberately conservative: a mixed
  * batch splits into a <=8-row decode prefix that runs the NT kernel straight
  * off the f32 buffer, so any m-neutral split disqualifies the whole call. */
-int pulsar_gpu_matmul_plain_uses_f16_act(uint64_t n_tok) {
-    if (!g_cublas_ready) return 0;
-    if (g_mneutral_rows > 0) return 0;   /* prefix/suffix split -> f32 NT path */
-    if (n_tok <= 8) return 0;            /* NT cap is 8; n_tok<=1 also f32 */
-    return 1;
-}
 
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
@@ -1877,124 +1786,6 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 
 
-int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map) return 0;
-    /* inc 4 prefix-split (see the mxfp8 twin): decode prefix [0,n_dec) custom-nt,
-     * prefill suffix [n_dec,n_tok) cuBLAS tensor-core, via pure-regime recursion. */
-    {
-        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
-        if (n_dec > 0 && n_dec < n_tok) {
-            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
-                                       out->bytes - n_dec * outb, 0 };
-            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
-                                       x->bytes - n_dec * inb, 0 };
-            const int saved = g_mneutral_rows;
-            g_mneutral_rows = (int)n_dec;
-            int r1 = pulsar_gpu_matmul_f16_tensor(&out_pre, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
-            g_mneutral_rows = 0;
-            int r2 = pulsar_gpu_matmul_f16_tensor(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
-            g_mneutral_rows = saved;
-            return r1 && r2;
-        }
-    }
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    /* The producer may have skipped this buffer's f32 store because
-     * pulsar_gpu_matmul_plain_uses_f16_act() promised the cuBLAS branch below.
-     * If we are about to take any other branch, that promise was wrong: fail
-     * loudly rather than multiply whatever happens to be in the f32 buffer. */
-    if (act_cache_f32_missing(x->ptr) && !pulsar_gpu_matmul_plain_uses_f16_act(n_tok)) {
-        fprintf(stderr, "pulsar: matmul_f16 needs the f32 activation but the producer "
-                        "emitted f16 only (n_tok=%llu, mneutral=%d)\n",
-                (unsigned long long)n_tok, g_mneutral_rows);
-        return 0;
-    }
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
-    if (!wptr) return 0;
-    const __half *w = (const __half *)wptr;
-    /* Small batches (spec-decode verify, n_tok 2..4): batched f16 GEMV. One
-     * weight-row read serves all tokens and there is no f32->f16 activation
-     * convert or tmp alloc; per-token output is bit-identical to the n=1
-     * matmul_f16_kernel. */
-    /* 2026-07-21: raising to 8 was TRIED and REVERTED, same as the mxfp8 twin
-     * above. This one is the clearest case: the cuBLAS side converts activations
-     * to __half for cublasGemmEx while the GEMV stays f32, so the two dispatches
-     * were never going to agree. Measured non-bit-exact at widths 6 and 8. */
-    static const int f16_gemv_max_n = 4;
-    /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
-     * mxfp8 twin). Default cap 4 for prefill / decode-only (identical cases 2/3/4). */
-    const uint64_t f16_nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)f16_gemv_max_n;
-    if (n_tok >= 2 && n_tok <= f16_nt_cap && n_tok <= 8) {
-        dim3 g((unsigned)out_dim);
-        #define PULSAR_F16_NT(N) matmul_nt_kernel<N, __half><<<g, 256>>>( \
-                (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
-        switch (n_tok) {
-        case 2: PULSAR_F16_NT(2); break;
-        case 3: PULSAR_F16_NT(3); break;
-        case 4: PULSAR_F16_NT(4); break;
-        case 5: PULSAR_F16_NT(5); break;
-        case 6: PULSAR_F16_NT(6); break;
-        case 7: PULSAR_F16_NT(7); break;
-        default: PULSAR_F16_NT(8); break;   /* n_tok == 8 */
-        }
-        #undef PULSAR_F16_NT
-        return cuda_ok(cudaGetLastError(), "matmul_f16 nt launch");
-    }
-    if (g_cublas_ready && n_tok > 1) {
-        const uint64_t xh_count = n_tok * in_dim;
-        /* Armed activation cache: this f32 tensor feeds several F16 projections
-         * per layer and the conversion is pure, so run it once (see
-         * mxfp8_act_cache_t -- and note the cached copy must live outside the
-         * shared cuda_tmp scratch, which unrelated kernels overwrite between
-         * those calls). */
-        mxfp8_act_cache_t *hc = act_slot_find(x->ptr, n_tok, in_dim);
-        if (hc && !mxfp8_act_cache_reserve((void **)&hc->xh, &hc->xh_cap,
-                                           xh_count * sizeof(__half), "act f16")) {
-            hc = NULL;
-        }
-        __half *xh = hc ? hc->xh
-                        : (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
-        if (!xh) return 0;
-        if (!hc || !hc->valid_h) {
-            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
-            if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
-            if (hc) hc->valid_h = 1;
-        }
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmEx(g_cublas,
-                                         CUBLAS_OP_T,
-                                         CUBLAS_OP_N,
-                                         (int)out_dim,
-                                         (int)n_tok,
-                                         (int)in_dim,
-                                         &alpha,
-                                         w,
-                                         CUDA_R_16F,
-                                         (int)in_dim,
-                                         xh,
-                                         CUDA_R_16F,
-                                         (int)in_dim,
-                                         &beta,
-                                         out->ptr,
-                                         CUDA_R_32F,
-                                         (int)out_dim,
-                                         CUDA_R_32F,
-                                         CUBLAS_GEMM_DEFAULT);
-        return cublas_ok(st, "f16 matmul");
-    }
-    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-    return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
-}
 
 
 
@@ -2102,26 +1893,6 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
 
 
 
-int pulsar_gpu_matmul_f16_pair_tensor(
-        pulsar_gpu_tensor *out0,
-        pulsar_gpu_tensor *out1,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight0_offset,
-        uint64_t weight1_offset,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t n_tok) {
-    if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
-        return 0;
-    }
-    /* Two separate coalesced matmuls (each fast via matmul_f16_kernel). */
-    return pulsar_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
-                                       in_dim, out_dim, x, n_tok) &&
-           pulsar_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
-                                       in_dim, out_dim, x, n_tok);
-}
 
 
 
