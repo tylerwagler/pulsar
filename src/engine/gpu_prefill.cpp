@@ -603,10 +603,23 @@ bool gpu_graph_encode_layer_attention_batch(
         return false;
     }
     const bool zero_prefix = pos0 == 0;
-    /* DIAGNOSTIC, REMOVE: disarm the grouped-activation cache at EVERY layer,
-     * not only inside the per-token fallback.  batch_heads keeps the same
-     * (ptr, n_tokens, n_groups, group_dim) key on every layer, so a layer that
-     * skips the fallback inherits the previous layer's `valid`. */
+    /* ⚠ DISARM THE GROUPED-ACTIVATION CACHE FIRST, EVERY LAYER.
+     * g_gact is a single-entry cache keyed on (batch_heads->ptr, n_tokens,
+     * n_groups, group_dim).  Every layer of a prefill shares that pointer and
+     * those dims, so the key is IDENTICAL across all 43 layers: a layer that
+     * reaches attention through an arm which never re-slots the cache would
+     * otherwise inherit the previous layer's `valid` and hand the "a" GEMM
+     * layer N-1's activations -- the [[L035]] / C1 stale-cache failure, a hit
+     * that is well-formed, current-shaped, and wrong.
+     *
+     * This lived inside the per-token fallback until 2026-08-15, so only that
+     * arm was protected.  It was reachable: a 62-token prefill gives ratio-128
+     * layers n_comp == 0, no arm claims the batch, the fallback runs and notes
+     * the cache, and the next ratio-4 layer takes the static-mixed arm and
+     * skips the disarm.  The n_tokens >= 128 floor on the raw launcher was
+     * suppressing it by keeping fp16 -- the only producer that sets *mx_out --
+     * off that path at small batch.  Caught by multiseq_frontier_gate S1
+     * populate-order invariance. */
     pulsar_gpu_mxfp8_gact_disarm();
     static int index_stage_env = -1, q_stage_env = -1;
     const bool index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
@@ -1907,13 +1920,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * wrong answer, not a slow one -- so the fusion is refused rather
          * than partially applied.  (Threading the indexed per-token path is
          * the follow-up that lifts this restriction.) */
-        /* ⚠ DISARM FIRST, UNCONDITIONALLY.  batch_heads keeps the SAME
-         * (ptr, n_tokens, n_groups, group_dim) key on every layer, so a layer
-         * that takes the ineligible path below would otherwise inherit the
-         * previous layer's `valid` and hand the "a" GEMM layer N-1's
-         * activations.  That is the [[L035]] / C1 stale-cache failure exactly:
-         * a hit that is well-formed, current-shaped, and wrong. */
-        pulsar_gpu_mxfp8_gact_disarm();
+        /* (the cache was disarmed for this layer at the top of the encode) */
         if (ok && raw_prefix_tokens == n_tokens &&
             !pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
                                         &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
