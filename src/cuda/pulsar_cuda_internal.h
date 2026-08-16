@@ -182,6 +182,17 @@ __device__ __forceinline__ static float pulsar_w_load_f32_or_bf16(const void *w,
     else                return ((const float *)w)[i];
 }
 
+/* Typed weight load: the POINTER carries the storage, so a mismatched width is
+ * a compile error rather than a silent wrong-width read. Prefer these over the
+ * bool-templated void* pair above for anything newly written -- that pair is
+ * what let the embed kernels read an f16 table as f32 on 2026-08-15. */
+__device__ __forceinline__ static float pulsar_wt_load(const float *p, uint64_t i) { return p[i]; }
+__device__ __forceinline__ static float pulsar_wt_load(const __half *p, uint64_t i) { return __half2float(p[i]); }
+__device__ __forceinline__ static float pulsar_wt_load(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
+
+/* Bytes per element of the above, for the range checks that accompany them. */
+__host__ __device__ __forceinline__ static uint64_t pulsar_wt_bytes_f32(void) { return 4; }
+
 template <bool BF16>
 __device__ __forceinline__ static float pulsar_w_load_f16_or_bf16(const void *w, uint64_t i) {
     if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);

@@ -82,10 +82,6 @@ __global__ static void matmul_f16_kernel(
  * than a bool template: the pointer type IS the contract, so a mismatched
  * width cannot be passed silently (which is exactly how the embed kernels came
  * to read an f16 table as f32 on 2026-08-15). */
-__device__ __forceinline__ static float nt_wload(const __half *p, uint64_t i) { return __half2float(p[i]); }
-__device__ __forceinline__ static float nt_wload(const float *p, uint64_t i) { return p[i]; }
-__device__ __forceinline__ static float nt_wload(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
-
 template <int NT, typename WT>
 __global__ static void matmul_nt_kernel(
         float *out,
@@ -101,7 +97,7 @@ __global__ static void matmul_nt_kernel(
     for (int t = 0; t < NT; t++) sum[t] = 0.0f;
     const WT *wr = w + row * in_dim;
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float wv = nt_wload(wr, i);
+        const float wv = pulsar_wt_load(wr, i);
         #pragma unroll
         for (int t = 0; t < NT; t++) sum[t] += wv * x[t * in_dim + i];
     }

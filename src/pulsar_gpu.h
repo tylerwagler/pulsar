@@ -1385,7 +1385,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
  * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
  * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
  * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32. */
-int pulsar_gpu_hc_norm_mix_f16_tensor(
+int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1393,7 +1393,11 @@ int pulsar_gpu_hc_norm_mix_f16_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        float                   eps);
+        float                   eps,
+        /* ds4 tensor type of the mix weight: 1 F16, 30 BF16, 0 F32.
+         * Templated rather than F16-gated -- the fusion is about avoiding a
+         * scratch round trip, not about the weight being 2 bytes. */
+        uint32_t                w_type);
 
 int pulsar_gpu_output_hc_weights_tensor(
         pulsar_gpu_tensor       *out,

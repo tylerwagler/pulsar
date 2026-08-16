@@ -957,10 +957,10 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
  *     in the same order and the same pairwise tree as matmul_f16_kernel.
  * There is no split-K, no atomic, and no cross-thread re-association anywhere.
  * ------------------------------------------------------------------------- */
-template <uint32_t BLK, uint32_t UNROLL>
-__global__ static void hc_norm_mix_f16_kernel(
+template <uint32_t BLK, uint32_t UNROLL, typename WT>
+__global__ static void hc_norm_mix_kernel(
         float *out,
-        const __half *w,
+        const WT *w,
         const pulsar_hc_t *x,
         uint32_t n,
         uint32_t out_dim,
@@ -994,7 +994,7 @@ __global__ static void hc_norm_mix_f16_kernel(
     __syncthreads();   /* partial[] is reused below */
 
     /* stage 2: dot(w[row], normed x) -- same order as matmul_f16_kernel */
-    const __half *wr = w + (uint64_t)row * n;
+    const WT *wr = w + (uint64_t)row * n;
     float dot = 0.0f;
     i = tid;
     for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
@@ -1003,7 +1003,7 @@ __global__ static void hc_norm_mix_f16_kernel(
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) xv[u] = pulsar_hc_load(x, i + u * BLK);
         #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) wv[u] = __half2float(wr[i + u * BLK]);
+        for (uint32_t u = 0; u < UNROLL; u++) wv[u] = pulsar_wt_load(wr, i + u * BLK);
         /* pinned roundings: __fmul_rn reproduces the f32 that rms_norm_plain
          * stored into flat_hc, __fmaf_rn reproduces matmul_f16_kernel's
          * contracted `sum += w * x`.  Written explicitly so no future
@@ -1013,7 +1013,7 @@ __global__ static void hc_norm_mix_f16_kernel(
         for (uint32_t u = 0; u < UNROLL; u++) dot = __fmaf_rn(wv[u], __fmul_rn(xv[u], scale), dot);
     }
     for (; i < n; i += BLK) {
-        dot = __fmaf_rn(__half2float(wr[i]), __fmul_rn(pulsar_hc_load(x, i), scale), dot);
+        dot = __fmaf_rn(pulsar_wt_load(wr, i), __fmul_rn(pulsar_hc_load(x, i), scale), dot);
     }
     partial[tid] = dot;
     __syncthreads();
@@ -1025,7 +1025,15 @@ __global__ static void hc_norm_mix_f16_kernel(
 }
 
 
-int pulsar_gpu_hc_norm_mix_f16_tensor(
+/* w_type: ds4 tensor type of the mix weight -- 1 F16, 30 BF16, 0 F32.
+ *
+ * Was F16-only, which made this fusion silently unreachable the moment hc_*_fn
+ * moved to another storage: gpu_graph_norm_mix_plain fell back to a separate
+ * rms_norm_plain + matmul pair with a 64 KB f32 scratch round trip between
+ * them, the very cost this kernel exists to remove (~5.4% of decode by its own
+ * measurement). The fusion has nothing to do with the weight's width, so it is
+ * templated on storage rather than gated on one type. */
+int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1033,18 +1041,25 @@ int pulsar_gpu_hc_norm_mix_f16_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        float                   eps) {
+        float                   eps,
+        uint32_t                w_type) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    const uint64_t elt = (w_type == 0u) ? 4u : 2u;      /* F32 : F16/BF16 */
+    const uint64_t weight_bytes = out_dim * in_dim * elt;
     if (weight_bytes > model_size - weight_offset) return 0;
     /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
     if (x->bytes < in_dim * PULSAR_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "hc_mix");
     if (!wptr) return 0;
-    hc_norm_mix_f16_kernel<256, 8><<<(uint32_t)out_dim, 256>>>(
-            (float *)out->ptr, (const __half *)wptr, (const pulsar_hc_t *)x->ptr,
-            (uint32_t)in_dim, (uint32_t)out_dim, eps);
-    return cuda_ok(cudaGetLastError(), "hc norm mix f16 launch");
+#define PULSAR_HCMIX(WT, CAST)                                          \
+    hc_norm_mix_kernel<256, 8, WT><<<(uint32_t)out_dim, 256>>>(          \
+            (float *)out->ptr, (const CAST)wptr, (const pulsar_hc_t *)x->ptr, \
+            (uint32_t)in_dim, (uint32_t)out_dim, eps)
+    if (w_type == 30u)      PULSAR_HCMIX(__nv_bfloat16, __nv_bfloat16 *);
+    else if (w_type == 0u)  PULSAR_HCMIX(float, float *);
+    else                    PULSAR_HCMIX(__half, __half *);
+#undef PULSAR_HCMIX
+    return cuda_ok(cudaGetLastError(), "hc norm mix launch");
 }

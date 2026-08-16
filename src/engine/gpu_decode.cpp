@@ -347,10 +347,16 @@ static bool gpu_graph_norm_mix_plain(
         uint64_t              out_dim,
         const pulsar_gpu_tensor *src_hc,
         pulsar_gpu_tensor       *out) {
-    if (w->type == PULSAR_TENSOR_F16) {
-        return pulsar_gpu_hc_norm_mix_f16_tensor(out, model->map, model->size,
+    /* Any storage the fused kernel can read takes the fusion; only an fp8 mix
+     * weight still needs the unfused pair. Was F16-only, which quietly dropped
+     * the fusion -- and its ~5.4% of decode -- as soon as hc_*_fn moved. */
+    if (w->type == PULSAR_TENSOR_F16 ||
+        w->type == PULSAR_TENSOR_BF16 ||
+        w->type == PULSAR_TENSOR_F32) {
+        return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
                                               w->abs_offset, hc_dim, out_dim,
-                                              src_hc, PULSAR_RMS_EPS) != 0;
+                                              src_hc, PULSAR_RMS_EPS,
+                                              w->type) != 0;
     }
     if (!pulsar_gpu_rms_norm_plain_tensor(g->flat_hc, src_hc, (uint32_t)hc_dim, PULSAR_RMS_EPS)) return false;
     return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, g->flat_hc, 1);
