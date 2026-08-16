@@ -1328,7 +1328,6 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
-        void                    *norm_out_h,
         void                    *norm_out_q,
         void                    *norm_out_sf,
         int                      norm_out_kbp,

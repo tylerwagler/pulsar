@@ -420,7 +420,6 @@ bool gpu_graph_encode_decode_layer(
         }
         ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->attn_cur,
                                                          g->attn_norm,
-                                                         NULL,
                                                          an_q, an_sf, an_kbp,
                                                          g->hc_split,
                                                          g->hc_mix,
@@ -1076,7 +1075,6 @@ bool gpu_graph_encode_decode_layer(
         }
         ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->ffn_cur,
                                                          g->ffn_norm,
-                                                         NULL,
                                                          fn_q, fn_sf, fn_kbp,
                                                          g->hc_split,
                                                          g->hc_mix,

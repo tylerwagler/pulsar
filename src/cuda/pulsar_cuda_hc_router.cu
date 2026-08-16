@@ -183,7 +183,6 @@ template <uint32_t BLK, uint32_t VEC, bool NWBF16>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
-        __half *norm_out_h,
         __nv_fp8_e4m3 *norm_out_q,
         unsigned char *norm_out_sf,
         int norm_out_kbp,
@@ -244,7 +243,6 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
                 ? (accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col)) : 0.0f;
         if (col < n_embd) {
             norm_out[obase + col] = v;
-            if (norm_out_h) norm_out_h[obase + col] = __float2half(v);
         }
         /* Warp-uniform: every lane must reach the shuffle.  BLK is a multiple of
          * 32 and columns are contiguous within a warp, so a warp spans exactly
@@ -695,7 +693,6 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
-        void                    *norm_out_h,
         void                    *norm_out_q,
         void                    *norm_out_sf,
         int                      norm_out_kbp,
@@ -765,7 +762,6 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(                           \
                 out ? (float *)out->ptr : NULL,                                       \
                 (float *)norm_out->ptr,                                              \
-                (__half *)norm_out_h,                                                \
                 (__nv_fp8_e4m3 *)norm_out_q,                                         \
                 (unsigned char *)norm_out_sf,                                        \
                 norm_out_kbp,                                                        \

@@ -675,12 +675,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
     {
-        /* Emit the F16 encoding of batch_attn_norm straight out of this kernel's
-         * epilogue, into the activation cache's f16 slot.  Otherwise the first
-         * F16 projection below pays a full f32_to_f16_kernel pass over
-         * [n_tokens x n_embd] -- and that pass is already bandwidth-bound, so it
-         * cannot be made cheaper, only removed.  Bit-exact: same value, same
-         * __float2half f32_to_f16_kernel would have applied. */
         /* ...and the E4M3 encoding too: batch_attn_norm feeds seven MXFP8
          * projections, every one of which would otherwise wait on a separate
          * quantize pass over the whole tensor. */
@@ -695,7 +689,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  gpu_graph_debug_wants("hc_attn_pre", il, pos0)
                                                                      ? attn_cur_view : NULL,
                                                                  g->batch_attn_norm,
-                                                                 NULL,
                                                                  attn_norm_q,
                                                                  attn_norm_sf,
                                                                  attn_norm_kbp,
@@ -2189,7 +2182,6 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  gpu_graph_debug_wants("hc_ffn_pre", il, pos0)
                                                                      ? ffn_cur_view : NULL,
                                                                  g->batch_ffn_norm,
-                                                                 NULL,
                                                                  ffn_norm_q,
                                                                  ffn_norm_sf,
                                                                  ffn_norm_kbp,
