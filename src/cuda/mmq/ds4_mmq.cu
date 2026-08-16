@@ -407,13 +407,10 @@ int ds4_mmq_moe_impl(
     ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
-    const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = 1;             // src1 rows per channel (one per token)
     const int64_t ne12         = n_tokens;      // src1 channels (= tokens)
     const int64_t blck         = ggml_blck_size(type);
-    const int64_t s01          = (int64_t)K / blck;
-    const int64_t s02          = (int64_t)M * s01;   // per-expert weight stride in blocks
 
     // 1. Build the expert-major work map.
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
@@ -476,8 +473,6 @@ int ds4_mmq_moe_impl(
     const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr &&
                           K % 256 == 0 && d2r_iq2s_avail != 0);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1;
-    char *src1_q8_1_p = nullptr;
     ggml_cuda_pool_alloc<char> src1_e4m3;
     char *src1_e4m3_p = nullptr;
 
@@ -494,30 +489,33 @@ int ds4_mmq_moe_impl(
     const int64_t s12_src = (int64_t)K * ne11;                          // stride between channels = K*1
     const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
 
-    auto stage_q8_1 = [&]() {
-        if (src1_q8_1_p) {
-            return;
-        }
-        src1_q8_1_p = src1_q8_1.alloc(ctx->pool(), nbytes_src1_q8_1);
-        cudaMemsetAsync(src1_q8_1_p, 0, nbytes_src1_q8_1, stream);
-        quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1.get(), (void *)src1_q8_1_p,
-            type, /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-            stream);
-    };
-
-    if (d2r_iq2) {
-        src1_e4m3_p = src1_e4m3.alloc(ctx->pool(), nbytes_src1_q8_1);
-        cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
-        ds4_quantize_mmq_e4m3_cuda(
-            X_f32, ids_src1.get(), (void *)src1_e4m3_p,
-            /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-            /*n_expert_used=*/0, /*scatter=*/false, stream);
-    } else {
-        stage_q8_1();
+    /* d2r_iq2 is a REQUIREMENT here, not a preference.  This function is
+     * instantiated for exactly one type (GGML_TYPE_IQ2_XXS, from
+     * ds4_mmq_iq2_xxs_moe_soa), so "another quant type could arrive and want
+     * q8_1" describes no caller.  Every way d2r_iq2 can be false is a defect:
+     * a null SoA pointer, K not a multiple of 256, or an architecture below
+     * Ampere -- none of which a working configuration produces.
+     *
+     * The q8_1 staging that used to sit here covered those cases by silently
+     * running this GEMM on int8 affine activations while every other expert
+     * GEMM ran E4M3.  That is a FORMAT divergence, and a size-thresholded
+     * version of exactly it is what once hid the down conversion for two days.
+     * Fail closed instead: one activation format, every batch size, or an
+     * error that says which precondition broke. */
+    if (!d2r_iq2) {
+        fprintf(stderr,
+                "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%256=%d avail=%d) -- "
+                "refusing to run these expert activations in another format\n",
+                tag, (const void *)x_soa, (int)K, (int)(K % 256), d2r_iq2s_avail);
+        return -1;
     }
+    src1_e4m3_p = src1_e4m3.alloc(ctx->pool(), nbytes_src1_q8_1);
+    cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
+    ds4_quantize_mmq_e4m3_cuda(
+        X_f32, ids_src1.get(), (void *)src1_e4m3_p,
+        /*ne00=*/K, s11_src, s12_src, s13_src,
+        /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+        /*n_expert_used=*/0, /*scatter=*/false, stream);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -532,14 +530,11 @@ int ds4_mmq_moe_impl(
     // with M innermost and n_expert_used as the second dim that mmq writes
     // through ids_dst.  s1 = M (the column stride in the flat dst buffer
     // mmq writes into).  The output is column-major: out[col*M + row].
-    const int64_t s1            = (int64_t)M;
     // stride_channel_y per upstream: ne11 * ne10_padded * sizeof(block_q8_1)
     //                                     / (QK8_1 * sizeof(int))
     // In MoE mode the kernel zeroes out the channel-stride contribution to
     // offset_y after reading expert_bounds, so the value is permissive -
     // but we set it consistently with upstream.
-    const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-    const int64_t s13_mmq = ne12 * s12_mmq;
 
 
     /* pulsar (plan 41b): IQ2_XXS twin of the Q2_K block below.  Our v5mx down
@@ -554,80 +549,33 @@ int ds4_mmq_moe_impl(
      * completely: a 26-token prompt gives 156 rows, so the arm never engaged and
      * two days of cross-arm measurements came back bit-identical.
      * One path, one activation format, every batch size. */
-    if (d2r_iq2) {
-        {
-            const size_t w_bytes =
-                ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
-            if (w_bytes != 0) {
-                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), w_bytes);
-                const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
-                    x_soa, soa_blocks,
-                    src1_e4m3_p,
-                    ids_dst.get(), expert_bounds.get(),
-                    out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes,
-                    stream);
-                if (rc == 0) {
-                    return 0;
-                }
-            }
+    const size_t w_bytes =
+        ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
+    if (w_bytes == 0) {
+        fprintf(stderr, "%s: D2R scratch sizing failed (rows=%lld experts=%d)\n",
+                tag, (long long)ne_get_rows, n_experts);
+        return -1;
+    }
+    {
+        ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), w_bytes);
+        const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
+            x_soa, soa_blocks,
+            src1_e4m3_p,
+            ids_dst.get(), expert_bounds.get(),
+            out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes,
+            stream);
+        /* Every rc != 0 is a bad pointer, a bad shape, or undersized scratch --
+         * a caller defect, never a shape this path legitimately hands back. */
+        if (rc != 0) {
+            fprintf(stderr, "%s: D2R launch declined (rc=%d, rows=%lld) -- no fallback\n",
+                    tag, rc, (long long)ne_get_rows);
+            return -1;
         }
     }
-
-
-    /* Only reachable when D2R did not take the work (another quant type, or the
-     * launcher declined).  Stage q8_1 here so the common IQ2 path never pays
-     * for a format it does not use. */
-    stage_q8_1();
-
-    const mmq_args args = {
-        /*x=*/(const char *)W,
-        /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1_p,
-        /*ids_dst=*/ids_dst.get(),
-        /*expert_bounds=*/expert_bounds.get(),
-        /*dst=*/out_f32,
-        /*y_scale=*/nullptr,
-        /*ncols_x=*/ne00,
-        /*nrows_x=*/(int64_t)M,
-        /*ncols_dst=*/ne_get_rows,
-        /*stride_row_x=*/s01,
-        /*ncols_y=*/ne_get_rows,
-        /*nrows_dst=*/s1,
-        /*nchannels_x=*/(int64_t)n_experts,
-        /*nchannels_y=*/(int64_t)n_experts,
-        /*stride_channel_x=*/s02,
-        /*stride_channel_y=*/s12_mmq,
-        /*stride_channel_dst=*/(int64_t)0,
-        /*nsamples_x=*/1,
-        /*nsamples_y=*/1,
-        /*stride_sample_x=*/0,
-        /*stride_sample_y=*/s13_mmq,
-        /*stride_sample_dst=*/0,
-        /*ncols_max=*/ne_get_rows,
-        /*x_soa=*/x_soa,
-        /*soa_blocks=*/soa_blocks,
-    };
-
-    /* Reaching here with IQ2 means D2R declined the work, so this GEMM runs int8
-     * q8_1 activations while every other expert GEMM runs E4M3.  That is a
-     * FORMAT change, not just a speed change, and it must never be silent
-     * again -- a size-thresholded version of exactly this is what hid the down
-     * conversion.  One-shot, off the hot path. */
-    if (type == GGML_TYPE_IQ2_XXS) {
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING %s fell back to generic MMQ -- these expert "
-                    "activations are int8 q8_1, NOT E4M3 (rows=%lld)\n",
-                    tag, (long long)ne_get_rows);
-        }
-    }
-    mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
+        fprintf(stderr, "%s: D2R launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
     if (sanitize_out) {
@@ -635,9 +583,6 @@ int ds4_mmq_moe_impl(
     }
     return 0;
 }
-
-
-
 
 // Produce the weighted SwiGLU rows in their canonical pair-major order. The
 // proven upstream quantizer below gathers them through the already available
@@ -708,13 +653,10 @@ int ds4_mmq_moe_pair_impl(
     ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
-    const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = 1;
     const int64_t ne12         = n_tokens;
     const int64_t blck         = ggml_blck_size(type);
-    const int64_t s01          = (int64_t)K / blck;
-    const int64_t s02          = (int64_t)M * s01;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
@@ -759,16 +701,13 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = ne_get_rows;
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
     ggml_cuda_pool_alloc<char> src1_e4m3_alloc;
     char *src1_e4m3 = nullptr;
-    char *src1_q8_1 = nullptr;
 
     /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only now;
      * q8_1 exists solely for the generic MMQ fallback (another quant type, or
@@ -790,34 +729,26 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
-    auto stage_q8_1 = [&]() {
-        if (src1_q8_1) {
-            return;
-        }
-        src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
-        cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
-        quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1, (void *)src1_q8_1,
-            type, /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-            stream);
-    };
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/input_quant",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
-        if (d2r_iq2) {
-            src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
-            cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
-            ds4_quantize_mmq_e4m3_cuda(
-                X_f32, ids_src1, (void *)src1_e4m3,
-                /*ne00=*/K, s11_src, s12_src, s13_src,
-                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-                /*n_expert_used=*/0, /*scatter=*/false, stream);
-        } else {
-            stage_q8_1();
+        /* E4M3 or nothing -- same requirement as the single-tensor impl. */
+        if (!d2r_iq2) {
+            fprintf(stderr,
+                    "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%256=%d avail=%d) -- "
+                    "refusing to run these expert activations in another format\n",
+                    tag, (const void *)xa_soa, (int)K, (int)(K % 256), d2r_iq2_avail);
+            return -1;
         }
+        src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+        cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
+        ds4_quantize_mmq_e4m3_cuda(
+            X_f32, ids_src1, (void *)src1_e4m3,
+            /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            /*n_expert_used=*/0, /*scatter=*/false, stream);
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -826,9 +757,6 @@ int ds4_mmq_moe_pair_impl(
         }
     }
 
-    const int64_t s1      = (int64_t)M;
-    const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-    const int64_t s13_mmq = ne12 * s12_mmq;
 
 
     bool gate_up_done = false;
@@ -857,78 +785,16 @@ int ds4_mmq_moe_pair_impl(
         }
     }
 
+    /* No q8_1 fallback: see the requirement note in ds4_mmq_moe_impl. D2R
+     * declining is a defect -- bad SoA pointer, K not a 256-multiple, undersized
+     * scratch -- not a shape this path legitimately returns, and covering it by
+     * silently switching gate/up to int8 affine activations is the exact
+     * divergence that once hid the down conversion. */
     if (!gate_up_done) {
-    stage_q8_1();
-    mmq_args args = {
-        /*x=*/(const char *)W_a,
-        /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1,
-        /*ids_dst=*/ids_dst,
-        /*expert_bounds=*/expert_bounds,
-        /*dst=*/out_a,
-        /*y_scale=*/nullptr,
-        /*ncols_x=*/ne00,
-        /*nrows_x=*/(int64_t)M,
-        /*ncols_dst=*/ne_get_rows,
-        /*stride_row_x=*/s01,
-        /*ncols_y=*/ne_get_rows,
-        /*nrows_dst=*/s1,
-        /*nchannels_x=*/(int64_t)n_experts,
-        /*nchannels_y=*/(int64_t)n_experts,
-        /*stride_channel_x=*/s02,
-        /*stride_channel_y=*/s12_mmq,
-        /*stride_channel_dst=*/(int64_t)0,
-        /*nsamples_x=*/1,
-        /*nsamples_y=*/1,
-        /*stride_sample_x=*/0,
-        /*stride_sample_y=*/s13_mmq,
-        /*stride_sample_dst=*/0,
-        /*ncols_max=*/routed_ncols_max,
-        /*x_soa=*/xa_soa,
-        /*soa_blocks=*/soa_blocks,
-    };
-
-    /* See the matching note in ds4_mmq_moe_impl: an IQ2 batch that lands here
-     * multiplies against int8 q8_1 while the D2R path uses E4M3.  Say so. */
-    if (type == GGML_TYPE_IQ2_XXS) {
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING %s gate/up fell back to generic MMQ -- these "
-                    "expert activations are int8 q8_1, NOT E4M3 (rows=%lld)\n",
-                    tag, (long long)ne_get_rows);
-        }
-    }
-    {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/iq2_gate",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
-                nvtx_prefill);
-        mul_mat_q_case<type>(*ctx, args, stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "%s: mul_mat_q_case (pair a) launch failed: %s\n", tag, cudaGetErrorString(err));
-            return -4;
-        }
-    }
-
-    // Second matmul over the same activation buffer and same routing map.
-    args.x     = (const char *)W_b;
-    args.dst   = out_b;
-    args.x_soa = xb_soa;
-    {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/iq2_up",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
-                nvtx_prefill);
-        mul_mat_q_case<type>(*ctx, args, stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
-            return -5;
-        }
-    }
+        fprintf(stderr,
+                "%s: D2R gate/up declined (rows=%lld) -- no fallback\n",
+                tag, (long long)ne_get_rows);
+        return -1;
     }
     }
 
