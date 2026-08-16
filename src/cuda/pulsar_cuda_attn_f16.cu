@@ -170,6 +170,12 @@ static void attn_f16_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t g = lane >> 2u;          /* fragment groupID 0..7 */
     const uint32_t tg = lane & 3u;          /* thread-in-group 0..3 */
+    /* ldmatrix addressing for the phase-3 B fragment: lanes 0-7 supply the eight
+     * rows of the k0..7 tile, lanes 8-15 the k8..15 tile (16-31 are ignored for
+     * .x2 but still compute an address, harmlessly duplicating). Verified
+     * bit-identical to the scalar loads it replaces -- see the note at the load. */
+    const uint32_t ldm_row = lane & 7u;
+    const uint32_t ldm_half = (lane >> 3u) & 1u;
 
     /* Dead/evicted row: zero the heads and leave together.  This MUST precede
      * every __syncthreads in the kernel, exactly as in the f32 twin -- a
@@ -261,7 +267,11 @@ static void attn_f16_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)AF16_DIM);
 
-    __shared__ __half sKV[AF16_ROWS * AF16_KVSTRIDE];
+    /* __align__(16) is REQUIRED by the ldmatrix in phase 3: it loads 8 x 16 bits
+     * per lane and the address must be 16-byte aligned.  A __half array is only
+     * 2-byte aligned by default, and this one follows sRawRows[256] plus three
+     * uint32_t, so its natural offset is 1036 -- misaligned by 12. */
+    __shared__ __align__(16) __half sKV[AF16_ROWS * AF16_KVSTRIDE];
     __shared__ float  sPart[4][AF16_MT][AF16_HEADS][AF16_ROWS];  /* k-split partials */
     __shared__ float  sS[AF16_HPB][AF16_ROWS];
     __shared__ __half sP[AF16_HPB][AF16_ROWS];
@@ -464,15 +474,28 @@ static void attn_f16_kernel(
                 acc[m][n][0] *= ca; acc[m][n][1] *= ca;
                 acc[m][n][2] *= cb; acc[m][n][3] *= cb;
                 /* B[k=row][n=dim]: this lane's column is n_base+g, and its four
-                 * k values are rows 2t, 2t+1, 2t+8, 2t+9.  Already fp16 in
-                 * smem, so repack the bits rather than round-tripping f32. */
-                const __half *kc = &sKV[warp * AF16_DPW + n * 8u + g];
-                const uint32_t b0 =
-                    (uint32_t)__half_as_ushort(kc[(tg * 2u)      * AF16_KVSTRIDE]) |
-                    ((uint32_t)__half_as_ushort(kc[(tg * 2u + 1u) * AF16_KVSTRIDE]) << 16);
-                const uint32_t b1 =
-                    (uint32_t)__half_as_ushort(kc[(tg * 2u + 8u) * AF16_KVSTRIDE]) |
-                    ((uint32_t)__half_as_ushort(kc[(tg * 2u + 9u) * AF16_KVSTRIDE]) << 16);
+                 * k values are rows 2t, 2t+1, 2t+8, 2t+9 -- i.e. every lane walks
+                 * a COLUMN of a row-major tile, which is what `ldmatrix.trans`
+                 * exists for.  One instruction replaces four scalar LDS.u16 plus
+                 * the shift/or repacking, and the transpose is free in the
+                 * instruction rather than paid in address arithmetic.
+                 *
+                 * BIT-IDENTICAL, verified rather than assumed: a standalone probe
+                 * (pulsar-notes/probes/ldm_probe.cu) filled this exact [16][520]
+                 * layout with position-encoding values, built the fragment both
+                 * ways and compared the raw registers -- 0 of 512 differed across
+                 * all warps and lanes.  Guessing an ldmatrix lane mapping is
+                 * precisely how you get a kernel that runs and is quietly wrong,
+                 * so the mapping is evidence, not derivation. */
+                const uint32_t colbase = warp * AF16_DPW + n * 8u;
+                uint32_t b0, b1;
+                {
+                    const uint32_t saddr = (uint32_t)__cvta_generic_to_shared(
+                        &sKV[(ldm_half * 8u + ldm_row) * AF16_KVSTRIDE + colbase]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+                                 "{%0,%1}, [%2];\n"
+                                 : "=r"(b0), "=r"(b1) : "r"(saddr));
+                }
                 af16_mma(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
                          pa0, pa1, pa2, pa3, b0, b1);
             }
