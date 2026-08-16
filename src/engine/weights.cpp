@@ -129,9 +129,7 @@ static void tensor_expect_plain_or_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_F16)
-        tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_BF16)
+    if (t->type == PULSAR_TENSOR_BF16)
         tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
     else if (t->type == PULSAR_TENSOR_F32)
         tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
@@ -152,7 +150,7 @@ static void tensor_expect_plain_or_mxfp8(
          * accepted here must stay exactly in step with the four arms of
          * gpu_graph_matmul_plain_tensor, or a tensor passes load and then
          * dispatches into nothing. */
-        pulsar_die("tensor has unsupported weight type; expected F32, F16, BF16 or FP8_E4M3");
+        pulsar_die("tensor has unsupported weight type; expected F32, BF16 or FP8_E4M3");
 }
 
 
@@ -178,21 +176,6 @@ static void tensor_expect_f32_or_bf16(
         tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
 }
 
-/* F16 or BF16, both 2 bytes. Used where an artifact may predate the move to
- * bf16 storage and must still load. */
-static void tensor_expect_f32_or_bf16_or_f16(
-        const pulsar_tensor *t,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_BF16)
-        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
-    else
-        tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
-}
-
 static void tensor_expect_plain_layout(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -206,11 +189,10 @@ static void tensor_expect_plain_layout(
      * tensor_expect_plain_or_mxfp8 and had already been extended -- the drafter
      * goes through THIS one, and changing the type policy without walking every
      * validator that sees it is exactly how that gets missed. */
-    if (t->type != PULSAR_TENSOR_F16 &&
-        t->type != PULSAR_TENSOR_BF16 &&
+    if (t->type != PULSAR_TENSOR_BF16 &&
         t->type != PULSAR_TENSOR_F32) {
         fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected F32, F16 or BF16\n",
+                "pulsar: tensor %.*s has type %s, expected F32 or BF16\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -507,7 +489,7 @@ static void weights_validate_layout(
          * source (it flushes anything under 5.96e-8 to zero) while bf16 is an
          * exact one. There is no version of this where f16 is the better
          * choice; it was simply never revisited. */
-        tensor_expect_f32_or_bf16_or_f16(w->token_embd, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        tensor_expect_layout(w->token_embd, PULSAR_TENSOR_BF16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
     const bool have_output = weights_have_output_head(w);
@@ -979,7 +961,6 @@ void config_validate_model(const pulsar_model *m) {
 static bool weights_tensor_type_supported(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_F32:
-    case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
     case PULSAR_TENSOR_FP8_E4M3:
@@ -1016,7 +997,7 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
          * and a list naming types the engine no longer reads sends them looking
          * for a bug in their file instead of re-quantising it. */
         fprintf(stderr,
-                "pulsar: supported weight tensor types: f32, f16, i32, bf16, "
+                "pulsar: supported weight tensor types: f32, i32, bf16, "
                 "fp8_e4m3 (MXFP8), mxfp8_lt, cutlass_mxfp4 (40), iq2_xxs_mmq (43)\n");
         exit(1);
     }

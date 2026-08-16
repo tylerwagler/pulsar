@@ -181,8 +181,7 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t 
  * tensor_expect_plain_or_mxfp8's accept set. A type this returns true for but
  * the matmul cannot dispatch is a runtime failure on a tensor that passed load. */
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
-    return w->type == PULSAR_TENSOR_F16 ||
-           w->type == PULSAR_TENSOR_BF16 ||
+    return w->type == PULSAR_TENSOR_BF16 ||
            w->type == PULSAR_TENSOR_F32 ||
            w->type == PULSAR_TENSOR_FP8_E4M3;
 }
@@ -350,8 +349,7 @@ static bool gpu_graph_norm_mix_plain(
     /* Any storage the fused kernel can read takes the fusion; only an fp8 mix
      * weight still needs the unfused pair. Was F16-only, which quietly dropped
      * the fusion -- and its ~5.4% of decode -- as soon as hc_*_fn moved. */
-    if (w->type == PULSAR_TENSOR_F16 ||
-        w->type == PULSAR_TENSOR_BF16 ||
+    if (w->type == PULSAR_TENSOR_BF16 ||
         w->type == PULSAR_TENSOR_F32) {
         return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
                                               w->abs_offset, hc_dim, out_dim,
@@ -661,27 +659,18 @@ bool gpu_graph_encode_decode_layer(
             ok = false;
         }
         if (ok) {
-            if (layer->attn_compressor_kv->type == PULSAR_TENSOR_F16) {
-                ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                      g->comp_sc_cur,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->attn_compressor_kv->abs_offset,
-                                                      layer->attn_compressor_gate->abs_offset,
-                                                      PULSAR_N_EMBD,
-                                                      comp_width,
-                                                      g->attn_norm,
-                                                      1) != 0;
-            } else {
-                ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                    layer->attn_compressor_kv,
-                                                    PULSAR_N_EMBD, comp_width,
-                                                    g->attn_norm, 1) &&
-                     gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                    layer->attn_compressor_gate,
-                                                    PULSAR_N_EMBD, comp_width,
-                                                    g->attn_norm, 1);
-            }
+            /* The F16 pair fast path is gone with the last F16 weight. It was
+             * never a fusion -- two sequential matmul_f16 calls, and
+             * matmul_f16_kernel is structurally identical to the bf16 one, so
+             * this costs nothing measurable. */
+            ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                layer->attn_compressor_kv,
+                                                PULSAR_N_EMBD, comp_width,
+                                                g->attn_norm, 1) &&
+                 gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                layer->attn_compressor_gate,
+                                                PULSAR_N_EMBD, comp_width,
+                                                g->attn_norm, 1);
         } else {
             if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
                                                          layer->attn_compressor_kv,
@@ -751,27 +740,14 @@ bool gpu_graph_encode_decode_layer(
                 ok = false;
             }
             if (ok) {
-                if (layer->indexer_compressor_kv->type == PULSAR_TENSOR_F16) {
-                    ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                          g->comp_sc_cur,
-                                                          model->map,
-                                                          model->size,
-                                                          layer->indexer_compressor_kv->abs_offset,
-                                                          layer->indexer_compressor_gate->abs_offset,
-                                                          PULSAR_N_EMBD,
-                                                          index_width,
-                                                          g->attn_norm,
-                                                          1) != 0;
-                } else {
-                    ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                        layer->indexer_compressor_kv,
-                                                        PULSAR_N_EMBD, index_width,
-                                                        g->attn_norm, 1) &&
-                         gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                        layer->indexer_compressor_gate,
-                                                        PULSAR_N_EMBD, index_width,
-                                                        g->attn_norm, 1);
-                }
+                ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
+                                                    layer->indexer_compressor_kv,
+                                                    PULSAR_N_EMBD, index_width,
+                                                    g->attn_norm, 1) &&
+                     gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
+                                                    layer->indexer_compressor_gate,
+                                                    PULSAR_N_EMBD, index_width,
+                                                    g->attn_norm, 1);
             } else {
                 if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
                                                              layer->indexer_compressor_kv,
@@ -1891,10 +1867,6 @@ bool gpu_graph_matmul_plain_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok) {
-    if (w->type == PULSAR_TENSOR_F16) {
-        return pulsar_gpu_matmul_f16_tensor(out, model->map, model->size,
-                                           w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
-    }
     if (w->type == PULSAR_TENSOR_F32) {
         return pulsar_gpu_matmul_f32_tensor(out, model->map, model->size,
                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
