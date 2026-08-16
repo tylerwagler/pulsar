@@ -319,19 +319,58 @@ static void emit_rows_free(emit_rows *er) {
     memset(er, 0, sizeof(*er));
 }
 
+/* How far apart are two packed rows?  A bare memcmp cannot tell a 1-ULP numeric
+ * drift from a cross-bank read, and the callers' messages assert the latter --
+ * so report the byte histogram alongside the verdict.  Packed rows (attn: e4m3
+ * + ue8m0 + bf16; index: e2m1 + e8m0) put low mantissa bits in low byte bits, so
+ *   a few bytes off by +-1  -> numeric drift (different kernel/path, same data)
+ *   most bytes off widely   -> different data (the leak these checks look for)
+ * No format decode needed to separate those two. */
+static void row_delta(const unsigned char *x, const unsigned char *y, size_t n,
+                      size_t *n_diff, int *max_delta) {
+    *n_diff = 0; *max_delta = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int d = (int)x[i] - (int)y[i];
+        const int ad = d < 0 ? -d : d;
+        if (ad) { (*n_diff)++; if (ad > *max_delta) *max_delta = ad; }
+    }
+}
+
 static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *what) {
     int equal = 1;
+    size_t worst_bytes = 0; int worst_delta = 0; uint32_t worst_layer = 0;
+    const char *worst_kind = "";
     for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         if ((a->attn[il] != NULL) != (b->attn[il] != NULL)) { equal = 0; continue; }
         if (a->attn[il] && memcmp(a->attn[il], b->attn[il], attn_row_bytes()) != 0) {
-            fprintf(stderr, "  %s: attn emitted row differs at layer %u\n", what, il);
+            size_t nd; int md;
+            row_delta((const unsigned char *)a->attn[il],
+                      (const unsigned char *)b->attn[il], attn_row_bytes(), &nd, &md);
+            fprintf(stderr, "  %s: attn emitted row differs at layer %u"
+                            " (%zu/%zu bytes, max byte delta %d)\n",
+                    what, il, nd, attn_row_bytes(), md);
+            if (md > worst_delta) { worst_delta = md; worst_bytes = nd;
+                                    worst_layer = il; worst_kind = "attn"; }
             equal = 0;
         }
         if (a->index[il] && b->index[il] &&
             memcmp(a->index[il], b->index[il], index_row_bytes()) != 0) {
-            fprintf(stderr, "  %s: indexer emitted row differs at layer %u\n", what, il);
+            size_t nd; int md;
+            row_delta((const unsigned char *)a->index[il],
+                      (const unsigned char *)b->index[il], index_row_bytes(), &nd, &md);
+            fprintf(stderr, "  %s: indexer emitted row differs at layer %u"
+                            " (%zu/%zu bytes, max byte delta %d)\n",
+                    what, il, nd, index_row_bytes(), md);
+            if (md > worst_delta) { worst_delta = md; worst_bytes = nd;
+                                    worst_layer = il; worst_kind = "indexer"; }
             equal = 0;
         }
+    }
+    if (!equal) {
+        fprintf(stderr, "  %s: WORST %s layer %u -- %zu bytes differ, max byte delta %d"
+                        "  [few bytes / small delta = numeric drift;"
+                        " many bytes / large delta = different data]\n",
+                what, worst_kind, worst_layer, worst_bytes, worst_delta);
     }
     return equal;
 }
