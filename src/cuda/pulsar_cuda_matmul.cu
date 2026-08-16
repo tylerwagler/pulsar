@@ -2000,6 +2000,33 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 
 int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
+    /* inc 4 prefix-split (see the f16/mxfp8 twins): decode prefix [0,n_dec)
+     * M-independent, prefill suffix [n_dec,n_tok) tensor-core, via pure-regime
+     * recursion. MISSING here until 2026-08-16, which is why every weight family
+     * that moved onto this arm failed cuda-mixed-neutrality-gate while the f16
+     * and mxfp8 arms passed: a mixed batch ran as one call at the full width, so
+     * the decode rows were never computed at their own M. */
+    {
+        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        if (n_dec > 0 && n_dec < n_tok) {
+            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
+            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+                                       out->bytes - n_dec * outb, 0 };
+            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+                                       x->bytes - n_dec * inb, 0 };
+            const int saved = g_mneutral_rows;
+            g_mneutral_rows = (int)n_dec;
+            int r1 = pulsar_gpu_matmul_bf16_tensor(&out_pre, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
+            g_mneutral_rows = 0;
+            int r2 = pulsar_gpu_matmul_bf16_tensor(&out_suf, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
+            g_mneutral_rows = saved;
+            return r1 && r2;
+        }
+    }
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight_offset) return 0;
@@ -2082,6 +2109,33 @@ int pulsar_gpu_matmul_f16_pair_tensor(
 
 int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    /* inc 4 prefix-split (see the f16/mxfp8 twins): decode prefix [0,n_dec)
+     * M-independent, prefill suffix [n_dec,n_tok) tensor-core, via pure-regime
+     * recursion. MISSING here until 2026-08-16, which is why every weight family
+     * that moved onto this arm failed cuda-mixed-neutrality-gate while the f16
+     * and mxfp8 arms passed: a mixed batch ran as one call at the full width, so
+     * the decode rows were never computed at their own M. */
+    {
+        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        if (n_dec > 0 && n_dec < n_tok) {
+            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
+            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
+            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
+            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
+                                       out->bytes - n_dec * outb, 0 };
+            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
+                                       x->bytes - n_dec * inb, 0 };
+            const int saved = g_mneutral_rows;
+            g_mneutral_rows = (int)n_dec;
+            int r1 = pulsar_gpu_matmul_f32_tensor(&out_pre, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
+            g_mneutral_rows = 0;
+            int r2 = pulsar_gpu_matmul_f32_tensor(&out_suf, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
+            g_mneutral_rows = saved;
+            return r1 && r2;
+        }
+    }
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
     if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
