@@ -4,7 +4,7 @@
 /* Read an HC residual CARRIER (BF16 storage under task #62) into an f32 host
  * buffer, expanding each stored sample (BF16->f32 is an exact bit-extension:
  * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
- * layer-0 parity self-test (gpu_graph_decode_test) and the env-gated DSpark
+ * layer-0 parity self-test (since removed) and the env-gated DSpark
  * dumps — never the production decode path. In the PULSAR_HC_F32 fallback build the
  * carrier is already f32, so it is a plain read. n is a sample count. */
 /* Host-side f32 -> HC carrier store (task #62). Round-to-nearest-even so a host

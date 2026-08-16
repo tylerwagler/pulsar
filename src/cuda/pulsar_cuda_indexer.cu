@@ -117,9 +117,11 @@ __global__ static void indexer_scores_kernel(
 
 /* Descriptor-aware variant of the single-token fast tier: the banked entry
  * keeps this kernel (rather than forcing the generic per-(row,comp) kernel)
- * because its reduction order is what the classic single-token decode uses —
- * the PULSAR_DECODE_DESCR byte-gate and any per-session solo/banked comparison
- * depend on the banked n_tokens==1 scan being bit-identical to classic.
+ * because its reduction order is what the classic single-token decode uses:
+ * any per-session solo/banked comparison depends on the banked n_tokens==1 scan
+ * being bit-identical to classic.  (The PULSAR_DECODE_DESCR byte-gate that
+ * originally enforced this was removed in 7ffb086 -- nothing set it -- so the
+ * property is now asserted only by the multiseq gates.)
  * (Documented deviation from the Tier-2 spec's "generic only" note; the WMMA
  * multi-token tier does stay single-bank.)  Descriptor semantics match
  * indexer_scores_kernel (one row, so positions[0]/seq_id[0]). */

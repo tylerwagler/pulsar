@@ -1818,10 +1818,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 &index_stage_t0);
             }
             /* PULSAR_PREFILL_SLICE: same span loop as the chunked branch.  The
-             * historical pulsar_gpu_indexer_scores_prefill_tensor is exactly the
-             * decode-batch entry with pos0 == 0 (zero_prefix means pos0 == 0,
-             * same launcher, causal), so a span at offset s0 scores the same
-             * per-token values with pos0 = s0.  Attention per span keeps
+             * zero-prefix case is the decode-batch entry with pos0 == 0
+             * (zero_prefix means pos0 == 0, same launcher, causal), so a span at
+             * offset s0 scores the same per-token values with pos0 = s0.  Attention per span keeps
              * first_raw_pos == 0 by passing n_raw = s0 + sn with raw_start 0. */
             const uint32_t zslice = gpu_graph_prefill_slice();
             const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;

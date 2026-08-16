@@ -1006,7 +1006,7 @@ static int routed_moe_launch_mixed40(
 #ifdef PULSAR_HAVE_MMQ
 /* ---- MMQ (llama.cpp INT8 tensor-core) routed gate/up -----------------------
  * Plan 41b.  Measured on GB10, same box/model/prompt/metric: the shipped dp4a
- * moe_gate_up_mid_expert_tile8_rowspan_kernel costs 73.20 ms/layer at a
+ * the since-removed per-expert tile8 rowspan kernel cost 73.20 ms/layer at a
  * 4096-token prefill; Palaferri's stock mul_mat_q<IQ2_XXS> costs 29.99 ms/layer
  * (2.44x) and Entrpi's bespoke fused D2R 18.01 ms (4.07x).  This routes our
  * gate/up through the vendored stock MMQ.
@@ -1051,7 +1051,7 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
     if (idx >= total) return;
     float g = gate_raw[idx];
     float u = up_raw[idx];
-    /* identical clamp semantics to moe_gate_up_mid_expert_tile8_rowspan_kernel */
+    /* clamp semantics match the qwarp32 gate/up path above */
     if (clamp > 1.0e-6f) {
         if (g > clamp) g = clamp;
         if (u > clamp) u = clamp;
