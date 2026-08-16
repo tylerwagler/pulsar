@@ -131,6 +131,8 @@ static void tensor_expect_plain_or_mxfp8(
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
     if (t->type == PULSAR_TENSOR_F16)
         tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
+    else if (t->type == PULSAR_TENSOR_BF16)
+        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
     else if (t->type == PULSAR_TENSOR_FP8_E4M3)
         tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
     else
@@ -140,8 +142,13 @@ static void tensor_expect_plain_or_mxfp8(
          * which has no type-41 branch. Pre-storing one as MXFP8_LT would decode to
          * garbage, so a future FP8 variant of these must fail FAST here at load,
          * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
-         * through cuda_fp8_mx_weight) may be MXFP8_LT. */
-        pulsar_die("tensor has unsupported weight type; expected F16 or FP8_E4M3");
+         * through cuda_fp8_mx_weight) may be MXFP8_LT.
+         *
+         * BF16 was added 2026-08-15 and DOES have a plain-path branch; the three
+         * accepted here must stay exactly in step with the three arms of
+         * gpu_graph_matmul_plain_tensor, or a tensor passes load and then
+         * dispatches into nothing. */
+        pulsar_die("tensor has unsupported weight type; expected F16, BF16 or FP8_E4M3");
 }
 
 
@@ -459,10 +466,15 @@ static void weights_validate_layout(
         tensor_expect_plain_or_mxfp8(w->output_hc_fn, 2, hc_dim, PULSAR_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, PULSAR_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
-        /* Output head is MXFP8, routed to the FP8 matmul.  The BF16 alternative
-         * (kept lossless, with its own dedicated matmul) is gone: the shipped
-         * artifact's head is MXFP8 and no BF16 tensor appears anywhere in it. */
-        tensor_expect_mxfp8(w->output,           2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        /* Output head is BF16 (source format, kept lossless by a dedicated BF16
+         * matmul) or MXFP8 (routed to the FP8 matmul).  Source ships this head
+         * bf16, so MXFP8 is BELOW source here -- the one place in the model
+         * where a dense tensor is.  Both are accepted so the two can be
+         * A/B'd against the same binary. */
+        if (w->output->type == PULSAR_TENSOR_BF16)
+            tensor_expect_layout(w->output,      PULSAR_TENSOR_BF16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        else
+            tensor_expect_mxfp8(w->output,       2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -901,18 +913,23 @@ void config_validate_model(const pulsar_model *m) {
 
 /* Weight formats the engine still decodes -- exactly the seven types present in
  * the shipped artifact (a full scan of its 1406 tensors found 0/1/26/38/40/41/43
- * and nothing else).  Q4_K, Q8_0, Q2_K (10), IQ2_XXS (16), BF16 (30),
- * FP4_E2M1 (39) and IQ2_XXS_SOA (42) have been removed along with their readers.
+ * and nothing else).  Q4_K, Q8_0, Q2_K (10), IQ2_XXS (16), FP4_E2M1 (39) and
+ * IQ2_XXS_SOA (42) have been removed along with their readers.
  * Rejecting up front gives one clear error instead of failing on the first
  * per-tensor layout check -- or, worse, dispatching into a deleted arm.
  *
- * BF16 was the alternative OUTPUT-HEAD format; the shipped head is MXFP8, so its
- * dedicated bf16 matmul and the three decode branches that chose it went too. */
+ * BF16 (30) is BACK as of 2026-08-15, after 0f6e1dd removed it as unreachable.
+ * That removal was correct at the time and is not being second-guessed: the
+ * artifact genuinely had no BF16 tensor.  It does now, because the tensors that
+ * are bf16 or f32 upstream are stored bf16 instead of f16 -- f16 was deleting
+ * ~11% of the small weights in some of them -- and because the output head goes
+ * back to bf16 to match source.  Both need this type accepted. */
 static bool weights_tensor_type_supported(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_F32:
     case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_I32:
+    case PULSAR_TENSOR_BF16:
     case PULSAR_TENSOR_FP8_E4M3:
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
@@ -947,7 +964,7 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
          * and a list naming types the engine no longer reads sends them looking
          * for a bug in their file instead of re-quantising it. */
         fprintf(stderr,
-                "pulsar: supported weight tensor types: f32, f16, i32, "
+                "pulsar: supported weight tensor types: f32, f16, i32, bf16, "
                 "fp8_e4m3 (MXFP8), mxfp8_lt, cutlass_mxfp4 (40), iq2_xxs_mmq (43)\n");
         exit(1);
     }
