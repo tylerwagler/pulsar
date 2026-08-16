@@ -1662,7 +1662,8 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     static int raw_path_reported = 0;
     if (!raw_path_reported) {
         raw_path_reported = 1;
-        const int takes_window = n_tokens > 1 && head_dim == 512;
+        const int takes_window = n_tokens > 1 && head_dim == 512 &&
+                n_tokens >= 128u;
         fprintf(stderr,
                 "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> %s\n",
                 n_tokens, head_dim, window,
@@ -1671,7 +1672,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                     ? "unfused cuBLAS two-GEMM"
                                     : "generic per-token kernel"));
     }
-    if (n_tokens > 1 && head_dim == 512) {
+    if (n_tokens > 1 && head_dim == 512 && n_tokens >= 128u) {
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
          * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
          * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
