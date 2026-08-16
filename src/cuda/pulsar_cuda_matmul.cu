@@ -78,10 +78,18 @@ __global__ static void matmul_f16_kernel(
  * needs an f32->f16 activation convert + tmp alloc per call. Per-token loop
  * structure and shared-memory reduction match matmul_f16_kernel exactly, so each
  * token's output is bit-identical to the n=1 kernel run on that token alone. */
-template <int NT>
-__global__ static void matmul_f16_nt_kernel(
+/* Weight load for the nt kernel, one overload per storage. Overloads rather
+ * than a bool template: the pointer type IS the contract, so a mismatched
+ * width cannot be passed silently (which is exactly how the embed kernels came
+ * to read an f16 table as f32 on 2026-08-15). */
+__device__ __forceinline__ static float nt_wload(const __half *p, uint64_t i) { return __half2float(p[i]); }
+__device__ __forceinline__ static float nt_wload(const float *p, uint64_t i) { return p[i]; }
+__device__ __forceinline__ static float nt_wload(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
+
+template <int NT, typename WT>
+__global__ static void matmul_nt_kernel(
         float *out,
-        const __half *w,
+        const WT *w,
         const float *x,
         uint64_t in_dim,
         uint64_t out_dim) {
@@ -91,9 +99,9 @@ __global__ static void matmul_f16_nt_kernel(
     float sum[NT];
     #pragma unroll
     for (int t = 0; t < NT; t++) sum[t] = 0.0f;
-    const __half *wr = w + row * in_dim;
+    const WT *wr = w + row * in_dim;
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        const float wv = __half2float(wr[i]);
+        const float wv = nt_wload(wr, i);
         #pragma unroll
         for (int t = 0; t < NT; t++) sum[t] += wv * x[t * in_dim + i];
     }
@@ -1926,7 +1934,7 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     const uint64_t f16_nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)f16_gemv_max_n;
     if (n_tok >= 2 && n_tok <= f16_nt_cap && n_tok <= 8) {
         dim3 g((unsigned)out_dim);
-        #define PULSAR_F16_NT(N) matmul_f16_nt_kernel<N><<<g, 256>>>( \
+        #define PULSAR_F16_NT(N) matmul_nt_kernel<N, __half><<<g, 256>>>( \
                 (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
         switch (n_tok) {
         case 2: PULSAR_F16_NT(2); break;
@@ -2000,6 +2008,29 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
     const uint16_t *w = (const uint16_t *)wptr;
+    /* M-independence, same contract as the f16 and f32 arms. The cuBLAS path
+     * below additionally ROUNDS the activations to bf16, so its disagreement
+     * with the n=1 kernel is larger than the f32 arm's, not smaller. */
+    {
+        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
+        if (n_tok >= 2 && n_tok <= nt_cap) {
+            dim3 g((unsigned)out_dim);
+            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16><<<g, 256>>>( \
+                    (float *)out->ptr, (const __nv_bfloat16 *)w,                        \
+                    (const float *)x->ptr, in_dim, out_dim)
+            switch (n_tok) {
+            case 2: PULSAR_NT_LAUNCH(2); break;
+            case 3: PULSAR_NT_LAUNCH(3); break;
+            case 4: PULSAR_NT_LAUNCH(4); break;
+            case 5: PULSAR_NT_LAUNCH(5); break;
+            case 6: PULSAR_NT_LAUNCH(6); break;
+            case 7: PULSAR_NT_LAUNCH(7); break;
+            default: PULSAR_NT_LAUNCH(8); break;
+            }
+            #undef PULSAR_NT_LAUNCH
+            return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
+        }
+    }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xb_count = n_tok * in_dim;
         uint16_t *xb = (uint16_t *)cuda_tmp_alloc(xb_count * sizeof(uint16_t), "bf16 gemm activations");
@@ -2061,6 +2092,36 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
+    /* M-INDEPENDENCE, same contract as the f16 arm above. cuBLAS below is
+     * batch-shape dependent: a row computed at n_tok=1 and the same row inside
+     * a wider batch do not agree bit-for-bit. That is invisible while these
+     * weights are f16 (the f16 arm has this nt kernel) and became visible the
+     * moment hc_*_fn and the *_ape families moved onto this path -- it is what
+     * cuda-mixed-neutrality-gate's GATE 2 caught, whose contract is rel-RMS 0
+     * between a fused prefill and a classic resume.
+     *
+     * The nt kernel's per-token loop and reduction match the n=1 kernel exactly,
+     * so each token's output is bit-identical to running it alone. The gate
+     * raises the cap to 8 via g_mneutral_rows, exactly as the f16 twin does. */
+    {
+        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
+        if (n_tok >= 2 && n_tok <= nt_cap) {
+            dim3 g((unsigned)out_dim);
+            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, float><<<g, 256>>>( \
+                    (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
+            switch (n_tok) {
+            case 2: PULSAR_NT_LAUNCH(2); break;
+            case 3: PULSAR_NT_LAUNCH(3); break;
+            case 4: PULSAR_NT_LAUNCH(4); break;
+            case 5: PULSAR_NT_LAUNCH(5); break;
+            case 6: PULSAR_NT_LAUNCH(6); break;
+            case 7: PULSAR_NT_LAUNCH(7); break;
+            default: PULSAR_NT_LAUNCH(8); break;
+            }
+            #undef PULSAR_NT_LAUNCH
+            return cuda_ok(cudaGetLastError(), "matmul_f32 nt launch");
+        }
+    }
     if (g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
