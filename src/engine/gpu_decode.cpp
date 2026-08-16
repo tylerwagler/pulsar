@@ -1423,7 +1423,8 @@ bool gpu_graph_dspark_draft_forward(
                                               PULSAR_N_VOCAB,
                                               n_draft,
                                               PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
+                                              PULSAR_N_HC,
+                                              base_weights->token_embd->type == PULSAR_TENSOR_BF16) != 0;
     pulsar_gpu_tensor_free(tokens_t);
     if (!ok) return false;
 

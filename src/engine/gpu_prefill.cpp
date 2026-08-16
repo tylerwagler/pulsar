@@ -26,7 +26,8 @@ static bool gpu_graph_encode_token_raw_swa(
                                               (uint32_t)weights->token_embd->dim[1],
                                               (uint32_t)token,
                                               PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
+                                              PULSAR_N_HC,
+                                              weights->token_embd->type == PULSAR_TENSOR_BF16) != 0;
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -251,7 +252,8 @@ bool gpu_graph_upload_prompt_embeddings_hc(
                                                 (uint32_t)weights->token_embd->dim[1],
                                                 n_tokens,
                                                 PULSAR_N_EMBD,
-                                                PULSAR_N_HC) != 0;
+                                                PULSAR_N_HC,
+                                                weights->token_embd->type == PULSAR_TENSOR_BF16) != 0;
     }
 
     return gpu_graph_upload_prompt_embeddings_hc_cpu(out_hc,

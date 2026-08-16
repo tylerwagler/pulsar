@@ -174,6 +174,21 @@ static void tensor_expect_f32_or_bf16(
         tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
 }
 
+/* F16 or BF16, both 2 bytes. Used where an artifact may predate the move to
+ * bf16 storage and must still load. */
+static void tensor_expect_f32_or_bf16_or_f16(
+        const pulsar_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) pulsar_die("internal error: missing tensor while validating layout");
+    if (t->type == PULSAR_TENSOR_BF16)
+        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
+    else
+        tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
+}
+
 static void tensor_expect_plain_layout(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -475,7 +490,12 @@ static void weights_validate_layout(
 
     if (require_token_embd && !w->token_embd) pulsar_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        tensor_expect_layout(w->token_embd, PULSAR_TENSOR_F16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        /* BF16 upstream. F16 and BF16 are both 2 bytes here, so this costs
+         * nothing to store either way -- but f16 is a LOSSY copy of a bf16
+         * source (it flushes anything under 5.96e-8 to zero) while bf16 is an
+         * exact one. There is no version of this where f16 is the better
+         * choice; it was simply never revisited. */
+        tensor_expect_f32_or_bf16_or_f16(w->token_embd, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
     const bool have_output = weights_have_output_head(w);
@@ -1238,8 +1258,19 @@ void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, 
     const uint64_t stride = te->dim[0];
     const uint16_t *row = base + (uint64_t)token * stride;
 
-    for (uint64_t i = 0; i < stride; i++) {
-        out[i] = f16_to_f32(row[i]);
+    /* Same 2-byte stride either way; only the decode differs. bf16 is the top
+     * 16 bits of the f32, so widening is a shift, not a conversion. */
+    if (te->type == PULSAR_TENSOR_BF16) {
+        for (uint64_t i = 0; i < stride; i++) {
+            const uint32_t bits = (uint32_t)row[i] << 16;
+            float v;
+            memcpy(&v, &bits, sizeof(v));
+            out[i] = v;
+        }
+    } else {
+        for (uint64_t i = 0; i < stride; i++) {
+            out[i] = f16_to_f32(row[i]);
+        }
     }
 }
 

@@ -126,7 +126,9 @@ int pulsar_gpu_embed_token_hc_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd,
-        uint32_t          n_hc);
+        uint32_t          n_hc,
+        /* token_embd storage: 1 = bf16 (source), 0 = f16 */
+        int w_bf16);
 
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
@@ -137,7 +139,8 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        int                    w_bf16);
 
 int pulsar_gpu_indexer_score_one_tensor(
         pulsar_gpu_tensor       *scores,

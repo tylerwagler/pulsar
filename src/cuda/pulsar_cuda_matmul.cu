@@ -2,21 +2,25 @@
 
 
 
-__global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+/* WBF16: token_embd storage. f16 and bf16 are both 2 bytes, so every size
+ * check around this is already right for either -- only the decode differs. */
+template <bool WBF16>
+__global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const void *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;
     uint32_t e = i % n_embd;
     uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
-    pulsar_hc_store(out, i, __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)tok * n_embd + e]));
+    pulsar_hc_store(out, i, pulsar_w_load<WBF16>(w, (uint64_t)tok * n_embd + e));
 }
 
 
 
+template <bool WBF16>
 __global__ static void embed_tokens_hc_kernel(
         pulsar_hc_t *out,
         const int32_t *tokens,
-        const __half *w,
+        const void *w,
         uint32_t n_vocab,
         uint32_t n_tokens,
         uint32_t n_embd,
@@ -30,7 +34,7 @@ __global__ static void embed_tokens_hc_kernel(
     int32_t tok_i = tokens[t];
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
-    pulsar_hc_store(out, gid, __half2float(w[(uint64_t)tok * n_embd + d]));
+    pulsar_hc_store(out, gid, pulsar_w_load<WBF16>(w, (uint64_t)tok * n_embd + d));
 }
 
 
@@ -458,7 +462,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
 
 
 
-int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc, int w_bf16) {
     if (!out_hc || !model_map || weight_offset >= model_size || n_vocab == 0) return 0;
     /* The kernel writes n_embd*n_hc carrier samples; validate like the batched
      * sibling does. Before the BF16 narrowing an undersized out_hc still had 2x
@@ -469,7 +473,10 @@ int pulsar_gpu_embed_token_hc_tensor(pulsar_gpu_tensor *out_hc, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, (const unsigned short *)wptr, token, n_vocab, n_embd, n_hc);
+    if (w_bf16)
+        embed_token_hc_kernel<true><<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, wptr, token, n_vocab, n_embd, n_hc);
+    else
+        embed_token_hc_kernel<false><<<(n + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr, wptr, token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -484,7 +491,8 @@ int pulsar_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        int                     w_bf16) {
     if (!out_hc || !tokens_t || !model_map ||
         weight_offset > model_size ||
         (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
@@ -497,11 +505,15 @@ int pulsar_gpu_embed_tokens_hc_tensor(
                                             "token_embd");
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (pulsar_hc_t *)out_hc->ptr,
-        (const int32_t *)tokens_t->ptr,
-        (const __half *)wptr,
-        n_vocab, n_tokens, n_embd, n_hc);
+#define PULSAR_EMBED_LAUNCH(NW)                             \
+    embed_tokens_hc_kernel<NW><<<(n + 255) / 256, 256>>>(   \
+        (pulsar_hc_t *)out_hc->ptr,                         \
+        (const int32_t *)tokens_t->ptr,                     \
+        wptr,                                               \
+        n_vocab, n_tokens, n_embd, n_hc)
+    if (w_bf16) PULSAR_EMBED_LAUNCH(true);
+    else        PULSAR_EMBED_LAUNCH(false);
+#undef PULSAR_EMBED_LAUNCH
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 

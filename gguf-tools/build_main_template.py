@@ -217,10 +217,12 @@ def suffix_type(ds4_name, ndim):
         # the mantissas copy verbatim and the round trip is exact.
         return FP8_E4M3
     if ds4_name == 'token_embd.weight':
-        # Also BF16 upstream, but the engine pins this one to F16 on a separate
-        # path (weights.cpp tensor_expect_layout(..., PULSAR_TENSOR_F16, ...)),
-        # so it cannot move until that changes.
-        return F16
+        # BF16 upstream, and BF16 here since 2026-08-15. This one is FREE: f16
+        # and bf16 are both 2 bytes, so the 1059 MB table is exactly the same
+        # size either way -- f16 was simply a lossy copy of a bf16 source for no
+        # saving at all. The engine reads either (weights.cpp
+        # tensor_expect_f32_or_bf16_or_f16 + the templated embed kernels).
+        return BF16
     if ds4_name == 'output.weight':
         return BF16
     raise ValueError(f'no type policy for {ds4_name!r} (ndim={ndim})')
