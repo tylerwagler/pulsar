@@ -752,6 +752,9 @@ struct mxfp8_act_cache_t {
     size_t         sx_cap;
     __half        *xh;
     size_t         xh_cap;
+    int            valid_b;      /* xb holds the bf16 conversion of that (ptr,shape) */
+    __nv_bfloat16 *xb;
+    size_t         xb_cap;
     uint64_t       lru;          /* eviction stamp; 0 = never used */
 };
 static thread_local mxfp8_act_cache_t g_act_slots[PULSAR_ACT_SLOTS];
@@ -789,7 +792,7 @@ static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint
         s->key_in_dim = in_dim;
         s->lru        = ++g_act_clock;
     }
-    s->valid = 0; s->valid_h = 0; s->f32_absent = 0;
+    s->valid = 0; s->valid_h = 0; s->valid_b = 0; s->f32_absent = 0;
     return s;
 }
 
@@ -802,6 +805,7 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void) {
         g_act_slots[i].key_ptr    = NULL;
         g_act_slots[i].valid      = 0;
         g_act_slots[i].valid_h    = 0;
+        g_act_slots[i].valid_b    = 0;
         g_act_slots[i].f32_absent = 0;
     }
     g_act_cur = NULL;
@@ -2056,10 +2060,28 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
     }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xb_count = n_tok * in_dim;
-        uint16_t *xb = (uint16_t *)cuda_tmp_alloc(xb_count * sizeof(uint16_t), "bf16 gemm activations");
-        if (!xb) return 0;
-        f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>(xb, (const float *)x->ptr, xb_count);
-        if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
+        /* Armed activation cache, same as the f16 twin above: one f32 buffer
+         * feeds several BF16 projections per layer (compressor kv + gate, the
+         * routers), and the conversion is pure, so convert ONCE and reuse.
+         * This arm re-converted on every call until 2026-08-16 -- a full-width
+         * pass per projection per layer, which at prefill widths is the bulk of
+         * what BF16 weights appeared to "cost" against F16. */
+        mxfp8_act_cache_t *hb = act_slot_find(x->ptr, n_tok, in_dim);
+        if (hb && !mxfp8_act_cache_reserve((void **)&hb->xb, &hb->xb_cap,
+                                           xb_count * sizeof(__nv_bfloat16), "act bf16")) {
+            hb = NULL;
+        }
+        __nv_bfloat16 *xbb = hb ? hb->xb
+                                : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
+                                                                  "bf16 gemm activations");
+        if (!xbb) return 0;
+        if (!hb || !hb->valid_b) {
+            f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
+                                                                (const float *)x->ptr, xb_count);
+            if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
+            if (hb) hb->valid_b = 1;
+        }
+        const uint16_t *xb = (const uint16_t *)xbb;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
