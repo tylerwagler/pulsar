@@ -952,7 +952,9 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                                              base_row, dmap, dsize,
                                              w->markov_w1->abs_offset,
                                              w->markov_w2->abs_offset,
-                                             refined[pos], vocab_size, embed_dim);
+                                             refined[pos], vocab_size, embed_dim,
+                                             w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                             w->markov_w2->type == PULSAR_TENSOR_BF16);
         pulsar_gpu_tensor_free(base_row);
         if (!draft_ok || !sample_drafts) continue;
         /* Read this position's refined logits back BEFORE the next markov step
@@ -1093,7 +1095,9 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                                                       dmap, dsize,
                                                       w->markov_w1->abs_offset,
                                                       w->confidence_proj->abs_offset,
-                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size) &&
+                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size,
+                                                      w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                                      w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
                 pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
                 have_conf = true;
                 if (tau > 0.0f) {

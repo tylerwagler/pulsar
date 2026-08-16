@@ -177,7 +177,9 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
  * copy is a silent wrong-operand bug rather than a rounding difference. */
 
 
-template <uint32_t BLK, uint32_t VEC>
+/* NWBF16: storage of norm_w (attn_norm / ffn_norm), bf16 in source. Promoted
+ * to f32 before it multiplies, so an f32 tensor stays bit-exact. */
+template <uint32_t BLK, uint32_t VEC, bool NWBF16>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
@@ -190,7 +192,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         const pulsar_hc_t *residual_hc,
         const float *scale,
         const float *base,
-        const float *norm_w,
+        const void *norm_w,
         uint32_t n_embd,
         uint32_t n_hc,
         uint32_t n_rows,
@@ -238,7 +240,8 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     #pragma unroll
     for (uint32_t u = 0; u < VEC; u++) {
         const uint32_t col = d + u * BLK;
-        const float v = (col < n_embd) ? (accs[u] * norm_scale * norm_w[col]) : 0.0f;
+        const float v = (col < n_embd)
+                ? (accs[u] * norm_scale * pulsar_w_load<NWBF16>(norm_w, col)) : 0.0f;
         if (col < n_embd) {
             norm_out[obase + col] = v;
             if (norm_out_h) norm_out_h[obase + col] = __float2half(v);
@@ -709,7 +712,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps) {
+        float                   norm_eps,
+        int                     norm_w_bf16) {
     /* `out` is OPTIONAL: it is the pre-norm carrier, which nothing reads except
      * a debug dump, so callers pass NULL unless a dump was requested. */
     if (!norm_out || !split || !mix || !residual_hc || !model_map ||
@@ -726,7 +730,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset ||
         norm_weight_offset > model_size ||
-        (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
+        (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16) > model_size - norm_weight_offset) {
         return 0;
     }
     const uint64_t n_rows = n_rows_in;
@@ -739,8 +743,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
             3ull * sizeof(float), "hc_scale");
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
             mix_bytes, "hc_base");
-    const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
-            (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+    const void *norm_w = cuda_model_range_ptr(model_map, norm_weight_offset,
+            (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
 #define PULSAR_HCFUSED_BLK 256u
 #define PULSAR_HCFUSED_VEC 16u
@@ -756,21 +760,25 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         return 0;
     }
     {
-        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC>
-                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
-                out ? (float *)out->ptr : NULL,
-                (float *)norm_out->ptr,
-                (__half *)norm_out_h,
-                (__nv_fp8_e4m3 *)norm_out_q,
-                (unsigned char *)norm_out_sf,
-                norm_out_kbp,
-                (float *)split->ptr,
-                (const float *)mix->ptr,
-                (const pulsar_hc_t *)residual_hc->ptr,
-                scale,
-                base,
-                norm_w,
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
+#define PULSAR_HCFUSED_LAUNCH(NW)                                                    \
+        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC, NW> \
+                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(                           \
+                out ? (float *)out->ptr : NULL,                                       \
+                (float *)norm_out->ptr,                                              \
+                (__half *)norm_out_h,                                                \
+                (__nv_fp8_e4m3 *)norm_out_q,                                         \
+                (unsigned char *)norm_out_sf,                                        \
+                norm_out_kbp,                                                        \
+                (float *)split->ptr,                                                 \
+                (const float *)mix->ptr,                                             \
+                (const pulsar_hc_t *)residual_hc->ptr,                               \
+                scale,                                                               \
+                base,                                                                \
+                norm_w,                                                              \
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps)
+        if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(true);
+        else             PULSAR_HCFUSED_LAUNCH(false);
+#undef PULSAR_HCFUSED_LAUNCH
         return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
     }
 }

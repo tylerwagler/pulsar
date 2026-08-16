@@ -430,7 +430,8 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_N_HC,
                                                          PULSAR_N_HC_SINKHORN_ITER,
                                                          PULSAR_HC_EPS,
-                                                         PULSAR_RMS_EPS) != 0;
+                                                         PULSAR_RMS_EPS,
+        layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->attn_norm, 1, PULSAR_N_EMBD);
         if (ok && an_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     } else if (ok) {
@@ -509,7 +510,8 @@ bool gpu_graph_encode_decode_layer(
                                                              PULSAR_N_HEAD_DIM,
                                                              1,
                                                              PULSAR_RMS_EPS,
-                                                             qn_q, qn_sf, qn_kbp) != 0;
+                                                             qn_q, qn_sf, qn_kbp,
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
     } else {
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->qr_norm, 1, (uint64_t)q_rank,
                                                         &qn_q, &qn_sf, &qn_kbp)) {
@@ -519,7 +521,8 @@ bool gpu_graph_encode_decode_layer(
                                                       model->map, model->size,
                                                       layer->attn_q_a_norm->abs_offset,
                                                       (uint32_t)q_rank, PULSAR_RMS_EPS,
-                                                      qn_q, qn_sf, qn_kbp) != 0;
+                                                      qn_q, qn_sf, qn_kbp,
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
     }
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->qr_norm, 1, (uint64_t)q_rank);
     if (ok && qn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
@@ -599,7 +602,8 @@ bool gpu_graph_encode_decode_layer(
         if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
                                                       model->map, model->size,
                                                       layer->attn_kv_a_norm->abs_offset,
-                                                      PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS) != 0;
+                                                      PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS,
+        layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) {
             gpu_graph_debug_dump_tensor("KVnorm", g->kv, PULSAR_N_HEAD_DIM, il, pos);
         }
@@ -1104,7 +1108,8 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_N_HC,
                                                          PULSAR_N_HC_SINKHORN_ITER,
                                                          PULSAR_HC_EPS,
-                                                         PULSAR_RMS_EPS) != 0;
+                                                         PULSAR_RMS_EPS,
+        layer->ffn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->ffn_norm, 1, PULSAR_N_EMBD);
         if (ok && fn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     } else if (ok) {
@@ -1326,7 +1331,8 @@ bool gpu_graph_dspark_project_main_x(
                                             dspark_model->size,
                                             w->main_norm->abs_offset,
                                             (uint32_t)E,
-                                            PULSAR_RMS_EPS) != 0;
+                                            PULSAR_RMS_EPS,
+        w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
     }
 
     return ok;
@@ -1358,7 +1364,8 @@ void gpu_graph_dspark_seed_draft_kv(
                                              dspark_model->map,
                                              dspark_model->size,
                                              w->layer[li].attn_kv_a_norm->abs_offset,
-                                             PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS)) {
+                                             PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS,
+        w->layer[li].attn_kv_a_norm->type == PULSAR_TENSOR_BF16)) {
             continue;
         }
         /* Seed one KV row per committed position.  Each row is RoPE'd at its OWN
@@ -1472,7 +1479,8 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_attn_norm, attn_cur_view,
             dspark_model->map, dspark_model->size,
             layer->attn_norm->abs_offset,
-            PULSAR_N_EMBD, n_draft, PULSAR_RMS_EPS) != 0;
+            PULSAR_N_EMBD, n_draft, PULSAR_RMS_EPS,
+        layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
@@ -1485,7 +1493,8 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_qr_norm, g->batch_qr,
             dspark_model->map, dspark_model->size,
             layer->attn_q_a_norm->abs_offset,
-            q_rank, n_draft, PULSAR_RMS_EPS) != 0;
+            q_rank, n_draft, PULSAR_RMS_EPS,
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_q, dspark_model->map, dspark_model->size,
             layer->attn_q_b->abs_offset,
@@ -1510,7 +1519,8 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_kv, g->batch_kv_raw,
             dspark_model->map, dspark_model->size,
             layer->attn_kv_a_norm->abs_offset,
-            PULSAR_N_HEAD_DIM, n_draft, PULSAR_RMS_EPS) != 0;
+            PULSAR_N_HEAD_DIM, n_draft, PULSAR_RMS_EPS,
+        layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_kv, n_draft,
             PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
@@ -1678,7 +1688,8 @@ bool gpu_graph_encode_output_head(
                                                   model->size,
                                                   weights->output_norm->abs_offset,
                                                   PULSAR_N_EMBD,
-                                                  PULSAR_RMS_EPS) != 0;
+                                                  PULSAR_RMS_EPS,
+        weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
@@ -1779,7 +1790,8 @@ bool gpu_graph_encode_output_head_batch(
                                                        weights->output_norm->abs_offset,
                                                        PULSAR_N_EMBD,
                                                        n_tokens,
-                                                       PULSAR_RMS_EPS) != 0;
+                                                       PULSAR_RMS_EPS,
+        weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         if (weights->output->type == PULSAR_TENSOR_BF16)
             ok = pulsar_gpu_matmul_bf16_tensor(logits, model->map, model->size,
@@ -1841,7 +1853,8 @@ bool gpu_graph_encode_dspark_output_head_batch(
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
                                                      dspark_model->map, dspark_model->size,
                                                      dw->final_norm->abs_offset,
-                                                     PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS) != 0;
+                                                     PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS,
+        dw->final_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         if (bw->output->type == PULSAR_TENSOR_BF16)
             ok = pulsar_gpu_matmul_bf16_tensor(logits, base_model->map, base_model->size,

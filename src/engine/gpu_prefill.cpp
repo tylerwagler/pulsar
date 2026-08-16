@@ -730,7 +730,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  PULSAR_N_HC,
                                                                  PULSAR_N_HC_SINKHORN_ITER,
                                                                  PULSAR_HC_EPS,
-                                                                 PULSAR_RMS_EPS) != 0;
+                                                                 PULSAR_RMS_EPS,
+        layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_attn_pre", g->batch_attn_cur,
@@ -814,7 +815,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              PULSAR_RMS_EPS,
                                                              qr_norm_q,
                                                              qr_norm_sf,
-                                                             qr_norm_kbp) != 0;
+                                                             qr_norm_kbp,
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_tokens, (uint64_t)q_rank);
         if (ok && qr_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     }
@@ -2235,7 +2237,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  PULSAR_N_HC,
                                                                  PULSAR_N_HC_SINKHORN_ITER,
                                                                  PULSAR_HC_EPS,
-                                                                 PULSAR_RMS_EPS) != 0;
+                                                                 PULSAR_RMS_EPS,
+        layer->ffn_norm->type == PULSAR_TENSOR_BF16) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,

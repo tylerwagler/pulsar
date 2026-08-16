@@ -76,7 +76,11 @@ __global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pu
  * a GEMM consuming this norm multiplies in the source's format instead of
  * against f32.  Same contract as pulsar_cuda_mx.cuh: every lane of a warp must
  * reach the emit, which the launcher guarantees by refusing n % 256 != 0. */
-__global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps,
+/* WBF16: the norm weight is bf16 (source format) rather than f32. Storage only
+ * -- the value is promoted to f32 before it multiplies, so the arithmetic here
+ * is identical either way and an f32 artifact stays bit-exact. */
+template <bool WBF16>
+__global__ static void rms_norm_weight_kernel(float *out, const float *x, const void *w, uint32_t n, uint32_t rows, float eps,
                                               __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -96,7 +100,7 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i] * scale * w[i];
+        const float v = xr[i] * scale * pulsar_w_load<WBF16>(w, i);
         orow[i] = v;
         if (out_q) pulsar_mx_emit_block(v, i, row, n, out_kbp, out_q, out_sf);
     }
@@ -111,14 +115,18 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
  * in particular every lane must reach pulsar_mx_emit_block(), which is why the
  * host only supplies the slots when q_n is a multiple of the block size (then
  * the strided loop runs the same number of times on every thread). */
+/* QWBF16/KVWBF16: storage of q_w and kv_w. Separate flags -- they are separate
+ * tensors. `which` is blockIdx.y, so the select below is block-uniform and the
+ * branch costs nothing. */
+template <bool QWBF16, bool KVWBF16>
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
-        const float *q_w,
+        const void *q_w,
         uint32_t q_n,
         float *kv_out,
         const float *kv,
-        const float *kv_w,
+        const void *kv_w,
         uint32_t kv_n,
         uint32_t rows,
         float eps,
@@ -131,7 +139,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     const uint32_t n = which == 0u ? q_n : kv_n;
     const float *xr = (which == 0u ? q : kv) + (uint64_t)row * n;
     float *orow = (which == 0u ? q_out : kv_out) + (uint64_t)row * n;
-    const float *w = which == 0u ? q_w : kv_w;
+    const bool is_q = (which == 0u);
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = xr[i];
@@ -147,7 +155,9 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     const int emit_mx = (q_out_q != NULL) && (which == 0u);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i] * scale * w[i];
+        const float wv = is_q ? pulsar_w_load<QWBF16>(q_w, i)
+                              : pulsar_w_load<KVWBF16>(kv_w, i);
+        const float v = xr[i] * scale * wv;
         orow[i] = v;
         if (emit_mx) {
             pulsar_mx_emit_block(v, i, row, n, q_out_kbp, q_out_q, q_out_sf);
@@ -1087,14 +1097,15 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, const pulsar_g
 
 
 int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
-        void *out_q, void *out_sf, int out_kbp) {
+        void *out_q, void *out_sf, int out_kbp, int w_bf16) {
+    /* The weight is sized by ITS storage; out/x are f32 buffers regardless. */
+    const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
     if (!out || !x || !model_map || weight_offset > model_size ||
-        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        model_size - weight_offset < w_bytes ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
-    if (!wptr) return 0;
-    const float *w = (const float *)wptr;
+    const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
+    if (!w) return 0;
     /* FAIL LOUD, not skip: the caller arms the activation cache off the same
      * slot pointer, so a silently skipped emission leaves the GEMM reading a
      * memset-zero E4M3 buffer -- a well-formed WRONG answer. */
@@ -1103,26 +1114,34 @@ int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gp
                         "(needs a multiple of 256)\n", n);
         return 0;
     }
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
-                                       (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
+    if (w_bf16)
+        rms_norm_weight_kernel<true><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+                                           (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
+    else
+        rms_norm_weight_kernel<false><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+                                           (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
-int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
-    return pulsar_gpu_rms_norm_weight_mx_tensor(out, x, model_map, model_size, weight_offset, n, eps, NULL, NULL, 0);
+int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps, int w_bf16) {
+    return pulsar_gpu_rms_norm_weight_mx_tensor(out, x, model_map, model_size, weight_offset, n, eps, NULL, NULL, 0, w_bf16);
 }
 
 
-int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps, int w_bf16) {
+    const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
     if (!out || !x || !model_map || weight_offset > model_size ||
-        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        model_size - weight_offset < w_bytes ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
-    if (!wptr) return 0;
-    const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
-                                          NULL, NULL, 0);
+    const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
+    if (!w) return 0;
+    if (w_bf16)
+        rms_norm_weight_kernel<true><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                              NULL, NULL, 0);
+    else
+        rms_norm_weight_kernel<false><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                              NULL, NULL, 0);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
@@ -1142,22 +1161,26 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         float                   eps,
         void                   *q_out_q,
         void                   *q_out_sf,
-        int                     q_out_kbp) {
+        int                     q_out_kbp,
+        int                     q_w_bf16,
+        int                     kv_w_bf16) {
+    const uint64_t q_w_bytes = (uint64_t)q_n * pulsar_w_elt_bytes(q_w_bf16);
+    const uint64_t kv_w_bytes = (uint64_t)kv_n * pulsar_w_elt_bytes(kv_w_bf16);
     if (!q_out || !q || !kv_out || !kv || !model_map ||
         q_weight_offset > model_size ||
         kv_weight_offset > model_size ||
-        model_size - q_weight_offset < (uint64_t)q_n * sizeof(float) ||
-        model_size - kv_weight_offset < (uint64_t)kv_n * sizeof(float) ||
+        model_size - q_weight_offset < q_w_bytes ||
+        model_size - kv_weight_offset < kv_w_bytes ||
         q_out->bytes < (uint64_t)q_n * rows * sizeof(float) ||
         q->bytes < (uint64_t)q_n * rows * sizeof(float) ||
         kv_out->bytes < (uint64_t)kv_n * rows * sizeof(float) ||
         kv->bytes < (uint64_t)kv_n * rows * sizeof(float)) {
         return 0;
     }
-    const float *q_w = (const float *)cuda_model_range_ptr(model_map,
-            q_weight_offset, (uint64_t)q_n * sizeof(float), "q_rms_weight");
-    const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
-            kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
+    const void *q_w = cuda_model_range_ptr(model_map,
+            q_weight_offset, q_w_bytes, "q_rms_weight");
+    const void *kv_w = cuda_model_range_ptr(model_map,
+            kv_weight_offset, kv_w_bytes, "kv_rms_weight");
     if (!q_w || !kv_w) return 0;
     /* The strided epilogue keeps every lane of a warp live only when the row
      * divides evenly by the 256-thread block; otherwise some lanes exit before
@@ -1171,20 +1194,26 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         return 0;
     }
     dim3 grid(rows, 2u, 1u);
-    dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
-            (float *)q_out->ptr,
-            (const float *)q->ptr,
-            q_w,
-            q_n,
-            (float *)kv_out->ptr,
-            (const float *)kv->ptr,
-            kv_w,
-            kv_n,
-            rows,
-            eps,
-            (__nv_fp8_e4m3 *)q_out_q,
-            (unsigned char *)q_out_sf,
-            q_out_kbp);
+#define PULSAR_QKV_NORM_LAUNCH(A, B)                    \
+    dsv4_qkv_rms_norm_rows_kernel<A, B><<<grid, 256>>>( \
+            (float *)q_out->ptr,                        \
+            (const float *)q->ptr,                      \
+            q_w,                                        \
+            q_n,                                        \
+            (float *)kv_out->ptr,                       \
+            (const float *)kv->ptr,                     \
+            kv_w,                                       \
+            kv_n,                                       \
+            rows,                                       \
+            eps,                                        \
+            (__nv_fp8_e4m3 *)q_out_q,                   \
+            (unsigned char *)q_out_sf,                  \
+            q_out_kbp)
+    if (q_w_bf16 && kv_w_bf16)   PULSAR_QKV_NORM_LAUNCH(true, true);
+    else if (q_w_bf16)           PULSAR_QKV_NORM_LAUNCH(true, false);
+    else if (kv_w_bf16)          PULSAR_QKV_NORM_LAUNCH(false, true);
+    else                         PULSAR_QKV_NORM_LAUNCH(false, false);
+#undef PULSAR_QKV_NORM_LAUNCH
     return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
 }
 
@@ -1562,7 +1591,9 @@ int pulsar_gpu_compressor_update_tensor(
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        (ape_type != 0u && ape_type != 1u) ||
+        /* ds4 types: 0 = F32, 30 = BF16 (source format). */
+        (norm_type != 0u && norm_type != 30u)) {
         return 0;
     }
     const uint32_t coff = ratio == 4u ? 2u : 1u;
@@ -1574,7 +1605,8 @@ int pulsar_gpu_compressor_update_tensor(
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
-    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    const int norm_bf16 = (norm_type == 30u);
+    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_bf16);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
         kv_cur->bytes < kv_bytes || sc_cur->bytes < kv_bytes ||
@@ -1602,7 +1634,7 @@ int pulsar_gpu_compressor_update_tensor(
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
                                                        model_map, model_size, norm_offset,
-                                                       head_dim, 1, rms_eps);
+                                                       head_dim, 1, rms_eps, norm_bf16);
     if (ok) ok = pulsar_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
                                             pos + 1u - ratio, n_ctx_orig, false,
                                             freq_base, freq_scale, ext_factor, attn_factor,
@@ -1647,7 +1679,9 @@ int pulsar_gpu_compressor_prefill_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        (ape_type != 0u && ape_type != 1u) ||
+        /* ds4 types: 0 = F32, 30 = BF16 (source format). */
+        (norm_type != 0u && norm_type != 30u)) {
         return 0;
     }
 
@@ -1662,7 +1696,8 @@ int pulsar_gpu_compressor_prefill_tensor(
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
-    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    const int norm_bf16 = (norm_type == 30u);
+    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_bf16);
 
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
@@ -1721,7 +1756,7 @@ int pulsar_gpu_compressor_prefill_tensor(
         if (!cuda_ok(cudaGetLastError(), "compressor prefill pool launch")) return 0;
         if (!pulsar_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                    model_map, model_size, norm_offset,
-                                                   head_dim, n_comp, rms_eps)) return 0;
+                                                   head_dim, n_comp, rms_eps, norm_bf16)) return 0;
         if (n_rot != 0) {
             const uint32_t pairs = n_comp * (n_rot / 2u);
             rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
@@ -1765,7 +1800,9 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
-        (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        (ape_type != 0u && ape_type != 1u) ||
+        /* ds4 types: 0 = F32, 30 = BF16 (source format). */
+        (norm_type != 0u && norm_type != 30u)) {
         return 0;
     }
 
@@ -1778,7 +1815,8 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
-    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    const int norm_bf16 = (norm_type == 30u);
+    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_bf16);
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
@@ -1799,7 +1837,7 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
     if (!cuda_ok(cudaGetLastError(), "compressor replay pool launch")) return 0;
     if (!pulsar_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
                                                model_map, model_size, norm_offset,
-                                               head_dim, n_comp, rms_eps)) return 0;
+                                               head_dim, n_comp, rms_eps, norm_bf16)) return 0;
     if (n_rot != 0) {
         const uint32_t pairs = n_comp * (n_rot / 2u);
         rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(

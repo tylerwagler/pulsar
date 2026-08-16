@@ -482,7 +482,12 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
 int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
         uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
-        void *out_q, void *out_sf, int out_kbp);
+        void *out_q, void *out_sf, int out_kbp,
+        /* 1 when this norm weight is stored bf16 (source format) rather
+         * than f32. Storage only -- the value is promoted to f32 before it
+         * multiplies, so an f32 tensor stays bit-exact. Pass the TENSOR's
+         * type; never assume, the drafter and the main model can differ. */
+        int w_bf16);
 
 int pulsar_gpu_rms_norm_weight_tensor(
         pulsar_gpu_tensor       *out,
@@ -491,7 +496,8 @@ int pulsar_gpu_rms_norm_weight_tensor(
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                n,
-        float                   eps);
+        float                   eps,
+        int                     w_bf16);
 
 int pulsar_gpu_rms_norm_weight_rows_tensor(
         pulsar_gpu_tensor       *out,
@@ -501,7 +507,8 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         uint32_t                rows,
-        float                   eps);
+        float                   eps,
+        int                     w_bf16);
 
 /* As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
  * the norm's own epilogue into the activation-cache slots, so the MXFP8
@@ -523,7 +530,9 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         float                   eps,
         void                   *q_out_q,
         void                   *q_out_sf,
-        int                     q_out_kbp);
+        int                     q_out_kbp,
+        int                     q_w_bf16,
+        int                     kv_w_bf16);
 
 int pulsar_gpu_head_rms_norm_tensor(
         pulsar_gpu_tensor *x,
@@ -1364,7 +1373,9 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps);
+        float                   norm_eps,
+        /* Storage of norm_w (attn_norm / ffn_norm): 1 = bf16, 0 = f32. */
+        int                     norm_w_bf16);
 
 
 /* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
@@ -1459,7 +1470,13 @@ int pulsar_gpu_dspark_markov_step_model(
         uint64_t                markov_w2_offset,
         int32_t                prev_token,
         uint32_t               vocab_size,
-        uint32_t               embed_dim);
+        uint32_t               embed_dim,
+        /* Storage of markov_w1 and markov_w2: 1 = bf16 (source format), 0 =
+         * f32.  Separate flags because they are separate tensors.  The step
+         * streams all of markov_w2 at one FMA per element, so its width sets
+         * the kernel's runtime, not just its footprint. */
+        int                    w1_bf16,
+        int                    w2_bf16);
 
 int pulsar_gpu_dspark_hc_mean_reduce(
         pulsar_gpu_tensor       *out,
@@ -1489,7 +1506,12 @@ int pulsar_gpu_dspark_confidence_score_model(
         uint32_t                n_positions,
         uint32_t                hidden_dim,
         uint32_t                embed_dim,
-        uint32_t                vocab_size);
+        uint32_t                vocab_size,
+        /* Storage of markov_w1 and proj respectively -- they are separate
+         * tensors and nothing forces them to agree, so do not collapse these
+         * into one flag. */
+        int                     w1_bf16,
+        int                     proj_bf16);
 
 
 /* ===========================================================================

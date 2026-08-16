@@ -16,6 +16,16 @@
  * or without the runner-up requested.  The runner-up (drafter #2) is used only
  * when the host passes a non-NULL refined_id2_dst (measurement path).
  */
+/* W1BF16/W2BF16 select the storage of markov_w1 and markov_w2 (pulsar_w_load).
+ * They are SEPARATE tensors and nothing in the format forces them to agree, so
+ * they get separate flags even though every artifact so far converts them
+ * together -- a single shared flag silently misreads one of them the first time
+ * that stops being true.
+ *
+ * This kernel streams the WHOLE of markov_w2 -- every vocab row, every step --
+ * at one multiply-add per element, so it is pure bandwidth: halving the element
+ * width halves its runtime. That, not the 132 MB, is why the storage matters. */
+template <bool W1BF16, bool W2BF16>
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
         int32_t *block_best_id,
@@ -23,12 +33,12 @@ __global__ static void dspark_markov_step_kernel(
         int32_t *block_second_id,
         float *block_second_val,
         const float *base_logits,
-        const float *markov_w1,
-        const float *markov_w2,
+        const void *markov_w1,
+        const void *markov_w2,
         int32_t prev_token,
         uint32_t vocab_size,
         uint32_t embed_dim) {
-    const float *embed = markov_w1 + (uint64_t)prev_token * embed_dim;
+    const uint64_t embed_base = (uint64_t)prev_token * embed_dim;
     float best_val = -INFINITY;
     int32_t best_id = 0;
     float second_val = -INFINITY;
@@ -37,8 +47,10 @@ __global__ static void dspark_markov_step_kernel(
     for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
          v += blockDim.x * gridDim.x) {
         float dot = 0.0f;
-        const float *w2_row = markov_w2 + (uint64_t)v * embed_dim;
-        for (uint32_t i = 0; i < embed_dim; i++) dot += w2_row[i] * embed[i];
+        const uint64_t w2_base = (uint64_t)v * embed_dim;
+        for (uint32_t i = 0; i < embed_dim; i++)
+            dot += pulsar_w_load<W2BF16>(markov_w2, w2_base + i) *
+                   pulsar_w_load<W1BF16>(markov_w1, embed_base + i);
         float val = base_logits[v] + dot;
         refined_logits[v] = val;
         if (val > best_val) { second_val = best_val; second_id = best_id;
@@ -191,7 +203,9 @@ int pulsar_gpu_dspark_markov_step_model(
         uint64_t markov_w2_offset,
         int32_t prev_token,
         uint32_t vocab_size,
-        uint32_t embed_dim) {
+        uint32_t embed_dim,
+        int w1_bf16,
+        int w2_bf16) {
     if (!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map)
         return 0;
     if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
@@ -199,16 +213,22 @@ int pulsar_gpu_dspark_markov_step_model(
     if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
     if ((uint64_t)prev_token >= vocab_size) return 0;
 
-    const uint64_t w_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
+    /* Sized by the STORAGE width, not sizeof(float): a bf16 markov head is half
+     * these bytes and checking it against the f32 size would reject a valid
+     * tensor near the end of the file. */
+    const uint64_t w1_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t w2_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
     if (markov_w1_offset > dspark_model_size ||
-        w_bytes > dspark_model_size - markov_w1_offset) return 0;
+        w1_bytes > dspark_model_size - markov_w1_offset) return 0;
     if (markov_w2_offset > dspark_model_size ||
-        w_bytes > dspark_model_size - markov_w2_offset) return 0;
+        w2_bytes > dspark_model_size - markov_w2_offset) return 0;
 
-    const float *w1 = (const float *)cuda_model_range_ptr(
-        dspark_model_map, markov_w1_offset, w_bytes, "dspark_markov_w1");
-    const float *w2 = (const float *)cuda_model_range_ptr(
-        dspark_model_map, markov_w2_offset, w_bytes, "dspark_markov_w2");
+    const void *w1 = cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const void *w2 = cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
     if (!w1 || !w2) return 0;
 
     const uint32_t block_dim = 256;
@@ -241,14 +261,20 @@ int pulsar_gpu_dspark_markov_step_model(
     }
     if (!rb.id || !rb.val || !rb.id2 || !rb.val2 || !rb.out) return 0;
 
-    dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
-        (float *)refined_logits->ptr,
-        (int32_t *)rb.id->ptr,
-        (float *)rb.val->ptr,
-        (int32_t *)rb.id2->ptr,
-        (float *)rb.val2->ptr,
-        (const float *)base_logits->ptr,
-        w1, w2, prev_token, vocab_size, embed_dim);
+#define PULSAR_MARKOV_LAUNCH(A, B)                          \
+    dspark_markov_step_kernel<A, B><<<grid_dim, block_dim>>>( \
+        (float *)refined_logits->ptr,                         \
+        (int32_t *)rb.id->ptr,                                \
+        (float *)rb.val->ptr,                                 \
+        (int32_t *)rb.id2->ptr,                               \
+        (float *)rb.val2->ptr,                                \
+        (const float *)base_logits->ptr,                      \
+        w1, w2, prev_token, vocab_size, embed_dim)
+    if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_LAUNCH(true, true);
+    else if (w1_bf16)         PULSAR_MARKOV_LAUNCH(true, false);
+    else if (w2_bf16)         PULSAR_MARKOV_LAUNCH(false, true);
+    else                      PULSAR_MARKOV_LAUNCH(false, false);
+#undef PULSAR_MARKOV_LAUNCH
 
     int rc = 0;
     if (cudaGetLastError() == cudaSuccess)
@@ -264,22 +290,26 @@ int pulsar_gpu_dspark_markov_step_model(
  * hidden is the post-hc_head drafter hidden and markov_embed is a row of markov_w1
  * gathered by token id. Used to size the verify budget (confidence-scheduled
  * verification) -- higher confidence => the draft is more likely accepted. */
+template <bool W1BF16, bool PROJBF16>
 __global__ static void dspark_confidence_score_kernel(
         float *scores,
         const float *hidden,        /* [n_positions, hidden_dim] */
         const int32_t *token_ids,   /* [n_positions] */
-        const float *markov_w1,     /* [vocab, embed_dim] */
-        const float *proj,          /* [hidden_dim + embed_dim] */
+        const void *markov_w1,      /* [vocab, embed_dim], f32 or bf16 */
+        const void *proj,           /* [hidden_dim + embed_dim], f32 or bf16 */
         uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
     uint32_t p = blockIdx.x;
     if (p >= n_positions) return;
     int32_t t = token_ids[p];
     if (t < 0 || (uint32_t)t >= vocab_size) t = 0;
     const float *hp = hidden + (uint64_t)p * hidden_dim;
-    const float *emb = markov_w1 + (uint64_t)t * embed_dim;
+    const uint64_t emb_base = (uint64_t)t * embed_dim;
     float dot = 0.0f;
-    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x) dot += hp[i] * proj[i];
-    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x) dot += emb[i] * proj[hidden_dim + i];
+    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x)
+        dot += hp[i] * pulsar_w_load<PROJBF16>(proj, i);
+    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x)
+        dot += pulsar_w_load<W1BF16>(markov_w1, emb_base + i) *
+               pulsar_w_load<PROJBF16>(proj, hidden_dim + i);
     __shared__ float partial[256];
     partial[threadIdx.x] = dot;
     __syncthreads();
@@ -299,22 +329,30 @@ int pulsar_gpu_dspark_confidence_score_model(
         uint64_t dspark_model_size,
         uint64_t markov_w1_offset,
         uint64_t proj_offset,
-        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
+        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size,
+        int w1_bf16, int proj_bf16) {
     if (!scores || !hidden || !token_ids || !dspark_model_map) return 0;
     if (n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0) return 0;
     if (scores->bytes < (uint64_t)n_positions * sizeof(float)) return 0;
     if (hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float)) return 0;
     if (token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t)) return 0;
-    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
-    const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * sizeof(float);
+    /* Each sized by its OWN storage width -- w1 and proj are separate tensors. */
+    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * pulsar_w_elt_bytes(proj_bf16);
     if (markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset) return 0;
     if (proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset) return 0;
-    const float *w1 = (const float *)cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
-    const float *proj = (const float *)cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
+    const void *w1 = cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
+    const void *proj = cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
     if (!w1 || !proj) return 0;
-    dspark_confidence_score_kernel<<<n_positions, 256>>>(
-        (float *)scores->ptr, (const float *)hidden->ptr, (const int32_t *)token_ids->ptr,
-        w1, proj, n_positions, hidden_dim, embed_dim, vocab_size);
+#define PULSAR_CONF_LAUNCH(A, B)                                                    \
+    dspark_confidence_score_kernel<A, B><<<n_positions, 256>>>(                     \
+        (float *)scores->ptr, (const float *)hidden->ptr, (const int32_t *)token_ids->ptr, \
+        w1, proj, n_positions, hidden_dim, embed_dim, vocab_size)
+    if (w1_bf16 && proj_bf16)        PULSAR_CONF_LAUNCH(true, true);
+    else if (w1_bf16)                PULSAR_CONF_LAUNCH(true, false);
+    else if (proj_bf16)              PULSAR_CONF_LAUNCH(false, true);
+    else                             PULSAR_CONF_LAUNCH(false, false);
+#undef PULSAR_CONF_LAUNCH
     return cuda_ok(cudaGetLastError(), "dspark confidence score");
 }
 

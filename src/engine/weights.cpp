@@ -154,6 +154,26 @@ static void tensor_expect_plain_or_mxfp8(
 
 
 
+/* For weights whose consumer reads f32 OR bf16 storage, chosen per tensor at
+ * load (see pulsar_w_load in the CUDA internal header).  These are tensors the
+ * checkpoint holds in bf16 and we used to widen to f32 for no reason -- the
+ * drafter's markov head and confidence projection, and the norm weights.
+ * Accepting both keeps one binary able to load an artifact from either side of
+ * that change; every caller must pass the tensor's actual type down to the
+ * kernel, never assume. */
+static void tensor_expect_f32_or_bf16(
+        const pulsar_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) pulsar_die("internal error: missing tensor while validating layout");
+    if (t->type == PULSAR_TENSOR_BF16)
+        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
+    else
+        tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
+}
+
 static void tensor_expect_plain_layout(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -465,7 +485,7 @@ static void weights_validate_layout(
         tensor_expect_layout(w->output_hc_base,  PULSAR_TENSOR_F32,  1, PULSAR_N_HC, 0, 0);
         tensor_expect_plain_or_mxfp8(w->output_hc_fn, 2, hc_dim, PULSAR_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, PULSAR_TENSOR_F32,  1, 1, 0, 0);
-        tensor_expect_layout(w->output_norm,     PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
+        tensor_expect_f32_or_bf16(w->output_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Output head is BF16 (source format, kept lossless by a dedicated BF16
          * matmul) or MXFP8 (routed to the FP8 matmul).  Source ships this head
          * bf16, so MXFP8 is BELOW source here -- the one place in the model
@@ -488,12 +508,12 @@ static void weights_validate_layout(
         tensor_expect_plain_or_mxfp8(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  PULSAR_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   PULSAR_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->attn_norm,      PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_norm,  1, PULSAR_N_EMBD, 0, 0);
         tensor_expect_mxfp8(l->attn_q_a,        2, PULSAR_N_EMBD, PULSAR_N_LORA_Q, 0);
-        tensor_expect_layout(l->attn_q_a_norm,  PULSAR_TENSOR_F32,  1, PULSAR_N_LORA_Q, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_q_a_norm,  1, PULSAR_N_LORA_Q, 0, 0);
         tensor_expect_mxfp8(l->attn_q_b,        2, PULSAR_N_LORA_Q, q_dim, 0);
         tensor_expect_mxfp8(l->attn_kv,         2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
-        tensor_expect_layout(l->attn_kv_a_norm, PULSAR_TENSOR_F32,  1, PULSAR_N_HEAD_DIM, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_kv_a_norm,  1, PULSAR_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     PULSAR_TENSOR_F32,  1, PULSAR_N_HEAD, 0, 0);
         tensor_expect_mxfp8(l->attn_output_a,   2, PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, PULSAR_N_EMBD, 0);
@@ -504,7 +524,7 @@ static void weights_validate_layout(
             tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, ratio, 0);
             tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, comp_width, 0);
             tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, comp_width, 0);
-            tensor_expect_layout(l->attn_compressor_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD_DIM, 0, 0);
+            tensor_expect_f32_or_bf16(l->attn_compressor_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
         }
         if (ratio == 4) {
             const uint64_t index_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
@@ -514,13 +534,13 @@ static void weights_validate_layout(
             tensor_expect_plain_or_mxfp8(l->indexer_compressor_ape, 2, index_width, ratio, 0);
             tensor_expect_plain_or_mxfp8(l->indexer_compressor_kv, 2, PULSAR_N_EMBD, index_width, 0);
             tensor_expect_plain_or_mxfp8(l->indexer_compressor_gate, 2, PULSAR_N_EMBD, index_width, 0);
-            tensor_expect_layout(l->indexer_compressor_norm,   PULSAR_TENSOR_F32, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            tensor_expect_f32_or_bf16(l->indexer_compressor_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale,   PULSAR_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    PULSAR_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->ffn_norm,       PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
+        tensor_expect_f32_or_bf16(l->ffn_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Router + bias stay padded to the full n_expert; only the expert
          * weight tensors are dense-trimmed to the per-layer survivor count
          * (== n_expert for un-pruned models). */
@@ -1093,19 +1113,19 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint64_t out_low_dim = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
 
     tensor_expect_mxfp8(w->main_proj, 2, 3ull * E, E, 0);
-    tensor_expect_layout(w->main_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+    tensor_expect_f32_or_bf16(w->main_norm, 1, E, 0, 0);
 
     for (int li = 0; li < 3; li++) {
         const pulsar_layer_weights *l = &w->layer[li];
         tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->attn_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_norm, 1, E, 0, 0);
         tensor_expect_mxfp8(l->attn_q_a, 2, E, PULSAR_N_LORA_Q, 0);
-        tensor_expect_layout(l->attn_q_a_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_LORA_Q, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_q_a_norm, 1, PULSAR_N_LORA_Q, 0, 0);
         tensor_expect_mxfp8(l->attn_q_b, 2, PULSAR_N_LORA_Q, q_dim, 0);
         tensor_expect_mxfp8(l->attn_kv, 2, E, PULSAR_N_HEAD_DIM, 0);
-        tensor_expect_layout(l->attn_kv_a_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD_DIM, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_kv_a_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD, 0, 0);
         tensor_expect_mxfp8(l->attn_output_a, 2,
                              PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
@@ -1113,7 +1133,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->ffn_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_EXPERT, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
@@ -1126,13 +1146,16 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_mxfp8(l->ffn_down_shexp, 2, PULSAR_N_FF_EXP, E, 0);
     }
 
-    tensor_expect_layout(w->markov_w1, PULSAR_TENSOR_F32, 2, 256, V, 0);
-    tensor_expect_layout(w->markov_w2, PULSAR_TENSOR_F32, 2, 256, V, 0);
-    tensor_expect_layout(w->confidence_proj, PULSAR_TENSOR_F32, 1, E + 256, 0, 0);
+    /* bf16 upstream; f32 here until 2026-08-15. markov_w2 is the single
+     * largest above-source tensor in the model (66 MB of pure width) and the
+     * markov step streams all of it every draft position. */
+    tensor_expect_f32_or_bf16(w->markov_w1, 2, 256, V, 0);
+    tensor_expect_f32_or_bf16(w->markov_w2, 2, 256, V, 0);
+    tensor_expect_f32_or_bf16(w->confidence_proj, 1, E + 256, 0, 0);
     tensor_expect_layout(w->hc_head_base, PULSAR_TENSOR_F32, 1, PULSAR_N_HC, 0, 0);
     tensor_expect_layout(w->hc_head_fn, PULSAR_TENSOR_F32, 2, (uint64_t)PULSAR_N_HC * E, PULSAR_N_HC, 0);
     tensor_expect_layout(w->hc_head_scale, PULSAR_TENSOR_F32, 1, 1, 0, 0);
-    tensor_expect_layout(w->final_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+    tensor_expect_f32_or_bf16(w->final_norm, 1, E, 0, 0);
 }
 
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {

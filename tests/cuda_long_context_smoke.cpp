@@ -306,7 +306,8 @@ static int check_dspark_markov_head(void) {
             if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, NULL, base,
                                                   map_host, 2 * w_bytes,
                                                   0, w_bytes,
-                                                  id, vocab_size, embed_dim)) {
+                                                  id, vocab_size, embed_dim,
+                                                  /*w1_bf16=*/0, /*w2_bf16=*/0)) {
                 rc = 1;
                 goto cleanup;
             }
@@ -387,7 +388,8 @@ static int check_dspark_confidence_head(void) {
                                               proj_offset + total_dim * sizeof(float),
                                               0, proj_offset,
                                               n_positions, hidden_dim, embed_dim,
-                                              vocab_size) &&
+                                              vocab_size,
+                                              /*w1_bf16=*/0, /*proj_bf16=*/0) &&
         pulsar_gpu_synchronize() &&
         pulsar_gpu_tensor_read(scores, 0, scores_host, (uint64_t)n_positions * sizeof(float))) {
         rc = 0;

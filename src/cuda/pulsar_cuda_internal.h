@@ -161,6 +161,28 @@ __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t
 #endif
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
+/* A weight tensor stored EITHER f32 or bf16, decided per tensor at load time
+ * rather than per build (unlike pulsar_hc_t above, which is one compile-time
+ * choice for the whole engine).  Several families moved to bf16 storage to stop
+ * paying f32 bytes for values the checkpoint only ever held in bf16; the
+ * drafter's f32-source tensors, and any artifact built before that, still
+ * carry f32.  Both must work in one binary, so the storage is a template
+ * parameter: the inner loop keeps a plain indexed load and there is no branch
+ * per element.  Math stays f32 either way -- bf16 is storage, not precision. */
+template <bool BF16>
+__device__ __forceinline__ static float pulsar_w_load(const void *w, uint64_t i) {
+    if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);
+    else                return ((const float *)w)[i];
+}
+
+/* Bytes per element for the above.  Every bounds check on such a weight must
+ * use THIS, not sizeof(float): a bf16 tensor is half the bytes, and validating
+ * it against the f32 size rejects a legitimate tensor sitting near the end of
+ * the file. */
+__host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf16) {
+    return w_bf16 ? 2u : 4u;
+}
+
 typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
