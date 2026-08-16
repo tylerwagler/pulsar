@@ -129,12 +129,18 @@ CONDITIONAL_LAYER_SUFFIXES = [
 # HF-dtype passthrough: several groups take a specific ds4 type regardless of
 # their HF dtype -- confirmed against real HF shard dtypes.
 #
-# 2026-08-15: the BF16_GROUP below WAS F16, which was wrong. Those tensors are
-# bfloat16 upstream (config.json torch_dtype, and the shard headers agree), and
-# bf16 -> f16 is lossy where it counts: bf16 carries 8 exponent bits (f32 range)
-# and 7 mantissa, f16 carries 5 and 10, so the conversion spends range the data
-# needs on mantissa bits it never had. bf16 -> f32 -> bf16 round-trips exactly,
-# so BF16 storage is a lossless copy of the source.
+# 2026-08-15: the BF16_GROUP below WAS F16, which was wrong -- but not for one
+# uniform reason, so read the per-family notes on the group itself. Checked
+# against the actual shard headers rather than config.json's torch_dtype, which
+# is a default and not a per-tensor promise: the group splits into 188 tensors
+# that really are bf16 upstream and 149 that are f32. In BOTH cases f16 is the
+# wrong 16-bit container, because what these tensors need is exponent RANGE
+# (bf16: 8 bits, f32's) and what f16 spends its width on is mantissa (10 bits
+# against bf16's 7) that the values do not carry. The measured cost of getting
+# that backwards is on the group.
+#
+# The same check found indexer.attn_q_b is f8_e4m3 upstream and does NOT belong
+# here; see the note under the group.
 DENSE_FP8 = {
     'attn_q_a.weight', 'attn_q_b.weight', 'attn_kv.weight',
     'attn_output_a.weight', 'attn_output_b.weight',
@@ -142,12 +148,37 @@ DENSE_FP8 = {
 }
 # BF16 upstream -> BF16 here (was F16 until 2026-08-15; see the note above).
 BF16_GROUP = {
+    # --- BF16 upstream: storing BF16 is a lossless copy (188 tensors) ---
     'ffn_gate_inp.weight',
-    'attn_compressor_ape.weight', 'attn_compressor_kv.weight', 'attn_compressor_gate.weight',
-    'indexer.attn_q_b.weight', 'indexer.proj.weight',
-    'indexer_compressor_ape.weight', 'indexer_compressor_kv.weight', 'indexer_compressor_gate.weight',
+    'attn_compressor_kv.weight', 'attn_compressor_gate.weight',
+    'indexer.proj.weight',
+    'indexer_compressor_kv.weight', 'indexer_compressor_gate.weight',
+    # --- F32 upstream: BF16 is a deliberate narrowing, not a copy (149) ---
+    # These are f32 in the checkpoint, so 16-bit storage loses something either
+    # way and the only question is WHAT. Measured against the real shards:
+    # nothing here comes near f16's 65504 ceiling (max |w| is 5.1), but the
+    # small end is dense -- values run down to 2.7e-15, and f16 flushes
+    # everything under 5.96e-8 to exactly zero:
+    #
+    #     layers.0.hc_attn_fn   11.07% of nonzero weights -> 0
+    #     hc_head_fn             5.73%                    -> 0
+    #     layers.0.hc_ffn_fn     0.71%                    -> 0
+    #
+    # (relative error 1.0 on every one of them -- the weight is not
+    # approximated, it is deleted). bf16 carries f32's exponent range, so its
+    # min normal is 1.18e-38 and it flushes NONE of them; it pays for that with
+    # mantissa bits, which is the cheap side of the trade for weights this
+    # small. So BF16 here is chosen on measured damage, not on matching source.
+    'attn_compressor_ape.weight', 'indexer_compressor_ape.weight',
     'hc_attn_fn.weight', 'hc_ffn_fn.weight', 'output_hc_fn.weight',
 }
+
+# NOT in the group: indexer.attn_q_b.weight is F8_E4M3 upstream (21 tensors).
+# f16 already represents every e4m3 value exactly -- 10 mantissa bits against
+# e4m3's 3, and f16's range covers e4m3's -- so storing it F16 costs nothing in
+# fidelity, only 2x the bytes. BF16 would be exact too, so moving it buys
+# nothing. The real fix is to keep it fp8 end to end, which is an A8-campaign
+# item and an engine change, not a template type flip.
 
 
 def suffix_type(ds4_name, ndim):
@@ -160,6 +191,10 @@ def suffix_type(ds4_name, ndim):
         return BF16
     if suffix == 'ffn_gate_tid2eid.weight':
         return I32
+    if suffix == 'indexer.attn_q_b.weight':
+        # F8_E4M3 upstream; F16 holds every e4m3 value exactly, so this is
+        # lossless and only costs bytes. See the note above BF16_GROUP.
+        return F16
     if ds4_name == 'token_embd.weight':
         # Also BF16 upstream, but the engine pins this one to F16 on a separate
         # path (weights.cpp tensor_expect_layout(..., PULSAR_TENSOR_F16, ...)),
@@ -197,6 +232,35 @@ class HFCheckpoint:
         """Real on-disk HF shape (row-major [out, in, ...])."""
         shard = self.weight_map[name]
         return self._shard_header(shard)[name]['shape']
+
+    def dtype(self, name):
+        """On-disk safetensors dtype string, e.g. 'BF16', 'F8_E4M3', 'I8'.
+
+        This is the CONTAINER dtype, which is not always the logical format:
+        the routed experts are declared fp4 by config.json but ride in an I8
+        container two-per-byte alongside an F8_E8M0 scale.
+        """
+        shard = self.weight_map[name]
+        return self._shard_header(shard)[name]['dtype']
+
+    def raw(self, name):
+        """The tensor's bytes exactly as stored, no dtype interpretation.
+
+        Row-major, which is the same byte order ds4 wants -- ne_reversed()
+        reverses the DIMENSION LIST for the GGUF convention, it does not
+        transpose data -- so these bytes can be written straight into a
+        matching ds4 tensor region.
+        """
+        shard = self.weight_map[name]
+        hdr = self._shard_header(shard)
+        start, end = hdr[name]['data_offsets']
+        with open(os.path.join(self.dir, shard), 'rb') as f:
+            n, = struct.unpack('<Q', f.read(8))
+            f.seek(8 + n + start)
+            buf = f.read(end - start)
+        if len(buf) != end - start:
+            raise SystemExit(f'{name}: short read from {shard}')
+        return buf
 
 
 def ne_reversed(hf_shape):
