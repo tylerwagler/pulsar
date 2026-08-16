@@ -199,10 +199,18 @@ static void tensor_expect_plain_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != PULSAR_TENSOR_F16 && t->type != PULSAR_TENSOR_F32) {
+    /* Accepts the three NON-fp8 arms of gpu_graph_matmul_plain_tensor, which is
+     * what every caller here feeds. BF16 was missing until 2026-08-16 and the
+     * drafter's router is bf16 now, so an otherwise-correct artifact died at
+     * load with "expected F16 or F32". The main model's router is checked by
+     * tensor_expect_plain_or_mxfp8 and had already been extended -- the drafter
+     * goes through THIS one, and changing the type policy without walking every
+     * validator that sees it is exactly how that gets missed. */
+    if (t->type != PULSAR_TENSOR_F16 &&
+        t->type != PULSAR_TENSOR_BF16 &&
+        t->type != PULSAR_TENSOR_F32) {
         fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected F16 or F32\n",
+                "pulsar: tensor %.*s has type %s, expected F32, F16 or BF16\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
