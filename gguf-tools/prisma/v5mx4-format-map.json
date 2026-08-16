@@ -472,5 +472,5 @@
  "blk.9.ffn_gate_shexp.weight": "MXFP8_LT",
  "blk.9.ffn_up_exps.weight": "CUTLASS_MXFP4",
  "blk.9.ffn_up_shexp.weight": "MXFP8_LT",
- "output.weight": "MXFP8_LT"
+ "output.weight": "BF16"
 }
