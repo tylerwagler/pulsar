@@ -126,15 +126,22 @@ CONDITIONAL_LAYER_SUFFIXES = [
 # quantizer isn't given an explicit --dense/--attention/--experts/etc
 # override; norms are additionally a hard ds4 requirement -- see
 # weights.c's mtp_weights_validate_layout-style F32 checks). NOT a native-
-# HF-dtype passthrough: several groups (norms, ffn_gate_inp, compressor/
-# indexer/hc_*_fn) are natively BF16/F32 in HF but ds4 requires a specific
-# different type regardless -- confirmed against real HF shard dtypes.
+# HF-dtype passthrough: several groups take a specific ds4 type regardless of
+# their HF dtype -- confirmed against real HF shard dtypes.
+#
+# 2026-08-15: the BF16_GROUP below WAS F16, which was wrong. Those tensors are
+# bfloat16 upstream (config.json torch_dtype, and the shard headers agree), and
+# bf16 -> f16 is lossy where it counts: bf16 carries 8 exponent bits (f32 range)
+# and 7 mantissa, f16 carries 5 and 10, so the conversion spends range the data
+# needs on mantissa bits it never had. bf16 -> f32 -> bf16 round-trips exactly,
+# so BF16 storage is a lossless copy of the source.
 DENSE_FP8 = {
     'attn_q_a.weight', 'attn_q_b.weight', 'attn_kv.weight',
     'attn_output_a.weight', 'attn_output_b.weight',
     'ffn_gate_shexp.weight', 'ffn_up_shexp.weight', 'ffn_down_shexp.weight',
 }
-F16_GROUP = {
+# BF16 upstream -> BF16 here (was F16 until 2026-08-15; see the note above).
+BF16_GROUP = {
     'ffn_gate_inp.weight',
     'attn_compressor_ape.weight', 'attn_compressor_kv.weight', 'attn_compressor_gate.weight',
     'indexer.attn_q_b.weight', 'indexer.proj.weight',
@@ -149,11 +156,14 @@ def suffix_type(ds4_name, ndim):
         return F32
     if suffix in DENSE_FP8:
         return FP8_E4M3
-    if suffix in F16_GROUP:
-        return F16
+    if suffix in BF16_GROUP:
+        return BF16
     if suffix == 'ffn_gate_tid2eid.weight':
         return I32
     if ds4_name == 'token_embd.weight':
+        # Also BF16 upstream, but the engine pins this one to F16 on a separate
+        # path (weights.cpp tensor_expect_layout(..., PULSAR_TENSOR_F16, ...)),
+        # so it cannot move until that changes.
         return F16
     if ds4_name == 'output.weight':
         return BF16
