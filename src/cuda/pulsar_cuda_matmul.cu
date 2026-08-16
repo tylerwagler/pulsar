@@ -2,8 +2,13 @@
 
 
 
-/* WBF16: token_embd storage. f16 and bf16 are both 2 bytes, so every size
- * check around this is already right for either -- only the decode differs. */
+/* WBF16: token_embd storage, F16 or BF16 -- NOT f32. Both are 2 bytes, so every
+ * size check around this is right for either and only the decode differs, which
+ * is why this must use the f16_or_bf16 loader. It briefly used the f32_or_bf16
+ * one: same bf16 branch, but a false branch that reads 4 bytes per element off a
+ * 2-byte table, walking a gigabyte past the end. It faulted asynchronously, so
+ * the error surfaced in the next unrelated CUDA call and looked like an
+ * out-of-memory failure rather than a bad read. */
 template <bool WBF16>
 __global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const void *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -11,7 +16,7 @@ __global__ static void embed_token_hc_kernel(pulsar_hc_t *out, const void *w, ui
     if (i >= n) return;
     uint32_t e = i % n_embd;
     uint32_t tok = token < n_vocab ? token : n_vocab - 1; /* clamp: an OOB token id is a wild global read */
-    pulsar_hc_store(out, i, pulsar_w_load<WBF16>(w, (uint64_t)tok * n_embd + e));
+    pulsar_hc_store(out, i, pulsar_w_load_f16_or_bf16<WBF16>(w, (uint64_t)tok * n_embd + e));
 }
 
 
@@ -34,7 +39,7 @@ __global__ static void embed_tokens_hc_kernel(
     int32_t tok_i = tokens[t];
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
-    pulsar_hc_store(out, gid, pulsar_w_load<WBF16>(w, (uint64_t)tok * n_embd + d));
+    pulsar_hc_store(out, gid, pulsar_w_load_f16_or_bf16<WBF16>(w, (uint64_t)tok * n_embd + d));
 }
 
 

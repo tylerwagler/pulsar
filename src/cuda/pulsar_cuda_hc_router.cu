@@ -241,7 +241,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     for (uint32_t u = 0; u < VEC; u++) {
         const uint32_t col = d + u * BLK;
         const float v = (col < n_embd)
-                ? (accs[u] * norm_scale * pulsar_w_load<NWBF16>(norm_w, col)) : 0.0f;
+                ? (accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col)) : 0.0f;
         if (col < n_embd) {
             norm_out[obase + col] = v;
             if (norm_out_h) norm_out_h[obase + col] = __float2half(v);

@@ -49,8 +49,8 @@ __global__ static void dspark_markov_step_kernel(
         float dot = 0.0f;
         const uint64_t w2_base = (uint64_t)v * embed_dim;
         for (uint32_t i = 0; i < embed_dim; i++)
-            dot += pulsar_w_load<W2BF16>(markov_w2, w2_base + i) *
-                   pulsar_w_load<W1BF16>(markov_w1, embed_base + i);
+            dot += pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, w2_base + i) *
+                   pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
         float val = base_logits[v] + dot;
         refined_logits[v] = val;
         if (val > best_val) { second_val = best_val; second_id = best_id;
@@ -306,10 +306,10 @@ __global__ static void dspark_confidence_score_kernel(
     const uint64_t emb_base = (uint64_t)t * embed_dim;
     float dot = 0.0f;
     for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x)
-        dot += hp[i] * pulsar_w_load<PROJBF16>(proj, i);
+        dot += hp[i] * pulsar_w_load_f32_or_bf16<PROJBF16>(proj, i);
     for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x)
-        dot += pulsar_w_load<W1BF16>(markov_w1, emb_base + i) *
-               pulsar_w_load<PROJBF16>(proj, hidden_dim + i);
+        dot += pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, emb_base + i) *
+               pulsar_w_load_f32_or_bf16<PROJBF16>(proj, hidden_dim + i);
     __shared__ float partial[256];
     partial[threadIdx.x] = dot;
     __syncthreads();

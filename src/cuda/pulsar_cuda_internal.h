@@ -169,10 +169,23 @@ static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must 
  * carry f32.  Both must work in one binary, so the storage is a template
  * parameter: the inner loop keeps a plain indexed load and there is no branch
  * per element.  Math stays f32 either way -- bf16 is storage, not precision. */
+/* NAME THE OTHER HALF. These take a void* and pick the decode from a bool, so
+ * nothing in the type system stops you calling the wrong one -- and the false
+ * branch is a DIFFERENT WIDTH in each (4 bytes vs 2). Passing an f16 tensor to
+ * the f32 variant reads twice the bytes and runs off the end of the tensor,
+ * which faults asynchronously and surfaces as a failure in whatever CUDA call
+ * comes next. That is exactly what happened on 2026-08-15 with token_embd.
+ * The suffix is the contract: check it against the tensor's actual type. */
 template <bool BF16>
-__device__ __forceinline__ static float pulsar_w_load(const void *w, uint64_t i) {
+__device__ __forceinline__ static float pulsar_w_load_f32_or_bf16(const void *w, uint64_t i) {
     if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);
     else                return ((const float *)w)[i];
+}
+
+template <bool BF16>
+__device__ __forceinline__ static float pulsar_w_load_f16_or_bf16(const void *w, uint64_t i) {
+    if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);
+    else                return __half2float(((const __half *)w)[i]);
 }
 
 /* Bytes per element for the above.  Every bounds check on such a weight must

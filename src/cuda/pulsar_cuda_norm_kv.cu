@@ -100,7 +100,7 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i] * scale * pulsar_w_load<WBF16>(w, i);
+        const float v = xr[i] * scale * pulsar_w_load_f32_or_bf16<WBF16>(w, i);
         orow[i] = v;
         if (out_q) pulsar_mx_emit_block(v, i, row, n, out_kbp, out_q, out_sf);
     }
@@ -155,8 +155,8 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     const int emit_mx = (q_out_q != NULL) && (which == 0u);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float wv = is_q ? pulsar_w_load<QWBF16>(q_w, i)
-                              : pulsar_w_load<KVWBF16>(kv_w, i);
+        const float wv = is_q ? pulsar_w_load_f32_or_bf16<QWBF16>(q_w, i)
+                              : pulsar_w_load_f32_or_bf16<KVWBF16>(kv_w, i);
         const float v = xr[i] * scale * wv;
         orow[i] = v;
         if (emit_mx) {
