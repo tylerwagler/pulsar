@@ -47,3 +47,6 @@ __pycache__/
 
 # ad-hoc pre-cutover backup binaries
 *.bak-preoop
+
+# built on demand by gguf-tools/reflow_artifact.py from the codec sources
+gguf-tools/libds4q_reflow.so
