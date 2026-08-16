@@ -666,7 +666,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
-    if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_flat_hc, n_tokens, hc_dim);
+    /* No arm() for batch_flat_hc: its only reader is the plain F32 GEMM below
+     * (hc_attn_fn is F32), no e4m3_slot is ever reserved for it, and no MXFP8
+     * consumer exists -- so arming only claimed one of the six cache slots and
+     * reset validity bits nobody read. */
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_attn_fn,
@@ -2161,7 +2164,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
-    if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_flat_hc, n_tokens, hc_dim);
+    /* No arm() for batch_flat_hc -- see the note on the attention side. */
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_ffn_fn,

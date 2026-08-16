@@ -243,6 +243,65 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   }
 }
 
+/* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
+ * 128x4 SF atom swizzle from pulsar_cuda_matmul.cu (mx_sfoff).  Duplicated here
+ * rather than exported because it is the on-disk-free layout of a device buffer
+ * this TU only READS -- and the two must agree, so it is spelled out identically
+ * and asserted by the bit-exactness of the gather against the pack path. */
+__device__ __forceinline__ int mx_sfoff_src(int row, int kb, int KBp) {
+  return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
+         + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
+}
+
+/* Gather ALREADY-E4M3 activations straight into the grouped GEMM's A operand.
+ *
+ * The norm that produced this activation emitted E4M3 + ue8m0 into the engine's
+ * activation cache, in exactly the scheme pack_act_e4m3_rowmajor_* uses --
+ * se = floor(log2(amax)) - 7, byte se+127, payload v * 2^-se -- and the two
+ * encoders were verified byte-identical over a 4M-value conversion sweep and a
+ * full 512x4096 block encode.  So there is nothing to recompute: move the codes.
+ *
+ * That turns the activation half of the gather from a 4-byte copy plus a
+ * re-encode pass into a 1-byte copy, on the layers where the routed experts are
+ * CUTLASS MXFP4.
+ *
+ * The two sides disagree only on WHERE the scale byte lives -- the cache uses
+ * mx_sfoff, CUTLASS its own tile atom -- so read through one and write through
+ * the other.  The byte is never recomputed.
+ *
+ * Padding rows carry row_src < 0 and get zero payload and a zero scale, which is
+ * what the f32 path produced from its pre-zeroed rows. */
+template<class TSFA>
+__global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
+                                       const uint8_t *src_q, const uint8_t *src_sf, int src_kbp,
+                                       const int32_t *row_src, int M, int K){
+  const int nblk = K / 32;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)M * nblk) return;
+  const int m = (int)(idx / nblk), kb = (int)(idx % nblk);
+  const int src = row_src[m];
+  int4 *d = reinterpret_cast<int4*>(A_data + (size_t)m * K + (size_t)kb * 32);
+  if (src < 0) {
+    const int4 z = make_int4(0, 0, 0, 0);
+    d[0] = z; d[1] = z;
+    tSFA(m, kb * 32, 0) = ElementSF::bitcast((uint8_t)0);
+    return;
+  }
+  const int4 *s = reinterpret_cast<const int4*>(src_q + (size_t)src * K + (size_t)kb * 32);
+  d[0] = s[0]; d[1] = s[1];
+  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[mx_sfoff_src(src, kb, src_kbp)]);
+}
+
+static void gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
+                                   const void *src_q, const void *src_sf, int src_kbp,
+                                   const int32_t *row_src, int M, int K){
+  auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
+  auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
+  const int nb = M * (K / 32), t = 128, b = (nb + t - 1) / t;
+  gather_act_e4m3_kernel<<<b,t>>>(A_data, tSFA, (const uint8_t*)src_q, (const uint8_t*)src_sf,
+                                  src_kbp, row_src, M, K);
+}
+
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
                     const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K){
   auto strideA = cutlass::make_cute_packed_stride(typename GemmKernel::StrideA{}, {M,K,1});
@@ -621,7 +680,8 @@ int pulsar_cutlass_grouped_moe(
     float clamp, int n_total_expert,
     int in_dim, int mid_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-    uint8_t *scratch, size_t scratch_bytes){
+    uint8_t *scratch, size_t scratch_bytes,
+    const void *act_q, const void *act_sf, int act_kbp, const int32_t *row_src_tok){
   pulsar_grouped_scratch_layout L = grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim);
   if (!scratch || scratch_bytes < L.total_bytes) return -1;
   int sm = grouped_sm_count();
@@ -640,8 +700,13 @@ int pulsar_cutlass_grouped_moe(
   cudaMemsetAsync(xSF, 0, L.xSF_bytes);
   cudaMemsetAsync(midSF, 0, L.midSF_bytes);
 
-  // Pack the whole padded activation buffer once (one global SF layout; per-group slices below).
-  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  // Fill the whole padded A operand once (one global SF layout; per-group slices below).
+  // Preferred: move the E4M3 the producing norm already emitted. Fall back to
+  // encoding the gathered f32 when no cached encoding was handed over.
+  if (act_q && act_sf && row_src_tok)
+    gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim);
+  else
+    pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
 
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   long pmt_in  = grouped_per_mtile_sfA(in_dim);

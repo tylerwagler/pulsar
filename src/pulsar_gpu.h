@@ -440,6 +440,18 @@ void pulsar_gpu_mxfp8_gact_disarm(void);
 /* Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 
+/* Hand back the E4M3 encoding this buffer already carries, or 0 if the cache
+ * holds none for (ptr, n_tok, in_dim). Lets a consumer that would otherwise
+ * quantize the f32 copy reuse the producer's encoding instead -- the routed-MoE
+ * gather is the one that matters, since it re-encoded every gathered row.
+ * `scale` is indexed with the mx_sfoff swizzle over `kbp` blocks per row. */
+int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
+                                        uint64_t n_tok,
+                                        uint64_t in_dim,
+                                        const void **data,
+                                        const void **scale,
+                                        int *kbp);
+
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,
@@ -1246,7 +1258,23 @@ int pulsar_cutlass_grouped_moe(
         const uint32_t *padded_offsets,
         int             padded_total,
         uint8_t        *scratch,
-        size_t          scratch_bytes);
+        size_t          scratch_bytes,
+        /* Optional pre-encoded activation. The norm that produced this tensor
+         * already emitted E4M3 + ue8m0 into the activation cache, in the same
+         * scheme this GEMM's packer uses (verified bit-identical, payload and
+         * scale byte). Pass the cache's data/scale plus a row->source-token map
+         * and the gather moves 1-byte codes straight into the A operand instead
+         * of copying f32 and re-encoding it: a quarter of the activation traffic
+         * and one fewer pass over [padded_total x in_dim].
+         * act_sf is read through the ENGINE's mx_sfoff swizzle and written
+         * through the CUTLASS tile atom -- only the location differs, never the
+         * byte. row_src_tok[R] < 0 marks a padding row (zero payload + scale).
+         * Pass act_q = NULL to take the f32 pack path, in which case
+         * x_gathered must be populated and its padding rows pre-zeroed. */
+        const void     *act_q,
+        const void     *act_sf,
+        int             act_kbp,
+        const int32_t  *row_src_tok);
 
 /* Single-projection W4A8 GEMM for MIXED type-40 + iq2/q2k layers. Computes out[T,out_dim] =
  * x[T,in_dim] . W[out_dim,in_dim]^T for ONE expert's type-40 CUTLASS weight (data at W_d, swizzled

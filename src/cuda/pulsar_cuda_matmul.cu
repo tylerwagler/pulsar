@@ -902,6 +902,26 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
     if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid = 1;
 }
 
+/* Read side of the cache for a consumer that is NOT this file's GEMM: hand back
+ * the E4M3 payload and scale a producer already emitted, so the consumer can
+ * skip its own quantize pass.  Returns 0 when there is no valid encoding for
+ * this exact (ptr, n_tok, in_dim), which the caller must treat as "encode it
+ * yourself" -- never as an error. */
+int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
+                                        uint64_t n_tok,
+                                        uint64_t in_dim,
+                                        const void **data,
+                                        const void **scale,
+                                        int *kbp) {
+    if (!x || !data || !scale || !kbp) return 0;
+    mxfp8_act_cache_t *s = act_slot_find(x->ptr, n_tok, in_dim);
+    if (!s || !s->valid || !s->xq || !s->sx) return 0;
+    *data  = s->xq;
+    *scale = s->sx;
+    *kbp   = mx_rup((int)(in_dim / 32), 4);
+    return 1;
+}
+
 
 
 static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,

@@ -422,8 +422,12 @@ __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uin
 /* One block per sorted-pair slot s: locate its expert e (offsets[e] <= s < offsets[e+1]), place
  * the token's activation row at padded row padded_off[e] + (s - offsets[e]), record the routing
  * weight and the originating pair index (padded_pair[R]) for the later scatter. */
+/* row_src_tok[R] records which token row R came from, so a consumer that already
+ * has that token encoded (the CUTLASS path reads the activation cache's E4M3)
+ * can gather the codes itself.  When it does, x_gathered is NULL and the f32 row
+ * copy below -- the expensive half of this kernel -- is skipped entirely. */
 __global__ static void moe_padded_gather_kernel(
-        float *x_gathered, float *w_gathered, int32_t *padded_pair,
+        float *x_gathered, float *w_gathered, int32_t *padded_pair, int32_t *row_src_tok,
         const float *x, const float *weights,
         const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *padded_off,
         uint32_t pair_count, uint32_t n_total, uint32_t n_expert, uint32_t in_dim) {
@@ -440,10 +444,16 @@ __global__ static void moe_padded_gather_kernel(
     uint32_t R = padded_off[e] + i;
     uint32_t pair = sorted_pairs[s];
     uint32_t tok = pair / n_expert;
-    const float *src = x + (uint64_t)tok * in_dim;
-    float *dst = x_gathered + (uint64_t)R * in_dim;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
-    if (threadIdx.x == 0) { w_gathered[R] = weights[pair]; padded_pair[R] = (int32_t)pair; }
+    if (x_gathered) {
+        const float *src = x + (uint64_t)tok * in_dim;
+        float *dst = x_gathered + (uint64_t)R * in_dim;
+        for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
+    }
+    if (threadIdx.x == 0) {
+        w_gathered[R] = weights[pair];
+        padded_pair[R] = (int32_t)pair;
+        if (row_src_tok) row_src_tok[R] = (int32_t)tok;
+    }
 }
 
 /* One block per padded row R: scatter the pre-weighted FFN result back to the flat down buffer at
@@ -509,14 +519,26 @@ static int routed_moe_launch_cutlass_grouped(
     /* Host upper bound on padded rows: every active expert adds <=127 padding; round to 128. */
     const uint64_t padded_upper = (((uint64_t)pair_count + 128ull * n_total_expert + 127ull) / 128ull) * 128ull;
 
+    /* The norm that produced x already emitted its E4M3 + ue8m0 encoding. When
+     * it is still cached we hand it to the grouped GEMM and gather the 1-byte
+     * codes, which drops both the f32 row copy here and the re-encode there --
+     * the same values, encoded once instead of twice. A miss is not an error;
+     * it just means we take the f32 path we always took. */
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    const bool cached_act = pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim,
+                                                                &act_q, &act_sf, &act_kbp) != 0;
+
     const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
     const uint64_t offsets_bytes = ((uint64_t)n_total_expert + 1) * sizeof(uint32_t);
     const uint64_t cursors_bytes = counts_bytes;
     const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
     const uint64_t padoff_bytes = counts_bytes;
-    const uint64_t xg_bytes = padded_upper * expert_in_dim * sizeof(float);
+    /* No f32 gather buffer at all on the cached path -- nothing reads it. */
+    const uint64_t xg_bytes = cached_act ? 0 : padded_upper * expert_in_dim * sizeof(float);
     const uint64_t wg_bytes = padded_upper * sizeof(float);
     const uint64_t ppair_bytes = padded_upper * sizeof(int32_t);
+    const uint64_t rsrc_bytes = cached_act ? padded_upper * sizeof(int32_t) : 0;
     const uint64_t ffn_bytes = padded_upper * out_dim * sizeof(float);
     const uint64_t grp_bytes = pulsar_cutlass_grouped_moe_scratch_bytes(
             (int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
@@ -531,6 +553,7 @@ static int routed_moe_launch_cutlass_grouped(
     const uint64_t xg_off = off;      off = cutlass_moe_align_up(off + xg_bytes, align);
     const uint64_t wg_off = off;      off = cutlass_moe_align_up(off + wg_bytes, align);
     const uint64_t ppair_off = off;   off = cutlass_moe_align_up(off + ppair_bytes, align);
+    const uint64_t rsrc_off = off;    off = cutlass_moe_align_up(off + rsrc_bytes, align);
     const uint64_t ffn_off = off;     off = cutlass_moe_align_up(off + ffn_bytes, align);
     const uint64_t grp_off = off;     off = cutlass_moe_align_up(off + grp_bytes, align);
     const uint64_t total_scratch = off;
@@ -543,18 +566,23 @@ static int routed_moe_launch_cutlass_grouped(
     uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
     uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
     uint32_t *padded_off = (uint32_t *)(scratch + padoff_off);
-    float *x_gathered = (float *)(scratch + xg_off);
+    float *x_gathered = cached_act ? NULL : (float *)(scratch + xg_off);
     float *w_gathered = (float *)(scratch + wg_off);
     int32_t *padded_pair = (int32_t *)(scratch + ppair_off);
+    int32_t *row_src_tok = cached_act ? (int32_t *)(scratch + rsrc_off) : NULL;
     float *ffn_out = (float *)(scratch + ffn_off);
     uint8_t *grp_scratch = scratch + grp_off;
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
     int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "moe_grouped counts clear");
     /* padding rows must be zeroed (pack sees clean data) and unmapped (padded_pair = -1). */
-    if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
+    if (ok && x_gathered) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_bytes), "moe_grouped wg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_bytes), "moe_grouped ppair clear");
+    /* -1 everywhere: rows the gather never visits ARE the padding rows, and the
+     * E4M3 gather zero-fills exactly those (what the pre-zeroed f32 rows gave). */
+    if (ok && row_src_tok) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_bytes),
+                                        "moe_grouped rsrc clear");
     if (ok) {
         moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
@@ -572,7 +600,7 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped padded offsets launch");
     }
     if (ok) {
-        moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair,
+        moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, row_src_tok,
                 (const float *)x->ptr, (const float *)weights->ptr,
                 sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped gather launch");
@@ -582,7 +610,8 @@ static int routed_moe_launch_cutlass_grouped(
                 (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
                 gate_stride, gate_data_bytes, down_stride, down_data_bytes,
                 clamp, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes);
+                counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes,
+                act_q, act_sf, act_kbp, row_src_tok);
         if (rc != 0) return 0;
     }
     if (ok) {
@@ -898,7 +927,10 @@ static int routed_moe_launch_mixed40(
         float *mid_g  = (float *)(scratch + mg_o);
         if (use_grouped) {
             /* grouped: padded-gather x -> grouped GEMMs -> swiglu(padded) -> padded-scatter. */
-            moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair,
+            /* row_src_tok = NULL: the mixed-40 path goes through
+             * pulsar_cutlass_grouped_proj, which has its own packer and no
+             * pre-encoded-activation entry yet, so it still gathers f32. */
+            moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, NULL,
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
