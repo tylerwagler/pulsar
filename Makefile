@@ -331,7 +331,25 @@ context-coherence-probe:
 # (MXFP4 68 B), --quality and its five slow paths gone, TF32 unconditional,
 # and the n_tokens >= 128 attention floor removed at all three sites once the
 # stale-gact bug it was hiding was fixed (26e7569 itself).
-PREFILL_BASELINE_REF ?= 26e7569
+# MOVED 26e7569 -> a695c73 on 2026-08-16, for a reason the earlier moves did not
+# have: the old anchor CANNOT LOAD the new artifact at all. 26e7569 predates BF16
+# weight support, and the source-format migration puts token_embd, the output
+# head, the norms, the compressors and the drafter markov head in BF16 -- so the
+# baseline worktree dies at load and the gate cannot run, rather than reporting a
+# difference. That is a structural block, not a rotted anchor.
+#
+# What ships with it (all deliberate numerics changes, per the policy above):
+# every tensor stored in its SOURCE format -- bf16 where the checkpoint is bf16,
+# f32 where it is f32, e4m3 where it is e4m3 -- which removes the last F16 tensor
+# from the artifact. Plus the engine work that made it loadable and neutral: the
+# BF16 weight path restored, the f32/bf16 matmul arms given the inc-4
+# prefix/suffix split they never had (the mixed-neutrality break), and the fused
+# HC norm+mix GEMV generalised off F16.
+#
+# Deliberately baselined BEFORE the F16 deletion sweep, not after: that sweep
+# removes only paths the artifact can no longer reach, so it must be bit-exact,
+# and anchoring here makes the gate PROVE that rather than assume it.
+PREFILL_BASELINE_REF ?= a695c73
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
