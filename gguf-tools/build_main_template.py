@@ -129,46 +129,54 @@ CONDITIONAL_LAYER_SUFFIXES = [
 # HF-dtype passthrough: several groups take a specific ds4 type regardless of
 # their HF dtype -- confirmed against real HF shard dtypes.
 #
-# 2026-08-15: the BF16_GROUP below WAS F16, which was wrong -- but not for one
-# uniform reason, so read the per-family notes on the group itself. Checked
-# against the actual shard headers rather than config.json's torch_dtype, which
-# is a default and not a per-tensor promise: the group splits into 188 tensors
-# that really are bf16 upstream and 149 that are f32. In BOTH cases f16 is the
-# wrong 16-bit container, because what these tensors need is exponent RANGE
-# (bf16: 8 bits, f32's) and what f16 spends its width on is mantissa (10 bits
-# against bf16's 7) that the values do not carry. The measured cost of getting
-# that backwards is on the group.
+# 2026-08-15: every group below is now the format the checkpoint actually uses,
+# checked against the real shard headers rather than config.json's torch_dtype
+# (a default, not a per-tensor promise). Getting there took two passes:
 #
-# The same check found indexer.attn_q_b is f8_e4m3 upstream and does NOT belong
-# here; see the note under the group.
+#   - the families that ARE bf16 upstream were stored f16. bf16 -> f16 is lossy
+#     where it counts: f16 has 5 exponent bits against bf16's 8, so it flushes
+#     anything under 5.96e-8 to zero, and these tensors run to 2.7e-15.
+#   - the families that are F32 upstream were ALSO stored f16, and briefly moved
+#     to bf16 here, which fixed the flushing but still sat below source. They
+#     are F32 now -- see F32_SOURCE.
+#   - indexer.attn_q_b is f8_e4m3 upstream and belongs in neither group.
+#
+# So BF16_GROUP means exactly one thing again: bf16 upstream, bf16 here,
+# lossless.
 DENSE_FP8 = {
     'attn_q_a.weight', 'attn_q_b.weight', 'attn_kv.weight',
     'attn_output_a.weight', 'attn_output_b.weight',
     'ffn_gate_shexp.weight', 'ffn_up_shexp.weight', 'ffn_down_shexp.weight',
 }
 # BF16 upstream -> BF16 here (was F16 until 2026-08-15; see the note above).
+# BF16 upstream -> BF16 here. Lossless copy, nothing to weigh.
 BF16_GROUP = {
-    # --- BF16 upstream: storing BF16 is a lossless copy (188 tensors) ---
     'ffn_gate_inp.weight',
     'attn_compressor_kv.weight', 'attn_compressor_gate.weight',
     'indexer.proj.weight',
     'indexer_compressor_kv.weight', 'indexer_compressor_gate.weight',
-    # --- F32 upstream: BF16 is a deliberate narrowing, not a copy (149) ---
-    # These are f32 in the checkpoint, so 16-bit storage loses something either
-    # way and the only question is WHAT. Measured against the real shards:
-    # nothing here comes near f16's 65504 ceiling (max |w| is 5.1), but the
-    # small end is dense -- values run down to 2.7e-15, and f16 flushes
-    # everything under 5.96e-8 to exactly zero:
-    #
-    #     layers.0.hc_attn_fn   11.07% of nonzero weights -> 0
-    #     hc_head_fn             5.73%                    -> 0
-    #     layers.0.hc_ffn_fn     0.71%                    -> 0
-    #
-    # (relative error 1.0 on every one of them -- the weight is not
-    # approximated, it is deleted). bf16 carries f32's exponent range, so its
-    # min normal is 1.18e-38 and it flushes NONE of them; it pays for that with
-    # mantissa bits, which is the cheap side of the trade for weights this
-    # small. So BF16 here is chosen on measured damage, not on matching source.
+}
+
+# F32 upstream -> F32 here. These were f16, which was actively destructive:
+# nothing in them approaches f16's 65504 ceiling (max |w| is 5.1) but the small
+# end is dense, values run to 2.7e-15, and f16 flushes everything under 5.96e-8
+# to exactly zero --
+#
+#     layers.0.hc_attn_fn   11.07% of nonzero weights -> 0, worst row loses 28%
+#     hc_head_fn             5.73%                    -> 0
+#     layers.0.hc_ffn_fn     0.71%                    -> 0
+#
+# relative error 1.0 on each: not approximated, deleted. bf16 would stop that
+# (f32's exponent range, min normal 1.18e-38) and was the interim choice, but it
+# is still narrower than the source. F32 is what the checkpoint holds, costs
+# +70.6 MB over bf16 across all five families, and needs no new engine path --
+# the plain matmul already has an F32 arm and the compressor kernels already
+# take ape_type 0 = F32.
+#
+# The two *_ape families in particular MUST NOT be bf16: the compressor kernels
+# validate ape_type as 0 (F32) or 1 (F16) and reject 30 outright, so a bf16 ape
+# fails at run time.
+F32_SOURCE = {
     'attn_compressor_ape.weight', 'indexer_compressor_ape.weight',
     'hc_attn_fn.weight', 'hc_ffn_fn.weight', 'output_hc_fn.weight',
 }
@@ -205,6 +213,8 @@ def suffix_type(ds4_name, ndim):
         return FP8_E4M3
     if suffix in BF16_GROUP:
         return BF16
+    if suffix in F32_SOURCE:
+        return F32
     if suffix == 'ffn_gate_tid2eid.weight':
         return I32
     if suffix == 'indexer.attn_q_b.weight':

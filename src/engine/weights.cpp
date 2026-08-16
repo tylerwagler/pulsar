@@ -133,6 +133,8 @@ static void tensor_expect_plain_or_mxfp8(
         tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
     else if (t->type == PULSAR_TENSOR_BF16)
         tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
+    else if (t->type == PULSAR_TENSOR_F32)
+        tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
     else if (t->type == PULSAR_TENSOR_FP8_E4M3)
         tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
     else
@@ -144,11 +146,13 @@ static void tensor_expect_plain_or_mxfp8(
          * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
          * through cuda_fp8_mx_weight) may be MXFP8_LT.
          *
-         * BF16 was added 2026-08-15 and DOES have a plain-path branch; the three
-         * accepted here must stay exactly in step with the three arms of
+         * BF16 and F32 were added 2026-08-15 and both have plain-path branches.
+         * F32 is here because the hc_*_fn / *_compressor_ape families are f32
+         * upstream and now stay f32 rather than being narrowed. The four
+         * accepted here must stay exactly in step with the four arms of
          * gpu_graph_matmul_plain_tensor, or a tensor passes load and then
          * dispatches into nothing. */
-        pulsar_die("tensor has unsupported weight type; expected F16, BF16 or FP8_E4M3");
+        pulsar_die("tensor has unsupported weight type; expected F32, F16, BF16 or FP8_E4M3");
 }
 
 

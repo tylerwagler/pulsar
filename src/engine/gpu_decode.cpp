@@ -183,6 +183,7 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t 
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
     return w->type == PULSAR_TENSOR_F16 ||
            w->type == PULSAR_TENSOR_BF16 ||
+           w->type == PULSAR_TENSOR_F32 ||
            w->type == PULSAR_TENSOR_FP8_E4M3;
 }
 
