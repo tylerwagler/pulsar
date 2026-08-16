@@ -603,25 +603,6 @@ bool gpu_graph_encode_layer_attention_batch(
         return false;
     }
     const bool zero_prefix = pos0 == 0;
-    /* ---- DIAGNOSTIC, REMOVE: zero the unwritten tail of the batch buffers so
-     * nothing downstream can read a previous prefill's rows.  Tests whether the
-     * S1 order dependence travels through stale tail rows. ---- */
-    if (g->prefill_cap > n_tokens) {
-        const uint32_t tail = g->prefill_cap - n_tokens;
-        struct { pulsar_gpu_tensor *t; uint64_t row; } dz[] = {
-            { g->batch_q,     q_dim },
-            { g->batch_kv,    (uint64_t)PULSAR_N_HEAD_DIM },
-            { g->batch_heads, q_dim },
-        };
-        for (unsigned i = 0; i < 3; i++) {
-            if (!dz[i].t) continue;
-            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(dz[i].t,
-                    (uint64_t)n_tokens * dz[i].row * sizeof(float),
-                    (uint64_t)tail * dz[i].row * sizeof(float));
-            if (v) { gpu_tensor_fill_f32(v, 0.0f, (uint64_t)tail * dz[i].row);
-                     pulsar_gpu_tensor_free(v); }
-        }
-    }
     static int index_stage_env = -1, q_stage_env = -1;
     const bool index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
     const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
