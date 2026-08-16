@@ -152,7 +152,14 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    /* Optional pre-encoded activation: the E4M3 + ue8m0 the producing norm
+     * already wrote for X_f32, with act_kbp blocks per row. Supplying it makes
+     * the input staging a gather instead of a re-encode -- identical bytes,
+     * 1 B/element read instead of 4. Pass NULL/NULL/0 to encode from X_f32. */
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
 
 
 // MoE vector matmul entries (Step 6). Same signature and semantics as the

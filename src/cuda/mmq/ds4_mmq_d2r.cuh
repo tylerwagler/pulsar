@@ -23,6 +23,18 @@ void ds4_quantize_mmq_e4m3_cuda(
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
         int n_expert_used, bool scatter, cudaStream_t stream);
 
+/* Same output bytes as the above, but sourced from an encoding the producing
+ * norm already made (the activation cache: [row][ne00] E4M3 plus a ue8m0 plane
+ * in the pulsar_mx_sfoff swizzle).  A copy, not a re-encode -- both sides share
+ * pulsar_mx_shared_exp and their float->e4m3 conversions were verified
+ * byte-identical.  src_kbp is the cache's blocks-per-row pitch. */
+void ds4_gather_mmq_e4m3_cuda(
+        const void *src_q, const void *src_sf, int src_kbp,
+        const int32_t *ids, void *vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        int n_expert_used, bool scatter, cudaStream_t stream);
+
 bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc);
 
 size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_experts);

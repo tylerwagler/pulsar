@@ -907,19 +907,28 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
  * skip its own quantize pass.  Returns 0 when there is no valid encoding for
  * this exact (ptr, n_tok, in_dim), which the caller must treat as "encode it
  * yourself" -- never as an error. */
+int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
+                                            uint64_t n_tok,
+                                            uint64_t in_dim,
+                                            const void **data,
+                                            const void **scale,
+                                            int *kbp) {
+    if (!ptr || !data || !scale || !kbp) return 0;
+    mxfp8_act_cache_t *s = act_slot_find(ptr, n_tok, in_dim);
+    if (!s || !s->valid || !s->xq || !s->sx) return 0;
+    *data  = s->xq;
+    *scale = s->sx;
+    *kbp   = mx_rup((int)(in_dim / 32), 4);
+    return 1;
+}
+
 int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
                                         uint64_t n_tok,
                                         uint64_t in_dim,
                                         const void **data,
                                         const void **scale,
                                         int *kbp) {
-    if (!x || !data || !scale || !kbp) return 0;
-    mxfp8_act_cache_t *s = act_slot_find(x->ptr, n_tok, in_dim);
-    if (!s || !s->valid || !s->xq || !s->sx) return 0;
-    *data  = s->xq;
-    *scale = s->sx;
-    *kbp   = mx_rup((int)(in_dim / 32), 4);
-    return 1;
+    return x ? pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(x->ptr, n_tok, in_dim, data, scale, kbp) : 0;
 }
 
 

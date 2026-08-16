@@ -1197,11 +1197,22 @@ static int routed_moe_try_mmq_gate_up(
      * entry.  There is no raw arm and no repack. */
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
     float *up_raw = mid_out;          /* folded in place below */
+    /* x_f32 is ffn_norm, whose fused norm already emitted its E4M3 + ue8m0 into
+     * the activation cache. Hand that over and the input staging gathers the
+     * codes instead of encoding them again from f32. A miss just means the
+     * staging encodes, which is what it did before -- same bytes either way. */
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(x_f32, n_tokens, expert_in_dim,
+                                                 &act_q, &act_sf, &act_kbp)) {
+        act_q = NULL; act_sf = NULL; act_kbp = 0;
+    }
     const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
         gate_w, up_w, x_f32, selected_ptr, gate_raw, up_raw,
         (int)expert_mid_dim, (int)expert_in_dim,
         (int)n_tokens, (int)n_total_expert,
-        (int)n_expert, cudaStreamPerThread);
+        (int)n_expert, cudaStreamPerThread,
+        act_q, act_sf, act_kbp);
     if (rc != 0) return 0;
     const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
     const uint32_t threads = 256u;

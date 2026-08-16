@@ -452,6 +452,15 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
                                         const void **scale,
                                         int *kbp);
 
+/* Same lookup keyed on the raw device pointer, for callers that only ever held
+ * one (the routed-MoE path takes float* activations, not tensors). */
+int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
+                                            uint64_t n_tok,
+                                            uint64_t in_dim,
+                                            const void **data,
+                                            const void **scale,
+                                            int *kbp);
+
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,

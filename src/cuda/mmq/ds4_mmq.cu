@@ -615,7 +615,14 @@ int ds4_mmq_moe_pair_impl(
         const char    * xb_soa     = NULL,
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
-        bool            sanitize_out = true) {
+        bool            sanitize_out = true,
+        /* Optional: the E4M3 encoding of X_f32 that its producing norm already
+         * emitted, plus the ue8m0 plane and its blocks-per-row pitch. When
+         * present the staging gathers these bytes instead of re-encoding the
+         * f32 -- same output, a quarter of the read. NULL = encode from f32. */
+        const void    * act_q      = NULL,
+        const void    * act_sf     = NULL,
+        int             act_kbp    = 0) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -744,11 +751,34 @@ int ds4_mmq_moe_pair_impl(
         }
         src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
         cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
-        ds4_quantize_mmq_e4m3_cuda(
-            X_f32, ids_src1, (void *)src1_e4m3,
-            /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-            /*n_expert_used=*/0, /*scatter=*/false, stream);
+        /* Prefer the producer's own encoding when the caller handed one over:
+         * identical bytes, but a 1-byte read per element instead of 4 and no
+         * encode at all.  Falling back to encoding from f32 is a COST choice,
+         * not a format one -- both paths emit the same E4M3. */
+        /* One-shot, like the other tier announcements: which way the expert
+         * activations got their E4M3 is provenance worth seeing once, and it is
+         * the difference between "this made no difference" and "this never
+         * ran". */
+        static int staging_announced = 0;
+        if (!staging_announced) {
+            staging_announced = 1;
+            fprintf(stderr, "pulsar: MoE gate/up E4M3 staging = %s\n",
+                    (act_q && act_sf) ? "gathered from the producer's encoding"
+                                      : "encoded from f32 (no cached encoding)");
+        }
+        if (act_q && act_sf) {
+            ds4_gather_mmq_e4m3_cuda(
+                act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3,
+                /*ne00=*/K, s11_src, s12_src, s13_src,
+                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+                /*n_expert_used=*/0, /*scatter=*/false, stream);
+        } else {
+            ds4_quantize_mmq_e4m3_cuda(
+                X_f32, ids_src1, (void *)src1_e4m3,
+                /*ne00=*/K, s11_src, s12_src, s13_src,
+                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+                /*n_expert_used=*/0, /*scatter=*/false, stream);
+        }
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -839,7 +869,8 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         const void * Wa_soa, const void * Wb_soa,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const void * act_q, const void * act_sf, int act_kbp) {
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
@@ -850,7 +881,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
-        /*sanitize_out=*/false);
+        /*sanitize_out=*/false, act_q, act_sf, act_kbp);
 }
 
 
