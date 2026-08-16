@@ -661,9 +661,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * skipped; with the mix weight at F32 that skip is impossible by
      * construction -- cublasSgemm needs exactly the store it was skipping. */
     void *attn_norm_q = NULL, *attn_norm_sf = NULL; int attn_norm_kbp = 0;
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_f16_tensor(g->batch_flat_hc,
-                                                      NULL,
-                                                      0,
+    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
@@ -2165,9 +2163,7 @@ bool gpu_graph_encode_layer_ffn_batch(
             g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_f16_tensor(g->batch_flat_hc,
-                                                      NULL,
-                                                      0,
+    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,

@@ -23,12 +23,11 @@
  * (no warp shuffles, no split-K): every float op happens in the same sequence,
  * so this is bit-exact by construction, not by measurement. */
 template <uint32_t BLK, uint32_t UNROLL>
-__global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pulsar_hc_t *x, uint32_t n, uint32_t rows, float eps) {
+__global__ static void rms_norm_plain_kernel(float *out, const pulsar_hc_t *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const pulsar_hc_t *xr = x + (uint64_t)row * n;
-    float *orow = out ? out + (uint64_t)row * n : NULL;
-    __half *hrow = out_h ? out_h + (uint64_t)row * n : NULL;
+    float *orow = out + (uint64_t)row * n;
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
     uint32_t i = tid;
@@ -57,16 +56,10 @@ __global__ static void rms_norm_plain_kernel(float *out, __half *out_h, const pu
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) v[u] = pulsar_hc_load(xr, i + u * BLK);
         #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) {
-            const float nv = v[u] * scale;
-            if (hrow) hrow[i + u * BLK] = __float2half(nv);
-            if (orow) orow[i + u * BLK] = nv;
-        }
+        for (uint32_t u = 0; u < UNROLL; u++) orow[i + u * BLK] = v[u] * scale;
     }
     for (; i < n; i += BLK) {
-        const float nv = pulsar_hc_load(xr, i) * scale;
-        if (hrow) hrow[i] = __float2half(nv);
-        if (orow) orow[i] = nv;
+        orow[i] = pulsar_hc_load(xr, i) * scale;
     }
 }
 
@@ -1072,27 +1065,20 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 int pulsar_gpu_rms_norm_plain_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
-    rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, NULL, (const pulsar_hc_t *)x->ptr, n, 1, eps);
-    return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
-}
-
-
-int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h, int skip_f32, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
-    if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
-    /* skip_f32 drops the f32 store entirely -- it is DEAD whenever the only
-     * consumer reads the f16 encoding we just wrote, and it is the widest
-     * store in the layer (4 B/elem over n_hc*n_embd).  Only honoured when an
-     * f16 destination exists to replace it. */
-    float *o = (skip_f32 && out_h) ? NULL : (float *)out->ptr;
-    rms_norm_plain_kernel<256, 8><<<rows, 256>>>(o, (__half *)out_h,
-                                                 (const pulsar_hc_t *)x->ptr, n, rows, eps);
+    rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, (const pulsar_hc_t *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
-    return pulsar_gpu_rms_norm_plain_rows_f16_tensor(out, NULL, 0, x, n, rows, eps);
+    if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
+    /* The f16 destination and its skip_f32 companion are gone with the last F16
+     * weight (2026-08-16): every caller passed NULL/0, so the emission could
+     * never fire and the f32 store could never be skipped. */
+    rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr,
+                                                 (const pulsar_hc_t *)x->ptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
 

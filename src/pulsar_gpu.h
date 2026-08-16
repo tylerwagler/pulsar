@@ -409,10 +409,7 @@ double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
 
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
 
-int pulsar_gpu_rms_norm_plain_rows_f16_tensor(pulsar_gpu_tensor *out, void *out_h,
-                                              int skip_f32,
-                                              const pulsar_gpu_tensor *x,
-                                              uint32_t n, uint32_t rows, float eps);
+
 
 /* True only when the plain-F16 matmul is guaranteed to consume the CACHED f16
  * activation, so the producer may skip its f32 store.  Conservative by design. */
