@@ -266,6 +266,13 @@ static void attn_f16_kernel(
     __shared__ float  sS[AF16_HPB][AF16_ROWS];
     __shared__ __half sP[AF16_HPB][AF16_ROWS];
     __shared__ float  sCorr[AF16_HPB];
+    /* Per-tile row validity for the top-k selection. An entry the indexer left
+     * invalid means "there is no k-th row here", so it must contribute NOTHING;
+     * see the mask in phase 2. Written by the d4 == 0 thread of each row during
+     * staging, so the existing post-staging __syncthreads covers it and no extra
+     * barrier is needed. Rows >= nr are never read (phase 2 masks them anyway),
+     * so a stale entry from the previous tile is harmless. */
+    __shared__ uint8_t sRowBad[AF16_ROWS];
     __shared__ float  sM[AF16_HPB], sL[AF16_HPB];
 
     /* ---- Q fragments, once, into registers -----------------------------
@@ -319,6 +326,7 @@ static void attn_f16_kernel(
             const uint32_t r = i / (AF16_DIM / 4u);
             const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
+            bool bad = false;
             if (r < nr) {
                 const uint32_t sr = row0 + r;
                 if (sr < raw_count) {
@@ -336,7 +344,15 @@ static void attn_f16_kernel(
                     uint32_t ci = sr - raw_count;
                     if (topk) {
                         const int32_t c = topk[(uint64_t)t * top_k + ci];
-                        ci = (c >= 0 && (uint32_t)c < sVisComp) ? (uint32_t)c : 0u;
+                        /* An out-of-range selection is not row 0 -- it is NO row.
+                         * The load still happens (row 0 keeps the access in range
+                         * and the branch uniform), but the row is flagged and its
+                         * score is masked to -INF below, so it contributes zero
+                         * instead of injecting an unselected position into the
+                         * output and double-counting row 0 when row 0 was also
+                         * legitimately selected. */
+                        bad = !(c >= 0 && (uint32_t)c < sVisComp);
+                        ci = bad ? 0u : (uint32_t)c;
                     }
                     const uint64_t crow = (uint64_t)comp_base + ci;
                     if (comp_pack) {
@@ -366,6 +382,9 @@ static void attn_f16_kernel(
                     }
                 }
             }
+            /* Exactly one thread per row has d4 == 0, so this writes each row's
+             * flag once without a clearing pass or an extra barrier. */
+            if (d4 == 0u) sRowBad[r] = bad ? 1u : 0u;
             __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
             dst[0] = make_half2(__float2half(f0), __float2half(f1));
             dst[1] = make_half2(__float2half(f2), __float2half(f3));
@@ -399,7 +418,7 @@ static void attn_f16_kernel(
             const uint32_t mt = h / AF16_HEADS, hh = h % AF16_HEADS;
             const float v = sPart[0][mt][hh][r] + sPart[1][mt][hh][r] +
                             sPart[2][mt][hh][r] + sPart[3][mt][hh][r];
-            sS[h][r] = (r < nr) ? v * scale : -INFINITY;
+            sS[h][r] = (r < nr && !sRowBad[r]) ? v * scale : -INFINITY;
         }
         __syncthreads();
 
@@ -407,10 +426,19 @@ static void attn_f16_kernel(
             const uint32_t h = tid;
             float mx = sM[h];
             for (uint32_t r = 0; r < nr; r++) mx = fmaxf(mx, sS[h][r]);
+            /* ⚠ MASKING MAKES AN ALL--INF TILE REACHABLE, AND expf(-INF - -INF)
+             * IS NaN.  Before the row mask above, every r < nr carried a real
+             * score so mx could only be -INF when the tile was empty of rows at
+             * all; now a tile whose selections are ALL invalid produces one.
+             * Such a tile contributes nothing, so short-circuit p to zero rather
+             * than letting a NaN into sP and from there into the output.
+             * mx == -INF implies sM[h] == -INF (mx >= sM[h]), so corr is already
+             * 0 and l stays 0 -- nothing has been accumulated to rescale. */
+            const bool empty = (mx == -INFINITY);
             const float corr = (sM[h] == -INFINITY) ? 0.0f : __expf(sM[h] - mx);
             float l = sL[h] * corr;
             for (uint32_t r = 0; r < nr; r++) {
-                const float p = __expf(sS[h][r] - mx);
+                const float p = empty ? 0.0f : __expf(sS[h][r] - mx);
                 sP[h][r] = __float2half(p);
                 l += p;
             }

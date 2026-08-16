@@ -251,7 +251,15 @@ static void spec_frontier_free(pulsar_spec_frontier *f) {
  * NULL handle (prepare rejected a size, or alloc failed) keeps the loop path. */
 static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return;
-    g->spec_frontier_copy_init = 1;
+    /* ⚠ THE FLAG IS SET ON SUCCESS, NOT ON ENTRY.  It used to be set here, before
+     * either prepare() below was attempted, so a single transient failure latched
+     * it forever: every later snapshot AND restore silently fell to the ~126-copy
+     * loop path (252 per accepted step), with nothing logged and no way back.  A
+     * fallback that can only be entered and never left is indistinguishable from
+     * the fast path being gone.  Leaving the flag clear on failure costs one
+     * retry per snapshot -- and prepare() only builds descriptor tables, which is
+     * far cheaper than the loop it avoids, so retrying is strictly better than
+     * staying degraded. */
     pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
     pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
     uint64_t bytes[PULSAR_MAX_LAYER * 4];
@@ -271,12 +279,36 @@ static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
             if (ib > mx) mx = ib;
         }
     }
-    if (n == 0) return;
-    g->spec_snap_copies = pulsar_gpu_batched_copy_prepare(dst, src, bytes, n);
+    if (n == 0) {
+        /* No compressed layers: there is genuinely nothing to copy, and the loop
+         * path below is equally empty. Done, not degraded. */
+        g->spec_frontier_copy_init = 1;
+        return;
+    }
+    void *snap = pulsar_gpu_batched_copy_prepare(dst, src, bytes, n);
     /* restore = the same set with src/dst swapped */
-    g->spec_restore_copies = pulsar_gpu_batched_copy_prepare(src, dst, bytes, n);
+    void *restore = pulsar_gpu_batched_copy_prepare(src, dst, bytes, n);
+    if (!snap || !restore) {
+        /* Take neither: a snapshot batched but a restore looped (or the reverse)
+         * would be a correctness hazard, not just a slow path. */
+        pulsar_gpu_batched_copy_free(snap);
+        pulsar_gpu_batched_copy_free(restore);
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "pulsar: WARNING spec frontier batched-copy prepare failed "
+                    "(%u descriptors, max %llu B) -- falling back to the per-tensor "
+                    "copy loop for this snapshot; will retry on the next one\n",
+                    n, (unsigned long long)mx);
+        }
+        return;                      /* init stays 0 -- the next call retries */
+    }
+    g->spec_snap_copies = snap;
+    g->spec_restore_copies = restore;
     g->spec_frontier_copy_n = n;
     g->spec_frontier_copy_max_bytes = mx;
+    g->spec_frontier_copy_init = 1;
 }
 
 static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {

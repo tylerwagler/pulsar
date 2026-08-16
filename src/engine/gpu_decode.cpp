@@ -1332,14 +1332,31 @@ void gpu_graph_dspark_seed_draft_kv(
     pulsar_gpu_tensor *kv_norm = g->dspark_seed_norm;
     pulsar_gpu_tensor *kv_rot = g->dspark_seed_rot;
     if (!kv_out || !kv_norm || !kv_rot) return;
-    for (int li = 0; li < 3; li++) {
+
+    /* ⚠ THE THREE LAYERS MUST ADVANCE IN LOCKSTEP, so a partial failure rolls the
+     * whole seed back.  This loop used to `continue` past a failed layer without
+     * advancing dspark_n_raw[li], leaving that layer's ring counter behind its
+     * siblings' PERMANENTLY: every later draft then RoPEs at a different sequence
+     * position per layer.  The verifier still rejects the bad drafts, so output
+     * stays exact -- which is precisely why it was invisible.  What degrades is
+     * ACCEPTANCE, silently, for the rest of the session.
+     *
+     * Rolling the counters back is enough to stay consistent: rows already
+     * written sit at ring slots the counters no longer reach, so nothing reads
+     * them and the next successful seed overwrites the same slots. */
+    const uint32_t n_raw_entry[3] = {
+        g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2]
+    };
+    bool seeded = true;
+    for (int li = 0; li < 3 && seeded; li++) {
         if (!pulsar_gpu_matmul_mxfp8_tensor(kv_out,
                                           dspark_model->map,
                                           dspark_model->size,
                                           w->layer[li].attn_kv->abs_offset,
                                           PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
                                           g->dspark_main_x, 1)) {
-            continue;
+            seeded = false;
+            break;
         }
         if (!pulsar_gpu_rms_norm_weight_tensor(kv_norm, kv_out,
                                              dspark_model->map,
@@ -1347,7 +1364,8 @@ void gpu_graph_dspark_seed_draft_kv(
                                              w->layer[li].attn_kv_a_norm->abs_offset,
                                              PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS,
         w->layer[li].attn_kv_a_norm->type == PULSAR_TENSOR_BF16)) {
-            continue;
+            seeded = false;
+            break;
         }
         /* Seed one KV row per committed position.  Each row is RoPE'd at its OWN
          * sequence position (dspark_n_raw[li]) and fp8-rounded, matching the
@@ -1358,16 +1376,45 @@ void gpu_graph_dspark_seed_draft_kv(
         for (uint32_t i = 0; i < n_rows; i++) {
             const uint32_t pos = g->dspark_n_raw[li];
             const uint32_t row = pos % PULSAR_DSPARK_DRAFT_WINDOW;
-            pulsar_gpu_tensor_copy(kv_rot, 0, kv_norm, 0, kv_bytes);
-            pulsar_gpu_rope_tail_tensor(kv_rot, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+            /* Both copies were unchecked: a failed stage used to leave the row
+             * unwritten while the counter still advanced past it, i.e. the ring
+             * would be read as if it held a seeded position. */
+            if (!pulsar_gpu_tensor_copy(kv_rot, 0, kv_norm, 0, kv_bytes)) {
+                seeded = false;
+                break;
+            }
+            if (!pulsar_gpu_rope_tail_tensor(kv_rot, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
                                      pos, 0, false,
                                      (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL);
-            pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT);
-            pulsar_gpu_tensor_copy(g->dspark_raw_cache[li],
+                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL)) {
+                seeded = false;
+                break;
+            }
+            if (!pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT)) {
+                seeded = false;
+                break;
+            }
+            if (!pulsar_gpu_tensor_copy(g->dspark_raw_cache[li],
                                 (uint64_t)row * kv_bytes,
-                                kv_rot, 0, kv_bytes);
+                                kv_rot, 0, kv_bytes)) {
+                seeded = false;
+                break;
+            }
             g->dspark_n_raw[li]++;
+        }
+    }
+    if (!seeded) {
+        g->dspark_n_raw[0] = n_raw_entry[0];
+        g->dspark_n_raw[1] = n_raw_entry[1];
+        g->dspark_n_raw[2] = n_raw_entry[2];
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "pulsar: WARNING drafter KV seed failed (%u row(s)) -- rolled the "
+                    "three layers back to %u/%u/%u to keep them in step; this step's "
+                    "draft is unseeded and acceptance will dip until the next seed\n",
+                    n_rows, n_raw_entry[0], n_raw_entry[1], n_raw_entry[2]);
         }
     }
 }
