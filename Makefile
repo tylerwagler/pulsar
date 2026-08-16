@@ -241,6 +241,15 @@ cuda-algo-stability-gate: tests/algo_stability_gate
 cuda-mixed-prefill-gate: tests/mixed_prefill_gate
 	PULSAR_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
 
+# Artifact-only, no GPU, seconds: does the ROUTER agree with the artifact's own
+# REAP declaration? A router left in source expert order against compacted
+# expert weights routes every token to the wrong expert and NOTHING FAILS --
+# in range, no NaN, still fluent, just missing most of what the model knows.
+# srcfmt-v1 shipped exactly that on 40 of 43 layers. Cheap enough to run on
+# every artifact before it is ever loaded.
+cuda-reap-router-audit:
+	python3 gguf-tools/reap/audit_reap_router.py $(FRONTIER_MODEL)
+
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
@@ -442,7 +451,7 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
 #   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
-GATE_TARGETS = cuda-regression cuda-attn-gates cuda-prefill-gate \
+GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-attn-gates cuda-prefill-gate \
                cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
