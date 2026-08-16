@@ -216,6 +216,12 @@ def main():
     ap.add_argument('--verify', action='store_true',
                     help='re-read the output and check every tensor')
     ap.add_argument('--limit', type=int, help='stop after N tensors (smoke test)')
+    ap.add_argument('--only', action='append', default=[], metavar='FAMILY',
+                    help='change ONLY these families; hold every other family at '
+                         'its current type. The complement of --pin, and the '
+                         'right shape for a bisect: the output differs from the '
+                         'input in exactly the named group, so a gate verdict '
+                         'attributes to that group and nothing else.')
     ap.add_argument('--pin', action='append', default=[], metavar='FAMILY',
                     help='hold this family at its CURRENT type instead of the '
                          'policy target. Repeatable. Used to build one-variable '
@@ -256,6 +262,8 @@ def main():
         if nm.startswith('dspark.'):
             pp = nm.split('.')
             fam_now = 'dspark.' + ('.'.join(pp[2:]) if pp[1].isdigit() else '.'.join(pp[1:]))
+        if a.only and not (fam_now in a.only or nm in a.only):
+            want = cur          # not under test: hold it at the input's type
         if fam_now in a.pin or nm in a.pin:
             want = cur          # hold it where it is; falls into byte-copy below
         if want is None or want == cur:
@@ -283,6 +291,8 @@ def main():
         new_off.append(total)
         total += nb + pad(nb)
 
+    if a.only:
+        print('-- ONLY these families change: %s' % ', '.join(a.only))
     if a.pin:
         print('-- PINNED (held at their current type): %s' % ', '.join(a.pin))
     print('-- %d tensors: %d byte-copied, %d repacked in place, '
