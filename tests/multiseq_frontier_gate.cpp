@@ -336,21 +336,80 @@ static void row_delta(const unsigned char *x, const unsigned char *y, size_t n,
     }
 }
 
+
+/* ---- value-space row comparison -------------------------------------------
+ * Byte distance is meaningless for a block-scaled row: flipping one ue8m0
+ * exponent re-quantises the 64 mantissas under it, so a 1e-3 perturbation can
+ * rewrite ~every byte.  Decode and compare the actual numbers instead. */
+static float e4m3_to_f32(unsigned char b) {
+    const int s = (b >> 7) & 1, e = (b >> 3) & 15, m = b & 7;
+    float v;
+    if (e == 0) v = (float)m * 0.001953125f;              /* 2^-6 / 8 subnormal */
+    else        v = (1.0f + (float)m * 0.125f) * ldexpf(1.0f, e - 7);
+    return s ? -v : v;
+}
+
+/* attn pack row: [n_nope e4m3][n_nope/64 ue8m0][pad to 4B][n_rot bf16] */
+static double attn_row_max_absdiff(const unsigned char *a, const unsigned char *b) {
+    const uint32_t n_rot = 64u;
+    const uint32_t hd = (uint32_t)PULSAR_N_HEAD_DIM;
+    const uint32_t n_nope = hd - n_rot;
+    const uint32_t nsf = ((n_nope / 64u) + 3u) & ~3u;
+    double worst = 0.0;
+    for (uint32_t d = 0; d < n_nope; d++) {
+        const float sa = ldexpf(1.0f, (int)a[n_nope + (d >> 6)] - 127);
+        const float sb = ldexpf(1.0f, (int)b[n_nope + (d >> 6)] - 127);
+        const double va = (double)e4m3_to_f32(a[d]) * sa;
+        const double vb = (double)e4m3_to_f32(b[d]) * sb;
+        const double e = fabs(va - vb);
+        if (e > worst) worst = e;
+    }
+    const unsigned char *ra = a + n_nope + nsf, *rb = b + n_nope + nsf;
+    for (uint32_t i = 0; i < n_rot; i++) {
+        uint32_t xa = ((uint32_t)ra[2*i+1] << 24) | ((uint32_t)ra[2*i] << 16);
+        uint32_t xb = ((uint32_t)rb[2*i+1] << 24) | ((uint32_t)rb[2*i] << 16);
+        float fa, fb; memcpy(&fa, &xa, 4); memcpy(&fb, &xb, 4);
+        const double e = fabs((double)fa - (double)fb);
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
+/* index row: 64 e2m1 nibble pairs (low nibble first) + 4 e8m0 block-32 scales */
+static float e2m1_to_f32(unsigned nib) {
+    static const float mag[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float v = mag[nib & 7u];
+    return (nib & 8u) ? -v : v;
+}
+static double index_row_max_absdiff(const unsigned char *a, const unsigned char *b) {
+    const uint32_t hd = 128u;
+    double worst = 0.0;
+    for (uint32_t d = 0; d < hd; d++) {
+        const float sa = ldexpf(1.0f, (int)a[64u + (d >> 5)] - 127);
+        const float sb = ldexpf(1.0f, (int)b[64u + (d >> 5)] - 127);
+        const unsigned na = (d & 1u) ? (a[d >> 1] >> 4) : (a[d >> 1] & 0xfu);
+        const unsigned nb = (d & 1u) ? (b[d >> 1] >> 4) : (b[d >> 1] & 0xfu);
+        const double e = fabs((double)e2m1_to_f32(na) * sa - (double)e2m1_to_f32(nb) * sb);
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
 static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *what) {
     int equal = 1;
-    size_t worst_bytes = 0; int worst_delta = 0; uint32_t worst_layer = 0;
-    const char *worst_kind = "";
+    double worst_value = 0.0;
     for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         if ((a->attn[il] != NULL) != (b->attn[il] != NULL)) { equal = 0; continue; }
         if (a->attn[il] && memcmp(a->attn[il], b->attn[il], attn_row_bytes()) != 0) {
             size_t nd; int md;
             row_delta((const unsigned char *)a->attn[il],
                       (const unsigned char *)b->attn[il], attn_row_bytes(), &nd, &md);
-            fprintf(stderr, "  %s: attn emitted row differs at layer %u"
-                            " (%zu/%zu bytes, max byte delta %d)\n",
-                    what, il, nd, attn_row_bytes(), md);
-            if (md > worst_delta) { worst_delta = md; worst_bytes = nd;
-                                    worst_layer = il; worst_kind = "attn"; }
+            const double vd = attn_row_max_absdiff(
+                    (const unsigned char *)a->attn[il], (const unsigned char *)b->attn[il]);
+            fprintf(stderr, "  %s: attn row differs at layer %u"
+                            " (%zu/%zu bytes; MAX |delta| = %.3e)\n",
+                    what, il, nd, attn_row_bytes(), vd);
+            if (vd > worst_value) worst_value = vd;
             equal = 0;
         }
         if (a->index[il] && b->index[il] &&
@@ -358,19 +417,20 @@ static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *w
             size_t nd; int md;
             row_delta((const unsigned char *)a->index[il],
                       (const unsigned char *)b->index[il], index_row_bytes(), &nd, &md);
-            fprintf(stderr, "  %s: indexer emitted row differs at layer %u"
-                            " (%zu/%zu bytes, max byte delta %d)\n",
-                    what, il, nd, index_row_bytes(), md);
-            if (md > worst_delta) { worst_delta = md; worst_bytes = nd;
-                                    worst_layer = il; worst_kind = "indexer"; }
+            const double vd = index_row_max_absdiff(
+                    (const unsigned char *)a->index[il], (const unsigned char *)b->index[il]);
+            fprintf(stderr, "  %s: indexer row differs at layer %u"
+                            " (%zu/%zu bytes; MAX |delta| = %.3e)\n",
+                    what, il, nd, index_row_bytes(), vd);
+            if (vd > worst_value) worst_value = vd;
             equal = 0;
         }
     }
     if (!equal) {
-        fprintf(stderr, "  %s: WORST %s layer %u -- %zu bytes differ, max byte delta %d"
-                        "  [few bytes / small delta = numeric drift;"
-                        " many bytes / large delta = different data]\n",
-                what, worst_kind, worst_layer, worst_bytes, worst_delta);
+        fprintf(stderr, "  %s: WORST VALUE |delta| = %.3e"
+                        "   [~1e-3 => numeric drift, same data via a different"
+                        " kernel path;  O(1) => different data]\n",
+                what, worst_value);
     }
     return equal;
 }
