@@ -375,6 +375,88 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
 }
 
 
+/* A8 twin of grouped_fp8mx_a_warp8_kernel: both operands E4M3 with their own
+ * ue8m0 block scales, so the attn-output "a" projection multiplies in the
+ * source's activation format instead of against f32.
+ *
+ * Activation layout is the GROUPED cache's, which is NOT the f32 input's:
+ * mxfp8_quant_act_grouped_kernel writes data GROUP-MAJOR,
+ * [(g * n_tokens + tok) * group_dim + i], while the f32 heads it reads are
+ * token-major [(tok * n_groups + g) * group_dim + i]. Getting that transpose
+ * wrong reads a well-formed activation belonging to another group, which is a
+ * wrong answer with no symptom -- so it is spelled out here rather than
+ * inferred at the call site.
+ *
+ * Only the common case: the caller guarantees a de-interleaved weight,
+ * rank % PULSAR_FP8MX_ROWS == 0 (a row quad never straddles a group) and
+ * group_dim % 32 == 0 (whole blocks, so bn is always 32). Anything else keeps
+ * the f32 path, which is a FALLBACK not a format choice -- see the launcher. */
+__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
+        const __nv_fp8_e4m3 *wblk, unsigned char wscale_byte,
+        const __nv_fp8_e4m3 *xblk, unsigned char xscale_byte) {
+    const float sw = __int_as_float((uint32_t)wscale_byte << 23);   /* E8M0 */
+    const float sa = __int_as_float((uint32_t)xscale_byte << 23);   /* E8M0 */
+    float s = 0.0f;
+    /* Same (g, j) traversal as the f32 helper so the summation order matches. */
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+        const uint32_t wp = ((const uint32_t *)wblk)[g];
+        const uint32_t xp = ((const uint32_t *)xblk)[g];
+        const __nv_fp8_e4m3 *wq = (const __nv_fp8_e4m3 *)&wp;
+        const __nv_fp8_e4m3 *xq = (const __nv_fp8_e4m3 *)&xp;
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            s += __half2float((__half)wq[j]) * __half2float((__half)xq[j]);
+    }
+    return sw * sa * s;
+}
+
+__global__ static void grouped_fp8mx_a_warp8_a8_kernel(
+        float *low,
+        const __nv_fp8_e4m3 *wdata,
+        const unsigned char *wscale,
+        int KBp,
+        const __nv_fp8_e4m3 *xdata,
+        const unsigned char *xscale,
+        int xKBp,
+        uint64_t scale_slab,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks) {
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row0 >= low_dim || tok >= n_tokens) return;
+    const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
+                                                        : (uint32_t)PULSAR_FP8MX_ROWS;
+    const uint64_t group = row0 / rank;
+    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const __nv_fp8_e4m3 *xr = xdata + (group * (uint64_t)n_tokens + tok) * group_dim;
+    const unsigned char *xs = xscale + group * scale_slab;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const unsigned char xsb = xs[mx_sfoff((int)tok, (int)b, xKBp)];
+#pragma unroll
+        for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
+            if (r >= nr) continue;
+            const uint32_t rw = (uint32_t)(row0 + r);
+            acc[r] += dev_dot_fp8mx_deint_block_a8(
+                    wdata + (uint64_t)rw * group_dim + i0,
+                    wscale[mx_sfoff((int)rw, (int)b, KBp)],
+                    xr + i0, xsb);
+        }
+    }
+    for (uint32_t r = 0; r < nr; r++) {
+        const float red = warp_sum_f32(acc[r]);
+        if (lane == 0) low[tok * low_dim + row0 + r] = red;
+    }
+}
+
+
 /* Small-batch (2..4 token) variant of the grouped o_a GEMV: one launch whose
  * weight blocks are read once and served from L1 across the NT tokens' dots,
  * replacing the per-group block-scaled tensor-core GEMMs that dominated the
@@ -2053,6 +2135,59 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
+
+    /* A8: multiply the attn-output "a" projection in E4M3 rather than against
+     * f32 heads. This is the largest byte consumer in the model and was the
+     * last big decode GEMV still on W8A32.
+     *
+     * The encoding is made HERE rather than in the attention epilogue. Prefill
+     * splits it across two producers (attn_f16 owns the nope blocks, rope_tail
+     * the tail it rewrites) to avoid a separate pass over a
+     * [n_tok x n_head x head_dim] tensor -- worth it at 4096 tokens. This path
+     * only ever serves small n (decode, verify batches, mixed steps), where the
+     * same tensor is ~128 KB and one quantise pass is noise next to the weight
+     * traffic the GEMV is about to do. Doing it after the inverse rope also
+     * means ONE producer owns the whole range, so there is no half-emitted
+     * encoding to get wrong.
+     *
+     * Covers EVERY n this function serves, not just n==1: converting the n==1
+     * kernel and leaving the 2..4 nt fusion on f32 would be a size-thresholded
+     * activation format -- the exact defect removed from the mmvq pair path and
+     * refused by name in the MoE down path. Format beats fusion. */
+    if (dw && group_dim % 32 == 0 &&
+        rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
+        const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
+        const size_t data_n  = (size_t)n_tokens * n_groups * group_dim;
+        const size_t scale_n = (size_t)n_groups * slab;
+        const size_t off_sx = (data_n * sizeof(__nv_fp8_e4m3) + 255) & ~(size_t)255;
+        char *scratch = (char *)cuda_tmp_alloc(off_sx + scale_n, "attn_out_a a8 acts");
+        if (scratch) {
+            __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)scratch;
+            unsigned char *sx = (unsigned char *)(scratch + off_sx);
+            /* mx_sfoff leaves holes; the GEMV reads only the (tok, kb) pairs the
+             * quantiser fills, but zero the slab so a hole can never carry a
+             * stale byte from a previous call's larger shape. */
+            cudaMemsetAsync(sx, 0, scale_n, cudaStreamPerThread);
+            const int warps = (int)n_tokens * (int)n_groups * (int)(group_dim / 32);
+            mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
+                    heads, (int)n_tokens, (int)n_groups, (int)group_dim, KBp, xq, sx, slab);
+            if (cudaGetLastError() == cudaSuccess) {
+                static int announced_oa8 = 0;
+                if (!announced_oa8) {
+                    announced_oa8 = 1;
+                    fprintf(stderr, "pulsar: attn-out 'a' GEMV = W8A8 (E4M3 acts) for "
+                                    "group_dim=%llu rank=%llu\n",
+                            (unsigned long long)group_dim, (unsigned long long)rank);
+                }
+                grouped_fp8mx_a_warp8_a8_kernel<<<grid_a, 256>>>(
+                        low, dw->data, dw->scale, KBp, xq, sx, KBp, (uint64_t)slab,
+                        group_dim, rank, n_groups, n_tokens, blocks_a);
+                return cuda_ok(cudaGetLastError(), "attention_output_a a8 launch");
+            }
+            /* Quantise failed: fall through to f32 rather than run on a partly
+             * written buffer. */
+        }
+    }
     /* Small verify batches: one nt launch, weight blocks L1-shared across tokens;
      * per-token bit-identical to the n=1 DEINT kernel below. */
     if (dw && n_tokens >= 2u && n_tokens <= 4u &&
