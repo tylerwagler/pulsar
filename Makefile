@@ -358,7 +358,24 @@ context-coherence-probe:
 # Deliberately baselined BEFORE the F16 deletion sweep, not after: that sweep
 # removes only paths the artifact can no longer reach, so it must be bit-exact,
 # and anchoring here makes the gate PROVE that rather than assume it.
-PREFILL_BASELINE_REF ?= a695c73
+# MOVED a695c73 -> 06d0b3e on 2026-08-17, an ordinary application of the policy:
+# numerics shipped, so the anchor moves. What shipped is the A8 campaign's decode
+# half -- the five dense GEMVs (a6aafc2), then the attn-output 'a' and 'b'
+# projections (960d439, 4e3aa31) -- which puts decode on E4M3 activations end to
+# end, plus the REAP router repair. Against a695c73 the gate was red at every
+# depth and so asserted nothing.
+#
+# ⚠ THE PRICE IS ON THE RECORD AND THE ANCHOR MOVES BACK IF IT IS PAID DOWN:
+# that conversion costs -12.1% of SERVED decode (22.28 -> 19.59 t/s), entirely
+# through speculative acceptance (0.5227 -> 0.4091); per-step time is 0.5%
+# better. Baselining here records those numerics as intended, which is a claim a
+# revert would overturn. See L057.
+#
+# Baselining at HEAD makes the run trivially green -- both sides are the same
+# commit -- so today's PASS is not evidence about the engine. Its value is the
+# anchor for tomorrow's drift, plus a harness self-test: a commit compared
+# against ITSELF failing would mean the gate is broken rather than the engine.
+PREFILL_BASELINE_REF ?= 06d0b3e
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
