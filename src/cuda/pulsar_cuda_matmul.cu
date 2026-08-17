@@ -42,6 +42,50 @@ __global__ static void embed_tokens_hc_kernel(
 
 
 
+/* BF16 is the high 16 bits of f32, so conversions are pure bit ops (no header). */
+__device__ __forceinline__ static float bf16_to_f32_act(uint16_t b) {
+    return __uint_as_float((uint32_t)b << 16);
+}
+
+/* Round an f32 activation to BF16 and widen back, so the value that reaches the
+ * multiply is exactly a BF16 value.  The rounding expression is copied from
+ * f32_to_bf16_kernel rather than re-derived, because the cuBLAS arm converts
+ * through that kernel and the two MUST agree: they are the same GEMM at
+ * different batch sizes.
+ *
+ * WHY THIS EXISTS.  The source model runs a BF16 activation stream
+ * (ds4-source-numerics: BF16 residual, E4M3 only where the weight is quantised),
+ * so multiplying a BF16 weight by an f32 activation is over-precision on one
+ * side of the product -- it does not buy fidelity, it diverges from the
+ * reference.  Tyler's call, 2026-08-17: "BF16 stream, E4M3 at quantised GEMMs".
+ *
+ * It also closes a split that this file already knew about.  The BF16 arm sent
+ * n_tok>1 to cuBLAS, which rounds activations to bf16, and n_tok==1 plus the nt
+ * batch to kernels that did not -- the same size-thresholded activation-format
+ * defect removed from the MoE in ea86645, and the comment on the nt cap said so
+ * out loud: "the cuBLAS path below additionally ROUNDS the activations to bf16,
+ * so its disagreement with the n=1 kernel is larger than the f32 arm's". The
+ * disagreement is now zero. */
+__device__ __forceinline__ static float pulsar_act_bf16(float v) {
+    const uint32_t u = __float_as_uint(v);
+    return bf16_to_f32_act((uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+}
+
+/* Activation load, selected by the WEIGHT's storage type exactly as
+ * pulsar_wt_load selects the weight load: a BF16 weight takes a BF16
+ * activation, an f32 weight is left alone.  Overloads rather than a flag, for
+ * the reason the weight loader gives -- the pointer type is the contract, so
+ * the two cannot be paired wrongly by a caller.  Two overloads, because the nt
+ * kernel has exactly two instantiations (bf16 and f32); an __half overload was
+ * written here and deleted the same minute, because nothing instantiates it. */
+__device__ __forceinline__ static float pulsar_at_load(const __nv_bfloat16 *, const float *x, uint64_t i) {
+    return pulsar_act_bf16(x[i]);
+}
+__device__ __forceinline__ static float pulsar_at_load(const float *, const float *x, uint64_t i) {
+    return x[i];
+}
+
+
 /* Small-batch (2..4 token) f16 GEMV: one weight-row read serves all NT tokens,
  * replacing the cuBLAS GemmEx path which is latency-bound at these shapes and
  * needs an f32->f16 activation convert + tmp alloc per call. Per-token loop
@@ -68,7 +112,7 @@ __global__ static void matmul_nt_kernel(
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
         const float wv = pulsar_wt_load(wr, i);
         #pragma unroll
-        for (int t = 0; t < NT; t++) sum[t] += wv * x[t * in_dim + i];
+        for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(wr, x, t * in_dim + i);
     }
 
     __shared__ float partial[256];
@@ -149,7 +193,7 @@ __global__ static void matmul_bf16_kernel(
     const uint16_t *wr = w + row * in_dim;
     const float *xr = x + tok * in_dim;
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += bf16_to_f32(wr[i]) * xr[i];
+        sum += bf16_to_f32(wr[i]) * pulsar_act_bf16(xr[i]);
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -2010,8 +2054,11 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
     if (!wptr) return 0;
     const uint16_t *w = (const uint16_t *)wptr;
     /* M-independence, same contract as the f16 and f32 arms. The cuBLAS path
-     * below additionally ROUNDS the activations to bf16, so its disagreement
-     * with the n=1 kernel is larger than the f32 arm's, not smaller. */
+     * below rounds activations to bf16; as of 2026-08-17 so do the nt kernel and
+     * the n==1 kernel, so all three agree on the activation format and the only
+     * remaining cross-arm difference is accumulation ORDER. It read "its
+     * disagreement with the n=1 kernel is larger than the f32 arm's, not
+     * smaller" until the split was closed. */
     {
         const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
         if (n_tok >= 2 && n_tok <= nt_cap) {
