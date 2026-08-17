@@ -763,8 +763,18 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
         if (t->type == PULSAR_TENSOR_FP8_E4M3) {
-            pulsar_gpu_register_fp8_weight(t->abs_offset);
-            n_fp8++;
+            /* Plain type-38 is no longer served. The runtime used to convert it
+             * at first use into exactly the bytes MXFP8_LT already holds --
+             * a second resident copy of every such weight beside the mmap. That
+             * path is gone (2026-08-17, L060), so refuse at load with something
+             * actionable rather than registering a weight nothing can resolve. */
+            fprintf(stderr,
+                    "pulsar: tensor %.*s is plain MXFP8 (type 38); this build serves "
+                    "pre-stored MXFP8_LT (41) only. Repack with "
+                    "tools/mxfp8_prestore/repack_mxfp8_lt.py, and check the artifact "
+                    "with gguf-tools/audit_artifact_types.py\n",
+                    (int)t->name.len, t->name.ptr);
+            pulsar_die("plain MXFP8 weight in artifact");
         } else if (t->type == PULSAR_TENSOR_MXFP8_LT) {
             /* Same FP8 matmul path, but flag the offset as pre-stored so the
              * resolver points cuBLASLt at the mmap instead of converting. */
@@ -778,6 +788,9 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
         fprintf(stderr, "pulsar: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
                 " (%llu pre-stored MXFP8_LT, zero-copy)\n",
                 (unsigned long long)n_fp8, (unsigned long long)n_fp8_lt);
+    /* n_fp8 == n_fp8_lt by construction now -- a plain one dies above. The line
+     * still prints both because a future divergence should be visible, and
+     * because 369/390 is exactly how the double-store was spotted. */
     const double t0 = now_sec();
     uint64_t prepared = 0;
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, skip_prefix, &prepared)) {

@@ -90,20 +90,50 @@ __global__ static void moe_count_sorted_pairs_kernel(
 
 
 
+/* Exclusive prefix sum over the per-expert counts.  This ran as <<<1,1>>>: one
+ * CUDA thread walking 256 experts serially, on every CUTLASS layer of every
+ * step, with two more launches either side of it.  Now a single block scans in
+ * shared memory.
+ *
+ * The results are IDENTICAL, not merely equivalent: these are uint32 counts and
+ * integer addition is associative and exact, so reassociating the sum cannot
+ * move a value.  That is why this is safe to change under a bit-exactness
+ * regime where the same edit on floats would not be.
+ *
+ * Chunked so expert_count > blockDim still works; the model's 256 fits one
+ * pass. */
 __global__ static void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
         const uint32_t *counts,
         uint32_t expert_count) {
-    if (threadIdx.x == 0) {
-        uint32_t sum = 0;
-        for (uint32_t e = 0; e < expert_count; e++) {
-            offsets[e] = sum;
-            cursors[e] = sum;
-            sum += counts[e];
+    __shared__ uint32_t sh[256];
+    __shared__ uint32_t base;
+    const uint32_t tid = threadIdx.x;
+    if (tid == 0) base = 0u;
+    __syncthreads();
+
+    for (uint32_t chunk = 0; chunk < expert_count; chunk += 256u) {
+        const uint32_t e = chunk + tid;
+        const uint32_t v = (e < expert_count) ? counts[e] : 0u;
+        sh[tid] = v;
+        __syncthreads();
+        for (uint32_t off = 1u; off < 256u; off <<= 1) {
+            const uint32_t add = (tid >= off) ? sh[tid - off] : 0u;
+            __syncthreads();
+            sh[tid] += add;
+            __syncthreads();
         }
-        offsets[expert_count] = sum;
+        if (e < expert_count) {
+            const uint32_t excl = base + sh[tid] - v;   /* inclusive -> exclusive */
+            offsets[e] = excl;
+            cursors[e] = excl;
+        }
+        __syncthreads();
+        if (tid == 255u) base += sh[255];
+        __syncthreads();
     }
+    if (tid == 0) offsets[expert_count] = base;
 }
 
 
@@ -338,7 +368,7 @@ static int routed_moe_launch_cutlass(
         ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass count launch");
     }
     if (ok) {
-        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+        moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
         ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass prefix launch");
     }
     if (ok) {
@@ -587,7 +617,7 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
     }
     if (ok) {
-        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+        moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped prefix launch");
     }
     if (ok) {
@@ -911,7 +941,7 @@ static int routed_moe_launch_mixed40(
             free(h_counts);
         }
     }
-    if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+    if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
     if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
               ok = cuda_ok(cudaGetLastError(), "mixed40 scatter"); }

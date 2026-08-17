@@ -672,15 +672,6 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
 
 /* GGUF MXFP8 weight (row-major [out,in], 33B blocks: [E8M0][32xE4M3]) ->
  * E4M3 data[in,out]col + swizzled E8M0 scale. one warp per (out,kb). */
-__global__ static void mxfp8_weight_convert_kernel(const unsigned char *src, int out_dim, int in_dim,
-                                                   int KBp, __nv_fp8_e4m3 *data, unsigned char *scale) {
-    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
-    int KB = in_dim / 32; if (warp >= out_dim * KB) return;
-    int o = warp / KB, kb = warp % KB;
-    const unsigned char *blk = src + ((size_t)o * KB + kb) * 33;
-    data[(size_t)(kb * 32 + lane) + (size_t)o * in_dim] = *(const __nv_fp8_e4m3 *)&blk[1 + lane];
-    if (lane == 0) scale[mx_sfoff(o, kb, KBp)] = blk[0];
-}
 
 
 static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
@@ -745,30 +736,26 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
             (void)label;
             return wp;
         }
-        /* An LT offset whose mmap pointers didn't resolve must NOT fall through
-         * to the generic convert path: that path reads 33B-interleaved blocks,
-         * but LT bytes are already de-interleaved, so a convert would be
-         * garbage. Fail cleanly instead (dispatch will report the error). */
         fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu did not resolve to "
                 "device-accessible mmap pointers\n", (unsigned long long)offset);
         return NULL;
     }
 
-    const unsigned char *src = (const unsigned char *)cuda_model_range_ptr(model_map, offset, weight_bytes, "fp8_mx");
-    if (!src) return NULL;
-    __nv_fp8_e4m3 *data = NULL; unsigned char *scale = NULL;
-    if (cudaMalloc(&data, data_bytes) != cudaSuccess) return NULL;
-    if (cudaMalloc(&scale, scale_bytes) != cudaSuccess) { cudaFree(data); return NULL; }
-    cudaMemset(scale, 0, scale_bytes);
-    int warps = (int)out_dim * KB;
-    mxfp8_weight_convert_kernel<<<(warps * 32 + 255) / 256, 256>>>(src, (int)out_dim, (int)in_dim, KBp, data, scale);
-    if (!cuda_ok(cudaGetLastError(), "fp8_mx weight convert")) { cudaFree(data); cudaFree(scale); return NULL; }
-    fp8_mx_weight w = { model_map, offset, in_dim, out_dim, data, scale };
-    g_fp8_mx_by_offset[offset] = w;
-    (void)label;
-    const fp8_mx_weight *wp = &g_fp8_mx_by_offset[offset];
-    fc_off[slot] = offset; fc_ptr[slot] = wp;
-    return wp;
+    /* Every MXFP8 weight is pre-stored, so reaching here means an offset was
+     * registered as FP8 but not as MXFP8_LT -- i.e. a plain type-38 tensor.
+     * Those are refused at load (gguf.cpp), so this is unreachable and stays
+     * only to say so rather than returning a silent NULL.
+     *
+     * What USED to be here: cudaMalloc of the data and scale buffers plus
+     * mxfp8_weight_convert_kernel, de-interleaving the 33B-interleaved blocks
+     * into exactly the bytes an MXFP8_LT tensor already contains -- a second
+     * resident copy of every plain weight beside the mmap.  Deleted 2026-08-17
+     * once the artifact reached 390/390 pre-stored; see L060. */
+    fprintf(stderr, "pulsar: FP8 weight at offset %llu is not pre-stored MXFP8_LT; "
+            "plain type-38 weights are no longer converted at runtime -- repack with "
+            "tools/mxfp8_prestore/repack_mxfp8_lt.py\n", (unsigned long long)offset);
+    (void)label; (void)weight_bytes; (void)KB;
+    return NULL;
 }
 
 
@@ -1407,23 +1394,6 @@ static int cuda_attention_output_a_mx_gemm(
  * activation (single token). One warp per output row; lane L covers in-dim
  * positions {L, 32+L, ...}. No f16 expansion -> no decode bandwidth regression
  * vs the removed Q8_0 path. Used when MXFP8 tensor-cores don't apply (n_tok==1). */
-__global__ static void mxfp8_mmvq_kernel(float *out, const unsigned char *w, const float *x,
-                                         int in_dim, int out_dim) {
-    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    int lane = threadIdx.x & 31;
-    if (o >= out_dim) return;
-    int KB = in_dim / 32;
-    const unsigned char *row = w + (size_t)o * KB * 33;
-    float acc = 0.f;
-    for (int kb = 0; kb < KB; kb++) {
-        const unsigned char *blk = row + (size_t)kb * 33;
-        float scale = exp2f((float)blk[0] - 127.f);
-        __half wh = (__half)(*(const __nv_fp8_e4m3 *)&blk[1 + lane]);
-        acc += __half2float(wh) * scale * x[kb * 32 + lane];
-    }
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
-    if (lane == 0) out[o] = acc;
-}
 
 
 /* Decode mmvq over the DE-INTERLEAVED cached weight (contiguous E4M3 data[out,in]
@@ -1662,14 +1632,12 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offs
  * the cache's (host_base, offset, dims) guard then false-positives and serves
  * dangling pointers into freed memory (garbage/NaN activations, and an
  * illegal TMA access inside the cuBLASLt MXFP8 GEMM once a page is gone).
- * Converted (non-LT) entries own their device buffers; free them here so a
- * multi-engine process does not leak one conversion set per engine cycle. */
+ *
+ * Every entry is now arena-owned. The loop that cudaFree'd converted (non-LT)
+ * buffers went with the convert path on 2026-08-17: nothing allocates them, so
+ * freeing them was reachable only if a plain type-38 weight had been resolved,
+ * which the loader now refuses. */
 void cuda_fp8_weight_cache_clear(void) {
-    for (auto &kv : g_fp8_mx_by_offset) {
-        if (g_mxfp8_lt_offsets.count(kv.first)) continue;   /* arena-owned, freed with the arena */
-        if (kv.second.data) (void)cudaFree((void *)kv.second.data);
-        if (kv.second.scale) (void)cudaFree((void *)kv.second.scale);
-    }
     g_fp8_mx_by_offset.clear();
     memset(g_fp8_fc_off, 0, sizeof(g_fp8_fc_off));
     memset(g_fp8_fc_ptr, 0, sizeof(g_fp8_fc_ptr));
@@ -1937,41 +1905,13 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                         (int)in_dim, (int)out_dim, KBp);
             return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint");
         }
-        /* The raw kernel below reads 33B-INTERLEAVED blocks. A pre-stored
-         * MXFP8_LT weight is already de-interleaved, so it must NEVER reach this
-         * path -- fail closed, rather than run the deint path's `w == NULL`
-         * fallthrough on LT bytes, which would be garbage.
-         *
-         * ⚠ WHAT ACTUALLY REACHES HERE, measured against the shipped artifact
-         * on 2026-08-17: NOT the shape predicate.  All 390 MXFP8/MXFP8_LT
-         * tensors have in_dim in {1024, 2048, 4096, 8192, 12288} and every one
-         * is a multiple of 128, so `in_dim % 128 != 0` is unsatisfiable for this
-         * model.  `w == NULL` therefore means the OTHER thing
-         * cuda_fp8_mx_weight can return NULL for: a cudaMalloc failure building
-         * the de-interleaved buffers, or an unresolved mmap range.  So this is
-         * an OOM/mapping handler wearing a shape guard's clothing.  It is a
-         * real path -- correct results from the raw bytes for the 21 plain
-         * MXFP8 tensors, a clean error for the 369 LT ones -- and it is NOT
-         * dead code to be swept, which is exactly the wrong call someone will
-         * make from the dimension test alone.
-         *
-         * (PULSAR_FP8_MMVQ_RAW is gone for the converse reason: it forced
-         * w == NULL, so on an MXFP8_LT artifact it could only ever reach the
-         * hard error above.  An override whose sole effect is a fail-closed
-         * abort is not an operational fallback.) */
-        if (g_mxfp8_lt_offsets.count(weight_offset)) {
-            fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu cannot use the raw "
-                    "interleaved mmvq path\n", (unsigned long long)weight_offset);
-            return 0;
-        }
-        const unsigned char *wfp8 = (const unsigned char *)cuda_model_range_ptr(
-                model_map, weight_offset, fbytes, "fp8_mx_mmvq");
-        if (!wfp8) return 0;
-        for (uint64_t t = 0; t < n_tok; t++)
-            mxfp8_mmvq_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim, wfp8,
-                                                  (const float *)x->ptr + t * in_dim,
-                                                  (int)in_dim, (int)out_dim);
-        return cuda_ok(cudaGetLastError(), "fp8_mx mmvq");
+        /* No raw arm any more.  It read 33B-interleaved blocks for plain
+         * type-38 weights; the artifact is 390/390 pre-stored MXFP8_LT and the
+         * loader refuses type 38, so nothing can select it.  A resolver failure
+         * is now terminal here rather than silently slower. */
+        fprintf(stderr, "pulsar: MXFP8 weight at offset %llu did not resolve\n",
+                (unsigned long long)weight_offset);
+        return 0;
     }
     fprintf(stderr,
             "pulsar: matmul %s at offset %llu is not a registered MXFP8 weight "
