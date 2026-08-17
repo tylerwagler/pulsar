@@ -1939,12 +1939,26 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
         }
         /* The raw kernel below reads 33B-INTERLEAVED blocks. A pre-stored
          * MXFP8_LT weight is already de-interleaved, so it must NEVER reach this
-         * path — fail closed (rather than run the deint path's `w == NULL`
-         * fallthrough on LT bytes, which would be garbage). This also means
-         * (This is also why PULSAR_FP8_MMVQ_RAW is gone: it forced w == NULL,
-         * so on our MXFP8_LT artifact it could only ever reach this hard error.
-         * An override whose sole effect is a fail-closed abort is not an
-         * operational fallback.) */
+         * path -- fail closed, rather than run the deint path's `w == NULL`
+         * fallthrough on LT bytes, which would be garbage.
+         *
+         * ⚠ WHAT ACTUALLY REACHES HERE, measured against the shipped artifact
+         * on 2026-08-17: NOT the shape predicate.  All 390 MXFP8/MXFP8_LT
+         * tensors have in_dim in {1024, 2048, 4096, 8192, 12288} and every one
+         * is a multiple of 128, so `in_dim % 128 != 0` is unsatisfiable for this
+         * model.  `w == NULL` therefore means the OTHER thing
+         * cuda_fp8_mx_weight can return NULL for: a cudaMalloc failure building
+         * the de-interleaved buffers, or an unresolved mmap range.  So this is
+         * an OOM/mapping handler wearing a shape guard's clothing.  It is a
+         * real path -- correct results from the raw bytes for the 21 plain
+         * MXFP8 tensors, a clean error for the 369 LT ones -- and it is NOT
+         * dead code to be swept, which is exactly the wrong call someone will
+         * make from the dimension test alone.
+         *
+         * (PULSAR_FP8_MMVQ_RAW is gone for the converse reason: it forced
+         * w == NULL, so on an MXFP8_LT artifact it could only ever reach the
+         * hard error above.  An override whose sole effect is a fail-closed
+         * abort is not an operational fallback.) */
         if (g_mxfp8_lt_offsets.count(weight_offset)) {
             fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu cannot use the raw "
                     "interleaved mmvq path\n", (unsigned long long)weight_offset);
