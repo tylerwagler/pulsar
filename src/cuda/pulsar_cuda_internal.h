@@ -143,6 +143,19 @@ struct pulsar_gpu_tensor {
     int owner;
 };
 
+/* Constant-fill of an f32 device buffer.  This lived TWICE, byte-identical and
+ * `static`, in pulsar_cuda_norm_kv.cu and pulsar_cuda_runtime.cu -- one of the
+ * two duplicate kernel definitions the 2026-08-17 inventory turned up.  It is
+ * still `static`, so each TU that uses it still gets its own copy in the binary
+ * (cross-TU __global__ linkage would need -rdc=true, which this build does not
+ * use); what the move buys is ONE definition to keep correct instead of two
+ * that can drift apart silently. */
+__global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
+
+
 /* Hyper-connection residual-stream stored sample type (task #62; see the
  * PULSAR_HC_ELT_SIZE note in pulsar_gpu.h). pulsar_hc_t is the on-device STORAGE type of
  * the six swap-coupled HC residual carriers; loads promote to f32 and stores
@@ -150,15 +163,9 @@ struct pulsar_gpu_tensor {
  * bf16 storage, f32 math). Only the carriers use this — flat_hc (RMSNorm out)
  * and hc_mix/hc_split (Sinkhorn control weights) stay f32. sizeof(pulsar_hc_t)
  * MUST equal PULSAR_HC_ELT_SIZE. */
-#ifdef PULSAR_HC_F32
-typedef float pulsar_hc_t;
-__device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return p[i]; }
-__device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = v; }
-#else
 typedef __nv_bfloat16 pulsar_hc_t;
 __device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
 __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
-#endif
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
 /* A weight tensor stored EITHER f32 or bf16, decided per tensor at load time

@@ -5,8 +5,7 @@
  * buffer, expanding each stored sample (BF16->f32 is an exact bit-extension:
  * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
  * layer-0 parity self-test (since removed) and the env-gated DSpark
- * dumps — never the production decode path. In the PULSAR_HC_F32 fallback build the
- * carrier is already f32, so it is a plain read. n is a sample count. */
+ * dumps — never the production decode path. n is a sample count. */
 /* Host-side f32 -> HC carrier store (task #62). Round-to-nearest-even so a host
  * staged write matches the GPU's __float2bfloat16 store path. NaN is
  * CANONICALIZED to 0x7FFF, which is what cvt.rn.bf16.f32 emits on sm_80+ (and
@@ -14,9 +13,6 @@
  * half would NOT match. Inf needs no special case: it rounds exactly through
  * the RNE path below. `dst` is raw carrier bytes, n a sample count. */
 void pulsar_store_hc_carrier_f32(void *dst, const float *src, uint64_t n) {
-#ifdef PULSAR_HC_F32
-    memcpy(dst, src, (size_t)n * sizeof(float));
-#else
     uint16_t *d = (uint16_t *)dst;
     for (uint64_t i = 0; i < n; i++) {
         uint32_t x;
@@ -28,16 +24,11 @@ void pulsar_store_hc_carrier_f32(void *dst, const float *src, uint64_t n) {
             d[i] = (uint16_t)((x + bias) >> 16);
         }
     }
-#endif
 }
 
 
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n) {
-#ifdef PULSAR_HC_F32
-    return pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * sizeof(float),
-                               out, n * sizeof(float));
-#else
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
     int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_HC_ELT_SIZE,
                                  tmp, n * PULSAR_HC_ELT_SIZE);
@@ -45,8 +36,7 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
         /* Read failed and left tmp uninitialized — do NOT convert it. Callers
          * (the DSpark dumps at session.c) memset `out` to zero beforehand and
          * ignore the return, relying on "zeros on failure"; converting garbage
-         * here would silently write heap noise into the dump, and the f32
-         * fallback build leaves `out` untouched in the same case. */
+         * here would silently write heap noise into the dump. */
         free(tmp);
         return 0;
     }
@@ -56,7 +46,6 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
     }
     free(tmp);
     return rc;
-#endif
 }
 
 

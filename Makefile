@@ -33,18 +33,11 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 
-# HC residual-carrier storage precision (task #62). HC_F32=1 restores f32
-# carriers (the fallback, and the control build for the byte-exact gate).
-# CRITICAL: this MUST reach BOTH the host (CFLAGS) and device (NVCCFLAGS) TUs.
-# Defining it on only one half compiles and links cleanly, the in-TU
-# static_assert does NOT fire, and every residual read/write silently strides
-# the wrong element size -> total activation corruption. Never pass
-# -DPULSAR_HC_F32 by hand; use HC_F32=1.
-HC_F32 ?= 0
-ifeq ($(HC_F32),1)
-CFLAGS += -DPULSAR_HC_F32
-NVCCFLAGS += -DPULSAR_HC_F32
-endif
+# HC_F32=1 (-DPULSAR_HC_F32) used to restore f32 residual carriers: the control
+# build that proved the BF16 storage narrowing was a pure no-op. That flip
+# shipped and nothing set the switch afterwards -- no target, no gate, no test,
+# only a comment in tests/attn_indexed_bench.cu -- so it went on 2026-08-17.
+# The carriers are BF16, full stop, and pulsar_hc_t has one definition.
 
 CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include

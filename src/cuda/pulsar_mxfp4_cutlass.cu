@@ -217,7 +217,20 @@ __global__ void pack_act_e4m3_rowmajor_warp(uint8_t *A_data, TSFA tSFA, const fl
 // LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
 __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
-// mid = silu(clamp(gate)) * clamp(up) * routing_weight  — matches engine pulsar_cuda.cu:10827-10835
+// mid = silu(clamp(gate)) * clamp(up) * routing_weight.
+// TWIN of swiglu_kernel in pulsar_cuda_hc_router.cu, and deliberately a
+// separate copy: this TU builds standalone (-DPULSAR_MXFP4_STANDALONE) and
+// does not take pulsar_cuda_internal.h, so the two cannot share a definition
+// without coupling them. They MUST agree on the arithmetic above.
+// Two differences that are intentional, not drift: the routing weight is a
+// per-row array here and a scalar there, and the engine's twin carries an
+// E4M3 + E8M0 epilogue that this one does not -- which is why the CUTLASS
+// down path re-quantises mid through e4m3_act_roundtrip_kernel instead of
+// reading the producer's encoding.
+// This cited `pulsar_cuda.cu:10827-10835` until 2026-08-17 to assert the
+// agreement. That file does not exist -- the engine was split up long ago --
+// so the reference had been unfollowable, and the invariant uncheckable,
+// for however long it took anyone to look.
 __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
   long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
   float g=gate[i], u=up[i];

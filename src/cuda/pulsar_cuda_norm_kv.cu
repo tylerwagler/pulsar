@@ -869,10 +869,6 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
 
 
 
-__global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = v;
-}
 
 
 

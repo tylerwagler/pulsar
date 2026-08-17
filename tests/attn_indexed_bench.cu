@@ -33,7 +33,7 @@
  *
  * Build (this TU replaces pulsar_cuda_attention.o):
  *   OBJS=$(ls src/cuda/*.o src/engine/*.o | grep -v pulsar_cuda_attention.o)
- *   nvcc -O3 --use_fast_math -arch=sm_120f -DPULSAR_HC_F32 \
+ *   nvcc -O3 --use_fast_math -arch=sm_120f \
  *        -Isrc -Isrc/cuda -Isrc/engine -o /tmp/attnbench \
  *        tests/attn_indexed_bench.cu $OBJS -lm -Xcompiler -pthread \
  *        -L$CUDA_HOME/targets/sbsa-linux/lib -lcudart -lcublas -lcublasLt

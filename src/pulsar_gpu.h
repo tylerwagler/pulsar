@@ -36,15 +36,11 @@
  * size of a stored HC residual sample, shared by the CUDA kernels (typed via
  * pulsar_hc_t in pulsar_cuda_internal.h) and the C host stride/offset math.
  *
- * Define PULSAR_HC_F32 (compile flag) to restore f32 carriers — the fallback, and
- * the intermediate used to prove the storage-narrowing plumbing is a pure
- * no-op (f32 build must be byte-identical to the pre-change build) before the
- * BF16 flip. One compile-time switch; NO per-token/per-layer runtime branch. */
-#ifdef PULSAR_HC_F32
-#define PULSAR_HC_ELT_SIZE 4u
-#else
+ * There WAS a PULSAR_HC_F32 compile flag restoring f32 carriers. It existed to
+ * prove the storage-narrowing plumbing was a pure no-op before the BF16 flip,
+ * that flip shipped, and nothing has set it since -- no target, no gate, no
+ * test. Removed 2026-08-17 with the rest of the callerless switches. */
 #define PULSAR_HC_ELT_SIZE 2u
-#endif
 
 
 /* =========================================================================

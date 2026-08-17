@@ -980,7 +980,6 @@ void pulsar_gpu_cleanup(void) {
 
 
 
-__global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
 
 
@@ -1517,8 +1516,4 @@ void pulsar_gpu_print_memory_report(const char *label) {
 
 
 
-__global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
-    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = v;
-}
 
