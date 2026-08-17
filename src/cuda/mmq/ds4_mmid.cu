@@ -128,28 +128,6 @@ static __global__ void mm_ids_helper_global(
     expert_bounds[gridDim.x] = nex_prev + it_compact_count;
 }
 
-// ds4: kill switch for the case-1 fast path (DS4_MMID_CASE1=0).
-static bool ds4_mmid_case1_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("DS4_MMID_CASE1");
-        cached = !(env && env[0] == '0');
-    }
-    return cached != 0;
-}
-
-// ds4: kill switch for the large-n global path (DS4_MMID_LARGE=0 refuses
-// instead, which throws the whole MoE block onto the legacy expert-tile
-// fallback -- the W8192 prefill cliff).
-static bool ds4_mmid_large_path_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("DS4_MMID_LARGE");
-        cached = !(env && env[0] == '0');
-    }
-    return cached != 0;
-}
-
 // ds4 replacement for ggml_cuda_launch_mm_ids_helper.  Adds two things upstream
 // does not have, then delegates:
 //   * n_expert_used == 1: the routed-MoE down matmul reinterprets (token, slot)
@@ -168,7 +146,7 @@ void ds4_launch_mm_ids_helper(
     const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
     const size_t nbytes = (size_t) n_tokens * sizeof(mm_ids_helper_store);
 
-    if (nbytes > smpbo && ds4_mmid_large_path_enabled()) {
+    if (nbytes > smpbo) {
         static bool logged = false;
         if (!logged) {
             logged = true;
@@ -200,7 +178,7 @@ void ds4_launch_mm_ids_helper(
         return;
     }
 
-    if (n_expert_used == 1 && ds4_mmid_case1_enabled()) {
+    if (n_expert_used == 1) {
         launch_mm_ids_helper< 1>(ids, ids_src1, ids_dst, expert_bounds, n_experts,
                                  n_tokens, n_expert_used, nchannels_y, si1, sis1,
                                  /*write_inverse=*/false, stream);

@@ -98,28 +98,16 @@ private:
 // Init
 // ----------------------------------------------------------------------------
 
-// Step 7 task #29: experimental persistent Q8_1 scratch buffer.
-//
-// Hypothesis: ggml_cuda_pool_alloc inside ds4_mmq_moe_vec_impl records a
-// cudaMallocAsync graph node into the captured layer graph.  At replay
-// time the alloc node returns a (potentially different) address, but the
-// matvec kernel's pointer argument was baked in at capture time.  Result:
-// the matvec reads stale/wrong memory and produces a different output
-// than eager execution, even with identical inputs.
-//
-// Mitigation under test: pre-allocate a persistent device buffer at
-// startup via plain cudaMalloc (NOT cudaMallocAsync, NOT inside any
-// capture).  When the env flag DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
-// ds4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
-// If slot 213 (routed_gate) now matches OFF, the pool's interaction with
-// graph capture was the root cause.  If it still differs, the bug is in
-// the captured matvec kernel itself.
-//
-// Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
-// 256 KB allocation gives generous headroom for short prefill batches.
-static void *g_q81_scratch_ptr   = nullptr;
-static size_t g_q81_scratch_bytes = 0;
-static bool   g_q81_scratch_enabled = false;
+// Task #29 parked a persistent Q8_1 scratch buffer here, behind
+// DS4_CUDA_MMQ_Q81_PERSISTENT, to test one hypothesis: that
+// ggml_cuda_pool_alloc records a cudaMallocAsync node into the captured layer
+// graph, so at replay the alloc returns a different address while the matvec's
+// pointer argument stays baked in from capture time -- which would make a
+// captured decode disagree with an eager one on identical inputs.  The
+// experiment was never adopted and the env was never set by anything, so the
+// buffer could not be allocated and its consumer branch could not be taken;
+// removed 2026-08-17.  The hypothesis is kept because it is worth knowing, and
+// it is still UNTESTED -- do not read this comment as a negative result.
 
 
 
@@ -179,26 +167,6 @@ extern "C" int ds4_mmq_init(int device) {
         return -1;
     }
 
-    // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
-    // Must happen here (before any layer-graph capture) so the cudaMalloc
-    // is not forbidden by capture-mode restrictions, and so the kernel
-    // pointer arg baked into the captured graph stays valid at replay.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
-        const size_t bytes = 256 * 1024;
-        cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_mmq_init: cudaMalloc(q81_scratch %zu B) failed: %s; "
-                            "falling back to pool_alloc\n",
-                    bytes, cudaGetErrorString(err));
-            g_q81_scratch_ptr = nullptr;
-            g_q81_scratch_enabled = false;
-        } else {
-            g_q81_scratch_bytes = bytes;
-            g_q81_scratch_enabled = true;
-            fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
-                    bytes, g_q81_scratch_ptr);
-        }
-    }
     return 0;
 }
 
@@ -444,7 +412,7 @@ int ds4_mmq_moe_impl(
     // cap dispatches the bit-identical two-pass global variant instead of
     // asserting — refusing here used to throw the WHOLE MoE block (including
     // gate/up mmq work) onto the legacy expert-tile fallback, the W8192 prefill
-    // cliff.  DS4_MMID_LARGE=0 restores the refusal.
+    // cliff.  
     ds4_launch_mm_ids_helper(
         ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
         n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
@@ -1039,12 +1007,8 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded);
     cudaError_t err;
     if (!x8) {
-    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
-        x8 = (char *)g_q81_scratch_ptr;
-    } else {
-        q8_pool.alloc(ctx->pool(), nbytes_q8_1);
-        x8 = q8_pool.get();
-    }
+    q8_pool.alloc(ctx->pool(), nbytes_q8_1);
+    x8 = q8_pool.get();
     quantize_row_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)x8,
         GGML_TYPE_Q8_0, /*ne00=*/K,
