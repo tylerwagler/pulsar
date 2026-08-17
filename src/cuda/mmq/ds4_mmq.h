@@ -241,34 +241,6 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     int           K,
     cudaStream_t  stream);
 
-int ds4_mmq_iq2_xxs_aligned_moe_vec(
-    const void    * W_aligned,
-    const float   * X_f32,
-    const int32_t * ids,
-    float         * out_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    cudaStream_t    stream);
-
-
-int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
-    const void    * W_gate_aligned,
-    const void    * W_up_aligned,
-    const float   * X_f32,
-    const int32_t * ids,
-    const float   * weights,
-    float         * mid_f32,
-    int             M,
-    int             K,
-    int             n_tokens,
-    int             n_experts,
-    int             n_expert_used,
-    float           clamp,
-    cudaStream_t    stream);
-
 // Fused down+sum vector entries for routed MoE with top_k=6. These preserve
 // the canonical Q8_1 activation quantization used by the regular _moe_vec
 // path, but avoid materializing [token, slot, out_dim] down results and avoid

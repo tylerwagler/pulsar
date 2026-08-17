@@ -1092,59 +1092,6 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
     mid_out[idx] = (g / (1.0f + expf(-g))) * u * weights[pair];
 }
 
-/* DECODE arm for pre-aligned (type-43) tensors.
- * The big-batch arm below needs n_tokens >= 128; at decode n_tokens is 1, so
- * without this the dp4a qwarp32/LUT kernels would have to read the aligned
- * layout -- which they cannot -- and the fail-closed guard aborts the run
- * ("cuda decode failed").  ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec folds
- * clamp + SwiGLU + router weight and writes mid[slot*M + row], which is exactly
- * our mid layout (pair == slot when n_tokens == 1), so no fold kernel is needed
- * here.  Returns 1 when it produced `mid`. */
-static int routed_moe_try_mmq_gate_up_vec(
-        float *mid_out,
-        const char *gate_w,
-        const char *up_w,
-        const float *x_f32,
-        const int32_t *selected_ptr,
-        const float *weights_ptr,
-        uint32_t gate_type,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t n_tokens,
-        float clamp) {
-    if (gate_type != 43u) return 0;          /* aligned artifacts only */
-    if (n_tokens != 1u) return 0;            /* _vec entries are n_tokens==1 */
-    return ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
-               gate_w, up_w, x_f32, selected_ptr, weights_ptr, mid_out,
-               (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
-               (int)n_total_expert, (int)n_expert, clamp,
-               cudaStreamPerThread) == 0;
-}
-
-/* DECODE arm for the routed down.  Same pairs reshape as the prefill arm: one
- * row per (token,slot), each using exactly one expert.  Output stays per-pair
- * so the existing fixed-order moe_sum_kernel still does the reduction. */
-static int routed_moe_try_mmq_down_vec(
-        float *down_out,
-        const float *mid_f32,
-        const char *down_w,
-        const int32_t *selected_ptr,
-        uint32_t down_type,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        uint32_t n_total_expert,
-        uint64_t pairs) {
-    if (down_type != 43u) return 0;
-    if (pairs == 0 || pairs > (uint64_t)INT32_MAX) return 0;
-    return ds4_mmq_iq2_xxs_aligned_moe_vec(
-               down_w, mid_f32, selected_ptr, down_out,
-               (int)out_dim, (int)expert_mid_dim,
-               (int)pairs, (int)n_total_expert, 1,
-               cudaStreamPerThread) == 0;
-}
-
 /* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
 static int routed_moe_try_mmq_gate_up(
         float *mid_out,
@@ -1376,23 +1323,39 @@ static int routed_moe_launch(
          * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
          * precisely why these stages are bit-exact and re-tileable.) */
         const uint32_t pair_count = n_tokens * n_expert;
-        /* n_tokens > 1 is the whole condition the batch arms are gated on, now
-         * that the both-mxfp4 special case and the sorted-pair build are gone. */
-        const uint32_t use_big_batch = n_tokens > 1u;
-        /* 128 used to be a throughput heuristic for type 16, which could always
-         * fall back to the dp4a chain below it.  Type 43 cannot, and the gate/up
-         * _vec arm only serves n_tokens==1, so 2..127 had no reader at all: any
-         * short CLI prompt is one small chunk and died with "MMQ declined".  The
-         * batch arm is the only correct reader at n_tokens>1, so it takes every
-         * such n.  With type 16 gone the threshold has no remaining meaning and
-         * use_big_batch is simply n_tokens > 1; n_tokens==1 still routes to
-         * the _vec arms. */
+        /* EVERY batch size takes the batch arm, n_tokens==1 included.  This was
+         * `n_tokens > 1u`, and that comparison was the last size-thresholded
+         * activation-format split in the engine: n>=2 reached the D2R arm with
+         * E4M3 operands, while n==1 went to the _vec arm, which stages
+         * `block_q8_1` and runs integer dp4a against the IQ2 codebook.  q8_1 is
+         * not a preference there -- dp4a is an integer instruction and E4M3
+         * cannot feed it -- so the split was a KERNEL difference wearing a
+         * format's clothes, and the exposure was plain decode and the drafter's
+         * own forwards (speculative verify batches are n>1 and already ran
+         * E4M3).
+         *
+         * ds4_mmq.cu:492 already refuses exactly this on the prefill down path
+         * by name -- "one activation format, every batch size" -- having been
+         * written after a size-thresholded split hid a missing conversion for
+         * two days.  This was the surviving instance of the thing that comment
+         * forbids, and Tyler's call (2026-08-17) is that the format wins:
+         * "We want one activation format everywhere."
+         *
+         * ⚠ IT COSTS 9.4% OF DECODE, MEASURED, AND THAT IS ACCEPTED, NOT
+         * UNKNOWN: 17.47 -> 15.82 t/s, routed_moe 0.473 -> 0.584 ms/layer.
+         * Cause is tile occupancy, not arithmetic -- the batch path's kNTile is
+         * 64 token-expert pairs wide and decode presents 6, so the N dimension
+         * runs at 9.4% occupancy.  Recovering it is a separate perf row (L056
+         * option B), NOT a precondition for this line; the fidelity decision
+         * ships first and the speed follows it.  Prefill is a clean control at
+         * 957.08 -> 957.00 t/s: only the n==1 path moved. */
         /* The sorted-pair and expert-tile structures USED to be built here: a
          * scratch allocation plus six kernel launches (count, prefix, scatter,
          * two tile builders, and an 8/16-row pair) on every layer of every
          * prefill chunk.  Nothing read them.  MMQ takes selected_ptr directly,
          * and the only surviving use of the result was `sorted_pairs != NULL`
-         * as a stand-in for `n_tokens > 1` -- which use_big_batch already is.
+         * as a stand-in for `n_tokens > 1`, a distinction this path no longer
+         * makes at all.
          * The file said so itself: "not read by MMQ itself; they survive as
          * the shape signal the batch arms are gated on".  A shape signal does
          * not need six kernels to compute.
@@ -1406,8 +1369,7 @@ static int routed_moe_launch(
          * gate and up share a type: the fused gate+up kernels read ONE layout. */
         int mmq_done = 0;
 #ifdef PULSAR_HAVE_MMQ
-        /* Shape-time decision, evaluated once per launch -- not per token. */
-        if (ok && use_big_batch) {
+        if (ok) {
             mmq_done = routed_moe_try_mmq_gate_up(
                 (float *)mid->ptr, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
@@ -1415,15 +1377,12 @@ static int routed_moe_launch(
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
         }
-        /* decode: n_tokens < 128 never reaches the big-batch arm above */
-        if (ok && !mmq_done) {
-            mmq_done = routed_moe_try_mmq_gate_up_vec(
-                (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, selected_ptr,
-                (const float *)weights->ptr, gate_type,
-                expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
-            if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up vec");
-        }
-        /* fail closed: nothing else can read the aligned layout */
+        /* Fail closed, and note WHICH failure this now is.  A _vec fallback used
+         * to sit here for n_tokens==1.  It cannot come back: it stages q8_1, so
+         * reinstating it as a decline-handler would mean a declined batch launch
+         * silently changes the activation format instead of failing -- the split
+         * removed above, restored by the back door and visible only as a quality
+         * regression.  One format, or an error. */
         if (ok && !mmq_done) {
             fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined and no fallback exists\n");
             ok = 0;
@@ -1437,7 +1396,7 @@ static int routed_moe_launch(
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
          * q8_1, which is why there is no mid -> midq q8_K quantize left here. */
-        if (ok && use_big_batch) {
+        if (ok) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
                                                     (const float *)mid->ptr,
                                                     down_w, selected_ptr,
@@ -1446,19 +1405,10 @@ static int routed_moe_launch(
                                                     (uint64_t)n_tokens * n_expert);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
         }
-        /* decode: below the big-batch threshold, and possibly on the
-         * direct-sum6 path.  The _vec entry writes PER-PAIR, so whenever it
-         * runs the fixed-order moe_sum_kernel must run too -- see the sum gate
-         * below, which is widened by mmq_down_done for exactly this case. */
-        if (ok && !mmq_down_done) {
-            mmq_down_done = routed_moe_try_mmq_down_vec((float *)down->ptr,
-                                                        (const float *)mid->ptr,
-                                                        down_w, selected_ptr,
-                                                        down_type, expert_mid_dim, out_dim,
-                                                        n_total_expert,
-                                                        (uint64_t)n_tokens * n_expert);
-            if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down vec");
-        }
+        /* Same fail-closed rule as gate/up: the down _vec arm is gone with the
+         * threshold that was its only reader.  The reduction below is unaffected
+         * -- it was already owed unconditionally, because every surviving arm
+         * writes per-pair. */
         if (ok && !mmq_down_done) {
             fprintf(stderr, "pulsar: type-43 down but MMQ declined and no fallback exists\n");
             ok = 0;
