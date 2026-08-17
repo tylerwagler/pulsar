@@ -475,7 +475,8 @@ uint64_t gpu_graph_session_bytes_banked(
         /* Option F: dspark_raw_cache[3] + dspark_prompt_h[3] are BANKED slabs
          * (n_banks lanes) so the N=2 spec-time-slice lane keeps a warm ring per
          * bank; the rest of the drafter state is shared across banks. */
-        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
+        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW
+                 * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;          /* dspark_raw_cache[3], packed */
         total += (uint64_t)PULSAR_N_EMBD * f32;              /* dspark_main_x */
         total += 3ull * pc * PULSAR_N_EMBD * f32;            /* dspark_bulk_h[3] */
         total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_EMBD * f32; /* dspark_prompt_h[3] */
@@ -1919,7 +1920,7 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
          * swaps it). */
         if (g->banks.n_banks != 0) {
             g->banks.dspark_raw_bank_bytes =
-                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
+                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
             g->banks.dspark_raw[i] = pulsar_gpu_tensor_alloc(
                 (uint64_t)g->banks.n_banks * g->banks.dspark_raw_bank_bytes);
             g->dspark_raw_cache[i] = g->banks.dspark_raw[i]
@@ -1928,7 +1929,7 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
                 : NULL;
         } else {
             g->dspark_raw_cache[i] = pulsar_gpu_tensor_alloc(
-                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float));
+                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
         }
         g->dspark_n_raw[i] = 0;
         ok = ok && g->dspark_target_h[i] && g->dspark_target_h_batch[i] &&

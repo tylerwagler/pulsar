@@ -1532,7 +1532,7 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
             raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
-            0 /* drafter ring is always f32 */,
+            1 /* drafter ring is PULSAR_ATTN_PACK too */,
             NULL, NULL, 1) != 0;
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
@@ -1552,7 +1552,7 @@ bool gpu_graph_dspark_draft_forward(
             0,
             PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
             1,
-            0 /* drafter ring is always f32 */,
+            1 /* drafter ring is PULSAR_ATTN_PACK too */,
             NULL, NULL, 0, 1) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,

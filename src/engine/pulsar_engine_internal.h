@@ -882,7 +882,7 @@ typedef struct {
      * drafter is loaded; the graph's dspark_raw_cache[i]/dspark_prompt_h[i]
      * become bank views into these, swapped by gpu_graph_bank_repoint so the
      * spec path transparently uses the active bank's ring.  NULL otherwise. */
-    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * head_dim * f32 */
+    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * PULSAR_ATTN_PACK row (584 B) */
     uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
     pulsar_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
     pulsar_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
