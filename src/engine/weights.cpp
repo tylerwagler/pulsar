@@ -143,32 +143,22 @@ static void tensor_expect_plain_or_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_BF16)
-        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_F32)
-        tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_FP8_E4M3)
-        tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_MXFP8_LT)
-        tensor_expect_layout(t, PULSAR_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
-    else
-        /* MXFP8_LT was rejected here until 2026-08-17, deliberately and
-         * correctly: gpu_graph_matmul_plain_tensor had no type-41 branch, so a
-         * type-41 tensor routed here would have passed load and dispatched into
-         * nothing. That guard did its job -- a repacked artifact was tried on
-         * 2026-08-17 and died at load with this exact message instead of
-         * misbehaving. The arm now exists, so the type is accepted; the guard
-         * stays for whatever type is added next without one.
-         *
-         * BF16 and F32 were added 2026-08-15 and both have plain-path branches.
-         * F32 is here because the hc_*_fn / *_compressor_ape families are f32
-         * upstream and now stay f32 rather than being narrowed. The types
-         * accepted here must stay exactly in step with the arms of
-         * gpu_graph_matmul_plain_tensor AND with
-         * gpu_graph_weight_is_plain_or_mxfp8, or a tensor passes load and then
-         * dispatches into nothing. Three places, and the 2026-08-17 addition of
-         * MXFP8_LT touched all three. */
-        pulsar_die("tensor has unsupported weight type; expected F32, BF16, FP8_E4M3 or MXFP8_LT");
+    /* Membership comes from pulsar_weight_is_plain_or_mxfp8 -- see the note on
+     * it. This function used to restate the set, and drifted from the
+     * dispatcher it is supposed to mirror.
+     *
+     * MXFP8_LT was rejected here until 2026-08-17, deliberately and correctly:
+     * gpu_graph_matmul_plain_tensor had no type-41 branch, so such a tensor
+     * would have passed load and dispatched into nothing. The guard did its job
+     * -- a repacked artifact was tried that day and died HERE, at load, instead
+     * of misbehaving. The arm exists now, so the type is in the set. */
+    if (!pulsar_weight_is_plain_or_mxfp8(t->type)) {
+        fprintf(stderr, "pulsar: tensor %.*s has type %s, which the plain matmul "
+                        "cannot dispatch\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        pulsar_die("unsupported weight type for the plain matmul path");
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
 

@@ -427,6 +427,26 @@ typedef struct {
     uint64_t value_pos;
 } pulsar_kv;
 
+/* THE accept set for gpu_graph_matmul_plain_tensor -- ONE definition.
+ *
+ * This lived as three parallel lists: the dispatcher's arms, the load
+ * validator's accept set, and a decode-time predicate, each with a comment
+ * telling the next person to keep it in step with the other two. They drifted
+ * exactly as you would expect -- the validator's comment said "the four arms"
+ * while there were three -- and the failure mode is nasty: a type accepted by
+ * the validator but missing an arm passes load and dies at runtime on a tensor
+ * the artifact was told was fine.
+ *
+ * The dispatcher still switches, because it must MAP a type to an arm. What it
+ * may not do is disagree about membership, so it asserts against this instead
+ * of restating it. */
+static inline bool pulsar_weight_is_plain_or_mxfp8(uint32_t type) {
+    return type == PULSAR_TENSOR_BF16 ||
+           type == PULSAR_TENSOR_F32 ||
+           type == PULSAR_TENSOR_FP8_E4M3 ||
+           type == PULSAR_TENSOR_MXFP8_LT;
+}
+
 typedef struct {
     pulsar_str name;
     uint32_t ndim;

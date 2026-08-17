@@ -166,14 +166,8 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t 
     return g->attn_comp_dequant;
 }
 
-/* Must stay in step with gpu_graph_matmul_plain_tensor's arms AND with
- * tensor_expect_plain_or_mxfp8's accept set. A type this returns true for but
- * the matmul cannot dispatch is a runtime failure on a tensor that passed load. */
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
-    return w->type == PULSAR_TENSOR_BF16 ||
-           w->type == PULSAR_TENSOR_F32 ||
-           w->type == PULSAR_TENSOR_FP8_E4M3 ||
-           w->type == PULSAR_TENSOR_MXFP8_LT;
+    return pulsar_weight_is_plain_or_mxfp8(w->type);
 }
 
 
@@ -1908,7 +1902,14 @@ bool gpu_graph_matmul_plain_tensor(
         return pulsar_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
-    fprintf(stderr, "pulsar: plain matmul does not support %s\n", tensor_type_name(w->type));
+    /* Reached only if a type is IN pulsar_weight_is_plain_or_mxfp8 but has no
+     * arm above -- i.e. the two drifted. Say which, because the old message
+     * ("does not support") reads like an artifact problem when it is ours. */
+    fprintf(stderr, "pulsar: plain matmul has no arm for %s%s\n",
+            tensor_type_name(w->type),
+            pulsar_weight_is_plain_or_mxfp8(w->type)
+                ? " -- but it IS in the accept set; an arm is missing here"
+                : " (and it is correctly absent from the accept set)");
     return false;
 }
 
