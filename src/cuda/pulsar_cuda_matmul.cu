@@ -1565,6 +1565,65 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
 }
 
 
+/* A8 twin of the NT batched GEMV.  Restores the invariant the comment above
+ * claims and A8 quietly broke: "each token's output is bit-identical to the n=1
+ * kernel run on that token alone".
+ *
+ * That held while both arms read f32.  Then the n==1 path moved to E4M3
+ * (mxfp8_mmvq_deint_a8_kernel) and this one did not, so from that commit the
+ * SPEC-DECODE VERIFY BATCH multiplied in a different activation format than the
+ * drafter's own forwards -- the drafter proposing under one numerics and the
+ * target verifying under another, which is exactly the cross-arm mismatch that
+ * cost 6.6 points of acceptance in the MoE (L056) before ea86645 closed it.
+ *
+ * Multiply order is copied from the n==1 A8 kernel and must stay that way:
+ * qw[j] * qa[j] * s, with s = sw*sa hoisted, NOT (qw*sw)*(qa*sa).  The f32 NT
+ * kernel hoists wj = w*sc for the same reason -- matching the arm it must agree
+ * with is worth more than a saved multiply.
+ *
+ * The activation cache is row-major [rows, K] (mxfp8_quant_act_kernel stores at
+ * row*K + k), so a lane's 4 elements stay contiguous per token and the scale row
+ * is simply the token index. */
+template <int NT>
+__global__ static void mxfp8_mmvq_deint_nt_a8_kernel(float *out, const __nv_fp8_e4m3 *data,
+                                                     const unsigned char *scale,
+                                                     const __nv_fp8_e4m3 *xq,
+                                                     const unsigned char *xs,
+                                                     int in_dim, int out_dim, int KBp, int xKBp) {
+    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
+    float acc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+    for (int base = 0; base < in_dim; base += 128) {
+        int k = base + lane * 4;
+        uint32_t wpk = *(const uint32_t *)(row + k);
+        int kb = k >> 5;
+        float sw = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
+        #pragma unroll
+        for (int t = 0; t < NT; t++) {
+            uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
+            float sa = __int_as_float((uint32_t)xs[mx_sfoff(t, kb, xKBp)] << 23);
+            const float s = sw * sa;
+            const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                acc[t] += __half2float((__half)qw[j]) * __half2float((__half)qa[j]) * s;
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        float a = acc[t];
+        for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
+        if (lane == 0) out[(size_t)t * out_dim + o] = a;
+    }
+}
+
+
 /* PER-TENSOR routing: every offset registered at load (the MXFP8 workhorse
  * weights: attn_kv/q_a/q_b, attn_output_a/b, shared experts, output head)
  * takes the FP8 path; anything unregistered is rejected below. */
@@ -1729,6 +1788,46 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 const int KBp = mx_rup((int)(in_dim / 32), 4);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
+                /* A8 first, for the same reason the n==1 path takes it: the
+                 * source multiplies dynamic E4M3 activations, and this arm
+                 * serving the verify batch in f32 while n==1 served the
+                 * drafter's forwards in E4M3 is a size-thresholded activation
+                 * format -- the defect this codebase keeps re-finding. */
+                const mxfp8_act_cache_t *ac8nt = act_slot_find(x->ptr, n_tok, in_dim);
+                if (ac8nt && ac8nt->valid) {
+                    const int xKBp = mx_rup((int)(in_dim / 32), 4);
+                    {
+                        /* Keyed on the (in,out) pair and announced once per
+                         * shape, exactly like the n==1 twin: a gate PASS cannot
+                         * tell "the A8 arm ran" from "the A8 arm never ran", and
+                         * a silently-missed cache would look identical. */
+                        static uint64_t seen_nt[16] = {0};
+                        static int n_seen_nt = 0;
+                        const uint64_t key = (in_dim << 32) ^ out_dim;
+                        int known = 0;
+                        for (int i = 0; i < n_seen_nt; i++) if (seen_nt[i] == key) { known = 1; break; }
+                        if (!known && n_seen_nt < 16) {
+                            seen_nt[n_seen_nt++] = key;
+                            fprintf(stderr, "pulsar: verify-batch GEMV W8A8 (E4M3 acts) for "
+                                            "in_dim=%llu out_dim=%llu\n",
+                                    (unsigned long long)in_dim, (unsigned long long)out_dim);
+                        }
+                    }
+                    #define PULSAR_FP8_NT_A8(N) mxfp8_mmvq_deint_nt_a8_kernel<N><<<grid, wpb * 32>>>( \
+                            (float *)out->ptr, bw->data, bw->scale, ac8nt->xq, ac8nt->sx, \
+                            (int)in_dim, (int)out_dim, KBp, xKBp)
+                    switch (n_tok) {
+                    case 2: PULSAR_FP8_NT_A8(2); break;
+                    case 3: PULSAR_FP8_NT_A8(3); break;
+                    case 4: PULSAR_FP8_NT_A8(4); break;
+                    case 5: PULSAR_FP8_NT_A8(5); break;
+                    case 6: PULSAR_FP8_NT_A8(6); break;
+                    case 7: PULSAR_FP8_NT_A8(7); break;
+                    default: PULSAR_FP8_NT_A8(8); break;
+                    }
+                    #undef PULSAR_FP8_NT_A8
+                    return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
+                }
                 #define PULSAR_FP8_NT(N) mxfp8_mmvq_deint_nt_kernel<N><<<grid, wpb * 32>>>( \
                         (float *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
                         (int)in_dim, (int)out_dim, KBp)
