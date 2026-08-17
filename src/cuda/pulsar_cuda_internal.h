@@ -194,17 +194,16 @@ __device__ __forceinline__ static float pulsar_w_load_f32_or_bf16(const void *w,
  * bool-templated void* pair above for anything newly written -- that pair is
  * what let the embed kernels read an f16 table as f32 on 2026-08-15. */
 __device__ __forceinline__ static float pulsar_wt_load(const float *p, uint64_t i) { return p[i]; }
-__device__ __forceinline__ static float pulsar_wt_load(const __half *p, uint64_t i) { return __half2float(p[i]); }
 __device__ __forceinline__ static float pulsar_wt_load(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
 
 /* Bytes per element of the above, for the range checks that accompany them. */
 __host__ __device__ __forceinline__ static uint64_t pulsar_wt_bytes_f32(void) { return 4; }
 
-template <bool BF16>
-__device__ __forceinline__ static float pulsar_w_load_f16_or_bf16(const void *w, uint64_t i) {
-    if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);
-    else                return __half2float(((const __half *)w)[i]);
-}
+/* pulsar_w_load_f16_or_bf16<BF16> lived here: the false arm read __half. It had
+ * no callers, and the artifact has had ZERO F16 tensors since the source-format
+ * migration -- the type survives only as an enum value with no loader and no
+ * validator that accepts it. Deleted 2026-08-17 with the __half overload of
+ * pulsar_wt_load, for the same reason. */
 
 /* Bytes per element for the above.  Every bounds check on such a weight must
  * use THIS, not sizeof(float): a bf16 tensor is half the bytes, and validating

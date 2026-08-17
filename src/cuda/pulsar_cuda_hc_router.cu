@@ -1061,9 +1061,19 @@ int pulsar_gpu_hc_norm_mix_tensor(
     hc_norm_mix_kernel<256, 8, WT><<<(uint32_t)out_dim, 256>>>(          \
             (float *)out->ptr, (const CAST)wptr, (const pulsar_hc_t *)x->ptr, \
             (uint32_t)in_dim, (uint32_t)out_dim, eps)
+    /* Fail closed on an unexpected type.  This used to fall through to a
+     * __half instantiation, so ANY type that was not BF16 or F32 got read as
+     * f16 -- silently, at the wrong element width, which is precisely the
+     * failure the typed-loader note in pulsar_cuda_internal.h was written after
+     * (the embed kernels reading an f16 table as f32 on 2026-08-15).  The
+     * artifact's hc_*_fn family is F32 and its drafter twin BF16, so the f16
+     * arm was unreachable AND wrong for whatever would have reached it. */
     if (w_type == 30u)      PULSAR_HCMIX(__nv_bfloat16, __nv_bfloat16 *);
     else if (w_type == 0u)  PULSAR_HCMIX(float, float *);
-    else                    PULSAR_HCMIX(__half, __half *);
+    else {
+        fprintf(stderr, "pulsar: hc_mix weight type %u is neither BF16 nor F32\n", w_type);
+        return 0;
+    }
 #undef PULSAR_HCMIX
     return cuda_ok(cudaGetLastError(), "hc norm mix launch");
 }
