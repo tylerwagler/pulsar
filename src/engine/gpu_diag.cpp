@@ -608,10 +608,13 @@ static bool gpu_graph_bank_slabs_alloc(
         bool                  managed_kv_cache,
         const gpu_graph_dims *dz) {
     pulsar_bank_slabs *b = &g->banks;
-    const uint64_t raw_elem = sizeof(uint16_t);   /* raw KV ring is __half */
+    /* The raw KV ring is PULSAR_ATTN_PACK rows: 584 B at head_dim 512, the same
+      * 448 E4M3 + 8 scale + 64 bf16 layout the compressed pool uses. It was
+      * __half (1024 B) until 2026-08-17, which spent 2 bytes per element on nope
+      * dims that hold E4M3 precision, in a dtype the source model has nowhere. */
     b->n_banks = n_banks;
     b->cur_bank = 0;
-    b->raw_bank_bytes = (uint64_t)dz->raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
+    b->raw_bank_bytes = (uint64_t)dz->raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1654,13 +1657,14 @@ bool gpu_graph_alloc_raw_cap(
     g->kv_raw = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     g->kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
-    const uint64_t raw_elem_bytes = sizeof(uint16_t);   /* raw KV ring is __half */
+    /* PULSAR_ATTN_PACK rows -- see the bank sizing above. */
+    const uint64_t raw_row_bytes_pack = PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_raw_cache[il] = banked
             ? pulsar_gpu_tensor_view(g->banks.raw[il], 0, g->banks.raw_bank_bytes)
             : gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
-                    (uint64_t)raw_cap * PULSAR_N_HEAD_DIM * raw_elem_bytes);
+                    (uint64_t)raw_cap * raw_row_bytes_pack);
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;

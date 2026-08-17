@@ -116,7 +116,7 @@ static bool gpu_graph_decode_kv_store(
         pulsar_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          raw_row,
-        uint32_t          raw_f16) {
+        uint32_t          raw_pack) {
 
     return pulsar_gpu_kv_fp8_store_raw_tensor(kv,
                                              raw_cache,
@@ -124,7 +124,7 @@ static bool gpu_graph_decode_kv_store(
                                              raw_row,
                                              PULSAR_N_HEAD_DIM,
                                              PULSAR_N_ROT,
-                                             raw_f16) != 0;
+                                             raw_pack) != 0;
 }
 
 
@@ -358,7 +358,7 @@ bool gpu_graph_encode_decode_layer(
         int                     token) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    const uint32_t raw_f16 = 1u;   /* the raw KV ring is always __half */
+    const uint32_t raw_pack = 1u;  /* the main raw ring is PULSAR_ATTN_PACK rows */
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
     const uint32_t n_groups = PULSAR_N_OUT_GROUP;
@@ -578,7 +578,7 @@ bool gpu_graph_encode_decode_layer(
     /* RoPE stays as the exact standalone kernel above.  The decode fusion
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
-    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row, raw_f16);
+    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row, raw_pack);
     PULSAR_CUDA_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->kv, PULSAR_N_HEAD_DIM, il, pos);
@@ -917,7 +917,7 @@ bool gpu_graph_encode_decode_layer(
                     pulsar_layer_compress_ratio(il),
                     PULSAR_N_HEAD,
                     PULSAR_N_HEAD_DIM,
-                    raw_f16,
+                    raw_pack,
                     NULL,
                     NULL,
                     NULL,
@@ -942,7 +942,7 @@ bool gpu_graph_encode_decode_layer(
                                                          1u,
                                                          n_comp,
                                                          PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                                         raw_f16) != 0;
+                                                         raw_pack) != 0;
         }
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("attention");

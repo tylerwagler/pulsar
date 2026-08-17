@@ -545,44 +545,6 @@ __device__ static float dsv4_e4m3fn_decode_dev(uint8_t byte, float scale) {
 #define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
 
 
-/* Fused decode KV store: fake-quant the nope dims of the single kv row IN
- * PLACE (same 64-thread block, same reduction and scale math as
- * fp8_kv_quantize_kernel -> bit-identical values land in x), and write the
- * whole row into the raw cache with store_raw_kv_batch_kernel's exact
- * __float2half roundtrip semantics. One launch instead of two per layer per
- * decode token. */
-__global__ static void fp8_kv_quantize_store_kernel(
-        float *x, float *raw, uint32_t raw_cap, uint32_t pos,
-        uint32_t head_dim, uint32_t n_rot, int raw_f16) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t row = pos % raw_cap;
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < n_nope; off += 64) {
-        float v = 0.0f;
-        if (off + tid < n_nope) v = x[off + tid];
-        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
-        if (off + tid < n_nope) {
-            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
-            x[off + tid] = q;
-            const __half h = __float2half(q);
-            if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + off + tid] = h;
-            else         raw[(uint64_t)row * head_dim + off + tid] = __half2float(h);
-        }
-        __syncthreads();
-    }
-    for (uint32_t d = n_nope + tid; d < head_dim; d += 64) {
-        const __half h = __float2half(x[d]);
-        if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + d] = h;
-        else         raw[(uint64_t)row * head_dim + d] = __half2float(h);
-    }
-}
 
 __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     uint32_t row = blockIdx.x;
@@ -616,22 +578,42 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
  * head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
  * takes the same treatment one dtype up: bf16-roundtripped in place, then
  * stored.  Read-back is bit-identical to the f32 path. */
-__global__ static void attn_pack_store_kernel(float *x, uint8_t *out, uint32_t out_row0, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
+/* `x` is the OPTIONAL f32 staging to round-trip in place; NULL when the source
+ * must not be modified (the raw-ring writers take a const kv).  `src` is what is
+ * read.  positions/seq_id/n_banks/raw_cap give the ring scatter the raw cache
+ * needs -- destination row is bank*raw_cap + pos%raw_cap.  raw_cap == 0
+ * degenerates to consecutive rows at out_row0, which is what the compressed pool
+ * wants, so ONE kernel now writes both KV caches in the one 584 B format. */
+__global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
+                                              uint32_t out_row0, uint32_t n_rows,
+                                              uint32_t head_dim, uint32_t n_rot,
+                                              const int32_t * __restrict__ positions,
+                                              const int32_t * __restrict__ seq_id,
+                                              uint32_t n_banks, uint32_t raw_cap) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows) return;
+    uint64_t dst_row;
+    if (raw_cap) {
+        if (seq_id && (uint32_t)seq_id[row] >= n_banks) return;   /* dead row stores nothing */
+        const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
+        dst_row = (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
+    } else {
+        dst_row = (uint64_t)(out_row0 + row);
+    }
     const uint32_t n_nope = head_dim - n_rot;
     const uint32_t nblk = n_nope / PULSAR_FP8_KV_BLOCK;
     const uint32_t nblk_pad = (nblk + 3u) & ~3u;
     const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    float *xr = x + (uint64_t)row * head_dim;
-    uint8_t *outr = out + (uint64_t)(out_row0 + row) * rowbytes;
+    const float *sr = src + (uint64_t)row * head_dim;
+    float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
+    uint8_t *outr = out + dst_row * rowbytes;
     uint8_t *sc = outr + n_nope;
     __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + n_nope + nblk_pad);
     __shared__ float scratch[64];
     for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
         float v = 0.0f;
-        if (off + tid < n_nope) v = xr[off + tid];
+        if (off + tid < n_nope) v = sr[off + tid];
         scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
         __syncthreads();
         for (uint32_t stride = 32; stride > 0; stride >>= 1) {
@@ -648,7 +630,7 @@ __global__ static void attn_pack_store_kernel(float *x, uint8_t *out, uint32_t o
         }
         if (off + tid < n_nope) {
             const float c = fminf(448.0f, fmaxf(-448.0f, v / scale));
-            xr[off + tid] = dsv4_e4m3fn_dequant_dev(c) * scale;
+            if (xr) xr[off + tid] = dsv4_e4m3fn_dequant_dev(c) * scale;
             outr[off + tid] = dsv4_e4m3fn_encode_dev(c);
         }
         __syncthreads();
@@ -661,9 +643,9 @@ __global__ static void attn_pack_store_kernel(float *x, uint8_t *out, uint32_t o
      * precisely what the packed row decodes to.  Without the write-back the
      * value-preserving invariant would hold for 448 of 512 dims only. */
     for (uint32_t d = tid; d < n_rot; d += blockDim.x) {
-        const __nv_bfloat16 b = __float2bfloat16(xr[n_nope + d]);
+        const __nv_bfloat16 b = __float2bfloat16(sr[n_nope + d]);
         rope[d] = b;
-        xr[n_nope + d] = __bfloat162float(b);
+        if (xr) xr[n_nope + d] = __bfloat162float(b);
     }
 }
 
@@ -837,10 +819,13 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
 
 
 
-/* raw_f16: per-call flag describing the storage format of the PASSED raw
- * cache (__half when set, f32 otherwise).  The value stored is the same
- * __float2half rounding the f32 path roundtrips through, so read-back (as
- * __half2float) is bit-identical in both modes.
+/* The f32 raw ring: the DRAFTER's transient KV only.  The main ring is packed
+ * (PULSAR_ATTN_PACK, 584 B/row) as of 2026-08-17 and never comes here.
+ *
+ * The __float2half round-trip is KEPT deliberately.  It existed so the f32 ring
+ * held exactly what the f16 ring would; that ring is gone, so the justification
+ * is now only "do not change drafter numerics in a storage commit". Packing this
+ * ring too would drop its nope dims to E4M3, which is a draft-quality decision.
  *
  * positions/seq_id/n_banks: per-row multi-session banking (same descriptor
  * contract as the decode attention kernels, pulsar_cuda_attention.cu).  Row t
@@ -850,7 +835,7 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
  * scribble another bank's ring (the read-side dead-row guard zeroes the
  * row's outputs).  NULL/NULL/1 degenerates to the classic single-cache
  * consecutive store bit-exactly. */
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int raw_f16,
+__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                  const int32_t * __restrict__ positions,
                                                  const int32_t * __restrict__ seq_id,
                                                  uint32_t n_banks) {
@@ -863,8 +848,7 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
     const uint32_t p = positions ? (uint32_t)positions[t] : pos0 + t;
     uint32_t row = (seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u) + p % raw_cap;
     const __half h = __float2half(kv[(uint64_t)t * head_dim + d]);
-    if (raw_f16) ((__half *)raw)[(uint64_t)row * head_dim + d] = h;
-    else         raw[(uint64_t)row * head_dim + d] = __half2float(h);
+    raw[(uint64_t)row * head_dim + d] = __half2float(h);
 }
 
 
@@ -1323,8 +1307,10 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
         packed->bytes < ((uint64_t)out_row0 + n_rows) * PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
         return 0;
     }
-    attn_pack_store_kernel<<<n_rows, 64>>>((float *)x->ptr, (uint8_t *)packed->ptr,
-                                           out_row0, n_rows, head_dim, n_rot);
+    attn_pack_store_kernel<<<n_rows, 64>>>((float *)x->ptr, (const float *)x->ptr,
+                                          (uint8_t *)packed->ptr,
+                                           out_row0, n_rows, head_dim, n_rot,
+                                           NULL, NULL, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attn_pack_store launch");
 }
 
@@ -1431,7 +1417,7 @@ int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n
 }
 
 
-int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16);
+int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_pack);
 
 
 int pulsar_gpu_kv_fp8_store_raw_tensor(
@@ -1441,27 +1427,43 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_row,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        uint32_t          raw_f16) {
+        uint32_t          raw_pack) {
     if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    fp8_kv_quantize_store_kernel<<<1, 64>>>((float *)kv->ptr, (float *)raw_cache->ptr,
-                                            raw_cap, raw_row, head_dim, n_rot, (int)raw_f16);
-    return cuda_ok(cudaGetLastError(), "fp8_kv_quantize_store launch");
+    /* One row, packed, with the ring's own modulo. The f32 staging is rounded in
+     * place so it keeps holding exactly what the packed row decodes to -- the
+     * invariant fp8_kv_quantize_store_kernel used to provide, now provided by
+     * the same kernel the compressed pool uses. */
+    attn_pack_store_kernel<<<1, 64>>>((float *)kv->ptr, (const float *)kv->ptr,
+                                      (uint8_t *)raw_cache->ptr,
+                                      raw_row, 1u, head_dim, n_rot,
+                                      NULL, NULL, 1u, raw_cap);
+    return cuda_ok(cudaGetLastError(), "raw pack store launch");
 }
 
 
-int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_f16) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_pack) {
+    const uint64_t need = raw_pack ? (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+                                   : (uint64_t)raw_cap * head_dim * sizeof(float);
+    if (!raw_cache || !kv || raw_cap == 0 || raw_cache->bytes < need ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim, (int)raw_f16,
+    if (raw_pack) {
+        /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
+         * round-trip the decode store does. */
+        attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
+                                          (uint8_t *)raw_cache->ptr,
+                                          row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
+                                          NULL, NULL, 1u, raw_cap);
+        return cuda_ok(cudaGetLastError(), "raw pack store launch");
+    }
+    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim,
                                                                NULL, NULL, 1u);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 
 
-int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_f16,
+int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_pack,
                                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
     /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
      * is the whole bank pool (byte bound scales by n_banks) and the uint32
@@ -1480,11 +1482,25 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
-    if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < kv_banks * raw_cap * head_dim * (raw_f16 ? sizeof(__half) : sizeof(float)) ||
+    const uint64_t need = raw_pack
+            ? kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+            : kv_banks * raw_cap * head_dim * sizeof(float);
+    if (!raw_cache || !kv || raw_cap == 0 || raw_cache->bytes < need ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+    if (raw_pack) {
+        /* One block per row, 64 threads -- the packed format needs a per-64-block
+         * amax, so this cannot be the flat one-thread-per-element scatter the f32
+         * ring uses.  x = NULL: kv is const on this entry. */
+        attn_pack_store_kernel<<<n_tokens, 64>>>(NULL, (const float *)kv->ptr,
+                                                 (uint8_t *)raw_cache->ptr,
+                                                 pos0, n_tokens, head_dim, PULSAR_ATTN_PACK_NROT,
+                                                 descr ? (const int32_t *)positions->ptr : NULL,
+                                                 descr ? (const int32_t *)seq_id->ptr : NULL,
+                                                 descr ? n_banks : 1u, raw_cap);
+        return cuda_ok(cudaGetLastError(), "raw pack store batch launch");
+    }
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim, (int)raw_f16,
+    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim,
                                                         descr ? (const int32_t *)positions->ptr : NULL,
                                                         descr ? (const int32_t *)seq_id->ptr : NULL,
                                                         descr ? n_banks : 1u);
