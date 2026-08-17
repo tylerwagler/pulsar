@@ -897,10 +897,15 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   }
 }
 
-template <class SFL>
+/* A8=true reads mid as the E4M3 + E8M0 pair e4m3_act_pack_kernel emitted, rather
+ * than the f32 buffer the round-trip leaves behind after deriving exactly those
+ * bytes. Same value into the dot product, 1 byte read instead of 4. */
+template <class SFL, bool A8 = false>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
-    const float *midq,        // [n_slots, K] fp4-roundtripped mid
+    const float *midq,        // [n_slots, K] f32 mid (A8=false)
+    const uint8_t *midq8,     // [n_slots, K] E4M3 mid (A8=true)
+    const uint8_t *midsf,     // [n_slots, K/32] E8M0
     const int32_t *sel,       // [n_slots] expert ids
     const uint8_t *down_base,
     uint64_t stride, uint64_t data_bytes, SFL sfl,
@@ -918,14 +923,20 @@ __global__ static void expert_gemv_down_kernel(
   const uint8_t *de = down_base + (size_t)e * stride;
   const uint8_t *dd = de + (size_t)n * (K / 2);
   const uint8_t *dsf = de + data_bytes;
-  const float *xt = midq + (size_t)slot * K;
+  const float *xt = A8 ? nullptr : midq + (size_t)slot * K;
+  const uint8_t *xt8 = A8 ? midq8 + (size_t)slot * K : nullptr;
+  const uint8_t *xsf = A8 ? midsf + (size_t)slot * (K / 32) : nullptr;
   float a = 0.f;
   for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
     const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));
     const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
+    const float sa = A8 ? gemv_sf_val(xsf[k0 >> 5]) : 0.f;
     #pragma unroll
-    for (int j = 0; j < 8; j++)
-      a += lut[(w >> (4 * j)) & 0xFu] * sc * xt[k0 + j];
+    for (int j = 0; j < 8; j++) {
+      const float xv = A8 ? (__half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[k0 + j]) * sa)
+                          : xt[k0 + j];
+      a += lut[(w >> (4 * j)) & 0xFu] * sc * xv;
+    }
   }
   for (int sh = 16; sh > 0; sh >>= 1) a += __shfl_xor_sync(0xffffffffu, a, sh);
   if (lane == 0) o[n] = a;
@@ -948,6 +959,31 @@ __global__ static void e4m3_act_roundtrip_kernel(float *xq, const float *x, long
   if (se < -127) se = -127; if (se > 127) se = 127;
   const float inv = exp2f((float)-se), s = exp2f((float)se);
   for (int i = 0; i < 32; i++) dst[i] = (float)((cutlass::float_e4m3_t)(src[i] * inv)) * s;
+}
+
+/* Packing twin of e4m3_act_roundtrip_kernel: IDENTICAL recipe -- same per-32
+ * amax, same se, same encode -- but it keeps the E4M3 byte and the E8M0
+ * exponent instead of multiplying straight back to f32.  The round-trip derives
+ * the compact form and throws it away; the consumer then reads 4 bytes where 1
+ * plus a shared scale would do.
+ *
+ * Bit-exact against the round-trip by construction: the GEMV computes
+ * (float)e4m3 * exp2(se), which is exactly what dst[i] held. */
+__global__ static void e4m3_act_pack_kernel(uint8_t *q, uint8_t *sf, const float *x, long nblk32) {
+  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk32) return;
+  const float *src = x + b * 32;
+  uint8_t *dq = q + b * 32;
+  float mx = 0.f;
+  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
+  int se = -127; if (mx > 0.f) { int e = (int)floorf(log2f(mx)); se = e - 7; }
+  if (se < -127) se = -127; if (se > 127) se = 127;
+  const float inv = exp2f((float)-se);
+  sf[b] = (uint8_t)(se + 127);
+  for (int i = 0; i < 32; i++) {
+    const cutlass::float_e4m3_t e = (cutlass::float_e4m3_t)(src[i] * inv);
+    dq[i] = *(const uint8_t *)&e;
+  }
 }
 
 /* Persistent activation round-trip buffers, grown on demand and reused across
@@ -1003,7 +1039,8 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-    expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected,
+    expert_gemv_down_kernel<decltype(sfl_dn), false><<<g, 256>>>(
+        down_out, midq, nullptr, nullptr, selected,
         down_w, down_stride, down_data_bytes, sfl_dn,
         n_total_expert, mid_dim, out_dim);
   }
@@ -1074,14 +1111,21 @@ int pulsar_cutlass_gemv_down(
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim) {
   if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u)) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  const size_t midq_floats = (size_t)n_slots * mid_dim;
-  if (!gemv_actbuf_ensure(midq_floats)) return 1;
-  float *midq = g_fp4_gemv_actbuf;
+  const size_t midq_elems = (size_t)n_slots * mid_dim;
+  const long nb = (long)(midq_elems / 32);
+  /* mid must be quantised here -- the gate/up GEMV gives one warp one output
+   * element, so a 32-wide MX block spans four CTAs and no epilogue can see its
+   * amax.  What CAN go is the dequantise: pack once and let the GEMV read the
+   * bytes, instead of writing 4 bytes per element that hold 1 byte of value. */
+  const size_t need_floats = (midq_elems + (size_t)nb * 4u + 3u) / 4u;
+  if (!gemv_actbuf_ensure(need_floats)) return 1;
+  uint8_t *midq8 = (uint8_t *)g_fp4_gemv_actbuf;
+  uint8_t *midsf = midq8 + midq_elems;
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  { const long nb = (long)(midq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid, nb); }
+  e4m3_act_pack_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq8, midsf, mid, nb);
   dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-  expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected, down_w,
+  expert_gemv_down_kernel<decltype(sfl_dn), true><<<g, 256>>>(
+      down_out, nullptr, midq8, midsf, selected, down_w,
       down_stride, down_data_bytes, sfl_dn, n_total_expert, mid_dim, out_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
