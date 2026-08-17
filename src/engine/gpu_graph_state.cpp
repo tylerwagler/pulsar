@@ -35,6 +35,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_comp_sc);
     pulsar_gpu_tensor_free(g->batch_comp_kv);
     pulsar_gpu_tensor_free(g->batch_kv);
+    pulsar_gpu_tensor_free(g->batch_kv_pack);
     pulsar_gpu_tensor_free(g->batch_kv_raw);
     pulsar_gpu_tensor_free(g->batch_q);
     pulsar_gpu_tensor_free(g->batch_qr_norm);

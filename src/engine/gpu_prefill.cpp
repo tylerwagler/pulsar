@@ -913,10 +913,22 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
-    if (ok) ok = pulsar_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
-                                                       n_tokens,
-                                                       PULSAR_N_HEAD_DIM,
-                                                       PULSAR_N_ROT) != 0;
+    /* One pass: round-trip batch_kv in place (nope E4M3, rope bf16) AND emit the
+     * packed rows attention will read.  This was pulsar_gpu_dsv4_fp8_kv_quantize_tensor
+     * followed by attention reading the f32 staging directly -- so the chunk's own
+     * KV was multiplied at 4 bytes/element while every later chunk read the same
+     * rows out of the ring at 584 B.
+     *
+     * It must be THIS entry and not the repack one: repack uses an exact integer
+     * scale bucket, while this shares pulsar_gpu_dsv4_fp8_kv_quantize_tensor's
+     * fast-math scale -- which is what the ring store uses, so the chunk's rows
+     * and the ring's rows agree byte for byte. */
+    if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->batch_kv,
+                                                           g->batch_kv_pack,
+                                                           0u,
+                                                           n_tokens,
+                                                           PULSAR_N_HEAD_DIM,
+                                                           PULSAR_N_ROT) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -947,12 +959,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           model->size,
                                                           layer->attn_sinks->abs_offset,
                                                           g->batch_q,
-                                                          g->batch_kv,
+                                                          g->batch_kv_pack,
                                                           n_tokens,
                                                           g->raw_window,
                                                           PULSAR_N_HEAD,
                                                           PULSAR_N_HEAD_DIM,
-                                                          0 /* batch_kv is f32 */) != 0;
+                                                          1 /* batch_kv_pack is PULSAR_ATTN_PACK */) != 0;
         if (ok) batch_attention_done = true;
     } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
         /*
@@ -1872,7 +1884,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        model->size,
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
-                                                                       g->batch_kv,
+                                                                       g->batch_kv_pack,
                                                                        gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                        n_tokens,
                                                                        n_comp,
@@ -1880,7 +1892,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
                                                                        PULSAR_N_HEAD_DIM,
-                                                                       0 /* batch_kv is f32 */) != 0;
+                                                                       1 /* batch_kv_pack is PULSAR_ATTN_PACK */) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -1921,12 +1933,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               model->size,
                                                               layer->attn_sinks->abs_offset,
                                                               g->batch_q,
-                                                              g->batch_kv,
+                                                              g->batch_kv_pack,
                                                               raw_prefix_tokens,
                                                               g->raw_window,
                                                               PULSAR_N_HEAD,
                                                               PULSAR_N_HEAD_DIM,
-                                                              0 /* batch_kv is f32 */,
+                                                              1 /* batch_kv_pack is PULSAR_ATTN_PACK */,
                                                               gact_data, gact_scale, gact_kbp,
                                                               (uint32_t)gact_slab, n_groups,
                                                               PULSAR_N_HEAD_DIM - PULSAR_N_ROT,

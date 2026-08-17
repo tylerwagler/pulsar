@@ -1083,6 +1083,14 @@ typedef struct {
     pulsar_gpu_tensor *batch_q;
     pulsar_gpu_tensor *batch_kv_raw;
     pulsar_gpu_tensor *batch_kv;
+    /* The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.
+     * batch_kv above stays f32 because norm/rope/fp8-quantize are in-place
+     * elementwise passes over it, which is f32-as-scratch and is what torch does
+     * too (compute wide, store narrow). What was wrong until 2026-08-17 was f32
+     * as the multiply OPERAND: attention read the staging buffer directly, so
+     * the chunk's own KV was attended at 4 bytes/element while every later
+     * chunk read the same rows out of the packed ring at 584 B/row. */
+    pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;
     pulsar_gpu_tensor *batch_comp_sc;
     pulsar_gpu_tensor *batch_indexer_q;
