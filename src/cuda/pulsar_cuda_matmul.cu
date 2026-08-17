@@ -1622,14 +1622,33 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * ~out_dim x; see the kernel comment). */
             mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, n_tok, in_dim);
             if (ac8 && ac8->valid) {
-                /* Say it once.  A gate PASS cannot distinguish "the A8 path ran
-                 * and is correct" from "the A8 path never ran", and the second
-                 * is what a mis-keyed cache would silently produce. */
-                static int announced_a8 = 0;
-                if (!announced_a8) {
-                    announced_a8 = 1;
-                    fprintf(stderr, "pulsar: decode GEMV = W8A8 (E4M3 activations; "
-                                    "was W8A32 against f32)\n");
+                /* Say it once PER SHAPE, not once per process.  A gate PASS
+                 * cannot distinguish "the A8 path ran and is correct" from "the
+                 * A8 path never ran", and the second is what a mis-keyed cache
+                 * would silently produce -- so a single global line proved only
+                 * that SOME GEMV converted, which is the easy half. Keyed on
+                 * in_dim, the log enumerates exactly which decode GEMVs reach
+                 * W8A8: 4096 = attn_q_a/kv, 1024 = attn_q_b, 2048 = shared_down.
+                 * Anything missing from that list is still multiplying against
+                 * f32, which is the whole question when the goal is one
+                 * activation format everywhere. */
+                {
+                    /* Keyed on the (in,out) PAIR, not in_dim alone: attn_q_a,
+                     * attn_kv and the shared gate/up all read in_dim 4096, so
+                     * an in_dim-only key reported the first and silently hid the
+                     * other two -- an under-reporting diagnostic, which is the
+                     * one failure mode a diagnostic must not have. */
+                    static uint64_t seen[16] = {0};
+                    static int n_seen = 0;
+                    const uint64_t key = (in_dim << 32) ^ out_dim;
+                    int known = 0;
+                    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
+                    if (!known && n_seen < 16) {
+                        seen[n_seen++] = key;
+                        fprintf(stderr, "pulsar: decode GEMV W8A8 (E4M3 acts) for "
+                                        "in_dim=%llu out_dim=%llu\n",
+                                (unsigned long long)in_dim, (unsigned long long)out_dim);
+                    }
                 }
                 const int xKBp = mx_rup((int)(in_dim / 32), 4);
                 for (uint64_t t = 0; t < n_tok; t++)
@@ -1703,8 +1722,20 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
     /* Decode fast path: both weights share x and in_dim, so fuse the two
      * de-interleaved mmvq launches into one. Only when both are registered
      * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
-     * otherwise defer to the per-weight path below. */
-    if (n_tok == 1 && in_dim % 128 == 0 &&
+     * otherwise defer to the per-weight path below.
+     *
+     * ⚠ FORMAT BEFORE FUSION. This kernel takes x as f32 and has no A8 variant,
+     * so taking it when the producer HAS emitted an E4M3 encoding would silently
+     * run attn_q_a and attn_kv as W8A32 while every other decode GEMV ran W8A8 --
+     * which is exactly what it did: gpu_decode.cpp arms an E4M3 slot off
+     * attn_norm for these two, and nothing read it. A size- or shape-thresholded
+     * activation format is the defect this codebase refuses by name elsewhere
+     * ("one activation format, every batch size"), so when a valid encoding
+     * exists we give up the launch fusion and take the per-weight A8 path
+     * below. Fusing two launches is worth less than the operand being right. */
+    const mxfp8_act_cache_t *pair_a8 = act_slot_find(x->ptr, n_tok, in_dim);
+    const bool have_a8 = pair_a8 && pair_a8->valid;
+    if (!have_a8 && n_tok == 1 && in_dim % 128 == 0 &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes0 = out0_dim * fblocks * 33;

@@ -511,12 +511,17 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        float                   clamp) {
+        float                   clamp,
+        void                   *mid_q,
+        void                   *mid_sf,
+        int                     mid_kbp) {
     return pulsar_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
                                         gate_offset, in_dim, out_dim, x, 1) &&
            pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           pulsar_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
+           /* One row here, so n == out_dim and the MX row width IS out_dim. */
+           pulsar_gpu_swiglu_mx_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f,
+                                       mid_q, mid_sf, mid_kbp, (uint32_t)out_dim);
 }
 
 

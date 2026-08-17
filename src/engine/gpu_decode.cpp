@@ -1155,6 +1155,17 @@ bool gpu_graph_encode_decode_layer(
         gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, PULSAR_N_EMBD, il, pos);
     }
     if (ok) {
+        /* A8 for shared_down: emit shared_mid's E4M3 from the SwiGLU epilogue
+         * so the down GEMV multiplies in the source's format instead of f32.
+         * Prefill has done this since gpu_prefill.cpp:2300 -- decode was simply
+         * still calling the plain SwiGLU, which is why shared_down was the last
+         * dense decode GEMV left on W8A32. A miss is not an error: the slot
+         * comes back NULL and the epilogue behaves as before. */
+        void *sm_q = NULL, *sm_sf = NULL; int sm_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->shared_mid, 1, (uint64_t)shared_dim,
+                                                        &sm_q, &sm_sf, &sm_kbp)) {
+            sm_q = NULL; sm_sf = NULL; sm_kbp = 0;
+        }
         ok = pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -1165,7 +1176,10 @@ bool gpu_graph_encode_decode_layer(
                                                          PULSAR_N_EMBD,
                                                          shared_dim,
                                                          g->ffn_norm,
-                                                         PULSAR_SWIGLU_CLAMP_EXP) != 0;
+                                                         PULSAR_SWIGLU_CLAMP_EXP,
+                                                         sm_q, sm_sf, sm_kbp) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->shared_mid, 1, (uint64_t)shared_dim);
+        if (ok && sm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
     if (ok && fuse_shared_down_hc) {

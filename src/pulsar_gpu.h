@@ -359,7 +359,16 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        float                   clamp);
+        float                   clamp,
+        /* Optional activation-cache slots for `mid`. When supplied the SwiGLU
+         * epilogue emits mid's E4M3 + ue8m0 encoding, so the shared_down GEMV
+         * multiplies in the source's format instead of against f32 -- the same
+         * producer-emits-once shape the norms already use. NULL = plain f32
+         * behaviour. Prefill has taken this path since gpu_prefill.cpp:2300;
+         * decode was left on the plain SwiGLU. */
+        void                   *mid_q,
+        void                   *mid_sf,
+        int                     mid_kbp);
 
 
 /* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
