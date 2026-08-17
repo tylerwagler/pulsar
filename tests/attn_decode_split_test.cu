@@ -70,7 +70,7 @@ struct Case {
     uint32_t n_tokens, n_raw, raw_cap, raw_start, n_comp, window, ratio;
     uint32_t pos_base;      /* positions[t] = pos_base + 3*t (descr mode) */
     int descr;              /* 0: single_all scalar decode; 1: banked */
-    int raw_f16, comp_pack;
+    int raw_pack, comp_pack;
     uint32_t n_banks, comp_cap;
 };
 
@@ -81,7 +81,7 @@ int main() {
 
     const Case cases[] = {
         {"single_all f32comp",  1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 0, 1, 0},
-        {"single_all raw-f16",  1, 128, 4352,  5, 640, 0, 0, 0, 0, 1, 0, 1, 0},
+        {"single_all raw-pack", 1, 128, 4352,  5, 640, 0, 0, 0, 0, 1, 0, 1, 0},
         {"single_all pack",     1, 128, 4352, 41, 600, 0, 0, 0, 0, 0, 1, 1, 0},
         {"banked 4tok",         4,  64,  64,  0, 200, 24, 4, 850, 1, 0, 0, 2, 256},
         {"banked pack",         4,  64,  64,  0, 200, 24, 4, 870, 1, 0, 1, 2, 256},
@@ -125,11 +125,24 @@ int main() {
             }
         }
 
-        /* raw f16 rows: kernel reads halves when raw_f16 -- reuse raw[] as
-         * the value source, store as __half. */
-        std::vector<__half> rawh((size_t)total_raw_rows * D);
-        if (c.raw_f16)
-            for (size_t i = 0; i < rawh.size(); i++) rawh[i] = __float2half(raw[i]);
+        /* Packed raw rows: the ring is PULSAR_ATTN_PACK as of 2026-08-17, the
+         * same 584 B layout as the comp pool, so build it the same way -- random
+         * VALID bytes, with golden and split both reading this buffer. It stored
+         * __half until then, and this case built halves; the engine reading
+         * packed rows saw NaN, which is how the format change was caught. */
+        std::vector<uint8_t> rawp((size_t)total_raw_rows * pack_row);
+        if (c.raw_pack) {
+            std::uniform_int_distribution<int> bd2(0, 255);
+            const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
+            for (size_t r = 0; r < total_raw_rows; r++) {
+                uint8_t *row = &rawp[r * pack_row];
+                for (uint32_t d = 0; d < n_nope; d++) row[d] = (uint8_t)bd2(rng);
+                for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
+                    row[n_nope + sc] = (uint8_t)(118 + (int)(r + sc) % 16);
+                __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
+                for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
+            }
+        }
 
         std::vector<int32_t> pos(c.n_tokens), seq(c.n_tokens);
         for (uint32_t t = 0; t < c.n_tokens; t++) {
@@ -141,14 +154,14 @@ int main() {
         float *draw, *dcomp, *dq, *ds, *dgold, *dsplit;
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
-        cudaMalloc(&draw, c.raw_f16 ? rawh.size() * 2 : raw.size() * 4);
+        cudaMalloc(&draw, c.raw_pack ? rawp.size() : raw.size() * 4);
         cudaMalloc(&dcomp, c.comp_pack ? compp.size() : comp.size() * 4);
         cudaMalloc(&dq, q.size() * 4);
         cudaMalloc(&ds, sinks.size() * 4);
         cudaMalloc(&dgold, q.size() * 4);
         cudaMalloc(&dsplit, q.size() * 4);
-        if (c.raw_f16) cudaMemcpy(draw, rawh.data(), rawh.size() * 2, cudaMemcpyHostToDevice);
-        else           cudaMemcpy(draw, raw.data(), raw.size() * 4, cudaMemcpyHostToDevice);
+        if (c.raw_pack) cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
+        else            cudaMemcpy(draw, raw.data(), raw.size() * 4, cudaMemcpyHostToDevice);
         if (c.comp_pack) cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
         else             cudaMemcpy(dcomp, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
@@ -175,7 +188,7 @@ int main() {
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
                 (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
-                c.window, c.ratio, n_head, D, c.raw_f16,
+                c.window, c.ratio, n_head, D, c.raw_pack,
                 dpos, dseq, (const void * const *)dbp,
                 c.comp_cap, c.descr ? c.n_banks : 1u, NULL, NULL);
         /* candidate: split walk + merge through the production scratch */
@@ -187,7 +200,7 @@ int main() {
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
                 (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
-                c.window, c.ratio, n_head, D, c.raw_f16,
+                c.window, c.ratio, n_head, D, c.raw_pack,
                 dpos, dseq, (const void * const *)dbp,
                 c.comp_cap, c.descr ? c.n_banks : 1u, po, pml);
         dim3 gm(c.n_tokens, n_head, 1);
