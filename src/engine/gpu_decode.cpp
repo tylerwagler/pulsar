@@ -1362,9 +1362,17 @@ void gpu_graph_dspark_seed_draft_kv(
                 seeded = false;
                 break;
             }
-            if (!pulsar_gpu_tensor_copy(g->dspark_raw_cache[li],
-                                (uint64_t)row * kv_bytes,
-                                kv_rot, 0, kv_bytes)) {
+            /* Store through the ring's own writer, not a byte copy.  This was
+             * pulsar_gpu_tensor_copy at row*kv_bytes -- an f32 row at a 2048 B
+             * stride -- which stopped being the ring's layout when it became
+             * PULSAR_ATTN_PACK (584 B) in 157cd1d.  It then failed its bounds
+             * check, the seed aborted, and acceptance collapsed far enough that
+             * the yield-quench dropped the request to plain decode.  A writer
+             * that bypasses the store API is a writer the next format change
+             * will miss, which is exactly what happened. */
+            if (!pulsar_gpu_store_raw_kv_tensor(g->dspark_raw_cache[li], kv_rot,
+                                                PULSAR_DSPARK_DRAFT_WINDOW, row,
+                                                PULSAR_N_HEAD_DIM, 1u)) {
                 seeded = false;
                 break;
             }

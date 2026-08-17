@@ -1078,15 +1078,24 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                 static int dump_ring = -1;
                 if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
                 if (dump_ring) {
+                    /* The drafter ring is PULSAR_ATTN_PACK rows (584 B) as of
+                     * 157cd1d, not f32.  This asked for DRAFT_WINDOW*head_dim
+                     * floats -- more bytes than the ring now holds -- and the
+                     * read is (void)-cast, so it would have written a block of
+                     * ZEROS to the dump and looked like an empty ring.  It now
+                     * dumps the packed bytes, so the record is the ring's real
+                     * contents; a reader decodes nope as e4m3 * 2^(e8-127) and
+                     * rope as bf16, per PULSAR_ATTN_PACK_ROWBYTES. */
                     const uint64_t ring_bytes =
-                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
-                    float *ring = (float *)xmalloc(ring_bytes);
+                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+                    uint8_t *ring = (uint8_t *)xmalloc(ring_bytes);
                     for (int li2 = 0; li2 < 3; li2++) {
                         int32_t nr = (int32_t)g->dspark_n_raw[li2];
                         fwrite(&nr, sizeof(int32_t), 1, f2);
                         memset(ring, 0, ring_bytes);
-                        (void)pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes);
-                        fwrite(ring, sizeof(float), ring_bytes / sizeof(float), f2);
+                        if (!pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes))
+                            fprintf(stderr, "pulsar: DSPARK_DUMP_RING read failed for layer %d\n", li2);
+                        fwrite(ring, 1, ring_bytes, f2);
                     }
                     free(ring);
                     const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
