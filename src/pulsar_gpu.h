@@ -78,6 +78,13 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Same copy on the per-thread stream, WITHOUT blocking the host. Only for
+ * destinations consumed by a later kernel on that same stream -- stream order
+ * covers those. Anything the host reads back, or that crosses streams, keeps
+ * the blocking form above. */
+int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
+                                 const pulsar_gpu_tensor *src, uint64_t src_offset,
+                                 uint64_t bytes);
 
 /* Batched D2D copy: prepare a device-side descriptor table over fixed tensor
  * allocations once (whole-tensor copies, byte counts multiples of 16; returns

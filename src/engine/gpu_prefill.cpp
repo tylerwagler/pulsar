@@ -1047,8 +1047,16 @@ bool gpu_graph_encode_layer_attention_batch(
             if (sn > n_tokens) sn = n_tokens;
             if (sn > 17u) sn = 17u;
             const uint64_t sb = (uint64_t)sn * comp_width * sizeof(float);
-            ok = pulsar_gpu_tensor_copy(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
-                 pulsar_gpu_tensor_copy(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
+            /* ASYNC: nothing on the host reads these. They are written here and
+             * consumed only by gpu_graph_dspark_compressor_rollforward, which
+             * hands row views straight to the update kernels -- same stream, so
+             * stream order already gives the ordering the blocking copy was
+             * providing. As cudaMemcpy they were ~124 synchronous D2D per spec
+             * step (41 compressor layers + 21 indexer layers, two each), and
+             * each one stalled the host for a copy no host code was waiting
+             * on. See L038. */
+            ok = pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
+                 pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
         }
         uint32_t n_comp = g->layer_n_comp[il];
         if (zero_prefix) {
@@ -1393,8 +1401,10 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (sn > n_tokens) sn = n_tokens;
                 if (sn > 17u) sn = 17u;
                 const uint64_t sb = (uint64_t)sn * index_width * sizeof(float);
-                ok = pulsar_gpu_tensor_copy(g->spec_icomp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
-                     pulsar_gpu_tensor_copy(g->spec_icomp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
+                /* ASYNC for the same reason as the attn compressor save above:
+                 * read only by the rollforward's update kernels, same stream. */
+                ok = pulsar_gpu_tensor_copy_async(g->spec_icomp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
+                     pulsar_gpu_tensor_copy_async(g->spec_icomp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
             }
             if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_q,
                                                           model,

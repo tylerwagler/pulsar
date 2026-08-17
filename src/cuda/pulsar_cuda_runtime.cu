@@ -1150,6 +1150,35 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 
+/* Same copy, issued on the per-thread stream instead of blocking the host.
+ *
+ * cudaMemcpy D2D is SYNCHRONOUS: it waits for the copy to land before
+ * returning, so a caller that issues many of them per step pays that wait on
+ * the host even though nothing on the host reads the result. Use this wherever
+ * the destination is only ever consumed by a later kernel -- stream order
+ * already gives you that -- and keep the synchronous form for anything the
+ * host reads back, or that crosses to a different stream.
+ *
+ * NOT a drop-in for every call site: the ordering guarantee is per-stream, so
+ * a destination handed to another stream, or to the allocator, still needs the
+ * blocking version or an explicit sync. */
+int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
+                                 const pulsar_gpu_tensor *src, uint64_t src_offset,
+                                 uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                   (const char *)src->ptr + src_offset,
+                                   (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread),
+                   "tensor copy async");
+}
+
+
 /* ---- Batched tensor copy: one kernel over a device-side descriptor table. ----
  * Built for the spec-frontier snapshot/restore paths, which copy ~126 small
  * per-layer state tensors per fused step; as individual cudaMemcpy calls those
