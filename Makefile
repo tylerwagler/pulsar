@@ -368,7 +368,19 @@ context-coherence-probe:
 # commit -- so today's PASS is not evidence about the engine. Its value is the
 # anchor for tomorrow's drift, plus a harness self-test: a commit compared
 # against ITSELF failing would mean the gate is broken rather than the engine.
-PREFILL_BASELINE_REF ?= 06d0b3e
+# MOVED 06d0b3e -> 4d1ee81 on 2026-08-17, second move today and the same rule
+# both times: numerics shipped, so the anchor follows. What shipped since the
+# morning anchor is the KV unification -- every cache on PULSAR_ATTN_PACK, which
+# moves the rope tail f16 -> bf16 -- plus the fp4 GEMV reading the producer's
+# E4M3 instead of re-deriving it, and the plain matmul's BF16 activations.
+#
+# Against 06d0b3e this gate is red at every depth, which is the rot condition
+# the note above warns about: an assertion that always fires asserts nothing.
+#
+# PRICE ON THE RECORD, as with the last move: the KV work costs -4.6% decode and
+# -4.9 acceptance points (L061), kept deliberately for one KV format end to end.
+# If the drafter half is reverted the anchor moves again.
+PREFILL_BASELINE_REF ?= 4d1ee81
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
