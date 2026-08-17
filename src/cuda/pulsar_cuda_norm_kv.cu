@@ -568,6 +568,21 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
         }
         __syncthreads();
     }
+    /* The rope tail takes the same treatment one dtype up, exactly as
+     * attn_pack_store_kernel does it.
+     *
+     * This kernel used to leave rope alone, and every one of its three callers
+     * then PACKED the buffer into a ring -- which narrows rope to bf16. So a
+     * token attended to itself at f32 rope precision during its own chunk, and
+     * at bf16 rope precision from every later chunk: the same operand with two
+     * numerics, chosen by when you looked at it. The nope dims never had this
+     * problem because the E4M3 roundtrip here already matched what the ring
+     * stores.
+     *
+     * With this the staging buffer holds EXACTLY what the packed row decodes to
+     * for all 512 dims, so the subsequent pack is a pure re-encode. */
+    for (uint32_t d = tid; d < n_rot; d += blockDim.x)
+        xr[n_nope + d] = __bfloat162float(__float2bfloat16(xr[n_nope + d]));
 }
 
 /* PULSAR_ATTN_PACK store: quantize the nope dims of n_rows f32 rows of x with
