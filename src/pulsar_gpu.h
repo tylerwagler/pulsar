@@ -1059,16 +1059,8 @@ int pulsar_gpu_attention_output_low_tensor(
  * routing, shared SwiGLU, and the IQ2_XXS/Q2_K/MXFP4 routed experts.
  */
 
-int pulsar_gpu_swiglu_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *gate,
-        const pulsar_gpu_tensor *up,
-        uint32_t                n,
-        float                   clamp,
-        float                   weight);
-
-/* As above, but the result's E4M3 + E8M0 block-scale encoding is emitted from
- * the SwiGLU epilogue into the activation-cache slots, so the MXFP8 shared_down
+/* SwiGLU over gate/up.  The result's E4M3 + E8M0 block-scale encoding is
+ * emitted from the epilogue into the activation-cache slots, so the shared_down
  * GEMM never runs a separate quantize pass over the mid tensor.  `mid_dim` is
  * the row width (the launch is flat over n = rows * mid_dim, so the MX row/col
  * must be recovered by division).  NULL slots give the plain behaviour. */

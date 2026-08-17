@@ -495,10 +495,6 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 
-int pulsar_gpu_swiglu_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up, uint32_t n, float clamp, float weight) {
-    return pulsar_gpu_swiglu_mx_tensor(out, gate, up, n, clamp, weight, NULL, NULL, 0, 0);
-}
-
 
 int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         pulsar_gpu_tensor       *gate,
