@@ -2355,6 +2355,25 @@ int pulsar_gpu_attention_output_batch_tensor(
                                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
                                     (const float *)heads->ptr, "attn_out_a")) return 0;
     }
+    /* Emit `low` here too, for the same reason as the n==1 entry below: the "b"
+     * GEMM consumes it next. This entry is what the SERVER actually takes --
+     * with the drafter live, verify batches come through here, not through
+     * attention_output_low_tensor -- so emitting only there converted the
+     * benchmark and left production on f32. The bench has no drafter, so it
+     * could not have shown that. */
+    if (low_dim % 256 == 0) {
+        void *lq = NULL, *lsf = NULL; int lkbp = 0;
+        if (pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, n_tokens, low_dim, &lq, &lsf, &lkbp)) {
+            const int lwarps = (int)n_tokens * (int)(low_dim / 32);
+            mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
+                    (const float *)low->ptr, (int)n_tokens, (int)low_dim, lkbp,
+                    (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
+            if (cudaGetLastError() == cudaSuccess) {
+                pulsar_gpu_mxfp8_act_cache_arm(low, n_tokens, low_dim);
+                pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+            }
+        }
+    }
 
     return cuda_matmul_mxfp8_tensor_labeled(out,
                                            model_map,
