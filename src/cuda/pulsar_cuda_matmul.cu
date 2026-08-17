@@ -191,6 +191,27 @@ __device__ __forceinline__ static float dev_dot_fp8mx_deint_block(
 }
 
 
+__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
+        const __nv_fp8_e4m3 *wblk, unsigned char wscale_byte,
+        const __nv_fp8_e4m3 *xblk, unsigned char xscale_byte) {
+    const float sw = __int_as_float((uint32_t)wscale_byte << 23);   /* E8M0 */
+    const float sa = __int_as_float((uint32_t)xscale_byte << 23);   /* E8M0 */
+    float s = 0.0f;
+    /* Same (g, j) traversal as the f32 helper so the summation order matches. */
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+        const uint32_t wp = ((const uint32_t *)wblk)[g];
+        const uint32_t xp = ((const uint32_t *)xblk)[g];
+        const __nv_fp8_e4m3 *wq = (const __nv_fp8_e4m3 *)&wp;
+        const __nv_fp8_e4m3 *xq = (const __nv_fp8_e4m3 *)&xp;
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            s += __half2float((__half)wq[j]) * __half2float((__half)xq[j]);
+    }
+    return sw * sa * s;
+}
+
+
 __device__ __forceinline__ static float dev_dot_fp8mx_f32_block(
         const unsigned char *wblk, const float *x, uint64_t bn) {
     const float wscale = __int_as_float((uint32_t)wblk[0] << 23);   /* E8M0 */
@@ -230,7 +251,15 @@ enum { PULSAR_FP8MX_ROWS = 4 };
 
 
 
-template<bool DEINT>
+/* A8 adds the activation as E4M3 + its own ue8m0 scale, so the attn-output "b"
+ * projection multiplies in the source's format. Only the ACCUMULATE differs --
+ * the hc_expand epilogue (residual mix, split, carrier store) is identical, so
+ * it is a template parameter rather than a second kernel. A8 implies DEINT: the
+ * raw 33B reader has no E4M3-activation form and the launcher never pairs them.
+ * xdata/xscale are the per-slot cache layout (flat [in_dim] at n_tok 1, scale
+ * at mx_sfoff(0, kb, xKBp)) -- NOT the group-major grouped layout the "a"
+ * projection uses. Two caches, two layouts, one letter apart in the call. */
+template<bool DEINT, bool A8 = false>
 __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
         pulsar_hc_t *out_hc,
         float *block_out,
@@ -247,7 +276,10 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
         uint32_t n_embd,
         uint32_t n_hc,
         uint64_t blocks,
-        int has_add) {
+        int has_add,
+        const __nv_fp8_e4m3 *xdata = nullptr,
+        const unsigned char *xscale = nullptr,
+        int xKBp = 0) {
     const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
     const uint32_t lane = threadIdx.x & 31u;
     if (row0 >= out_dim) return;
@@ -260,14 +292,23 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
         if (bn == 32u) {
             float xb[32];
+            if (!A8) {
 #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
+                for (int k = 0; k < 8; k++) {
+                    *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
+                }
             }
+            const unsigned char xsb = A8 ? xscale[mx_sfoff(0, (int)b, xKBp)] : (unsigned char)0;
 #pragma unroll
             for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 if (r >= nr) continue;
-                if (DEINT) {
+                if (A8) {
+                    const uint32_t rw = (uint32_t)(row0 + r);
+                    acc[r] += dev_dot_fp8mx_deint_block_a8(
+                            wdata + (uint64_t)rw * in_dim + i0,
+                            wscale[mx_sfoff((int)rw, (int)b, KBp)],
+                            xdata + i0, xsb);
+                } else if (DEINT) {
                     const uint32_t rw = (uint32_t)(row0 + r);
                     acc[r] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * in_dim + i0,
                                                         wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
@@ -391,25 +432,6 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
  * rank % PULSAR_FP8MX_ROWS == 0 (a row quad never straddles a group) and
  * group_dim % 32 == 0 (whole blocks, so bn is always 32). Anything else keeps
  * the f32 path, which is a FALLBACK not a format choice -- see the launcher. */
-__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
-        const __nv_fp8_e4m3 *wblk, unsigned char wscale_byte,
-        const __nv_fp8_e4m3 *xblk, unsigned char xscale_byte) {
-    const float sw = __int_as_float((uint32_t)wscale_byte << 23);   /* E8M0 */
-    const float sa = __int_as_float((uint32_t)xscale_byte << 23);   /* E8M0 */
-    float s = 0.0f;
-    /* Same (g, j) traversal as the f32 helper so the summation order matches. */
-#pragma unroll
-    for (int g = 0; g < 8; g++) {
-        const uint32_t wp = ((const uint32_t *)wblk)[g];
-        const uint32_t xp = ((const uint32_t *)xblk)[g];
-        const __nv_fp8_e4m3 *wq = (const __nv_fp8_e4m3 *)&wp;
-        const __nv_fp8_e4m3 *xq = (const __nv_fp8_e4m3 *)&xp;
-#pragma unroll
-        for (int j = 0; j < 4; j++)
-            s += __half2float((__half)wq[j]) * __half2float((__half)xq[j]);
-    }
-    return sw * sa * s;
-}
 
 __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         float *low,
@@ -1902,6 +1924,33 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
     const int KBp = mx_rup((int)(in_dim / 32), 4);
     const dim3 hg(((unsigned)out_dim + 31u) / 32u);
     const float *ba = block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr;
+    /* A8: the "b" projection reads attn_low, which the "a" projection produced
+     * one call earlier and encoded into the per-slot activation cache. If that
+     * encoding is current, multiply in E4M3 instead of against f32 -- the last
+     * decode consumer that was still W8A32. Cache miss falls through to f32,
+     * which is a fallback, not a second format: the "a" projection emits
+     * unconditionally, so a miss means the shapes disagreed and that is worth
+     * finding, not silently living with. */
+    if (dw) {
+        const mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, 1, in_dim);
+        if (ac8 && ac8->valid) {
+            static int announced_ob8 = 0;
+            if (!announced_ob8) {
+                announced_ob8 = 1;
+                fprintf(stderr, "pulsar: attn-out 'b' GEMV = W8A8 (E4M3 acts) for "
+                                "in_dim=%llu out_dim=%llu\n",
+                        (unsigned long long)in_dim, (unsigned long long)out_dim);
+            }
+            const int xKBp = mx_rup((int)(in_dim / 32), 4);
+            matmul_fp8mx_hc_expand_warp8_kernel<true, true><<<hg, 256>>>(
+                    (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
+                    (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
+                    (const unsigned char *)wptr, dw->data, dw->scale, KBp,
+                    (const float *)x->ptr, in_dim, out_dim, n_embd, n_hc, blocks,
+                    block_add ? 1 : 0, ac8->xq, ac8->sx, xKBp);
+            return cuda_ok(cudaGetLastError(), "fp8_hc_expand a8 launch");
+        }
+    }
     if (dw) {
         matmul_fp8mx_hc_expand_warp8_kernel<true><<<hg, 256>>>(
                 (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
@@ -2346,8 +2395,31 @@ int pulsar_gpu_attention_output_low_tensor(
             cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
     if (!out_a) return 0;
 
-    return launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes, out_a,
-                                  group_dim, rank, n_groups, 1, blocks_a, low_dim,
-                                  (const float *)heads->ptr, "attn_out_a");
+    if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes, out_a,
+                                group_dim, rank, n_groups, 1, blocks_a, low_dim,
+                                (const float *)heads->ptr, "attn_out_a")) return 0;
+
+    /* Emit `low` so the "b" projection that consumes it next multiplies in
+     * E4M3 too. Done here rather than as an epilogue on the "a" kernel: the
+     * warp that reduces a row does not hold that row's block neighbours, so an
+     * in-kernel encode would need a second pass regardless, and `low` is only
+     * low_dim floats (32 KB) at decode. Feeds BOTH "b" arms -- the fused
+     * hc_expand's A8 branch reads this slot, and the non-fused
+     * cuda_matmul_mxfp8_tensor_labeled finds it on its own. A failure to get a
+     * slot is not an error: "b" falls back to f32. */
+    if (low_dim % 256 == 0) {
+        void *lq = NULL, *lsf = NULL; int lkbp = 0;
+        if (pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, 1, low_dim, &lq, &lsf, &lkbp)) {
+            const int lwarps = (int)(low_dim / 32);
+            mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
+                    (const float *)low->ptr, 1, (int)low_dim, lkbp,
+                    (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
+            if (cudaGetLastError() == cudaSuccess) {
+                pulsar_gpu_mxfp8_act_cache_arm(low, 1, low_dim);
+                pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+            }
+        }
+    }
+    return 1;
 }
 
