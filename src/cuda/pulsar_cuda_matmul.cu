@@ -42,46 +42,29 @@ __global__ static void embed_tokens_hc_kernel(
 
 
 
-/* BF16 is the high 16 bits of f32, so conversions are pure bit ops (no header). */
-__device__ __forceinline__ static float bf16_to_f32_act(uint16_t b) {
-    return __uint_as_float((uint32_t)b << 16);
-}
-
-/* Round an f32 activation to BF16 and widen back, so the value that reaches the
- * multiply is exactly a BF16 value.  The rounding expression is copied from
- * f32_to_bf16_kernel rather than re-derived, because the cuBLAS arm converts
- * through that kernel and the two MUST agree: they are the same GEMM at
- * different batch sizes.
+/* Activation load, keyed on the ACTIVATION's own storage type.  A BF16 weight
+ * is fed a BF16 activation buffer and an f32 weight an f32 one, so the pointer
+ * type is the whole contract and a caller cannot pair them wrongly.
  *
- * WHY THIS EXISTS.  The source model runs a BF16 activation stream
- * (ds4-source-numerics: BF16 residual, E4M3 only where the weight is quantised),
- * so multiplying a BF16 weight by an f32 activation is over-precision on one
- * side of the product -- it does not buy fidelity, it diverges from the
- * reference.  Tyler's call, 2026-08-17: "BF16 stream, E4M3 at quantised GEMMs".
+ * WHY BF16 AT ALL.  The source model runs a BF16 activation stream
+ * (ds4-source-numerics: torch_dtype bfloat16, E4M3 only where the weight is
+ * quantised, and NO f32 activations anywhere), so multiplying a BF16 weight by
+ * an f32 activation is over-precision on one side of the product: it does not
+ * buy fidelity, it diverges from the reference.
  *
- * It also closes a split that this file already knew about.  The BF16 arm sent
- * n_tok>1 to cuBLAS, which rounds activations to bf16, and n_tok==1 plus the nt
- * batch to kernels that did not -- the same size-thresholded activation-format
- * defect removed from the MoE in ea86645, and the comment on the nt cap said so
- * out loud: "the cuBLAS path below additionally ROUNDS the activations to bf16,
- * so its disagreement with the n=1 kernel is larger than the f32 arm's". The
- * disagreement is now zero. */
-__device__ __forceinline__ static float pulsar_act_bf16(float v) {
-    const uint32_t u = __float_as_uint(v);
-    return bf16_to_f32_act((uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16));
+ * WHY A BUFFER RATHER THAN ROUNDING IN-REGISTER.  f161083 narrowed at the load
+ * -- pulsar_act_bf16(x[i]) -- which was correct arithmetic and the wrong shape,
+ * and it MEASURED as +2.9% step time.  In a GEMV every one of out_dim/8 warps
+ * walks the whole activation row, so narrowing at the load re-rounds the same
+ * in_dim values once per warp: hundreds of redundant conversions per launch.
+ * Converting once into a buffer the whole launch shares does it in_dim times
+ * total, and has the second, larger benefit that the nt, n==1 and cuBLASLt arms
+ * then read THE SAME BYTES instead of three separately-derived encodings of the
+ * same number. */
+__device__ __forceinline__ static float pulsar_at_load(const __nv_bfloat16 *x, uint64_t i) {
+    return __bfloat162float(x[i]);
 }
-
-/* Activation load, selected by the WEIGHT's storage type exactly as
- * pulsar_wt_load selects the weight load: a BF16 weight takes a BF16
- * activation, an f32 weight is left alone.  Overloads rather than a flag, for
- * the reason the weight loader gives -- the pointer type is the contract, so
- * the two cannot be paired wrongly by a caller.  Two overloads, because the nt
- * kernel has exactly two instantiations (bf16 and f32); an __half overload was
- * written here and deleted the same minute, because nothing instantiates it. */
-__device__ __forceinline__ static float pulsar_at_load(const __nv_bfloat16 *, const float *x, uint64_t i) {
-    return pulsar_act_bf16(x[i]);
-}
-__device__ __forceinline__ static float pulsar_at_load(const float *, const float *x, uint64_t i) {
+__device__ __forceinline__ static float pulsar_at_load(const float *x, uint64_t i) {
     return x[i];
 }
 
@@ -95,11 +78,11 @@ __device__ __forceinline__ static float pulsar_at_load(const float *, const floa
  * than a bool template: the pointer type IS the contract, so a mismatched
  * width cannot be passed silently (which is exactly how the embed kernels came
  * to read an f16 table as f32 on 2026-08-15). */
-template <int NT, typename WT>
+template <int NT, typename WT, typename AT = float>
 __global__ static void matmul_nt_kernel(
         float *out,
         const WT *w,
-        const float *x,
+        const AT *x,
         uint64_t in_dim,
         uint64_t out_dim) {
     uint64_t row = (uint64_t)blockIdx.x;
@@ -112,7 +95,7 @@ __global__ static void matmul_nt_kernel(
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
         const float wv = pulsar_wt_load(wr, i);
         #pragma unroll
-        for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(wr, x, t * in_dim + i);
+        for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(x, t * in_dim + i);
     }
 
     __shared__ float partial[256];
@@ -182,7 +165,7 @@ __global__ static void f32_to_bf16_kernel(uint16_t *out, const float *x, uint64_
 __global__ static void matmul_bf16_kernel(
         float *out,
         const uint16_t *w,
-        const float *x,
+        const __nv_bfloat16 *x,
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t n_tok) {
@@ -191,9 +174,9 @@ __global__ static void matmul_bf16_kernel(
     if (row >= out_dim || tok >= n_tok) return;
     float sum = 0.0f;
     const uint16_t *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
+    const __nv_bfloat16 *xr = x + tok * in_dim;
     for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += bf16_to_f32(wr[i]) * pulsar_act_bf16(xr[i]);
+        sum += bf16_to_f32(wr[i]) * __bfloat162float(xr[i]);
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -2188,6 +2171,40 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
     if (!wptr) return 0;
     const uint16_t *w = (const uint16_t *)wptr;
+
+    /* ONE bf16 activation for the whole call, produced before the arm is
+     * chosen.  Every arm below reads these exact bytes, so "which kernel ran"
+     * can no longer change the activation operand -- the failure mode this file
+     * has now hit three times (the cuBLAS-rounds/nt-does-not split, the MoE
+     * n==1 q8_1 split, and the A8 cache key).  It also replaces per-warp
+     * rounding with one pass: a GEMV gives every out_dim/8 warps the whole
+     * activation row, so narrowing at the load re-converted the same values
+     * hundreds of times per launch and measured +2.9% step time.
+     *
+     * Caching stays on the EXACT key, unlike the A8 lookup next door.  It does
+     * not need to be prefix-tolerant to be M-independent: bf16 conversion is
+     * elementwise, so a cache miss converts exactly the rows this call owns and
+     * gets byte-identical bytes to any other width that covers them.  A miss
+     * costs one pass, never a different answer -- which is the property the A8
+     * cache lacked, because there a miss changed the ARM and therefore the
+     * arithmetic. */
+    const uint64_t xb_count = n_tok * in_dim;
+    mxfp8_act_cache_t *hb = act_slot_find(x->ptr, n_tok, in_dim);
+    if (hb && !mxfp8_act_cache_reserve((void **)&hb->xb, &hb->xb_cap,
+                                       xb_count * sizeof(__nv_bfloat16), "act bf16")) {
+        hb = NULL;
+    }
+    __nv_bfloat16 *xbb = hb ? hb->xb
+                            : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
+                                                              "bf16 activations");
+    if (!xbb) return 0;
+    if (!hb || !hb->valid_b) {
+        f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
+                                                            (const float *)x->ptr, xb_count);
+        if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
+        if (hb) hb->valid_b = 1;
+    }
+    const __nv_bfloat16 *xb16 = xbb;
     /* M-independence, same contract as the f16 and f32 arms. The cuBLAS path
      * below rounds activations to bf16; as of 2026-08-17 so do the nt kernel and
      * the n==1 kernel, so all three agree on the activation format and the only
@@ -2198,9 +2215,9 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
         if (n_tok >= 2 && n_tok <= nt_cap) {
             dim3 g((unsigned)out_dim);
-            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16><<<g, 256>>>( \
+            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
                     (float *)out->ptr, (const __nv_bfloat16 *)w,                        \
-                    (const float *)x->ptr, in_dim, out_dim)
+                    xb16, in_dim, out_dim)
             switch (n_tok) {
             case 2: PULSAR_NT_LAUNCH(2); break;
             case 3: PULSAR_NT_LAUNCH(3); break;
@@ -2215,29 +2232,7 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         }
     }
     if (g_cublas_ready && n_tok > 1) {
-        const uint64_t xb_count = n_tok * in_dim;
-        /* Armed activation cache, same as the f16 twin above: one f32 buffer
-         * feeds several BF16 projections per layer (compressor kv + gate, the
-         * routers), and the conversion is pure, so convert ONCE and reuse.
-         * This arm re-converted on every call until 2026-08-16 -- a full-width
-         * pass per projection per layer, which at prefill widths is the bulk of
-         * what BF16 weights appeared to "cost" against F16. */
-        mxfp8_act_cache_t *hb = act_slot_find(x->ptr, n_tok, in_dim);
-        if (hb && !mxfp8_act_cache_reserve((void **)&hb->xb, &hb->xb_cap,
-                                           xb_count * sizeof(__nv_bfloat16), "act bf16")) {
-            hb = NULL;
-        }
-        __nv_bfloat16 *xbb = hb ? hb->xb
-                                : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
-                                                                  "bf16 gemm activations");
-        if (!xbb) return 0;
-        if (!hb || !hb->valid_b) {
-            f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
-                                                                (const float *)x->ptr, xb_count);
-            if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
-            if (hb) hb->valid_b = 1;
-        }
-        const uint16_t *xb = (const uint16_t *)xbb;
+        const uint16_t *xb = (const uint16_t *)xb16;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -2252,7 +2247,7 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         return cublas_ok(st, "bf16 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, xb16, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
 }
 
