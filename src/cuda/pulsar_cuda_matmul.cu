@@ -875,6 +875,42 @@ static mxfp8_act_cache_t *act_slot_find(const void *ptr, uint64_t n_tok, uint64_
     return NULL;
 }
 
+/* Consumer-side lookup that tolerates a WIDER cache block.
+ *
+ * The exact-key act_slot_find above is correct for ARMING -- the producer owns
+ * the whole (ptr, n_tok, in_dim) block it just wrote.  It is WRONG for
+ * CONSUMING, and that asymmetry is what failed GATE 4 on 2026-08-17: in a fused
+ * mixed step the norm arms the cache at the FULL batch width (66 rows in the
+ * gate), then the inc-4 prefix split asks the matmul for just the decode rows
+ * (n_dec=2), misses on n_tok, and silently drops to the f32 arm -- while those
+ * same decode rows in a decode-only step hit the cache and take A8.  Same op,
+ * two numerics, chosen by batch width: an M-DEPENDENCE hiding inside a cache
+ * key, which is exactly what GATE 4 exists to catch.
+ *
+ * Taking a prefix is safe because the encoding is ROW-LOCAL in both halves: the
+ * quantiser reduces amax per (row, kb) warp and stores data at row*K + k, and
+ * mx_sfoff(row, kb, KBp) is a function of row, kb and KBp only -- never of the
+ * total row count.  So rows [0, need) of a width-N block are BYTE-IDENTICAL to
+ * a width-need block, and consuming the prefix makes the A8 arms genuinely
+ * M-independent rather than only appearing so at the widths a gate happens to
+ * exercise.  ⚠ The n==1 A8 arm had the SAME latent defect and no gate caught
+ * it, because this gate co-schedules two decode banks and so never ran the
+ * n_dec==1 mixed case.
+ *
+ * Tightest fit wins, so a decode-only step still reads its own exact block. */
+static mxfp8_act_cache_t *act_slot_find_rows(const void *ptr, uint64_t need, uint64_t in_dim) {
+    if (!ptr || need == 0) return NULL;
+    mxfp8_act_cache_t *best = NULL;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (s->key_ptr == ptr && s->key_in_dim == in_dim && s->key_ntok >= need) {
+            if (!best || s->key_ntok < best->key_ntok) best = s;
+        }
+    }
+    if (best) best->lru = ++g_act_clock;
+    return best;
+}
+
 /* Find this key's slot, or take over the least-recently-used one.  Acquiring
  * RESETS the validity bits: the caller is about to (re)write that buffer, so
  * whatever the slot held is stale by definition.  Buffers are grow-only and
@@ -1793,7 +1829,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                  * serving the verify batch in f32 while n==1 served the
                  * drafter's forwards in E4M3 is a size-thresholded activation
                  * format -- the defect this codebase keeps re-finding. */
-                const mxfp8_act_cache_t *ac8nt = act_slot_find(x->ptr, n_tok, in_dim);
+                const mxfp8_act_cache_t *ac8nt = act_slot_find_rows(x->ptr, n_tok, in_dim);
                 if (ac8nt && ac8nt->valid) {
                     const int xKBp = mx_rup((int)(in_dim / 32), 4);
                     {
@@ -1867,7 +1903,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * activations, so f32 here is over-precision, not accuracy.  It is
              * NOT a speed win (the weight matrix dominates GEMV traffic by
              * ~out_dim x; see the kernel comment). */
-            mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, n_tok, in_dim);
+            mxfp8_act_cache_t *ac8 = act_slot_find_rows(x->ptr, n_tok, in_dim);
             if (ac8 && ac8->valid) {
                 /* Say it once PER SHAPE, not once per process.  A gate PASS
                  * cannot distinguish "the A8 path ran and is correct" from "the
@@ -1980,7 +2016,7 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
      * ("one activation format, every batch size"), so when a valid encoding
      * exists we give up the launch fusion and take the per-weight A8 path
      * below. Fusing two launches is worth less than the operand being right. */
-    const mxfp8_act_cache_t *pair_a8 = act_slot_find(x->ptr, n_tok, in_dim);
+    const mxfp8_act_cache_t *pair_a8 = act_slot_find_rows(x->ptr, n_tok, in_dim);
     const bool have_a8 = pair_a8 && pair_a8->valid;
     if (!have_a8 && n_tok == 1 && in_dim % 128 == 0 &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
@@ -2075,7 +2111,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
      * unconditionally, so a miss means the shapes disagreed and that is worth
      * finding, not silently living with. */
     if (dw) {
-        const mxfp8_act_cache_t *ac8 = act_slot_find(x->ptr, 1, in_dim);
+        const mxfp8_act_cache_t *ac8 = act_slot_find_rows(x->ptr, 1, in_dim);
         if (ac8 && ac8->valid) {
             static int announced_ob8 = 0;
             if (!announced_ob8) {
