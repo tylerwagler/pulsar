@@ -830,10 +830,20 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 // indexed with the same layout object the packers use (SF sections of both
 // packers agree byte-for-byte).
 
-template <class SFL>
+/* A8=true reads the activation as the E4M3 + swizzled-E8M0 pair the producing
+ * norm already emitted, instead of the f32 buffer e4m3_act_roundtrip_kernel
+ * builds by deriving that same encoding and immediately throwing the bytes
+ * away.  Bit-exact, not merely equivalent: the round-trip writes
+ * (float)e4m3(v*inv)*s and this computes (float)e4m3 * s from the same block
+ * scale, so the value entering the dot product is identical.  A lane's 8
+ * consecutive k start at a multiple of 8 and so never straddle a 32-element
+ * block, which is what lets one scale serve the inner unroll. */
+template <class SFL, bool A8 = false>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N]
-    const float *xq,          // [n_tokens, K] fp4-roundtripped activations
+    const float *xq,          // [n_tokens, K] f32 activations (A8=false)
+    const __nv_fp8_e4m3 *xq8, // [n_tokens, K] E4M3 activations (A8=true)
+    const uint8_t *xsf, int xkbp,
     const int32_t *sel,       // [n_slots] expert ids
     const float *rw,          // [n_slots] routing weights
     const uint8_t *gate_base, const uint8_t *up_base,
@@ -855,16 +865,19 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   const uint8_t *ud = ue + (size_t)n * (K / 2);
   const uint8_t *gsf = ge + data_bytes;
   const uint8_t *usf = ue + data_bytes;
-  const float *xt = xq + (size_t)(slot / n_expert) * K;
+  const int xrow = slot / n_expert;
+  const float *xt = A8 ? nullptr : xq + (size_t)xrow * K;
+  const __nv_fp8_e4m3 *xt8 = A8 ? xq8 + (size_t)xrow * K : nullptr;
   float g = 0.f, u = 0.f;
   for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
     const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
     const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
     const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
     const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
+    const float sa = A8 ? gemv_sf_val(xsf[mx_sfoff_src(xrow, k0 >> 5, xkbp)]) : 0.f;
     #pragma unroll
     for (int j = 0; j < 8; j++) {
-      const float xv = xt[k0 + j];
+      const float xv = A8 ? (__half2float((__half)xt8[k0 + j]) * sa) : xt[k0 + j];
       g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
       u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
     }
@@ -979,7 +992,8 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   }
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid_scratch, xq, selected, rweights,
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
+        mid_scratch, xq, nullptr, nullptr, 0, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }
@@ -1015,17 +1029,41 @@ static int gemv_actbuf_ensure(size_t need_floats) {
 int pulsar_cutlass_gemv_gateup(
     float *mid, const float *x, const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
-    float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim) {
+    float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
+    const void *act_q, const void *act_sf, int act_kbp) {
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
+  dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
+
+  /* Preferred: read the E4M3 the producing norm already emitted. The fallback
+   * derives the same encoding here and dequantises it straight back to f32 --
+   * correct, and pure waste when the bytes already exist. A miss is not an
+   * error; it means no cached encoding was handed over. */
+  if (act_q && act_sf) {
+    /* Say it once. A bit-exactness check cannot tell "the A8 arm ran and agrees"
+     * from "the A8 arm never ran", and a silently-missed cache lookup produces
+     * exactly the second -- the failure this file's sibling diagnostics were
+     * added for on 2026-08-17. */
+    static int announced_gemv_a8 = 0;
+    if (!announced_gemv_a8) {
+      announced_gemv_a8 = 1;
+      fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
+                      "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
+    }
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        mid, nullptr, (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+        selected, rweights, gate_w, up_w,
+        gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+  }
   const size_t xq_floats = (size_t)n_tokens * in_dim;
   if (!gemv_actbuf_ensure(xq_floats)) return 1;
   float *xq = g_fp4_gemv_actbuf;
-  auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   { const long nb = (long)(xq_floats / 32);
     e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb); }
-  dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-  expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid, xq, selected, rweights, gate_w, up_w,
+  expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
+      mid, xq, nullptr, nullptr, 0, selected, rweights, gate_w, up_w,
       gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }

@@ -1315,7 +1315,8 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
  * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
 int pulsar_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
-        float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim);
+        float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
+    const void *act_q, const void *act_sf, int act_kbp);
 int pulsar_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
         const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);

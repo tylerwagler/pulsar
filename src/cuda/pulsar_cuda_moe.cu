@@ -984,9 +984,19 @@ static int routed_moe_launch_mixed40(
             /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
              * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
             (void)gate_g; (void)up_g; (void)mid_g;
+            /* Hand over the producing norm's E4M3 if it is still cached, exactly
+             * as the grouped path above does. Without it the GEMV re-derives the
+             * same encoding and dequantises it straight back to f32 -- the same
+             * values, encoded twice. A miss just takes the f32 path. */
+            const void *gq = NULL, *gsf = NULL;
+            int gkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &gq, &gsf, &gkbp)) {
+                gq = NULL; gsf = NULL; gkbp = 0;
+            }
             if (pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
-                    clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
+                    clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+                    gq, gsf, gkbp) != 0) ok = 0;
         }
         /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
          * layers).  MMQ takes mid_flat as f32 directly and does its own q8_1,
