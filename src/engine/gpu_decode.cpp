@@ -172,7 +172,8 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t 
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
     return w->type == PULSAR_TENSOR_BF16 ||
            w->type == PULSAR_TENSOR_F32 ||
-           w->type == PULSAR_TENSOR_FP8_E4M3;
+           w->type == PULSAR_TENSOR_FP8_E4M3 ||
+           w->type == PULSAR_TENSOR_MXFP8_LT;
 }
 
 
@@ -1892,7 +1893,18 @@ bool gpu_graph_matmul_plain_tensor(
         return pulsar_gpu_matmul_bf16_tensor(out, model->map, model->size,
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
-    if (w->type == PULSAR_TENSOR_FP8_E4M3) {
+    /* FP8_E4M3 and MXFP8_LT are the same numbers in two layouts, and
+     * pulsar_gpu_matmul_mxfp8_tensor already tells them apart: an offset
+     * registered as LT (gguf.cpp) resolves straight to the mmap, a plain one is
+     * de-interleaved once into a device buffer. Both land on the same kernels.
+     *
+     * MXFP8_LT was absent here until 2026-08-17, and that absence was load-bearing
+     * -- it is why the 21 indexer.attn_q_b tensors ship as plain type 38 and pay a
+     * second resident copy. tensor_expect_plain_or_mxfp8 rejected type 41 on
+     * purpose so the gap failed at load rather than dispatching into nothing,
+     * which is exactly what it did when a repacked artifact was tried. Adding the
+     * arm is what makes that repack legal. */
+    if (w->type == PULSAR_TENSOR_FP8_E4M3 || w->type == PULSAR_TENSOR_MXFP8_LT) {
         return pulsar_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }

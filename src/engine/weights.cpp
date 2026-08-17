@@ -149,22 +149,26 @@ static void tensor_expect_plain_or_mxfp8(
         tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
     else if (t->type == PULSAR_TENSOR_FP8_E4M3)
         tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
+    else if (t->type == PULSAR_TENSOR_MXFP8_LT)
+        tensor_expect_layout(t, PULSAR_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
     else
-        /* Deliberately does NOT accept MXFP8_LT: the weights routed here
-         * (hc_attn_fn/hc_ffn_fn, ffn_gate_inp, attn/indexer compressors,
-         * output_hc_fn) take the PLAIN matmul path (gpu_graph_matmul_plain_tensor),
-         * which has no type-41 branch. Pre-storing one as MXFP8_LT would decode to
-         * garbage, so a future FP8 variant of these must fail FAST here at load,
-         * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
-         * through cuda_fp8_mx_weight) may be MXFP8_LT.
+        /* MXFP8_LT was rejected here until 2026-08-17, deliberately and
+         * correctly: gpu_graph_matmul_plain_tensor had no type-41 branch, so a
+         * type-41 tensor routed here would have passed load and dispatched into
+         * nothing. That guard did its job -- a repacked artifact was tried on
+         * 2026-08-17 and died at load with this exact message instead of
+         * misbehaving. The arm now exists, so the type is accepted; the guard
+         * stays for whatever type is added next without one.
          *
          * BF16 and F32 were added 2026-08-15 and both have plain-path branches.
          * F32 is here because the hc_*_fn / *_compressor_ape families are f32
-         * upstream and now stay f32 rather than being narrowed. The four
-         * accepted here must stay exactly in step with the four arms of
-         * gpu_graph_matmul_plain_tensor, or a tensor passes load and then
-         * dispatches into nothing. */
-        pulsar_die("tensor has unsupported weight type; expected F32, BF16 or FP8_E4M3");
+         * upstream and now stay f32 rather than being narrowed. The types
+         * accepted here must stay exactly in step with the arms of
+         * gpu_graph_matmul_plain_tensor AND with
+         * gpu_graph_weight_is_plain_or_mxfp8, or a tensor passes load and then
+         * dispatches into nothing. Three places, and the 2026-08-17 addition of
+         * MXFP8_LT touched all three. */
+        pulsar_die("tensor has unsupported weight type; expected F32, BF16, FP8_E4M3 or MXFP8_LT");
 }
 
 
