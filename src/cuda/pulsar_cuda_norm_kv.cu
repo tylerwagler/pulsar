@@ -819,37 +819,6 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
 
 
 
-/* The f32 raw ring: the DRAFTER's transient KV only.  The main ring is packed
- * (PULSAR_ATTN_PACK, 584 B/row) as of 2026-08-17 and never comes here.
- *
- * The __float2half round-trip is KEPT deliberately.  It existed so the f32 ring
- * held exactly what the f16 ring would; that ring is gone, so the justification
- * is now only "do not change drafter numerics in a storage commit". Packing this
- * ring too would drop its nope dims to E4M3, which is a draft-quality decision.
- *
- * positions/seq_id/n_banks: per-row multi-session banking (same descriptor
- * contract as the decode attention kernels, pulsar_cuda_attention.cu).  Row t
- * stores to bank seq_id[t]'s ring at slot positions[t] % raw_cap — the ring
- * is position-indexed, so one scatter launch stores all rows across all
- * banks.  Dead rows (out-of-pool seq_id) store NOTHING: a wild id must not
- * scribble another bank's ring (the read-side dead-row guard zeroes the
- * row's outputs).  NULL/NULL/1 degenerates to the classic single-cache
- * consecutive store bit-exactly. */
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
-                                                 const int32_t * __restrict__ positions,
-                                                 const int32_t * __restrict__ seq_id,
-                                                 uint32_t n_banks) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * head_dim;
-    if (gid >= n) return;
-    uint32_t d = gid % head_dim;
-    uint32_t t = gid / head_dim;
-    if (seq_id && (uint32_t)seq_id[t] >= n_banks) return;
-    const uint32_t p = positions ? (uint32_t)positions[t] : pos0 + t;
-    uint32_t row = (seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u) + p % raw_cap;
-    const __half h = __float2half(kv[(uint64_t)t * head_dim + d]);
-    raw[(uint64_t)row * head_dim + d] = __half2float(h);
-}
 
 
 
@@ -1448,18 +1417,14 @@ int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gp
                                    : (uint64_t)raw_cap * head_dim * sizeof(float);
     if (!raw_cache || !kv || raw_cap == 0 || raw_cache->bytes < need ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    if (raw_pack) {
-        /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
-         * round-trip the decode store does. */
-        attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
-                                          (uint8_t *)raw_cache->ptr,
-                                          row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
-                                          NULL, NULL, 1u, raw_cap);
-        return cuda_ok(cudaGetLastError(), "raw pack store launch");
-    }
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim,
-                                                               NULL, NULL, 1u);
-    return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
+    (void)raw_pack;   /* every ring is packed; see the note on the kernel */
+    /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
+     * round-trip the decode store does. */
+    attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
+                                      (uint8_t *)raw_cache->ptr,
+                                      row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
+                                      NULL, NULL, 1u, raw_cap);
+    return cuda_ok(cudaGetLastError(), "raw pack store launch");
 }
 
 
@@ -1499,12 +1464,7 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
                                                  descr ? n_banks : 1u, raw_cap);
         return cuda_ok(cudaGetLastError(), "raw pack store batch launch");
     }
-    uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim,
-                                                        descr ? (const int32_t *)positions->ptr : NULL,
-                                                        descr ? (const int32_t *)seq_id->ptr : NULL,
-                                                        descr ? n_banks : 1u);
-    return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
+    return 0;   /* unreachable: raw_pack is 1 at every call site */
 }
 
 
