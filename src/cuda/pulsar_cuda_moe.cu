@@ -1,7 +1,6 @@
 #include "pulsar_cuda_internal.h"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
-#include "mmq/ds4_repack.h"  /* raw IQ2 block stream -> aligned artifact */
 #endif
 
 

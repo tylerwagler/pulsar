@@ -70,7 +70,6 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
-void *pulsar_gpu_tensor_contents(pulsar_gpu_tensor *tensor);
 /* Raw device pointer without a synchronize (for building device pointer tables). */
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor);
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count);

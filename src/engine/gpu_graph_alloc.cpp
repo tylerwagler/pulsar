@@ -2,12 +2,6 @@
 
 
 
-bool gpu_graph_alloc(
-        pulsar_gpu_graph *g,
-        const pulsar_weights     *weights,
-        const pulsar_layer_weights *layer) {
-    return gpu_graph_alloc_raw_cap(g, weights, layer, PULSAR_N_SWA, PULSAR_N_SWA, 1, false);
-}
 
 
 

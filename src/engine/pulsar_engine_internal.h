@@ -2263,10 +2263,6 @@ uint64_t gpu_graph_session_bytes_banked(
         bool                     enable_spec,
         uint32_t                 n_banks);
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]);
-bool gpu_graph_alloc(
-        pulsar_gpu_graph *g,
-        const pulsar_weights     *weights,
-        const pulsar_layer_weights *layer);
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,
         uint32_t               pos0,

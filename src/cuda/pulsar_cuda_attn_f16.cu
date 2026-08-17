@@ -105,13 +105,6 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
            ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);
 }
 
-/* raw_kv may be stored f16 or f32; comp_kv is always f32. */
-__device__ __forceinline__ static float af16_kv(const float *raw, int raw_f16,
-                                                uint64_t base, uint32_t d) {
-    if (raw_f16) return __half2float(((const __half *)raw)[base + d]);
-    return raw[base + d];
-}
-
 /* 512 threads means one block already fills 65536/(512) = 128 registers worth
  * of the SM budget, so asking for 2 resident blocks caps the kernel at 64 and
  * it spills (measured: 192 B stack, 196 B spill traffic).  1 is not a

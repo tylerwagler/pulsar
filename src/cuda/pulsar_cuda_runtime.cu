@@ -1098,17 +1098,12 @@ uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
 
 
 
-void *pulsar_gpu_tensor_contents(pulsar_gpu_tensor *tensor) {
-    if (!tensor) return NULL;
-    (void)cudaDeviceSynchronize();
-    return tensor->ptr;
-}
-
-
-
-/* Raw device pointer WITHOUT a synchronize — for building device pointer tables
+/* Raw device pointer, no synchronize — for building device pointer tables
  * (Tier-2 per-bank comp/index base tables) at allocation time, where the caller
- * controls ordering. Do NOT use to read tensor contents on the host. */
+ * controls ordering. Do NOT use to read tensor contents on the host; that is
+ * what pulsar_gpu_tensor_read is for. (There was a tensor_contents() here that
+ * synchronised the whole device and returned the pointer; nothing had called it
+ * in a long time, so it was a device-wide stall waiting for a first user.) */
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->ptr : NULL;
 }

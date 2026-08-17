@@ -128,18 +128,6 @@ static __global__ void mm_ids_helper_global(
     expert_bounds[gridDim.x] = nex_prev + it_compact_count;
 }
 
-// ds4 local: kill switch for the large-n global path (DS4_MMID_LARGE=0).
-// With the switch off the ds4_mmq.cu callers refuse past-cap shapes exactly
-// as before (whole-MoE fallback to the expert-tile kernels).
-bool ds4_mmid_large_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("DS4_MMID_LARGE");
-        cached = !(env && env[0] == '0');
-    }
-    return cached != 0;
-}
-
 // ds4: kill switch for the case-1 fast path (DS4_MMID_CASE1=0).
 static bool ds4_mmid_case1_enabled() {
     static int cached = -1;
