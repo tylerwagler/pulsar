@@ -1345,9 +1345,20 @@ static int routed_moe_launch(
         static int profile_moe_env = -1;
         if (profile_moe_env < 0) profile_moe_env = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
         const uint32_t profile_moe = (uint32_t)profile_moe_env;
-        cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+        /* Six boundaries, not seven. The seventh bracketed the sorted-pair /
+         * expert-tile build, which was deleted when nothing was found to read
+         * it -- but its cudaEventRecord went with the kernels while the
+         * teardown kept calling cudaEventElapsedTime on it. That returns
+         * cudaErrorInvalidResourceHandle, and because the result was discarded
+         * with (void) it became the sticky last error, which the NEXT launch
+         * check reported as "CUDA swiglu launch failed: invalid resource
+         * handle". So turning the profiler on killed the run one layer after
+         * the first profiled MoE -- a diagnostic that destroyed the thing it
+         * was measuring, and printed xq=0.000 sort=0.000 (the two intervals
+         * touching the dead event) as its only warning. */
+        cudaEvent_t prof_ev[5] = {NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
-            for (uint32_t i = 0; i < 7u; i++) {
+            for (uint32_t i = 0; i < 5u; i++) {
                 if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
                     for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
                     memset(prof_ev, 0, sizeof(prof_ev));
@@ -1386,7 +1397,7 @@ static int routed_moe_launch(
          * the shape signal the batch arms are gated on".  A shape signal does
          * not need six kernels to compute.
          * (The CUTLASS dispatchers above build their own and DO read them.) */
-        if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
+        if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         /* MMQ is now the ONLY reader here: this function is type-43-on-both-
          * sides, and the dp4a chains that used to follow each arm are gone with
          * the types that fed them.  So "MMQ declined" is terminal -- there is
@@ -1421,7 +1432,7 @@ static int routed_moe_launch(
         (void)mmq_done;
         return 0;   /* no MMQ build -> type 43 is unreadable; rejected at the door */
 #endif
-        if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
+        if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
@@ -1453,8 +1464,7 @@ static int routed_moe_launch(
             ok = 0;
         }
 #endif
-        if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
-        if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
+        if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         /* The MMQ arms write PER-PAIR results, so the fixed-order reduction is
          * always owed; the arms above are fail-closed, so reaching here with ok
          * set means one of them ran. */
@@ -1463,22 +1473,30 @@ static int routed_moe_launch(
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
-        if (prof_ev[6]) {
-            (void)cudaEventRecord(prof_ev[6], 0);
-            if (cudaEventSynchronize(prof_ev[6]) == cudaSuccess) {
-                float ms_xq = 0.0f, ms_sort = 0.0f, ms_gate = 0.0f, ms_midq = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
-                (void)cudaEventElapsedTime(&ms_xq, prof_ev[0], prof_ev[1]);
-                (void)cudaEventElapsedTime(&ms_sort, prof_ev[1], prof_ev[2]);
-                (void)cudaEventElapsedTime(&ms_gate, prof_ev[2], prof_ev[3]);
-                (void)cudaEventElapsedTime(&ms_midq, prof_ev[3], prof_ev[4]);
-                (void)cudaEventElapsedTime(&ms_down, prof_ev[4], prof_ev[5]);
-                (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
-                (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
+        if (prof_ev[4]) {
+            (void)cudaEventRecord(prof_ev[4], 0);
+            if (cudaEventSynchronize(prof_ev[4]) == cudaSuccess) {
+                float ms_pre = 0.0f, ms_gate = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
+                /* Checked, not discarded: swallowing these with (void) is what
+                 * let a dead event poison the next launch's error check. */
+                cudaError_t te = cudaSuccess;
+                te = cudaEventElapsedTime(&ms_pre,   prof_ev[0], prof_ev[1]) != cudaSuccess ? cudaGetLastError() : te;
+                te = cudaEventElapsedTime(&ms_gate,  prof_ev[1], prof_ev[2]) != cudaSuccess ? cudaGetLastError() : te;
+                te = cudaEventElapsedTime(&ms_down,  prof_ev[2], prof_ev[3]) != cudaSuccess ? cudaGetLastError() : te;
+                te = cudaEventElapsedTime(&ms_sum,   prof_ev[3], prof_ev[4]) != cudaSuccess ? cudaGetLastError() : te;
+                te = cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[4]) != cudaSuccess ? cudaGetLastError() : te;
+                if (te != cudaSuccess) {
+                    fprintf(stderr, "pulsar: MoE profile timing unavailable (%s) -- "
+                                    "numbers below are incomplete\n", cudaGetErrorString(te));
+                }
                 fprintf(stderr,
-                        "pulsar: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
-                        n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
+                        "pulsar: CUDA MoE profile tokens=%u pairs=%u pre=%.3f gateup=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                        n_tokens, pair_count, ms_pre, ms_gate, ms_down, ms_sum, ms_total);
             }
-            for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
+            for (uint32_t i = 0; i < 5u; i++) (void)cudaEventDestroy(prof_ev[i]);
+            /* Clear anything the teardown itself raised, so a diagnostic can
+             * never be mistaken for a kernel failure by the caller's check. */
+            (void)cudaGetLastError();
         }
         return ok;
     }
