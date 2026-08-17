@@ -1,9 +1,9 @@
-/* Job lifecycle around ONE request (split move-only from generate.c):
+/* Job lifecycle around ONE request (split move-only from generate.cpp):
  * the resumable gen_state machine (prefill -> decode -> finish), its
  * prefill-progress/keepalive plumbing, tool-checkpoint canonicalization
  * and thinking-checkpoint remembering, protocol stream emission glue,
  * and the generate_job_* driver stepped by the scheduler
- * (server_sched.c). gen_state/gen_phase live in pulsar_server_internal.h
+ * (server_sched.cpp). gen_state/gen_phase live in pulsar_server_internal.h
  * because the scheduler TU steps jobs by phase and drives the batched
  * lanes through the batch_* fields. */
 #include "pulsar_server_internal.h"
@@ -382,7 +382,7 @@ void server::remember_thinking_checkpoint(session_slot *sl,
  * same visible transcript on disk (kv_cache_store_current).
  *
  * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
- * for a tool-context turn (prompt_render.c: `tool_context || i > last_user_idx`),
+ * for a tool-context turn (prompt_render.cpp: `tool_context || i > last_user_idx`),
  * because agentic clients (opencode et al.) replay reasoning_content verbatim so
  * the model keeps its chain of thought across tool rounds.  So the key MUST carry
  * the reasoning too — an earlier version dropped it (<think></think>), which byte-
@@ -610,7 +610,7 @@ done:
  * the next quantum re-issues the sync, which resumes from the checkpoint.
  * A decode quantum runs the sampling loop for at most
  * PULSAR_SERVER_DECODE_QUANTUM_TOKENS tokens. Between quanta the session is not
- * touched, so the spec-decode carry (spec_carry_* in session.c) and sampling
+ * touched, so the spec-decode carry (spec_carry_* in session.cpp) and sampling
  * rng stay valid; with one slot the quanta run back-to-back and the output is
  * byte-identical to the old function.
  *
@@ -1270,7 +1270,7 @@ void server::gen_decode_init(session_slot *sl) {
 /* Sampling contract: request_init() pre-fills the engine defaults, so the
  * request values are already correct for non-thinking requests. In thinking
  * mode the engine defaults are re-asserted, but ONLY for parameters the
- * client left absent (per-param has_* flags set in api_parse.c); anything the
+ * client left absent (per-param has_* flags set in api_parse.cpp); anything the
  * client sent explicitly is respected as-is. That includes an explicit
  * temperature==0, which selects greedy decode so DSpark speculative decode
  * (greedy-only) can engage. Tool-call payload forcing (temperature=0 while

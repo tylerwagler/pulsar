@@ -959,7 +959,7 @@ static float sample_rng_f32(uint64_t *state) {
  * Measured in the real link config: FPCR = 0x0, FZ = 0, and the comparator
  * ORDERS subnormals. So keying them strictly is what matches. A gcc-linked
  * probe of the same source reports FPCR = 0x1000000 and the opposite answer —
- * do not test this outside the real linkage. tests/pulsar_test.c --sampler
+ * do not test this outside the real linkage. tests/pulsar_test.cpp --sampler
  * covers it (shape "subnormals + zeros (FZ range)"). */
 static inline uint32_t sample_desc_key(float f) {
     uint32_t u;
@@ -996,7 +996,7 @@ static inline uint32_t sample_desc_key(float f) {
  * replaced qsort produced at this size (glibc takes its stable msort_with_tmp
  * path for a 129280 x 12B array -- verified), but nothing here depends on that
  * unspecified detail: this sort is stable by construction and libc-independent.
- * tests/pulsar_test.c --sampler pins the order explicitly (and catches a
+ * tests/pulsar_test.cpp --sampler pins the order explicitly (and catches a
  * tie-order flip on a realistic shape -- ties are common, not adversarial).
  *
  * Requires n >= 1. */
@@ -1289,7 +1289,7 @@ static int sample_full_vocab(
  * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
  * candidates from `sum` — the NAIVE min-p pre-filter — therefore changes
  * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
- * probability. It is not an equivalent rewrite; tests/pulsar_test.c --sampler
+ * probability. It is not an equivalent rewrite; tests/pulsar_test.cpp --sampler
  * catches it (n 6 != 5). The full-vocab sum is load-bearing.
  *
  * What the top_k <= 0, min_p > 0 path DOES do (the LEGAL prefilter): the sum
@@ -1304,14 +1304,14 @@ static int sample_full_vocab(
  * summing in index order instead of the old sorted-descending order rounds
  * differently (~1e-7 relative), so every output prob moves by that much and
  * rng draws near a bucket edge can flip. Survivor membership and order are
- * unchanged (tests/pulsar_test.c --sampler-prefilter pins set/order identity
+ * unchanged (tests/pulsar_test.cpp --sampler-prefilter pins set/order identity
  * against the old-sum reference and characterizes the prob delta; --sampler
  * is byte-exact against the re-derived index-order-sum reference). The
  * min_p <= 0 full sort and the top_k > 0 preselect keep the old sorted-order
  * sum and remain byte-identical to the pre-prefilter build.
  *
  * ALIASING CONTRACT: `out`'s ids/probs must never point into `scratch`. The
- * spec walk (session.c) holds one dist at a time while reusing the scratch
+ * spec walk (session.cpp) holds one dist at a time while reusing the scratch
  * across accepted positions, so handing `out` a scratch pointer to save the
  * malloc would be silently wrong the moment two dists overlap — and the
  * --sampler gate builds one dist at a time, so it would NOT catch it.
@@ -1531,7 +1531,7 @@ int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t *rng) {
  *
  * Two bugs in the reference implementation this is modelled on
  * (xangel82/DS4-GB10-GX10-DSpark-CUDA — technique only, no code taken) are
- * fixed here, and the unit gate tests/pulsar_test.c --spec-math pins both:
+ * fixed here, and the unit gate tests/pulsar_test.cpp --spec-math pins both:
  *   (a) its `u <= ap` accept test can emit a token with p(x) == 0 (u==0 draws
  *       accept an impossible token). We reject p <= 0 outright and use a
  *       strict `<`, matching pulsar_sample_dist_accept's discipline.

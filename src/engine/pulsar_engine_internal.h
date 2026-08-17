@@ -2141,21 +2141,21 @@ uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
 /* Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
  * a context (the overcommit-reserved, physical-on-touch part); and the EXACT
  * touched (physically resident) demand-paged KV summed over the whole pool from
- * the per-bank compressor frontier. See the definitions in gpu_diag.c. */
+ * the per-bank compressor frontier. See the definitions in gpu_diag.cpp. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
 uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
 uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
 /* Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
  * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
- * + base-table rebuild). See gpu_diag.c. */
+ * + base-table rebuild). See gpu_diag.cpp. */
 bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank);
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
 /* Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
  * KV into dst + mirror frontier counters. Caller validates + pins src first. */
 bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst);
-/* plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.c). */
+/* plan-33 inc C: partial-cut fork + boundary machinery (gpu_diag.cpp). */
 uint32_t pulsar_partial_fork_base_align(void);
 bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t dst,
                                   uint32_t R, uint32_t src_len);
@@ -2224,7 +2224,7 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
                                    bool capture_cur);
 bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g);
 /* Tier-2 batched multi-session decode: one token per live bank through ONE
- * weight sweep (see the definition comment in imatrix.c for the full driver
+ * weight sweep (see the definition comment in imatrix.cpp for the full driver
  * contract).  logits out = [n_active * PULSAR_N_VOCAB], row k = bank[k].
  * Returns 1 ok / 0 recoverable rejection (nothing mutated) / -1 fatal (armed
  * sweep or head failed — session state untrusted). */
@@ -2241,7 +2241,7 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t               max_head_runs);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control
- * single source of truth (see gpu_diag.c).  Includes the whole bank pool
+ * single source of truth (see gpu_diag.cpp).  Includes the whole bank pool
  * when PULSAR_MSEQ_BANKS >= 2 (same knob the allocator reads). */
 uint64_t gpu_graph_session_bytes(
         const pulsar_weights       *weights,

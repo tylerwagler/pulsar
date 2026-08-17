@@ -1343,7 +1343,7 @@ pulsar_context_memory pulsar_context_memory_estimate(pulsar_backend backend,
 
 /* Packed variant of the estimate: recompute the three persistent KV caches
  * (raw ring, attn comp, indexer comp) with the real element/row widths the
- * graph actually allocates (see gpu_graph_alloc_raw_cap in gpu_diag.c), rather
+ * graph actually allocates (see gpu_graph_alloc_raw_cap in gpu_diag.cpp), rather
  * than the sizeof(float) pessimistic upper bound the base estimate uses.  The
  * f32 scratch working set (batch_* buffers etc.) is not packed and carries
  * through from the base estimate unchanged. */

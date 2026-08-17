@@ -1,8 +1,8 @@
-/* In-file unit tests extracted move-only from cli_main.c (the old
+/* In-file unit tests extracted move-only from cli_main.cpp (the old
  * `#else` branch of its PULSAR_SERVER_TEST guard). Compiled ONLY inside
- * the tests/pulsar_test.c harness TU, which #includes every server .c
- * with PULSAR_SERVER_TEST defined and includes cli_main.c BEFORE this
- * file, so cli_main.c file-statics the tests poke (parse_options,
+ * the tests/pulsar_test.cpp harness TU, which #includes every server .c
+ * with PULSAR_SERVER_TEST defined and includes cli_main.cpp BEFORE this
+ * file, so cli_main.cpp file-statics the tests poke (parse_options,
  * server_kv_budget_bytes, server_default_kv_disk_dir,
  * server_resolve_kv_disk_dir) remain reachable exactly as before.
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
@@ -1514,7 +1514,7 @@ static void check_resolved_sampling(const request *r, float want_temp,
 /* The sampling contract: engine defaults apply only to parameters the request
  * left absent; anything the client sent explicitly reaches the sampler as-is,
  * including values that happen to equal the defaults. Exercises
- * gen_resolve_sampling (generate.c) over the full matrix of
+ * gen_resolve_sampling (generate.cpp) over the full matrix of
  * {absent, explicit-nondefault, explicit-equal-to-default} per parameter,
  * with thinking on and off. "Absent" is simulated exactly as the parser
  * leaves it: request_init's default value with the has_ flag false. */

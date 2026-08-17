@@ -502,7 +502,7 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
  * (matching the reference generate.py forward_spec dataflow; the legacy loop
  * conditions on the hidden AFTER re-evaluating the base token -- a one-position
  * train/inference mismatch this path removes).
- * Greedy-only, like the legacy block (generate.c gates on temperature<=0).
+ * Greedy-only, like the legacy block (generate.cpp gates on temperature<=0).
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
 static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,

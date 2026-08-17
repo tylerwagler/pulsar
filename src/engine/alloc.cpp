@@ -1,7 +1,7 @@
 #include "pulsar_engine_internal.h"
 
 /* Checked allocators and the decode-phase allocation guard. Split out of
- * util.c in the C++ port. The guard is process-wide state armed around
+ * util.cpp in the C++ port. The guard is process-wide state armed around
  * phases that must not allocate (decode reuses preallocated scratch). */
 
 namespace pulsar {

@@ -2,7 +2,7 @@
 
 /* Batched multi-session decode over the session's bank pool — see the pulsar.h
  * declaration for the caller contract and gpu_graph_decode_multiseq_batch
- * (imatrix.c) for the step mechanics.
+ * (imatrix.cpp) for the step mechanics.
  *
  * The session's own single-bank bookkeeping is not merely un-advanced, it is
  * INVALIDATED on success: a multiseq step leaves the scalar frontier

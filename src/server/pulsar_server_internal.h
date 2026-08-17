@@ -355,8 +355,8 @@ typedef struct {
      * body. request_init() fills the value fields with engine defaults at
      * parse time, so the values alone cannot distinguish "explicitly 1.0"
      * from "absent" — downstream policy (e.g. think-mode defaults in
-     * generate.c) must consult these and default only what is absent.
-     * Zeroed by request_init's memset; set only in api_parse.c. */
+     * generate.cpp) must consult these and default only what is absent.
+     * Zeroed by request_init's memset; set only in api_parse.cpp. */
     bool has_temperature;
     bool has_top_k;
     bool has_top_p;
@@ -723,20 +723,20 @@ typedef struct {
  * the pool or adding GPU threads).
  *
  * All GPU work in this server runs on the SINGLE worker thread (worker_main in
- * generate.c). Client threads only parse HTTP and block on a per-job condvar
- * until the worker finishes (http_server.c handle path); they never touch a
+ * generate.cpp). Client threads only parse HTTP and block on a per-job condvar
+ * until the worker finishes (http_server.cpp handle path); they never touch a
  * pulsar_session_* or pulsar_gpu_* entry point. Verified by grepping every
  * pulsar_session_/pulsar_gpu_ call site under src/server: all of them are reached
- * only from the generation state machine (gen_* in generate.c) driven by
+ * only from the generation state machine (gen_* in generate.cpp) driven by
  * worker_main (or from cli_main startup/shutdown, before the worker starts and
  * after it joins) — with two deliberate exceptions, both plain loads of data
- * immutable after startup (no CUDA behind them): http_server.c reads
+ * immutable after startup (no CUDA behind them): http_server.cpp reads
  * pulsar_session_ctx(server.sess) on client threads, and client paths read the
  * model id via server_model_id_from_engine (pulsar_engine_model_id, a static
  * shape constant). Nothing else: /metrics in particular makes NO engine
  * calls — the worker publishes per-slot KV positions and the spec-decode
  * counters into plain server fields under mu (m_slot_pos/m_slot_ctx/m_spec,
- * server_publish_metrics_snapshot in generate.c, refreshed at bind time and
+ * server_publish_metrics_snapshot in generate.cpp, refreshed at bind time and
  * once per quantum) and send_metrics reads only those snapshots. No CUDA
  * call is made off the worker thread. This is a correctness invariant, not
  * an accident.
@@ -759,7 +759,7 @@ typedef struct {
  *
  * Increment 1 was pure structural plumbing (pool of capacity 1). Increment 2
  * made the generation path re-entrant: each job runs as a per-slot resumable
- * state machine (gen_state in generate.c) that the worker steps in bounded
+ * state machine (gen_state in generate.cpp) that the worker steps in bounded
  * quanta — one prefill chunk, or up to PULSAR_SERVER_DECODE_QUANTUM_TOKENS decode
  * tokens, per step. All GPU work still happens on the single worker thread.
  * Increment 3 adds the scheduler: the worker binds queued jobs to free slots
@@ -772,7 +772,7 @@ typedef struct {
  * freed CUDA memory does not promptly move), the worker evicts the
  * least-recently-serviced IDLE slot — snapshot to the disk kv cache, free
  * the session, release its ACTUAL bytes from the ledger — and provisions in
- * its place (see the increment-4 block in generate.c; slot 0 is pinned).
+ * its place (see the increment-4 block in generate.cpp; slot 0 is pinned).
  * Batched decode is a later increment (Tier 2). */
 
 /* Pool capacity (increment 3). Slot 0 is provisioned at startup with the
@@ -810,7 +810,7 @@ typedef struct {
 #define PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
 /* The rendered-prompt BOS marker. One definition for every render site AND
- * the startup trivial-match-threshold derivation (cli_main.c), so the
+ * the startup trivial-match-threshold derivation (cli_main.cpp), so the
  * derived threshold can never silently drift from what rendered prompts
  * actually begin with. (Unit tests keep independent string literals on
  * purpose — they pin the wire bytes, not this macro.) */
@@ -821,7 +821,7 @@ typedef struct {
  * TRIVIAL — "just the shared rendered-template header, not a warm
  * continuation" — below a threshold of
  *     tokens(BOS + think-max preamble) + this allowance,
- * measured once per model at startup (cli_main.c). The derived part is the
+ * measured once per model at startup (cli_main.cpp). The derived part is the
  * largest template-injected text two UNRELATED conversations can share; the
  * allowance covers incidental natural-language prologue overlap between
  * distinct conversations (measured 3–8 tokens beyond the header across real
@@ -857,7 +857,7 @@ typedef struct {
  * the rest this working set + measured total overhead ~18.7-19.0 GiB), and
  * it materialized mid-burst, AFTER every admission check had already read a
  * stale-high MemAvailable.  Two changes de-fang it:
- *   - cli_main.c runs a warmup generation at startup, so the working set
+ *   - cli_main.cpp runs a warmup generation at startup, so the working set
  *     materializes before the listener opens and before any admission math;
  *   - the admission budget is then re-derived from MEASURED post-warmup
  *     MemAvailable, min()'d with the static formula below, so these
@@ -912,7 +912,7 @@ typedef enum {
                           false) is reusable by the next provisioning. */
 } slot_state;
 
-/* Resumable per-job generation state (defined in generate.c). Owns everything
+/* Resumable per-job generation state (defined in generate.cpp). Owns everything
  * that used to be a local of the run-to-completion generate_job: prompt/cache
  * resolution results, prefill progress, stream writers for all four API
  * surfaces, decode-loop trackers, and the deferred socket writer. */
@@ -1010,7 +1010,7 @@ struct server {
      * owns one bank; `live_bank` is the bank whose device views + host carry are
      * currently installed on that session (server_bank_switch lazily saves the
      * old and restores the new). `spec_max_live` is the three-way scheduler knob
-     * (generate.c worker_main): n_active decode banks <= spec_max_live take the
+     * (generate.cpp worker_main): n_active decode banks <= spec_max_live take the
      * per-bank spec/plain time-slice lane, n_active > spec_max_live take the
      * batched multiseq lane. 0 in classic mode. */
     int          pool_banks;
@@ -1080,7 +1080,7 @@ struct server {
     char         spill_dir[512];
     /* Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
-     * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.c; immutable after
+     * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.cpp; immutable after
      * startup, worker thread reads only). */
     int slot_trivial_common_tokens;
     int default_tokens;
@@ -1355,8 +1355,8 @@ typedef struct thinking_state {
 } thinking_state;
 
 /* Resumable per-job generation state machine (moved verbatim from
- * generate.c when the scheduler split into its own TU): server_jobs.c owns
- * the lifecycle, but the scheduler/worker (server_sched.c) steps jobs by
+ * generate.cpp when the scheduler split into its own TU): server_jobs.cpp owns
+ * the lifecycle, but the scheduler/worker (server_sched.cpp) steps jobs by
  * phase and drives the batched/fused decode lanes through the batch_*
  * fields, so the definition is shared here. */
 typedef enum {
@@ -1538,7 +1538,7 @@ void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
-void pulsar_die(const char *msg); /* engine util.c; aborts the process */
+void pulsar_die(const char *msg); /* engine util.cpp; aborts the process */
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
@@ -1868,28 +1868,28 @@ int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
  * continuation of req's visible transcript? Same guards as
  * thinking_live_visible_prefix_prompt but byte-prefix check only — no
  * tokenization, no effective-prompt build. Returns the matched visible-key
- * length (>0), or 0 for no match (defined in kv_cache.c; unit-tested in
- * cli_main.c). */
+ * length (>0), or 0 for no match (defined in kv_cache.cpp; unit-tested in
+ * cli_main.cpp). */
 /* Trivial-match classifier for the router's choose-vs-provision decision
- * (defined in generate.c; unit-tested in cli_main.c). */
+ * (defined in generate.cpp; unit-tested in cli_main.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
                                          int trivial_tokens);
-/* Admission predicate (defined in cli_main.c; unit-tested there). */
+/* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
                              uint64_t incoming_bytes);
 /* Live MemAvailable floor predicate: kernel-breathing-room backstop applied
- * at provisioning time on top of the ledger (defined in cli_main.c;
+ * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in
- * generate.c; also used by startup warmup/budget derivation in cli_main.c). */
+ * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
 uint64_t server_mem_available_bytes(void);
 /* Log estimate-vs-actual for a freshly created session, warn loudly on >10%
  * drift (sizing code out of sync with the allocator), and return the value
- * the ledger must commit — the actual (defined in generate.c). */
+ * the ledger must commit — the actual (defined in generate.cpp). */
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                                uint64_t est_bytes,
                                                uint64_t actual_bytes);
@@ -1897,7 +1897,7 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * the admission ledger total, warning loudly (and clamping to 0, which fails
  * toward over-admission being caught by the MemAvailable floor rather than
  * leaking budget forever) if the pairing ever underflows (defined in
- * generate.c; unit-tested in cli_main.c). */
+ * generate.cpp; unit-tested in cli_main.cpp). */
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
@@ -1905,7 +1905,7 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * live checkpoint). In classic (non-pooled) mode == pulsar_session_pos(s->sess).
  * Worker-thread scheduling reads AND the client/worker tool-id lookups use this
  * instead of pulsar_session_pos so a non-live bank's frontier is never misread as
- * the pool's live cursor (defined in generate.c). */
+ * the pool's live cursor (defined in generate.cpp). */
 /* Install `bank` on the shared pool session: lazily saves the outgoing bank's
  * carry, reloads a guard-spilled target from disk, and repoints the graph's
  * views.  Returns false WITHOUT installing on any failure — callers must fail
@@ -1914,7 +1914,7 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
  * index or -1. Pure selection over host fields — never touches the session
- * (defined in generate.c; unit-tested in cli_main.c). */
+ * (defined in generate.cpp; unit-tested in cli_main.cpp). */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect,
                                     bool allow_slot0 = false);
@@ -1954,8 +1954,8 @@ char *build_responses_visible_assistant_suffix(const request *r,
 char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content);
 void *worker_main(void *arg);
-/* Job-lifecycle entry points (server_jobs.c), driven by the scheduler/
- * worker (server_sched.c): bind/step/unbind plus the three per-token
+/* Job-lifecycle entry points (server_jobs.cpp), driven by the scheduler/
+ * worker (server_sched.cpp): bind/step/unbind plus the three per-token
  * helpers the batched and fused mixed-batch quanta share with the classic
  * decode loop. */
 void gen_resolve_sampling(const request *req, float *temperature,

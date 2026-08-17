@@ -255,7 +255,7 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
 /* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
  * for any supported routed-expert quant combo, centralizing the
  * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
- * t->dim[1] * row_bytes` that's repeated across gpu_prefill.c/gpu_decode.c.
+ * t->dim[1] * row_bytes` that's repeated across gpu_prefill.cpp/gpu_decode.cpp.
  *
  * For CUTLASS_MXFP4 (type 40) "row_bytes" has no ordinary per-row meaning --
  * the tensor is expert-major ColumnMajor+swizzle with no per-row byte stride

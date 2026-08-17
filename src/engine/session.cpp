@@ -773,7 +773,7 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
  * exactly like pulsar_session_create and includes the DSpark drafter graph state
  * when the engine has a drafter loaded, so callers cannot pass mismatched
  * parameters.  Built on the same sizing code as the allocator
- * (gpu_graph_session_bytes, gpu_diag.c); reconcile against
+ * (gpu_graph_session_bytes, gpu_diag.cpp); reconcile against
  * pulsar_session_resident_bytes after the create. */
 uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
     auto *e = this;

@@ -6,7 +6,7 @@
 //
 // The module contains dense and routed kernels for Q8_0, Q2_K, Q4_K, and
 // IQ2_XXS, plus the GB10 aligned-SoA D2R and fused MoE epilogues. Numerical
-// parity and long-context coverage live in tests/cuda_long_context_smoke.c.
+// parity and long-context coverage live in tests/cuda_long_context_smoke.cpp.
 
 #include "ds4_mmq.h"
 

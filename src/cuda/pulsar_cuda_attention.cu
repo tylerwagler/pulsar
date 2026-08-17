@@ -392,7 +392,7 @@ __global__ static void attention_prefill_unpack_heads_kernel(
  * clamp/scratch bound, never to address into a specific bank.  The per-row
  * visible count is (qpos+1)/ratio — the SAME rule the engine's classic
  * single-session decode follows, because the engine emits a step's
- * compressed row BEFORE attention (gpu_decode.c: layer_n_comp is
+ * compressed row BEFORE attention (gpu_decode.cpp: layer_n_comp is
  * incremented before the attention launch reads it), so at an emit step
  * (qpos ≡ ratio-1 mod ratio) the row attends to the compressed row emitted
  * that same step.  DRIVER CONTRACT (banked mode): every bank's compressed

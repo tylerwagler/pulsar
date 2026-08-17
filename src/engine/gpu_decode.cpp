@@ -34,7 +34,7 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                                  tmp, n * PULSAR_HC_ELT_SIZE);
     if (rc == 0) {
         /* Read failed and left tmp uninitialized — do NOT convert it. Callers
-         * (the DSpark dumps at session.c) memset `out` to zero beforehand and
+         * (the DSpark dumps at session.cpp) memset `out` to zero beforehand and
          * ignore the return, relying on "zeros on failure"; converting garbage
          * here would silently write heap noise into the dump. */
         free(tmp);

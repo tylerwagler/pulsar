@@ -1,6 +1,6 @@
 #include "pulsar_engine_internal.h"
 
-/* Fatal-exit and colorized logging. Split out of util.c in the C++ port:
+/* Fatal-exit and colorized logging. Split out of util.cpp in the C++ port:
  * everything here is about reporting, nothing about compute. */
 
 void pulsar_die(const char *msg) {

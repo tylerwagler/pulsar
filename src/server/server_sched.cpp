@@ -1,4 +1,4 @@
-/* Scheduler/worker (split move-only from generate.c): worker_main and its
+/* Scheduler/worker (split move-only from generate.cpp): worker_main and its
  * quantum loop (classic / batched / fused mixed-batch lanes), job->slot
  * routing (choose_slot_for_job) and enqueue, lazy provisioning + the
  * admission/ledger/mem-floor helpers, LRU eviction and the warm-fork
@@ -73,7 +73,7 @@ int server::job_needed_ctx(const job *j) const {
 /* Reconcile a session's admission estimate with the bytes the allocator
  * actually committed (2026-07-13 lockup postmortem: the ledger must track
  * reality, not a formula). Logs the pair, warns loudly on >10% drift — that
- * means gpu_graph_session_bytes (gpu_diag.c) has fallen out of sync with
+ * means gpu_graph_session_bytes (gpu_diag.cpp) has fallen out of sync with
  * gpu_graph_alloc_raw_cap — and returns the value to commit to the ledger
  * (the actual, unless the engine could not measure one). */
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
@@ -93,8 +93,8 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                    "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap "
                    "(or a deliberately unaccounted allocation is enabled: directional-"
                    "steering dirs are in the measured delta but excluded from the "
-                   "estimate — see the exclusion list in gpu_diag.c); "
-                   "fix the sizing code (gpu_diag.c) before trusting admission control",
+                   "estimate — see the exclusion list in gpu_diag.cpp); "
+                   "fix the sizing code (gpu_diag.cpp) before trusting admission control",
                    (double)est_bytes / gib, (double)actual_bytes / gib);
     }
     return actual_bytes;
@@ -328,12 +328,12 @@ int server::provision_ctx_for_job(const job *j) const {
 
 
 /* Trivial-match classifier for the router's choose-vs-provision decision
- * (unit-tested in cli_main.c). A candidate slot's token-prefix match is
+ * (unit-tested in cli_main.cpp). A candidate slot's token-prefix match is
  * TRIVIAL — grounds to prefer provisioning a fresh slot over reusing (and
  * clobbering) the candidate — only when BOTH hold:
  *   - common < trivial_tokens: the match is no deeper than the rendered
  *     template header plus incidental prologue overlap (threshold derived at
- *     startup, cli_main.c / PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
+ *     startup, cli_main.cpp / PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
  *     does not indicate the same conversation;
  *   - slot_pos - common >= trivial_tokens: reuse would destroy a meaningful
  *     amount of some conversation's warm KV. When the slot holds less than
@@ -362,7 +362,7 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  *      on the owner), and leaving it queued would wedge the FIFO forever
  *      behind an unbindable head — so it is failed explicitly through
  *      *reject_ctx with the same context_length_exceeded client error the
- *      front door sends (http_server.c / request_exceeds_context; the front
+ *      front door sends (http_server.cpp / request_exceeds_context; the front
  *      door checks against slot 0's ctx and cannot see the owner's smaller
  *      one).
  *   2. A free fitting slot whose live thinking binding byte-matches the
@@ -740,7 +740,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
  * (their sampled frontier is gone), exactly like a server restart.
  *
  * Slot 0 is PINNED — never evicted: (a) client threads read
- * pulsar_session_ctx(s->sess) lock-free (http_server.c) under the
+ * pulsar_session_ctx(s->sess) lock-free (http_server.cpp) under the
  * CUDA-state audit's immutable-after-startup exception, so freeing that
  * session would be a data race; (b) slot 0 is the only slot guaranteed to fit
  * any admissible request (job_needed_ctx caps at its ctx), which preserves

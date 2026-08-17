@@ -1,7 +1,7 @@
 #include "pulsar_engine_internal.h"
 
 /* Model-layout queries: per-layer attention compression ratios and routed
- * expert counts. Split out of util.c in the C++ port. */
+ * expert counts. Split out of util.cpp in the C++ port. */
 
 bool pulsar_backend_uses_graph(pulsar_backend backend) {
     return backend == PULSAR_BACKEND_CUDA;

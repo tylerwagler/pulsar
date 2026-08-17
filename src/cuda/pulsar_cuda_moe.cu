@@ -243,7 +243,7 @@ static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1
 /* gate_stride/gate_data_bytes and down_stride/down_data_bytes come from
  * routed_expert_gate_down_layout()'s CUTLASS_MXFP4 branch: *_stride is the full per-expert
  * [data+SF] block size, *_data_bytes is where the SF blob starts within that block (the
- * "row_bytes" parameter slot, repurposed -- see that function's comment in weights.c). */
+ * "row_bytes" parameter slot, repurposed -- see that function's comment in weights.cpp). */
 static int routed_moe_launch_cutlass(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *down,

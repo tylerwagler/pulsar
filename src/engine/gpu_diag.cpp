@@ -501,7 +501,7 @@ uint64_t gpu_graph_session_bytes_banked(
 /* Tier-2 overcommit (task #55, increment 1): the DEMAND-PAGED (cudaMallocManaged,
  * physical-on-touch) bytes of ONE bank's ctx-scaled comp + index caches at the
  * given context.  This is exactly the comp/index portion of
- * gpu_graph_kv_cache_bytes_for_context (steering.c) MINUS the eager raw ring —
+ * gpu_graph_kv_cache_bytes_for_context (steering.cpp) MINUS the eager raw ring —
  * the part the overcommit auto-size reserves as VA only and does NOT charge at
  * admission (the eager floor is charged; physical materializes as the frontier
  * grows, tracked by gpu_graph_touched_kv_bytes).  Row widths track the ACTUAL

@@ -472,7 +472,7 @@ __device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
  *
  * SO: every re-encode path already routes through the EXACT helper below —
  * `mxkv_pack_kernel`, `attn_pack_repack_kernel`/`attn_pack_exact_e8_dev` — and
- * `gpu_decode.c:498` passes `quantize_fp8=false` under pack to avoid double-
+ * `gpu_decode.cpp:498` passes `quantize_fp8=false` under pack to avoid double-
  * rounding. **If you ever feed already-quantized data into
  * `fp8_kv_quantize*`, `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround
  * rate jumps from 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.** The plan-32

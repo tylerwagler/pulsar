@@ -193,7 +193,7 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                         pulsar_token_eos(engine), toks,
                         (int)(sizeof(toks) / sizeof(toks[0])),
                         err, sizeof(err));
-                /* Contract (session.c): eos arrives as a returned token; 0 means
+                /* Contract (session.cpp): eos arrives as a returned token; 0 means
                  * a rejected step (bad args / dirty multiseq state), not eos. */
                 if (n <= 0) { ok = false; break; }
                 emitted += n;
@@ -293,7 +293,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
  * VA-only, demand-paged, and NOT charged at admission". This lets a large --ctx
  * (e.g. the 1M default) come up with N>1 banks all 1M-CAPABLE, each paying only
  * for the KV it actually touches. DEFAULT ON as of v0.3.0: the increment-2
- * proactive eviction guard has landed (generate.c worker_batched_decode_quantum),
+ * proactive eviction guard has landed (generate.cpp worker_batched_decode_quantum),
  * so banks that grow toward 1M are bounded by LRU-idle eviction before the
  * physical budget is breached. PULSAR_OVERCOMMIT=0/off/false reverts to classic
  * full-charge admission; PULSAR_MSEQ_BANKS still pins and bypasses auto-sizing.
@@ -353,7 +353,7 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
 
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
- * every lazy slot provisioning in the scheduler (generate.c); an over-budget
+ * every lazy slot provisioning in the scheduler (generate.cpp); an over-budget
  * provisioning attempt leaves the job queued until a slot frees (plan Tier 1
  * §1.4). Non-static: the scheduler calls it; unit tests live in this TU. */
 bool server_kv_admits(uint64_t kv_budget_bytes,
@@ -370,7 +370,7 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * pulsar_server_internal.h for the 2026-07-15 sizing). avail == 0 means
  * /proc/meminfo was unreadable: fail closed — this guard exists precisely
  * for when other accounting is wrong, so it must not silently disarm
- * itself. Non-static: provision_slot and the eviction precheck (generate.c)
+ * itself. Non-static: provision_slot and the eviction precheck (generate.cpp)
  * call it; unit tests live in this TU. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
     if (avail_bytes == 0) return false;
@@ -405,7 +405,7 @@ void server::close_resources() {
     if (s->sess) pulsar_session_free(s->sess);
     s->sess = NULL;
     /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
-     * generate.c writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
+     * generate.cpp writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
      * still spilled when the server exits would otherwise leave a stale
      * multi-GiB file behind forever, so sweep every provisioned slot's bank
      * on the way out.  Best-effort: a missing file is the normal case. */
@@ -895,7 +895,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     /* Reconcile the estimate with what the allocator really did and commit the
-     * ACTUAL to the ledger (>10% drift means the sizing code in gpu_diag.c has
+     * ACTUAL to the ledger (>10% drift means the sizing code in gpu_diag.cpp has
      * fallen out of sync with the allocator — fix that, not the ledger). Under
      * overcommit the admission est is the eager floor only; reconcile against the
      * FULL banked est so it still matches the measured resident (which counts the

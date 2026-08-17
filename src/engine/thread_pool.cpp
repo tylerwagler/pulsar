@@ -1,6 +1,6 @@
 #include "pulsar_engine_internal.h"
 
-/* Persistent CPU worker pool. Split out of util.c in the C++ port.
+/* Persistent CPU worker pool. Split out of util.cpp in the C++ port.
  *
  * Decode reuses these threads instead of creating pthreads in the token
  * loop. The row partitioning below must stay exactly as the C

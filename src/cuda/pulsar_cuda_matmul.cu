@@ -1771,9 +1771,15 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * de-interleaved weight. One weight-row read serves all tokens, vs the
          * tensor-core tile path which is latency-bound at these shapes (the
          * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
-         * token). Bit-identical per token to the n=1 deint mmvq, so verify logits
-         * match the decode path's numerics.  (The env override that used to
-         * tensor-core dispatch for all n_tok>1. */
+         * token). Bit-identical per token to the n=1 kernel, so verify logits match
+         * the decode path's numerics -- and that holds WITHIN an activation
+         * format, not across: the A8 twin above pairs with
+         * mxfp8_mmvq_deint_a8_kernel, this f32 one with mxfp8_mmvq_deint_kernel.
+         * The claim was silently false from the day A8 converted n==1 and left
+         * this arm on f32 until 0a60a1a converted it too.  (A sentence ended
+         * here describing an env override that dispatched tensor-core for all
+         * n_tok>1; the override is gone and the sentence had been truncated
+         * mid-clause for however long, so it goes with it.) */
         /* 2026-07-21: raising this default 4 -> 8 was TRIED and REVERTED. The
          * "bit-identical" claim above is GEMV-n vs GEMV-1 -- it does NOT extend to
          * the cuBLASLt dispatch this cap hands off to, which is what widening the
@@ -2205,12 +2211,13 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         if (hb) hb->valid_b = 1;
     }
     const __nv_bfloat16 *xb16 = xbb;
-    /* M-independence, same contract as the f16 and f32 arms. The cuBLAS path
-     * below rounds activations to bf16; as of 2026-08-17 so do the nt kernel and
-     * the n==1 kernel, so all three agree on the activation format and the only
-     * remaining cross-arm difference is accumulation ORDER. It read "its
-     * disagreement with the n=1 kernel is larger than the f32 arm's, not
-     * smaller" until the split was closed. */
+    /* M-independence, same contract as the f16 and f32 arms.  All three arms now
+     * read the SAME bf16 activation buffer built above, so they cannot disagree
+     * on the operand at all and the only cross-arm difference left is
+     * accumulation ORDER.  This comment read "the cuBLAS path below additionally
+     * ROUNDS the activations to bf16, so its disagreement with the n=1 kernel is
+     * larger than the f32 arm's, not smaller" until 2026-08-17, which was true
+     * and was the bug. */
     {
         const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
         if (n_tok >= 2 && n_tok <= nt_cap) {
@@ -2508,8 +2515,10 @@ int pulsar_gpu_attention_output_batch_tensor(
      * GEMMs; decode and small verify batches (n_tokens<=4) take the
      * register-blocked GEMV path (launch_grouped_fp8mx_a dispatches the nt
      * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
-     * token to decode's kernel).  (The env override that used to restore the
-     * dispatch for all n_tokens>1, same as the dense-matmul gate. */
+     * token to decode's kernel).  (A sentence ended here describing an env
+     * override that restored the dispatch for all n_tokens>1; the override is
+     * gone and the sentence was truncated mid-clause.  The same fragment,
+     * near-verbatim, sat at the mxfp8 nt cap -- one edit left both behind.) */
     /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
      * for the measurement).  It shared its cap with that gate, so the two
      * defaults must move together. */
