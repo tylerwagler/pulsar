@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
     const int rc = indexed
         ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
-                                           n_comp, top_k, window, ratio, n_head, D, 0,
+                                           n_comp, top_k, window, ratio, n_head, D,
                                            NULL, NULL, NULL, 0u, 1u, 0)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
                                            n_comp ? dckv : NULL,
