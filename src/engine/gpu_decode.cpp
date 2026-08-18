@@ -147,22 +147,6 @@ uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
     return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 }
 
-/* Comp cache to hand the f32 prefill attention consumers (used when the fp16
- * attention tier is off): the dequantized first n_rows packed rows in the f32
- * shadow.  The dequant is
- * bit-exact: packed rows decode to exactly the values the f32 cache would
- * hold. */
-pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t il, uint32_t n_rows) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    if (!g->attn_comp_dequant) return NULL;
-    if (n_rows == 0) return g->attn_comp_dequant;
-    if (n_rows > g->layer_comp_cap[il]) return NULL;
-    if (pulsar_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il], g->attn_comp_dequant,
-                                         n_rows, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
-        return NULL;
-    }
-    return g->attn_comp_dequant;
-}
 
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
     return pulsar_weight_is_plain_or_mxfp8(w->type);

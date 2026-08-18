@@ -511,7 +511,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 /* v3 (2026-08-11): the ATTN_PACK comp row's rope tail narrowed f32 -> bf16,
  * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
  * old stride, so it MUST be rejected rather than reinterpreted. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(3)
+/* v4 (2026-08-17): the attn comp cache is stored as PULSAR_ATTN_PACK rows
+ * rather than dequantised f32. v3 files are refused by the header check --
+ * deliberately, since the row stride changed and a v3 file read as v4 would
+ * decode noise into a KV cache rather than fail. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(4)
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 13u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);

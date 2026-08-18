@@ -409,7 +409,6 @@ uint64_t gpu_graph_session_bytes_banked(
     total += 2ull * PULSAR_N_HEAD_DIM * f32;                 /* kv_raw, kv */
     total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
     total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
-    total += (uint64_t)dz.comp_cap * PULSAR_N_HEAD_DIM * f32;            /* attn_comp_dequant */
     total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
     total += dz.indexer_q_dim * f32;                      /* indexer_q */
     total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
@@ -1739,10 +1738,6 @@ bool gpu_graph_alloc_raw_cap(
      * step packs them to the persistent packed comp cache. */
     g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                               PULSAR_N_HEAD_DIM * sizeof(float));
-    /* f32 shadow read by session load, and by the prefill attention consumers
-     * when the fp16 tier is off (see gpu_graph_attn_comp_read_cache). */
-    g->attn_comp_dequant = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
-                                                PULSAR_N_HEAD_DIM * sizeof(float));
     {
         if (PULSAR_N_INDEXER_HEAD_DIM != 128u) {
             /* The packed loader and QAT+pack kernels hard-code the 68-byte
@@ -1872,7 +1867,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    g->attn_comp_stage && g->attn_comp_dequant &&
+                    g->attn_comp_stage &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&

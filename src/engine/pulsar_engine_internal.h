@@ -966,7 +966,6 @@ typedef struct {
      * packed comp cache is dequantized here (up to max layer_comp_cap rows,
      * bit-exact) before each prefill-attention read.  Decode reads the packed
      * cache natively. */
-    pulsar_gpu_tensor *attn_comp_dequant;
     /* f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
      * the QAT+pack step stores them MXKV-FP4-packed into the persistent
@@ -2309,14 +2308,6 @@ uint32_t gpu_graph_prefill_slice(void);
  * so scores and outputs are bit-identical; only storage and traffic change. */
 /* Comp-cache row stride in bytes for the active storage format (pack-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
-/* Returns the comp-cache tensor to hand to the f32 prefill attention consumers
- * for `n_rows` rows: the cache itself normally, or the f32 shadow
- * (attn_comp_dequant) after a bit-exact dequant when PULSAR_ATTN_PACK storage is
- * on.  NULL on error. */
-pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(
-        pulsar_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       n_rows);
 pulsar_gpu_tensor *gpu_graph_attn_comp_update_target(
         pulsar_gpu_graph *g,
         uint32_t       il);
