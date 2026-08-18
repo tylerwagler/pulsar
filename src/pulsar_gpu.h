@@ -198,7 +198,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim,
+        uint32_t n_head, uint32_t head_dim, int comp_pack,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok);
@@ -214,7 +214,12 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* Comp row format, exactly as in the INDEXED entry below. This entry
+         * hard-coded 0 until 2026-08-18, so handing it the packed pool read
+         * 584 B rows at a 2048 B stride -- out of bounds, NaN, and a clean
+         * compile, because both formats are const float *. */
+        int                     comp_pack);
 
 /* fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
@@ -1008,7 +1013,8 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                comp_kv_pack);
 
 
 int pulsar_gpu_attention_output_batch_tensor(

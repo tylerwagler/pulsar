@@ -119,7 +119,10 @@ static void attn_f16_kernel(
         const float *__restrict__ sinks,      /* [n_head] */
         const float *__restrict__ q,          /* [n_tokens][n_head][512] */
         const float *__restrict__ raw_kv,     /* [n_tokens][512], f16 or f32 */
-        const float *__restrict__ comp_kv,    /* [n_comp][512] f32, may alias raw */
+        const float *__restrict__ comp_kv,    /* comp_pack ? PULSAR_ATTN_PACK rows
+                                               * : [n_comp][512] f32; may alias raw.
+                                               * The stride is comp_pack's, not the
+                                               * pointer type's -- both are float*. */
         const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head,
@@ -635,7 +638,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim,
+        uint32_t n_head, uint32_t head_dim, int comp_pack,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok) {
@@ -645,6 +648,11 @@ int pulsar_gpu_attention_f16_prefill_mx(
     if (n_tokens == 0u) return 0;
     if (n_comp != 0u && !comp_kv) return 0;
     if (!af16_device_supported()) return 0;
+    /* Same packed-geometry contract the indexed entry enforces: the rope tail
+     * must fit and the nope span must divide the scale block, or attn_pack_ld
+     * walks rows that are not there. */
+    if (comp_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
+                      ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) return 0;
     /* The epilogue's grouped index math assumes whole heads per group and that
      * the nope/rope split falls on an MX block boundary (so rope_tail can own
      * the tail blocks without either side touching the other's).  Refuse the
@@ -661,7 +669,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, 0, 0,
+                                            NULL, NULL, NULL, 0u, 1u, comp_pack, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
                                             gact_kbp, gact_slab, n_groups, n_nope,
@@ -674,10 +682,10 @@ int pulsar_gpu_attention_f16_prefill(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim) {
+        uint32_t n_head, uint32_t head_dim, int comp_pack) {
     return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
-                                               n_head, head_dim,
+                                               n_head, head_dim, comp_pack,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
 }
 

@@ -1878,13 +1878,23 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
                                                                        g->batch_kv_pack,
-                                                                       gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                       /* Packed pool straight in.  This called
+                                                                        * gpu_graph_attn_comp_read_cache -- a full
+                                                                        * dequantise of 584 B rows into a 2048 B f32
+                                                                        * shadow, on the SHIPPED path, because the
+                                                                        * consumer could not read packed.  It can now:
+                                                                        * the f16 prefill entry takes comp_pack, and
+                                                                        * the scalar mixed kernel reads packed too, so
+                                                                        * both arms of this launch are covered. */
+                                                                       mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                                                                            : g->layer_attn_comp_cache[il],
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
-                                                                       PULSAR_N_HEAD_DIM) != 0;
+                                                                       PULSAR_N_HEAD_DIM,
+                                                                       1u) != 0;
             if (ok) batch_attention_done = true;
         }
     }

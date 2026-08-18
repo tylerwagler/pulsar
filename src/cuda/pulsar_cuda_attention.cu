@@ -157,7 +157,8 @@ __global__ static void attention_prefill_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t comp_kv_pack) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -183,9 +184,17 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
         float s = -INFINITY;
         {
-            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+            /* Packed rows go through attn_pack_dot_full -- the same walk the
+              * decode kernels use, so there is one decoder for the one format.
+              * This kernel could ONLY read f32 until 2026-08-17, which is why a
+              * whole f32 shadow of the packed pool existed to feed it. */
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            if (comp_kv_pack) {
+                dot = attn_pack_dot_full(qh, comp_kv, (uint64_t)c, head_dim, 0.0f);
+            } else {
+                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            }
             s = dot * scale;
         }
         scores[raw_count + c] = s;
@@ -216,7 +225,9 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim) * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        for (uint32_t c = 0; c < visible_comp; c++)
+            acc += (comp_kv_pack ? attn_comp_pack_ld(comp_kv, (uint64_t)c, d, head_dim)
+                                 : comp_kv[(uint64_t)c * head_dim + d]) * scores[raw_count + c];
         oh[d] = acc / denom;
     }
 }
@@ -1695,6 +1706,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
                     (const float *)raw_kv->ptr, NULL,
                     n_tokens, 0u, window, 1u, n_head, head_dim,
+                    /* comp_pack */ 0,   /* raw-window path: no comp rows at all */
                     gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
                     0u, n_tokens)) {
                 if (mx_out && gact_data) *mx_out = 1;
@@ -2261,7 +2273,8 @@ static int attention_prefill_mixed_launch(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                comp_kv_pack) {
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
         (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
@@ -2269,7 +2282,16 @@ static int attention_prefill_mixed_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        /* Pack-aware, like the three sibling launches.  A guard that hard-codes
+         * the f32 row stride demands 2048 B from a 584 B packed pool, fails,
+         * and returns 0 -- which is "did not encode", not an error, so the
+         * graph silently does not run.  ->bytes is just a number, so the
+         * mismatch is type-legal and compiles clean. */
+        (comp_kv_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
+         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp *
+         (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+                       : head_dim * sizeof(float))) ||
         false) {
         return 0;
     }
@@ -2314,7 +2336,8 @@ static int attention_prefill_mixed_launch(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
                     (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : NULL,
-                    n_tokens, n_comp, window, ratio, n_head, head_dim))
+                    n_tokens, n_comp, window, ratio, n_head, head_dim,
+                    (int)comp_kv_pack))
                 return 1;
             fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
                             "fall through to the f32 kernel\n");
@@ -2414,7 +2437,7 @@ static int attention_prefill_mixed_launch(
                                                   (const float *)raw_kv->ptr,
                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                   n_tokens, n_comp, window, ratio,
-                                                  n_head, head_dim);
+                                                  n_head, head_dim, comp_kv_pack);
     return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
 }
 
@@ -2433,10 +2456,12 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        uint32_t                comp_kv_pack) {
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+                                       n_comp, window, ratio, n_head, head_dim,
+                                       comp_kv_pack);
 }
 
 
