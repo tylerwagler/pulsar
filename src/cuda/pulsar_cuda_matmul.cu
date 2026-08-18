@@ -2406,23 +2406,6 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     if (g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        /* D6: f32 means f32 at EVERY width on this arm.
-         *
-         * The handle is created with CUBLAS_TF32_TENSOR_OP_MATH
-         * (pulsar_cuda_runtime.cu), so this Sgemm was computing with a 10-bit
-         * mantissa while widths 1..4 above it -- the GEMV and the nt kernel --
-         * compute in true f32.  Same weight, two precisions, chosen by batch
-         * width: the shape this codebase keeps re-finding, and reachable in
-         * production because the drafter's hc_head_fn ships as PULSAR_TENSOR_F32
-         * and DSpark drafts run to 16 rows.
-         *
-         * Pinned per call rather than at handle creation because the handle is
-         * shared: attention's cublasSgemmStridedBatched fallbacks ride the same
-         * math mode, and changing THOSE is a numerics decision with its own
-         * baseline, not part of removing a width threshold. */
-        cublasMath_t prev_math = CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasGetMathMode(g_cublas, &prev_math);
-        (void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
         cublasStatus_t st = cublasSgemm(g_cublas,
                                         CUBLAS_OP_T,
                                         CUBLAS_OP_N,
@@ -2437,7 +2420,6 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
                                         &beta,
                                         (float *)out->ptr,
                                         (int)out_dim);
-        (void)cublasSetMathMode(g_cublas, prev_math);
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
