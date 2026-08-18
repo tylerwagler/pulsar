@@ -1,6 +1,15 @@
 #include "pulsar_gpu.h"
-#include "pulsar.h"
-#include "engine/pulsar_engine_internal.h"
+
+/* PULSAR_ATTN_PACK row bytes, computed locally on purpose.  The engine has
+ * this arithmetic too, but its macro goes through the shape GLOBAL and this
+ * smoke links only the CUDA layer -- no engine objects, no model.  Must match
+ * PULSAR_ATTN_PACK_ROWBYTES in src/cuda/pulsar_cuda_internal.h:
+ * [n_nope e4m3][n_nope/64 E8M0, padded to 4][n_rot bf16] = 584 B at 512/64. */
+#define SMOKE_ATTN_NROT 64u
+#define SMOKE_ATTN_ROWBYTES(HD) \
+    ((uint64_t)((HD) - SMOKE_ATTN_NROT) + \
+     ((((uint64_t)((HD) - SMOKE_ATTN_NROT) / 64u) + 3u) & ~3ull) + \
+     (uint64_t)SMOKE_ATTN_NROT * 2u)
 
 #include <math.h>
 #include <stdint.h>
@@ -113,7 +122,7 @@ static int check_decode_attention_overflow_path(void) {
     pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
-    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
+    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
     pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
     int rc = 1;
     if (heads && q && raw && raw_f32 && comp &&
@@ -198,7 +207,7 @@ static int check_dspark_non_causal_attention(void) {
     pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * q_count * sizeof(float));
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
-    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
+    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
     if (heads_c && heads_nc && q && raw && raw_f32 &&
         pulsar_gpu_tensor_write(q, 0, q_host, (uint64_t)n_tokens * q_count * sizeof(float)) &&
@@ -658,7 +667,7 @@ static int check_multibank_decode_attention(void) {
     for (uint64_t i = 0; i < raw_count; i++) raw_host[i] = mb_rand();
     for (uint64_t i = 0; i < comp_count; i++) comp_host[i] = mb_rand();
 
-    const uint64_t raw_row_b = PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    const uint64_t raw_row_b = SMOKE_ATTN_ROWBYTES(head_dim);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw_slab = pulsar_gpu_tensor_alloc((uint64_t)n_banks * raw_cap * raw_row_b);
     pulsar_gpu_tensor *comp_slab = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
@@ -1085,10 +1094,10 @@ static int check_multibank_raw_store(void) {
      * head_dim > n_rot with the nope span divisible by the scale block, so the
      * old 32-wide fixture cannot be expressed in the format the ring now holds.
      * The f16/f32 loop is gone with it -- there is one ring format. */
-    const uint32_t n_banks = 2, raw_cap = 64, head_dim = PULSAR_N_HEAD_DIM, n_rows = 4;
+    const uint32_t n_banks = 2, raw_cap = 64, head_dim = 512, n_rows = 4;
     const int32_t pos_host[4] = {100, 5, 6, 7};    /* 100 % 64 = 36 (wrap) */
     const int32_t sid_host[4] = {0, 1, 1, -1};     /* row 3 dead */
-    const uint64_t row_bytes = PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    const uint64_t row_bytes = SMOKE_ATTN_ROWBYTES(head_dim);
     const uint64_t bank_bytes = (uint64_t)raw_cap * row_bytes;
     const uint64_t total = (uint64_t)n_banks * bank_bytes;
     const uint64_t kv_count = (uint64_t)n_rows * head_dim;
