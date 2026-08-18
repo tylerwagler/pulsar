@@ -1680,9 +1680,9 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                     : "generic per-token kernel"));
     }
     if (n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
+        /* bf16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
          * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
-         * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
+         * (PULSAR_CUDA_ATTN_F16=0 opts out): bf16 operands change the numbers,
          * and the suite-v1 KL run is what cleared the flip — the component
          * measurement (tests/attn_precision_fidelity.cc: top-1 attention
          * position preserved ~100%, KL <= 3e-7) was evidence, not the gate.
@@ -1694,8 +1694,8 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
             static int announced = 0;
             if (!announced) {
                 announced = 1;
-                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
+                fprintf(stderr, "pulsar: attention = bf16 tensor-core tier "
+                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to bf16)\n");
             }
             /* Only the fp16 tier can emit the grouped E4M3 encoding.  If it
              * declines the batch we fall through WITHOUT setting *mx_out, so
@@ -1911,7 +1911,7 @@ static int attention_decode_batch_launch(
         return 0;
     }
     if (n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
+        /* bf16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
          * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
          * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
          * fp16 decomposition applies.  True decode (n_tokens == 1) never
@@ -1923,7 +1923,7 @@ static int attention_decode_batch_launch(
             static int announced_dc = 0;
             if (!announced_dc) {
                 announced_dc = 1;
-                fprintf(stderr, "pulsar: continued-prefill attention = fp16 tensor-core tier\n");
+                fprintf(stderr, "pulsar: continued-prefill attention = bf16 tensor-core tier\n");
             }
             if (pulsar_gpu_attention_f16_indexed(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
@@ -2174,7 +2174,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
-        /* fp16 tensor-core tier for the indexed path -- it replaced the f32
+        /* bf16 tensor-core tier for the indexed path -- it replaced the f32
          * kernel that was the largest single entry in the prefill map
          * (12.5%).  Banked descriptors and ATTN_PACK comp rows ride the fp16
          * tier too, each behind its own gate: bank isolation is proven
@@ -2188,7 +2188,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
             static int announced = 0;
             if (!announced) {
                 announced = 1;
-                fprintf(stderr, "pulsar: indexed attention = fp16 tensor-core tier\n");
+                fprintf(stderr, "pulsar: indexed attention = bf16 tensor-core tier\n");
             }
             if (pulsar_gpu_attention_f16_indexed(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
@@ -2311,7 +2311,7 @@ static int attention_prefill_mixed_launch(
                                     : "generic per-token kernel"));
     }
     if (allow_fused && n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
+        /* bf16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
         static const int use_f16_attn_mixed = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
@@ -2319,8 +2319,8 @@ static int attention_prefill_mixed_launch(
             static int announced = 0;
             if (!announced) {
                 announced = 1;
-                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
+                fprintf(stderr, "pulsar: attention = bf16 tensor-core tier "
+                                "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to bf16)\n");
             }
             if (pulsar_gpu_attention_f16_prefill(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
