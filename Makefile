@@ -154,13 +154,31 @@ cuda-regression: tests/cuda_long_context_smoke
 # arch; pin it so the default can never decide whether a gate is honest.
 ATTN_GATE_ARCH ?= sm_120f
 
-tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile
+# ⚠ THESE THREE #include A SHIPPED .cu AND MUST DEPEND ON IT.
+#
+# Each of these tests compiles one .cu that pulls in the real kernel source, so
+# the engine is genuinely a prerequisite -- and until 2026-08-18 the rules said
+# only "<test>.cu Makefile".  Every kernel change since the KV format was
+# unified therefore left them UP TO DATE, and all three sat stale for days:
+# attn_f16_kernel_test was feeding f32 rows to a packed reader and would have
+# reported 598016 NaNs the moment it was rebuilt.  It took deleting the vendored
+# MMQ headers to force that rebuild.
+#
+# This is the failure the -B note further down predicts almost word for word --
+# "make would then see moe.o as up to date ... and print PASS -- the gate would
+# certify a kernel it never compiled" -- arriving on the TEST side rather than
+# the engine side.  Project-wide -MMD -MP remains the real fix; these explicit
+# prerequisites are the part that can land without restructuring the file.
+tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile
+tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile
+tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile \
+                            src/cuda/pulsar_cuda_attention.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
