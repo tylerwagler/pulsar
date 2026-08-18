@@ -281,46 +281,35 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
  * non-idempotency that forced quantize_fp8=false in the pack prefill paths).
  * Sub-1e-3-relative on isolated dims; acceptable for session restore, but do
  * NOT rely on save/load being bit-exact under pack. */
+/* The comp cache is written in the format it is HELD in: PULSAR_ATTN_PACK rows.
+ *
+ * Payload v3 stored f32. Saving dequantised 584 B rows into 2048 B, wrote that,
+ * and loading read it back and re-encoded -- a full round trip through a format
+ * neither end holds, for a file 3.5x larger than its own contents. The f32 buffer
+ * that round trip needed was the last f32 KV allocation in the engine.
+ *
+ * It also removes the re-encode entirely, which is worth more than the bytes: the
+ * load side needed the EXACT-scale repack because "the fast-math quantize bucket
+ * is not bit-idempotent at scale boundaries". Copying packed bytes cannot lose an
+ * idempotence it never invokes. */
 static int payload_write_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                         uint32_t n_rows, uint8_t *buf, size_t cap,
                                         char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float);
-    pulsar_gpu_tensor *src = g->attn_comp_dequant;
-    if (n_rows != 0) {
-        if (!src ||
-            pulsar_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il],
-                                             src, n_rows,
-                                             PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
-            payload_set_err(err, errlen, "failed to dequantize packed attn comp cache for session save");
-            return 1;
-        }
-    }
     if (n_rows == 0) return 0;
-    return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    return payload_write_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
+                                     buf, cap, err, errlen);
 }
 
 static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                        uint32_t n_rows, uint8_t *buf, size_t cap,
                                        uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float);
-    if (!g->attn_comp_dequant) {
-        payload_set_err(err, errlen, "packed attn comp cache staging missing on session load");
-        return 1;
-    }
-    int rc = payload_read_tensor_span(fp, g->attn_comp_dequant, 0, bytes,
-                                      buf, cap, remaining, err, errlen);
-    if (rc != 0) return rc;
-    /* Exact-scale repack: file rows are already roundtripped, and the
-     * fast-math quantize bucket is not bit-idempotent at scale boundaries. */
-    if (pulsar_gpu_attn_pack_repack_tensor(g->attn_comp_dequant,
-                                        g->layer_attn_comp_cache[il],
-                                        0, n_rows,
-                                        PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
-        payload_set_err(err, errlen, "failed to repack attn comp cache on session load");
-        return 1;
-    }
-    return 0;
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    /* Straight into the packed cache: the file holds exactly what it holds, so
+     * there is no staging buffer and no re-encode on either side. */
+    return payload_read_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
+                                    buf, cap, remaining, err, errlen);
 }
 
 

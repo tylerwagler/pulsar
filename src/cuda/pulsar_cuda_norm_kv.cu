@@ -664,28 +664,6 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
     }
 }
 
-/* PULSAR_ATTN_PACK dequant: packed rows -> f32 rows (nope = e4m3 value *
- * 2^(e8-127), rope = bf16 widened).  Bit-identical to the f32 cache values. */
-__global__ static void attn_pack_dequant_kernel(const uint8_t *in, float *out, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_rows) return;
-    const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t nblk_pad = (n_nope / PULSAR_FP8_KV_BLOCK + 3u) & ~3u;
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const uint8_t *inr = in + (uint64_t)row * rowbytes;
-    const uint8_t *sc = inr + n_nope;
-    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(inr + n_nope + nblk_pad);
-    float *outr = out + (uint64_t)row * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        if (d < n_nope) {
-            outr[d] = dsv4_e4m3fn_decode_dev(inr[d],
-                                             dsv4_e8m0_decode_scale_dev(sc[d / PULSAR_FP8_KV_BLOCK]));
-        } else {
-            outr[d] = __bfloat162float(rope[d - n_nope]);
-        }
-    }
-}
-
 /* Exact e4m3 (max_repr 448) scale bucket for repacking already-roundtripped
  * attn KV rows; see dsv4_e8m0_encode_scale_exact_dev for the bit-pattern trick. */
 __device__ static inline uint8_t attn_pack_exact_e8_dev(float amax) {
@@ -1296,24 +1274,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                            out_row0, n_rows, head_dim, n_rot,
                                            NULL, NULL, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attn_pack_store launch");
-}
-
-/* PULSAR_ATTN_PACK dequant: the first n_rows packed rows -> f32 rows in `out`. */
-int pulsar_gpu_attn_pack_dequant_tensor(const pulsar_gpu_tensor *in,
-                                                pulsar_gpu_tensor *out,
-                                                uint32_t n_rows,
-                                                uint32_t head_dim,
-                                                uint32_t n_rot) {
-    if (!in || !out || n_rows == 0 ||
-        n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
-        ((head_dim - n_rot) % PULSAR_FP8_KV_BLOCK) != 0 ||
-        in->bytes < (uint64_t)n_rows * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        out->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
-        return 0;
-    }
-    attn_pack_dequant_kernel<<<n_rows, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr,
-                                              n_rows, head_dim, n_rot);
-    return cuda_ok(cudaGetLastError(), "attn_pack_dequant launch");
 }
 
 /* PULSAR_ATTN_PACK REPACK-ONLY entry (session load): pack n_rows f32 rows that

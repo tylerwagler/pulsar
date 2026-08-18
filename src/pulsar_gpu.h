@@ -617,13 +617,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-int pulsar_gpu_attn_pack_dequant_tensor(
-        const pulsar_gpu_tensor *in,
-        pulsar_gpu_tensor       *out,
-        uint32_t               n_rows,
-        uint32_t               head_dim,
-        uint32_t               n_rot);
-
 /* Repack-only variant for session load: packs ALREADY-roundtripped f32 rows
  * with an exact integer-math scale bucket (value-idempotent; x unmodified).
  * The live emit path must keep using pulsar_gpu_attn_pack_quantize_store_tensor,

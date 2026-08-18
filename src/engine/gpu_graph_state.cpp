@@ -100,7 +100,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->comp_sc_cur);
     pulsar_gpu_tensor_free(g->comp_kv_cur);
     pulsar_gpu_tensor_free(g->attn_comp_stage);
-    pulsar_gpu_tensor_free(g->attn_comp_dequant);
     pulsar_gpu_tensor_free(g->idx_comp_stage);
     pulsar_gpu_tensor_free(g->comp_selected);
     pulsar_gpu_tensor_free(g->indexer_scores);
