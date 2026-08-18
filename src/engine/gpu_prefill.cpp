@@ -1885,16 +1885,26 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * consumer could not read packed.  It can now:
                                                                         * the f16 prefill entry takes comp_pack, and
                                                                         * the scalar mixed kernel reads packed too, so
-                                                                        * both arms of this launch are covered. */
-                                                                       mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                            : g->layer_attn_comp_cache[il],
+                                                                        * the f16 tier's arm of this launch is covered.
+                                                                        * NOT the tier-off arm: with the tier off this
+                                                                        * launch falls through to the cuBLAS two-GEMM
+                                                                        * path, whose pack kernel indexes
+                                                                        * comp_kv[c * head_dim + d] as f32. 079e9b1
+                                                                        * taught the SCALAR mixed kernel to read
+                                                                        * packed and never that one, so pk_native
+                                                                        * still selects the format here, exactly as
+                                                                        * at the five sibling sites. */
+                                                                       pk_native
+                                                                           ? (mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                                                                                   : g->layer_attn_comp_cache[il])
+                                                                           : gpu_graph_attn_comp_read_cache(g, il, n_comp),
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
                                                                        PULSAR_N_HEAD_DIM,
-                                                                       1u) != 0;
+                                                                       pk_native ? 1u : 0u) != 0;
             if (ok) batch_attention_done = true;
         }
     }
