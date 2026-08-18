@@ -1340,6 +1340,75 @@ int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gp
 }
 
 
+/* Scatter ALREADY-PACKED rows into the ring.  Row mapping is copied verbatim
+ * from attn_pack_store_kernel above, because the two must agree on which ring
+ * slot a batch row lands in; the only difference is that this one moves bytes
+ * instead of quantising.
+ *
+ * That difference is the point.  The prefill producer packs its chunk once
+ * (attn_pack_quantize_store_tensor, which also round-trips the f32 in place),
+ * and the ring store then re-quantised THAT ALREADY-ROUND-TRIPPED buffer --
+ * which is the exact pattern the warning at the top of this file calls out:
+ * feeding already-quantized data to a fresh quantizer takes the misround rate
+ * from 1e-7 to ~5% at E4M3 scale boundaries.  The old call site argued the two
+ * agree because both use the same fast-math scale; the warning says that bucket
+ * is not bit-idempotent.  Copying the bytes makes the question moot -- the ring
+ * gets exactly what attention read, by construction rather than by argument. */
+__global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
+                                                uint32_t out_row0, uint32_t n_rows,
+                                                uint32_t head_dim,
+                                                const int32_t *__restrict__ positions,
+                                                const int32_t *__restrict__ seq_id,
+                                                uint32_t n_banks, uint32_t raw_cap) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    uint64_t dst_row;
+    if (raw_cap) {
+        if (seq_id && (uint32_t)seq_id[row] >= n_banks) return;   /* dead row stores nothing */
+        const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
+        dst_row = (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
+    } else {
+        dst_row = (uint64_t)(out_row0 + row);
+    }
+    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    const uint8_t *sr = src + (uint64_t)row * rowbytes;
+    uint8_t *dr = out + dst_row * rowbytes;
+    for (uint32_t b = threadIdx.x; b < (uint32_t)rowbytes; b += blockDim.x) dr[b] = sr[b];
+}
+
+int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
+                                                uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
+                                                const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
+                                                uint32_t n_banks) {
+    const int descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         (uint64_t)n_banks * raw_cap > 4294967296ull)) {
+        fprintf(stderr,
+                "pulsar: banked packed raw store rejected: bad descriptor args "
+                "(n_tokens=%u n_banks=%u raw_cap=%u)\n",
+                n_tokens, n_banks, raw_cap);
+        return 0;
+    }
+    const uint64_t kv_banks = descr ? n_banks : 1u;
+    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    if (!raw_cache || !packed || raw_cap == 0 ||
+        head_dim <= PULSAR_ATTN_PACK_NROT ||
+        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0 ||
+        raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
+        packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
+    if (n_tokens == 0) return 1;
+    attn_pack_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr,
+                                               (uint8_t *)raw_cache->ptr,
+                                               pos0, n_tokens, head_dim,
+                                               descr ? (const int32_t *)positions->ptr : NULL,
+                                               descr ? (const int32_t *)seq_id->ptr : NULL,
+                                               descr ? n_banks : 1u, raw_cap);
+    return cuda_ok(cudaGetLastError(), "raw pack scatter launch");
+}
+
 int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
     /* Descriptor (banked) mode: both arrays or neither; the raw cache operand

@@ -941,8 +941,8 @@ bool gpu_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
-    if (ok && zero_prefix) ok = pulsar_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                                    g->batch_kv,
+    if (ok && zero_prefix) ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il],
+                                                                    g->batch_kv_pack,
                                                                     g->raw_cap,
                                                                     pos0,
                                                                     n_tokens,
@@ -977,9 +977,9 @@ bool gpu_graph_encode_layer_attention_batch(
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g,
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
-        ok = pulsar_gpu_store_raw_kv_batch_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
+        ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
                                                     : g->layer_raw_cache[il],
-                                                 g->batch_kv,
+                                                 g->batch_kv_pack,
                                                  g->raw_cap,
                                                  pos0,
                                                  n_tokens,
@@ -1727,9 +1727,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                       n_raw);
             double index_stage_t0 = 0.0;
 
-            ok = pulsar_gpu_store_raw_kv_batch_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
+            ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
                                                         : g->layer_raw_cache[il],
-                                                     g->batch_kv,
+                                                     g->batch_kv_pack,
                                                      g->raw_cap,
                                                      pos0,
                                                      n_tokens,

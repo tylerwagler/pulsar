@@ -1514,8 +1514,12 @@ bool gpu_graph_dspark_draft_forward(
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL) != 0;
-        if (ok) ok = pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
-            g->batch_kv, n_draft, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
+        /* No fake-quantise pass here.  batch_kv has no reader after the store
+         * below, and that store packs the rows itself -- so round-tripping first
+         * only fed already-quantized values to a fresh quantizer, which is the
+         * ~5%-misround pattern norm_kv warns about.  Packing the true f32 once
+         * is both cheaper and closer to what the target path does for the same
+         * token, which is what verification compares against. */
 
         /* --- Store draft KV transiently in ring buffer for attention --- */
         const uint32_t saved_n_raw = g->dspark_n_raw[li];

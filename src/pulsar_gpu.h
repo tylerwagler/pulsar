@@ -727,6 +727,22 @@ int pulsar_gpu_store_raw_kv_batch_tensor(
         const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
 
+/* Same scatter, but the source rows are ALREADY PULSAR_ATTN_PACK.  Prefer this
+ * wherever the caller has already packed the batch: re-quantising a buffer that
+ * has been round-tripped is the ~5%-misround pattern the norm_kv header warns
+ * about, and a byte copy makes the ring agree with what attention read by
+ * construction instead of by argument. */
+int pulsar_gpu_store_raw_kv_batch_packed_tensor(
+        pulsar_gpu_tensor       *raw_cache,
+        const pulsar_gpu_tensor *packed,
+        uint32_t                raw_cap,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        uint32_t                n_banks);
+
 /* =========================================================================
  * KV Compression and Attention.
  * =========================================================================
