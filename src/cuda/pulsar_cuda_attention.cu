@@ -2170,17 +2170,25 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * sampled; top-10 reorders and a greedy stream diverges within a token or
      * two).  Each build stays perfectly deterministic run to run.  Prefill is
      * untouched — it already took this kernel. */
-    /* The packed-comp clause below excludes multi-token non-descriptor calls
-     * because the f32 indexed kernel cannot read ATTN_PACK rows there.  The
-     * fp16 tier CAN, so it has to widen the gate -- nesting it inside meant a
-     * caller that passed packed rows silently fell through to the generic
-     * path instead, which measured 2.3x SLOWER and logged nothing, because the
-     * tier was never reached to refuse. */
+    /* There WAS a packed-comp clause here excluding multi-token non-descriptor
+     * calls, on the grounds that "the f32 indexed kernel cannot read ATTN_PACK
+     * rows there".  It can, and could all along: BOTH arms below take
+     * comp_kv_pack and decode through attn_comp_pack_ld --
+     * attention_indexed_mixed_heads8_online in its smem staging, and the
+     * generic attention_indexed_mixed_kernel in the dot and the accumulation.
+     * Decode has proved it every step since the format was unified: at
+     * n_tokens == 1 the clause admitted packed rows and routed them to exactly
+     * this heads8 kernel.
+     *
+     * Keeping it cost more than speed once all six prefill sites went packed:
+     * the clause started REFUSING the shipped shape, so multi-token tier-off
+     * fell through to the generic kernel -- 2.3x slower, and a different float
+     * accumulation order, which moved the tier-off logits (max 29.474 ->
+     * 28.028 on a 5530-token prompt).  Dropping it puts that shape back on the
+     * heads8 kernel and the value back. */
     const int f16_idx_ok = pulsar_gpu_attention_prefill_reads_packed_comp() &&
                            head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u;
-    if (head_dim == 512 && top_k <= 512u &&
-        (descr || !comp_kv_pack || n_tokens == 1u || f16_idx_ok) &&
-        !no_indexed_heads8) {
+    if (head_dim == 512 && top_k <= 512u && !no_indexed_heads8) {
         /* rb4 twopass has no pack support, so pack (and banked) always take the
          * online branch. */
         /* fp16 tensor-core tier for the indexed path -- it replaced the f32
