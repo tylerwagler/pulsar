@@ -1099,16 +1099,11 @@ static int routed_moe_launch_mixed40(
  * prealigned branch and the cache never repacked anything.  With it go the
  * 256-entry table, the budget probe, and the raw-forever pinning. */
 
-/* The vendored adapter references this ds4-engine hook from its q8-fold vec
- * (decode) path: given an activation pointer it may hand back pre-quantized
- * canonical q8_1 codes so the caller can skip its quantize prelude.  pulsar has
- * no such registry, and the path is single-token only (n_tokens != 1 bails
- * before this), so prefill never reaches it.  "No fold available" satisfies the
- * link -- the same stub Palaferri's own cuda/mmq/test TUs use. */
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim, const void **q81) {
-    (void)src; (void)in_dim; (void)q81;
-    return 0;
-}
+/* The ds4_cuda_q8_fold_take_q81 stub stood here.  The vendored adapter called it
+ * from its q8-fold vec path to ask for pre-quantized canonical q8_1 codes;
+ * pulsar never had such a registry, so the stub always answered "no fold" and
+ * existed purely to satisfy the link.  That path went with the mmvq half in
+ * ledger L066 step 2, so the stub has no caller and no reason to exist. */
 
 __global__ static void moe_mmq_swiglu_fold_kernel(
         float *mid_out,

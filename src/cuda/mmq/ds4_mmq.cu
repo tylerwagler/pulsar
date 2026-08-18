@@ -112,27 +112,6 @@ private:
 
 
 
-// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
-// A hit returns canonical block_q8_1 codes for this exact activation
-// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
-// its quantize prelude.  Only valid for single-token unpadded rows
-// (ne10_padded == K); the registry itself guarantees freshness (slots are
-// reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         const void **q81);
-static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
-                                int64_t ne10_padded) {
-    if (n_tokens != 1 || ne10_padded != K) return nullptr;
-    const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
-    static int logged = 0;
-    if (!logged) {
-        logged = 1;
-        fprintf(stderr, "ds4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
-    }
-    return (char *)(uintptr_t)p;
-}
-
 /* DS4_MMQ_D2R and DS4_MMQ_D2R_IQ2 are GONE (2026-08-15).  Both were
  * default-ON kill switches back to the mul_mat_q SoA-tile path, and a
  * repo-wide grep found ZERO setters -- no test, no script, no Makefile, no
@@ -854,224 +833,28 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
 }
 
 
-// ----------------------------------------------------------------------------
-// mmvq-backed entry points (Step 6 of the optimization plan).
-//
-// mmvq is upstream's matrix-vector matmul family, optimised for the
-// n_tokens <= MMVQ_MAX_BATCH_SIZE=8 regime. Unlike mmq it consumes the
-// CANONICAL block_q8_1 layout (via quantize_row_q8_1_cuda), not the
-// interleaved block_mx_act_mmq that quantize_mmq_q8_1_cuda produces.
-//
-// The single-W _moe_vec entries cover:
-//   - the down matmul at decode (treating [n_tokens=1, n_expert_used=6]
-//     as [n_tokens=6, n_expert_used=1])
-//   - dense attention projections at decode (n_tokens=1, no MoE)
-//   - any small-batch path where mmvq's per-token grid wins over mmq's
-//     tile-based approach
-//
-// The pair-fused _moe_pair_vec entries cover the gate+up matmuls at
-// decode using mmvq's built-in fusion. fusion.gate is the up_w pointer
-// and fusion.glu_op is GGML_GLU_OP_SWIGLU - the kernel computes
-// silu(gate@x) * (up@x) in a single launch. mmvq's fusion is supported
-// only at ncols_dst=1, so n_tokens=1 is the only valid case.
-// ----------------------------------------------------------------------------
-
-#include "mmvq.cuh"
-#include "ds4_mmvq.cuh"
-
-namespace {
-
-
-
-
-
-
-
-
-template <ggml_type type> struct ds4_mmq_vdr_mmvq_value;
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
-template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q4_K>    { static constexpr int value = VDR_Q4_K_Q8_1_MMVQ; };
-
-template <ggml_type type>
-static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
-        const void * __restrict__ W,
-        const block_q8_1 * __restrict__ X_q8,
-        const int & kbx,
-        const int & iqs) {
-    if constexpr (type == GGML_TYPE_IQ2_XXS) {
-        return vec_dot_iq2_xxs_q8_1(W, X_q8, kbx, iqs);
-    } else if constexpr (type == GGML_TYPE_Q2_K) {
-        return vec_dot_q2_K_q8_1(W, X_q8, kbx, iqs);
-    } else {
-        static_assert(type == GGML_TYPE_Q4_K, "unsupported fused vector type");
-        return vec_dot_q4_K_q8_1(W, X_q8, kbx, iqs);
-    }
-}
-
-static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
-    const uint32_t mask = 0xffffu << (threadIdx.x & 16u);
-    for (int offset = 8; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset, 16);
-    }
-    return v;
-}
-
-
-
-
-
-
-
-
-} // anonymous namespace
-
-
-
-
-
-
-
-// ---------------------------------------------------------------------------
-// Aligned-SoA Q8_0 dense decode matvec (megakernel program M1-Inc3).
-//
-// block_q8_0 is 34 bytes ([half d][int8 qs[32]]), so the raw code stream is
-// only 2-byte aligned — the same misalignment class proto_iq2_aligned proved
-// costly.  Artifact layout (weight server --repack-q8-aligned, derived kind
-// DERIVED_Q8_0_ALIGNED_DENSE): [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]]
-// with nblk = M * (K/32), block order equal to the raw tensor byte order.
-// Unlike the IQ2 expert repack, the raw spans stay SERVED (dense tensors are
-// ~6 GiB total, affordable to duplicate), so every other consumer is
-// unchanged.  proto_q8_aligned.cu A/B (GB10, L2-defeating rotation, double-ref
-// parity): attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
-// 199->230, head 224->243 GB/s; the warp-per-row accumulation is also ~1000x
-// closer to the double reference than the mmvq tile order at K>=4096.
-__global__ void q8_0_aligned_dense_vec_kernel(
-        float             *out,        // [M]
-        const int4        *qs,         // aligned codes, 2 int4 per block
-        const __half      *dq,         // block scales
-        const block_q8_1  *x8,         // [K/32] canonical Q8_1 activation
-        int                M,
-        int                nb)         // blocks per row = K/32
-{
-    const int row  = blockIdx.x;
-    const int lane = threadIdx.x;
-    const long long rbase = (long long)row * nb;
-
-    float acc = 0.0f;
-    for (int b0 = 0; b0 < nb; b0 += 32) {
-        const int b = b0 + lane;
-        const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B loads
-        const int4 w1 = qs[(rbase + b) * 2 + 1];
-        const int *u = (const int *)x8[b].qs;
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
-        sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
-        sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
-        sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
-        sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
-        sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
-        sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
-        sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
-        acc += __half2float(dq[rbase + b]) * __low2float(x8[b].ds) * (float)sumi;
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) out[row] = acc;
-}
-
-
-extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
-        const void * W_aligned, const float * X_f32, float * out_f32,
-        int M, int N, int K, cudaStream_t stream) {
-    const char *tag = "ds4_mmq_q8_0_aligned_dense_vec";
-    if (!W_aligned || !X_f32 || !out_f32) {
-        fprintf(stderr, "%s: null pointer\n", tag);
-        return -1;
-    }
-    // K % 1024: the kernel's 32-blocks-per-pass loop needs nb % 32 == 0.
-    if (N != 1 || M <= 0 || K <= 0 || K % 1024 != 0) return -1;
-
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
-    if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
-        return -1;
-    }
-    ds4_pool_set_stream(stream);
-    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
-    const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> q8_pool;
-    // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
-    // kernel) -- take them and skip the quantize prelude.
-    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded);
-    cudaError_t err;
-    if (!x8) {
-    q8_pool.alloc(ctx->pool(), nbytes_q8_1);
-    x8 = q8_pool.get();
-    quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)x8,
-        GGML_TYPE_Q8_0, /*ne00=*/K,
-        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
-        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
-        stream);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
-        return -2;
-    }
-    }
-
-    const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
-    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
-    q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
-        out_f32,
-        (const int4 *)((const char *)W_aligned + dq_bytes),
-        (const __half *)W_aligned,
-        (const block_q8_1 *)x8, M, K / 32);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
-        return -3;
-    }
-    return 0;
-}
-
-
-
-
-
-extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
-    if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0) return 0;
-    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
-    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
-    return dq_bytes + nblk * 64u;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Explicit instantiations. One per quant type the public API exposes.
-// Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
-// device functions from mmq.cuh, so the .o objects below contain everything
-// needed to link against the public C entries.
-template void mul_mat_q_case<GGML_TYPE_Q8_0>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
-template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
-template void mul_mat_q_case<GGML_TYPE_Q4_K>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+/* REMOVED 2026-08-18 (ledger L066, extraction step 2): the mmvq-backed half.
+ *
+ * It held ds4_mmq_q8_0_aligned_dense_vec, its q8_0_aligned_dense_vec_kernel,
+ * ds4_mmq_vec_dot_q8_1, ds4_mmq_iq2_xxs_aligned_bytes, and the explicit
+ * mul_mat_q_case<Q8_0/IQ2_XXS/Q4_K> instantiations.  Every one had ZERO
+ * undefined references anywhere in the object set -- defined, linked, and
+ * called by nothing.
+ *
+ * That is not an accident of this audit.  The only path that could still have
+ * reached mul_mat_q_case makes D2R a hard REQUIREMENT and fails closed rather
+ * than falling back to q8_1 ("one activation format, every batch size, or an
+ * error that says which precondition broke"), so once the routed experts moved
+ * to E4M3 the vendored kernels became unreachable by construction.
+ *
+ * The instantiation comment claimed these "drag in the load_tiles_<type> +
+ * vec_dot_<type> device functions ... so the .o objects contain everything
+ * needed to link against the public C entries".  True when written; the public
+ * C entries stopped going through mul_mat_q_case, and the comment did not
+ * notice.  It is the reason the vendored kernel family looked load-bearing.
+ *
+ * This also drops the last consumer of ds4_cuda_q8_fold_take_q81, the
+ * producer-emitted-q8_1 registry callback, which is removed above. */
 
 /* pulsar (plan 41b): IQ2_XXS single-tensor MoE over the aligned-SoA artifact.
  * Upstream has q2_K_moe_soa (single) and iq2_xxs_moe_pair_soa (pair) but no

@@ -197,13 +197,13 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
 //
 // where nblk = n_experts * M * (K / 256) and block linear order matches the
 // raw tensor byte order (expert-major, then row, then block).  The weight
-// server builds this layout (--repack-iq2-aligned); use
-// ds4_mmq_iq2_xxs_aligned_bytes to size or validate an artifact.
+// server builds this layout (--repack-iq2-aligned).  The
+// ds4_mmq_iq2_xxs_aligned_bytes sizing oracle that used to be named here was
+// removed in L066 step 2 -- it had no callers.
 //
 // Semantics and output layout are identical to ds4_mmq_iq2_xxs_moe_vec at
 // n_tokens == 1 (the only supported width; other widths return non-zero so
 // the caller can fall back).
-uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts);
 
 
 // M2 moe-down: aligned row-pair-SoA Q2_K routed-expert decode matvec.  Twin
@@ -232,14 +232,8 @@ uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts);
 // ds4_mmq_iq2_xxs_aligned_derepack).
 
 
-int ds4_mmq_q8_0_aligned_dense_vec(
-    const void  * W_aligned,
-    const float * X_f32,
-    float       * out_f32,
-    int           M,
-    int           N,
-    int           K,
-    cudaStream_t  stream);
+/* ds4_mmq_q8_0_aligned_dense_vec was declared here; removed in L066 step 2
+ * along with the whole mmvq-backed half, which nothing referenced. */
 
 // Fused down+sum vector entries for routed MoE with top_k=6. These preserve
 // the canonical Q8_1 activation quantization used by the regular _moe_vec

@@ -407,7 +407,8 @@ enum {
      * Producer: gguf-tools/repack_iq2_mmq.py.  Layout spec and the device
      * twin that must stay byte-identical to it:
      * ds4_repack_iq2_aligned_device() in src/cuda/mmq/ds4_repack.cu; size
-     * oracle ds4_mmq_iq2_xxs_aligned_bytes() in src/cuda/mmq/ds4_mmq.h.
+     * sizing rule documented in src/cuda/mmq/ds4_mmq.h (its
+     * ds4_mmq_iq2_xxs_aligned_bytes oracle was removed unused, L066 step 2).
      * Consumers: ds4_mmq_iq2_xxs_moe_pair_soa (gate/up) and
      * ds4_mmq_iq2_xxs_moe_soa (down).
      *
