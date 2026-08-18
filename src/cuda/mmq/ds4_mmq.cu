@@ -10,7 +10,7 @@
 
 #include "ds4_mmq.h"
 
-#include "common.cuh"
+#include "ds4_cuda_env.cuh"
 #include "../pulsar_cuda_scratch.h"
 #include "ds4_act_block.cuh"
 #include "mmid.cuh"

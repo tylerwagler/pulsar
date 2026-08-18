@@ -5,7 +5,7 @@
 
 #include <type_traits>
 
-#include "common.cuh"
+#include "ds4_cuda_env.cuh"
 #include "ds4_act_block.cuh"
 #include "mma.cuh"          /* ggml_cuda_mma::tile / load_ldmatrix */
 #include "ds4_mxfp8_mma.cuh"

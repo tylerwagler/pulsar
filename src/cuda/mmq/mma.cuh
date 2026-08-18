@@ -16,7 +16,7 @@
 // As described in the PTX documentation, all pointers for load_ldmatrix must be to shared memory and aligned to 16 bytes.
 // The API in this file also assumes that the pointers for load_generic are aligned to 16 bytes, unaligned pointers are considered undefined behavior.
 
-#include "common.cuh"
+#include "ds4_cuda_env.cuh"
 
 // On Volta each warp is doing 4 8x8 mma operations in parallel.
 // The basic memory layout for a 32x8 output tile is to stack 4 input tiles in I direction and to mirror the B tile.

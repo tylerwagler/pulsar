@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: MIT
 // ds4_ggml_stubs.h - minimal ggml-API stubs for ds4's vendored mmq kernels.
 //
-// The mmq.cuh / mma.cuh / vecdotq.cuh / quantize.cuh / mmid.cuh / common.cuh
-// files in this directory are vendored verbatim from llama.cpp's ggml-cuda
-// backend (MIT, copyright 2023-2026 The ggml authors). They transitively
-// #include "ggml.h", "ggml-impl.h", "ggml-cuda.h" - in ds4 those names
-// resolve to thin redirect headers in this directory which all #include this
-// stubs file.
+// The mma.cuh / mmid.cuh / mmid.cu files in this directory are vendored
+// verbatim from llama.cpp's ggml-cuda backend (MIT, copyright 2023-2026 The
+// ggml authors). They transitively #include "ggml.h", "ggml-impl.h",
+// "ggml-cuda.h" - in ds4 those names resolve to thin redirect headers in this
+// directory which all #include this stubs file.
 //
 // This file declares the minimum surface of the ggml API that the vendored
-// CUDA code references, EXCLUDING what's already provided by common.cuh
-// itself (compute-capability constants, MMA flags, ggml_cuda_device_info,
-// ggml_cuda_pool, ggml_cuda_pool_alloc, ggml_backend_cuda_context, the
-// CUDA_CHECK / CUBLAS_CHECK macros, ggml_cuda_get_device, ggml_cuda_set_device,
-// ggml_cuda_info). Those names live in common.cuh and we let it own them.
+// CUDA code references, EXCLUDING what ds4_cuda_env.cuh provides
+// (compute-capability constants, ggml_cuda_device_info, CUDA_CHECK,
+// ggml_cuda_get_device / ggml_cuda_set_device / ggml_cuda_info).  That file
+// replaced the vendored common.cuh on 2026-08-18; ggml_cuda_pool,
+// ggml_cuda_pool_alloc and ggml_backend_cuda_context are gone entirely.
+//
+// ⚠ SOME OF WHAT IS BELOW IS NOW DEAD.  struct ggml_tensor, ggml_nbytes and
+// ggml_glu_op existed for common.cuh's concurrent-event and fusion structs and
+// no live code references them any more -- a grep finds ggml_tensor only in
+// comments.  Not removed in the same commit that deleted common.cuh, so that
+// the deletion stays reviewable; trimming them is the obvious follow-on.
 //
 // Things this header DOES provide:
 //   * GGML_ASSERT / GGML_ABORT / GGML_UNUSED / GGML_UNUSED_VARS / GGML_PAD

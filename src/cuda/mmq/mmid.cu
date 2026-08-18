@@ -1,4 +1,4 @@
-#include "common.cuh"
+#include "ds4_cuda_env.cuh"
 #include "mmid.cuh"
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.

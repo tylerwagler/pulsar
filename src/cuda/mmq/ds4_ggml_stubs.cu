@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Implementations of the ggml-API stubs declared in ds4_ggml_stubs.h plus
 // the bodies of ggml_backend_cuda_context / ggml_cuda_info /
-// new_pool_for_device that the vendored common.cuh declares without
+// the device-info accessor that ds4_cuda_env.cuh declares without
 // defining.
 //
 // Phase 0: pool is plain cudaMallocAsync / cudaFreeAsync. Phase 4 swaps
 // in ds4's existing cuda_tmp_alloc slab allocator.
 
-#include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
+#include "ds4_cuda_env.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -22,11 +22,10 @@
 // Device info singleton.
 //
 // Common.cuh declares `const ggml_cuda_device_info & ggml_cuda_info();` -
-// we provide the body. The struct layout (common.cuh:1091) is:
-//   { int device_count; cuda_device_info devices[GGML_CUDA_MAX_DEVICES];
-//     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split; }
-// where cuda_device_info has { cc, nsm, smpb, smpbo, integrated, vmm,
-// vmm_granularity, total_vram, warp_size, supports_cooperative_launch }.
+// we provide the body.  The struct now lives in ds4_cuda_env.cuh and is
+//   { int device_count; cuda_device_info devices[GGML_CUDA_MAX_DEVICES]; }
+// where cuda_device_info has { cc, warp_size, smpbo } -- see the note there on
+// what was dropped from common.cuh's thirteen fields.
 // ----------------------------------------------------------------------------
 
 const ggml_cuda_device_info & ggml_cuda_info() {
@@ -44,23 +43,20 @@ const ggml_cuda_device_info & ggml_cuda_info() {
         for (int i = 0; i < count; i++) {
             cudaDeviceProp p;
             CUDA_CHECK(cudaGetDeviceProperties(&p, i));
-            info.devices[i].cc                          = p.major * 100 + p.minor * 10;
-            info.devices[i].nsm                         = p.multiProcessorCount;
-            info.devices[i].smpb                        = p.sharedMemPerBlock;
-            info.devices[i].smpbo                       = p.sharedMemPerBlockOptin;
-            info.devices[i].integrated                  = p.integrated != 0;
-            info.devices[i].vmm                         = false;
-            info.devices[i].vmm_granularity             = 0;
-            info.devices[i].total_vram                  = p.totalGlobalMem;
-            info.devices[i].warp_size                   = p.warpSize;
-            info.devices[i].supports_cooperative_launch = p.cooperativeLaunch != 0;
+            /* Three fields, because three fields are read: cc by the MMQ gate
+             * and the D2R availability checks, warp_size and smpbo by the
+             * mm_ids launchers.  The other ten upstream carries were filled
+             * here and read by nobody. */
+            info.devices[i].cc        = p.major * 100 + p.minor * 10;
+            info.devices[i].warp_size = p.warpSize;
+            info.devices[i].smpbo     = p.sharedMemPerBlockOptin;
         }
     });
     return info;
 }
 
 // ggml_cuda_get_device / ggml_cuda_set_device are declared (not defined) in
-// common.cuh. We provide thin wrappers.
+// ds4_cuda_env.cuh. We provide thin wrappers.
 
 int ggml_cuda_get_device() {
     int dev = 0;
@@ -84,8 +80,8 @@ int64_t ggml_time_us() {
 
 // ----------------------------------------------------------------------------
 // ggml_cuda_error: invoked by the CUDA_CHECK / CUBLAS_CHECK macros defined
-// in common.cuh on the error path. Marked [[noreturn]] in the declaration
-// (common.cuh:155) - abort() satisfies that contract.
+// in ds4_cuda_env.cuh on the error path. Marked [[noreturn]] in the
+// declaration there - abort() satisfies that contract.
 // ----------------------------------------------------------------------------
 
 [[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {

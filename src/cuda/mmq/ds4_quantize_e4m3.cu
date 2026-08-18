@@ -32,7 +32,7 @@
  * Prefer the gather -- see its comment for why it is a copy and not a re-encode. */
 
 #include "ds4_act_block.cuh"
-#include "common.cuh"
+#include "ds4_cuda_env.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 
 #include <cuda_fp8.h>
