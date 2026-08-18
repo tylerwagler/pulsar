@@ -288,6 +288,32 @@ __device__ static __forceinline__ float warp_max_f32(float v) {
     return v;
 }
 
+/* D7: round a Q vector onto the f16 grid, in registers.
+ *
+ * The fp16 tensor-core tier serves EVERY attention width except single-token
+ * decode (attention.cu gates it on n_tokens > 1 at all three entries), so
+ * speculative verify multiplied an f16 Q while the sequential decode of the
+ * same token multiplied an f32 one.  Acceptance depends on those two agreeing,
+ * and an operand-format difference is the class this codebase refuses.
+ *
+ * Q is the only operand that actually differs.  The tier stages KV as __half,
+ * but the packed ring is E4M3 nope + bf16 rope, and both are exactly
+ * representable in f16 (3 and 7 mantissa bits into 10, magnitudes far inside
+ * the range), so that conversion loses nothing the f32 kernel keeps.
+ *
+ * The softmax weights are deliberately NOT matched.  The tier rounds P after a
+ * block max and sums the rounded value; the decode kernels run an ONLINE
+ * softmax whose weight is rescaled every stage, so rounding it mid-stream is a
+ * different operation that would accumulate error the tier never incurs.
+ * Matching the input is right; emulating a different softmax's rounding is not. */
+__device__ static __forceinline__ float af16_round_f32(float v) {
+    return __half2float(__float2half(v));
+}
+__device__ static __forceinline__ float4 af16_round4(float4 v) {
+    return make_float4(af16_round_f32(v.x), af16_round_f32(v.y),
+                       af16_round_f32(v.z), af16_round_f32(v.w));
+}
+
 __device__ static __forceinline__ float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
