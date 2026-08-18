@@ -514,8 +514,14 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 /* v4 (2026-08-17): the attn comp cache is stored as PULSAR_ATTN_PACK rows
  * rather than dequantised f32. v3 files are refused by the header check --
  * deliberately, since the row stride changed and a v3 file read as v4 would
- * decode noise into a KV cache rather than fail. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(4)
+ * decode noise into a KV cache rather than fail.
+ * v5 (2026-08-18): the same for the raw ring (which was still being written as
+ * f32-expanded __half rows at the wrong stride) and the indexer comp cache
+ * (MXKV-FP4, 68 B/row, previously dequantised to 512 B f32 and re-encoded on
+ * load).  Every KV row in a payload is now stored in the format its cache holds
+ * it in, so a restore is a byte copy and re-encodes nothing.  Older files are
+ * refused for the same reason as before: the strides changed. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(5)
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 13u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);

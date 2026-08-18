@@ -158,7 +158,7 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
-            bytes += (uint64_t)g->layer_n_index_comp[il] * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += (uint64_t)g->layer_n_index_comp[il] * PULSAR_ENGINE_IDXFP4_ROWBYTES;
             bytes += layer_index_state_bytes(ratio);
             bytes += layer_index_state_bytes(ratio);
         }
@@ -227,50 +227,32 @@ static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
  * power-of-two block scales survive re-encoding); the one exception is a
  * 32-block whose amax sits below the mxkv encode floor (1e-20), which would
  * flush to zero — unreachable for RMS-normed indexer rows. */
+/* v5: the indexer comp cache is written in the format it is held in, exactly as
+ * v4 did for the attention comp cache.  It used to dequantise MXKV-FP4 rows into
+ * a 512 B/row f32 staging buffer, write that, and re-pack on load -- 68 B of
+ * content stored as 512 B, and a re-encode on every restore. */
 static int payload_write_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                     uint32_t n_rows, uint8_t *buf, size_t cap,
                                     char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    pulsar_gpu_tensor *src = g->layer_index_comp_cache[il];
-    if (n_rows != 0) {
-        if (!g->idx_comp_stage ||
-            pulsar_gpu_mxkv_dequant_tensor(g->layer_index_comp_cache[il],
-                                        g->idx_comp_stage,
-                                        PULSAR_ENGINE_MXKV_FMT_FP4,
-                                        n_rows,
-                                        PULSAR_N_INDEXER_HEAD_DIM) == 0) {
-            payload_set_err(err, errlen, "failed to dequantize fp4 indexer cache for session save");
-            return 1;
-        }
-        src = g->idx_comp_stage;
-    }
-    return payload_write_tensor_span(fp, src, 0, bytes, buf, cap, err, errlen);
+    if (n_rows == 0) return 0;
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    return payload_write_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
+                                     buf, cap, err, errlen);
 }
 
 static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                    uint32_t n_rows, uint8_t *buf, size_t cap,
                                    uint64_t *remaining, char *err, size_t errlen) {
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    if (n_rows == 0) {
-        return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
-                                        buf, cap, remaining, err, errlen);
-    }
-    if (!g->idx_comp_stage) {
-        payload_set_err(err, errlen, "fp4 indexer cache staging missing on session load");
-        return 1;
-    }
-    int rc = payload_read_tensor_span(fp, g->idx_comp_stage, 0, bytes,
-                                      buf, cap, remaining, err, errlen);
-    if (rc != 0) return rc;
-    if (pulsar_gpu_mxkv_pack_tensor(g->idx_comp_stage,
-                                 g->layer_index_comp_cache[il],
-                                 PULSAR_ENGINE_MXKV_FMT_FP4,
-                                 n_rows,
-                                 PULSAR_N_INDEXER_HEAD_DIM) == 0) {
-        payload_set_err(err, errlen, "failed to repack fp4 indexer cache on session load");
-        return 1;
-    }
-    return 0;
+    if (n_rows == 0) return 0;
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    /* Straight into the packed cache.  The old load path re-encoded through
+     * mxkv_pack_tensor, which needed the EXACT scale bucket to stay
+     * value-idempotent -- and 2026-08-18 measured that the fast-math bucket is
+     * NOT idempotent (removing an analogous double-quantise on the attn side
+     * moved acceptance).  Copying bytes cannot invoke an idempotence it never
+     * relies on, which is the same reason v4 gave for the attention rows. */
+    return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
+                                    buf, cap, remaining, err, errlen);
 }
 
 /* Attn comp cache spans under PULSAR_ATTN_PACK: session files always store f32
