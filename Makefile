@@ -387,7 +387,37 @@ context-coherence-probe:
 # PRICE ON THE RECORD, as with the last move: the KV work costs -4.6% decode and
 # -4.9 acceptance points (L061), kept deliberately for one KV format end to end.
 # If the drafter half is reverted the anchor moves again.
-PREFILL_BASELINE_REF ?= 4d1ee81
+#
+# MOVED 4d1ee81 -> 055239b on 2026-08-18, ordinary application of the policy.
+# NOTE THE REF: it is the last commit that changes COMPUTED numerics, not HEAD.
+# Everything after it (payload v5, the MXKV deletion, the cuda-regression repair)
+# changes stored formats, dead code and tests -- nothing prefill computes -- so
+# anchoring at HEAD would have recorded a numerics event that did not happen.
+#
+# What shipped since 4d1ee81:
+#   - the tensor-core tier back on f16 after a one-commit bf16 experiment
+#     (832c2d8). P is in [0,1] by construction, so bf16's exponent range is
+#     unusable while its 3 lost mantissa bits are pure cost.
+#   - the online softmax normalising by the weights the MMA actually multiplies
+#     (315c435): it summed the unrounded p while storing the rounded one, so the
+#     weights did not sum to one.
+#   - the packed-comp prefill migration reverted (a4c5b83) and re-landed
+#     correctly (d5dab83, 1e0517b, 9e9e48a, 1e65c81) -- see L063; the broken
+#     version zeroed EVERY prefill logits row.
+#   - the double-quantise removal (f2c3040, 055239b): three KV paths quantised
+#     the same rows twice, and the ring now takes the bytes attention read.
+#
+# ⚠ PRICE ON THE RECORD: decode acceptance 0.4362 -> 0.4237 (-2.9% rel), and
+# prefill throughput MEASURED FLAT (918.89 -> 917.68 t/s, inside noise), so the
+# consistency gain is not paid for by speed. Tyler decided to keep it (L064).
+# That decision is what this anchor records; a revert would overturn it and the
+# anchor would move back.
+#
+# The 2026-08-18 move also has a provenance the earlier ones lacked: L063 and
+# L064 record exactly which bytes moved and the experiment that proved it -- a
+# single-chunk prompt stayed bit-identical while a ring-reading one did not,
+# which is what established that the fast-math scale bucket is not idempotent.
+PREFILL_BASELINE_REF ?= 055239b
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
