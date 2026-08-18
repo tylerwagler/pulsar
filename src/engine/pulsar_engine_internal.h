@@ -559,72 +559,20 @@ typedef struct {
     uint64_t in_dim;
 } matvec_f16_ctx;
 
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t row0;
-    uint64_t blocks;
-} matvec_q8_0_ctx;
-
-typedef struct {
-    float *out0;
-    float *out1;
-    const uint8_t *data0;
-    const uint8_t *data1;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t blocks;
-} matvec_q8_0_pair_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t blocks;
-    uint64_t rank;
-} matvec_q8_0_grouped_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t n_groups;
-    uint64_t group_dim;
-    uint64_t blocks;
-    uint64_t rank;
-} matmul_q8_0_grouped_batch_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t blocks;
-} matmul_q8_0_batch_ctx;
-
-typedef struct {
-    float *out0;
-    float *out1;
-    const uint8_t *data0;
-    const uint8_t *data1;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t blocks;
-} matmul_q8_0_pair_batch_ctx;
+/* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
+ *
+ * Six ctx structs (matvec_q8_0_ctx, _pair_ctx, _grouped_ctx,
+ * matmul_q8_0_batch_ctx, _pair_batch_ctx, _grouped_batch_ctx),
+ * quantize_mid_pairs_ctx, and nine declarations.  matvec_q8_0 was the only one
+ * of them with a definition reachable from anywhere, and it had ZERO callers --
+ * its comment still said "used heavily in decode", which stopped being true when
+ * decode moved to the GPU.  The other five function declarations
+ * (matvec_q8_0_pair_prequant, matvec_q8_0_grouped_rows, matmul_q8_0_batch,
+ * matmul_q8_0_pair_batch, matmul_q8_0_grouped_batch) had no definition AT ALL:
+ * their bodies were deleted at some earlier point and the prototypes outlived
+ * them, which is why a grep for "q8" kept finding a CPU int8 path that could not
+ * run.  block_q8_K itself stays -- other declarations still reference it, and
+ * whether THOSE are live is a separate audit. */
 
 typedef struct {
     const float *x;
@@ -705,13 +653,6 @@ typedef struct {
     uint64_t up_row_bytes[PULSAR_MAX_EXPERT];
     uint64_t xq_blocks;
 } matvec_iq2_xxs_batch_mid_ctx;
-
-typedef struct {
-    const float *mid;
-    block_q8_K *midq;
-    uint64_t down_in_dim;
-    uint64_t down_blocks;
-} quantize_mid_pairs_ctx;
 
 typedef struct {
     float *down_pair;
@@ -1790,7 +1731,6 @@ void f16_round_inplace_cpu(float *x, uint32_t n);
 void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
 void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim);
 void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim);
-void pulsar_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k);
 void pulsar_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y);
 void pulsar_vec_dot_iq2_xxs_pair_q8_K(
         int n,
@@ -1820,47 +1760,6 @@ void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n
 void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps);
 void matvec_f16(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
-void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n);
-void matvec_q8_0_pair_prequant(
-        float           * out0,
-        float           * out1,
-        const pulsar_model * m,
-        const pulsar_tensor * w0,
-        const pulsar_tensor * w1,
-        const int8_t    * xq,
-        const float     * xscale);
-void matmul_q8_0_batch(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint64_t          n_tok);
-void matmul_q8_0_pair_batch(
-        float           * out0,
-        float           * out1,
-        const pulsar_model * m,
-        const pulsar_tensor * w0,
-        const pulsar_tensor * w1,
-        const float     * x,
-        uint64_t          n_tok);
-void matvec_q8_0(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
-void matvec_q8_0_grouped_rows(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint32_t          n_groups,
-        uint64_t          group_dim,
-        uint64_t          rank);
-void matmul_q8_0_grouped_batch(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint64_t          n_tok,
-        uint32_t          n_groups,
-        uint64_t          group_dim,
-        uint64_t          rank);
 void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i);
 float tensor_2d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t x, uint64_t y);
@@ -1903,7 +1802,6 @@ void matvec_q2_k_experts_accum_prequant(
         const int        *selected,
         int               n_expert);
 void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1);
-void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1);
 void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1);
 void matvec_experts_mid_prequant(
         float            *mid,
