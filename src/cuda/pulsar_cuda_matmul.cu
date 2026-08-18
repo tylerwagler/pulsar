@@ -812,10 +812,27 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * ⚠ The single-slot design had an ACCIDENTAL safety property -- arming anything
  * invalidated everything else, so a buffer rewritten with no arm could never
  * serve a stale hit.  Slots keyed independently lose that, so disarm() still
- * clears ALL of them.  That is what the disarms at the encode exits are for
- * (gpu_prefill.cpp:2416/2764, gpu_decode.cpp:2092/2170): batch_ffn_norm is
- * scratch that the output head legitimately reuses under the same (ptr, n_tok,
- * in_dim) key, which is exactly how the C1 stale-logits bug happened. */
+ * clears ALL of them.  batch_ffn_norm is scratch that the output head
+ * legitimately reuses under the same (ptr, n_tok, in_dim) key, which is exactly
+ * how the C1 stale-logits bug happened, so there are FOUR disarms and they are
+ * two different mechanisms -- named by function, because the line numbers this
+ * comment used to carry had rotted so far that two of them pointed past the end
+ * of the file:
+ *
+ *   ENCODE EXITS, which is what makes arm/disarm pair within one encode --
+ *     gpu_graph_encode_layer_attention_batch, gpu_graph_encode_layer_ffn_batch
+ *     (both gpu_prefill.cpp)
+ *   HEAD ENTRIES, the redundant second lock on the same door --
+ *     gpu_graph_encode_output_head_batch,
+ *     gpu_graph_encode_dspark_output_head_batch (both gpu_decode.cpp)
+ *
+ * ⚠ gpu_graph_encode_decode_layer arms four buffers and disarms NONE, so the
+ * pairing rule above holds for the batch path only.  It is safe today for a
+ * reason the rule does not state: the single-token buffers it arms (attn_norm,
+ * qr_norm, ffn_norm, shared_mid) are separate allocations from the batch_*
+ * buffers and from the output head's own scratch, so no later consumer can
+ * present a matching key.  That is an aliasing accident, not an invariant --
+ * see the decode audit's D3. */
 #define PULSAR_ACT_SLOTS 6
 
 struct mxfp8_act_cache_t {

@@ -77,40 +77,6 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 
 
-static bool gpu_graph_decode_hc_pre(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_model        *model,
-        uint64_t                scale_offset,
-        uint64_t                base_offset) {
-
-    return pulsar_gpu_hc_split_weighted_sum_tensor(out,
-                                                  split,
-                                                  mix,
-                                                  residual_hc,
-                                                  model->map,
-                                                  model->size,
-                                                  scale_offset,
-                                                  base_offset,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC,
-                                                  PULSAR_N_HC_SINKHORN_ITER,
-                                                  PULSAR_HC_EPS) != 0;
-}
-
-
-
-
-
-
-
-
-
-
-
-
 static bool gpu_graph_decode_kv_store(
         pulsar_gpu_tensor *kv,
         pulsar_gpu_tensor *raw_cache,
@@ -408,14 +374,6 @@ bool gpu_graph_encode_decode_layer(
         layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->attn_norm, 1, PULSAR_N_EMBD);
         if (ok && an_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-    } else if (ok) {
-        ok = gpu_graph_decode_hc_pre(g->attn_cur,
-                                       g->hc_split,
-                                       g->hc_mix,
-                                       g->cur_hc,
-                                       model,
-                                       layer->hc_attn_scale->abs_offset,
-                                       layer->hc_attn_base->abs_offset);
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
@@ -599,10 +557,12 @@ bool gpu_graph_encode_decode_layer(
             ok = false;
         }
         if (ok) {
-            /* The F16 pair fast path is gone with the last F16 weight. It was
-             * never a fusion -- two sequential calls, and the f16 and bf16
-             * kernels were structurally identical, so this costs nothing
-             * measurable. */
+            /* Two sequential calls, not a fusion: the F16 pair fast path is
+             * gone with the last F16 weight, and the f16 and bf16 kernels were
+             * structurally identical, so collapsing to one arm cost nothing
+             * measurable.  Its `else` -- an identical copy of these same two
+             * calls, guarded by `if (ok)` inside an `else` of `if (ok)` --
+             * outlived it as unreachable code until 2026-08-18. */
             ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
                                                 layer->attn_compressor_kv,
                                                 PULSAR_N_EMBD, comp_width,
@@ -611,15 +571,6 @@ bool gpu_graph_encode_decode_layer(
                                                 layer->attn_compressor_gate,
                                                 PULSAR_N_EMBD, comp_width,
                                                 g->attn_norm, 1);
-        } else {
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                         layer->attn_compressor_kv,
-                                                         PULSAR_N_EMBD, comp_width,
-                                                         g->attn_norm, 1);
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                         layer->attn_compressor_gate,
-                                                         PULSAR_N_EMBD, comp_width,
-                                                         g->attn_norm, 1);
         }
         const uint32_t comp_row = g->layer_n_comp[il];
         if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
@@ -688,15 +639,6 @@ bool gpu_graph_encode_decode_layer(
                                                     layer->indexer_compressor_gate,
                                                     PULSAR_N_EMBD, index_width,
                                                     g->attn_norm, 1);
-            } else {
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                             layer->indexer_compressor_kv,
-                                                             PULSAR_N_EMBD, index_width,
-                                                             g->attn_norm, 1);
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                             layer->indexer_compressor_gate,
-                                                             PULSAR_N_EMBD, index_width,
-                                                              g->attn_norm, 1);
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
             if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
@@ -1030,14 +972,6 @@ bool gpu_graph_encode_decode_layer(
         layer->ffn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->ffn_norm, 1, PULSAR_N_EMBD);
         if (ok && fn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-    } else if (ok) {
-        ok = gpu_graph_decode_hc_pre(g->ffn_cur,
-                                       g->hc_split,
-                                       g->hc_mix,
-                                       g->after_attn_hc,
-                                       model,
-                                       layer->hc_ffn_scale->abs_offset,
-                                       layer->hc_ffn_base->abs_offset);
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
