@@ -72,7 +72,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -221,6 +221,13 @@ cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
 # tests/bank_fork_gate.c. MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=3.
 cuda-fork-gate: tests/bank_fork_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
+
+# Session payload SAVE -> LOAD round trip. Nothing covered this before
+# 2026-08-18, and the gap hid a raw-ring stride bug that read past the end of
+# the ring allocation. Compares the comp caches byte-for-byte and then decodes
+# one token from both sessions -- a byte-copy payload owes exact equality.
+cuda-session-payload-gate: tests/session_payload_gate
+	./tests/session_payload_gate $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 2: cuBLASLt algo-stability. A decode bank's step logits must
 # be byte-identical across batched-step widths M (incl. the M=4->5 custom->cuBLASLt
@@ -589,6 +596,9 @@ tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pu
 tests/bank_fork_gate.o: tests/bank_fork_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_fork_gate.cpp
 
+tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/session_payload_gate.cpp
+
 tests/algo_stability_gate.o: tests/algo_stability_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
@@ -653,6 +663,9 @@ tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/pulsar_he
 tests/bank_fork_gate: tests/bank_fork_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/session_payload_gate: tests/session_payload_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -678,5 +691,5 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
