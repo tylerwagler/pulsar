@@ -138,7 +138,68 @@ static uint64_t cuda_model_local_model_limit_bytes(void);
 static int cuda_model_cache_limit_explicit(void);
 
 
+/* ---------------------------------------------------------------------------
+ * Scratch arena.
+ *
+ * cuda_tmp_alloc hands back ONE pointer, so every caller needing several
+ * buffers computes its own offsets.  routed_moe_cutlass does eight, each an
+ * align_up written out by hand, then reconstructs eight pointers from them.
+ * That arithmetic compiles perfectly when two buffers overlap, and offset/stride
+ * arithmetic done at the call site is where several of 2026-08-18's bugs lived
+ * (a payload span read at 1024 B against a 584 B row; a bank view sized on the
+ * f32 stride against a packed slab).
+ *
+ * The arena does the same bump in ONE place, refuses to hand out a slice that
+ * would exceed the reservation, and LATCHES that refusal -- so an overflow
+ * surfaces as a NULL rather than as two buffers quietly sharing bytes.
+ *
+ * It deliberately does not own memory: it slices the existing single scratch
+ * reservation, so the growth and lifetime rules callers already rely on are
+ * unchanged, and cuda_tmp_alloc below is now just "reserve, take one slice".
+ * ------------------------------------------------------------------------- */
+
+static void *cuda_tmp_reserve(uint64_t bytes, const char *what);
+
+int cuda_arena_begin(cuda_arena *a, uint64_t bytes, const char *what) {
+    if (!a) return 0;
+    a->base = NULL; a->cap = 0; a->used = 0; a->what = what; a->failed = 0;
+    if (bytes == 0) return 1;
+    void *p = cuda_tmp_reserve(bytes, what);
+    if (!p) { a->failed = 1; return 0; }
+    a->base = (uint8_t *)p;
+    a->cap = bytes;
+    return 1;
+}
+
+void *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align) {
+    if (!a || a->failed) return NULL;
+    if (bytes == 0) return NULL;
+    if (align == 0) align = 16;
+    const uint64_t off = (a->used + (align - 1)) & ~(align - 1);
+    if (off > a->cap || bytes > a->cap - off) {
+        /* Latch: once a take has been refused, every later take fails too.
+         * Returning a valid pointer after a refusal is how a caller ends up
+         * with two slices that overlap. */
+        a->failed = 1;
+        fprintf(stderr,
+                "pulsar: scratch arena '%s' exhausted (want %llu B at align %llu, "
+                "used %llu of %llu)\n",
+                a->what ? a->what : "scratch",
+                (unsigned long long)bytes, (unsigned long long)align,
+                (unsigned long long)a->used, (unsigned long long)a->cap);
+        return NULL;
+    }
+    a->used = off + bytes;
+    return a->base + off;
+}
+
+uint64_t cuda_arena_used(const cuda_arena *a) { return a ? a->used : 0; }
+
 void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
+    return cuda_tmp_reserve(bytes, what);
+}
+
+static void *cuda_tmp_reserve(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {

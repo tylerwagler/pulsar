@@ -337,29 +337,36 @@ static int routed_moe_launch_cutlass(
     const uint64_t ffn_scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(
             (int)T_max, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
 
+    /* Eight buffers out of one reservation.  This used to be eight hand-written
+     * align_up steps followed by eight pointer reconstructions; the arena does
+     * the same bump in one place and refuses (latching) rather than handing back
+     * a slice that overlaps its neighbour.  Sizing is unchanged: take() aligns
+     * each slice's START, which lands on exactly the offsets the old end-aligned
+     * chain produced, because the first slice began at 0. */
     const uint64_t align = 256;
-    uint64_t off = 0;
-    const uint64_t counts_off = off;  off = cutlass_moe_align_up(off + counts_bytes, align);
-    const uint64_t offsets_off = off; off = cutlass_moe_align_up(off + offsets_bytes, align);
-    const uint64_t cursors_off = off; off = cutlass_moe_align_up(off + cursors_bytes, align);
-    const uint64_t sorted_off = off;  off = cutlass_moe_align_up(off + sorted_bytes, align);
-    const uint64_t gx_off = off;      off = cutlass_moe_align_up(off + gather_x_bytes, align);
-    const uint64_t gw_off = off;      off = cutlass_moe_align_up(off + gather_w_bytes, align);
-    const uint64_t fo_off = off;      off = cutlass_moe_align_up(off + ffn_out_bytes, align);
-    const uint64_t fs_off = off;      off = cutlass_moe_align_up(off + ffn_scratch_bytes, align);
-    const uint64_t total_scratch = off;
+    const uint64_t total_scratch =
+        cutlass_moe_align_up(counts_bytes, align) +
+        cutlass_moe_align_up(offsets_bytes, align) +
+        cutlass_moe_align_up(cursors_bytes, align) +
+        cutlass_moe_align_up(sorted_bytes, align) +
+        cutlass_moe_align_up(gather_x_bytes, align) +
+        cutlass_moe_align_up(gather_w_bytes, align) +
+        cutlass_moe_align_up(ffn_out_bytes, align) +
+        cutlass_moe_align_up(ffn_scratch_bytes, align);
 
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(total_scratch, "routed_moe cutlass");
-    if (!scratch) return 0;
-
-    uint32_t *counts = (uint32_t *)(scratch + counts_off);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_off);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
-    float *x_gathered = (float *)(scratch + gx_off);
-    float *w_gathered = (float *)(scratch + gw_off);
-    float *ffn_out = (float *)(scratch + fo_off);
-    uint8_t *ffn_scratch = scratch + fs_off;
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, total_scratch, "routed_moe cutlass")) return 0;
+    uint32_t *counts       = (uint32_t *)cuda_arena_take(&ar, counts_bytes, align);
+    uint32_t *offsets      = (uint32_t *)cuda_arena_take(&ar, offsets_bytes, align);
+    uint32_t *cursors      = (uint32_t *)cuda_arena_take(&ar, cursors_bytes, align);
+    uint32_t *sorted_pairs = (uint32_t *)cuda_arena_take(&ar, sorted_bytes, align);
+    float    *x_gathered   = (float *)cuda_arena_take(&ar, gather_x_bytes, align);
+    float    *w_gathered   = (float *)cuda_arena_take(&ar, gather_w_bytes, align);
+    float    *ffn_out      = (float *)cuda_arena_take(&ar, ffn_out_bytes, align);
+    uint8_t  *ffn_scratch  = (uint8_t *)cuda_arena_take(&ar, ffn_scratch_bytes, align);
+    /* One check covers all eight: take() latches on the first refusal, so a
+     * partial success cannot produce aliased pointers. */
+    if (!ffn_scratch) return 0;
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
     int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe_cutlass counts clear");

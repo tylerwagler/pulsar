@@ -253,6 +253,32 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 /* ---- shared host functions ---- */
 
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
+
+/* Bump arena over the same single scratch reservation.
+ *
+ * Use this instead of cuda_tmp_alloc whenever a launch needs MORE THAN ONE
+ * buffer.  cuda_tmp_alloc returns one pointer, so multi-buffer callers have
+ * been slicing it by hand -- eight offsets in routed_moe_cutlass -- and offset
+ * arithmetic at the call site is exactly the kind that compiles clean while two
+ * buffers overlap.
+ *
+ * Contract: begin() reserves and resets; take() bump-allocates aligned slices
+ * and returns NULL if the reservation would be exceeded, LATCHING the failure
+ * so every later take fails too.  One NULL check after the last take is
+ * therefore sufficient -- a partial success cannot hand back aliased memory.
+ *
+ * Lifetime is the scratch buffer's: valid until the next reservation. */
+typedef struct {
+    uint8_t    *base;
+    uint64_t    cap;
+    uint64_t    used;
+    const char *what;
+    int         failed;
+} cuda_arena;
+
+int      cuda_arena_begin(cuda_arena *a, uint64_t bytes, const char *what);
+void    *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align);
+uint64_t cuda_arena_used(const cuda_arena *a);
 void cuda_fp8_weight_cache_clear(void);
 int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
