@@ -586,6 +586,25 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
  * quantize_store additionally roundtrips the f32 source rows IN PLACE
  * (identical to the plain quantize entry) so stages/dumps stay consistent.
  * Requires n_rot == 64 and (head_dim - n_rot) % 64 == 0. */
+/* THE BACKEND'S OWN ROW GEOMETRY, so the engine can check its copy against it.
+ *
+ * The packed KV row is defined TWICE -- PULSAR_ATTN_PACK_ROWBYTES(HD) in
+ * src/cuda/pulsar_cuda_internal.h and PULSAR_ENGINE_ATTN_PACK_ROWBYTES in
+ * src/engine/pulsar_engine_internal.h -- because head_dim is a RUNTIME shape
+ * behind this seam, so neither side can name the other's constant.  They were
+ * kept in step by a comment saying "must stay in sync", which is the same
+ * enforcement mechanism that has failed twice in one day elsewhere in this tree.
+ * The engine copies also hardcode the block sizes (64 for the attn row's E8M0
+ * scales, 32 for the indexer's) where the backend uses PULSAR_FP8_KV_BLOCK and
+ * PULSAR_MXKV_BLOCK, so changing a block size diverges them silently.
+ *
+ * These two entries let the engine ASK rather than assume; it does so once at
+ * graph alloc and refuses to start on a mismatch.  A wrong row size is not a
+ * subtle bug: every cache stride, every session payload span and every
+ * attention read is derived from it. */
+uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
+uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
+
 int pulsar_gpu_attn_pack_quantize_store_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,

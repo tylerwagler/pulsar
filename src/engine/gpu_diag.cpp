@@ -1627,6 +1627,40 @@ bool gpu_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
+    /* ROW GEOMETRY AGREEMENT, checked once, before anything is sized by it.
+     *
+     * The packed KV row and the indexer FP4 row are each defined twice -- once
+     * here and once in the backend -- because head_dim is a runtime shape that
+     * neither side can name across the seam.  Until now the two were kept in
+     * step by a comment.  Every cache stride, every session-payload span and
+     * every attention read is derived from these numbers, so a divergence is not
+     * a subtle bug: it is out-of-bounds reads at a wrong stride, which is
+     * exactly how the f32/packed mixup produced NaNs from a clean compile.
+     *
+     * Ask the backend and refuse to start if it disagrees.  This is cheap (two
+     * calls per graph) and it converts a silent divergence into a startup
+     * failure that names both numbers. */
+    {
+        const uint64_t eng_attn = (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+        const uint64_t gpu_attn = pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM);
+        const uint64_t eng_idx  = (uint64_t)PULSAR_ENGINE_IDXFP4_ROWBYTES;
+        const uint64_t gpu_idx  = pulsar_gpu_mxkv_fp4_rowbytes(PULSAR_N_INDEXER_HEAD_DIM);
+        if (eng_attn != gpu_attn || eng_idx != gpu_idx) {
+            fprintf(stderr,
+                    "pulsar: KV row geometry disagrees across the backend seam -- "
+                    "attn engine=%llu gpu=%llu (head_dim %u), "
+                    "index engine=%llu gpu=%llu (head_dim %u). "
+                    "PULSAR_ENGINE_ATTN_PACK_ROWBYTES / PULSAR_ENGINE_IDXFP4_ROWBYTES "
+                    "must match PULSAR_ATTN_PACK_ROWBYTES / PULSAR_MXKV_FP4_ROWBYTES.\n",
+                    (unsigned long long)eng_attn, (unsigned long long)gpu_attn,
+                    (unsigned)PULSAR_N_HEAD_DIM,
+                    (unsigned long long)eng_idx, (unsigned long long)gpu_idx,
+                    (unsigned)PULSAR_N_INDEXER_HEAD_DIM);
+            gpu_graph_free(g);
+            return false;
+        }
+    }
+
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer
      * cache pointers below then become bank-0 views instead of owning
      * allocations, and all single-session code runs unmodified. */

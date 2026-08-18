@@ -1117,6 +1117,17 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(pulsar_gpu_tensor *x, uint32_t n_tok,
 /* PULSAR_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
  * of x IN PLACE (identical to pulsar_gpu_dsv4_fp8_kv_quantize_tensor) and store
  * the packed rows into `packed` at rows [out_row0, out_row0+n_rows). */
+/* Row geometry, straight from the macros the kernels index with.  Deliberately
+ * NOT a re-derivation: if these ever stop being the same expression the kernels
+ * use, the check they exist for is worthless. */
+uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim) {
+    return PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+}
+
+uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim) {
+    return PULSAR_MXKV_FP4_ROWBYTES(head_dim);
+}
+
 int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                                        pulsar_gpu_tensor *packed,
                                                        uint32_t out_row0,
