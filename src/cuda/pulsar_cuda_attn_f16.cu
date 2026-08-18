@@ -443,8 +443,14 @@ static void attn_f16_kernel(
             float l = sL[h] * corr;
             for (uint32_t r = 0; r < nr; r++) {
                 const float p = empty ? 0.0f : __expf(sS[h][r] - mx);
-                sP[h][r] = __float2half(p);
-                l += p;
+                /* Sum the ROUNDED weight, not p: the MMA multiplies sP, so the
+                 * normaliser has to be the sum of what it multiplies or the
+                 * weights do not sum to one.  The sink term in the epilogue is
+                 * deliberately NOT rounded -- it has no V row, it is denominator
+                 * mass only. */
+                const __half ph = __float2half(p);
+                sP[h][r] = ph;
+                l += __half2float(ph);
             }
             for (uint32_t r = nr; r < AF16_ROWS; r++) sP[h][r] = __float2half(0.f);
             sM[h] = mx; sL[h] = l; sCorr[h] = corr;
