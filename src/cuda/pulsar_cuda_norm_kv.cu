@@ -592,6 +592,33 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
  * needs -- destination row is bank*raw_cap + pos%raw_cap.  raw_cap == 0
  * degenerates to consecutive rows at out_row0, which is what the compressed pool
  * wants, so ONE kernel now writes both KV caches in the one 584 B format. */
+/* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately.
+ *
+ * attn_pack_store_kernel (quantise then store) and attn_pack_scatter_kernel
+ * (copy already-packed bytes) must agree on this exactly: they write the same
+ * ring from the same batch, and a disagreement puts a token's KV in the wrong
+ * slot.  Nothing about that fails to compile, and it would surface as a
+ * position-dependent wrong answer rather than a crash.  The mapping was copied
+ * verbatim between the two when the scatter path was added (2026-08-18) with a
+ * comment saying they must stay in step; this replaces the comment.
+ *
+ * Returns ATTN_PACK_DEAD_ROW when seq_id puts the row outside the pool.  A
+ * helper cannot return on the caller's behalf, hence a sentinel -- and the
+ * caller's early-out stays UNIFORM ACROSS THE BLOCK, which matters because the
+ * store kernel __syncthreads() below: the decision depends only on blockIdx.x,
+ * so either the whole block leaves or none of it does. */
+#define ATTN_PACK_DEAD_ROW (~0ull)
+
+__device__ __forceinline__ static uint64_t attn_pack_ring_slot(
+        uint32_t row, uint32_t out_row0, uint32_t raw_cap, uint32_t n_banks,
+        const int32_t *__restrict__ positions,
+        const int32_t *__restrict__ seq_id) {
+    if (!raw_cap) return (uint64_t)(out_row0 + row);
+    if (seq_id && (uint32_t)seq_id[row] >= n_banks) return ATTN_PACK_DEAD_ROW;
+    const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
+    return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
+}
+
 __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
                                               uint32_t out_row0, uint32_t n_rows,
                                               uint32_t head_dim, uint32_t n_rot,
@@ -601,14 +628,9 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows) return;
-    uint64_t dst_row;
-    if (raw_cap) {
-        if (seq_id && (uint32_t)seq_id[row] >= n_banks) return;   /* dead row stores nothing */
-        const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
-        dst_row = (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
-    } else {
-        dst_row = (uint64_t)(out_row0 + row);
-    }
+    const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
+                                                positions, seq_id);
+    if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
     const uint32_t n_nope = head_dim - n_rot;
     const uint32_t nblk = n_nope / PULSAR_FP8_KV_BLOCK;
     const uint32_t nblk_pad = (nblk + 3u) & ~3u;
@@ -1250,10 +1272,10 @@ int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gp
 }
 
 
-/* Scatter ALREADY-PACKED rows into the ring.  Row mapping is copied verbatim
- * from attn_pack_store_kernel above, because the two must agree on which ring
- * slot a batch row lands in; the only difference is that this one moves bytes
- * instead of quantising.
+/* Scatter ALREADY-PACKED rows into the ring.  Shares attn_pack_ring_slot with
+ * attn_pack_store_kernel -- see the note there on why that is one function and
+ * not two identical blocks; the only difference here is that this one moves
+ * bytes instead of quantising.
  *
  * That difference is the point.  The prefill producer packs its chunk once
  * (attn_pack_quantize_store_tensor, which also round-trips the f32 in place),
@@ -1272,14 +1294,9 @@ __global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src,
                                                 uint32_t n_banks, uint32_t raw_cap) {
     uint32_t row = blockIdx.x;
     if (row >= n_rows) return;
-    uint64_t dst_row;
-    if (raw_cap) {
-        if (seq_id && (uint32_t)seq_id[row] >= n_banks) return;   /* dead row stores nothing */
-        const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
-        dst_row = (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
-    } else {
-        dst_row = (uint64_t)(out_row0 + row);
-    }
+    const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
+                                                positions, seq_id);
+    if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
     const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const uint8_t *sr = src + (uint64_t)row * rowbytes;
     uint8_t *dr = out + dst_row * rowbytes;

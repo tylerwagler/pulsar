@@ -147,11 +147,13 @@ uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
     return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 }
 
-/* Comp cache to hand the f32 prefill attention consumers (used when the fp16
- * attention tier is off): the dequantized first n_rows packed rows in the f32
- * shadow.  The dequant is
- * bit-exact: packed rows decode to exactly the values the f32 cache would
- * hold. */
+/* The comment that stood here described gpu_graph_attn_comp_read_cache: a
+ * dequantise of the packed comp pool into an f32 shadow, for prefill consumers
+ * that could only read f32.  Both are gone -- every prefill consumer reads
+ * PULSAR_ATTN_PACK rows (2026-08-18), and the attention kernels no longer take a
+ * comp format parameter at all -- but the comment outlived the function and
+ * ended up describing the unrelated one below. */
+
 static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
     return pulsar_weight_is_plain_or_mxfp8(w->type);
 }
