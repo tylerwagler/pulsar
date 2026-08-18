@@ -15,7 +15,7 @@
  * They are selected off this same function in ds4_mmq.cu; keep them together. */
 
 /* Stage MMQ activations as E4M3 + ue8m0 instead of q8_1 int8.  Same
- * block_q8_1_mmq layout: qs[] holds e4m3 bit patterns, d4[i] carries the ue8m0
+ * block_mx_act_mmq layout: qs[] holds e4m3 bit patterns, d4[i] carries the ue8m0
  * byte as a float. */
 void ds4_quantize_mmq_e4m3_cuda(
         const float *x, const int32_t *ids, void *vy,

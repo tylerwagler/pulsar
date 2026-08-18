@@ -50,7 +50,7 @@
 // 512 is that hard cap, so it can never undersize regardless of type, cc or
 // ne11.  Upstream calls the accessor per-tensor to allocate exactly; we
 // deliberately take the constant instead -- the over-allocation is bounded by
-// 512*sizeof(block_q8_1_mmq) once per call, and a constant cannot be wrong the
+// 512*sizeof(block_mx_act_mmq) once per call, and a constant cannot be wrong the
 // next time upstream changes how J is chosen.
 static constexpr int ds4_mmq_x_max() { return 512; }
 
@@ -426,7 +426,7 @@ int ds4_mmq_moe_impl(
     // 2. Gather + quantize the activation into Q8_1.
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
+        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
     /* ONE decision, made once, BEFORE staging: does the D2R E4M3 path take this
      * call?  Staging then follows the decision, instead of writing both formats
      * on every call and letting the consumer pick.  IQ2 experts are E4M3-only
@@ -487,7 +487,7 @@ int ds4_mmq_moe_impl(
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_mmq_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        fprintf(stderr, "%s: ds4_quantize_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
 
@@ -642,7 +642,7 @@ int ds4_mmq_moe_pair_impl(
 
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        ds4_mmq_x_max() * sizeof(block_q8_1_mmq);
+        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
     ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
     ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
     expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
@@ -750,7 +750,7 @@ int ds4_mmq_moe_pair_impl(
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "%s: quantize_mmq_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+            fprintf(stderr, "%s: ds4_quantize_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
             return -3;
         }
     }
@@ -859,7 +859,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
 // mmvq is upstream's matrix-vector matmul family, optimised for the
 // n_tokens <= MMVQ_MAX_BATCH_SIZE=8 regime. Unlike mmq it consumes the
 // CANONICAL block_q8_1 layout (via quantize_row_q8_1_cuda), not the
-// interleaved block_q8_1_mmq that quantize_mmq_q8_1_cuda produces.
+// interleaved block_mx_act_mmq that quantize_mmq_q8_1_cuda produces.
 //
 // The single-W _moe_vec entries cover:
 //   - the down matmul at decode (treating [n_tokens=1, n_expert_used=6]

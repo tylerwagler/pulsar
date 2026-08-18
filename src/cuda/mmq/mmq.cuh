@@ -24,7 +24,7 @@ enum mmq_q8_1_ds_layout {
 static constexpr int QK8_1_MMQ  = 4*QK8_1;
 static constexpr int QK_FP4_MMQ = 2*QK8_1_MMQ;
 
-struct block_q8_1_mmq {
+struct block_mx_act_mmq {
     // The y float data is converted to a data layout that can simply be copied to shared memory as a contiguous block.
     // The y float data is first grouped as blocks of 128 values.
     // These blocks are then treated as individual data values and transposed.
@@ -53,9 +53,9 @@ struct block_fp4_mmq {
     int8_t   qs[QK_FP4_MMQ / 2];
 };
 
-static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
-static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
-static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+static_assert(sizeof(block_mx_act_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_mx_act_mmq size");
+static_assert(sizeof(block_mx_act_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_mx_act_mmq size");
+static_assert(sizeof(block_fp4_mmq)  == sizeof(block_mx_act_mmq),    "Unexpected block_fp4_mmq size");
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
@@ -115,7 +115,7 @@ struct tile_x_sizes {
 // in terms of 32 bit elements that means K % 2 == 1 for dp4a or K % 8 == 4 for mma.
 #define MMQ_TILE_NE_K 32
 
-// block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
+// block_mx_act_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
 
@@ -898,7 +898,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
-    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int sz = sizeof(block_mx_act_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         // ds4 (L008): the aligned row-pair-SoA artifact needs one extra
@@ -1048,7 +1048,7 @@ static __global__ void mul_mat_q(
             __syncthreads();
         }
 
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_y   += (col_low + jt*J)*(sizeof(block_mx_act_mmq)/sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1142,7 +1142,7 @@ static __global__ void mul_mat_q(
             __syncthreads();
         }
 
-        offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+        offset_y += (col_low + jt * J) * (sizeof(block_mx_act_mmq) / sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
         if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1226,7 +1226,7 @@ static __global__ void mul_mat_q(
         __syncthreads();
     }
 
-    offset_y += (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+    offset_y += (col_low + jt * J) * (sizeof(block_mx_act_mmq) / sizeof(int));
     offset_dst += it*I;
     const float * y_scale_tile = nullptr;
     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1401,7 +1401,7 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+    const size_t nbs_y = config.J * (sizeof(block_mx_act_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 

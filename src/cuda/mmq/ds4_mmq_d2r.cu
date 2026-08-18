@@ -198,7 +198,7 @@ __device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
 
 template <bool FullTile>
 __device__ __forceinline__ void issue_q8_prefetch_one(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const char * __restrict__ q8_iter_base,
         int col_count, int stage, int t) {
     constexpr int cols = kNFrag * 8;
@@ -209,13 +209,13 @@ __device__ __forceinline__ void issue_q8_prefetch_one(
     const int c = col_local & 7;
     const bool valid = FullTile ? true : (col_local < col_count);
     void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
-    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_q8_1_mmq) + chunk * 16;
+    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
     cp_async_16B(dst, src, valid);
 }
 
 template <bool FullTile, int Iter>
 __device__ __forceinline__ void issue_q8_prefetch_unrolled(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const char * __restrict__ q8_iter_base,
         int col_count, int stage, int tid) {
     if constexpr (Iter < kQ8PrefetchTrips) {
@@ -234,7 +234,7 @@ __device__ __forceinline__ void issue_q8_prefetch_unrolled(
 
 template <bool FullTile>
 __device__ __forceinline__ void issue_q8_prefetch(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter, int tid) {
     const char *q8_tile_base = s_inv.q8_tile_base;
@@ -249,7 +249,7 @@ __device__ __forceinline__ void issue_q8_prefetch(
 }
 
 __device__ __forceinline__ void issue_q8_prefetch_one_fast(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const char * __restrict__ q8_iter_base,
         int stage, int t) {
     constexpr int cols = kNFrag * 8;
@@ -259,13 +259,13 @@ __device__ __forceinline__ void issue_q8_prefetch_one_fast(
     const int nf = col_local >> 3;
     const int chunk = t >> 6;
     void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
-    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_q8_1_mmq) + chunk * 16;
+    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
     cp_async_16B(dst, src, true);
 }
 
 template <int Iter>
 __device__ __forceinline__ void issue_q8_prefetch_fast_unrolled(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const char * __restrict__ q8_iter_base,
         int stage, int tid) {
     if constexpr (Iter < kQ8PrefetchTrips) {
@@ -282,7 +282,7 @@ __device__ __forceinline__ void issue_q8_prefetch_fast_unrolled(
 }
 
 __device__ __forceinline__ void issue_q8_prefetch_fast(
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter) {
     const char *q8_iter_base =
@@ -314,7 +314,7 @@ static_assert(sizeof(IQ2RawWarpStage) ==
               "unexpected IQ2 raw ring stage size");
 
 
-constexpr size_t kSmemQ8StageBytes = (size_t)kNFrag * 8 * sizeof(block_q8_1_mmq);
+constexpr size_t kSmemQ8StageBytes = (size_t)kNFrag * 8 * sizeof(block_mx_act_mmq);
 constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
 constexpr size_t kSmemIQ2RawBytes = (size_t)kWarps * kRawStages * sizeof(IQ2RawWarpStage);
 constexpr size_t kSmemIQ2GridBytes = 256u * sizeof(uint2);
@@ -340,10 +340,10 @@ static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
 template <int NFrag, typename TileB>
 __device__ __forceinline__ void load_B_tile(
         TileB &B,
-        const block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
         int stage, int nf, int k_in_q8) {
     const int *base = reinterpret_cast<const int *>(&s_q8[stage][nf][0].qs[k_in_q8]);
-    ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_q8_1_mmq) / sizeof(int));
+    ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_mx_act_mmq) / sizeof(int));
 }
 
 
@@ -506,7 +506,11 @@ __device__ __forceinline__ uint32_t iq2_decode_signed_half(
  * what gets MX-quantised -- there is no scale left to fold afterwards, which is
  * the point: the hardware applies it.
  *
- * NOT YET WIRED: the B tile still stages q8_1, so nothing calls this. */
+ * This comment used to read "NOT YET WIRED: the B tile still stages q8_1, so
+ * nothing calls this."  Both halves are false now: the B tile stages E4M3
+ * (ds4_quantize_e4m3.cu), and make_iq2_A_tile_e4m3 below calls this four times
+ * per pair.  Left as a note because the stale version was read as evidence that
+ * the routed path still ran q8_1 activations -- see ledger L065. */
 __device__ __forceinline__ static uint32_t iq2_pack_e4m3_quad(
         uint32_t signed4, float scale) {
     uint32_t out = 0;
@@ -590,7 +594,7 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
  *          lane group g carries column g's scale.  Using the c0/c1 pair here
  *          would hand the MMA a well-formed scale for the WRONG column.
  * The ue8m0 byte is stored as a float by ds4_quantize_mmq_e4m3 (which reuses
- * block_q8_1_mmq's d4 slot to keep the staging layout identical), hence the
+ * block_mx_act_mmq's d4 slot to keep the staging layout identical), hence the
  * cast back on read.
  *
  * GUARDED (!FullTile) CASE: out-of-range ROWS are already zeroed inside the A
@@ -603,7 +607,7 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
         int raw_stage, int q8_stage, bool raw_row0_ok, bool raw_row1_ok,
         int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
     static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
@@ -656,7 +660,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
         int k128_iter, const volatile SmemInvariants &s_inv) {
     const int warp = d2r_warp();
     const int group = d2r_group();
@@ -695,7 +699,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
 template <bool FullTile, typename TileA, typename TileB, typename TileC>
 __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[kNFrag][TileC::ne],
-        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
         const volatile SmemInvariants &s_inv) {
@@ -871,7 +875,7 @@ void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
 __global__ __launch_bounds__(kThreads, 2)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,
-                                const block_q8_1_mmq * __restrict__ q8,
+                                const block_mx_act_mmq * __restrict__ q8,
                                 const int32_t * __restrict__ ids_dst,
                                 const int32_t * __restrict__ expert_bounds,
                                 const int * __restrict__ work,
@@ -904,7 +908,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     using tile_B = ggml_cuda_mma::tile<8, 8, int>;
     using tile_C = ggml_cuda_mma::tile<16, 8, int>;
 
-    __shared__ __align__(16) block_q8_1_mmq s_q8[kStages][kNFrag][8];
+    __shared__ __align__(16) block_mx_act_mmq s_q8[kStages][kNFrag][8];
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) uint2 s_grid[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
@@ -929,11 +933,11 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         s_inv.iq2_dq_base = reinterpret_cast<const half *>(W_soa);
         s_inv.iq2_qs_base =
             reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(W_soa) + dq_bytes);
-        s_inv.q8_tile_base = reinterpret_cast<const char *>(q8) + (uint64_t)col_lo * sizeof(block_q8_1_mmq);
+        s_inv.q8_tile_base = reinterpret_cast<const char *>(q8) + (uint64_t)col_lo * sizeof(block_mx_act_mmq);
         s_inv.out = out;
         s_inv.sc_off_bytes = 0;
         s_inv.qs_off_bytes = 0;
-        s_inv.q8_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_q8_1_mmq));
+        s_inv.q8_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_mx_act_mmq));
         s_inv.nb = nb;
         s_inv.k128_iters = K >> 7;
         s_inv.M = M;
@@ -1092,7 +1096,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 2);
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        gate_soa, up_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
+        gate_soa, up_soa, (const block_mx_act_mmq *)q8, ids_dst, expert_bounds, work, n_items,
         out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1175,7 +1179,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 1);
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        W_soa, W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
+        W_soa, W_soa, (const block_mx_act_mmq *)q8, ids_dst, expert_bounds, work, n_items,
         /* Callers MUST stage E4M3 -- there is no int8 arm left to fall back
          * to.  This launch once read ds4_d2r_iq2_arm() itself, which ran the
          * E4M3 MMA against q8_1 bytes whenever the env was set (the arm-1

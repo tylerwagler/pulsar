@@ -483,7 +483,7 @@ static __global__ void quantize_mmq_q8_1(
     }
 
     const float4 * x4 = (const float4 *) x;
-    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+    block_mx_act_mmq * y = (block_mx_act_mmq *) vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block

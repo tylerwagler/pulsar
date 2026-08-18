@@ -7,12 +7,12 @@
  * routed-expert GEMMs are the last place it is used.
  *
  * ⚠ THE STAGING STRUCT IS REUSED VERBATIM, and that is the whole reason this is
- * one kernel rather than a staging rewrite.  block_q8_1_mmq already carries
+ * one kernel rather than a staging rewrite.  block_mx_act_mmq already carries
  * "1 scale per 32 values" (d4[4] over qs[128]) -- exactly the MX block size.  So
  * qs[] holds e4m3 BIT PATTERNS where it held int8, and d4[i] carries the ue8m0
  * byte (as a float, wasting 3 bytes per 32 values to keep the layout bit-for-bit
  * identical).  Nothing downstream moves: load_B_tile's ldmatrix is byte-agnostic
- * and its stride is sizeof(block_q8_1_mmq)-derived, and the prefetch/staging
+ * and its stride is sizeof(block_mx_act_mmq)-derived, and the prefetch/staging
  * paths are untouched.  Paying 12 bytes per 144-byte block to avoid touching a
  * hand-tuned staging pipeline is the right trade.
  *
@@ -67,7 +67,7 @@ static __global__ void ds4_quantize_mmq_e4m3(
     }
 
     const float4 *x4 = (const float4 *)x;
-    block_q8_1_mmq *y = (block_q8_1_mmq *)vy;
+    block_mx_act_mmq *y = (block_mx_act_mmq *)vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ;
     const int64_t iqs     = i0 % QK8_1_MMQ;
@@ -155,7 +155,7 @@ static __global__ void ds4_gather_mmq_e4m3(
         src_row = ids ? ids[blockIdx.x] : blockIdx.x;
     }
 
-    block_q8_1_mmq *y = (block_q8_1_mmq *)vy;
+    block_mx_act_mmq *y = (block_mx_act_mmq *)vy;
     const int64_t k_block = i0 / QK8_1_MMQ;
     const int64_t iqs     = i0 % QK8_1_MMQ;
 

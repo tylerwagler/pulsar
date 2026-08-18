@@ -105,9 +105,20 @@ Diffing every vendored file against pinned `5c0e946` shows we carry
 pair was previously documented; the `mmq.cuh` and `mmid` patches were not,
 which is exactly how a re-vendor turns into a surprise.
 
+⚠ **`block_q8_1_mmq` is renamed `block_mx_act_mmq` throughout (2026-08-18).**
+A pure rename — same fields, same 144-byte layout — but it WILL conflict on
+every re-vendor, so it is listed per file below.  It is worth the conflict: the
+routed-expert path stopped filling that struct with int8 q8_1 and now fills it
+with e4m3 bit patterns plus a ue8m0 byte in `d4[]` (see `ds4_quantize_e4m3.cu`),
+and the stale name cost real time — it was read as evidence that the MoE still
+ran q8_1 activations, and a whole scoping verdict was written on that mistake
+before Tyler caught it (ledger L065).  Upstream's name is correct upstream,
+where MMQ really does quantise activations to q8_1; in this fork it is not.
+
 | File            | ds4 delta vs pin | What it is |
 |-----------------|------------------|------------|
-| `mmq.cuh`       | +255 / −18 | **(a)** `load_tiles_q2_K_soa` and `load_tiles_iq2_xxs_soa` — aligned-SoA twins of upstream's `load_tiles_q2_K` / `load_tiles_iq2_xxs`, reading the weight-server artifact (P4 Inc3).  **(b)** the `x_soa` / `soa_blocks` fields on `mmq_args` plus the `if constexpr (type == …) { if (x_soa != nullptr) … }` dispatch that selects them.  **(c)** a `DS4_CUDA_MMQ_X_MAX` env clip (Step-4 experiment hook). |
+| `mmq.cuh`       | +255 / −18 | **(a)** `load_tiles_q2_K_soa` and `load_tiles_iq2_xxs_soa` — aligned-SoA twins of upstream's `load_tiles_q2_K` / `load_tiles_iq2_xxs`, reading the weight-server artifact (P4 Inc3).  **(b)** the `x_soa` / `soa_blocks` fields on `mmq_args` plus the `if constexpr (type == …) { if (x_soa != nullptr) … }` dispatch that selects them.  **(c)** a `DS4_CUDA_MMQ_X_MAX` env clip (Step-4 experiment hook).  **(d)** `block_q8_1_mmq` RENAMED to `block_mx_act_mmq` (2026-08-18, rename only — layout and size are byte-identical). |
+| `quantize.cu`   | rename only | same `block_q8_1_mmq` → `block_mx_act_mmq` rename; `quantize_mmq_q8_1_cuda` itself has no live caller in this build. |
 | `mmid.cu`       | +177 / −2  | ds4 expert-routing entries |
 | `mmvq.cu`       | +26 / −4   | `mul_mat_vec_q_switch_type` promoted from `static`; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` |
 | `mmvq.cuh`      | +18 / −0   | matching prototype exposure + the same gate |

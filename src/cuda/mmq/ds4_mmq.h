@@ -176,7 +176,7 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
 //   - K must be a multiple of 256 (same as the mmq path).
 //
 // Unlike the mmq path, mmvq consumes a CANONICAL block_q8_1 buffer (not
-// the interleaved block_q8_1_mmq the mmq path uses). The wrapper builds
+// the interleaved block_mx_act_mmq the mmq path uses). The wrapper builds
 // the canonical buffer internally; callers cannot reuse a Q8_1 buffer
 // previously built for the mmq path.
 //
