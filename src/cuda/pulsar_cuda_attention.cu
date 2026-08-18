@@ -953,11 +953,10 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
     if (valid_head) {
-        /* D7: same Q the fp16 tier multiplies.  See af16_round4. */
-        q0 = af16_round4(q4[lane +  0u]);
-        q1 = af16_round4(q4[lane + 32u]);
-        q2 = af16_round4(q4[lane + 64u]);
-        q3 = af16_round4(q4[lane + 96u]);
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
     }
 
     float max_s = -INFINITY;
@@ -1244,11 +1243,10 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
     if (valid_head) {
-        /* D7: same Q the fp16 tier multiplies.  See af16_round4. */
-        q0 = af16_round4(q4[lane +  0u]);
-        q1 = af16_round4(q4[lane + 32u]);
-        q2 = af16_round4(q4[lane + 64u]);
-        q3 = af16_round4(q4[lane + 96u]);
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
     }
 
     float max_s = -INFINITY;
