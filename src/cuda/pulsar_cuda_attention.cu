@@ -2281,7 +2281,11 @@ static int attention_prefill_mixed_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (comp_kv_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
+         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp *
+         (comp_kv_pack ? PULSAR_ATTN_PACK_ROWBYTES(head_dim)
+                       : head_dim * sizeof(float))) ||
         false) {
         return 0;
     }
