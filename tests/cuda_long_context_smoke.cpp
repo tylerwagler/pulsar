@@ -4,12 +4,14 @@
  * this arithmetic too, but its macro goes through the shape GLOBAL and this
  * smoke links only the CUDA layer -- no engine objects, no model.  Must match
  * PULSAR_ATTN_PACK_ROWBYTES in src/cuda/pulsar_cuda_internal.h:
- * [n_nope e4m3][n_nope/64 E8M0, padded to 4][n_rot bf16] = 584 B at 512/64. */
+ * [n_nope e4m3][n_nope/64 E8M0, padded to 4][n_rot bf16] = 584 B at 512/64.
+ *
+ * This used to be a THIRD hand-written copy of the row geometry, next to the
+ * engine's and the backend's.  It now asks the backend, which is the same thing
+ * gpu_graph_alloc does -- a test that computes the layout itself cannot catch a
+ * layout change, it can only disagree with one. */
 #define SMOKE_ATTN_NROT 64u
-#define SMOKE_ATTN_ROWBYTES(HD) \
-    ((uint64_t)((HD) - SMOKE_ATTN_NROT) + \
-     ((((uint64_t)((HD) - SMOKE_ATTN_NROT) / 64u) + 3u) & ~3ull) + \
-     (uint64_t)SMOKE_ATTN_NROT * 2u)
+#define SMOKE_ATTN_ROWBYTES(HD) pulsar_gpu_attn_pack_rowbytes(HD)
 
 #include <math.h>
 #include <stdint.h>
@@ -123,14 +125,19 @@ static int check_decode_attention_overflow_path(void) {
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
-    pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
+    pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
+    /* Packed comp rows, via the shipping encoder -- see the note in the
+     * multibank case; an f32 comp buffer is read at the packed stride now. */
+    pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc((uint64_t)n_comp * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
-    if (heads && q && raw && raw_f32 && comp &&
+    if (heads && q && raw && raw_f32 && comp && comp_f32 &&
         pulsar_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
         pulsar_gpu_tensor_write(raw_f32, 0, raw_host, raw_count * sizeof(float)) &&
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, n_raw, 0, n_raw,
                                             head_dim, NULL, NULL, 1) &&
-        pulsar_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        pulsar_gpu_tensor_write(comp_f32, 0, comp_host, comp_count * sizeof(float)) &&
+        pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp, 0, n_comp,
+                                                   head_dim, SMOKE_ATTN_NROT) &&
         pulsar_gpu_attention_decode_heads_tensor(heads,
                                               sinks,
                                               n_head * sizeof(float),
@@ -158,6 +165,7 @@ static int check_decode_attention_overflow_path(void) {
     }
 
     pulsar_gpu_tensor_free(comp);
+    pulsar_gpu_tensor_free(comp_f32);
     pulsar_gpu_tensor_free(raw_f32);
     pulsar_gpu_tensor_free(raw);
     pulsar_gpu_tensor_free(q);
@@ -558,7 +566,7 @@ static int mb_run_case(const char *label,
          * over with comp_kv_pack=0 -- so the two bank strides are NOT the same
          * arithmetic any more, which is exactly what this line got wrong. */
         const uint64_t raw_bank_bytes = (uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim);
-        const uint64_t comp_bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
+        const uint64_t comp_bank_bytes = (uint64_t)comp_cap * SMOKE_ATTN_ROWBYTES(head_dim);
         pulsar_gpu_tensor *raw_view = pulsar_gpu_tensor_view(
                 raw_slab, (uint64_t)row->bank * raw_bank_bytes, raw_bank_bytes);
         pulsar_gpu_tensor *comp_view = comp_slab
@@ -671,11 +679,20 @@ static int check_multibank_decode_attention(void) {
     const uint64_t raw_row_b = SMOKE_ATTN_ROWBYTES(head_dim);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw_slab = pulsar_gpu_tensor_alloc((uint64_t)n_banks * raw_cap * raw_row_b);
-    pulsar_gpu_tensor *comp_slab = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
+    /* Comp rows are ATTN_PACK.  They were f32 here until 2026-08-18, when the
+     * comp format parameter was removed from the kernels -- an f32 comp slab now
+     * gets read at the packed stride.  Written through the SHIPPING encoder
+     * rather than hand-packed, so the test cannot disagree with the format. */
+    pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
+    pulsar_gpu_tensor *comp_slab =
+        pulsar_gpu_tensor_alloc((uint64_t)n_banks * comp_cap * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
-    if (!raw_slab || !raw_f32 || !comp_slab ||
+    if (!raw_slab || !raw_f32 || !comp_slab || !comp_f32 ||
         !pulsar_gpu_tensor_write(raw_f32, 0, raw_host, raw_count * sizeof(float)) ||
-        !pulsar_gpu_tensor_write(comp_slab, 0, comp_host, comp_count * sizeof(float))) goto done;
+        !pulsar_gpu_tensor_write(comp_f32, 0, comp_host, comp_count * sizeof(float)) ||
+        !pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp_slab, 0,
+                                                   (uint32_t)(n_banks * comp_cap),
+                                                   head_dim, SMOKE_ATTN_NROT)) goto done;
     for (uint32_t b = 0; b < n_banks; b++) {
         pulsar_gpu_tensor *bv = pulsar_gpu_tensor_view(raw_slab, (uint64_t)b * raw_cap * raw_row_b,
                                                        (uint64_t)raw_cap * raw_row_b);
@@ -819,6 +836,7 @@ static int check_multibank_decode_attention(void) {
 
 done:
     pulsar_gpu_tensor_free(comp_slab);
+    pulsar_gpu_tensor_free(comp_f32);
     pulsar_gpu_tensor_free(raw_f32);
     pulsar_gpu_tensor_free(raw_slab);
     free(comp_host);
