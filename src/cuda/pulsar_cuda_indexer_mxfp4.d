@@ -52,16 +52,16 @@ src/cuda/pulsar_cuda_indexer_mxfp4.o : src/cuda/pulsar_cuda_indexer_mxfp4.cu \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/surface_indirect_functions.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/crt/cudacc_ext.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/device_launch_parameters.h \
-    src/cuda/pulsar_cuda_internal.h \
+    /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp16.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/nv/target \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/nv/detail/__target_macros \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/nv/detail/__preprocessor \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp16.hpp \
-    /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.hpp \
+    src/cuda/pulsar_cuda_internal.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/mma.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/crt/mma.h \
     /usr/local/cuda/bin/../targets/x86_64-linux/include/crt/mma.hpp \
@@ -178,7 +178,7 @@ src/cuda/pulsar_cuda_indexer_mxfp4.o : src/cuda/pulsar_cuda_indexer_mxfp4.cu \
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/device_launch_parameters.h:
 
-src/cuda/pulsar_cuda_internal.h:
+/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.h:
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp16.h:
 
@@ -190,13 +190,13 @@ src/cuda/pulsar_cuda_internal.h:
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp16.hpp:
 
-/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.h:
-
 /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.h:
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_fp8.hpp:
+
+src/cuda/pulsar_cuda_internal.h:
 
 /usr/local/cuda/bin/../targets/x86_64-linux/include/mma.h:
 

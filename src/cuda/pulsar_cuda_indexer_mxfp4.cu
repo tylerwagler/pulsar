@@ -33,6 +33,7 @@
  * 4096 blocks against the old kernel's 128, which is the occupancy half of the
  * problem.  The sync count goes from 128 per block to 3.
  */
+#include <cuda_fp8.h>
 #include "pulsar_cuda_internal.h"
 
 #include <cstdio>
@@ -224,6 +225,66 @@ static void idx_pack_q_kernel(
                        ((uint32_t)idx_f32_to_e4m3(v.z * inv) << 16) |
                        ((uint32_t)idx_f32_to_e4m3(v.w * inv) << 24);
     ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = w;
+}
+
+/* D5: give the f32 scorers the SAME Q this tier multiplies.
+ *
+ * Three scorers exist and they were fed two different Q formats: this tier
+ * quantises Q to E4M3 (measured in tests/idx_quant_fidelity.cc), while the
+ * single-token decode kernel and the banked/generic kernel dot in f32.  The
+ * indexer picks WHICH 512 compressed rows attention can see, so that was not a
+ * precision detail -- a token's candidate set could differ between its prefill
+ * and its decode, and between a solo and a banked prefill of the same prompt.
+ *
+ * This applies the tier's own quantisation as an in-place round-trip so the
+ * other two scorers multiply the same numbers.  It lives HERE, next to
+ * idx_pack_q_kernel, and shares idx_amax_shift and idx_f32_to_e4m3 with it --
+ * a second copy of the scale rule in the other TU is exactly the duplication
+ * that produced the defect.  The reduction ORDER still differs between the
+ * three kernels; that is the acceptable kind of divergence, and the operand
+ * format no longer is.
+ *
+ * The encode is ours and the decode is the hardware's, which is the one pairing
+ * that cannot drift: a byte's meaning is fixed by the format.
+ *
+ * IDEMPOTENT, so the tier is free to run over an already-round-tripped Q: se is
+ * derived from the block amax, round-to-nearest keeps that amax inside the same
+ * binade (E4M3 at exponent 8 is 256..448, and a value rounding up to 512
+ * saturates to 448 rather than carrying), so a second pass picks the same se
+ * and re-encodes to the same bytes. */
+__global__ __launch_bounds__(256, 4)
+static void idx_q_e4m3_roundtrip_kernel(float *__restrict__ q, uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row  = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+    if (row >= n_rows) return;
+
+    float4 v = ((const float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane];
+
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
+
+    const int se = idx_amax_shift(amax);
+    const float inv = ldexpf(1.0f, -se);
+    const float fwd = ldexpf(1.0f, se);
+
+    #define IDX_RT(component) do { \
+        const uint8_t b = idx_f32_to_e4m3((component) * inv); \
+        (component) = (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&b)) * fwd; \
+    } while (0)
+    IDX_RT(v.x); IDX_RT(v.y); IDX_RT(v.z); IDX_RT(v.w);
+    #undef IDX_RT
+
+    ((float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane] = v;
+}
+
+int pulsar_gpu_indexer_q_e4m3_roundtrip(float *q, uint32_t n_tokens, uint32_t n_head,
+                                        uint32_t head_dim) {
+    if (!q || n_tokens == 0 || n_head != IDX_HEADS || head_dim != IDX_HEAD_DIM) return 0;
+    const uint32_t n_rows = n_tokens * n_head;
+    idx_q_e4m3_roundtrip_kernel<<<(n_rows + 7u) / 8u, 256>>>(q, n_rows);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 /* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble

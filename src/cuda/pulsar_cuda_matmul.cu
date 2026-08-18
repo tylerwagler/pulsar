@@ -903,6 +903,65 @@ static mxfp8_act_cache_t *act_slot_find_rows(const void *ptr, uint64_t need, uin
     return best;
 }
 
+/* D3: tell a LEGITIMATE miss from a BROKEN one.
+ *
+ * Every consumer below reads the cache and, on a miss, quietly multiplies
+ * against f32 instead.  That makes the activation FORMAT a function of cache
+ * state rather than of what the engine meant -- W8A8 and W8A32 chosen by a
+ * lookup, with silence as the only signal.  The per-shape "W8A8" announcements
+ * do not close this: they fire when A8 DOES run, so the failure mode is a line
+ * that never appears, and nobody watches for an absent log line.
+ *
+ * The two misses are not the same event:
+ *
+ *   NO SLOT AT ALL -- the producer never armed this buffer, so it never claimed
+ *     to have emitted E4M3.  f32 is the correct and intended answer (the
+ *     drafter's own forwards are the live example).  Not an error.
+ *
+ *   A SLOT EXISTS AND IS VALID, BUT COVERS FEWER ROWS THAN ASKED -- the
+ *     producer DID declare E4M3 for this buffer and this consumer cannot use
+ *     the declaration.  There is no correct f32 answer here: the rows past
+ *     key_ntok were never encoded, so falling back silently changes the format
+ *     of an operand the engine believes is E4M3.  This is exactly the shape
+ *     that failed GATE 4 on 2026-08-17 (arm at full batch width, consume at the
+ *     decode prefix) and the shape act_slot_find_rows exists to prevent.
+ *
+ * So the second case is a defect, and it now says so and fails the launch
+ * rather than returning a differently-typed number.  Fail closed, one format or
+ * an error -- the same stance routed_moe_launch takes for a declined MMQ. */
+static bool act_slot_a8_declared_short(const void *ptr, uint64_t need, uint64_t in_dim) {
+    if (!ptr || need == 0) return false;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        const mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (s->key_ptr == ptr && s->key_in_dim == in_dim && s->valid &&
+            s->key_ntok < need) return true;
+    }
+    return false;
+}
+
+/* Report it once per (in,out) shape and fail.  Keyed on the pair for the reason
+ * the W8A8 announcements are: several decode GEMVs share in_dim 4096, so an
+ * in_dim-only key would report one and hide the rest. */
+static int act_a8_contract_fail(const char *what, uint64_t need,
+                                uint64_t in_dim, uint64_t out_dim) {
+    static uint64_t seen[16] = {0};
+    static int n_seen = 0;
+    const uint64_t key = (in_dim << 32) ^ out_dim;
+    int known = 0;
+    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
+    if (!known && n_seen < 16) {
+        seen[n_seen++] = key;
+        fprintf(stderr,
+                "pulsar: A8 CONTRACT VIOLATION in %s -- the producer declared E4M3 for "
+                "this activation but the cached block is narrower than the %llu rows "
+                "asked for (in_dim=%llu out_dim=%llu).  Refusing to silently multiply "
+                "against f32 instead.\n",
+                what, (unsigned long long)need,
+                (unsigned long long)in_dim, (unsigned long long)out_dim);
+    }
+    return 0;   /* every consumer of this returns int; 0 = launch failed */
+}
+
 /* Find this key's slot, or take over the least-recently-used one.  Acquiring
  * RESETS the validity bits: the caller is about to (re)write that buffer, so
  * whatever the slot held is stale by definition.  Buffers are grow-only and
@@ -1835,6 +1894,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                  * drafter's forwards in E4M3 is a size-thresholded activation
                  * format -- the defect this codebase keeps re-finding. */
                 const mxfp8_act_cache_t *ac8nt = act_slot_find_rows(x->ptr, n_tok, in_dim);
+                if (!ac8nt && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
+                    return act_a8_contract_fail("verify-batch GEMV", n_tok, in_dim, out_dim);
                 if (ac8nt && ac8nt->valid) {
                     const int xKBp = mx_rup((int)(in_dim / 32), 4);
                     {
@@ -1909,6 +1970,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * NOT a speed win (the weight matrix dominates GEMV traffic by
              * ~out_dim x; see the kernel comment). */
             mxfp8_act_cache_t *ac8 = act_slot_find_rows(x->ptr, n_tok, in_dim);
+            if (!ac8 && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
+                return act_a8_contract_fail("decode GEMV", n_tok, in_dim, out_dim);
             if (ac8 && ac8->valid) {
                 /* Say it once PER SHAPE, not once per process.  A gate PASS
                  * cannot distinguish "the A8 path ran and is correct" from "the
@@ -2008,6 +2071,8 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
      * exists we give up the launch fusion and take the per-weight A8 path
      * below. Fusing two launches is worth less than the operand being right. */
     const mxfp8_act_cache_t *pair_a8 = act_slot_find_rows(x->ptr, n_tok, in_dim);
+    if (!pair_a8 && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
+        return act_a8_contract_fail("qkv pair GEMV", n_tok, in_dim, out0_dim);
     const bool have_a8 = pair_a8 && pair_a8->valid;
     if (!have_a8 && n_tok == 1 && in_dim % 128 == 0 &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
@@ -2103,6 +2168,8 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
      * finding, not silently living with. */
     if (dw) {
         const mxfp8_act_cache_t *ac8 = act_slot_find_rows(x->ptr, 1, in_dim);
+        if (!ac8 && act_slot_a8_declared_short(x->ptr, 1, in_dim))
+            return act_a8_contract_fail("attn-out 'b' GEMV", 1, in_dim, out_dim);
         if (ac8 && ac8->valid) {
             static int announced_ob8 = 0;
             if (!announced_ob8) {
