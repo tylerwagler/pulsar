@@ -555,7 +555,10 @@ static int mb_run_case(const char *label,
     for (uint32_t r = 0; r < n_rows; r++) {
         const mb_row *row = &rows[r];
         const uint32_t ref_rows = 3;
-        const uint64_t raw_bank_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+        /* raw is PULSAR_ATTN_PACK now, comp is still the f32 slab this test hands
+         * over with comp_kv_pack=0 -- so the two bank strides are NOT the same
+         * arithmetic any more, which is exactly what this line got wrong. */
+        const uint64_t raw_bank_bytes = (uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim);
         const uint64_t comp_bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
         pulsar_gpu_tensor *raw_view = pulsar_gpu_tensor_view(
                 raw_slab, (uint64_t)row->bank * raw_bank_bytes, raw_bank_bytes);
