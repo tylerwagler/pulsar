@@ -339,6 +339,21 @@ int pulsar_gpu_indexer_scores_mxfp4(
         float                   scale,
         int                     causal);
 
+/* Round-trip Q through the MXFP4 scorer's OWN E4M3 quantisation, in place.
+ *
+ * The tier above quantises Q to E4M3 before the MMA; the single-token decode
+ * scorer and the banked/generic scorer dot in f32.  Since the indexer chooses
+ * which compressed rows attention can see, that made a token's candidate set
+ * depend on batch width and on whether the step was banked.  indexer_scores_launch
+ * calls this on the two f32 paths so all three scorers multiply one format.
+ * Idempotent, and shares the scale rule with idx_pack_q_kernel by construction.
+ * Requires n_head == 64 and head_dim == 128; returns 0 on refusal or failure. */
+int pulsar_gpu_indexer_q_e4m3_roundtrip(
+        float                   *q,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
         const pulsar_gpu_tensor *scores,

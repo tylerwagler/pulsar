@@ -819,6 +819,18 @@ static int indexer_scores_launch(
     const void * const *index_bank_ptrs_ptr =
         (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
+    /* D5: the two f32 scorers below take Q through the MXFP4 tier's own E4M3
+     * quantisation first, so all three scorers multiply the same operand format
+     * and a token's candidate set stops depending on batch width or banking.
+     * The tier itself is skipped -- it packs Q to E4M3 as part of its own
+     * launch, and leaving it untouched keeps solo prefill bit-identical. */
+    if (head_dim == 128u && n_head == 64u && (n_tokens == 1u || descr)) {
+        if (!pulsar_gpu_indexer_q_e4m3_roundtrip((float *)q->ptr, n_tokens,
+                                                 n_head, head_dim)) {
+            fprintf(stderr, "pulsar: indexer Q E4M3 round-trip failed\n");
+            return 0;
+        }
+    }
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
