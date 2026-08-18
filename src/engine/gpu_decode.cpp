@@ -822,9 +822,7 @@ bool gpu_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
-        if (!ok) {
-            /* fall through with ok == false */
-        } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+        if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
