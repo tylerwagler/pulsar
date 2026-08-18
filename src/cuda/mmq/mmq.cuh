@@ -21,29 +21,15 @@ enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D2S6,
 };
 
+#include "ds4_act_block.cuh"
+
 static constexpr int QK8_1_MMQ  = 4*QK8_1;
 static constexpr int QK_FP4_MMQ = 2*QK8_1_MMQ;
 
-struct block_mx_act_mmq {
-    // The y float data is converted to a data layout that can simply be copied to shared memory as a contiguous block.
-    // The y float data is first grouped as blocks of 128 values.
-    // These blocks are then treated as individual data values and transposed.
-    //
-    // To avoid shared memory bank conflicts each block is padded with 16 bytes.
-    // This padding is also used to store block scales/partial sums.
-    // The scales multiplied with the quantized data are equal to the unquantized values.
-    // The partial sums are obtained by summing up a subgroup of the contained values (prior to quantization)
-    //     and are only needed for performance reasons.
-    //
-    // The exact data stored depends on the x data type.
-    union {
-        float d4[4];    // 1 32 bit scale per 32 values, stored as d0,d1,d2,d3
-        half2 ds4[4];   // 1 16 bit scale + 1 16 bit partial sum per 32 values, stored as d0,s0,d1,s1,d2,s2,d3,s3
-        half  d2s6[8];  // 1 16 bit scale per 64 values + 1 16 bit partial sum per 16 values for the first 96 values,
-                        //     stored as d0,d1,s1,s2,s3,s4,s5
-    };
-    int8_t qs[QK8_1_MMQ];
-};
+/* Defined in ds4_act_block.cuh -- see ledger L066: the live IQ2 path is our own
+ * D2R MXFP8 GEMM and must not depend on this header, whose kernels nothing
+ * calls.  The static_asserts below deliberately STAY here, so this file keeps
+ * checking our literal 144 against the ggml types for as long as it exists. */
 
 // this struct is used for fp4 data types (currently only used for Blackwell)
 // mxfp4 has block size 32, each int32 of d4 contains 2 e8m0 scales in the lower 16 bits

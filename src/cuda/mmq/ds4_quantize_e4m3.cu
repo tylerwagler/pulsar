@@ -31,6 +31,7 @@
  * f32; ds4_gather_mmq_e4m3_cuda copies an encoding the producer already made.
  * Prefer the gather -- see its comment for why it is a copy and not a re-encode. */
 
+#include "ds4_act_block.cuh"
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"

@@ -6,7 +6,8 @@
 #include <type_traits>
 
 #include "common.cuh"
-#include "mmq.cuh"
+#include "ds4_act_block.cuh"
+#include "mma.cuh"          /* ggml_cuda_mma::tile / load_ldmatrix */
 #include "ds4_mxfp8_mma.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 
@@ -26,6 +27,24 @@
  * bytes as e4m3 -- which would be silently wrong, since every shape still
  * fits. */
 
+
+
+/* Lifted verbatim from the vendored vecdotq.cuh (upstream llama.cpp).
+ *
+ * Eight lines of bit twiddling with no dependencies, and this file is its only
+ * LIVE caller -- the other three are in mmq-load-tiles.cuh, which is on the
+ * deletion list (ledger L066: nothing calls the vendored mul_mat_q kernels).
+ * Copying it is what lets this translation unit stop including mmq.cuh, and a
+ * copy this small is cheaper than keeping a 1363-line header alive to supply
+ * it. */
+static __device__ __forceinline__ uint32_t ds4_unpack_ksigns(const uint8_t v) {
+    // v is a 7 bit int, with the 8th sign being encodable as popcnt
+    // with xor we can "correct" the bit instead of having to mask
+    const uint32_t p = __popc(v) & 1;
+    const uint32_t s = v ^ p << 7;
+    // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
+    return s * 0x01010101;
+}
 
 namespace {
 
@@ -470,7 +489,7 @@ __device__ __forceinline__ uint32_t iq2_decode_signed_half(
     const int hi = chunk & 1;
     const uint8_t aux = (uint8_t)(code.x >> (8 * group));
     const uint2 grid_pos = s_grid[aux];
-    const uint32_t signs8 = unpack_ksigns((uint8_t)(code.y >> (7 * group)));
+    const uint32_t signs8 = ds4_unpack_ksigns((uint8_t)(code.y >> (7 * group)));
     const uint32_t sel = hi ? 0x80402010u : 0x08040201u;
     const uint32_t s = __vcmpne4(signs8 & sel, 0);
     const uint32_t grid_half = hi ? grid_pos.y : grid_pos.x;
