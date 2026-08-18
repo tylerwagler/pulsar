@@ -12,8 +12,6 @@
 
 #include "common.cuh"
 #include "ds4_act_block.cuh"
-#include "mmq.cuh"
-#include "quantize.cuh"
 #include "mmid.cuh"
 #include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"

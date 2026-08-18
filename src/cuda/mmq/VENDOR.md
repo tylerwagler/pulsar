@@ -1,5 +1,40 @@
 # Vendored llama.cpp mmq kernels
 
+> ## ⚠ 2026-08-18: THE VENDORED KERNELS ARE GONE. READ THIS FIRST.
+>
+> **10,135 lines across 17 files were deleted** (ledger L066).  Everything below
+> that describes `mmq.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`,
+> `vecdotq.cuh`, `mmvq.*`, `quantize.*` or the `mmq-config-*` family is
+> HISTORICAL — those files no longer exist.
+>
+> **Why.** The routed experts moved to E4M3 activations, and the IQ2 GEMM now
+> unpacks weights to E4M3 in-register and issues a block-scaled MXFP8 MMA
+> (`ds4_mmq_d2r.cu`, ours).  The path that could still have reached upstream's
+> int8 `mul_mat_q` makes D2R a hard requirement and *fails closed*, so the
+> vendored kernel family became unreachable **by construction**.  Verified
+> before deletion with the linker's own view: `mul_mat_q_case` had 3 definitions
+> and **0 undefined references**, as did `ds4_mmq_q8_0_aligned_dense_vec`,
+> `ds4_mmq_iq2_xxs_aligned_bytes` and `quantize_mmq_q8_1_cuda`.
+>
+> **What is still vendored, and it is now a short list:**
+>
+> | file | why it survives |
+> |---|---|
+> | `common.cuh` | `ggml_backend_cuda_context` + `ggml_cuda_pool_alloc`, which the live MoE entries use for scratch |
+> | `mma.cuh` | `ggml_cuda_mma::tile` / `load_ldmatrix`, used by our D2R GEMM |
+> | `mmid.cu` + `mmid.cuh` | `#include`d by `ds4_mmid.cu` because upstream's `launch_mm_ids_helper<N>` is file-static |
+> | `ggml*.h`, `unary.cuh`, `vendors/` | headers the three above need |
+>
+> **Constants that outlived their files** now live in `ds4_act_block.cuh`:
+> `block_mx_act_mmq` (renamed from `block_q8_1_mmq`; it holds E4M3, not q8_1),
+> `DS4_ACT_BLOCK_VALS` (was `QK8_1_MMQ`), `DS4_ACT_QUANT_BLOCK` (was
+> `CUDA_QUANTIZE_BLOCK_SIZE_MMQ`) and `MMQ_DP4A_MAX_BATCH_SIZE`, which is still
+> read by the live `ds4_mmq_should_use` gate and is kept at upstream's value so
+> the routing decision is unchanged by the deletion.
+>
+> **A re-vendor is now much smaller, and the rename conflict noted below is
+> moot** for `mmq.cuh` and `quantize.cu` — both are deleted.
+
 This directory contains source files copied verbatim from
 [llama.cpp's `ggml-cuda` backend](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cuda),
 plus a thin ds4-side adapter (`ds4_ggml_stubs.{h,cu}` and `ds4_mmq.{h,cu}`)

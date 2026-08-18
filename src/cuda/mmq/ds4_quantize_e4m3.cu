@@ -33,8 +33,6 @@
 
 #include "ds4_act_block.cuh"
 #include "common.cuh"
-#include "mmq.cuh"
-#include "quantize.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 
 #include <cuda_fp8.h>
@@ -70,8 +68,8 @@ static __global__ void ds4_quantize_mmq_e4m3(
     const float4 *x4 = (const float4 *)x;
     block_mx_act_mmq *y = (block_mx_act_mmq *)vy;
 
-    const int64_t k_block = i0 / QK8_1_MMQ;
-    const int64_t iqs     = i0 % QK8_1_MMQ;
+    const int64_t k_block = i0 / DS4_ACT_BLOCK_VALS;
+    const int64_t iqs     = i0 % DS4_ACT_BLOCK_VALS;
 
     const float4 xi = i0 < ne00 ? x4[(base_idx + i00) / 4]
                                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -157,8 +155,8 @@ static __global__ void ds4_gather_mmq_e4m3(
     }
 
     block_mx_act_mmq *y = (block_mx_act_mmq *)vy;
-    const int64_t k_block = i0 / QK8_1_MMQ;
-    const int64_t iqs     = i0 % QK8_1_MMQ;
+    const int64_t k_block = i0 / DS4_ACT_BLOCK_VALS;
+    const int64_t iqs     = i0 % DS4_ACT_BLOCK_VALS;
 
     /* Cache rows are [row][ne00] E4M3, so the 4 bytes this thread owns sit
      * contiguously and 4-aligned -- one uchar4 load. Past ne00 the encoding
@@ -197,13 +195,13 @@ void ds4_quantize_mmq_e4m3_cuda(
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
         const int n_expert_used, const bool scatter, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    GGML_ASSERT(ne0 % DS4_ACT_BLOCK_VALS == 0);
     /* ne1 takes the largest values, so it is the grid's x dimension -- mirrored
      * from quantize_mmq_q8_1_cuda so the write indices above stay valid. */
-    const int64_t block_num_y = (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) /
-                                (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const int64_t block_num_y = (ne0 + 4 * DS4_ACT_QUANT_BLOCK - 1) /
+                                (4 * DS4_ACT_QUANT_BLOCK);
     const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const dim3 block_size(DS4_ACT_QUANT_BLOCK, 1, 1);
     if (scatter) {
         ds4_quantize_mmq_e4m3<true><<<num_blocks, block_size, 0, stream>>>(
                 x, ids, vy, ne00, s01, s02, s03, ne0, (int)ne1, (int)ne2, n_expert_used);
@@ -222,11 +220,11 @@ void ds4_gather_mmq_e4m3_cuda(
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
         const int n_expert_used, const bool scatter, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
-    const int64_t block_num_y = (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) /
-                                (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    GGML_ASSERT(ne0 % DS4_ACT_BLOCK_VALS == 0);
+    const int64_t block_num_y = (ne0 + 4 * DS4_ACT_QUANT_BLOCK - 1) /
+                                (4 * DS4_ACT_QUANT_BLOCK);
     const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const dim3 block_size(DS4_ACT_QUANT_BLOCK, 1, 1);
     if (scatter) {
         ds4_gather_mmq_e4m3<true><<<num_blocks, block_size, 0, stream>>>(
                 (const uint8_t *)src_q, (const uint8_t *)src_sf, src_kbp,

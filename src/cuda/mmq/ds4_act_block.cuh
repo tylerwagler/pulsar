@@ -52,3 +52,18 @@ struct block_mx_act_mmq {
 static_assert(sizeof(block_mx_act_mmq) == 144,
               "staging block must stay 144 B: every stride in the MMQ staging "
               "path is derived from this size");
+
+// Launch geometry for the staging kernels.  This was upstream's
+// CUDA_QUANTIZE_BLOCK_SIZE_MMQ in quantize.cuh; it is the only thing the live
+// E4M3 staging still needed from that header, and keeping a vendored file alive
+// to supply one integer is the wrong trade.
+static constexpr int DS4_ACT_QUANT_BLOCK = 128;
+
+// Batch-size knee used by ds4_mmq_should_use.  Upstream's
+// MMQ_DP4A_MAX_BATCH_SIZE from mmq.cuh: "max. batch size to use for dp4a MMQ
+// kernels when FP16 tensor cores are available".  The dp4a kernels it referred
+// to are deleted (L066); the CONSTANT survives because the gate that decides
+// whether the caller takes the MMQ route at all still reads it, and that gate is
+// live.  Kept at upstream's value so the routing decision is unchanged by the
+// deletion -- this extraction is not the place to retune a threshold.
+#define MMQ_DP4A_MAX_BATCH_SIZE 64
