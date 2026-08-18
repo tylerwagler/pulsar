@@ -489,9 +489,14 @@ int pulsar_gpu_indexer_scores_mxfp4(
     /* Pre-pack Q once per token; the scorer then only copies bytes. */
     const uint64_t qa_bytes  = (uint64_t)n_tokens * IDX_HEADS * IDX_HEAD_DIM;
     const uint64_t qsf_bytes = (uint64_t)n_tokens * IDX_HEADS * IDX_KSLABS;
-    uint8_t *qa = (uint8_t *)cuda_tmp_alloc(qa_bytes + qsf_bytes, "indexer mxfp4 Q pack");
-    if (!qa) return 0;
-    uint8_t *qsf = qa + qa_bytes;
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, ((qa_bytes + 255u) & ~255ull) + qsf_bytes,
+                          "indexer mxfp4 Q pack")) return 0;
+    uint8_t *qa  = (uint8_t *)cuda_arena_take(&ar, qa_bytes, 256);
+    /* qsf used to start at qa + qa_bytes with no padding, so its alignment was
+     * whatever the Q slab's byte count happened to leave.  The arena aligns it. */
+    uint8_t *qsf = (uint8_t *)cuda_arena_take(&ar, qsf_bytes, 256);
+    if (!qsf) return 0;   /* take() latches: one check covers both */
 
     /* One warp per (token, head) row, 8 warps per block. */
     const uint32_t pack_rows = n_tokens * IDX_HEADS;

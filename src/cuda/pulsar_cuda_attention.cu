@@ -1729,7 +1729,6 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
         const uint64_t score_bytes = score_count * sizeof(float);
-        const uint64_t out_offset = (score_bytes + 255u) & ~255ull;
         /* cuBLAS consumes f32 operands: in f16 raw mode, expand the raw rows
          * into an f32 staging region first (pure conversion, exact values, so
          * the gemms see the identical matrix the f32 path reads). */

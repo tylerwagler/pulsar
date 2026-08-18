@@ -627,6 +627,11 @@ static int cublaslt_ensure(void) {
 
 
 static inline int mx_rup(int x, int n) { return (x + n - 1) / n * n; }
+/* Reservation arithmetic for the scratch arena: every cuda_arena_take here
+ * 256-aligns, so the reservation has to budget the ALIGNED size of each
+ * slice.  Budgeting the raw sizes is how a caller reserves less than it
+ * then asks for and trips the arena's latch on the last take. */
+static inline size_t mx_a256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 
 __device__ __forceinline__ int mx_sfoff(int row, int kb, int KBp) {
@@ -1101,8 +1106,7 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     size_t wz = 32u << 20;
     /* xq, sx and the cuBLASLt workspace must be DISTINCT buffers, but
      * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
-     * realloc/free earlier ones). Carve three non-overlapping, 256-aligned
-     * regions from a single allocation instead. */
+     * realloc/free earlier ones), so these three come from one arena. */
     /* Armed activation cache (see mxfp8_act_cache_t above): reuse the E4M3 data
      * and E8M0 scales this activation was already quantized into, and take only
      * the cuBLASLt workspace from the shared tmp region. */
@@ -1119,20 +1123,23 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     __nv_fp8_e4m3 *xq;
     unsigned char *sx;
     void *ws;
+    cuda_arena ar;
     if (ac) {
+        /* Cache armed: the E4M3 data and its E8M0 scales already exist, so the
+         * arena reserves the cuBLASLt workspace and nothing else. */
+        if (!cuda_arena_begin(&ar, wz, "fp8_mx scratch")) return 0;
         xq = ac->xq;
         sx = ac->sx;
-        ws = cuda_tmp_alloc(wz, "fp8_mx scratch");
+        ws = cuda_arena_take(&ar, wz, 256);
         if (!ws) return 0;
     } else {
-        size_t off_xq = 0;
-        size_t off_sx = (in_dim * (size_t)ntok + 255) & ~(size_t)255;
-        size_t off_ws = (off_sx + sx_bytes + 255) & ~(size_t)255;
-        char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "fp8_mx scratch");
-        if (!scratch) return 0;
-        xq = (__nv_fp8_e4m3 *)(scratch + off_xq);
-        sx = (unsigned char *)(scratch + off_sx);
-        ws = scratch + off_ws;
+        const size_t xq_bytes = in_dim * (size_t)ntok;
+        if (!cuda_arena_begin(&ar, mx_a256(xq_bytes) + mx_a256(sx_bytes) + wz,
+                              "fp8_mx scratch")) return 0;
+        xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, xq_bytes, 256);
+        sx = (unsigned char *)cuda_arena_take(&ar, sx_bytes, 256);
+        ws = cuda_arena_take(&ar, wz, 256);
+        if (!ws) return 0;   /* take() latches: one check covers all three */
     }
     if (!ac || !ac->valid) {
         cudaMemsetAsync(sx, 0, sx_bytes, 0);
@@ -1267,6 +1274,7 @@ static int cuda_attention_output_a_mx_gemm(
     __nv_fp8_e4m3 *xq;
     unsigned char *sx;
     void *ws;
+    cuda_arena ar;
     /* Producer-emitted grouped encoding (attn_f16 epilogue + rope_tail): the
      * quantize pass is not moved, it is skipped entirely.  The slab geometry
      * the producers wrote must match what this GEMM is about to describe to
@@ -1287,16 +1295,16 @@ static int cuda_attention_output_a_mx_gemm(
         }
         xq = gc->xq;
         sx = gc->sx;
-        ws = cuda_tmp_alloc(wz, "attn_out_a mx scratch");
+        if (!cuda_arena_begin(&ar, wz, "attn_out_a mx scratch")) return 0;
+        ws = cuda_arena_take(&ar, wz, 256);
         if (!ws) return 0;
     } else {
-        size_t off_sx = (data_bytes + 255) & ~(size_t)255;
-        size_t off_ws = (off_sx + scale_bytes + 255) & ~(size_t)255;
-        char *scratch = (char *)cuda_tmp_alloc(off_ws + wz, "attn_out_a mx scratch");
-        if (!scratch) return 0;
-        xq = (__nv_fp8_e4m3 *)scratch;
-        sx = (unsigned char *)(scratch + off_sx);
-        ws = scratch + off_ws;
+        if (!cuda_arena_begin(&ar, mx_a256(data_bytes) + mx_a256(scale_bytes) + wz,
+                              "attn_out_a mx scratch")) return 0;
+        xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, data_bytes, 256);
+        sx = (unsigned char *)cuda_arena_take(&ar, scale_bytes, 256);
+        ws = cuda_arena_take(&ar, wz, 256);
+        if (!ws) return 0;   /* take() latches: one check covers all three */
         cudaMemsetAsync(sx, 0, scale_bytes, 0);
         int warps = (int)n_tokens * (int)n_groups * (int)KB;
         mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
@@ -2346,11 +2354,16 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
         const size_t data_n  = (size_t)n_tokens * n_groups * group_dim;
         const size_t scale_n = (size_t)n_groups * slab;
-        const size_t off_sx = (data_n * sizeof(__nv_fp8_e4m3) + 255) & ~(size_t)255;
-        char *scratch = (char *)cuda_tmp_alloc(off_sx + scale_n, "attn_out_a a8 acts");
-        if (scratch) {
-            __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)scratch;
-            unsigned char *sx = (unsigned char *)(scratch + off_sx);
+        const size_t data_bytes_a8 = data_n * sizeof(__nv_fp8_e4m3);
+        /* Soft failure on purpose: this path falls through to f32 rather than
+         * failing the call, and the arena latches, so a refused reservation
+         * arrives as a NULL take below and needs no separate branch. */
+        cuda_arena ar;
+        (void)cuda_arena_begin(&ar, mx_a256(data_bytes_a8) + mx_a256(scale_n),
+                               "attn_out_a a8 acts");
+        __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, data_bytes_a8, 256);
+        unsigned char *sx = (unsigned char *)cuda_arena_take(&ar, scale_n, 256);
+        if (sx) {   /* take() latches, so sx != NULL implies xq != NULL */
             /* mx_sfoff leaves holes; the GEMV reads only the (tok, kb) pairs the
              * quantiser fills, but zero the slab so a hole can never carry a
              * stale byte from a previous call's larger shape. */
