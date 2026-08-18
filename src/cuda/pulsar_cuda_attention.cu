@@ -1734,12 +1734,16 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
          * into an f32 staging region first (pure conversion, exact values, so
          * the gemms see the identical matrix the f32 path reads). */
         const uint64_t kv_count = (uint64_t)n_tokens * head_dim;
-        const uint64_t kv_offset = (kv_count * sizeof(float) + 255u) & ~255ull;
-        const uint64_t tmp_bytes = kv_offset + out_offset + out_count * sizeof(float);
-        float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention raw cublas");
-        if (!tmp) return 0;
-        float *scores = (float *)((char *)tmp + kv_offset);
-        float *out_tmp = (float *)((char *)tmp + kv_offset + out_offset);
+        const uint64_t kv_bytes = kv_count * sizeof(float);
+        const uint64_t out_bytes = out_count * sizeof(float);
+        const uint64_t tmp_bytes = ((kv_bytes + 255u) & ~255ull) +
+                                   ((score_bytes + 255u) & ~255ull) + out_bytes;
+        cuda_arena ar;
+        if (!cuda_arena_begin(&ar, tmp_bytes, "attention raw cublas")) return 0;
+        float *tmp     = (float *)cuda_arena_take(&ar, kv_bytes, 256);
+        float *scores  = (float *)cuda_arena_take(&ar, score_bytes, 256);
+        float *out_tmp = (float *)cuda_arena_take(&ar, out_bytes, 256);
+        if (!out_tmp) return 0;   /* take() latches: one check covers all three */
         const float *kv_mat = (const float *)raw_kv->ptr;
         {
             attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
@@ -2366,15 +2370,16 @@ static int attention_prefill_mixed_launch(
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
         const uint64_t kv_bytes = kv_count * sizeof(float);
-        const uint64_t score_offset = (kv_bytes + 255u) & ~255ull;
         const uint64_t score_bytes = score_count * sizeof(float);
-        const uint64_t out_offset = score_offset + ((score_bytes + 255u) & ~255ull);
-        uint64_t tmp_bytes = out_offset + out_count * sizeof(float);
-        float *tmp = (float *)cuda_tmp_alloc(tmp_bytes, "attention mixed cublas");
-        if (!tmp) return 0;
-        float *kv = tmp;
-        float *scores = (float *)((char *)tmp + score_offset);
-        float *out_tmp = (float *)((char *)tmp + out_offset);
+        const uint64_t out_bytes = out_count * sizeof(float);
+        const uint64_t tmp_bytes = ((kv_bytes + 255u) & ~255ull) +
+                                   ((score_bytes + 255u) & ~255ull) + out_bytes;
+        cuda_arena ar;
+        if (!cuda_arena_begin(&ar, tmp_bytes, "attention mixed cublas")) return 0;
+        float *kv      = (float *)cuda_arena_take(&ar, kv_bytes, 256);
+        float *scores  = (float *)cuda_arena_take(&ar, score_bytes, 256);
+        float *out_tmp = (float *)cuda_arena_take(&ar, out_bytes, 256);
+        if (!out_tmp) return 0;   /* take() latches: one check covers all three */
         const float *q_eff = (const float *)q->ptr;
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,

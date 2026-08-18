@@ -580,34 +580,41 @@ static int routed_moe_launch_cutlass_grouped(
             (int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
 
     const uint64_t align = 256;
-    uint64_t off = 0;
-    const uint64_t counts_off = off;  off = cutlass_moe_align_up(off + counts_bytes, align);
-    const uint64_t offsets_off = off; off = cutlass_moe_align_up(off + offsets_bytes, align);
-    const uint64_t cursors_off = off; off = cutlass_moe_align_up(off + cursors_bytes, align);
-    const uint64_t sorted_off = off;  off = cutlass_moe_align_up(off + sorted_bytes, align);
-    const uint64_t padoff_off = off;  off = cutlass_moe_align_up(off + padoff_bytes, align);
-    const uint64_t xg_off = off;      off = cutlass_moe_align_up(off + xg_bytes, align);
-    const uint64_t wg_off = off;      off = cutlass_moe_align_up(off + wg_bytes, align);
-    const uint64_t ppair_off = off;   off = cutlass_moe_align_up(off + ppair_bytes, align);
-    const uint64_t rsrc_off = off;    off = cutlass_moe_align_up(off + rsrc_bytes, align);
-    const uint64_t ffn_off = off;     off = cutlass_moe_align_up(off + ffn_bytes, align);
-    const uint64_t grp_off = off;     off = cutlass_moe_align_up(off + grp_bytes, align);
-    const uint64_t total_scratch = off;
+    /* Eleven buffers from one reservation.  Two are used only on one side of
+     * `cached_act`, but BOTH are still taken so the layout is independent of
+     * that flag -- the old code reserved space for both unconditionally and only
+     * the POINTERS were conditional, and keeping that property means this
+     * conversion cannot change what any kernel sees. */
+    const uint64_t total_scratch =
+        cutlass_moe_align_up(counts_bytes, align) +
+        cutlass_moe_align_up(offsets_bytes, align) +
+        cutlass_moe_align_up(cursors_bytes, align) +
+        cutlass_moe_align_up(sorted_bytes, align) +
+        cutlass_moe_align_up(padoff_bytes, align) +
+        cutlass_moe_align_up(xg_bytes, align) +
+        cutlass_moe_align_up(wg_bytes, align) +
+        cutlass_moe_align_up(ppair_bytes, align) +
+        cutlass_moe_align_up(rsrc_bytes, align) +
+        cutlass_moe_align_up(ffn_bytes, align) +
+        cutlass_moe_align_up(grp_bytes, align);
 
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(total_scratch, "routed_moe grouped");
-    if (!scratch) return 0;
-
-    uint32_t *counts = (uint32_t *)(scratch + counts_off);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_off);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
-    uint32_t *padded_off = (uint32_t *)(scratch + padoff_off);
-    float *x_gathered = cached_act ? NULL : (float *)(scratch + xg_off);
-    float *w_gathered = (float *)(scratch + wg_off);
-    int32_t *padded_pair = (int32_t *)(scratch + ppair_off);
-    int32_t *row_src_tok = cached_act ? (int32_t *)(scratch + rsrc_off) : NULL;
-    float *ffn_out = (float *)(scratch + ffn_off);
-    uint8_t *grp_scratch = scratch + grp_off;
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, total_scratch, "routed_moe grouped")) return 0;
+    uint32_t *counts       = (uint32_t *)cuda_arena_take(&ar, counts_bytes, align);
+    uint32_t *offsets      = (uint32_t *)cuda_arena_take(&ar, offsets_bytes, align);
+    uint32_t *cursors      = (uint32_t *)cuda_arena_take(&ar, cursors_bytes, align);
+    uint32_t *sorted_pairs = (uint32_t *)cuda_arena_take(&ar, sorted_bytes, align);
+    uint32_t *padded_off   = (uint32_t *)cuda_arena_take(&ar, padoff_bytes, align);
+    float    *x_gathered   = (float *)cuda_arena_take(&ar, xg_bytes, align);
+    float    *w_gathered   = (float *)cuda_arena_take(&ar, wg_bytes, align);
+    int32_t  *padded_pair  = (int32_t *)cuda_arena_take(&ar, ppair_bytes, align);
+    int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_bytes, align);
+    float    *ffn_out      = (float *)cuda_arena_take(&ar, ffn_bytes, align);
+    uint8_t  *grp_scratch  = (uint8_t *)cuda_arena_take(&ar, grp_bytes, align);
+    if (!grp_scratch) return 0;   /* take() latches: one check covers all eleven */
+    /* The two flag-dependent operands, exactly as before. */
+    if (cached_act) x_gathered = NULL;
+    else            row_src_tok = NULL;
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
     int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "moe_grouped counts clear");
@@ -865,33 +872,38 @@ static int routed_moe_launch_mixed40(
                  : pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_mid_dim, (int)out_dim));
 
     uint64_t off = 0;
-    const uint64_t counts_o  = off; off = cutlass_moe_align_up(off + counts_b, A);
-    const uint64_t offsets_o = off; off = cutlass_moe_align_up(off + offsets_b, A);
-    const uint64_t cursors_o = off; off = cutlass_moe_align_up(off + cursors_b, A);
-    const uint64_t sorted_o  = off; off = cutlass_moe_align_up(off + sorted_b, A);
-    const uint64_t padoff_o  = off; off = cutlass_moe_align_up(off + padoff_b, A);
-    const uint64_t xg_o   = off; off = cutlass_moe_align_up(off + xg_b, A);
-    const uint64_t wg_o   = off; off = cutlass_moe_align_up(off + wg_b, A);
-    const uint64_t ppair_o= off; off = cutlass_moe_align_up(off + ppair_b, A);
-    const uint64_t gg_o   = off; off = cutlass_moe_align_up(off + gg_b, A);
-    const uint64_t ug_o   = off; off = cutlass_moe_align_up(off + ug_b, A);
-    const uint64_t mg_o   = off; off = cutlass_moe_align_up(off + mg_b, A);
-    const uint64_t og_o   = off; off = cutlass_moe_align_up(off + og_b, A);
-    const uint64_t proj_o = off; off = cutlass_moe_align_up(off + proj_b, A);
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(off, "routed_moe mixed40");
-    if (!scratch) return 0;
+    /* Twelve buffers from one reservation.  The last four (gate/up/mid/out
+     * gathers) are consumed further down; they are TAKEN here with the rest so
+     * every slice comes from one bump sequence rather than being reconstructed
+     * from a saved offset at the point of use -- which is the pattern that lets
+     * a stale offset survive a layout change. */
+    const uint64_t total_scratch =
+        cutlass_moe_align_up(counts_b, A)  + cutlass_moe_align_up(offsets_b, A) +
+        cutlass_moe_align_up(cursors_b, A) + cutlass_moe_align_up(sorted_b, A) +
+        cutlass_moe_align_up(padoff_b, A)  + cutlass_moe_align_up(xg_b, A) +
+        cutlass_moe_align_up(wg_b, A)      + cutlass_moe_align_up(ppair_b, A) +
+        cutlass_moe_align_up(gg_b, A)      + cutlass_moe_align_up(ug_b, A) +
+        cutlass_moe_align_up(mg_b, A)      + cutlass_moe_align_up(og_b, A) +
+        cutlass_moe_align_up(proj_b, A);
 
-    uint32_t *counts  = (uint32_t *)(scratch + counts_o);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_o);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_o);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_o);
-    uint32_t *padded_off = (uint32_t *)(scratch + padoff_o);
-    float   *x_gathered = (float *)(scratch + xg_o);
-    float   *w_gathered = (float *)(scratch + wg_o);
-    int32_t *padded_pair = (int32_t *)(scratch + ppair_o);
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, total_scratch, "routed_moe mixed40")) return 0;
+    uint32_t *counts       = (uint32_t *)cuda_arena_take(&ar, counts_b, A);
+    uint32_t *offsets      = (uint32_t *)cuda_arena_take(&ar, offsets_b, A);
+    uint32_t *cursors      = (uint32_t *)cuda_arena_take(&ar, cursors_b, A);
+    uint32_t *sorted_pairs = (uint32_t *)cuda_arena_take(&ar, sorted_b, A);
+    uint32_t *padded_off   = (uint32_t *)cuda_arena_take(&ar, padoff_b, A);
+    float    *x_gathered   = (float *)cuda_arena_take(&ar, xg_b, A);
+    float    *w_gathered   = (float *)cuda_arena_take(&ar, wg_b, A);
+    int32_t  *padded_pair  = (int32_t *)cuda_arena_take(&ar, ppair_b, A);
+    float    *gate_g_buf   = (float *)cuda_arena_take(&ar, gg_b, A);
+    float    *up_g_buf     = (float *)cuda_arena_take(&ar, ug_b, A);
+    float    *mid_g_buf    = (float *)cuda_arena_take(&ar, mg_b, A);
+    float    *out_g_buf    = (float *)cuda_arena_take(&ar, og_b, A);
+    uint8_t  *proj_scratch = (uint8_t *)cuda_arena_take(&ar, proj_b, A);
+    if (!proj_scratch) return 0;  /* take() latches: one check covers all thirteen */
     float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
     float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
-    uint8_t *proj_scratch = scratch + proj_o;
 
     /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1). */
     int ok = cuda_ok(cudaMemset(counts, 0, counts_b), "mixed40 counts clear");
@@ -958,9 +970,9 @@ static int routed_moe_launch_mixed40(
 
     if (caseA) {
         /* Phase 1: gate & up W4A8 -> swiglu -> mid (pair layout). */
-        float *gate_g = (float *)(scratch + gg_o);
-        float *up_g   = (float *)(scratch + ug_o);
-        float *mid_g  = (float *)(scratch + mg_o);
+        float *gate_g = gate_g_buf;
+        float *up_g   = up_g_buf;
+        float *mid_g  = mid_g_buf;
         if (use_grouped) {
             /* grouped: padded-gather x -> grouped GEMMs -> swiglu(padded) -> padded-scatter. */
             /* row_src_tok = NULL: the mixed-40 path goes through
@@ -1027,8 +1039,11 @@ static int routed_moe_launch_mixed40(
         /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat.  The Q8_K
          * quantize of x that used to run here fed the dp4a kernels; MMQ takes x
          * as f32 and does its own q8_1, so it was pure waste once they went. */
-        float *mid_g = (float *)(scratch + xg_o);   /* reuse the gather buffer (K=mid_dim=cut_k) */
-        float *out_g = (float *)(scratch + og_o);
+        /* DELIBERATE ALIAS: reuse the gather buffer (K=mid_dim=cut_k).  Kept as an
+         * explicit alias of x_gathered rather than a separate arena slice -- giving
+         * it its own slice would silently double this scratch and change behaviour. */
+        float *mid_g = x_gathered;
+        float *out_g = out_g_buf;
         /* Type-43 gate/up against a type-40 down (3 of the artifact's layers).
          * `up` is pair-sized and was only read by the deleted qwarp32 branch, so
          * it serves as MMQ's raw gate buffer -- no arena change needed. */

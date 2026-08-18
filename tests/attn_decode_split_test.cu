@@ -70,7 +70,10 @@ struct Case {
     uint32_t n_tokens, n_raw, raw_cap, raw_start, n_comp, window, ratio;
     uint32_t pos_base;      /* positions[t] = pos_base + 3*t (descr mode) */
     int descr;              /* 0: single_all scalar decode; 1: banked */
-    int raw_pack, comp_pack;
+    /* raw_pack is GONE: the raw ring is PULSAR_ATTN_PACK and nothing else,
+     * so a case selecting the f32 arm described a shape the engine cannot
+     * produce.  Every case now builds packed raw rows. */
+    int comp_pack;
     uint32_t n_banks, comp_cap;
 };
 
@@ -80,13 +83,13 @@ int main() {
     std::normal_distribution<float> nd(0.f, 0.8f);
 
     const Case cases[] = {
-        {"single_all f32comp",  1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 0, 1, 0},
-        {"single_all raw-pack", 1, 128, 4352,  5, 640, 0, 0, 0, 0, 1, 0, 1, 0},
-        {"single_all pack",     1, 128, 4352, 41, 600, 0, 0, 0, 0, 0, 1, 1, 0},
-        {"banked 4tok",         4,  64,  64,  0, 200, 24, 4, 850, 1, 0, 0, 2, 256},
-        {"banked pack",         4,  64,  64,  0, 200, 24, 4, 870, 1, 0, 1, 2, 256},
-        {"tiny n_score",        1,   3,  64, 10,   1, 0, 0, 0, 0, 0, 0, 1, 0},
-        {"comp empty",          2,  40,  64,  0,   0, 48, 4, 100, 1, 0, 0, 1, 64},
+        {"single_all f32comp", 1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 1, 0},
+        {"single_all raw-pack", 1, 128, 4352, 5, 640, 0, 0, 0, 0, 0, 1, 0},
+        {"single_all pack", 1, 128, 4352, 41, 600, 0, 0, 0, 0, 1, 1, 0},
+        {"banked 4tok", 4, 64, 64, 0, 200, 24, 4, 850, 1, 0, 2, 256},
+        {"banked pack", 4, 64, 64, 0, 200, 24, 4, 870, 1, 1, 2, 256},
+        {"tiny n_score", 1, 3, 64, 10, 1, 0, 0, 0, 0, 0, 1, 0},
+        {"comp empty", 2, 40, 64, 0, 0, 48, 4, 100, 1, 0, 1, 64},
     };
 
     double worst_all = 0.0;
@@ -131,7 +134,7 @@ int main() {
          * __half until then, and this case built halves; the engine reading
          * packed rows saw NaN, which is how the format change was caught. */
         std::vector<uint8_t> rawp((size_t)total_raw_rows * pack_row);
-        if (c.raw_pack) {
+        {
             std::uniform_int_distribution<int> bd2(0, 255);
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_raw_rows; r++) {
@@ -154,14 +157,13 @@ int main() {
         float *draw, *dcomp, *dq, *ds, *dgold, *dsplit;
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
-        cudaMalloc(&draw, c.raw_pack ? rawp.size() : raw.size() * 4);
+        cudaMalloc(&draw, rawp.size());
         cudaMalloc(&dcomp, c.comp_pack ? compp.size() : comp.size() * 4);
         cudaMalloc(&dq, q.size() * 4);
         cudaMalloc(&ds, sinks.size() * 4);
         cudaMalloc(&dgold, q.size() * 4);
         cudaMalloc(&dsplit, q.size() * 4);
-        if (c.raw_pack) cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
-        else            cudaMemcpy(draw, raw.data(), raw.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
         if (c.comp_pack) cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
         else             cudaMemcpy(dcomp, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
@@ -188,7 +190,7 @@ int main() {
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
                 (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
-                c.window, c.ratio, n_head, D, c.raw_pack,
+                c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,
                 c.comp_cap, c.descr ? c.n_banks : 1u, NULL, NULL);
         /* candidate: split walk + merge through the production scratch */
@@ -200,7 +202,7 @@ int main() {
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
                 (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
-                c.window, c.ratio, n_head, D, c.raw_pack,
+                c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,
                 c.comp_cap, c.descr ? c.n_banks : 1u, po, pml);
         dim3 gm(c.n_tokens, n_head, 1);
