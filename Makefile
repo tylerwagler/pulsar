@@ -2,6 +2,9 @@ CC ?= cc
 NATIVE_CPU_FLAG ?= -march=native
 
 DEBUG_FLAGS ?= -g
+# Header dependency generation; see the ALL_OBJS/PULSAR_DEPS block below for why.
+PULSAR_DEPFLAGS := -MMD -MP
+
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 
@@ -18,12 +21,14 @@ CXXFLAGS += -D_GNU_SOURCE -fno-finite-math-only -fno-exceptions -fno-rtti
 # Keep the warning surface identical to the C build.
 CXXFLAGS += -Wno-missing-field-initializers
 CXXFLAGS += -DPULSAR_VERSION_STR='"$(PULSAR_VERSION_STR)"'
+CXXFLAGS += $(PULSAR_DEPFLAGS)
 
 # Version string reported by /version, /health and the startup banner. Derived
 # from git so it never goes stale (e.g. "v0.2.3-8-gec51fb2", "-dirty" if the
 # tree has uncommitted changes); falls back to "unknown" outside a git checkout.
 PULSAR_VERSION_STR := $(shell git describe --tags --dirty --always 2>/dev/null || echo unknown)
 CFLAGS += -DPULSAR_VERSION_STR='"$(PULSAR_VERSION_STR)"'
+CFLAGS += $(PULSAR_DEPFLAGS)
 
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
@@ -32,6 +37,7 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS += $(PULSAR_DEPFLAGS)
 
 # HC_F32=1 (-DPULSAR_HC_F32) used to restore f32 residual carriers: the control
 # build that proved the BF16 storage narrowing was a pure no-op. That flip
@@ -69,6 +75,41 @@ MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
 endif
 LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+
+# ---------------------------------------------------------------------------
+# AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
+#
+# Every rule below used to hand-list its header prerequisites, and the tree paid
+# for that three separate times on 2026-08-18 alone:
+#   * five tests were stale against a KV format change, the worst of them feeding
+#     f32 rows to a packed reader -- 598016 NaNs the instant it was rebuilt, days
+#     late, and only because deleting the vendored MMQ headers forced a rebuild;
+#   * an attn fixture had been degenerate for days behind those stale objects;
+#   * deleting common.cuh needed a manual `make clean`, because a hand-listed
+#     prerequisite cannot express "this header no longer exists".
+# The note on the prefill gate below PREDICTED this in as many words -- "make
+# would then see moe.o as up to date after a .cuh-only edit, relink the OLD
+# kernel, and print PASS -- the gate would certify a kernel it never compiled" --
+# and called project-wide -MMD -MP the real fix, deferring it because this
+# Makefile was shared with a parallel branch.  That branch (flashinfer-attn) is
+# retired, so the reason is gone and the fix lands.
+#
+# -MMD writes a .d beside each .o listing the headers it actually opened
+# (skipping system headers); -MP adds a phony target per header so a DELETED
+# header does not wedge the build with "No rule to make target".  nvcc accepts
+# both directly and, given -o, names the target with the object's full path --
+# checked, not assumed.
+#
+# Hand-listed prerequisites are kept underneath as a floor, not removed: they
+# cost nothing, and on a first build (no .d yet) they are all make has.
+ALL_OBJS = $(CORE_OBJS) $(AGENT_OBJS) $(SERVER_OBJS) \
+           $(patsubst %.cpp,%.o,$(wildcard src/cli/*.cpp)) \
+           $(patsubst %.c,%.o,$(wildcard src/cli/*.c)) \
+           $(patsubst %.cpp,%.o,$(wildcard src/lib/*.cpp)) \
+           $(patsubst %.c,%.o,$(wildcard src/lib/*.c)) \
+           $(patsubst %.cpp,%.o,$(wildcard src/vendor/*.cpp)) \
+           $(patsubst %.cpp,%.o,$(wildcard tests/*.cpp))
+PULSAR_DEPS = $(ALL_OBJS:.o=.d)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
@@ -167,8 +208,12 @@ ATTN_GATE_ARCH ?= sm_120f
 # This is the failure the -B note further down predicts almost word for word --
 # "make would then see moe.o as up to date ... and print PASS -- the gate would
 # certify a kernel it never compiled" -- arriving on the TEST side rather than
-# the engine side.  Project-wide -MMD -MP remains the real fix; these explicit
-# prerequisites are the part that can land without restructuring the file.
+# the engine side.
+#
+# ✅ Project-wide -MMD -MP landed 2026-08-18, so these lists are no longer what
+# keeps these three correct -- the generated .d files are.  They are KEPT as the
+# floor: on a first build, or immediately after `make clean`, no .d exists yet
+# and a hand-listed prerequisite is all make has.
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
                             src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
@@ -478,10 +523,19 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 # TARGET: a tree previously built at another arch can no longer leak a
 # mismatched object into the compare.
 #
-# Project-wide `-MMD -MP` dependency tracking is the better long-term fix and is
-# deliberately OUT OF SCOPE here (this Makefile is shared with a parallel branch;
-# restructuring it would collide).  Until it lands, -B is what keeps the gate
-# honest.
+# ✅ `-MMD -MP` LANDED 2026-08-18 (see the ALL_OBJS/PULSAR_DEPS block at the top).
+# The parallel branch this was deferred for -- flashinfer-attn -- is retired, so
+# the reason expired.  Make now sees .cuh edits by itself.
+#
+# -B STAYS ANYWAY, and the reason is worth being precise about, because "we have
+# dependency tracking now" is exactly the argument that would drop it wrongly:
+# -MMD -MP tracks WHICH FILES a TU read, not WHICH FLAGS it was compiled with.  A
+# tree previously built at another arch leaves objects whose headers are all
+# up to date and whose CODE is for the wrong GPU, and make cannot tell.  That
+# half of the hazard is untouched, and it is the half that made 6d41502's arch
+# pin appear not to work.  So: dependency tracking removed the .cuh-staleness
+# reason for -B; the arch-mismatch reason remains, and it is sufficient on its
+# own for an acceptance gate.
 # DIAGNOSTIC, deliberately NOT in GATE_TARGETS.  Spec-vs-greedy byte equality is
 # NOT an invariant of this engine: measured 2026-08-14 on clean dev, the set of
 # diverging draft depths is stable across generation LENGTH but changes with the
@@ -755,5 +809,10 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
+# Pull in the generated header dependencies.  `-include` (not `include`) so a
+# tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
+# silent rather than fatal.  This line is what makes every rule above correct
+# after the first build; the hand-listed prerequisites are only the floor.
+-include $(PULSAR_DEPS)
