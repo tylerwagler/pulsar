@@ -1341,10 +1341,14 @@ void gpu_graph_dspark_seed_draft_kv(
                 seeded = false;
                 break;
             }
-            if (!pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT)) {
-                seeded = false;
-                break;
-            }
+            /* No fake-quantise before the store.  The TARGET path this seed has
+             * to agree with (gpu_graph_decode_kv_store -> attn_pack_store_kernel
+             * with x = kv) quantises the true f32 exactly ONCE, packing to the
+             * ring and writing back in the same pass.  Round-tripping here first
+             * made the seed quantise twice, which is the ~5%-misround pattern
+             * norm_kv warns about and would let a seeded row differ from the
+             * target's row for the same token -- the one thing this seed exists
+             * to make identical. */
             /* Store through the ring's own writer, not a byte copy.  This was
              * pulsar_gpu_tensor_copy at row*kv_bytes -- an f32 row at a 2048 B
              * stride -- which stopped being the ring's layout when it became

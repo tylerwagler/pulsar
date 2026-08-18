@@ -918,10 +918,16 @@ bool gpu_graph_encode_layer_attention_batch(
      * KV was multiplied at 4 bytes/element while every later chunk read the same
      * rows out of the ring at 584 B.
      *
-     * It must be THIS entry and not the repack one: repack uses an exact integer
-     * scale bucket, while this shares pulsar_gpu_dsv4_fp8_kv_quantize_tensor's
-     * fast-math scale -- which is what the ring store uses, so the chunk's rows
-     * and the ring's rows agree byte for byte. */
+     * This is now the ONLY quantise of these rows.  It used to argue that its
+     * fast-math scale matched the ring store's, so the chunk's rows and the
+     * ring's rows "agree byte for byte" -- but that was two quantisations of the
+     * same data hoping to land identically, and the second one was fed an
+     * already-round-tripped buffer.  The ring store now scatters THESE bytes
+     * (pulsar_gpu_store_raw_kv_batch_packed_tensor), so the agreement is
+     * structural and there is nothing left to argue about.
+     *
+     * The in-place round-trip of batch_kv still matters: the compressor reads it
+     * afterwards and must see the values attention sees, not the wider ones. */
     if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->batch_kv,
                                                            g->batch_kv_pack,
                                                            0u,
