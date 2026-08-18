@@ -359,7 +359,12 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         uint32_t head_dim,
         /* Same idea as the softmax fp16 store: emit the packed KV directly in
          * the GEMM's operand type instead of writing f32 and converting after. */
-        __half *dst_h) {
+        __half *dst_h,
+        /* Comp row format. The raw half has read PULSAR_ATTN_PACK rows through
+         * raw_kv_ld since the format was unified; this half indexed f32 until
+         * 2026-08-18, which is why the cuBLAS arm could not be handed the
+         * packed pool. Same decoder as everywhere else, not a transcription. */
+        int comp_pack) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)(n_tokens + n_comp) * head_dim;
     if (gid >= n) return;
@@ -367,7 +372,9 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
     uint32_t r = gid / head_dim;
     const float v = r < n_tokens
             ? raw_kv_ld(raw_kv, (uint64_t)r, d, head_dim)
-            : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+            : (comp_pack
+                   ? attn_comp_pack_ld(comp_kv, (uint64_t)(r - n_tokens), d, head_dim)
+                   : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d]);
     if (dst_h) dst_h[gid] = __float2half(v);
     else dst[gid] = v;
 }
@@ -1742,7 +1749,8 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                     n_tokens,
                     0,
                     head_dim,
-                    NULL);
+                    NULL,
+                    /* comp_pack */ 0);   /* n_comp == 0: the comp half never runs */
             if (!cuda_ok(cudaGetLastError(), "attention raw f16 expand launch")) return 0;
             kv_mat = tmp;
         }
@@ -2367,7 +2375,8 @@ static int attention_prefill_mixed_launch(
                 n_tokens,
                 n_comp,
                 head_dim,
-                NULL);
+                NULL,
+                (int)comp_kv_pack);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
