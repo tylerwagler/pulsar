@@ -44,7 +44,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     const void    * gate_soa,
     const void    * up_soa,
     int64_t         soa_blocks,
-    const void    * q8,
+    const void    * act,
     const int32_t * ids_dst,
     const int32_t * expert_bounds,
     float         * out_gate,
@@ -61,4 +61,4 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
 // activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
 // directly into the expert-major Q8_1 D2S6 input consumed by Q2_K down.
 
-int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *q8, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, cudaStream_t stream);
+int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *act, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, cudaStream_t stream);

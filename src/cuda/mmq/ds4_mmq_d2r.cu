@@ -60,25 +60,25 @@ constexpr int kIQ2RawRowsPerWarp = 16;
 constexpr int kIQ2RawPairsPerRow = 8;
 constexpr int kIQ2RawQCodeChunks = kIQ2RawRowsPerWarp * kIQ2RawPairsPerRow;
 constexpr int kIQ2RawQCodeTrips = (kIQ2RawQCodeChunks + 31) / 32;
-constexpr int kQ8PrefetchItems = kNFrag * 8 * 9;
-constexpr int kQ8PrefetchTrips = (kQ8PrefetchItems + kThreads - 1) / kThreads;
+constexpr int kActPrefetchItems = kNFrag * 8 * 9;
+constexpr int kActPrefetchTrips = (kActPrefetchItems + kThreads - 1) / kThreads;
 
 static_assert(kNTile == 64, "D2R production path is CFG1 NT64 only");
 
-static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two q8 stages");
+static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two act stages");
 static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
-static_assert(kQ8PrefetchTrips == 3, "unexpected q8 issue trip count");
+static_assert(kActPrefetchTrips == 3, "unexpected act issue trip count");
 static_assert(kIQ2RawQCodeTrips == 4, "unexpected IQ2 raw-ring issue trip count");
 
 struct alignas(16) SmemInvariants {
     const char *w_base;
     const half *iq2_dq_base;
     const uint2 *iq2_qs_base;
-    const char *q8_tile_base;
+    const char *act_tile_base;
     float *out;
     uint32_t sc_off_bytes;
     uint32_t qs_off_bytes;
-    uint32_t q8_k128_stride_bytes;
+    uint32_t act_k128_stride_bytes;
     int nb;
     int k128_iters;
     int M;
@@ -207,7 +207,7 @@ __device__ __forceinline__ int d2r_tig() {
     return d2r_lane() & 3;
 }
 
-__device__ __forceinline__ int d2r_q8_stage(int k128_iter) {
+__device__ __forceinline__ int d2r_act_stage(int k128_iter) {
     return k128_iter & (kStages - 1);
 }
 
@@ -216,97 +216,97 @@ __device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
 }
 
 template <bool FullTile>
-__device__ __forceinline__ void issue_q8_prefetch_one(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
-        const char * __restrict__ q8_iter_base,
+__device__ __forceinline__ void issue_act_prefetch_one(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        const char * __restrict__ act_iter_base,
         int col_count, int stage, int t) {
     constexpr int cols = kNFrag * 8;
-    static_assert(cols == 64, "NT64 q8 prefetch mapping expects 64 columns");
+    static_assert(cols == 64, "NT64 act prefetch mapping expects 64 columns");
     const int col_local = t & (cols - 1);
     const int chunk = t >> 6;
     const int nf = col_local >> 3;
     const int c = col_local & 7;
     const bool valid = FullTile ? true : (col_local < col_count);
-    void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
-    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
+    void *dst = (char *)&s_act[stage][nf][c] + chunk * 16;
+    const void *src = act_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
     cp_async_16B(dst, src, valid);
 }
 
 template <bool FullTile, int Iter>
-__device__ __forceinline__ void issue_q8_prefetch_unrolled(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
-        const char * __restrict__ q8_iter_base,
+__device__ __forceinline__ void issue_act_prefetch_unrolled(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        const char * __restrict__ act_iter_base,
         int col_count, int stage, int tid) {
-    if constexpr (Iter < kQ8PrefetchTrips) {
+    if constexpr (Iter < kActPrefetchTrips) {
         const int t = tid + Iter * kThreads;
-        if constexpr ((Iter + 1) * kThreads <= kQ8PrefetchItems) {
-            issue_q8_prefetch_one<FullTile>(s_q8, q8_iter_base, col_count, stage, t);
+        if constexpr ((Iter + 1) * kThreads <= kActPrefetchItems) {
+            issue_act_prefetch_one<FullTile>(s_act, act_iter_base, col_count, stage, t);
         } else {
-            if (t < kQ8PrefetchItems) {
-                issue_q8_prefetch_one<FullTile>(s_q8, q8_iter_base, col_count, stage, t);
+            if (t < kActPrefetchItems) {
+                issue_act_prefetch_one<FullTile>(s_act, act_iter_base, col_count, stage, t);
             }
         }
-        issue_q8_prefetch_unrolled<FullTile, Iter + 1>(
-            s_q8, q8_iter_base, col_count, stage, tid);
+        issue_act_prefetch_unrolled<FullTile, Iter + 1>(
+            s_act, act_iter_base, col_count, stage, tid);
     }
 }
 
 template <bool FullTile>
-__device__ __forceinline__ void issue_q8_prefetch(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
+__device__ __forceinline__ void issue_act_prefetch(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter, int tid) {
-    const char *q8_tile_base = s_inv.q8_tile_base;
-    const uint32_t k128_stride = s_inv.q8_k128_stride_bytes;
+    const char *act_tile_base = s_inv.act_tile_base;
+    const uint32_t k128_stride = s_inv.act_k128_stride_bytes;
     int col_count = kNTile;
     if constexpr (!FullTile) {
         col_count = s_inv.col_count;
     }
-    const char *q8_iter_base = q8_tile_base + (uint64_t)k128_iter * (uint64_t)k128_stride;
-    issue_q8_prefetch_unrolled<FullTile, 0>(s_q8, q8_iter_base, col_count, stage, tid);
+    const char *act_iter_base = act_tile_base + (uint64_t)k128_iter * (uint64_t)k128_stride;
+    issue_act_prefetch_unrolled<FullTile, 0>(s_act, act_iter_base, col_count, stage, tid);
     cp_async_commit();
 }
 
-__device__ __forceinline__ void issue_q8_prefetch_one_fast(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
-        const char * __restrict__ q8_iter_base,
+__device__ __forceinline__ void issue_act_prefetch_one_fast(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        const char * __restrict__ act_iter_base,
         int stage, int t) {
     constexpr int cols = kNFrag * 8;
-    static_assert(cols == 64, "NT64 q8 prefetch mapping expects 64 columns");
+    static_assert(cols == 64, "NT64 act prefetch mapping expects 64 columns");
     const int col_local = t & (cols - 1);
     const int c = col_local & 7;
     const int nf = col_local >> 3;
     const int chunk = t >> 6;
-    void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
-    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
+    void *dst = (char *)&s_act[stage][nf][c] + chunk * 16;
+    const void *src = act_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
     cp_async_16B(dst, src, true);
 }
 
 template <int Iter>
-__device__ __forceinline__ void issue_q8_prefetch_fast_unrolled(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
-        const char * __restrict__ q8_iter_base,
+__device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        const char * __restrict__ act_iter_base,
         int stage, int tid) {
-    if constexpr (Iter < kQ8PrefetchTrips) {
+    if constexpr (Iter < kActPrefetchTrips) {
         const int t = tid + Iter * kThreads;
-        if constexpr ((Iter + 1) * kThreads <= kQ8PrefetchItems) {
-            issue_q8_prefetch_one_fast(s_q8, q8_iter_base, stage, t);
+        if constexpr ((Iter + 1) * kThreads <= kActPrefetchItems) {
+            issue_act_prefetch_one_fast(s_act, act_iter_base, stage, t);
         } else {
-            if (t < kQ8PrefetchItems) {
-                issue_q8_prefetch_one_fast(s_q8, q8_iter_base, stage, t);
+            if (t < kActPrefetchItems) {
+                issue_act_prefetch_one_fast(s_act, act_iter_base, stage, t);
             }
         }
-        issue_q8_prefetch_fast_unrolled<Iter + 1>(s_q8, q8_iter_base, stage, tid);
+        issue_act_prefetch_fast_unrolled<Iter + 1>(s_act, act_iter_base, stage, tid);
     }
 }
 
-__device__ __forceinline__ void issue_q8_prefetch_fast(
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
+__device__ __forceinline__ void issue_act_prefetch_fast(
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter) {
-    const char *q8_iter_base =
-        s_inv.q8_tile_base + (uint64_t)k128_iter * (uint64_t)s_inv.q8_k128_stride_bytes;
-    issue_q8_prefetch_fast_unrolled<0>(s_q8, q8_iter_base, stage, d2r_tid());
+    const char *act_iter_base =
+        s_inv.act_tile_base + (uint64_t)k128_iter * (uint64_t)s_inv.act_k128_stride_bytes;
+    issue_act_prefetch_fast_unrolled<0>(s_act, act_iter_base, stage, d2r_tid());
     cp_async_commit();
 }
 
@@ -359,9 +359,9 @@ static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
 template <int NFrag, typename TileB>
 __device__ __forceinline__ void load_B_tile(
         TileB &B,
-        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
-        int stage, int nf, int k_in_q8) {
-    const int *base = reinterpret_cast<const int *>(&s_q8[stage][nf][0].qs[k_in_q8]);
+        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
+        int stage, int nf, int k_in_act) {
+    const int *base = reinterpret_cast<const int *>(&s_act[stage][nf][0].qs[k_in_act]);
     ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_mx_act_mmq) / sizeof(int));
 }
 
@@ -607,7 +607,7 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
  * WHERE THE SCALES COME FROM, which is the easy thing to get wrong:
  *   sfa -- from make_iq2_A_tile_e4m3, keyed on `tig` (tig == 1 supplies row
  *          group+8, every other lane supplies row group).
- *   sfb -- from the COLUMN GROUP, i.e. s_q8[stage][nf][group], NOT from the
+ *   sfb -- from the COLUMN GROUP, i.e. s_act[stage][nf][group], NOT from the
  *          accumulator columns c0/c1.  For
  *          m16n8k32 the B fragment's 8 columns map one per 4-lane group, so
  *          lane group g carries column g's scale.  Using the c0/c1 pair here
@@ -626,8 +626,8 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
-        int raw_stage, int q8_stage, bool raw_row0_ok, bool raw_row1_ok,
+        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
+        int raw_stage, int act_stage, bool raw_row0_ok, bool raw_row1_ok,
         int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
     static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
     static_assert(TileC::ne == 4, "expected m16n8 accumulator fragment");
@@ -640,8 +640,8 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
     make_iq2_A_tile_e4m3<T1>(A1, sfa1, s_raw, s_grid, warp, raw_stage,
                              raw_row0_ok, raw_row1_ok, group, tig);
 
-    constexpr int k_in_q8_0 = (T0 & 3) * 32;
-    constexpr int k_in_q8_1 = (T1 & 3) * 32;
+    constexpr int k_in_act_0 = (T0 & 3) * 32;
+    constexpr int k_in_act_1 = (T1 & 3) * 32;
 
     int nf_live = NFrag;
     if constexpr (!FullTile) {
@@ -657,10 +657,10 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         }
         TileB B0;
         TileB B1;
-        load_B_tile(B0, s_q8, q8_stage, nf, k_in_q8_0);
-        load_B_tile(B1, s_q8, q8_stage, nf, k_in_q8_1);
-        const uint32_t sfb0 = (uint32_t)s_q8[q8_stage][nf][group].d4[T0 & 3];
-        const uint32_t sfb1 = (uint32_t)s_q8[q8_stage][nf][group].d4[T1 & 3];
+        load_B_tile(B0, s_act, act_stage, nf, k_in_act_0);
+        load_B_tile(B1, s_act, act_stage, nf, k_in_act_1);
+        const uint32_t sfb0 = (uint32_t)s_act[act_stage][nf][group].d4[T0 & 3];
+        const uint32_t sfb1 = (uint32_t)s_act[act_stage][nf][group].d4[T1 & 3];
 
         ds4_mma_m16n8k32_e4m3(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3],
                               (uint32_t)A0.x[0], (uint32_t)A0.x[1],
@@ -679,7 +679,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_mx_act_mmq (&s_q8)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
         int k128_iter, const volatile SmemInvariants &s_inv) {
     const int warp = d2r_warp();
     const int group = d2r_group();
@@ -695,22 +695,22 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
     }
     const int tig = d2r_tig();
     const int raw_stage = d2r_raw_stage(k128_iter >> 1);
-    const int q8_stage = d2r_q8_stage(k128_iter);
+    const int act_stage = d2r_act_stage(k128_iter);
     const int half_pair_base = (k128_iter & 1) ? 4 : 0;
 
     if (half_pair_base == 0) {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 0, 1>(
-            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 2, 3>(
-            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     } else {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 4, 5>(
-            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 6, 7>(
-            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     }
 }
@@ -718,7 +718,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
 template <bool FullTile, typename TileA, typename TileB, typename TileC>
 __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[kNFrag][TileC::ne],
-        block_mx_act_mmq (&s_q8)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
         const volatile SmemInvariants &s_inv) {
@@ -726,9 +726,9 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
     for (int pf = 0; pf < kStages; ++pf) {
         if (pf < s_inv.k128_iters) {
             if constexpr (FullTile) {
-                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf), pf);
+                issue_act_prefetch_fast(s_act, s_inv, d2r_act_stage(pf), pf);
             } else {
-                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf), pf, d2r_tid());
+                issue_act_prefetch<false>(s_act, s_inv, d2r_act_stage(pf), pf, d2r_tid());
             }
         }
     }
@@ -770,19 +770,19 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
 
         if constexpr (FullTile) {
             mma_fold_iq2_k128<true, TileA, TileB, TileC>(
-                acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
+                acc, s_raw, s_grid, s_act, k128_iter, s_inv);
         } else {
             mma_fold_iq2_k128<false, TileA, TileB, TileC>(
-                acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
+                acc, s_raw, s_grid, s_act, k128_iter, s_inv);
         }
 
         __syncthreads();
         const int pf_iter = k128_iter + kStages;
         if (pf_iter < s_inv.k128_iters) {
             if constexpr (FullTile) {
-                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter);
+                issue_act_prefetch_fast(s_act, s_inv, d2r_act_stage(pf_iter), pf_iter);
             } else {
-                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter, d2r_tid());
+                issue_act_prefetch<false>(s_act, s_inv, d2r_act_stage(pf_iter), pf_iter, d2r_tid());
             }
         }
         if ((k128_iter & 1) != 0) {
@@ -894,7 +894,7 @@ void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
 __global__ __launch_bounds__(kThreads, 2)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,
-                                const block_mx_act_mmq * __restrict__ q8,
+                                const block_mx_act_mmq * __restrict__ act,
                                 const int32_t * __restrict__ ids_dst,
                                 const int32_t * __restrict__ expert_bounds,
                                 const int * __restrict__ work,
@@ -927,7 +927,12 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     using tile_B = ggml_cuda_mma::tile<8, 8, int>;
     using tile_C = ggml_cuda_mma::tile<16, 8, int>;
 
-    __shared__ __align__(16) block_mx_act_mmq s_q8[kStages][kNFrag][8];
+    /* s_act / act_iter_base / act_stage etc. were s_q8 / q8_iter_base / q8_stage
+     * until 2026-08-18.  The bytes have been E4M3 since the A8 campaign; only
+     * the names still said int8, and a name that outlives its format is not
+     * cosmetic -- reading `block_q8_1_mmq` as evidence the MoE still ran q8_1 is
+     * exactly how L065 got written and retracted.  See ds4_act_block.cuh. */
+    __shared__ __align__(16) block_mx_act_mmq s_act[kStages][kNFrag][8];
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) uint2 s_grid[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
@@ -952,11 +957,11 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         s_inv.iq2_dq_base = reinterpret_cast<const half *>(W_soa);
         s_inv.iq2_qs_base =
             reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(W_soa) + dq_bytes);
-        s_inv.q8_tile_base = reinterpret_cast<const char *>(q8) + (uint64_t)col_lo * sizeof(block_mx_act_mmq);
+        s_inv.act_tile_base = reinterpret_cast<const char *>(act) + (uint64_t)col_lo * sizeof(block_mx_act_mmq);
         s_inv.out = out;
         s_inv.sc_off_bytes = 0;
         s_inv.qs_off_bytes = 0;
-        s_inv.q8_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_mx_act_mmq));
+        s_inv.act_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_mx_act_mmq));
         s_inv.nb = nb;
         s_inv.k128_iters = K >> 7;
         s_inv.M = M;
@@ -978,10 +983,10 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 
     if (full_warp_tile) {
         iq2_d2r_mainloop<true, tile_A, tile_B, tile_C>(
-            acc, s_q8, s_raw, s_grid, s_inv);
+            acc, s_act, s_raw, s_grid, s_inv);
     } else {
         iq2_d2r_mainloop<false, tile_A, tile_B, tile_C>(
-            acc, s_q8, s_raw, s_grid, s_inv);
+            acc, s_act, s_raw, s_grid, s_inv);
     }
 
     const int out_col_lo = s_inv.col_lo;
@@ -1005,7 +1010,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 #else
     (void)gate_soa;
     (void)up_soa;
-    (void)q8;
+    (void)act;
     (void)ids_dst;
     (void)expert_bounds;
     (void)work;
@@ -1061,7 +1066,7 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_exper
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
                                          const void *up_soa,
                                          int64_t soa_blocks,
-                                         const void *q8,
+                                         const void *act,
                                          const int32_t *ids_dst,
                                          const int32_t *expert_bounds,
                                          float *out_gate,
@@ -1079,7 +1084,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
         return 1;
     }
-    if (!gate_soa || !up_soa || !q8 || !ids_dst || !expert_bounds || !out_gate || !out_up ||
+    if (!gate_soa || !up_soa || !act || !ids_dst || !expert_bounds || !out_gate || !out_up ||
         !worklist_scratch || M <= 0 || K <= 0 || K % 256 != 0 || ne_get_rows <= 0 ||
         ne_get_rows > INT_MAX || n_experts <= 0) {
         return -1;
@@ -1115,7 +1120,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 2);
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        gate_soa, up_soa, (const block_mx_act_mmq *)q8, ids_dst, expert_bounds, work, n_items,
+        gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
         out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1145,7 +1150,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
  */
 int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
                                           int64_t soa_blocks,
-                                          const void *q8,
+                                          const void *act,
                                           const int32_t *ids_dst,
                                           const int32_t *expert_bounds,
                                           float *out,
@@ -1162,7 +1167,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
         return -1;
     }
-    if (!W_soa || !q8 || !ids_dst || !expert_bounds || !out) {
+    if (!W_soa || !act || !ids_dst || !expert_bounds || !out) {
         return -1;
     }
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0 || ne_get_rows <= 0) {
@@ -1198,7 +1203,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 1);
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        W_soa, W_soa, (const block_mx_act_mmq *)q8, ids_dst, expert_bounds, work, n_items,
+        W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
         /* Callers MUST stage E4M3 -- there is no int8 arm left to fall back
          * to.  This launch once read ds4_d2r_iq2_arm() itself, which ran the
          * E4M3 MMA against q8_1 bytes whenever the env was set (the arm-1

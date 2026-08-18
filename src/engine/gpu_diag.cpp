@@ -1780,9 +1780,14 @@ bool gpu_graph_alloc_raw_cap(
     g->router_weights = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(float));
     /* NOTE (task #64): these look debug-only — the qwarp32 kernels' stores are
      * read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
-     * routed_moe_*_impl rejects NULL gate/up (moe.cu ~2597/2908) and the batch
-     * path REUSES gate->ptr as cuda_block_q8_K staging for quantized mid
-     * (moe.cu ~2957). Keep them allocated unconditionally. */
+     * routed_moe_*_impl rejects NULL gate/up (`if (!gate_w || !up_w || !down_w)
+     * return 0;`, six sites in moe.cu). Keep them allocated unconditionally.
+     *
+     * The second reason given here was that the batch path reused gate->ptr as
+     * cuda_block_q8_K staging for quantized mid.  That is gone: the int8
+     * activation arms went with the E4M3 campaign and cuda_block_q8_K itself was
+     * deleted 2026-08-18 with zero references left.  The NULL check above is now
+     * the whole justification, and it is sufficient on its own. */
     g->routed_up = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));

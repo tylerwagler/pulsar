@@ -1788,10 +1788,15 @@ __global__ static void range_stats_kernel(const float *x, uint64_t n,
 
 /* ---- int8-vs-E4M3 activation divergence (diagnostic) ---------------------
  *
- * Settles a question analysis cannot: for the expert GEMMs we quantize
- * activations to q8_1 int8, while the SOURCE computes in E4M3.  Which is closer
- * to the source depends entirely on the tail of the real activation
- * distribution -- on a Gaussian the two are a wash, on a heavy-tailed one int8
+ * ⚠ HISTORICAL PREMISE, KEPT AS A MEASUREMENT TOOL.  Written when the expert
+ * GEMMs quantized activations to q8_1 int8 while the SOURCE computed in E4M3,
+ * to settle which was closer.  THE ENGINE NOW STAGES E4M3 EVERYWHERE and there
+ * is no int8 activation arm left, so this measures a counterfactual rather than
+ * the shipping path.  Retained because the number is still the right one to ask
+ * of any candidate activation format, and because it is what settled this one.
+ *
+ * What it found: which format is closer to the source depends entirely on the
+ * tail of the real activation distribution -- on a Gaussian the two are a wash, on a heavy-tailed one int8
  * loses ~4x because its uniform grid is pinned to the block max and one outlier
  * per 32 craters the resolution for the rest.
  *

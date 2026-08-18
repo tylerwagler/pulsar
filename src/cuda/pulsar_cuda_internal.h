@@ -210,11 +210,9 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
     return w_bf16 ? 2u : 4u;
 }
 
-typedef struct {
-    float d;
-    int8_t qs[CUDA_QK_K];
-    int16_t bsums[CUDA_QK_K / 16];
-} cuda_block_q8_K;
+/* cuda_block_q8_K was here: the Q8_K activation block, int8 quants with an f32
+ * scale and per-16 partial sums.  Zero references in the tree -- the int8
+ * activation arms it belonged to are gone and every expert GEMM stages E4M3. */
 
 typedef struct {
     uint16_t d;

@@ -342,7 +342,7 @@ int ds4_mmq_moe_impl(
      * instead of five pool round-trips.  All five are live simultaneously --
      * D2R is mandatory below (the non-D2R arm returns -1), so nothing here is
      * reserved for a path that will not run. */
-    const size_t nbytes_src1_q8_1 =
+    const size_t nbytes_src1_act =
         ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
         ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
     const size_t w_bytes =
@@ -359,14 +359,14 @@ int ds4_mmq_moe_impl(
     cuda_arena ar;
     if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
                                ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
-                               ds4_mmq_a256(nbytes_src1_q8_1) + w_bytes, tag)) {
+                               ds4_mmq_a256(nbytes_src1_act) + w_bytes, tag)) {
         fprintf(stderr, "%s: scratch reservation failed\n", tag);
         return -1;
     }
     int32_t *ids_src1      = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *ids_dst       = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *expert_bounds = (int32_t *)cuda_arena_take(&ar, eb_bytes, 256);
-    char    *src1_e4m3_p   = (char *)cuda_arena_take(&ar, nbytes_src1_q8_1, 256);
+    char    *src1_e4m3_p   = (char *)cuda_arena_take(&ar, nbytes_src1_act, 256);
     char    *d2r_work      = (char *)cuda_arena_take(&ar, w_bytes, 256);
     if (!d2r_work) return -1;   /* take() latches: one check covers all five */
 
@@ -457,7 +457,7 @@ int ds4_mmq_moe_impl(
                 tag, (const void *)x_soa, (int)K, (int)(K % 256), d2r_iq2s_avail);
         return -1;
     }
-    cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
+    cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_act, stream);
     ds4_quantize_mmq_e4m3_cuda(
         X_f32, ids_src1, (void *)src1_e4m3_p,
         /*ne00=*/K, s11_src, s12_src, s13_src,
@@ -602,7 +602,7 @@ int ds4_mmq_moe_pair_impl(
     const int64_t ne12         = n_tokens;
     const int64_t blck         = ggml_blck_size(type);
 
-    const size_t nbytes_src1_q8_1 =
+    const size_t nbytes_src1_act =
         ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
         ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
     /* One arena on the MMQ scratch slot for every buffer this call needs; see
@@ -615,7 +615,7 @@ int ds4_mmq_moe_pair_impl(
     cuda_arena ar;
     if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
                                ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
-                               ds4_mmq_a256(nbytes_src1_q8_1) +
+                               ds4_mmq_a256(nbytes_src1_act) +
                                ds4_mmq_a256(d2r_work_bytes), tag)) {
         fprintf(stderr, "%s: scratch reservation failed\n", tag);
         return -1;
@@ -663,7 +663,7 @@ int ds4_mmq_moe_pair_impl(
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    char *src1_e4m3 = (char *)cuda_arena_take(&ar, nbytes_src1_q8_1, 256);
+    char *src1_e4m3 = (char *)cuda_arena_take(&ar, nbytes_src1_act, 256);
 
     /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only now;
      * q8_1 exists solely for the generic MMQ fallback (another quant type, or
@@ -699,7 +699,7 @@ int ds4_mmq_moe_pair_impl(
             return -1;
         }
         if (!src1_e4m3) return -1;   /* take() latches */
-        cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
+        cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_act, stream);
         /* Prefer the producer's own encoding when the caller handed one over:
          * identical bytes, but a 1-byte read per element instead of 4 and no
          * encode at all.  Falling back to encoding from f32 is a COST choice,
