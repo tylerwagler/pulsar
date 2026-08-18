@@ -72,11 +72,8 @@ void ggml_cuda_set_device(int device) {
     }
 }
 
-int64_t ggml_time_us() {
-    using clock = std::chrono::steady_clock;
-    static const auto t0 = clock::now();
-    return std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
-}
+/* ggml_time_us's body was here; its declaration and its only would-be
+ * callers (USE_CUDA_GRAPH paths) went with common.cuh. */
 
 // ----------------------------------------------------------------------------
 // ggml_cuda_error: invoked by the CUDA_CHECK / CUBLAS_CHECK macros defined

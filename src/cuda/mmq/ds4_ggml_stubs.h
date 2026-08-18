@@ -176,49 +176,15 @@ enum ggml_type {
     GGML_TYPE_COUNT   = 43,
 };
 
-enum ggml_glu_op {
-    GGML_GLU_OP_REGLU,
-    GGML_GLU_OP_GEGLU,
-    GGML_GLU_OP_SWIGLU,
-    GGML_GLU_OP_SWIGLU_OAI, // referenced by mmvq.cu's fused-GLU epilogue
-    GGML_GLU_OP_COUNT,
-};
-
-// ----------------------------------------------------------------------------
-// ggml_tensor: complete enough for common.cuh's
-// ggml_cuda_concurrent_event::is_valid() to compile cleanly. We NEVER
-// instantiate or dereference one of these - the concurrent path is
-// disabled.
-//
-// Field set matches the upstream order/types so cudaGraph node_properties
-// (which holds a `ggml_tensor node` by value inside `#ifdef USE_CUDA_GRAPH`)
-// also compiles. Sizes are conservative for storage; ds4 never copies into
-// these.
-// ----------------------------------------------------------------------------
-
-struct ggml_tensor {
-    enum ggml_type type;
-    int32_t op;                              // enum ggml_op (opaque to us)
-    int32_t flags;
-    int64_t ne[GGML_MAX_DIMS];               // shape
-    size_t  nb[GGML_MAX_DIMS];               // stride bytes
-    int32_t op_params[16];                   // GGML_MAX_OP_PARAMS / sizeof(int32_t)
-    struct ggml_tensor * src[GGML_MAX_SRC];
-    struct ggml_tensor * view_src;
-    size_t  view_offs;
-    void *  data;
-    char    name[64];                        // GGML_MAX_NAME
-    void *  extra;
-    char    padding[8];
-};
-
-// ggml_nbytes: byte size of tensor data. We never call this; provide a
-// stub so common.cuh's is_valid() compiles. If anything does call it the
-// returned 0 will surface as an immediate logic error.
-static inline int64_t ggml_nbytes(const struct ggml_tensor * /*t*/) { return 0; }
-
-// Microsecond timer (used only inside USE_CUDA_GRAPH paths we disable).
-int64_t ggml_time_us();
+/* ggml_glu_op, struct ggml_tensor, ggml_nbytes and ggml_time_us stood here.
+ *
+ * Every one existed to satisfy common.cuh -- the GLU enum for mm_fusion_args,
+ * the tensor for ggml_cuda_concurrent_event::is_valid(), ggml_nbytes for the
+ * same, ggml_time_us for USE_CUDA_GRAPH paths we disable.  common.cuh was
+ * deleted on 2026-08-18 (L066) and nothing replaced those consumers, so all
+ * four went from "compiled but never called" to "not referenced at all": a grep
+ * across src/cuda/mmq finds ggml_tensor only inside two comments in ds4_mmq.cu
+ * describing what we deliberately do NOT vendor. */
 
 // ----------------------------------------------------------------------------
 // Inline size traits.
