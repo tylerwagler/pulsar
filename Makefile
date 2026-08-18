@@ -170,20 +170,36 @@ ATTN_GATE_ARCH ?= sm_120f
 # the engine side.  Project-wide -MMD -MP remains the real fix; these explicit
 # prerequisites are the part that can land without restructuring the file.
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attention.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
+                            src/cuda/pulsar_cuda_attention.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
+# attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
+# raw_cap] and its own header argues the compressed and indexed halves matter --
+# "wiring the kernel in against only the n_comp=0 path would have shipped that
+# half untested" -- but the gate ran the default (n_comp=0) shape ONLY, so both
+# halves were untested exactly as that note warned.  Running them found a stale
+# oracle: it clamped an out-of-visible top-k selection to row 0, mirroring the
+# f32 kernel, while the f16 kernel masks the row to -INF (row 0 substitution
+# double-counts row 0 whenever row 0 was also legitimately selected).  Every
+# top_k>0 shape disagreed by ~8e-1 and nothing was running to notice.
+# Likewise attn_f16_banked_test defaults to the f32 staging path; "p" is the
+# ATTN_PACK one, which is the only one the engine still produces.
 cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 	./tests/attn_f16_kernel_test
+	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
+	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
+	./tests/attn_f16_kernel_test 48 16 32 x 12 4 5 20    # indexed + ring raw rows
+	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_banked_test
+	./tests/attn_f16_banked_test p
 	./tests/attn_decode_split_test
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing

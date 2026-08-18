@@ -35,6 +35,7 @@ int cuda_ok(cudaError_t err, const char *what) {
     return 0;
 }
 #include "../src/cuda/pulsar_cuda_attention.cu"
+#include "attn_pack_fixture.h"
 
 /* Link stubs: the include above pulls in every launcher in the attention TU,
  * whose call graph reaches runtime/cublas/f16 symbols this test never
@@ -110,38 +111,48 @@ int main() {
                                                 un-applied sink shifts outputs */
 
         /* ATTN_PACK rows: 448 e4m3 bytes + 7 E8M0 scales + pad + 64 bf16 rope.
-         * Random VALID bytes -- attn_pack_e4m3 is total (no NaN encodings in
-         * its bit math), so any byte pattern decodes deterministically and
-         * golden-vs-split agreement is what's under test. */
+         * The payload ENCODES a normal draw rather than taking a random byte:
+         * a uniform byte is uniform in EXPONENT, which saturated the softmax to
+         * one-hot and left this test reporting residuals of 1.3e-49 and 0.0 --
+         * i.e. proving the merge on inputs where there is nothing to merge.
+         * See tests/attn_pack_fixture.h for the full note. */
         const uint64_t pack_row = PULSAR_ATTN_PACK_ROWBYTES(D);
         std::vector<uint8_t> compp((size_t)(total_comp_rows ? total_comp_rows : 1) * pack_row);
         if (c.comp_pack) {
-            std::uniform_int_distribution<int> bd(0, 255);
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_comp_rows; r++) {
                 uint8_t *row = &compp[r * pack_row];
-                for (uint32_t d = 0; d < n_nope; d++) row[d] = (uint8_t)bd(rng);
+                /* scales first: the payload is an encode against its own block
+                 * scale.  Band kept near 2^0 -- the encode makes magnitude
+                 * follow the draw, but a scale far from the data wastes E4M3's
+                 * range from the wrong end. */
                 for (uint32_t s = 0; s < PULSAR_ATTN_PACK_SCALES_PAD(D); s++)
-                    row[n_nope + s] = (uint8_t)(120 + (int)(r + s) % 14);
+                    row[n_nope + s] = (uint8_t)(124 + (int)(r + s) % 6);
+                for (uint32_t d = 0; d < n_nope; d++)
+                    row[d] = host_e4m3_encode(nd(rng),
+                                 host_pack_block_scale(row, n_nope, d,
+                                                       PULSAR_FP8_KV_BLOCK));
                 __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
                 for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
             }
         }
 
         /* Packed raw rows: the ring is PULSAR_ATTN_PACK as of 2026-08-17, the
-         * same 584 B layout as the comp pool, so build it the same way -- random
-         * VALID bytes, with golden and split both reading this buffer. It stored
+         * same 584 B layout as the comp pool, so build it the same way -- encoded
+         * draws, with golden and split both reading this buffer. It stored
          * __half until then, and this case built halves; the engine reading
          * packed rows saw NaN, which is how the format change was caught. */
         std::vector<uint8_t> rawp((size_t)total_raw_rows * pack_row);
         {
-            std::uniform_int_distribution<int> bd2(0, 255);
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_raw_rows; r++) {
                 uint8_t *row = &rawp[r * pack_row];
-                for (uint32_t d = 0; d < n_nope; d++) row[d] = (uint8_t)bd2(rng);
                 for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
-                    row[n_nope + sc] = (uint8_t)(118 + (int)(r + sc) % 16);
+                    row[n_nope + sc] = (uint8_t)(124 + (int)(r + sc) % 6);
+                for (uint32_t d = 0; d < n_nope; d++)
+                    row[d] = host_e4m3_encode(nd(rng),
+                                 host_pack_block_scale(row, n_nope, d,
+                                                       PULSAR_FP8_KV_BLOCK));
                 __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
                 for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
             }

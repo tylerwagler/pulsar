@@ -49,21 +49,8 @@ int cuda_ok(cudaError_t err, const char *what) {
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
 
 
-/* Host-side PULSAR_ATTN_PACK decode.  Mirrors attn_pack_e4m3 /
- * attn_comp_pack_ld in src/cuda/pulsar_cuda_internal.h; decode only, so there
- * is nothing here that can drift from the device's rounding. */
-static float host_e4m3_decode(uint8_t b, float scale) {
-    const uint32_t e = (b >> 3) & 15u;
-    const uint32_t m = b & 7u;
-    const float v = e ? std::ldexp(1.0f + (float)m / 8.0f, (int)e - 7)
-                      : (float)m * 0.001953125f;      /* 2^-9 * m, subnormal */
-    const float sv = v * scale;
-    return (b & 0x80u) ? -sv : sv;
-}
-static float host_bf16_widen(uint16_t bits) {
-    const uint32_t u = (uint32_t)bits << 16;
-    float f; std::memcpy(&f, &u, sizeof f); return f;
-}
+#include "attn_pack_fixture.h"   /* host E4M3 encode/decode: see the note there
+ * on why the fixture ENCODES a draw instead of drawing random bytes */
 
 int main(int argc, char **argv) {
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
@@ -98,14 +85,18 @@ int main(int argc, char **argv) {
     const size_t pack_row_h = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
     std::vector<uint8_t> rawp((size_t)n_tokens * pack_row_h);
     {
-        std::uniform_int_distribution<int> bd(0, 255);
         for (uint32_t r = 0; r < n_tokens; r++) {
             uint8_t *row = &rawp[(size_t)r * pack_row_h];
-            for (uint32_t d = 0; d < n_nope_h; d++) row[d] = (uint8_t)bd(rng);
-            /* scale bytes near 2^0 so decoded magnitudes match the old f32
-             * fixture's scale and the tolerances below stay meaningful */
+            /* scales FIRST -- the payload byte is an encode against its own
+             * block scale, so the scale has to exist before the value does.
+             * Near 2^0 so decoded magnitudes match the f32 fixture this
+             * replaced, and so the tolerances below stay meaningful. */
             for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
                 row[n_nope_h + sc] = (uint8_t)(126 + (int)((r + sc) % 3));
+            for (uint32_t d = 0; d < n_nope_h; d++)
+                row[d] = host_e4m3_encode((float)(nd(rng) * 0.5),
+                                          host_pack_block_scale(row, n_nope_h, d,
+                                                                PULSAR_FP8_KV_BLOCK));
             uint16_t *rope = (uint16_t *)(row + n_nope_h + PULSAR_ATTN_PACK_SCALES_PAD(D));
             for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) {
                 const float f = (float)(nd(rng) * 0.5);
@@ -114,9 +105,8 @@ int main(int argc, char **argv) {
             }
             for (uint32_t d = 0; d < D; d++) {
                 if (d < n_nope_h) {
-                    uint32_t sb = (uint32_t)row[n_nope_h + (d / PULSAR_FP8_KV_BLOCK)];
-                    float scale; const uint32_t su = sb << 23; std::memcpy(&scale, &su, sizeof scale);
-                    kv[(size_t)r * D + d] = host_e4m3_decode(row[d], scale);
+                    kv[(size_t)r * D + d] = host_e4m3_decode(row[d],
+                        host_pack_block_scale(row, n_nope_h, d, PULSAR_FP8_KV_BLOCK));
                 } else {
                     kv[(size_t)r * D + d] = host_bf16_widen(rope[d - n_nope_h]);
                 }
@@ -181,11 +171,25 @@ int main(int argc, char **argv) {
             }
             uint32_t ci = r - cnt;
             if (indexed && use_topk) {
-                /* clamp against VISIBLE comp, matching the f32 kernel */
                 const int32_t c = tk[(size_t)t * top_k + ci];
                 ci = (c >= 0 && (uint32_t)c < vis) ? (uint32_t)c : 0u;
             }
             return &ckv[(size_t)ci * D];
+        };
+        /* An out-of-range top-k selection is NO row, not row 0.  The f16 kernel
+         * loads row 0 to keep the access in range and the branch uniform, then
+         * masks the score to -INF so the row contributes zero; substituting row
+         * 0 for real would inject an unselected position AND double-count row 0
+         * whenever row 0 was also legitimately selected.  This oracle used to
+         * mirror the f32 kernel, which does substitute -- so it encoded the
+         * behaviour the f16 kernel was written to fix, and every top_k>0 shape
+         * disagreed with it by ~8e-1.  The divergence is confined to
+         * out-of-VISIBLE selections, which is why ratio=0 (everything visible)
+         * agreed and ratio=4 did not. */
+        auto kvbad = [&](uint32_t r) -> bool {
+            if (r < cnt || !(indexed && use_topk)) return false;
+            const int32_t c = tk[(size_t)t * top_k + (r - cnt)];
+            return !(c >= 0 && (uint32_t)c < vis);
         };
         const double scale = 1.0 / std::sqrt((double)D);
         for (uint32_t h = 0; h < n_head; h++) {
@@ -196,7 +200,7 @@ int main(int argc, char **argv) {
                 const float *kr = kvrow(r);
                 for (uint32_t d = 0; d < D; d++)
                     acc += h16(q[((size_t)t * n_head + h) * D + d]) * h16(kr[d]);
-                s[r] = acc * scale;
+                s[r] = kvbad(r) ? -INFINITY : acc * scale;
                 mx = std::max(mx, s[r]);
             }
             const double sink = sinks[h];
