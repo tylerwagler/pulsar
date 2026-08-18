@@ -11,6 +11,7 @@
 #include "ds4_mmq.h"
 
 #include "common.cuh"
+#include "../pulsar_cuda_scratch.h"
 #include "ds4_act_block.cuh"
 #include "mmid.cuh"
 #include "ds4_mmid.cuh"
@@ -52,6 +53,10 @@
 // 512*sizeof(block_mx_act_mmq) once per call, and a constant cannot be wrong the
 // next time upstream changes how J is chosen.
 static constexpr int ds4_mmq_x_max() { return 512; }
+
+// Reservation arithmetic for the scratch arena: each take() 256-aligns, so a
+// reservation must budget the ALIGNED size of every slice it will hand out.
+static constexpr size_t ds4_mmq_a256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
@@ -204,32 +209,16 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
     return true;
 #endif
 
-    if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
-    }
-    if (amd_mfma_available(cc)) {
-        if (GGML_CUDA_CC_IS_CDNA3(cc)) return true;
-        if (n_experts > 64 || ne11 <= 128) return true;
-        if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
-            type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) return true;
-        if (ne11 <= 256 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) return true;
-        return false;
-    }
-    if (amd_wmma_available(cc)) {
-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-            if (n_experts >= 64) return true;
-            switch (type) {
-                case GGML_TYPE_Q2_K: return ne11 <= 128;
-                case GGML_TYPE_Q6_K: return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
-                case GGML_TYPE_IQ2_XS:
-                case GGML_TYPE_IQ2_S:
-                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
-                default: return true;
-            }
-        }
-        return true;
-    }
-    return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+    /* The AMD arms are gone (L066 step 3, 2026-08-18).  Upstream branched here
+     * on CDNA / CDNA3 / RDNA3 / RDNA3_0 / RDNA3_5 via amd_mfma_available and
+     * amd_wmma_available; this engine runs on GB10 and nothing else, and `cc`
+     * is read from the DEVICE, so those arms were unreachable at runtime rather
+     * than merely uncompiled.  They were also the majority of what common.cuh
+     * still had to supply -- eight CC macros and two predicates for branches
+     * that cannot be taken -- which is what kept a 1,669-line vendored header
+     * alive.  The NVIDIA behaviour below is unchanged, including the pre-Turing
+     * fp16/DP4A knee, which is still reachable on an older NVIDIA part. */
+    return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
 extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
@@ -265,16 +254,6 @@ static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
     if (!p || n == 0) return;
     ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
-
-ggml_backend_cuda_context * get_ctx_for_device(int device) {
-    static ggml_backend_cuda_context * cached[GGML_CUDA_MAX_DEVICES] = {};
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
-    if (!cached[device]) {
-        cached[device] = new ggml_backend_cuda_context(device);
-    }
-    return cached[device];
-}
-
 
 } // anonymous namespace
 
@@ -344,13 +323,11 @@ int ds4_mmq_moe_impl(
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
 
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
-    if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
-        return -1;
-    }
-
-    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+    /* The vendored ggml pool is gone (L066): scratch now comes from the MMQ
+     * arena slot, which is a single persistent reservation rather than a
+     * per-call alloc.  That also retires task #22's ds4_pool_set_stream --
+     * there are no pool ops left to order against the kernels, because there is
+     * no allocation on the stream at all. */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -358,10 +335,40 @@ int ds4_mmq_moe_impl(
     const int64_t ne12         = n_tokens;      // src1 channels (= tokens)
     const int64_t blck         = ggml_blck_size(type);
 
+    /* Every buffer this call needs, sized up front, taken from ONE arena on the
+     * MMQ scratch slot.  Sizing has to be hoisted above the first take because
+     * an arena reserves once; that is the only thing the arena asks of a caller
+     * that the vendored pool did not, and it buys a single reservation per call
+     * instead of five pool round-trips.  All five are live simultaneously --
+     * D2R is mandatory below (the non-D2R arm returns -1), so nothing here is
+     * reserved for a path that will not run. */
+    const size_t nbytes_src1_q8_1 =
+        ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
+        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
+    const size_t w_bytes =
+        ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
+    if (w_bytes == 0) {
+        fprintf(stderr, "%s: D2R scratch sizing failed (rows=%lld experts=%d)\n",
+                tag, (long long)ne_get_rows, n_experts);
+        return -1;
+    }
+    const size_t ids_bytes = (size_t)ne_get_rows * sizeof(int32_t);
+    const size_t eb_bytes  = (size_t)(n_experts + 1) * sizeof(int32_t);
+
     // 1. Build the expert-major work map.
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    cuda_arena ar;
+    if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
+                               ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
+                               ds4_mmq_a256(nbytes_src1_q8_1) + w_bytes, tag)) {
+        fprintf(stderr, "%s: scratch reservation failed\n", tag);
+        return -1;
+    }
+    int32_t *ids_src1      = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
+    int32_t *ids_dst       = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
+    int32_t *expert_bounds = (int32_t *)cuda_arena_take(&ar, eb_bytes, 256);
+    char    *src1_e4m3_p   = (char *)cuda_arena_take(&ar, nbytes_src1_q8_1, 256);
+    char    *d2r_work      = (char *)cuda_arena_take(&ar, w_bytes, 256);
+    if (!d2r_work) return -1;   /* take() latches: one check covers all five */
 
     // Task #22 root-cause fix: mm_ids_helper COMPACTS - it only writes ids_src1
     // entries for in-range router ids and drops invalid ones (the router's NaN
@@ -373,8 +380,8 @@ int ds4_mmq_moe_impl(
     // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
     // those lanes' output is never consumed (the mmq write-back loop is
     // expert_bounds-bounded), the cost is a few KB of memset on-stream.
-    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+    cudaMemsetAsync(ids_src1, 0, ids_bytes, stream);
+    cudaMemsetAsync(ids_dst,  0, ids_bytes, stream);
 
     // si1 = stride between tokens in the ids tensor, in elements. Our ids is
     // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
@@ -392,7 +399,7 @@ int ds4_mmq_moe_impl(
     // gate/up mmq work) onto the legacy expert-tile fallback, the W8192 prefill
     // cliff.  
     ds4_launch_mm_ids_helper(
-        ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        ids, ids_src1, ids_dst, expert_bounds,
         n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
 
     cudaError_t err = cudaGetLastError();
@@ -401,10 +408,7 @@ int ds4_mmq_moe_impl(
         return -2;
     }
 
-    // 2. Gather + quantize the activation into Q8_1.
-    const size_t nbytes_src1_q8_1 =
-        ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
+    // 2. Gather + quantize the activation into E4M3.
     /* ONE decision, made once, BEFORE staging: does the D2R E4M3 path take this
      * call?  Staging then follows the decision, instead of writing both formats
      * on every call and letting the consumer pick.  IQ2 experts are E4M3-only
@@ -419,8 +423,6 @@ int ds4_mmq_moe_impl(
     const bool d2r_iq2 = (type == GGML_TYPE_IQ2_XXS && x_soa != nullptr &&
                           K % 256 == 0 && d2r_iq2s_avail != 0);
 
-    ggml_cuda_pool_alloc<char> src1_e4m3;
-    char *src1_e4m3_p = nullptr;
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
     // kernel's tail-tile reads and ne_get_rows columns need not fill the final mmq
@@ -455,10 +457,9 @@ int ds4_mmq_moe_impl(
                 tag, (const void *)x_soa, (int)K, (int)(K % 256), d2r_iq2s_avail);
         return -1;
     }
-    src1_e4m3_p = src1_e4m3.alloc(ctx->pool(), nbytes_src1_q8_1);
     cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_q8_1, stream);
     ds4_quantize_mmq_e4m3_cuda(
-        X_f32, ids_src1.get(), (void *)src1_e4m3_p,
+        X_f32, ids_src1, (void *)src1_e4m3_p,
         /*ne00=*/K, s11_src, s12_src, s13_src,
         /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
         /*n_expert_used=*/0, /*scatter=*/false, stream);
@@ -495,20 +496,12 @@ int ds4_mmq_moe_impl(
      * completely: a 26-token prompt gives 156 rows, so the arm never engaged and
      * two days of cross-arm measurements came back bit-identical.
      * One path, one activation format, every batch size. */
-    const size_t w_bytes =
-        ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
-    if (w_bytes == 0) {
-        fprintf(stderr, "%s: D2R scratch sizing failed (rows=%lld experts=%d)\n",
-                tag, (long long)ne_get_rows, n_experts);
-        return -1;
-    }
     {
-        ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), w_bytes);
         const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
-            ids_dst.get(), expert_bounds.get(),
-            out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), w_bytes,
+            ids_dst, expert_bounds,
+            out_f32, M, K, ne_get_rows, n_experts, d2r_work, w_bytes,
             stream);
         /* Every rc != 0 is a bad pointer, a bad shape, or undersized scratch --
          * a caller defect, never a shape this path legitimately hands back. */
@@ -597,13 +590,11 @@ int ds4_mmq_moe_pair_impl(
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
 
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
-    if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
-        return -1;
-    }
-
-    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+    /* The vendored ggml pool is gone (L066): scratch now comes from the MMQ
+     * arena slot, which is a single persistent reservation rather than a
+     * per-call alloc.  That also retires task #22's ds4_pool_set_stream --
+     * there are no pool ops left to order against the kernels, because there is
+     * no allocation on the stream at all. */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -611,19 +602,32 @@ int ds4_mmq_moe_pair_impl(
     const int64_t ne12         = n_tokens;
     const int64_t blck         = ggml_blck_size(type);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
-    ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
-    ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
+    const size_t nbytes_src1_q8_1 =
+        ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
+        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
+    /* One arena on the MMQ scratch slot for every buffer this call needs; see
+     * the note in ds4_mmq_moe_impl.  D2R is mandatory on both arms below, so
+     * nothing reserved here is for a path that will not run. */
+    const size_t d2r_work_bytes =
+        ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
+    const size_t ids_bytes = (size_t)ne_get_rows * sizeof(int32_t);
+    const size_t eb_bytes  = (size_t)(n_experts + 1) * sizeof(int32_t);
+    cuda_arena ar;
+    if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
+                               ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
+                               ds4_mmq_a256(nbytes_src1_q8_1) +
+                               ds4_mmq_a256(d2r_work_bytes), tag)) {
+        fprintf(stderr, "%s: scratch reservation failed\n", tag);
+        return -1;
+    }
     int32_t *ids_src1 = nullptr;
     int32_t *ids_dst = nullptr;
     int32_t *expert_bounds = nullptr;
 
-    const size_t nbytes_src1_q8_1 =
-        ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
-    ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
-    ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
-    expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+    ids_src1      = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
+    ids_dst       = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
+    expert_bounds = (int32_t *)cuda_arena_take(&ar, eb_bytes, 256);
+    if (!expert_bounds) return -1;   /* take() latches */
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
@@ -659,8 +663,7 @@ int ds4_mmq_moe_pair_impl(
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    ggml_cuda_pool_alloc<char> src1_e4m3_alloc;
-    char *src1_e4m3 = nullptr;
+    char *src1_e4m3 = (char *)cuda_arena_take(&ar, nbytes_src1_q8_1, 256);
 
     /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only now;
      * q8_1 exists solely for the generic MMQ fallback (another quant type, or
@@ -695,7 +698,7 @@ int ds4_mmq_moe_pair_impl(
                     tag, (const void *)xa_soa, (int)K, (int)(K % 256), d2r_iq2_avail);
             return -1;
         }
-        src1_e4m3 = src1_e4m3_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+        if (!src1_e4m3) return -1;   /* take() latches */
         cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_q8_1, stream);
         /* Prefer the producer's own encoding when the caller handed one over:
          * identical bytes, but a 1-byte read per element instead of 4 and no
@@ -741,10 +744,8 @@ int ds4_mmq_moe_pair_impl(
      * long prompts and another for short ones. */
     if (d2r_iq2) {
         {
-            const size_t d2r_work_bytes =
-                ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
-            if (d2r_work_bytes != 0) {
-                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
+            char *d2r_work = (char *)cuda_arena_take(&ar, d2r_work_bytes, 256);
+            if (d2r_work) {
                 ds4_mmq_nvtx_scope stage(
                         "ds4/prefill/moe/iq2_gate_up_d2r",
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
@@ -753,7 +754,7 @@ int ds4_mmq_moe_pair_impl(
                         xa_soa, xb_soa, soa_blocks,
                         src1_e4m3, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
-                        d2r_work.get(), d2r_work_bytes, stream);
+                        d2r_work, d2r_work_bytes, stream);
                 if (d2r_rc == 0) {
                     gate_up_done = true;
                 }

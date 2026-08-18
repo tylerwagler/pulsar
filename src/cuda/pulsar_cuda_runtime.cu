@@ -91,10 +91,12 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 
 
-static void *g_cuda_tmp;
+/* One reservation per slot; see pulsar_cuda_scratch.h for why there is more
+ * than one.  Indexed by CUDA_SCRATCH_MAIN / CUDA_SCRATCH_MMQ. */
+static void *g_cuda_tmp[CUDA_SCRATCH_SLOTS];
 
 
-static uint64_t g_cuda_tmp_bytes;
+static uint64_t g_cuda_tmp_bytes[CUDA_SCRATCH_SLOTS];
 
 
 static void *g_model_stage_raw[4];
@@ -158,13 +160,18 @@ static int cuda_model_cache_limit_explicit(void);
  * unchanged, and cuda_tmp_alloc below is now just "reserve, take one slice".
  * ------------------------------------------------------------------------- */
 
-static void *cuda_tmp_reserve(uint64_t bytes, const char *what);
+static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what);
 
 int cuda_arena_begin(cuda_arena *a, uint64_t bytes, const char *what) {
+    return cuda_arena_begin_slot(a, CUDA_SCRATCH_MAIN, bytes, what);
+}
+
+int cuda_arena_begin_slot(cuda_arena *a, int slot, uint64_t bytes, const char *what) {
     if (!a) return 0;
     a->base = NULL; a->cap = 0; a->used = 0; a->what = what; a->failed = 0;
+    if (slot < 0 || slot >= CUDA_SCRATCH_SLOTS) { a->failed = 1; return 0; }
     if (bytes == 0) return 1;
-    void *p = cuda_tmp_reserve(bytes, what);
+    void *p = cuda_tmp_reserve_slot(slot, bytes, what);
     if (!p) { a->failed = 1; return 0; }
     a->base = (uint8_t *)p;
     a->cap = bytes;
@@ -196,16 +203,20 @@ void *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align) {
 uint64_t cuda_arena_used(const cuda_arena *a) { return a ? a->used : 0; }
 
 void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
-    return cuda_tmp_reserve(bytes, what);
+    return cuda_tmp_reserve_slot(CUDA_SCRATCH_MAIN, bytes, what);
 }
 
-static void *cuda_tmp_reserve(uint64_t bytes, const char *what) {
+static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    if (slot < 0 || slot >= CUDA_SCRATCH_SLOTS) return NULL;
+    /* Returning the SAME base when the block already fits is what makes a
+     * second arena on this slot alias the first one's live slices, and the
+     * cudaFree below is what makes it worse.  One live arena per slot. */
+    if (g_cuda_tmp_bytes[slot] >= bytes) return g_cuda_tmp[slot];
+    if (g_cuda_tmp[slot]) {
+        (void)cudaFree(g_cuda_tmp[slot]);
+        g_cuda_tmp[slot] = NULL;
+        g_cuda_tmp_bytes[slot] = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -215,9 +226,9 @@ static void *cuda_tmp_reserve(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+    g_cuda_tmp[slot] = ptr;
+    g_cuda_tmp_bytes[slot] = bytes;
+    return g_cuda_tmp[slot];
 }
 
 
@@ -996,10 +1007,12 @@ void pulsar_gpu_cleanup(void) {
     cuda_fp8_weight_cache_clear();
     cuda_model_range_release_all();
     cuda_model_load_progress_reset();
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    for (int s = 0; s < CUDA_SCRATCH_SLOTS; s++) {
+        if (g_cuda_tmp[s]) {
+            (void)cudaFree(g_cuda_tmp[s]);
+            g_cuda_tmp[s] = NULL;
+            g_cuda_tmp_bytes[s] = 0;
+        }
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {

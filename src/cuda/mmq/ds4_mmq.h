@@ -329,7 +329,7 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
 // Step 8 (CUDA Graphs) calls this with the capture stream so pool
 // allocations land on the captured stream and don't invalidate capture.
 // Pass NULL to reset to cudaStreamPerThread.
-void ds4_pool_set_stream(cudaStream_t stream);
+/* ds4_pool_set_stream was here: the ggml pool it ordered is gone (L066). */
 
 /* pulsar (plan 41b): IQ2_XXS single-tensor MoE over the aligned-SoA artifact.
  * Upstream ships q2_K_moe_soa and iq2_xxs_moe_pair_soa but no IQ2 SINGLE soa
