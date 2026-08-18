@@ -418,99 +418,6 @@ static int check_dspark_confidence_head(void) {
 }
 
 
-/* ---- Stage 1: MX (microscaling) compressed-KV pack/dequant round-trip ---- */
-#define MXKV_FP4 2u
-#define MXKV_BLK 32u
-
-static float mxkv_e2m1_value(int i) {
-    static const float t[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    return t[i & 7];
-}
-static float mxkv_e2m1_snap(float x) {
-    float ax = fminf(fabsf(x), 6.0f);
-    int best = 0; float bd = fabsf(ax - mxkv_e2m1_value(0));
-    for (int i = 1; i < 8; i++) { float d = fabsf(ax - mxkv_e2m1_value(i));
-        if (d < bd || (d == bd && ((i & 1) == 0) && ((best & 1) != 0))) { best = i; bd = d; } }
-    return (x < 0.0f ? -1.0f : 1.0f) * mxkv_e2m1_value(best);
-}
-static float mxkv_ref_scale(float amax, float max_repr) {
-    float ratio = fmaxf(amax, 1.0e-20f) / max_repr;
-    int k = (int)ceilf(log2f(ratio)), e = k + 127;
-    if (e < 0) e = 0;
-    if (e > 254) e = 254;
-    return exp2f((float)(e - 127));
-}
-
-static int mxkv_run_case(uint32_t fmt, uint32_t n_tok, uint32_t head_dim, const float *src) {
-    const uint32_t nblk = head_dim / MXKV_BLK;
-    const uint32_t rowbytes = head_dim / 2 + nblk;
-    const float max_repr = 6.0f;
-
-    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)n_tok * head_dim * sizeof(float));
-    pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc((uint64_t)n_tok * rowbytes);
-    pulsar_gpu_tensor *deq = pulsar_gpu_tensor_alloc((uint64_t)n_tok * head_dim * sizeof(float));
-    float *gpu_deq = (float *)malloc((size_t)n_tok * head_dim * sizeof(float));
-    int rc = 1;
-    if (x && packed && deq && gpu_deq &&
-        pulsar_gpu_tensor_write(x, 0, src, (uint64_t)n_tok * head_dim * sizeof(float)) &&
-        pulsar_gpu_mxkv_pack_tensor(x, packed, fmt, n_tok, head_dim) &&
-        pulsar_gpu_mxkv_dequant_tensor(packed, deq, fmt, n_tok, head_dim) &&
-        pulsar_gpu_tensor_read(deq, 0, gpu_deq, (uint64_t)n_tok * head_dim * sizeof(float))) {
-        rc = 0;
-        double sum_abs = 0.0, sum_ref = 0.0; float worst = 0.0f;
-        for (uint32_t r = 0; r < n_tok && rc == 0; r++) {
-            for (uint32_t b = 0; b < nblk; b++) {
-                float amax = 0.0f;
-                for (uint32_t j = 0; j < MXKV_BLK; j++) amax = fmaxf(amax, fabsf(src[r * head_dim + b * MXKV_BLK + j]));
-                float scale = mxkv_ref_scale(amax, max_repr);
-                for (uint32_t j = 0; j < MXKV_BLK; j++) {
-                    uint32_t d = b * MXKV_BLK + j;
-                    float in = src[r * head_dim + d];
-                    float ref = mxkv_e2m1_snap(in / scale) * scale;
-                    float got = gpu_deq[r * head_dim + d];
-                    if (fabsf(got - ref) > 1e-3f) {
-                        fprintf(stderr, "mxkv fmt=%u mismatch @row%u d%u: gpu=%.6f ref=%.6f (in=%.6f scale=%.6g)\n",
-                                fmt, r, d, (double)got, (double)ref, (double)in, (double)scale);
-                        rc = 1; break;
-                    }
-                    sum_abs += fabs((double)got - (double)in);
-                    sum_ref += fabs((double)in);
-                    worst = fmaxf(worst, fabsf(got - in));
-                }
-            }
-        }
-        if (rc == 0) {
-            double rel = sum_ref > 0 ? sum_abs / sum_ref : 0.0;
-            /* FP8 ~<3% mean rel error, FP4 much coarser but bounded. */
-            double bound = 0.20;
-            printf("  mxkv fmt=%u rowbytes=%u mean_rel_err=%.4f worst_abs=%.4f -> %s\n",
-                   fmt, rowbytes, rel, (double)worst, rel <= bound ? "OK" : "HIGH");
-            if (rel > bound) rc = 1;
-        }
-    }
-    pulsar_gpu_tensor_free(deq); pulsar_gpu_tensor_free(packed); pulsar_gpu_tensor_free(x);
-    free(gpu_deq);
-    return rc;
-}
-
-static int check_mxkv_roundtrip(void) {
-    const uint32_t n_tok = 48, head_dim = 512;
-    float *src = (float *)malloc((size_t)n_tok * head_dim * sizeof(float));
-    if (!src) return 1;
-    /* Vary magnitude across blocks and rows so E8M0 per-block scaling is exercised. */
-    for (uint32_t r = 0; r < n_tok; r++)
-        for (uint32_t d = 0; d < head_dim; d++) {
-            float blkscale = exp2f((float)((int)(d / MXKV_BLK % 12) - 6));   /* 2^-6 .. 2^5 */
-            float v = sinf((float)(d * 3 + r * 7) * 0.031f) * blkscale * (1.0f + 0.1f * (float)r);
-            src[r * head_dim + d] = v;
-        }
-    int rc = 0;
-    if (mxkv_run_case(MXKV_FP4, n_tok, head_dim, src) != 0) rc = 1;
-    free(src);
-    return rc;
-}
-
-
 /* ---------------------------------------------------------------------------
  * Multi-bank descriptor attention smoke (Tier-2 step 2).
  *
@@ -1221,7 +1128,6 @@ static int check_multibank_raw_store(void) {
 int main(void) {
     if (!pulsar_gpu_init()) return 1;
     int rc = check_large_topk();
-    if (check_mxkv_roundtrip() != 0) rc = 1;
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;

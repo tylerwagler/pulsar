@@ -167,9 +167,6 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
 #define PULSAR_MAX_THREADS 32
 
 
-/* MXKV format selector passed to the pulsar_gpu_mxkv_* kernels (must match
- * PULSAR_MXKV_FMT_FP4 in src/cuda/pulsar_cuda_internal.h). */
-#define PULSAR_ENGINE_MXKV_FMT_FP4 2u
 /* MXKV FP4 row bytes for the indexer compressed cache (head_dim 128):
  * 64 nibble-pair bytes + 4 E8M0 block-32 scale bytes = 68 B (vs 512 f32). */
 #define PULSAR_ENGINE_IDXFP4_ROWBYTES \

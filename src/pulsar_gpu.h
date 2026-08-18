@@ -582,23 +582,6 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Microscaling (MX) compressed-KV pack. fmt is PULSAR_MXKV_FMT_FP4.
- * Row layout [data][E8M0 scales], block 32; head_dim must be a multiple of 32.
- * `out` (pack) / `in` (dequant) is sized n_tok * PULSAR_MXKV_ROWBYTES(fmt,head_dim). */
-int pulsar_gpu_mxkv_pack_tensor(
-        const pulsar_gpu_tensor *x,
-        pulsar_gpu_tensor       *out,
-        uint32_t               fmt,
-        uint32_t               n_tok,
-        uint32_t               head_dim);
-
-int pulsar_gpu_mxkv_dequant_tensor(
-        const pulsar_gpu_tensor *in,
-        pulsar_gpu_tensor       *out,
-        uint32_t               fmt,
-        uint32_t               n_tok,
-        uint32_t               head_dim);
-
 /* PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
  * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16 rope]
  * (584 B at head_dim 512 / n_rot 64, byte-identical to vLLM's fp8_ds_mla DSv4

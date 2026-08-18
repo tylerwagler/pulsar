@@ -245,12 +245,13 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                    uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
     const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
-    /* Straight into the packed cache.  The old load path re-encoded through
-     * mxkv_pack_tensor, which needed the EXACT scale bucket to stay
-     * value-idempotent -- and 2026-08-18 measured that the fast-math bucket is
-     * NOT idempotent (removing an analogous double-quantise on the attn side
-     * moved acceptance).  Copying bytes cannot invoke an idempotence it never
-     * relies on, which is the same reason v4 gave for the attention rows. */
+    /* Straight into the packed cache.  The old load path RE-ENCODED, which only
+     * stayed safe because it used an exact integer-math scale bucket -- and
+     * 2026-08-18 measured that the fast-math bucket is NOT value-idempotent
+     * (removing an analogous double-quantise on the attn side moved decode
+     * acceptance).  Copying bytes cannot invoke an idempotence it never relies
+     * on, which is the same reason v4 gave for the attention rows, and it is
+     * why the re-encode machinery could then be deleted outright. */
     return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
 }

@@ -366,12 +366,6 @@ __global__ static void rope_tail_kernel(
 
 
 
-__device__ static float dsv4_e4m3fn_value_dev(int i) {
-    int exp = (i >> 3) & 15;
-    int mant = i & 7;
-    if (exp == 0) return (float)mant * 0.001953125f;
-    return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-}
 
 
 
@@ -438,12 +432,10 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
     return (nib & 8u) ? (-val * scale) : (val * scale);
 }
 
-/* E8M0 microscale: a power-of-two scale stored as a single byte = exponent+127
- * (byte 255 is reserved NaN). Encoding uses dsv4_e8m0_encode_scale_exact_dev
- * below (bit-pattern ceil-log2, fast-math-safe). */
-__device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
-    return exp2f((float)((int)byte - 127));
-}
+/* E8M0 microscale decode lived here (byte = exponent+127, 255 reserved NaN).
+ * Its only caller in this TU was mxkv_dequant_kernel.  The readers that still
+ * decode E8M0 -- attn_comp_pack_ld and the indexer scorer -- each derive the
+ * scale inline from the stored byte, which is why nothing here needs it. */
 
 /* ===== INVARIANT: FRESH data -> fast path; RE-ENCODED data -> exact path =====
  * The `exp2f(ceilf(log2f(amax/K)))` form used by the quantize kernels below is
@@ -470,25 +462,31 @@ __device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
  * blocks land on it (~5% for E4M3's 448). A competing GB10 fork shipped exactly
  * this bug and lost 10.5% of their fp4 indexer lanes to zero.
  *
- * SO: every re-encode path routes through the EXACT scale bucket
- * `dsv4_e8m0_encode_scale_exact_dev` (`mxkv_pack_kernel` uses it), and
- * `gpu_decode.cpp:498` passes `quantize_fp8=false` under pack to avoid double-
- * rounding. **If you ever feed already-quantized data into
- * `fp8_kv_quantize*`, `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround
- * rate jumps from 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**
+ * **If you ever feed already-quantized data into `fp8_kv_quantize*`,
+ * `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround rate jumps from
+ * 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**  `gpu_decode.cpp:498` passes
+ * `quantize_fp8=false` under pack for exactly this reason.
  *
- * There WAS an attn-KV twin of this (`attn_pack_repack_kernel` /
- * `attn_pack_exact_e8_dev`), for re-encoding already-roundtripped f32 KV rows on
- * session load.  It is gone: since payload v4 the engine holds NO already-
- * quantized f32 KV rows anywhere — save and load copy packed bytes, and the only
- * f32 KV buffers left are the PRODUCERS, which carry fresh values that the fresh
- * quantizers are the correct tool for.
+ * This is MEASURED, not theoretical.  On 2026-08-18 three KV paths were found
+ * quantizing the same rows twice (prefill's ring store re-quantized the buffer
+ * the pack had just round-tripped; the draft batch and the drafter seed did the
+ * same).  Removing the second pass CHANGED THE BYTES: an 18-token prompt is one
+ * chunk and never reads the ring, and its logits were identical either way,
+ * while a 5530-token prompt that does read the ring moved 27.788 -> 27.321.
+ * So the fast-math bucket is NOT value-idempotent, and the call site that
+ * claimed the two passes "agree byte for byte" was wrong.  It cost 2.9% of
+ * decode acceptance to stop doing it, and it was still worth it -- the ring now
+ * holds what attention actually read.
  *
- * So the rule for plan-31b evict/restore and any other restore path is now
- * simpler: move PACKED BYTES.  If you ever find yourself holding already-
- * quantized f32 KV rows and needing to re-encode them, you need an exact-scale
- * path — build it on dsv4_e8m0_encode_scale_exact_dev, and do NOT reach for
- * attn_pack_store.
+ * THE RULE IS THEREFORE: never re-encode.  MOVE PACKED BYTES.  Every KV path in
+ * the engine now does -- prefill's ring scatter, session save/load (payload v5),
+ * and the drafter seed.  The exact integer-math scale buckets that used to make
+ * re-encoding survivable (`attn_pack_exact_e8_dev`,
+ * `dsv4_e8m0_encode_scale_exact_dev`) are deleted, because nothing re-encodes
+ * any more and an unreferenced safety net is just code that rots.  If a future
+ * restore path genuinely cannot move bytes, recover one from git history rather
+ * than reaching for the fresh quantizers above -- that is the whole point of
+ * this comment.
  *
  * KNOWN (benign, unfixed): `indexer_hadamard_fp4*_kernel`'s amax floor
  * 7.052966104933725e-38f is bit-exactly `6.0f * 2^-126` — i.e. it sits ON a
@@ -508,16 +506,6 @@ __device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
  * (E_m+k) and mantissa M_m; comparing positive floats is comparing their bit
  * patterns, so k = exp(amax) - E_m + (mant(amax) > M_m). Re-encoding rows that are
  * already on the (grid * 2^m) lattice is then value-idempotent. */
-__device__ static inline uint8_t dsv4_e8m0_encode_scale_exact_dev(float amax, float max_repr, float floor_val) {
-    const float a = fmaxf(amax, floor_val);
-    const uint32_t u  = __float_as_uint(a);
-    const uint32_t um = __float_as_uint(max_repr);
-    int e = (int)(u >> 23) - (int)(um >> 23)
-          + (((u & 0x7fffffu) > (um & 0x7fffffu)) ? 1 : 0) + 127;
-    if (e < 0) e = 0;
-    if (e > 254) e = 254;
-    return (uint8_t)e;
-}
 
 
 
@@ -544,11 +532,6 @@ __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
     return *(const uint8_t *)&f;
 }
 
-__device__ static float dsv4_e4m3fn_decode_dev(uint8_t byte, float scale) {
-    int idx = byte & 0x7f;
-    float val = dsv4_e4m3fn_value_dev(idx);
-    return (byte & 0x80) ? (-val * scale) : (val * scale);
-}
 
 #define PULSAR_FP8_KV_BLOCK 64u
 #define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
@@ -1130,90 +1113,6 @@ int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(pulsar_gpu_tensor *x, uint32_t n_tok,
 }
 
 
-
-/*
- * Microscaling (MX) compressed-KV pack: one warp per row, PULSAR_MXKV_BLOCK=32
- * elements per E8M0 scale.  Row layout is [data ...][E8M0 scale bytes ...]:
- * MXFP8 = E4M3 data (1 B/elem); MXFP4 = E2M1 data (2 elems/byte).  head_dim
- * must be a multiple of 32.  See PULSAR_MXKV_* in pulsar_cuda_internal.h.
- */
-__global__ static void mxkv_pack_kernel(const float *x, uint8_t *out,
-                                        uint32_t n_tok, uint32_t head_dim, uint32_t fmt) {
-    uint32_t row = blockIdx.x;
-    uint32_t lane = threadIdx.x;                 /* 0..31, one warp */
-    if (row >= n_tok) return;
-    const float *xr = x + (uint64_t)row * head_dim;
-    const uint32_t nblk = head_dim / PULSAR_MXKV_BLOCK;
-    const uint32_t data_bytes = (fmt == PULSAR_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
-    const uint32_t rowbytes = data_bytes + nblk;
-    uint8_t *outr = out + (uint64_t)row * rowbytes;
-    uint8_t *scales = outr + data_bytes;
-    const float max_repr = (fmt == PULSAR_MXKV_FMT_FP4) ? 6.0f : 448.0f;
-
-    for (uint32_t b = 0; b < nblk; b++) {
-        const uint32_t idx = b * PULSAR_MXKV_BLOCK + lane;
-        const float v = (idx < head_dim) ? xr[idx] : 0.0f;
-        float a = fabsf(v);
-        for (uint32_t s = 16u; s > 0u; s >>= 1) a = fmaxf(a, __shfl_down_sync(0xffffffffu, a, s));
-        a = __shfl_sync(0xffffffffu, a, 0);      /* block amax on every lane */
-        /* Exact bucket (not the fast-math ceil-log2 path) so save/load of the
-         * indexer/attn MX cache is value-idempotent — no boundary misround. */
-        const uint8_t e8 = dsv4_e8m0_encode_scale_exact_dev(a, max_repr, 1.0e-20f);
-        const float scale = dsv4_e8m0_decode_scale_dev(e8);
-        if (lane == 0) scales[b] = e8;
-        if (fmt == PULSAR_MXKV_FMT_FP4) {
-            const uint8_t nib = dsv4_e2m1fn_encode_dev(v / scale);
-            const uint32_t hi = __shfl_down_sync(0xffffffffu, (uint32_t)nib, 1);
-            if ((lane & 1u) == 0u && idx < head_dim)
-                outr[b * (PULSAR_MXKV_BLOCK / 2u) + (lane >> 1)] = (uint8_t)(nib | (hi << 4));
-        } else {
-            if (idx < head_dim)
-                outr[b * PULSAR_MXKV_BLOCK + lane] = dsv4_e4m3fn_encode_dev(v / scale);
-        }
-    }
-}
-
-__global__ static void mxkv_dequant_kernel(const uint8_t *in, float *out,
-                                           uint32_t n_tok, uint32_t head_dim, uint32_t fmt) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_tok) return;
-    const uint32_t nblk = head_dim / PULSAR_MXKV_BLOCK;
-    const uint32_t data_bytes = (fmt == PULSAR_MXKV_FMT_FP4) ? (head_dim + 1u) / 2u : head_dim;
-    const uint32_t rowbytes = data_bytes + nblk;
-    const uint8_t *inr = in + (uint64_t)row * rowbytes;
-    const uint8_t *scales = inr + data_bytes;
-    float *outr = out + (uint64_t)row * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        const float scale = dsv4_e8m0_decode_scale_dev(scales[d / PULSAR_MXKV_BLOCK]);
-        if (fmt == PULSAR_MXKV_FMT_FP4) {
-            const uint8_t byte = inr[d >> 1];
-            const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-            outr[d] = dsv4_e2m1fn_decode_dev(nib, scale);
-        } else {
-            outr[d] = dsv4_e4m3fn_decode_dev(inr[d], scale);
-        }
-    }
-}
-
-int pulsar_gpu_mxkv_pack_tensor(const pulsar_gpu_tensor *x, pulsar_gpu_tensor *out,
-                                        uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
-    if (!x || !out || n_tok == 0 || (head_dim % PULSAR_MXKV_BLOCK) != 0 ||
-        fmt != PULSAR_MXKV_FMT_FP4 ||
-        x->bytes < (uint64_t)n_tok * head_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * PULSAR_MXKV_ROWBYTES(fmt, head_dim)) return 0;
-    mxkv_pack_kernel<<<n_tok, 32>>>((const float *)x->ptr, (uint8_t *)out->ptr, n_tok, head_dim, fmt);
-    return cuda_ok(cudaGetLastError(), "mxkv_pack launch");
-}
-
-int pulsar_gpu_mxkv_dequant_tensor(const pulsar_gpu_tensor *in, pulsar_gpu_tensor *out,
-                                           uint32_t fmt, uint32_t n_tok, uint32_t head_dim) {
-    if (!in || !out || n_tok == 0 || (head_dim % PULSAR_MXKV_BLOCK) != 0 ||
-        fmt != PULSAR_MXKV_FMT_FP4 ||
-        in->bytes < (uint64_t)n_tok * PULSAR_MXKV_ROWBYTES(fmt, head_dim) ||
-        out->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-    mxkv_dequant_kernel<<<n_tok, 256>>>((const uint8_t *)in->ptr, (float *)out->ptr, n_tok, head_dim, fmt);
-    return cuda_ok(cudaGetLastError(), "mxkv_dequant launch");
-}
 
 /* PULSAR_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
  * of x IN PLACE (identical to pulsar_gpu_dsv4_fp8_kv_quantize_tensor) and store
