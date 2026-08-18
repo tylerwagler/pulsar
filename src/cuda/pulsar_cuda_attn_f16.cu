@@ -93,7 +93,7 @@ __device__ __forceinline__ static void af16_mma(
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
         uint32_t b0, uint32_t b1) {
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
@@ -101,8 +101,8 @@ __device__ __forceinline__ static void af16_mma(
 #endif
 
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
-    return (uint32_t)__bfloat16_as_ushort(__float2bfloat16(lo)) |
-           ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
+    return (uint32_t)__half_as_ushort(__float2half(lo)) |
+           ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);
 }
 
 /* 512 threads means one block already fills 65536/(512) = 128 registers worth
@@ -261,13 +261,13 @@ static void attn_f16_kernel(
     const float scale = rsqrtf((float)AF16_DIM);
 
     /* __align__(16) is REQUIRED by the ldmatrix in phase 3: it loads 8 x 16 bits
-     * per lane and the address must be 16-byte aligned.  A 16-bit array is only
+     * per lane and the address must be 16-byte aligned.  A __half array is only
      * 2-byte aligned by default, and this one follows sRawRows[256] plus three
      * uint32_t, so its natural offset is 1036 -- misaligned by 12. */
-    __shared__ __align__(16) __nv_bfloat16 sKV[AF16_ROWS * AF16_KVSTRIDE];
+    __shared__ __align__(16) __half sKV[AF16_ROWS * AF16_KVSTRIDE];
     __shared__ float  sPart[4][AF16_MT][AF16_HEADS][AF16_ROWS];  /* k-split partials */
     __shared__ float  sS[AF16_HPB][AF16_ROWS];
-    __shared__ __nv_bfloat16 sP[AF16_HPB][AF16_ROWS];
+    __shared__ __half sP[AF16_HPB][AF16_ROWS];
     __shared__ float  sCorr[AF16_HPB];
     /* Per-tile row validity for the top-k selection. An entry the indexer left
      * invalid means "there is no k-th row here", so it must contribute NOTHING;
@@ -389,9 +389,9 @@ static void attn_f16_kernel(
             /* Exactly one thread per row has d4 == 0, so this writes each row's
              * flag once without a clearing pass or an extra barrier. */
             if (d4 == 0u) sRowBad[r] = bad ? 1u : 0u;
-            __nv_bfloat162 *dst = (__nv_bfloat162 *)&sKV[r * AF16_KVSTRIDE + d4];
-            dst[0] = make_bfloat162(__float2bfloat16(f0), __float2bfloat16(f1));
-            dst[1] = make_bfloat162(__float2bfloat16(f2), __float2bfloat16(f3));
+            __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
+            dst[0] = make_half2(__float2half(f0), __float2half(f1));
+            dst[1] = make_half2(__float2half(f2), __float2half(f3));
         }
         __syncthreads();
 
@@ -404,7 +404,7 @@ static void attn_f16_kernel(
                 const uint32_t k0 = (kgrp * AF16_KPW + s) * 16u;
                 /* B[k=dim][n=row] = KV[row][dim]: fixed row per lane group,
                  * two dim pairs.  This is the column walk the padding is for. */
-                const __nv_bfloat16 *kr = &sKV[(rbase + g) * AF16_KVSTRIDE + k0];
+                const __half *kr = &sKV[(rbase + g) * AF16_KVSTRIDE + k0];
                 const uint32_t b0 = *(const uint32_t *)&kr[tg * 2u];
                 const uint32_t b1 = *(const uint32_t *)&kr[tg * 2u + 8u];
                 af16_mma(s0, s1, s2, s3, qf[s][0], qf[s][1], qf[s][2], qf[s][3], b0, b1);
@@ -443,10 +443,10 @@ static void attn_f16_kernel(
             float l = sL[h] * corr;
             for (uint32_t r = 0; r < nr; r++) {
                 const float p = empty ? 0.0f : __expf(sS[h][r] - mx);
-                sP[h][r] = __float2bfloat16(p);
+                sP[h][r] = __float2half(p);
                 l += p;
             }
-            for (uint32_t r = nr; r < AF16_ROWS; r++) sP[h][r] = __float2bfloat16(0.f);
+            for (uint32_t r = nr; r < AF16_ROWS; r++) sP[h][r] = __float2half(0.f);
             sM[h] = mx; sL[h] = l; sCorr[h] = corr;
         }
         __syncthreads();
