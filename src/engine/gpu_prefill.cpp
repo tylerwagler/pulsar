@@ -592,7 +592,6 @@ bool gpu_graph_encode_layer_attention_batch(
      * Ask the backend whether its prefill attention reads packed rows natively
      * and, when it does, skip the shadow.  Bit-exact by construction -- packed
      * rows decode to exactly the values the f32 cache would hold. */
-    const bool pk_native = pulsar_gpu_attention_prefill_reads_packed_comp() != 0;
     const uint32_t nb = gpu_graph_bank_pool_count(g);
     if (mseq && (pos0 == 0 || n_tokens > g->batch_multiseq_rows ||
                  (uint32_t)g->ms_positions[0] != pos0)) {
@@ -1758,8 +1757,7 @@ bool gpu_graph_encode_layer_attention_batch(
                  * only the redundant repeats are gone. */
                 pulsar_gpu_tensor *span_comp_src =
                     mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                         : (pk_native ? g->layer_attn_comp_cache[il]
-                                      : gpu_graph_attn_comp_read_cache(g, il, n_comp));
+                         : (g->layer_attn_comp_cache[il]);
                 const struct gpu_graph_span_ops sop = {
                     /* comp_src   */ span_comp_src,
                     /* raw_src    */ mseq ? gpu_graph_bank_raw_pool(g, il) : g->layer_raw_cache[il],
@@ -1767,7 +1765,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                           : g->layer_index_comp_cache[il],
                     /* index_bases*/ mseq ? gpu_graph_bank_index_comp_bases(g, il) : NULL,
                     /* comp_bases */ mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
-                    /* comp_pack  */ (uint32_t)(mseq || pk_native ? 1u : 0u),
+                    /* comp_pack  */ 1u,
                     /* comp_cap   */ mseq ? g->layer_comp_cap[il] : 0u,
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
@@ -1793,10 +1791,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? gpu_graph_bank_raw_pool(g, il)
                                                                               : g->layer_raw_cache[il],
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                              : (pk_native ? g->layer_attn_comp_cache[il]
-                                                                                           : gpu_graph_attn_comp_read_cache(g, il, n_comp)),
-                                                                         mseq ? 1u
-                                                                              : (pk_native ? 1u : 0),
+                                                                              : (g->layer_attn_comp_cache[il]),
+                                                                         1u,
                                                                          n_tokens,
                                                                          pos0,
                                                                          mseq ? 0 : n_raw,
@@ -1840,23 +1836,20 @@ bool gpu_graph_encode_layer_attention_batch(
             /* Hoisted for the same reason as the chunked branch above: the shadow
              * depends only on (il, n_comp) and the span body only reads it.
              *
-             * Also honour pk_native here, which this branch never did.  The
-             * chunked branch hands the packed cache straight to the backend when
-             * it reads packed rows natively; this one built the f32 shadow
-             * unconditionally, which is why it was the ONLY source of
-             * attn_pack_dequant launches in production (pk_native is on for every
-             * shipped configuration). Bit-exact: packed rows decode to exactly
-             * the values the shadow would hold. */
+             * The packed cache goes straight to the backend now. Every attention
+             * consumer reads PULSAR_ATTN_PACK rows as of 2026-08-17, so the f32
+             * shadow this branch used to build has no reader left in prefill --
+             * it survives only for session load. Bit-exact either way: packed
+             * rows decode to exactly the values the shadow would hold. */
             pulsar_gpu_tensor *zspan_comp_src =
-                pk_native ? g->layer_attn_comp_cache[il]
-                          : gpu_graph_attn_comp_read_cache(g, il, n_comp);
+                g->layer_attn_comp_cache[il];
             const struct gpu_graph_span_ops zsop = {
                 /* comp_src   */ zspan_comp_src,
                 /* raw_src    */ g->layer_raw_cache[il],
                 /* index_src  */ g->layer_index_comp_cache[il],
                 /* index_bases*/ NULL,
                 /* comp_bases */ NULL,
-                /* comp_pack  */ (uint32_t)(pk_native ? 1u : 0u),
+                /* comp_pack  */ 1u,
                 /* comp_cap   */ 0u,
                 /* n_banks    */ 1u,
                 /* mseq       */ false,
@@ -1878,13 +1871,22 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        layer->attn_sinks->abs_offset,
                                                                        g->batch_q,
                                                                        g->batch_kv_pack,
-                                                                       gpu_graph_attn_comp_read_cache(g, il, n_comp),
+                                                                       /* packed pool straight in: this
+                                                                        * used to call
+                                                                        * gpu_graph_attn_comp_read_cache,
+                                                                        * a full dequantise of 584 B rows
+                                                                        * into a 2048 B f32 shadow, purely
+                                                                        * because this kernel could not
+                                                                        * read the packed form. */
+                                                                       mseq ? gpu_graph_bank_attn_comp_pool(g, il)
+                                                                            : g->layer_attn_comp_cache[il],
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
-                                                                       PULSAR_N_HEAD_DIM) != 0;
+                                                                       PULSAR_N_HEAD_DIM,
+                                                                       1u) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -1997,9 +1999,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               /* Native packed read when the backend supports it: this
                                                                                * sits in a PER-TOKEN loop and cur_comp grows per token,
                                                                                * so the shadow was rebuilt for every token. */
-                                                                              pk_native ? g->layer_attn_comp_cache[il]
-                                                                                        : gpu_graph_attn_comp_read_cache(g, il, cur_comp),
-                                                                              pk_native ? 1u : 0,
+                                                                              g->layer_attn_comp_cache[il],
+                                                                              1u,
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -2023,10 +2024,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
-                                                                 cur_comp ? (pk_native ? g->layer_attn_comp_cache[il]
-                                                                                       : gpu_graph_attn_comp_read_cache(g, il, cur_comp))
+                                                                 cur_comp ? (g->layer_attn_comp_cache[il])
                                                                           : NULL,
-                                                                 (cur_comp && pk_native) ? 1u : 0,
+                                                                 cur_comp ? 1u : 0u,
                                                                  cur_comp,
                                                                  PULSAR_N_HEAD,
                                                                  PULSAR_N_HEAD_DIM) != 0;

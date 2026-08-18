@@ -1008,7 +1008,8 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                comp_kv_pack);
 
 
 int pulsar_gpu_attention_output_batch_tensor(
