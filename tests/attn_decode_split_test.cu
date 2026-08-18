@@ -73,8 +73,13 @@ struct Case {
     int descr;              /* 0: single_all scalar decode; 1: banked */
     /* raw_pack is GONE: the raw ring is PULSAR_ATTN_PACK and nothing else,
      * so a case selecting the f32 arm described a shape the engine cannot
-     * produce.  Every case now builds packed raw rows. */
-    int comp_pack;
+     * produce.  Every case now builds packed raw rows.
+     *
+     * comp_pack went the same way on 2026-08-18, for the same reason: the
+     * kernels no longer take a comp format parameter, so an f32 comp case
+     * describes a shape nothing can produce -- and worse, it would still have
+     * PASSED, because golden and split would both read the same f32 bytes as
+     * packed rows and agree on the garbage. */
     uint32_t n_banks, comp_cap;
 };
 
@@ -84,13 +89,13 @@ int main() {
     std::normal_distribution<float> nd(0.f, 0.8f);
 
     const Case cases[] = {
-        {"single_all f32comp", 1, 128, 4352, 17, 600, 0, 0, 0, 0, 0, 1, 0},
-        {"single_all raw-pack", 1, 128, 4352, 5, 640, 0, 0, 0, 0, 0, 1, 0},
-        {"single_all pack", 1, 128, 4352, 41, 600, 0, 0, 0, 0, 1, 1, 0},
-        {"banked 4tok", 4, 64, 64, 0, 200, 24, 4, 850, 1, 0, 2, 256},
-        {"banked pack", 4, 64, 64, 0, 200, 24, 4, 870, 1, 1, 2, 256},
-        {"tiny n_score", 1, 3, 64, 10, 1, 0, 0, 0, 0, 0, 1, 0},
-        {"comp empty", 2, 40, 64, 0, 0, 48, 4, 100, 1, 0, 1, 64},
+        {"single_all comp",   1, 128, 4352, 17, 600, 0, 0, 0, 0, 1, 0},
+        {"single_all wide",   1, 128, 4352, 5, 640, 0, 0, 0, 0, 1, 0},
+        {"single_all deep",   1, 128, 4352, 41, 600, 0, 0, 0, 0, 1, 0},
+        {"banked 4tok",       4, 64, 64, 0, 200, 24, 4, 850, 1, 2, 256},
+        {"banked alt",        4, 64, 64, 0, 200, 24, 4, 870, 1, 2, 256},
+        {"tiny n_score",      1, 3, 64, 10, 1, 0, 0, 0, 0, 1, 0},
+        {"comp empty",        2, 40, 64, 0, 0, 48, 4, 100, 1, 1, 64},
     };
 
     double worst_all = 0.0;
@@ -100,11 +105,9 @@ int main() {
         const uint32_t total_comp_rows = (c.descr ? c.n_banks : 1u) *
                                          (c.descr ? c.comp_cap : c.n_comp);
         std::vector<float> raw((size_t)total_raw_rows * D);
-        std::vector<float> comp((size_t)(total_comp_rows ? total_comp_rows : 1) * D);
         std::vector<float> q((size_t)c.n_tokens * n_head * D);
         std::vector<float> sinks(n_head);
         for (auto &v : raw) v = nd(rng);
-        for (auto &v : comp) v = nd(rng);
         for (auto &v : q) v = nd(rng) * 0.25f;
         for (auto &v : sinks) v = nd(rng);   /* sinks in-distribution: the merge
                                                 applies them once; a double- or
@@ -118,7 +121,7 @@ int main() {
          * See tests/attn_pack_fixture.h for the full note. */
         const uint64_t pack_row = PULSAR_ATTN_PACK_ROWBYTES(D);
         std::vector<uint8_t> compp((size_t)(total_comp_rows ? total_comp_rows : 1) * pack_row);
-        if (c.comp_pack) {
+        {
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_comp_rows; r++) {
                 uint8_t *row = &compp[r * pack_row];
@@ -169,14 +172,13 @@ int main() {
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
         cudaMalloc(&draw, rawp.size());
-        cudaMalloc(&dcomp, c.comp_pack ? compp.size() : comp.size() * 4);
+        cudaMalloc(&dcomp, compp.size());
         cudaMalloc(&dq, q.size() * 4);
         cudaMalloc(&ds, sinks.size() * 4);
         cudaMalloc(&dgold, q.size() * 4);
         cudaMalloc(&dsplit, q.size() * 4);
         cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
-        if (c.comp_pack) cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
-        else             cudaMemcpy(dcomp, comp.data(), comp.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
         cudaMemset(dgold, 0xe5, q.size() * 4);
@@ -187,8 +189,7 @@ int main() {
             cudaMemcpy(dpos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(dseq, seq.data(), seq.size() * 4, cudaMemcpyHostToDevice);
             std::vector<const void *> hbp(c.n_banks);
-            const size_t bank_bytes = c.comp_pack ? (size_t)c.comp_cap * pack_row
-                                                  : (size_t)c.comp_cap * D * 4;
+            const size_t bank_bytes = (size_t)c.comp_cap * pack_row;
             for (uint32_t b = 0; b < c.n_banks; b++)
                 hbp[b] = (const uint8_t *)dcomp + b * bank_bytes;
             cudaMalloc(&dbp, c.n_banks * sizeof(void *));
@@ -199,7 +200,7 @@ int main() {
         /* golden: single walk (z=1, no partials) */
         dim3 g1(c.n_tokens, hg, 1);
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
+                (const float *)draw, (const float *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,
@@ -211,7 +212,7 @@ int main() {
             return 1;
         dim3 gs(c.n_tokens, hg, PULSAR_DEC_SPLITKV_S);
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0, c.comp_pack,
+                (const float *)draw, (const float *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,

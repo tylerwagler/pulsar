@@ -422,7 +422,6 @@ struct gpu_graph_span_ops {
     pulsar_gpu_tensor       *index_src;     /* indexer comp-cache operand     */
     const pulsar_gpu_tensor *index_bases;   /* per-bank base table, or NULL   */
     const pulsar_gpu_tensor *comp_bases;    /* per-bank base table, or NULL   */
-    uint32_t                 comp_pack;     /* comp rows are packed           */
     uint32_t                 comp_cap;      /* per-bank stride, 0 when scalar */
     uint32_t                 n_banks;       /* 1 when scalar                  */
     bool                     mseq;
@@ -521,7 +520,6 @@ static bool gpu_graph_indexed_attention_span(
                                                                   sq_view,
                                                                   op->raw_src,
                                                                   op->comp_src,
-                                                                  op->comp_pack,
                                                                   g->comp_selected,
                                                                   sn,
                                                                   spos0,
@@ -1772,7 +1770,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                           : g->layer_index_comp_cache[il],
                     /* index_bases*/ mseq ? gpu_graph_bank_index_comp_bases(g, il) : NULL,
                     /* comp_bases */ mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
-                    /* comp_pack  */ 1u,
                     /* comp_cap   */ mseq ? g->layer_comp_cap[il] : 0u,
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
@@ -1799,7 +1796,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               : g->layer_raw_cache[il],
                                                                          mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                                                                               : g->layer_attn_comp_cache[il],
-                                                                         1u,
                                                                          n_tokens,
                                                                          pos0,
                                                                          mseq ? 0 : n_raw,
@@ -1850,7 +1846,6 @@ bool gpu_graph_encode_layer_attention_batch(
                 /* index_src  */ g->layer_index_comp_cache[il],
                 /* index_bases*/ NULL,
                 /* comp_bases */ NULL,
-                /* comp_pack  */ 1u,
                 /* comp_cap   */ 0u,
                 /* n_banks    */ 1u,
                 /* mseq       */ false,
@@ -1890,8 +1885,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        g->raw_window,
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
-                                                                       PULSAR_N_HEAD_DIM,
-                                                                       1u) != 0;
+                                                                       PULSAR_N_HEAD_DIM) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -2005,7 +1999,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                * cur_comp grows per token, so the shadow was rebuilt
                                                                                * for every token. */
                                                                               g->layer_attn_comp_cache[il],
-                                                                              1u,
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -2030,7 +2023,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  g->raw_cap,
                                                                  raw_start,
                                                                  cur_comp ? g->layer_attn_comp_cache[il] : NULL,
-                                                                 cur_comp ? 1u : 0,
                                                                  cur_comp,
                                                                  PULSAR_N_HEAD,
                                                                  PULSAR_N_HEAD_DIM) != 0;

@@ -113,7 +113,32 @@ int main(int argc, char **argv) {
             }
         }
     }
-    for (auto &v : ckv) v = (float)(nd(rng) * 0.5);
+    /* Comp rows are PULSAR_ATTN_PACK too.  They were f32 until 2026-08-18 and the
+     * kernel chose between formats on a comp_pack flag; that flag is gone, so a
+     * comp row IS a packed row and the fixture has to build one.  Same
+     * encode-a-draw discipline as the raw rows above -- see attn_pack_fixture.h. */
+    const size_t n_ckv = (size_t)(n_comp ? n_comp : 1u);
+    std::vector<uint8_t> ckvp(n_ckv * pack_row_h);
+    for (size_t r = 0; r < n_ckv; r++) {
+        uint8_t *row = &ckvp[r * pack_row_h];
+        for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
+            row[n_nope_h + sc] = (uint8_t)(126 + (int)((r + sc) % 3));
+        for (uint32_t d = 0; d < n_nope_h; d++)
+            row[d] = host_e4m3_encode((float)(nd(rng) * 0.5),
+                                      host_pack_block_scale(row, n_nope_h, d,
+                                                            PULSAR_FP8_KV_BLOCK));
+        uint16_t *rope = (uint16_t *)(row + n_nope_h + PULSAR_ATTN_PACK_SCALES_PAD(D));
+        for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) {
+            const float f = (float)(nd(rng) * 0.5);
+            uint32_t u; std::memcpy(&u, &f, sizeof u);
+            rope[d] = (uint16_t)(u >> 16);
+        }
+        for (uint32_t d = 0; d < D; d++)
+            ckv[r * D + d] = (d < n_nope_h)
+                ? host_e4m3_decode(row[d], host_pack_block_scale(row, n_nope_h, d,
+                                                                 PULSAR_FP8_KV_BLOCK))
+                : host_bf16_widen(rope[d - n_nope_h]);
+    }
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
     const int bench_only = (argc > 4 && argv[4][0] == 'b');
@@ -219,8 +244,8 @@ int main(int argc, char **argv) {
     /* ---- kernel ----------------------------------------------------------- */
     float *dq, *dkv, *dckv, *ds, *dout;
     cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dkv, rawp.size());
-    cudaMalloc(&dckv, ckv.size() * 4);
-    cudaMemcpy(dckv, ckv.data(), ckv.size() * 4, cudaMemcpyHostToDevice);
+    cudaMalloc(&dckv, ckvp.size());
+    cudaMemcpy(dckv, ckvp.data(), ckvp.size(), cudaMemcpyHostToDevice);
     cudaMalloc(&ds, sinks.size() * 4); cudaMalloc(&dout, out.size() * 4);
     cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dkv, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
@@ -236,11 +261,11 @@ int main(int argc, char **argv) {
         ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
-                                           NULL, NULL, NULL, 0u, 1u, 0)
+                                           NULL, NULL, NULL, 0u, 1u)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
                                            n_comp ? dckv : NULL,
                                            n_tokens, n_comp, window, ratio,
-                                           n_head, D, 0);
+                                           n_head, D);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
@@ -253,12 +278,12 @@ int main(int argc, char **argv) {
         const int iters = 20;
         for (int i = 0; i < 3; i++)
             pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, 0);
+                                             n_tokens, n_comp, window, ratio, n_head, D);
         cudaDeviceSynchronize();
         cudaEventRecord(e0);
         for (int i = 0; i < iters; i++)
             pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, 0);
+                                             n_tokens, n_comp, window, ratio, n_head, D);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
         printf("timing: %.4f ms/launch  (n_tokens=%u window=%u n_head=%u)\n",

@@ -83,7 +83,13 @@ static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
 }
 
 int main(int argc, char **argv) {
-    const int packed = (argc > 1 && argv[1][0] == 'p');
+    /* Comp banks are ATTN_PACK, full stop.  This took a 'p' argument selecting
+     * between packed and f32 banks until 2026-08-18, when the format parameter
+     * was removed from the kernels -- there is one comp format, so there is one
+     * mode.  The argument is still accepted and ignored so old invocations do
+     * not fail. */
+    (void)argc; (void)argv;
+    const int packed = 1;
     const uint32_t D = AF16_DIM, n_head = 32u;
     const uint32_t n_banks = 4u, raw_cap = 64u, comp_cap = 32u;
     const uint32_t n_tokens = 16u, top_k = 8u, window = 24u, ratio = 2u;
@@ -177,9 +183,9 @@ int main(int argc, char **argv) {
         cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
 
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, draw, packed ? (const float *)dpk : dcomp, use_tk, n_tokens,
+        dout, ds, dq, draw, (const float *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
-        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, packed);
+        n_head, D, dpos, dseq, dbp, comp_cap, n_banks);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;

@@ -198,7 +198,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int comp_pack,
+        uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok);
@@ -214,18 +214,13 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        /* Comp row format, exactly as in the INDEXED entry below. This entry
-         * hard-coded 0 until 2026-08-18, so handing it the packed pool read
-         * 584 B rows at a 2048 B stride -- out of bounds, NaN, and a clean
-         * compile, because both formats are const float *. */
-        int                     comp_pack);
+        uint32_t                head_dim);
 
 /* fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
  * (topk == NULL, the continued-prefill sweep).  Banked descriptors
  * (positions/seq_id/comp_bank_ptrs; all-or-nothing) and ATTN_PACK comp rows
- * (comp_pack) are served natively -- bank isolation gated by
+ * are ATTN_PACK rows, always -- bank isolation gated by
  * tests/attn_f16_banked_test.cu.  Returns 0 on refusal or failure. */
 int pulsar_gpu_attention_f16_indexed(
         float                   *heads,
@@ -249,8 +244,7 @@ int pulsar_gpu_attention_f16_indexed(
         const int               *seq_id,
         const void * const      *comp_bank_ptrs,
         uint32_t                comp_cap,
-        uint32_t                n_banks,
-        int                     comp_pack);
+        uint32_t                n_banks);
 
 /* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
@@ -851,7 +845,6 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_pack,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim);
@@ -935,7 +928,6 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_pack,
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                n_raw,
@@ -961,7 +953,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_pack,
         const pulsar_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -993,8 +984,7 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                comp_kv_pack);
+        uint32_t                head_dim);
 
 
 int pulsar_gpu_attention_output_batch_tensor(

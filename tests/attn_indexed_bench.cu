@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
             heads, sinks, q, raw_kv, comp_kv, topk,
             n_tokens, /*pos0=*/0u, n_raw_rt, raw_cap, /*raw_start=*/0u,
             n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
-            /*comp_kv_pack=*/0u, positions, /*seq_id=*/nullptr,
+            positions, /*seq_id=*/nullptr,
             /*comp_bank_ptrs=*/nullptr, comp_cap, /*n_banks=*/1u);
     };
 

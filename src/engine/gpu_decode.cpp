@@ -889,7 +889,6 @@ bool gpu_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    1u,
                     comp_selected,
                     1,
                     pos,
@@ -923,7 +922,6 @@ bool gpu_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         1u,
                                                          n_comp,
                                                          PULSAR_N_HEAD, PULSAR_N_HEAD_DIM) != 0;
         }

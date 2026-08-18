@@ -235,8 +235,9 @@ tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile \
 # f32 kernel, while the f16 kernel masks the row to -INF (row 0 substitution
 # double-counts row 0 whenever row 0 was also legitimately selected).  Every
 # top_k>0 shape disagreed by ~8e-1 and nothing was running to notice.
-# Likewise attn_f16_banked_test defaults to the f32 staging path; "p" is the
-# ATTN_PACK one, which is the only one the engine still produces.
+# attn_f16_banked_test took a "p" argument selecting ATTN_PACK comp banks over
+# f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
+# there is one mode and one invocation.
 cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
@@ -244,7 +245,6 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/att
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 5 20    # indexed + ring raw rows
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_banked_test
-	./tests/attn_f16_banked_test p
 	./tests/attn_decode_split_test
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing

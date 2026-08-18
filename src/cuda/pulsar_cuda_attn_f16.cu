@@ -118,11 +118,20 @@ static void attn_f16_kernel(
         float *__restrict__ heads,            /* [n_tokens][n_head][512] */
         const float *__restrict__ sinks,      /* [n_head] */
         const float *__restrict__ q,          /* [n_tokens][n_head][512] */
-        const float *__restrict__ raw_kv,     /* [n_tokens][512], f16 or f32 */
-        const float *__restrict__ comp_kv,    /* comp_pack ? PULSAR_ATTN_PACK rows
-                                               * : [n_comp][512] f32; may alias raw.
-                                               * The stride is comp_pack's, not the
-                                               * pointer type's -- both are float*. */
+        const float *__restrict__ raw_kv,     /* PULSAR_ATTN_PACK rows */
+        const float *__restrict__ comp_kv,    /* PULSAR_ATTN_PACK rows; may alias raw.
+                                               * ⚠ THE POINTER TYPE LIES: these are
+                                               * 584 B byte rows behind a float*, so
+                                               * the stride is the FORMAT's, never
+                                               * sizeof(float)*head_dim.  There used
+                                               * to be a comp_pack parameter here
+                                               * choosing between packed and f32
+                                               * rows; passing it wrong read 584 B
+                                               * rows at a 2048 B stride and produced
+                                               * out-of-bounds NaNs from a clean
+                                               * compile.  It is gone -- there is one
+                                               * format, so there is nothing to get
+                                               * wrong. */
         const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head,
@@ -130,7 +139,7 @@ static void attn_f16_kernel(
         uint32_t top_k,
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks, int comp_pack,
+        uint32_t comp_cap, uint32_t n_banks,
         int ring,                         /* ring/descriptor row plan; topk may
                                            * be NULL -> visible comp prefix */
         /* Grouped E4M3 activation slots for the attn-output "a" projection.
@@ -152,7 +161,7 @@ static void attn_f16_kernel(
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
-    (void)comp_pack; (void)ring;
+    (void)ring;
     (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
     (void)n_groups; (void)n_nope;
     (void)gact_tok0; (void)gact_ntok;
@@ -362,7 +371,7 @@ static void attn_f16_kernel(
                         ci = bad ? 0u : (uint32_t)c;
                     }
                     const uint64_t crow = (uint64_t)comp_base + ci;
-                    if (comp_pack) {
+                    {
                         const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
                         const uint8_t *pr = (const uint8_t *)comp_src +
                             crow * PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);
@@ -383,9 +392,6 @@ static void attn_f16_kernel(
                             f2 = __bfloat162float(rope[o + 2u]);
                             f3 = __bfloat162float(rope[o + 3u]);
                         }
-                    } else {
-                        const float4 v4 = *(const float4 *)(comp_src + crow * AF16_DIM + d4);
-                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
                     }
                 }
             }
@@ -638,7 +644,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int comp_pack,
+        uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok) {
@@ -651,8 +657,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
     /* Same packed-geometry contract the indexed entry enforces: the rope tail
      * must fit and the nope span must divide the scale block, or attn_pack_ld
      * walks rows that are not there. */
-    if (comp_pack && (head_dim <= PULSAR_ATTN_PACK_NROT ||
-                      ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0)) return 0;
+    if (head_dim <= PULSAR_ATTN_PACK_NROT ||
+        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0) return 0;
     /* The epilogue's grouped index math assumes whole heads per group and that
      * the nope/rope split falls on an MX block boundary (so rope_tail can own
      * the tail blocks without either side touching the other's).  Refuse the
@@ -669,7 +675,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, comp_pack, 0,
+                                            NULL, NULL, NULL, 0u, 1u, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
                                             gact_kbp, gact_slab, n_groups, n_nope,
@@ -682,10 +688,10 @@ int pulsar_gpu_attention_f16_prefill(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int comp_pack) {
+        uint32_t n_head, uint32_t head_dim) {
     return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
-                                               n_head, head_dim, comp_pack,
+                                               n_head, head_dim,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
 }
 
@@ -693,8 +699,8 @@ int pulsar_gpu_attention_f16_prefill(
  * top-k SELECTION (topk != NULL) or the visible prefix (topk == NULL).
  * Banked descriptors are all-or-nothing (positions+seq_id+comp_bank_ptrs
  * together or none -- a partial set is refused rather than guessed at), and
- * ATTN_PACK comp rows are read natively via comp_pack.  A 0 here is a real
- * failure, never a silent shape demotion. */
+ * comp rows are ATTN_PACK, always -- the format parameter is gone (see the note
+ * on the kernel).  A 0 here is a real failure, never a silent shape demotion. */
 int pulsar_gpu_attention_f16_indexed(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv, const int *topk,
@@ -702,7 +708,7 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
+        uint32_t comp_cap, uint32_t n_banks) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
@@ -735,7 +741,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u, comp_pack, 1,
+                                            positions ? n_banks : 1u, 1,
                                             NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }
