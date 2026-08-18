@@ -350,6 +350,15 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
+/* Row-based twins of the two readers above (pulsar_sample_logits' relation to
+ * pulsar_session_sample): score a caller-supplied logits row.  The batched
+ * decode entries return one row per bank and leave s->logits untouched by
+ * contract, so a caller that samples from those rows must read its logprobs
+ * from them too.  Identical arithmetic; the session readers delegate here. */
+int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
+                            pulsar_token_score *out, int k);
+int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
+                             pulsar_token_score *out);
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n);
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);

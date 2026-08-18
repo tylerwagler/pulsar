@@ -2,6 +2,153 @@
 
 
 
+/* ---- OpenAI logprobs ledger ---------------------------------------------
+ *
+ * The contract these helpers exist to keep: a reported logprob is the TARGET
+ * model's distribution at the position the token was drawn at.  That is only
+ * true if the value is captured at the DRAW, from the very row the sampler
+ * read, so every decode lane calls one of the two capture entries below
+ * immediately after choosing its token and gen_emit_token consumes the capture
+ * when that token is committed to the response.
+ *
+ * DSpark speculative decode is the one lane that cannot honour it: the target
+ * rows that verified the accepted drafts live inside the fused verify batch and
+ * are overwritten by the next step, and after
+ * pulsar_session_generate_speculative returns the session's logits describe
+ * only the position AFTER the last committed token.  Reading the drafter's
+ * distribution instead would be a silently wrong number, so a request that asks
+ * for logprobs decodes with speculation OFF (see gen_decode_init) and pays the
+ * throughput instead. */
+void logprob_ledger_reset(logprob_ledger *lg) {
+    if (!lg) return;
+    for (int i = 0; i < lg->len; i++) {
+        free(lg->v[i].tok.piece);
+        for (int t = 0; t < lg->v[i].n_top; t++) free(lg->v[i].top[t].piece);
+        free(lg->v[i].top);
+    }
+    lg->len = 0;
+    lg->streamed = 0;
+    lg->pending_valid = false;
+}
+
+
+
+void logprob_ledger_free(logprob_ledger *lg) {
+    if (!lg) return;
+    logprob_ledger_reset(lg);
+    free(lg->v);
+    lg->v = NULL;
+    lg->cap = 0;
+}
+
+
+
+/* pulsar_*_top_logprobs pads its output to k and marks the unused tail with
+ * id < 0 (a vocabulary smaller than k, or an all-non-finite row).  Only the
+ * filled prefix is meaningful. */
+static int logprob_trim(const pulsar_token_score *top, int n) {
+    int i = 0;
+    while (i < n && top[i].id >= 0) i++;
+    return i;
+}
+
+
+
+/* Capture from the session's own logits row — the classic single-slot lane,
+ * where pulsar_session_sample() drew from exactly this distribution and the
+ * session has not been advanced yet. */
+void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token) {
+    if (!lg || !lg->enabled) return;
+    pulsar_token_score chosen;
+    lg->pending_logprob = pulsar_session_token_logprob(sess, token, &chosen)
+                              ? chosen.logprob : -INFINITY;
+    lg->pending_n_top = lg->top_k > 0
+                            ? logprob_trim(lg->pending_top,
+                                           pulsar_session_top_logprobs(sess, lg->pending_top,
+                                                                    lg->top_k))
+                            : 0;
+    lg->pending_valid = true;
+}
+
+
+
+/* Capture from ONE row of a batched decode step.  Those entries return a row
+ * per bank and leave the session's logits untouched by contract, so the row the
+ * host sampler read is the only correct source here. */
+void logprob_capture_row(logprob_ledger *lg, const float *logits, int n_vocab, int token) {
+    if (!lg || !lg->enabled) return;
+    pulsar_token_score chosen;
+    lg->pending_logprob = pulsar_logits_token_logprob(logits, n_vocab, token, &chosen)
+                              ? chosen.logprob : -INFINITY;
+    lg->pending_n_top = lg->top_k > 0
+                            ? logprob_trim(lg->pending_top,
+                                           pulsar_logits_top_logprobs(logits, n_vocab,
+                                                                   lg->pending_top,
+                                                                   lg->top_k))
+                            : 0;
+    lg->pending_valid = true;
+}
+
+
+
+/* Bind the pending capture to the token now being emitted, materializing the
+ * alternatives' text here (the capture sites hold ids only; detokenizing 20 ids
+ * per position is worth doing once, off the sampler).
+ *
+ * A missing capture means an emit path reached here without a matching draw
+ * site.  Report nothing rather than a distribution belonging to some other
+ * position: the whole request's logprobs are dropped, because a ledger with a
+ * hole in it is not something a client can align to its tokens.  Returns false
+ * exactly then, so the caller can say so in the log. */
+bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
+                    const char *piece, size_t piece_len, size_t end_off) {
+    if (!lg || !lg->enabled) return true;
+    if (!lg->pending_valid) {
+        logprob_ledger_reset(lg);
+        lg->enabled = false;
+        return false;
+    }
+    if (lg->len == lg->cap) {
+        lg->cap = lg->cap ? lg->cap * 2 : 64;
+        lg->v = (logprob_entry *)server_xrealloc(lg->v, (size_t)lg->cap * sizeof(lg->v[0]));
+    }
+    logprob_entry *e = &lg->v[lg->len++];
+    e->tok.token = token;
+    e->tok.piece = xstrndup(piece ? piece : "", piece_len);
+    e->tok.piece_len = piece_len;
+    e->tok.logprob = lg->pending_logprob;
+    e->end_off = end_off;
+    e->n_top = lg->pending_n_top;
+    e->top = NULL;
+    if (e->n_top > 0) {
+        e->top = (logprob_token *)server_xmalloc((size_t)e->n_top * sizeof(e->top[0]));
+        for (int i = 0; i < e->n_top; i++) {
+            size_t n = 0;
+            char *text = pulsar_token_text(engine, lg->pending_top[i].id, &n);
+            e->top[i].token = lg->pending_top[i].id;
+            e->top[i].piece = text ? text : xstrndup("", 0);
+            e->top[i].piece_len = text ? n : 0;
+            e->top[i].logprob = lg->pending_top[i].logprob;
+        }
+    }
+    lg->pending_valid = false;
+    return true;
+}
+
+
+
+/* How many not-yet-streamed entries are fully covered by a release watermark:
+ * the count of leading unstreamed entries whose piece ends at or before `upto`.
+ * SIZE_MAX is the final flush (everything still held). */
+int logprob_stream_ready(const logprob_ledger *lg, size_t upto) {
+    if (!lg || !lg->enabled) return 0;
+    int n = lg->streamed;
+    while (n < lg->len && lg->v[n].end_off <= upto) n++;
+    return n;
+}
+
+
+
 bool thinking_state::tail_ends_with(const char *s) const {
     const auto *st = this;
     int n = (int)strlen(s);

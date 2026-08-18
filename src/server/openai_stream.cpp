@@ -201,6 +201,111 @@ void append_openai_usage_json(buf *b, const request *r,
 
 
 
+/* A token piece can be a PARTIAL UTF-8 sequence — the tokenizer splits
+ * multibyte characters across tokens — while the wire must stay valid UTF-8.
+ * "bytes" carries the exact bytes and is the authoritative form; "token"
+ * substitutes U+FFFD for anything that is not a well-formed sequence, which is
+ * what the OpenAI API does with the same problem. */
+static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
+    buf clean = {0};
+    size_t i = 0;
+    while (i < len) {
+        const unsigned char c = (unsigned char)piece[i];
+        size_t need = c < 0x80                 ? 1
+                    : (c >= 0xc2 && c <= 0xdf) ? 2
+                    : (c >= 0xe0 && c <= 0xef) ? 3
+                    : (c >= 0xf0 && c <= 0xf4) ? 4
+                                               : 0;
+        bool ok = need > 0 && len - i >= need;
+        for (size_t k = 1; ok && k < need; k++)
+            ok = ((unsigned char)piece[i + k] & 0xc0) == 0x80;
+        if (ok) {
+            buf_append(&clean, piece + i, need);
+            i += need;
+        } else {
+            buf_puts(&clean, "\xef\xbf\xbd");
+            i++;
+        }
+    }
+    buf_putc(b, '"');
+    json_escape_fragment_n(b, clean.ptr ? clean.ptr : "", clean.len);
+    buf_putc(b, '"');
+    buf_free(&clean);
+}
+
+
+
+/* JSON has no -Infinity.  A degenerate row (every logit non-finite) is the only
+ * way to produce one, and `null` is how the engine's --dump-logits reports the
+ * same condition — an unmistakable hole beats a fabricated finite number. */
+static void append_logprob_number_json(buf *b, float v) {
+    if (isfinite(v)) buf_printf(b, "%.9g", (double)v);
+    else buf_puts(b, "null");
+}
+
+
+
+/* {"token":...,"logprob":...,"bytes":[...]  — the whole of an alternative's
+ * entry and the head of a chosen token's, whose "top_logprobs" array follows.
+ * Left OPEN for that reason; both callers close the object. */
+static void append_logprob_token_open_json(buf *b, const logprob_token *t) {
+    buf_puts(b, "{\"token\":");
+    append_logprob_text_json(b, t->piece, t->piece_len);
+    buf_puts(b, ",\"logprob\":");
+    append_logprob_number_json(b, t->logprob);
+    buf_puts(b, ",\"bytes\":[");
+    for (size_t k = 0; k < t->piece_len; k++) {
+        if (k) buf_putc(b, ',');
+        buf_printf(b, "%u", (unsigned)(unsigned char)t->piece[k]);
+    }
+    buf_putc(b, ']');
+}
+
+
+
+/* The OpenAI logprobs object for entries [from, to) of a request's ledger,
+ * emitted with a leading comma so callers append it inside a choice object
+ * (append_openai_timings_json's convention).  Nothing is written unless the
+ * client asked for logprobs.
+ *
+ * The array is named `content` because that is the field name in the OpenAI
+ * schema; see logprob_ledger for what it actually spans (every generated token,
+ * not only the visible content substring). */
+void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int to) {
+    if (!lg || !lg->enabled) return;
+    if (from < 0) from = 0;
+    if (to > lg->len) to = lg->len;
+    buf_puts(b, ",\"logprobs\":{\"content\":[");
+    for (int i = from; i < to; i++) {
+        const logprob_entry *e = &lg->v[i];
+        if (i > from) buf_putc(b, ',');
+        append_logprob_token_open_json(b, &e->tok);
+        buf_puts(b, ",\"top_logprobs\":[");
+        for (int t = 0; t < e->n_top; t++) {
+            if (t) buf_putc(b, ',');
+            append_logprob_token_open_json(b, &e->top[t]);
+            buf_putc(b, '}');
+        }
+        buf_puts(b, "]}");
+    }
+    buf_puts(b, "]}");
+}
+
+
+
+/* Streaming form: attach the entries whose token bytes this chunk RELEASES
+ * (piece ending at or before the watermark; SIZE_MAX on the final chunk) and
+ * mark them streamed, so the entries concatenated over a stream reproduce the
+ * non-streaming array exactly once. */
+static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, size_t release_upto) {
+    if (!lp || !lp->enabled) return;
+    const int to = logprob_stream_ready(lp, release_upto);
+    append_openai_logprobs_json(b, lp, lp->streamed, to);
+    lp->streamed = to;
+}
+
+
+
 /* Additive per-response timing block (llama.cpp-ish field names for client
  * familiarity, plus DS4 cache-split and DSpark extensions). Emits a leading
  * ",\"timings\":{...}" so callers append it directly after the usage object.
@@ -393,8 +498,11 @@ size_t text_stream_safe_limit(const char *raw, size_t start,
 
 
 
+/* `release_upto` is the absolute offset in the raw completion that this delta
+ * carries the client up to; the logprob entries it covers ride along. */
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
-                             const char *field, const char *text, size_t len) {
+                             const char *field, const char *text, size_t len,
+                             logprob_ledger *lp, size_t release_upto) {
     if (len == 0) return true;
     buf b = {0};
     long now = (long)time(NULL);
@@ -404,7 +512,9 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     json_escape(&b, field);
     buf_putc(&b, ':');
     json_escape_n(&b, text, len);
-    buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    buf_putc(&b, '}');
+    append_openai_logprobs_delta(&b, lp, release_upto);
+    buf_puts(&b, ",\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
@@ -1243,7 +1353,7 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
                                   raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
+                                  limit - st->emit_pos, st->lp, limit)) return false;
             st->sent_reasoning = true;
             st->emit_pos = limit;
         }
@@ -1278,7 +1388,7 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
                 if (limit > st->emit_pos &&
                     !sse_chat_delta_n(fd, r, id, "reasoning_content",
                                       raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
+                                      limit - st->emit_pos, st->lp, limit)) return false;
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
@@ -1296,7 +1406,7 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
                                   raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
+                                  limit - st->emit_pos, st->lp, limit)) return false;
             st->sent_content = true;
             st->emit_pos = limit;
         }
@@ -1342,7 +1452,13 @@ bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{}");
+    /* Entries whose bytes never reached a content/reasoning delta (tool-call
+     * bytes, suppressed protocol markers, a held tail) are still this
+     * completion's tokens: flush the remainder here so the streamed logprobs
+     * concatenate to the non-streaming array. */
+    append_openai_logprobs_delta(&b, st->lp, SIZE_MAX);
+    buf_puts(&b, ",\"finish_reason\":");
     json_escape(&b, finish);
     buf_puts(&b, "}]}\n\n");
 

@@ -14,6 +14,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     bool tool_choice_none = false;
     bool tool_choice_required = false;
     bool got_thinking = false;
+    bool got_top_logprobs = false;
     bool thinking_enabled = true;
     pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
@@ -109,6 +110,25 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
                 goto bad;
             }
             r->has_top_k = true;
+        } else if (!strcmp(key, "logprobs")) {
+            /* OpenAI SDKs send an explicit null for "not set" on both logprobs
+             * fields, so accept it as absent rather than as malformed JSON. */
+            json_ws(&p);
+            if (!json_lit(&p, "null") && !json_bool(&p, &r->logprobs)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "top_logprobs")) {
+            /* Range and the logprobs:true dependency are checked after the loop
+             * (the two keys can arrive in either order). */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                if (!json_int(&p, &r->top_logprobs)) {
+                    free(key);
+                    goto bad;
+                }
+                got_top_logprobs = true;
+            }
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -171,6 +191,26 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         request_free(r);
         return false;
     }
+    /* OpenAI's two logprobs rules, both 400s there: top_logprobs is meaningless
+     * without logprobs:true, and the per-position alternative count is capped.
+     * Rejecting is the whole point — a silently clamped k would hand back a
+     * distribution the client did not ask for and cannot detect. */
+    if (got_top_logprobs && !r->logprobs) {
+        snprintf(err, errlen, "top_logprobs requires logprobs to be true");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (r->top_logprobs < 0 || r->top_logprobs > PULSAR_SERVER_MAX_TOP_LOGPROBS) {
+        snprintf(err, errlen, "top_logprobs must be between 0 and %d",
+                 PULSAR_SERVER_MAX_TOP_LOGPROBS);
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (!r->logprobs) r->top_logprobs = 0;
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;

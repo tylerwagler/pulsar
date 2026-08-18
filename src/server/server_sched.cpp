@@ -1624,6 +1624,10 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
         gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token =
             pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        /* The bank is live and its classic logits are what this token was drawn
+         * from; after the multiseq step below they describe nothing (the step
+         * leaves s->logits untouched by contract), so capture here or never. */
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true;
@@ -1696,6 +1700,9 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
             g->batch_feed_token =
                 pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+            /* This bank's row IS the target distribution at batch_feed_pos, and
+             * it is overwritten by the next step's sweep. */
+            logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
     free(logits);
@@ -1794,6 +1801,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true; g->batch_active = true;
@@ -1925,6 +1933,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
             g->batch_feed_token = pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+            logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
     free(reqs); free(logits);

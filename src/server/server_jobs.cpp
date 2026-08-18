@@ -1182,7 +1182,12 @@ void server::gen_stream_begin(session_slot *sl) {
             g->phase = GEN_DONE;
             return;
         }
-        if (g->openai_live_chat) openai_stream_start(&j->req, &g->openai_live);
+        if (g->openai_live_chat) {
+            openai_stream_start(&j->req, &g->openai_live);
+            /* Borrowed for the job's lifetime: the delta emitters attach the
+             * entries their bytes release (see append_openai_logprobs_delta). */
+            g->openai_live.lp = &g->logprobs;
+        }
         if (g->responses_live_chat) {
             responses_stream_init(&j->req, &g->responses_live);
             g->responses_live.active = true;
@@ -1245,7 +1250,21 @@ void server::gen_decode_init(session_slot *sl) {
     g->tool_scan_waiting_for_think_close =
         g->thinking_gates_tool_markers && g->thinking.inside;
     g->think_recovery_scan_from = 0;
-    g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL;
+    /* A logprobs request decodes WITHOUT speculation.  The fused DSpark step
+     * verifies K drafts in one batch and keeps each position's target row only
+     * inside that batch; by the time pulsar_session_generate_speculative
+     * returns, the session's logits describe the position AFTER the last
+     * committed token and the per-draft rows are gone.  There is no correct
+     * distribution left to report for an accepted draft token, and the
+     * drafter's own is a different model — so the choice is fewer tokens per
+     * second, never a number from the wrong distribution. */
+    g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL && !j->req.logprobs;
+    /* Entries from a superseded attempt (tool-error recovery, a web_search
+     * round) go with the text they described: gen_decode_init discards
+     * g->text, so the ledger restarts with it. */
+    logprob_ledger_reset(&g->logprobs);
+    g->logprobs.enabled = j->req.logprobs;
+    g->logprobs.top_k = j->req.top_logprobs;
     dsml_decode_tracker_init(&g->dsml_tracker);
 
     /* tool_choice="required": the prompt was prefilled into an open DSML
@@ -1327,6 +1346,12 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
+    if (!logprob_commit(&g->logprobs, s->engine, token, piece, piece_len, g->text.len)) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: chat ctx=%s emitted a token with no captured "
+                   "distribution after %d tokens; logprobs dropped for this request",
+                   g->ctx_span, g->completion);
+    }
     g->thinking.feed(piece, piece_len);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
@@ -1552,6 +1577,9 @@ void server::gen_step_decode(session_slot *sl) {
                 g->finish = "stop";
                 break;
             }
+            /* Before the eval: pulsar_session_eval advances the session and
+             * overwrites the very logits this token was drawn from. */
+            logprob_capture_session(&g->logprobs, s->sess, token);
             if (pulsar_session_eval(s->sess, token, g->err, sizeof(g->err)) != 0) {
                 g->finish = "error";
                 break;
@@ -1995,7 +2023,8 @@ void server::gen_step_finish(session_slot *sl) {
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        g->prompt_tokens,
-                       g->completion_total + g->completion);
+                       g->completion_total + g->completion,
+                       &g->logprobs);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -2079,6 +2108,7 @@ void server::gen_state_free(session_slot *sl) {
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
+    logprob_ledger_free(&g->logprobs);
     buf_free(&g->web_rounds_json);
     pulsar_tokens_free(&g->effective_prompt);
     pulsar_tokens_free(&g->cold_prefix);

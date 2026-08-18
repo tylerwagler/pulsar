@@ -883,7 +883,8 @@ bool responses_final_response(int fd, bool enable_cors,
 bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           const logprob_ledger *lp) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -899,7 +900,11 @@ bool final_response(int fd, bool enable_cors,
             buf_puts(&b, ",\"tool_calls\":");
             append_tool_calls_json(&b, calls, id, &r->tool_orders);
         }
-        buf_puts(&b, "},\"finish_reason\":");
+        buf_putc(&b, '}');
+        /* Sibling of message/finish_reason inside the choice, as in the OpenAI
+         * schema; absent unless the client asked for it. */
+        append_openai_logprobs_json(&b, lp, 0, lp ? lp->len : 0);
+        buf_puts(&b, ",\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     } else {

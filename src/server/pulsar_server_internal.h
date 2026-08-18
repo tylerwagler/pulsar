@@ -77,6 +77,10 @@
  * boundaries. */
 #define PULSAR_SERVER_DECODE_QUANTUM_TOKENS 16
 
+/* OpenAI caps chat-completions top_logprobs at 20; a request above it is a 400,
+ * so this also bounds the per-token capture buffer (see logprob_ledger). */
+#define PULSAR_SERVER_MAX_TOP_LOGPROBS 20
+
 /* Ceiling for bytes queued in a slot_writer for a client that stops reading.
  * The stall timeout is the real slow-client guard; this cap only bounds worst
  * case memory if a client keeps draining just enough to defeat it. */
@@ -333,6 +337,56 @@ static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, dou
     h->sum += v;
 }
 
+/* One generated token's TARGET-model distribution, captured at the instant the
+ * token was drawn and kept until the token's bytes reach the client.
+ *
+ * `end_off` is the offset into gen_state.text just past this token's piece.
+ * The protocol projections release BYTES, not tokens (they hold tails for stop
+ * strings, partial UTF-8 and half-written DSML tags), so the byte watermark is
+ * what decides which SSE chunk an entry rides on; without it a chunk could
+ * carry logprobs for a token whose text it has not sent yet. */
+typedef struct {
+    int    token;
+    char  *piece;                /* owned raw token bytes (may be partial UTF-8) */
+    size_t piece_len;
+    float  logprob;
+} logprob_token;
+
+typedef struct {
+    logprob_token tok;           /* the token that was actually emitted */
+    size_t end_off;
+    int    n_top;
+    logprob_token *top;          /* owned; n_top alternatives, descending */
+} logprob_entry;
+
+/* Per-request OpenAI logprobs state.  Inert (and allocation-free) unless the
+ * client asked for logprobs: every capture site is behind `enabled`, so a
+ * request that did not ask pays one predictable not-taken branch per token.
+ *
+ * COVERAGE: an entry is recorded for EVERY generated token, in generation
+ * order, over the whole raw completion — reasoning bytes and DSML tool-call
+ * bytes included, not just the visible content substring.  The streamed
+ * entries therefore concatenate to exactly the non-streaming array, which is
+ * the invariant a client can check.
+ *
+ * `pending_*` holds the distribution of the token that has been SAMPLED but not
+ * yet emitted.  Every decode lane draws its next token from a row it has in
+ * hand (the session's own logits, or one row of a batched step's output) and
+ * only later feeds it to gen_emit_token, so capture happens at the draw and is
+ * consumed at the emit.  Exactly one token is ever in flight per slot. */
+typedef struct {
+    bool enabled;
+    int  top_k;                  /* client's top_logprobs, 0..PULSAR_SERVER_MAX_TOP_LOGPROBS */
+    logprob_entry *v;
+    int  len;
+    int  cap;
+    int  streamed;               /* entries already written to an SSE chunk */
+    bool pending_valid;
+    float pending_logprob;
+    int  pending_n_top;
+    pulsar_token_score pending_top[PULSAR_SERVER_MAX_TOP_LOGPROBS];
+} logprob_ledger;
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -361,6 +415,12 @@ typedef struct {
     bool has_top_k;
     bool has_top_p;
     bool has_min_p;
+    /* OpenAI logprobs (chat completions only).  `logprobs` alone reports the
+     * chosen token's logprob; `top_logprobs` additionally asks for that many
+     * alternatives per position and is rejected without logprobs:true, per the
+     * OpenAI contract. */
+    bool logprobs;
+    int  top_logprobs;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -467,6 +527,11 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
+    /* Borrowed (never owned): the request's logprob ledger, so the delta
+     * emitters can attach the entries whose bytes the delta releases.  NULL
+     * whenever the client did not ask for logprobs — openai_stream_start
+     * zeroes it and only the job binds it. */
+    logprob_ledger *lp;
     openai_tool_stream tool;
 } openai_stream;
 
@@ -1428,6 +1493,7 @@ struct gen_state {
 
     /* decode attempt state (reset by GEN_DECODE_INIT) */
     buf text;
+    logprob_ledger logprobs;   /* per-token target distributions; see the type */
     size_t plain_stream_pos;
     size_t stop_scan_from;
     const char *finish;
@@ -1744,7 +1810,8 @@ bool responses_final_response(int fd, bool enable_cors,
 bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens);
+                           int prompt_tokens, int completion_tokens,
+                           const logprob_ledger *lp);
 void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,
                                      const tool_schema_orders *orders,
@@ -1960,6 +2027,22 @@ void *worker_main(void *arg);
  * decode loop. */
 void gen_resolve_sampling(const request *req, float *temperature,
                           int *top_k, float *top_p, float *min_p);
+/* OpenAI logprobs ledger (generate.cpp).  capture_* records the distribution a
+ * token was DRAWN from; logprob_commit binds it to that token as it is emitted
+ * and returns false if a capture was missing (the ledger then reports nothing
+ * for the request rather than a distribution from the wrong position).
+ * logprob_stream_ready reports how many entries a byte watermark releases. */
+void logprob_ledger_reset(logprob_ledger *lg);
+void logprob_ledger_free(logprob_ledger *lg);
+void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
+void logprob_capture_row(logprob_ledger *lg, const float *logits, int n_vocab, int token);
+bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
+                    const char *piece, size_t piece_len, size_t end_off);
+int  logprob_stream_ready(const logprob_ledger *lg, size_t upto);
+/* The OpenAI logprobs object for ledger entries [from, to), leading comma
+ * included (append_openai_timings_json's convention); nothing when the client
+ * did not ask for logprobs. */
+void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int to);
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);

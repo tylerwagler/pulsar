@@ -1179,10 +1179,17 @@ int pulsar_session::sample(float temperature, int top_k, float top_p, float min_
 
 
 
-int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
-    auto *s = this;
-    if (!s || !out || k <= 0) return 0;
-    if (k > (int)PULSAR_N_VOCAB) k = (int)PULSAR_N_VOCAB;
+/* Row-based twins of the two session logprob readers below, in the same
+ * relation pulsar_sample_logits has to pulsar_session::sample: score a
+ * caller-supplied logits row instead of the session's own.  The batched decode
+ * entries (pulsar_session_decode_multiseq / _mixed) hand each bank's row back to
+ * the caller and deliberately leave s->logits alone, so for those steps the
+ * returned row is the ONLY place that position's distribution exists.  Same
+ * arithmetic as before, moved verbatim — the session methods now delegate. */
+int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
+                            pulsar_token_score *out, int k) {
+    if (!logits || !out || k <= 0 || n_vocab <= 0) return 0;
+    if (k > n_vocab) k = n_vocab;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = PULSAR_NEG_INF;
@@ -1190,14 +1197,14 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
     }
 
     float max_logit = PULSAR_NEG_INF;
-    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
-        const float v = s->logits[i];
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
         if (!isfinite(v)) continue;
         if (v > max_logit) max_logit = v;
         for (int j = 0; j < k; j++) {
             if (out[j].id < 0 || v > out[j].logit) {
                 for (int l = k - 1; l > j; l--) out[l] = out[l - 1];
-                out[j].id = (int)i;
+                out[j].id = i;
                 out[j].logit = v;
                 break;
             }
@@ -1206,8 +1213,8 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
-        const float v = s->logits[i];
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
@@ -1219,27 +1226,43 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
 
 
 
-int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
-    auto *s = this;
-    if (!s || !out || token < 0 || token >= (int)PULSAR_N_VOCAB) return 0;
+int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
+                             pulsar_token_score *out) {
+    if (!logits || !out || n_vocab <= 0 || token < 0 || token >= n_vocab) return 0;
 
     float max_logit = PULSAR_NEG_INF;
-    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
-        const float v = s->logits[i];
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
     }
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
-        const float v = s->logits[i];
+    for (int i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
     const double logsum = (double)max_logit + log(sum);
     out->id = token;
-    out->logit = s->logits[token];
+    out->logit = logits[token];
     out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : PULSAR_NEG_INF;
     return 1;
+}
+
+
+
+int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
+    auto *s = this;
+    if (!s) return 0;
+    return pulsar_logits_top_logprobs(s->logits, (int)PULSAR_N_VOCAB, out, k);
+}
+
+
+
+int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
+    auto *s = this;
+    if (!s) return 0;
+    return pulsar_logits_token_logprob(s->logits, (int)PULSAR_N_VOCAB, token, out);
 }
 
 
