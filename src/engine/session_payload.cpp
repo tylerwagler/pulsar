@@ -145,11 +145,13 @@ static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkp
 static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
-    /* Session files always store comp rows as f32 (packed caches dequant to
-     * the f32 shadow on save), so payload sizing is format-independent. */
-    const uint64_t comp_row = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
+    /* v4 stores raw AND comp rows in the format the caches hold them in, so
+     * both are PULSAR_ATTN_PACK rows.  This sized them at the f32 stride --
+     * 2048 B against the real 584 B -- which over-reserved the disk cache by
+     * 3.5x on the KV bulk of every payload. */
+    const uint64_t comp_row = (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * PULSAR_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * comp_row;
@@ -314,103 +316,27 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
 
 
 
-static PULSAR_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const pulsar_gpu_tensor *tensor,
-                                                                 uint64_t offset_f16, uint64_t count,
-                                                                 uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    if (!tensor ||
-        count > (UINT64_MAX / sizeof(uint16_t)) ||
-        count > (UINT64_MAX / sizeof(float)) ||
-        offset_f16 > pulsar_gpu_tensor_bytes(tensor) ||
-        count * sizeof(uint16_t) > pulsar_gpu_tensor_bytes(tensor) - offset_f16)
-    {
-        payload_set_err(err, errlen, "session tensor is smaller than the F16 payload");
-        return 1;
-    }
 
-    size_t cap_elems = cap / (sizeof(uint16_t) + sizeof(float));
-    cap_elems &= ~(size_t)1u;
-    if (cap_elems == 0) {
-        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
-        return 1;
-    }
-    uint16_t *h = (uint16_t *)buf;
-    float *f = (float *)(void *)(buf + cap_elems * sizeof(uint16_t));
-
-    uint64_t done = 0;
-    while (done < count) {
-        const size_t n = count - done > (uint64_t)cap_elems
-            ? cap_elems
-            : (size_t)(count - done);
-        if (pulsar_gpu_tensor_read(tensor, offset_f16 + done * sizeof(uint16_t),
-                                h, n * sizeof(uint16_t)) == 0) {
-            payload_set_err(err, errlen, "failed to read GPU F16 session tensor");
-            return 1;
-        }
-        for (size_t i = 0; i < n; i++) f[i] = f16_to_f32(h[i]);
-        if (payload_write_bytes(fp, f, (uint64_t)n * sizeof(float), err, errlen) != 0) return 1;
-        done += n;
-    }
-    return 0;
-}
-
-
-
-static PULSAR_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, pulsar_gpu_tensor *tensor,
-                                                                uint64_t offset_f16, uint64_t count,
-                                                                uint8_t *buf, size_t cap, uint64_t *remaining,
-                                                                char *err, size_t errlen) {
-    if (!tensor ||
-        count > (UINT64_MAX / sizeof(uint16_t)) ||
-        count > (UINT64_MAX / sizeof(float)) ||
-        offset_f16 > pulsar_gpu_tensor_bytes(tensor) ||
-        count * sizeof(uint16_t) > pulsar_gpu_tensor_bytes(tensor) - offset_f16)
-    {
-        payload_set_err(err, errlen, "session tensor is smaller than the F16 payload");
-        return 1;
-    }
-
-    size_t cap_elems = cap / (sizeof(uint16_t) + sizeof(float));
-    cap_elems &= ~(size_t)1u;
-    if (cap_elems == 0) {
-        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
-        return 1;
-    }
-    uint16_t *h = (uint16_t *)buf;
-    float *f = (float *)(void *)(buf + cap_elems * sizeof(uint16_t));
-
-    uint64_t done = 0;
-    while (done < count) {
-        const size_t n = count - done > (uint64_t)cap_elems
-            ? cap_elems
-            : (size_t)(count - done);
-        if (payload_read_bytes(fp, f, (uint64_t)n * sizeof(float), remaining, err, errlen) != 0) return 1;
-        for (size_t i = 0; i < n; i++) h[i] = f32_to_f16(f[i]);
-        if (pulsar_gpu_tensor_write(tensor, offset_f16 + done * sizeof(uint16_t),
-                                 h, n * sizeof(uint16_t)) == 0) {
-            payload_set_err(err, errlen, "failed to restore GPU F16 session tensor");
-            return 1;
-        }
-        done += n;
-    }
-    return 0;
-}
-
-/* Raw-ring row spans: session files always store f32 rows, while the ring
- * holds __half containers, so save expands f16->f32 and load packs f32->f16 --
- * bit-exact both ways because the values are f16-rounded at store time. */
+/* Raw-ring row spans.  The ring is PULSAR_ATTN_PACK, like every other KV buffer
+ * -- one row is PULSAR_ENGINE_ATTN_PACK_ROWBYTES, not PULSAR_N_HEAD_DIM __half
+ * containers.  This path still said f16 long after the ring stopped being f16:
+ * it read at a 1024 B stride from a 584 B/row buffer and reinterpreted packed
+ * bytes as halves, so it walked the wrong rows AND past the end of the
+ * allocation.  Nothing caught it because ->bytes is a number and __half is a
+ * legal way to look at those bytes. */
 static int payload_write_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    return payload_write_tensor_span_f16_as_f32(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
-            (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, err, errlen);
+    return payload_write_tensor_span(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
+            (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, err, errlen);
 }
 
 static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                 char *err, size_t errlen) {
-    return payload_read_tensor_span_f32_as_f16(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_N_HEAD_DIM * sizeof(uint16_t),
-            (uint64_t)PULSAR_N_HEAD_DIM, buf, cap, remaining, err, errlen);
+    return payload_read_tensor_span(fp, g->layer_raw_cache[il],
+            (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
+            (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, remaining, err, errlen);
 }
 
 uint64_t pulsar_session::payload_bytes() {

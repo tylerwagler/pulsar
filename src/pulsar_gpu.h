@@ -617,18 +617,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Repack-only variant for session load: packs ALREADY-roundtripped f32 rows
- * with an exact integer-math scale bucket (value-idempotent; x unmodified).
- * The live emit path must keep using pulsar_gpu_attn_pack_quantize_store_tensor,
- * whose fast-math scale matches pulsar_gpu_dsv4_fp8_kv_quantize_tensor exactly. */
-int pulsar_gpu_attn_pack_repack_tensor(
-        const pulsar_gpu_tensor *x,
-        pulsar_gpu_tensor       *packed,
-        uint32_t               out_row0,
-        uint32_t               n_rows,
-        uint32_t               head_dim,
-        uint32_t               n_rot);
-
 /* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
  * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
  * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */

@@ -470,15 +470,25 @@ __device__ static float dsv4_e8m0_decode_scale_dev(uint8_t byte) {
  * blocks land on it (~5% for E4M3's 448). A competing GB10 fork shipped exactly
  * this bug and lost 10.5% of their fp4 indexer lanes to zero.
  *
- * SO: every re-encode path already routes through the EXACT helper below —
- * `mxkv_pack_kernel`, `attn_pack_repack_kernel`/`attn_pack_exact_e8_dev` — and
+ * SO: every re-encode path routes through the EXACT scale bucket
+ * `dsv4_e8m0_encode_scale_exact_dev` (`mxkv_pack_kernel` uses it), and
  * `gpu_decode.cpp:498` passes `quantize_fp8=false` under pack to avoid double-
  * rounding. **If you ever feed already-quantized data into
  * `fp8_kv_quantize*`, `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround
- * rate jumps from 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.** The plan-32
- * evict/restore and plan-33 fork/restore work is precisely the kind of change
- * that could do this: restore paths MUST keep using the exact repack entry
- * points, never these fresh quantizers.
+ * rate jumps from 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**
+ *
+ * There WAS an attn-KV twin of this (`attn_pack_repack_kernel` /
+ * `attn_pack_exact_e8_dev`), for re-encoding already-roundtripped f32 KV rows on
+ * session load.  It is gone: since payload v4 the engine holds NO already-
+ * quantized f32 KV rows anywhere — save and load copy packed bytes, and the only
+ * f32 KV buffers left are the PRODUCERS, which carry fresh values that the fresh
+ * quantizers are the correct tool for.
+ *
+ * So the rule for plan-31b evict/restore and any other restore path is now
+ * simpler: move PACKED BYTES.  If you ever find yourself holding already-
+ * quantized f32 KV rows and needing to re-encode them, you need an exact-scale
+ * path — build it on dsv4_e8m0_encode_scale_exact_dev, and do NOT reach for
+ * attn_pack_store.
  *
  * KNOWN (benign, unfixed): `indexer_hadamard_fp4*_kernel`'s amax floor
  * 7.052966104933725e-38f is bit-exactly `6.0f * 2^-126` — i.e. it sits ON a
@@ -663,54 +673,6 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         if (xr) xr[n_nope + d] = __bfloat162float(b);
     }
 }
-
-/* Exact e4m3 (max_repr 448) scale bucket for repacking already-roundtripped
- * attn KV rows; see dsv4_e8m0_encode_scale_exact_dev for the bit-pattern trick. */
-__device__ static inline uint8_t attn_pack_exact_e8_dev(float amax) {
-    return dsv4_e8m0_encode_scale_exact_dev(amax, 448.0f, 1.0e-4f);
-}
-
-__global__ static void attn_pack_repack_kernel(const float *x, uint8_t *out, uint32_t out_row0, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (row >= n_rows) return;
-    const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t nblk = n_nope / PULSAR_FP8_KV_BLOCK;
-    const uint32_t nblk_pad = (nblk + 3u) & ~3u;
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const float *xr = x + (uint64_t)row * head_dim;
-    uint8_t *outr = out + (uint64_t)(out_row0 + row) * rowbytes;
-    uint8_t *sc = outr + n_nope;
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + n_nope + nblk_pad);
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
-        float v = 0.0f;
-        if (off + tid < n_nope) v = xr[off + tid];
-        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        const uint8_t e8 = attn_pack_exact_e8_dev(scratch[0]);
-        const float scale = dsv4_e8m0_decode_scale_dev(e8);
-        if (tid == 0) sc[off / PULSAR_FP8_KV_BLOCK] = e8;
-        if (off + tid < n_nope) {
-            outr[off + tid] = dsv4_e4m3fn_encode_dev(fminf(448.0f, fmaxf(-448.0f, v / scale)));
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        for (uint32_t p = nblk; p < nblk_pad; p++) sc[p] = 0;
-    }
-    /* x is already-roundtripped cache data on this path, so its rope dims are
-     * exactly bf16-representable and this narrowing is lossless — the same
-     * re-encode invariant attn_pack_exact_e8_dev buys for the nope dims. */
-    for (uint32_t d = tid; d < n_rot; d += blockDim.x)
-        rope[d] = __float2bfloat16(xr[n_nope + d]);
-}
-
-
 
 /* The QAT transform both indexer FP4 kernels run before they diverge: the
  * 128-point Hadamard butterfly, the 1/sqrt(128) scaling, and the per-32-block
@@ -1276,28 +1238,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
     return cuda_ok(cudaGetLastError(), "attn_pack_store launch");
 }
 
-/* PULSAR_ATTN_PACK REPACK-ONLY entry (session load): pack n_rows f32 rows that
- * are ALREADY fp8-roundtripped (session files always contain such rows) into
- * `packed` at [out_row0, out_row0+n_rows), using the exact integer-math scale
- * bucket — value-idempotent, unlike the fast-math quantize path which can
- * misround the bucket at scale boundaries.  x is not modified. */
-int pulsar_gpu_attn_pack_repack_tensor(const pulsar_gpu_tensor *x,
-                                               pulsar_gpu_tensor *packed,
-                                               uint32_t out_row0,
-                                               uint32_t n_rows,
-                                               uint32_t head_dim,
-                                               uint32_t n_rot) {
-    if (!x || !packed || n_rows == 0 ||
-        n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
-        ((head_dim - n_rot) % PULSAR_FP8_KV_BLOCK) != 0 ||
-        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
-        packed->bytes < ((uint64_t)out_row0 + n_rows) * PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
-        return 0;
-    }
-    attn_pack_repack_kernel<<<n_rows, 64>>>((const float *)x->ptr, (uint8_t *)packed->ptr,
-                                            out_row0, n_rows, head_dim, n_rot);
-    return cuda_ok(cudaGetLastError(), "attn_pack_repack launch");
-}
 
 
 
