@@ -40,7 +40,7 @@ static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *
 
 
 
-static PULSAR_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
+static int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
     if (remaining && *remaining < bytes) {
         payload_set_err(err, errlen, "truncated session payload");
         return 1;
@@ -62,7 +62,7 @@ static PULSAR_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t 
 
 
 
-static PULSAR_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
+static int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
     uint8_t b[4];
     payload_put_u32(b, v);
     return payload_write_bytes(fp, b, sizeof(b), err, errlen);
@@ -70,7 +70,7 @@ static PULSAR_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err
 
 
 
-static PULSAR_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
+static int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
     if (remaining && *remaining < sizeof(b)) {
         payload_set_err(err, errlen, "truncated session payload");
@@ -110,14 +110,14 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
 
 
 
-static PULSAR_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
+static uint64_t layer_attn_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
     return (uint64_t)coff * PULSAR_N_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
 
 
-static PULSAR_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
+static uint64_t layer_index_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
     return (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
@@ -443,7 +443,13 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
      *   5 raw window, 6 compressed cap, 7 token count,
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
-     *   12 live raw rows serialized below.
+     *   12 live raw rows serialized below,
+     *   13 attn-pack row bytes, 14 indexer fp4 row bytes.
+     *
+     * 13/14 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
+     * file written for a different model; these catch one written for a
+     * different row LAYOUT at the same shape -- which is what a KV format change
+     * produces, and which the version alone was guarding until 2026-08-18.
      */
     uint32_t header[PULSAR_SESSION_PAYLOAD_U32_FIELDS] = {
         PULSAR_SESSION_PAYLOAD_MAGIC,
@@ -459,6 +465,8 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         PULSAR_N_INDEXER_HEAD_DIM,
         PULSAR_N_VOCAB,
         raw_live,
+        (uint32_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
+        (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -581,6 +589,18 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         h[10] != PULSAR_N_INDEXER_HEAD_DIM || h[11] != PULSAR_N_VOCAB)
     {
         payload_set_err(err, errlen, "KV checkpoint was written for a different Pulsar layout");
+        return 1;
+    }
+    /* Storage format, checked separately from shape: a KV format change keeps
+     * head_dim and moves the row STRIDE, so the checks above would pass it.
+     * Every row span below is addressed with these strides, so a mismatch here
+     * is the difference between refusing a file and decoding noise into a cache. */
+    if (h[13] != (uint32_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES ||
+        h[14] != (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES)
+    {
+        payload_set_err(err, errlen,
+                        "KV checkpoint row strides differ from this build "
+                        "(attn/indexer storage format changed)");
         return 1;
     }
     /* prefill_cap is scratch scheduling capacity, not durable KV layout.

@@ -520,9 +520,17 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * (MXKV-FP4, 68 B/row, previously dequantised to 512 B f32 and re-encoded on
  * load).  Every KV row in a payload is now stored in the format its cache holds
  * it in, so a restore is a byte copy and re-encodes nothing.  Older files are
- * refused for the same reason as before: the strides changed. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(5)
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 13u
+ * refused for the same reason as before: the strides changed.
+ * v6 (2026-08-18): the header carries the KV ROW STRIDES it was written with,
+ * so a storage-format change is caught structurally instead of relying on
+ * someone remembering to bump the version.  That reliance already failed once:
+ * the raw ring went from f32-expanded halves at 1024 B to packed 584 B WITHOUT
+ * a bump, and a file straddling that change would have decoded noise into a KV
+ * cache rather than refusing to load.  The version still moves on format
+ * changes -- this just means forgetting is no longer silent. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(6)
+/* 13 shape/counters + 2 row strides (attn pack, indexer fp4). */
+#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 15u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
