@@ -115,16 +115,14 @@ static bool gpu_graph_decode_kv_store(
         pulsar_gpu_tensor *kv,
         pulsar_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
-        uint32_t          raw_row,
-        uint32_t          raw_pack) {
+        uint32_t          raw_row) {
 
     return pulsar_gpu_kv_fp8_store_raw_tensor(kv,
                                              raw_cache,
                                              raw_cap,
                                              raw_row,
                                              PULSAR_N_HEAD_DIM,
-                                             PULSAR_N_ROT,
-                                             raw_pack) != 0;
+                                             PULSAR_N_ROT) != 0;
 }
 
 
@@ -358,7 +356,6 @@ bool gpu_graph_encode_decode_layer(
         int                     token) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    const uint32_t raw_pack = 1u;  /* the main raw ring is PULSAR_ATTN_PACK rows */
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
     const uint32_t n_groups = PULSAR_N_OUT_GROUP;
@@ -578,7 +575,7 @@ bool gpu_graph_encode_decode_layer(
     /* RoPE stays as the exact standalone kernel above.  The decode fusion
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
-    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row, raw_pack);
+    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
     PULSAR_CUDA_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->kv, PULSAR_N_HEAD_DIM, il, pos);
@@ -917,7 +914,6 @@ bool gpu_graph_encode_decode_layer(
                     pulsar_layer_compress_ratio(il),
                     PULSAR_N_HEAD,
                     PULSAR_N_HEAD_DIM,
-                    raw_pack,
                     NULL,
                     NULL,
                     NULL,
@@ -941,8 +937,7 @@ bool gpu_graph_encode_decode_layer(
                                                          n_comp ? comp_cache : NULL,
                                                          1u,
                                                          n_comp,
-                                                         PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                                         raw_pack) != 0;
+                                                         PULSAR_N_HEAD, PULSAR_N_HEAD_DIM) != 0;
         }
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("attention");
@@ -1372,7 +1367,7 @@ void gpu_graph_dspark_seed_draft_kv(
              * will miss, which is exactly what happened. */
             if (!pulsar_gpu_store_raw_kv_tensor(g->dspark_raw_cache[li], kv_rot,
                                                 PULSAR_DSPARK_DRAFT_WINDOW, row,
-                                                PULSAR_N_HEAD_DIM, 1u)) {
+                                                PULSAR_N_HEAD_DIM)) {
                 seeded = false;
                 break;
             }
@@ -1540,7 +1535,6 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(
             g->dspark_raw_cache[li], g->batch_kv,
             raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
-            1 /* drafter ring is PULSAR_ATTN_PACK too */,
             NULL, NULL, 1) != 0;
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
@@ -1560,7 +1554,6 @@ bool gpu_graph_dspark_draft_forward(
             0,
             PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
             1,
-            1 /* drafter ring is PULSAR_ATTN_PACK too */,
             NULL, NULL, 0, 1) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,

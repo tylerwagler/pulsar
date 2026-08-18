@@ -198,7 +198,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int raw_pack,
+        uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok);
@@ -214,8 +214,7 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        int                     raw_pack);
+        uint32_t                head_dim);
 
 /* fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
@@ -241,7 +240,6 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        int                     raw_pack,
         const int               *positions,
         const int               *seq_id,
         const void * const      *comp_bank_ptrs,
@@ -654,17 +652,13 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
 /* Tell the indexer score kernels the indexer compressed cache is stored
  * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
 
-/* raw_pack parameter convention (attention readers / raw KV writers below):
+/* Every KV buffer is PULSAR_ATTN_PACK rows -- 584 B at head_dim 512 -- so the
+ * attention readers and raw-KV writers below take NO format parameter.
  *
- *   1 = the raw ring holds PULSAR_ATTN_PACK rows, 584 B at head_dim 512 -- the
- *       SAME layout, and the same decoder, as the compressed pool. This is the
- *       main KV ring.
- *   0 = f32, element-addressed. The DRAFTER's transient ring only.
- *
- * It was `raw_pack` and selected __half storage until 2026-08-17. f16 is not a
- * format the source model uses anywhere: its KV cache is fp8/e4m3 with a ue8m0
- * scale, and its residual stream is bf16. The ring was spending 2 bytes per
- * element on nope dims carrying E4M3 precision. */
+ * They carried one (`raw_f16`, later `raw_pack`) until 2026-08-17. Three storage
+ * formats died with it: __half for the main ring, f32-holding-f16-values for the
+ * drafter's, and the f32 batch buffer prefill handed attention for the current
+ * chunk. None of the three is a format the source model uses. */
 
 /* As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
@@ -720,8 +714,7 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot,
-        uint32_t          raw_pack);
+        uint32_t          n_rot);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * pulsar_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
@@ -731,8 +724,7 @@ int pulsar_gpu_store_raw_kv_tensor(
         const pulsar_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
-        uint32_t                head_dim,
-        uint32_t                raw_pack);
+        uint32_t                head_dim);
 
 /* Banked mode (positions/seq_id non-NULL): row t stores to bank seq_id[t]'s
  * ring at slot positions[t] %% raw_cap over the whole pool (raw_cache = the
@@ -745,7 +737,6 @@ int pulsar_gpu_store_raw_kv_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                head_dim,
-        uint32_t                raw_pack,
         const pulsar_gpu_tensor *positions,
         const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
@@ -878,8 +869,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                comp_kv_pack,
         uint32_t                n_comp,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                raw_pack);
+        uint32_t                head_dim);
 
 /* As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if
@@ -891,7 +881,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(
         pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size,
         uint64_t sinks_offset, const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window,
-        uint32_t n_head, uint32_t head_dim, uint32_t raw_pack,
+        uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
         uint32_t n_groups, uint32_t n_nope, int *mx_out);
 
@@ -905,8 +895,7 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                n_tokens,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                raw_pack);
+        uint32_t                head_dim);
 
 /* Batched decode attention.  The trailing descriptor quad enables multi-
  * session banked mode: positions/seq_id are int32 [n_tokens] DEVICE arrays
@@ -948,7 +937,6 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_pack,
         const pulsar_gpu_tensor *positions,
         const pulsar_gpu_tensor *seq_id,
         uint32_t                comp_cap,
@@ -974,7 +962,6 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                non_causal,
-        uint32_t                raw_pack,
         const pulsar_gpu_tensor *positions,
         const pulsar_gpu_tensor *seq_id,
         const pulsar_gpu_tensor *comp_bank_ptrs,
@@ -1002,7 +989,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        uint32_t                raw_pack,
         const pulsar_gpu_tensor *positions,
         const pulsar_gpu_tensor *seq_id,
         const pulsar_gpu_tensor *comp_bank_ptrs,
@@ -1022,8 +1008,7 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                raw_pack);
+        uint32_t                head_dim);
 
 
 int pulsar_gpu_attention_output_batch_tensor(

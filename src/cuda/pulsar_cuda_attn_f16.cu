@@ -122,7 +122,7 @@ static void attn_f16_kernel(
         const float *__restrict__ comp_kv,    /* [n_comp][512] f32, may alias raw */
         const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, int raw_pack,
+        uint32_t n_head,
         uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start_in,
         uint32_t top_k,
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
@@ -146,7 +146,7 @@ static void attn_f16_kernel(
         uint32_t gact_tok0, uint32_t gact_ntok) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
-    (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_pack;
+    (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
     (void)comp_pack; (void)ring;
@@ -334,20 +334,16 @@ static void attn_f16_kernel(
                 const uint32_t sr = row0 + r;
                 if (sr < raw_count) {
                     const uint32_t rr = ring ? sRawRows[sr] : (raw_start + sr);
-                    if (raw_pack) {
-                        /* PULSAR_ATTN_PACK rows, decoded with attn_comp_pack_ld --
-                         * the same function the scalar kernels and the compressed
-                         * pool use, so there is one decoder for the one format.
-                         * This read the ring as __half until 2026-08-17 and would
-                         * have read packed bytes as halves without complaint. */
-                        f0 = attn_comp_pack_ld(raw_kv, rr, d4 + 0u, AF16_DIM);
-                        f1 = attn_comp_pack_ld(raw_kv, rr, d4 + 1u, AF16_DIM);
-                        f2 = attn_comp_pack_ld(raw_kv, rr, d4 + 2u, AF16_DIM);
-                        f3 = attn_comp_pack_ld(raw_kv, rr, d4 + 3u, AF16_DIM);
-                    } else {
-                        const float4 v4 = *(const float4 *)(raw_kv + (uint64_t)rr * AF16_DIM + d4);
-                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
-                    }
+                    /* PULSAR_ATTN_PACK rows, decoded with attn_comp_pack_ld --
+                     * the same function the scalar kernels and the compressed
+                     * pool use, so there is one decoder for the one format. This
+                     * read the ring as __half until 2026-08-17 and would have
+                     * read packed bytes as halves without complaint; the f32 arm
+                     * beside it went with the format flag. */
+                    f0 = attn_comp_pack_ld(raw_kv, rr, d4 + 0u, AF16_DIM);
+                    f1 = attn_comp_pack_ld(raw_kv, rr, d4 + 1u, AF16_DIM);
+                    f2 = attn_comp_pack_ld(raw_kv, rr, d4 + 2u, AF16_DIM);
+                    f3 = attn_comp_pack_ld(raw_kv, rr, d4 + 3u, AF16_DIM);
                 } else {
                     uint32_t ci = sr - raw_count;
                     if (topk) {
@@ -633,7 +629,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int raw_pack,
+        uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok) {
@@ -658,7 +654,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_pack, 0u, 0u, 1u, 0u, 0u,
+                                            n_head, 0u, 0u, 1u, 0u, 0u,
                                             NULL, NULL, NULL, 0u, 1u, 0, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
@@ -672,10 +668,10 @@ int pulsar_gpu_attention_f16_prefill(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int raw_pack) {
+        uint32_t n_head, uint32_t head_dim) {
     return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
-                                               n_head, head_dim, raw_pack,
+                                               n_head, head_dim,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
 }
 
@@ -690,7 +686,7 @@ int pulsar_gpu_attention_f16_indexed(
         const float *raw_kv, const float *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_pack,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
@@ -720,7 +716,7 @@ int pulsar_gpu_attention_f16_indexed(
     attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_pack, pos0, n_raw, raw_cap,
+                                            n_head, pos0, n_raw, raw_cap,
                                             raw_start, top_k,
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,

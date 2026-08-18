@@ -1401,7 +1401,7 @@ int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n
 }
 
 
-int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_pack);
+int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 
 
 int pulsar_gpu_kv_fp8_store_raw_tensor(
@@ -1410,8 +1410,7 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          head_dim,
-        uint32_t          n_rot,
-        uint32_t          raw_pack) {
+        uint32_t          n_rot) {
     if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
         raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -1427,12 +1426,10 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
 }
 
 
-int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t raw_pack) {
-    const uint64_t need = raw_pack ? (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)
-                                   : (uint64_t)raw_cap * head_dim * sizeof(float);
-    if (!raw_cache || !kv || raw_cap == 0 || raw_cache->bytes < need ||
+int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
+    if (!raw_cache || !kv || raw_cap == 0 ||
+        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    (void)raw_pack;   /* every ring is packed; see the note on the kernel */
     /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
      * round-trip the decode store does. */
     attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
@@ -1443,7 +1440,7 @@ int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gp
 }
 
 
-int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, uint32_t raw_pack,
+int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
     /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
      * is the whole bank pool (byte bound scales by n_banks) and the uint32
@@ -1462,12 +1459,10 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
-    const uint64_t need = raw_pack
-            ? kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)
-            : kv_banks * raw_cap * head_dim * sizeof(float);
-    if (!raw_cache || !kv || raw_cap == 0 || raw_cache->bytes < need ||
+    if (!raw_cache || !kv || raw_cap == 0 ||
+        raw_cache->bytes < kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
-    if (raw_pack) {
+    {
         /* One block per row, 64 threads -- the packed format needs a per-64-block
          * amax, so this cannot be the flat one-thread-per-element scatter the f32
          * ring uses.  x = NULL: kv is const on this entry. */
@@ -1479,7 +1474,6 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
                                                  descr ? n_banks : 1u, raw_cap);
         return cuda_ok(cudaGetLastError(), "raw pack store batch launch");
     }
-    return 0;   /* unreachable: raw_pack is 1 at every call site */
 }
 
 
