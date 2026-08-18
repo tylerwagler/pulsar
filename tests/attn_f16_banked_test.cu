@@ -96,12 +96,12 @@ int main(int argc, char **argv) {
     /* bank b is the constant v_b, everywhere: raw ring slice AND comp slice */
     auto vb = [](uint32_t b) { return 0.25f * (float)(b + 1u); };
 
-    std::vector<float> raw((size_t)n_banks * raw_cap * D);
+    const size_t pack_row_b = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_banks * raw_cap * pack_row_b);
     std::vector<float> comp((size_t)n_banks * comp_cap * D);
     for (uint32_t b = 0; b < n_banks; b++) {
         for (uint32_t r = 0; r < raw_cap; r++)
-            for (uint32_t d = 0; d < D; d++)
-                raw[((size_t)b * raw_cap + r) * D + d] = vb(b);
+            pack_const_row(&rawp[((size_t)b * raw_cap + r) * pack_row_b], vb(b), D);
         for (uint32_t r = 0; r < comp_cap; r++)
             for (uint32_t d = 0; d < D; d++)
                 comp[((size_t)b * comp_cap + r) * D + d] = vb(b);
@@ -132,12 +132,12 @@ int main(int argc, char **argv) {
                 pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
     float *dq, *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
-    cudaMalloc(&dq, q.size()*4); cudaMalloc(&draw, raw.size()*4);
+    cudaMalloc(&dq, q.size()*4); cudaMalloc(&draw, rawp.size());
     cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
     cudaMalloc(&dout, out.size()*4); cudaMalloc(&dtk, tk.size()*4);
     cudaMalloc(&dpos, pos.size()*4); cudaMalloc(&dseq, seq.size()*4);
     cudaMemcpy(dq, q.data(), q.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(draw, raw.data(), raw.size()*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dcomp, comp.data(), comp.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dout, out.data(), out.size()*4, cudaMemcpyHostToDevice);

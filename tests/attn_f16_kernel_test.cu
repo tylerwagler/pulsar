@@ -41,11 +41,29 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <random>
 
 /* host mirror of the fp16 round trip the kernel applies to its operands */
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
+
+
+/* Host-side PULSAR_ATTN_PACK decode.  Mirrors attn_pack_e4m3 /
+ * attn_comp_pack_ld in src/cuda/pulsar_cuda_internal.h; decode only, so there
+ * is nothing here that can drift from the device's rounding. */
+static float host_e4m3_decode(uint8_t b, float scale) {
+    const uint32_t e = (b >> 3) & 15u;
+    const uint32_t m = b & 7u;
+    const float v = e ? std::ldexp(1.0f + (float)m / 8.0f, (int)e - 7)
+                      : (float)m * 0.001953125f;      /* 2^-9 * m, subnormal */
+    const float sv = v * scale;
+    return (b & 0x80u) ? -sv : sv;
+}
+static float host_bf16_widen(uint16_t bits) {
+    const uint32_t u = (uint32_t)bits << 16;
+    float f; std::memcpy(&f, &u, sizeof f); return f;
+}
 
 int main(int argc, char **argv) {
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
@@ -74,7 +92,37 @@ int main(int argc, char **argv) {
                        ckv((size_t)(n_comp ? n_comp : 1u) * D),
                        sinks(n_head), out((size_t)n_tokens * n_head * D, -12345.f);
     for (auto &v : q) v = (float)(nd(rng) * 0.5);
-    for (auto &v : kv) v = (float)(nd(rng) * 0.5);
+    /* Raw KV: build PULSAR_ATTN_PACK rows first, then DECODE them into kv[] so
+     * the f64 oracle below and the kernel are looking at the same numbers. */
+    const uint32_t n_nope_h = D - PULSAR_ATTN_PACK_NROT;
+    const size_t pack_row_h = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_tokens * pack_row_h);
+    {
+        std::uniform_int_distribution<int> bd(0, 255);
+        for (uint32_t r = 0; r < n_tokens; r++) {
+            uint8_t *row = &rawp[(size_t)r * pack_row_h];
+            for (uint32_t d = 0; d < n_nope_h; d++) row[d] = (uint8_t)bd(rng);
+            /* scale bytes near 2^0 so decoded magnitudes match the old f32
+             * fixture's scale and the tolerances below stay meaningful */
+            for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
+                row[n_nope_h + sc] = (uint8_t)(126 + (int)((r + sc) % 3));
+            uint16_t *rope = (uint16_t *)(row + n_nope_h + PULSAR_ATTN_PACK_SCALES_PAD(D));
+            for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) {
+                const float f = (float)(nd(rng) * 0.5);
+                uint32_t u; std::memcpy(&u, &f, sizeof u);
+                rope[d] = (uint16_t)(u >> 16);          /* truncate to bf16 */
+            }
+            for (uint32_t d = 0; d < D; d++) {
+                if (d < n_nope_h) {
+                    uint32_t sb = (uint32_t)row[n_nope_h + (d / PULSAR_FP8_KV_BLOCK)];
+                    float scale; const uint32_t su = sb << 23; std::memcpy(&scale, &su, sizeof scale);
+                    kv[(size_t)r * D + d] = host_e4m3_decode(row[d], scale);
+                } else {
+                    kv[(size_t)r * D + d] = host_bf16_widen(rope[d - n_nope_h]);
+                }
+            }
+        }
+    }
     for (auto &v : ckv) v = (float)(nd(rng) * 0.5);
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
@@ -166,12 +214,12 @@ int main(int argc, char **argv) {
 
     /* ---- kernel ----------------------------------------------------------- */
     float *dq, *dkv, *dckv, *ds, *dout;
-    cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dkv, kv.size() * 4);
+    cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dkv, rawp.size());
     cudaMalloc(&dckv, ckv.size() * 4);
     cudaMemcpy(dckv, ckv.data(), ckv.size() * 4, cudaMemcpyHostToDevice);
     cudaMalloc(&ds, sinks.size() * 4); cudaMalloc(&dout, out.size() * 4);
     cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dkv, kv.data(), kv.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dkv, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
 
