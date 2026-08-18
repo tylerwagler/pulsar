@@ -35,6 +35,10 @@
 
 #include "ds4_ggml_stubs.h"   // GGML_ASSERT/ABORT/UNUSED, ggml_type, GGML_CUDA_MAX_DEVICES
 #define GGML_COMMON_DECL_CUDA   // selects the CUDA declarations in ggml-common.h
+#define GGML_COMMON_IMPL_CUDA   // ...and EMITS the tables (iq2xxs_grid et al) as
+                                // `static const __device__`.  DECL alone declares
+                                // the block layouts but defines no table, and the
+                                // table block is #if'd out rather than erroring.
 #include "ggml-common.h"      // block_q*/block_iq* layouts + QK8_1, still vendored
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
@@ -70,6 +74,67 @@
             shared_memory_limit_raised[id] = true;                                                         \
         }                                                                                                  \
     } while (0)
+
+#define GGML_CUDA_CC_RUBIN         1300
+
+// ----------------------------------------------------------------------------
+// FEATURE MACROS.  ⚠ THESE ARE LOAD-BEARING AND THEIR ABSENCE IS SILENT.
+//
+// These are preprocessor macros, not the predicate FUNCTIONS above, and the
+// device code selects whole kernel bodies on them:
+// ds4_mmq_d2r.cu:905 is `#if defined(TURING_MMA_AVAILABLE)` around the entire
+// IQ2 tensor-core GEMM, and ds4_mmq_soa_tiles.cuh guards six more blocks.
+//
+// Leaving one undefined does NOT fail to compile.  It takes the #else arm, and
+// the build is clean, and the engine runs, and every logit is wrong.  That is
+// exactly what happened when this header first replaced common.cuh: the first
+// version omitted TURING_MMA_AVAILABLE, the D2R kernel compiled to its fallback,
+// and the prefill gate came back 129280/129280 logits different at every depth
+// with decode acceptance down from 0.4237 to 0.1786.
+//
+// The empty-shim-and-compile method that found the other nineteen symbols CANNOT
+// find these: an undefined identifier is an error, an undefined `#if defined()`
+// is just false.  If you touch this block, grep `_AVAILABLE` across src/cuda/mmq
+// and diff the set against what is defined here.
+//
+// AMD_MFMA_AVAILABLE / AMD_WMMA_AVAILABLE are deliberately absent: upstream
+// defines them only under GGML_USE_HIP, so they were never defined in this build
+// either, and the code that tests them takes the same arm it always did.
+// ----------------------------------------------------------------------------
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+#define FP16_AVAILABLE
+#endif
+
+#if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
+#define FAST_FP16_AVAILABLE
+#endif
+
+// The Volta instructions are in principle available on Turing or newer but they
+// are effectively unusable:
+#if __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+#define VOLTA_MMA_AVAILABLE
+#endif
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#define TURING_MMA_AVAILABLE
+#endif
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#define AMPERE_MMA_AVAILABLE
+#endif
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#define BLACKWELL_MMA_AVAILABLE
+#endif
+
+// Tautological today, on purpose: it fires if a later edit removes the defines
+// above, which is the failure this whole comment block exists to prevent.  The
+// D2R IQ2 GEMM is the engine's expert matmul -- if it is compiling to a stub we
+// want a build error, not a gate run.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !defined(TURING_MMA_AVAILABLE)
+#error "TURING_MMA_AVAILABLE undefined on a Turing+ arch: the D2R IQ2 GEMM would silently compile to its #else stub."
+#endif
 
 // ----------------------------------------------------------------------------
 // Error reporting.  ggml_cuda_error is defined in ds4_ggml_stubs.cu.
