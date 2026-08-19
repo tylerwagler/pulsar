@@ -57,12 +57,12 @@ int pulsar_gpu_attention_f16_indexed(float *, const float *, const float *,
         const float *, const float *, const int *, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, int, const int *, const int *, const void * const *, uint32_t,
-        uint32_t, int) {
+        uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_indexed hit\n"); exit(97);
 }
 int pulsar_gpu_attention_f16_prefill(float *, const float *, const float *,
         const float *, const float *, uint32_t, uint32_t, uint32_t, uint32_t,
-        uint32_t, uint32_t, int) {
+        uint32_t, uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_prefill hit\n"); exit(97);
 }
 

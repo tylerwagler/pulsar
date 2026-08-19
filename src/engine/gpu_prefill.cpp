@@ -535,7 +535,8 @@ static bool gpu_graph_indexed_attention_span(
                                                                   sp_view, ss_view,
                                                                   op->comp_bases,
                                                                   op->comp_cap,
-                                                                  op->n_banks) != 0;
+                                                                  op->n_banks,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
         if (ok && stage_profile) {
             ok = gpu_graph_indexer_stage_profile_boundary("attention", il, spos0, sn, n_comp, stage_t0);
         }
@@ -835,8 +836,29 @@ bool gpu_graph_encode_layer_attention_batch(
                     "kernel -- dumped prefill values differ from a normal run\n");
         }
     }
+        /* Deferring norm+rope into the attention Q load leaves batch_q RAW,
+         * so any dump of the normed intermediate ("Qnorm" or "Qcur") forces
+         * the materializing paths below -- same doctrine as the warning
+         * above: a dump request changes the kernel path and says so. */
+        const bool prefill_q_defer = !prefill_q_norm_debug &&
+                                     !gpu_graph_debug_wants("Qcur", il, pos0) &&
+                                     pulsar_gpu_attn_f16_tier_on();
+        g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
-        if (ok && !prefill_q_norm_debug) {
+        if (ok && prefill_q_defer) {
+            memset(&g->q_prep, 0, sizeof g->q_prep);
+            g->q_prep.eps = PULSAR_RMS_EPS;
+            g->q_prep.n_rot = PULSAR_N_ROT;
+            g->q_prep.n_ctx_orig = compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0;
+            g->q_prep.freq_base = freq_base;
+            g->q_prep.freq_scale = freq_scale;
+            g->q_prep.ext_factor = ext_factor;
+            g->q_prep.attn_factor = attn_factor;
+            g->q_prep.beta_fast = PULSAR_ROPE_YARN_BETA_FAST;
+            g->q_prep.beta_slow = PULSAR_ROPE_YARN_BETA_SLOW;
+            g->q_prep_active = 1;
+            prefill_q_norm_rope_fused = true;   /* deferred into attention */
+        } else if (ok && !prefill_q_norm_debug) {
             prefill_q_norm_rope_fused =
                 pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
                                                        n_tokens,
@@ -965,7 +987,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           n_tokens,
                                                           g->raw_window,
                                                           PULSAR_N_HEAD,
-                                                          PULSAR_N_HEAD_DIM) != 0;
+                                                          PULSAR_N_HEAD_DIM,
+                                                          mseq ? g->batch_positions : NULL,
+                                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
         if (ok) batch_attention_done = true;
     } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
         /*
@@ -1011,7 +1035,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     mseq ? g->batch_positions : NULL,
                                                                     mseq ? g->batch_seq_id : NULL,
                                                                     0,
-                                                                    mseq ? nb : 1) != 0;
+                                                                    mseq ? nb : 1,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -1810,7 +1835,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                           mseq ? g->batch_seq_id : NULL,
                                                                           mseq ? gpu_graph_bank_attn_comp_bases(g, il) : NULL,
                                                                           mseq ? g->layer_comp_cap[il] : 0,
-                                                                          mseq ? nb : 1) != 0;
+                                                                          mseq ? nb : 1,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
             }
             if (ok) batch_attention_done = true;
         }
@@ -1884,7 +1910,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        g->raw_window,
                                                                        ratio,
                                                                        PULSAR_N_HEAD,
-                                                                       PULSAR_N_HEAD_DIM) != 0;
+                                                                       PULSAR_N_HEAD_DIM,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -1933,7 +1960,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                               gact_data, gact_scale, gact_kbp,
                                                               (uint32_t)gact_slab, n_groups,
                                                               PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
-                                                              &gact_emitted) != 0;
+                                                              &gact_emitted,
+                                          mseq ? g->batch_positions : NULL,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
         }
         if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
         if (raw_prefix_tokens < n_tokens) {
@@ -2010,7 +2039,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               PULSAR_N_HEAD,
                                                                               PULSAR_N_HEAD_DIM,
-                                                                              NULL, NULL, NULL, 0, 1) != 0;
+                                                                              NULL, NULL, NULL, 0, 1,
+                                          g->q_prep_active ? &g->q_prep : NULL) != 0;
                 } else if (ok) {
                     ok = pulsar_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,

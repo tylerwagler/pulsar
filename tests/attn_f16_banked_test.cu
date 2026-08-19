@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
     const int rc = pulsar_gpu_attention_f16_indexed(
         dout, ds, dq, draw, (const float *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
-        n_head, D, dpos, dseq, dbp, comp_cap, n_banks);
+        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, NULL);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
