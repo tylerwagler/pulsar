@@ -448,10 +448,34 @@ static void attn_f16_kernel(
              * mx == -INF implies sM[h] == -INF (mx >= sM[h]), so corr is already
              * 0 and l stays 0 -- nothing has been accumulated to rescale. */
             const bool empty = (mx == -INFINITY);
-            const float corr = (sM[h] == -INFINITY) ? 0.0f : __expf(sM[h] - mx);
+            /* expf, not __expf, and the distinction is the point.
+             *
+             * This tier's softmax and the f32 online kernels' softmax
+             * (pulsar_cuda_attention.cu) must track each other: the tier serves
+             * prefill and speculative verify, the online kernels serve
+             * single-token decode, and those two disagreeing is the whole class
+             * of defect this file keeps being audited for.
+             *
+             * They already agreed -- but only BY ACCIDENT of a global flag.
+             * --use_fast_math maps expf onto the same MUFU-based approximation
+             * __expf names directly, so the 22 plain expf calls over there and
+             * the 4 explicit intrinsics here compiled identically.  Written that
+             * way, the agreement survives only as long as nobody changes the
+             * build.  Drop --use_fast_math to make something more precise -- the
+             * exact change made to the cuBLAS math mode on 2026-08-18 -- and
+             * this kernel would have stayed fast while decode went precise, and
+             * nothing in either file would have said so.
+             *
+             * Spelled the same on both sides, they now track each other under
+             * ANY flag setting: fast together, or precise together.
+             *
+             * VERIFIED a no-op at the time of the change: SASS for this TU is
+             * byte-identical before and after (cuobjdump -sass, 4218 lines,
+             * 37 MUFU). */
+            const float corr = (sM[h] == -INFINITY) ? 0.0f : expf(sM[h] - mx);
             float l = sL[h] * corr;
             for (uint32_t r = 0; r < nr; r++) {
-                const float p = empty ? 0.0f : __expf(sS[h][r] - mx);
+                const float p = empty ? 0.0f : expf(sS[h][r] - mx);
                 /* Sum the ROUNDED weight, not p: the MMA multiplies sP, so the
                  * normaliser has to be the sum of what it multiplies or the
                  * weights do not sum to one.  The sink term in the epilogue is
@@ -517,9 +541,9 @@ static void attn_f16_kernel(
         const uint32_t h = hbase + tid;
         const float sink = (h < n_head) ? sinks[h] : -INFINITY;
         const float nm = fmaxf(sM[tid], sink);
-        const float os = (sM[tid] == -INFINITY) ? 0.0f : __expf(sM[tid] - nm);
+        const float os = (sM[tid] == -INFINITY) ? 0.0f : expf(sM[tid] - nm);
         sCorr[tid] = os;
-        sL[tid] = sL[tid] * os + __expf(sink - nm);
+        sL[tid] = sL[tid] * os + expf(sink - nm);
     }
     __syncthreads();
 
