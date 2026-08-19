@@ -217,7 +217,7 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
 
 
 /* ---- CUTLASS MXFP4 (type 40) grouped-expert dispatch. --------------------------------------
- * Unlike the qwarp32/dp4a paths above, which process each (token,expert) pair independently on
+ * Unlike the per-expert paths above, which process each (token,expert) pair independently on
  * device, CUTLASS's dense GemmUniversal interface needs one contiguous [T_e,in_dim] activation
  * matrix per expert with T_e known host-side at launch time. So this path: (1) sorts tokens by
  * expert (it builds its own sorted pairs; the routed path's build was deleted), (2) reads the
@@ -1139,7 +1139,7 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
     if (idx >= total) return;
     float g = gate_raw[idx];
     float u = up_raw[idx];
-    /* clamp semantics match the qwarp32 gate/up path above */
+    /* clamp semantics match the swiglu gate/up path above */
     if (clamp > 1.0e-6f) {
         if (g > clamp) g = clamp;
         if (u > clamp) u = clamp;

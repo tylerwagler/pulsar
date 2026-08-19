@@ -121,7 +121,7 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
 
 /* Is graph dumping enabled AT ALL this process?  Read once and cached.  Exposed
  * so graph allocation can skip buffers that exist ONLY to be dumped: the routed
- * MoE gate/up staging slabs are written by the qwarp32 kernels and read by
+ * MoE gate/up staging slabs are written by the routed-expert kernels and read by
  * nothing except gpu_graph_debug_dump_tensor, yet cost ~400 MB per session at
  * the default prefill_cap and ~2-4 MB/token of pointless device writes. */
 bool gpu_graph_debug_dump_enabled(void) {

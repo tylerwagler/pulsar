@@ -256,16 +256,6 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                     buf, cap, remaining, err, errlen);
 }
 
-/* Attn comp cache spans under PULSAR_ATTN_PACK: session files always store f32
- * rows, so save dequantizes the packed cache into the f32 shadow first and
- * load repacks from it.  Save is bit-exact by construction (packed rows decode
- * to exactly the fp8-roundtripped values the f32 pipeline holds).  Load
- * re-quantizes already-roundtripped rows; that is value-preserving except for
- * blocks whose amax sits exactly on a scale boundary, where the recomputed
- * block scale can shift one step and re-round small values (the same
- * non-idempotency that forced quantize_fp8=false in the pack prefill paths).
- * Sub-1e-3-relative on isolated dims; acceptable for session restore, but do
- * NOT rely on save/load being bit-exact under pack. */
 /* The comp cache is written in the format it is HELD in: PULSAR_ATTN_PACK rows.
  *
  * Payload v3 stored f32. Saving dequantised 584 B rows into 2048 B, wrote that,

@@ -1811,8 +1811,8 @@ bool gpu_graph_alloc_raw_cap(
     g->router_probs = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT * sizeof(float));
     g->router_selected = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(int));
     g->router_weights = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(float));
-    /* NOTE (task #64): these look debug-only — the qwarp32 kernels' stores are
-     * read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
+    /* NOTE (task #64): these look debug-only — the routed-expert gate/up stores
+     * are read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
      * routed_moe_*_impl rejects NULL gate/up (`if (!gate_w || !up_w || !down_w)
      * return 0;`, four sites in moe.cu). Keep them allocated unconditionally.
      *
