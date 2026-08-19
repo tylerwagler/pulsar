@@ -91,7 +91,7 @@ different readers:
 | 42 `iq2_xxs_soa` | `q` plane first (64 B/block), then `d` plane (2 B/block), no padding | pulsar's own dp4a MoE kernels |
 | 43 `iq2_xxs_mmq` | `d` plane first (2 B/block), pad to 64 B, then a 64 B-aligned `q` plane | the vendored llama.cpp MMQ kernels |
 
-Type 43 is the layout `ds4_repack_iq2_aligned_device()` builds, so storing it in
+Type 43 is the layout `repack_iq2_mmq.py` builds offline, so storing it in
 the GGUF is what lets MMQ read routed experts with full-width aligned loads
 instead of `LDG.E.U16` pairs.  Microbenched at the production shape (K=4096,
 M=2048, 192 experts, 6 used, 4096 tokens): raw blocks 44.704 vs aligned SoA
@@ -122,10 +122,6 @@ then writes a manifest of the converted spans.  The GPU-side verifiers, which
 need `nvcc` and the vendored adapter in `src/cuda/mmq`:
 
 ```sh
-verify_iq2_mmq_model.cu        # per span: device-repack(raw) == shipped, and
-                               # derepack(shipped) == raw.  Run with the manifest.
-verify_iq2_mmq_roundtrip.cu    # same two directions on one extracted tensor
-                               # (pair it with extract_iq2_mmq_tensor.py)
 verify_iq2_mmq_kernel_equiv.cu # do the SoA kernels return the same f32 as the
                                # raw-block kernels on the same weights?
 ```

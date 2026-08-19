@@ -151,8 +151,9 @@ void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
  *     [dq, +nblk*64) q plane, block b's 64 qs bytes at dq + b*64
  * Size identity (and therefore an in-place layout change that preserves every
  * gguf data offset) requires nblk % 32 == 0; the packer refuses otherwise.
- * Byte-identical to gguf-tools/repack_iq2_mmq.py and to
- * ds4_repack_iq2_aligned_device() in src/cuda/mmq/ds4_repack.cu.
+ * Byte-identical to gguf-tools/repack_iq2_mmq.py (the offline producer of this
+ * layout; the on-device ds4_repack_iq2_aligned_device()/ds4_repack.cu twin was
+ * removed -- the device side reads this layout directly through the MMQ SoA loaders).
  * NOT interchangeable with IQ2_XXS_SOA (42), which is a different permutation
  * (q plane first, no padding). */
 size_t ds4q_iq2_xxs_mmq_bytes(int64_t nblk);

@@ -3,8 +3,8 @@
 against the native ds4q_pack_iq2_xxs_mmq(). Driven by `make test-iq2-mmq`.
 
 This mirrors the transform in gguf-tools/repack_iq2_mmq.py, which is the
-layout's reference implementation (and matches ds4_repack_iq2_aligned_device()
-in src/cuda/mmq/ds4_repack.cu). Kept deliberately independent and stdlib-only:
+layout's reference implementation and the offline producer of the aligned
+artifact (the device side only de-repacks it). Kept deliberately independent and stdlib-only:
 the point of the test is that two separately-written implementations agree, so
 importing the other one would defeat it.
 

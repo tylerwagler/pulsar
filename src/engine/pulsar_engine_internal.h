@@ -404,10 +404,12 @@ enum {
      * shares type 16's {256, 66} accounting and mmaps through the generic
      * path, exactly as 42 and MXFP8_LT (41) do.
      *
-     * Producer: gguf-tools/repack_iq2_mmq.py.  Layout spec and the device
-     * twin that must stay byte-identical to it:
-     * ds4_repack_iq2_aligned_device() in src/cuda/mmq/ds4_repack.cu; size
-     * sizing rule documented in src/cuda/mmq/ds4_mmq.h (its
+     * Producer: gguf-tools/repack_iq2_mmq.py builds this aligned layout OFFLINE
+     * (the weight server's --repack-iq2-aligned). There is no on-device repack
+     * twin any more -- the old ds4_repack_iq2_aligned_device()/ds4_repack.cu was
+     * removed; the device side reads the stored artifact DIRECTLY through the
+     * MMQ SoA consumers below, so the layout invariant is now repack_iq2_mmq.py
+     * <-> those SoA loaders. The size rule is in src/cuda/mmq/ds4_mmq.h (its
      * ds4_mmq_iq2_xxs_aligned_bytes oracle was removed unused, L066 step 2).
      * Consumers: ds4_mmq_iq2_xxs_moe_pair_soa (gate/up) and
      * ds4_mmq_iq2_xxs_moe_soa (down).

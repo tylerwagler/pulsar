@@ -19,9 +19,9 @@ the vendored llama.cpp MMQ adapter's kernels read, which puts the d plane FIRST
 and 64B-aligns the code plane.  The two are NOT interchangeable; they are
 different permutations of the same bytes.
 
-Layout, per tensor of nblk = ne/256 blocks -- must match
-ds4_repack_iq2_aligned_device() / repack_iq2_xxs_aligned_kernel() in
-src/cuda/mmq/ds4_repack.cu, and ds4_mmq_iq2_xxs_aligned_bytes() in ds4_mmq.h:
+Layout, per tensor of nblk = ne/256 blocks -- this is the OFFLINE producer of
+the aligned layout; the vendored MMQ SoA loaders in src/cuda/mmq read it back
+directly (the old on-device repack twin ds4_repack.cu was removed):
 
     dq_bytes = align_up(nblk * 2, 64)
     [0,        nblk*2)          d plane : block b's __half d at b*2
@@ -49,10 +49,10 @@ Usage:
 
 --match limits which tensor names are converted, comma-separated (default:
 every 3-D IQ2_XXS routed-expert tensor).  Converting a SUBSET is legitimate:
-the vendored adapter's own runtime repack candidate predicate
-(ds4_repack_iq2_candidate) only ever covers ffn_gate_exps and ffn_up_exps, so
---match ffn_gate_exps,ffn_up_exps reproduces exactly the set the runtime cache
-would have built, which is what an offline-vs-runtime logits parity run needs.
+the now-retired runtime repack cache only ever covered ffn_gate_exps and
+ffn_up_exps, so --match ffn_gate_exps,ffn_up_exps reproduces exactly the set
+that cache would have built, which is what an offline-vs-runtime logits parity
+run needs.
 gate and up must be converted TOGETHER -- the fused gate+up kernels read one
 layout and a half-repacked pair is rejected.
 
