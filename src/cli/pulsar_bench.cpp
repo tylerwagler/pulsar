@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_argparse.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -48,45 +49,6 @@ static double bench_now_sec(void) {
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_BENCH, topic);
 }
-
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static int parse_nonnegative_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static double parse_double_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    double v = strtod(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v)) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-bench: %s requires an argument\n", opt);
-        exit(2);
-    }
-    return argv[++*i];
-}
-
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;

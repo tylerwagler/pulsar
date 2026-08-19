@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_argparse.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -83,37 +84,6 @@ static void cli_interrupt_clear(void) {
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_DS4, topic);
 }
-
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static uint64_t parse_u64(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-static float parse_float_range(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
@@ -1488,14 +1458,6 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     repl_chat_free(&chat);
     return rc;
-}
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar: missing value for %s\n", opt);
-        exit(2);
-    }
-    return argv[++(*i)];
 }
 
 static char *read_prompt_file(const char *path, bool fatal) {

@@ -1,4 +1,5 @@
 #include "pulsar_agent_internal.h"
+#include "pulsar_argparse.h"
 
 
 
@@ -100,18 +101,6 @@ void agent_input_buf_free(agent_input_buf *b) {
 
 
 
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-
-
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -136,33 +125,6 @@ bool agent_slash_command_known(const char *cmd) {
 
 
 
-static uint64_t parse_u64(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-
-
-static float parse_float_range(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-
-
-
-
-
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
@@ -179,16 +141,6 @@ double agent_now_sec(void) {
 
 void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_AGENT, topic);
-}
-
-
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-agent: missing value for %s\n", opt);
-        exit(2);
-    }
-    return argv[++(*i)];
 }
 
 

@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_argparse.h"
 
 /* pulsar-eval: small built-in benchmark integration test.
  *
@@ -1512,45 +1513,6 @@ static double run_clock_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static int parse_int_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static uint64_t parse_u64_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-static float parse_float_arg(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-eval: %s requires an argument\n", opt);
-        exit(2);
-    }
-    return argv[++*i];
-}
-
-
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
@@ -1584,37 +1546,37 @@ static eval_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
-            c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
-            c.max_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--questions")) {
-            c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.question_limit = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
-            c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
-            c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
-            c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
-            c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
+            c.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--regrade-trace")) {
             c.regrade_trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
-            c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.soft_limit_reply_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
-            c.hard_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.hard_limit_reply_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--soft-limit-think-close-rank")) {
-            c.soft_limit_think_close_rank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.soft_limit_think_close_rank = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--pause-ms")) {
-            c.pause_ms = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.pause_ms = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
                 fprintf(stderr, "pulsar-eval: --prefill-chunk must be positive\n");
                 exit(2);
