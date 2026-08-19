@@ -443,6 +443,7 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
     TEST_ASSERT(pulsar_session_sync(session, &prompt, err, sizeof(err)) == 0);
 
     pulsar_token_score scores[20];
+    float max_delta = 0.0f;
     for (int i = 0; i < vc->nsteps; i++) {
         const test_vec_step *step = &vc->steps[i];
         int nscore = pulsar_session_top_logprobs(session, scores, 20);
@@ -470,11 +471,19 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
                 fprintf(stderr, "pulsar-test: vector %s step %d official top token missing locally\n",
                         vc->id, i);
                 TEST_ASSERT(false);
-            } else if (fabsf(local_lp - step->top[t].logprob) > 4.0f) {
-                fprintf(stderr,
-                        "pulsar-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
-                        vc->id, i, local_lp, step->top[t].logprob);
-                TEST_ASSERT(false);
+            } else {
+                /* Quantized artifact vs the official full-precision API.
+                 * Passing runs stay well under this bound (the per-vector
+                 * max is printed below -- read it, don't trust the PASS);
+                 * the old 4.0 bound was too loose to catch anything. */
+                float delta = fabsf(local_lp - step->top[t].logprob);
+                if (delta > max_delta) max_delta = delta;
+                if (delta > 0.5f) {
+                    fprintf(stderr,
+                            "pulsar-test: vector %s step %d logprob delta too high: local=%g official=%g\n",
+                            vc->id, i, local_lp, step->top[t].logprob);
+                    TEST_ASSERT(false);
+                }
             }
         }
 
@@ -482,6 +491,8 @@ static void test_logprob_vector_case(pulsar_engine *engine, const test_vec_case 
             TEST_ASSERT(pulsar_session_eval(session, token, err, sizeof(err)) == 0);
         }
     }
+    printf("pulsar-test: vector %s max logprob delta vs official: %.4f (bound 0.5)\n",
+           vc->id, max_delta);
 
     pulsar_session_free(session);
     pulsar_tokens_free(&prompt);
