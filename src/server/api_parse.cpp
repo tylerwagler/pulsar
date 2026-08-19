@@ -505,6 +505,7 @@ bad:
  * level all reject so the client sees a 400 instead of an answer built on
  * silently dropped context. */
 static bool parse_responses_content_array(const char **p, char **out) {
+    *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -1457,6 +1458,10 @@ bad:
 
 
 static bool parse_prompt(const char **p, char **out) {
+    /* Build into a local and publish to *out only on success, so every
+     * failure return leaves *out == NULL (the double-free contract, see
+     * json_string_n) rather than a partially-parsed heap value. */
+    *out = NULL;
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (**p != '[') {
@@ -1466,23 +1471,25 @@ static bool parse_prompt(const char **p, char **out) {
     }
     (*p)++;
     json_ws(p);
+    char *s = NULL;
     if (**p == '"') {
-        if (!json_string(p, out)) return false;
+        if (!json_string(p, &s)) return false;
     } else {
-        *out = xstrdup("");
-        if (**p && **p != ']' && !json_skip_value(p)) return false;
+        s = xstrdup("");
+        if (**p && **p != ']' && !json_skip_value(p)) { free(s); return false; }
     }
     while (**p && **p != ']') {
         json_ws(p);
         if (**p == ',') {
             (*p)++;
-            if (!json_skip_value(p)) return false;
+            if (!json_skip_value(p)) { free(s); return false; }
         } else {
             break;
         }
     }
-    if (**p != ']') return false;
+    if (**p != ']') { free(s); return false; }
     (*p)++;
+    *out = s;
     return true;
 }
 

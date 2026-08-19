@@ -3218,6 +3218,37 @@ static void test_json_skip_has_nesting_limit(void) {
 
 
 
+/* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
+ * duplicate-key idiom `free(x); if (!helper(&p, &x)) goto fail;` cannot
+ * double-free x (the fail label frees it again).  A malformed second value on
+ * a repeated request key is attacker-controlled, so a regression here is a
+ * remote single-process-server abort.  json_string_n has always done this;
+ * json_content / json_raw_value / parse_prompt / parse_responses_content_array
+ * / parse_anthropic_system are the ones that had drifted.  We drive the exact
+ * idiom: seed the out-pointer with a heap value (as a first key would), free
+ * it, reparse a malformed value, and assert the helper nulled the pointer so
+ * the trailing free is a free(NULL) no-op. */
+static void test_json_value_helpers_null_out_on_failure(void) {
+    struct { const char *name; bool (*fn)(const char **, char **); const char *bad; } cases[] = {
+        {"json_content",       json_content,       "[}"},
+        {"json_raw_value",     json_raw_value,     "tru"},
+        {"parse_prompt",       parse_prompt,       "[42, "},
+        {"parse_responses_content_array", parse_responses_content_array, "[{"},
+        {"parse_anthropic_system",        parse_anthropic_system,        "[{\"type\":}"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *out = xstrdup("value from the first occurrence of the key");
+        free(out);                       /* what the reparse idiom does */
+        const char *p = cases[i].bad;
+        bool ok = cases[i].fn(&p, &out);
+        TEST_ASSERT(!ok);                /* the malformed value must fail */
+        TEST_ASSERT(out == NULL);        /* ... and must have nulled *out */
+        free(out);                       /* the fail-label free: no double-free */
+    }
+}
+
+
+
 static void append_tool_heavy_schema(buf *b, int idx) {
     if (idx) buf_putc(b, ',');
     buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
@@ -5403,6 +5434,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_json_value_helpers_null_out_on_failure();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

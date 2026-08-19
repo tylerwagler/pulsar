@@ -407,6 +407,10 @@ bool json_skip_value(const char **p) {
 
 
 bool json_raw_value(const char **p, char **out) {
+    /* Null *out up front, like json_string_n: callers that reparse a
+     * duplicate key in place (`free(x); json_raw_value(&p, &x)`) must not be
+     * left holding a dangling pointer when the second value is malformed. */
+    *out = NULL;
     json_ws(p);
     const char *start = *p;
     if (!json_skip_value(p)) return false;
@@ -450,6 +454,9 @@ char *json_minify_raw_value(const char *json) {
 
 
 bool json_content(const char **p, char **out) {
+    /* Null *out up front (see json_string_n): a reparse-in-place caller must
+     * not double-free when a duplicate key's second value fails to parse. */
+    *out = NULL;
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {

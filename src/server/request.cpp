@@ -1748,6 +1748,7 @@ static bool parse_anthropic_system_object(const char **p, buf *out) {
 
 
 bool parse_anthropic_system(const char **p, char **out) {
+    *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
     json_ws(p);
     buf b = {0};
     if (**p == '"') {
