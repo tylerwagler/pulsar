@@ -25,28 +25,26 @@ these tensors run down to 2.7e-15 -- 11.07% of layers.0.hc_attn_fn's nonzero
 weights are gone, not approximated.  Widening a zero gives you a wider zero.
 Only re-reading the checkpoint recovers the values, which is the whole point.
 
-TWO SOURCE DTYPES, TWO DIFFERENT CLAIMS
----------------------------------------
-The group is not uniform, so do not describe the output as one thing:
+BF16 SOURCES ONLY (the F32-narrowing arm is gone)
+-------------------------------------------------
+BF16_GROUP now means exactly one thing: bf16 upstream, bf16 here, so every
+splice is a straight memcpy and the result is a LOSSLESS copy of what the
+checkpoint holds.  This tool used to also narrow F32-upstream tensors to
+bf16, but those tensors (hc_*_fn and friends) moved to the F32 group under
+the source-format policy -- the srcfmt artifacts keep them F32 -- so the
+narrowing arm had no caller left and was deleted (2026-08-19).  An F32
+source for a group member is now a skip, not a conversion.
 
-  188 tensors are BF16 upstream -> straight memcpy, and the result is a
-      LOSSLESS copy of what the checkpoint holds.
-  149 tensors are F32 upstream -> truncated to bf16 with round-to-nearest-even.
-      That is a deliberate NARROWING, chosen because f16 is worse for this data
-      (it deletes 11% of the small weights; bf16 keeps f32's range and pays in
-      mantissa bits these values do not use).
-
-Either way the source is row-major and so is ds4 -- ne_reversed() flips the
-DIMENSION LIST for GGUF's convention, it does not transpose data -- so no
-re-layout is involved.  We verify every tensor against source after writing
-rather than trusting any of the above.
+The source is row-major and so is ds4 -- ne_reversed() flips the DIMENSION
+LIST for GGUF's convention, it does not transpose data -- so no re-layout is
+involved.  We verify every tensor against source after writing rather than
+trusting any of the above.
 
 USAGE
     splice_bf16_plain.py IN.gguf OUT.gguf --hf /mnt/models/dsv4-flash-0731
                          [--match SUBSTR] [--dry-run]
 
-Run it with the quant venv (/home/claude/.venvs/pulsar-quant/bin/python): the
-F32 half needs numpy.  The BF16-only half does not.
+No numpy needed: the memcpy path runs on the system python.
 
 NOTE the engine must accept PULSAR_TENSOR_BF16 in tensor_expect_plain_or_mxfp8
 (weights.cpp) before the spliced artifact will load; it dies on anything but
@@ -67,30 +65,11 @@ BF16 = 30
 
 
 def bf16_bytes(ckpt, hf, src_dtype):
-    """The tensor as BF16 bytes, ready to write into the artifact.
-
-    BF16 source is a straight memcpy -- the bytes are already what we want.
-    F32 source is truncated to the top 16 bits with round-to-nearest-even,
-    which is exactly what bf16 IS, so no range is lost and only mantissa bits
-    below bf16's 7 are dropped.
-    """
-    buf = ckpt.raw(hf)
-    if src_dtype == 'BF16':
-        return buf
-
-    import numpy as np  # only the F32 path needs it
-    u = np.frombuffer(buf, dtype='<u4')
-    # This MUST agree bit-for-bit with ds4q_f32_to_bf16_row (quants_common.c),
-    # or a spliced artifact stops being equivalent to a rebuilt one and the two
-    # paths quietly diverge. Both branches below are transcribed from it.
-    rounded = ((u.astype('<u8') + (0x7FFF + ((u >> 16) & 1))) >> 16).astype('<u2')
-    is_nan = (u & 0x7FFFFFFF) > 0x7F800000
-    if is_nan.any():
-        # The C quiets NaN rather than rounding it; match that, but say so --
-        # NaN in a weight tensor is a checkpoint problem, not a splice problem.
-        print(f'   !! {hf}: {int(is_nan.sum())} NaNs in source, quieted (matches quantizer)')
-        rounded = np.where(is_nan, ((u >> 16) | 64).astype('<u2'), rounded)
-    return rounded.astype('<u2').tobytes()
+    """The tensor as BF16 bytes: a straight memcpy of the BF16 source."""
+    if src_dtype != 'BF16':
+        raise SystemExit(f'{hf}: source dtype {src_dtype}; only BF16 sources '
+                         f'are spliced (the F32-narrowing arm was deleted)')
+    return ckpt.raw(hf)
 
 
 def hf_name_for(ds4_name):
@@ -136,8 +115,8 @@ def main():
             skipped.append((t['name'], f'no source tensor ({hf})'))
             continue
         dt = ckpt.dtype(hf)
-        if dt not in ('BF16', 'F32'):
-            skipped.append((t['name'], f'source dtype {dt}, expected BF16 or F32'))
+        if dt != 'BF16':
+            skipped.append((t['name'], f'source dtype {dt}, expected BF16'))
             continue
         want = t['ne'] * 2
         todo.append(dict(t, hf=hf, nbytes=want, src_dtype=dt))
@@ -149,12 +128,10 @@ def main():
         if len(skipped) > 12:
             print(f'     ... and {len(skipped) - 12} more')
 
-    n_copy = sum(1 for t in todo if t['src_dtype'] == 'BF16')
     total = sum(t['nbytes'] for t in todo)
     print(f'-- splicing {len(todo)} tensors, {total / 1e6:.1f} MB '
-          f'({100.0 * total / max(os.path.getsize(args.src), 1):.3f}% of the artifact)')
-    print(f'     {n_copy} from a BF16 source (lossless copy), '
-          f'{len(todo) - n_copy} narrowed from F32')
+          f'({100.0 * total / max(os.path.getsize(args.src), 1):.3f}% of the artifact), '
+          f'all lossless copies from BF16 sources')
     for t in todo[:6]:
         print(f'     {t["name"]:40s} <- {t["hf"]:40s} {t["src_dtype"]:>5s} {t["nbytes"]:>9d} B')
     if len(todo) > 6:

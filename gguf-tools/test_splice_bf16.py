@@ -33,12 +33,17 @@ from splice_bf16_plain import bf16_bytes, hf_name_for  # noqa: E402
 F16, BF16 = 1, 30
 ALIGN = 32
 
-# (ds4 name, is_target). The decoy must NOT be in BF16_GROUP.
+# (ds4 name, is_target). The decoy must NOT be in BF16_GROUP. All targets are
+# BF16-upstream group members -- the F32-narrowing arm was deleted along with
+# the hc_*_fn fixtures that exercised it (those tensors moved to the F32
+# group under the source-format policy, so the splicer rightly skips them).
+# ffn_gate_inp is the only group member present in the checkpoint's top-level
+# weight map (the compressor/indexer members live in the QAT sidecar), so the
+# post-decoy ordering case uses layer 1's copy of it.
 CASES = [
-    ('blk.0.hc_attn_fn.weight', True),     # F32 source  -> narrowed
     ('blk.0.ffn_gate_inp.weight', True),   # BF16 source -> lossless copy
     ('blk.0.attn_norm.weight', False),     # decoy, stays put
-    ('blk.0.hc_ffn_fn.weight', True),      # F32 source, AFTER the decoy
+    ('blk.1.ffn_gate_inp.weight', True),   # target AFTER the decoy
 ]
 
 

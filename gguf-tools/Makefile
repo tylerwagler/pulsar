@@ -22,7 +22,7 @@ QUANTIZE_OBJS := $(QUANTIZE_SRCS:.c=.o)
 QUANTS_SRCS := quants_common.c quants_fp.c quants_kquants.c
 QUANTS_OBJS := $(QUANTS_SRCS:.c=.o)
 
-.PHONY: all clean quality-score test test-cutlass-mxfp4 test-mxfp8-lt sfcmp
+.PHONY: all clean quality-score test test-py test-cutlass-mxfp4 test-mxfp8-lt sfcmp
 
 all: deepseek4-quantize
 
@@ -33,6 +33,16 @@ test_quants: test_quants.c $(QUANTS_OBJS)
 # once shipped sign-stripped MXFP4 donors while test_quants (rebuilt) passed.
 test: test_quants deepseek4-quantize
 	./test_quants
+
+# Self-tests for the python maintenance tools (reflow_artifact.py and
+# splice_bf16_plain.py). Kept out of `test` because they need the HF source
+# checkpoint on disk; reflow's F32 codec path also needs numpy, so prefer the
+# quant venv when it exists.
+PYTEST_PYTHON ?= $(shell test -x $(HOME)/.venvs/pulsar-quant/bin/python && \
+	echo $(HOME)/.venvs/pulsar-quant/bin/python || echo python3)
+test-py:
+	$(PYTEST_PYTHON) test_reflow_artifact.py
+	$(PYTEST_PYTHON) test_splice_bf16.py
 
 # Byte-compare the quantizer's native cutlass_mxfp4 (type 40) output against
 # a reference GGUF whose type-40 tensors were produced by the validated
