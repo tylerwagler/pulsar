@@ -1475,19 +1475,6 @@ bool pulsar_kvstore_store_live_prefix_text(pulsar_kvstore *kc,
                                                hooks, err, err_len);
 }
 
-bool pulsar_kvstore_store_live_prefix(pulsar_kvstore *kc,
-                                   pulsar_engine *engine,
-                                   pulsar_session *session,
-                                   const pulsar_tokens *tokens,
-                                   int store_len,
-                                   const char *reason,
-                                   const pulsar_kvstore_trailer_hooks *hooks,
-                                   char *err,
-                                   size_t err_len) {
-    return pulsar_kvstore_store_live_prefix_text(kc, engine, session, tokens,
-                                              store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
-}
 
 int pulsar_kvstore_try_load_text(pulsar_kvstore *kc,
                               pulsar_engine *engine,

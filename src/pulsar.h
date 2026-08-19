@@ -117,7 +117,6 @@ int pulsar_engine_vocab_size(pulsar_engine *e);
  * check it against pulsar_engine_vocab_size. */
 int pulsar_engine_logits_width(const pulsar_engine *e);
 const char *pulsar_engine_model_name(pulsar_engine *e);
-int pulsar_engine_layer_count(pulsar_engine *e);
 
 /* DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often
@@ -137,8 +136,6 @@ void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
  * per-response accept-rate the global engine counters cannot attribute under
  * concurrent decode. */
 void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out);
-uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer);
-uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
@@ -158,7 +155,6 @@ uint32_t pulsar_think_max_min_context(void);
 pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by pulsar_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */
-pulsar_context_memory pulsar_context_memory_estimate(pulsar_backend backend, int ctx_size);
 pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
         pulsar_backend backend,
         int ctx_size,
@@ -321,7 +317,6 @@ void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progr
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns PULSAR_SESSION_SYNC_INTERRUPTED when it stops. */
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud);
-void pulsar_session_report_progress(pulsar_session *s, const char *event, int current, int total);
 
 typedef enum {
     PULSAR_SESSION_REWRITE_ERROR = -1,
@@ -493,7 +488,6 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void pulsar_session_invalidate(pulsar_session *s);
-void pulsar_session_rewind(pulsar_session *s, int pos);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);
@@ -506,7 +500,6 @@ int pulsar_session_prefill_cap(pulsar_session *s);
  * exact and sync must run to completion. */
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s);
 int pulsar_engine_routed_quant_bits(pulsar_engine *e);
-bool pulsar_engine_has_output_head(pulsar_engine *e);
 bool pulsar_engine_has_dspark(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);

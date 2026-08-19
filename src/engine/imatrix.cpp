@@ -1333,10 +1333,6 @@ pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
 
 
 
-pulsar_context_memory pulsar_context_memory_estimate(pulsar_backend backend,
-                                               int         ctx_size) {
-    return pulsar_context_memory_estimate_with_prefill(backend, ctx_size, 0);
-}
 
 
 

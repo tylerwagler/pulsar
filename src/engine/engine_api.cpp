@@ -183,10 +183,7 @@ void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
 int pulsar_engine_logits_width(const pulsar_engine *e) { return e ? e->logits_width() : 0; }
 const char *pulsar_engine_model_name(pulsar_engine *e) { return e->model_name(); }
-int pulsar_engine_layer_count(pulsar_engine *e) { return e ? e->layer_count() : (int)PULSAR_N_LAYER; }
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if (e) { e->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
-uint32_t pulsar_engine_layer_compress_ratio(pulsar_engine *e, uint32_t layer) { return e ? e->layer_compress_ratio(layer) : (layer >= PULSAR_N_LAYER ? 0 : pulsar_layer_compress_ratio(layer)); }
-uint64_t pulsar_engine_hidden_f32_values(pulsar_engine *e) { return e ? e->hidden_f32_values() : (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD; }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }
 bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { return e ? e->session_cost_bytes(ctx_size) : 0; }
@@ -208,7 +205,6 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { e->dump_tokens(tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
-bool pulsar_engine_has_output_head(pulsar_engine *e) { return e && e->has_output_head(); }
 bool pulsar_engine_has_dspark(pulsar_engine *e) { return e && e->has_dspark(); }
 
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) { return pulsar_session::create(out, e, ctx_size); }
@@ -216,7 +212,6 @@ void pulsar_session_free(pulsar_session *s) { if (s) s->destroy(); }
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
-void pulsar_session_report_progress(pulsar_session *s, const char *event, int current, int total) { if (s) s->report_progress(event, current, total); }
 void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out) { if (s) { s->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) { return s ? s->touched_kv_bytes() : 0; }
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) { return s ? s->bank_free_physical(bank) : false; }
@@ -254,7 +249,6 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) { s->invalidate(); }
-void pulsar_session_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { return s ? s->prefill_quantum_min_suffix() : 0; }
