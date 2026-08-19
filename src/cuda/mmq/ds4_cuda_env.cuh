@@ -83,7 +83,7 @@
 // These are preprocessor macros, not the predicate FUNCTIONS above, and the
 // device code selects whole kernel bodies on them:
 // ds4_mmq_d2r.cu:905 is `#if defined(TURING_MMA_AVAILABLE)` around the entire
-// IQ2 tensor-core GEMM, and ds4_mmq_soa_tiles.cuh guards six more blocks.
+// IQ2 tensor-core GEMM.
 //
 // Leaving one undefined does NOT fail to compile.  It takes the #else arm, and
 // the build is clean, and the engine runs, and every logit is wrong.  That is
