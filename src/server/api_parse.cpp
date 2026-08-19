@@ -120,13 +120,19 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
             }
         } else if (!strcmp(key, "top_logprobs")) {
             /* Range and the logprobs:true dependency are checked after the loop
-             * (the two keys can arrive in either order). */
+             * (the two keys can arrive in either order).  Not parsed with
+             * json_int: that folds negatives to 0 and truncates fractions, so
+             * the post-loop rejection could never fire for exactly the inputs
+             * it exists to reject. */
             json_ws(&p);
             if (!json_lit(&p, "null")) {
-                if (!json_int(&p, &r->top_logprobs)) {
+                double v = 0.0;
+                if (!json_number(&p, &v)) {
                     free(key);
                     goto bad;
                 }
+                r->top_logprobs = (v >= 0 && v <= PULSAR_SERVER_MAX_TOP_LOGPROBS
+                                   && v == (double)(int)v) ? (int)v : -1;
                 got_top_logprobs = true;
             }
         } else if (!strcmp(key, "seed")) {
@@ -203,7 +209,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         return false;
     }
     if (r->top_logprobs < 0 || r->top_logprobs > PULSAR_SERVER_MAX_TOP_LOGPROBS) {
-        snprintf(err, errlen, "top_logprobs must be between 0 and %d",
+        snprintf(err, errlen, "top_logprobs must be an integer between 0 and %d",
                  PULSAR_SERVER_MAX_TOP_LOGPROBS);
         chat_msgs_free(&msgs);
         free(tool_schemas);

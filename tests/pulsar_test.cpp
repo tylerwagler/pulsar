@@ -2607,6 +2607,75 @@ static void test_api_min_p_range_validation(void) {
 
 
 
+/* logprobs parse validation: rejection, not clamping, is the contract — a
+ * silently adjusted top_logprobs hands back a distribution the client did
+ * not ask for and cannot detect.  The teeth are the values a naive
+ * json_int parse folds into range (negatives to 0, fractions truncated):
+ * those must 400, exactly as OpenAI does.  Parse-only; the engine is used
+ * just to tokenize.  (Failed parses free the request themselves.) */
+static void test_api_logprobs_parse_validation(void) {
+    pulsar_engine *engine = test_get_engine();
+    if (!engine) return;
+    char err[160];
+    request r;
+
+    /* the enabled shape, keys in either order */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":true,\"top_logprobs\":5}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.logprobs && r.top_logprobs == 5);
+    request_free(&r);
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"top_logprobs\":20,\"logprobs\":true}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.logprobs && r.top_logprobs == 20);
+    request_free(&r);
+
+    /* logprobs alone: chosen-token entries only */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":true}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.logprobs && r.top_logprobs == 0);
+    request_free(&r);
+
+    /* explicit nulls are OpenAI-SDK "not set" */
+    TEST_ASSERT(parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":null,\"top_logprobs\":null}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(!r.logprobs && r.top_logprobs == 0);
+    request_free(&r);
+
+    /* top_logprobs without logprobs:true — even 0 — is a 400 */
+    TEST_ASSERT(!parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"top_logprobs\":0}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "requires"));
+
+    /* out of domain: negative, fractional, above the cap — all 400s */
+    TEST_ASSERT(!parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":true,\"top_logprobs\":-5}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "integer"));
+    TEST_ASSERT(!parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":true,\"top_logprobs\":3.9}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "integer"));
+    TEST_ASSERT(!parse_chat_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logprobs\":true,\"top_logprobs\":21}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "integer"));
+}
+
+
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
@@ -2631,6 +2700,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
+    {"--api-logprobs-parse", "api-logprobs-parse", "logprobs/top_logprobs parse: out-of-domain rejects, never clamps", test_api_logprobs_parse_validation},
     {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},

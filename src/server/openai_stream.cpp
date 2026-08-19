@@ -219,6 +219,18 @@ static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
         bool ok = need > 0 && len - i >= need;
         for (size_t k = 1; ok && k < need; k++)
             ok = ((unsigned char)piece[i + k] & 0xc0) == 0x80;
+        /* 10xxxxxx continuations alone still admit overlongs, UTF-16
+         * surrogates and > U+10FFFF; the second byte carries the extra
+         * constraint (Unicode 15 Table 3-7).  Without this, ED A0 80 walks
+         * through as "well-formed" and a strict client rejects the JSON. */
+        if (ok && need >= 3) {
+            const unsigned char c1 = (unsigned char)piece[i + 1];
+            ok = c == 0xe0 ? c1 >= 0xa0
+               : c == 0xed ? c1 <= 0x9f
+               : c == 0xf0 ? c1 >= 0x90
+               : c == 0xf4 ? c1 <= 0x8f
+                           : true;
+        }
         if (ok) {
             buf_append(&clean, piece + i, need);
             i += need;

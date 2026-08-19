@@ -5387,7 +5387,46 @@ static void test_kv_cache_open_unusable_dir_disables(void) {
 
 
 
+/* append_logprob_text_json substitutes U+FFFD for every ill-formed UTF-8
+ * sequence in a logprob entry's "token" string — including the ones a bare
+ * 10xxxxxx continuation check admits: overlongs, UTF-16 surrogates, and
+ * > U+10FFFF.  "bytes" carries the exact bytes; this guard is about keeping
+ * the JSON well-formed for strict clients, so the boundary rows of Unicode
+ * Table 3-7 are the teeth: the largest legal value on one side of each
+ * second-byte constraint and the smallest illegal value on the other. */
+static void test_logprob_token_json_sanitizes_ill_formed_utf8(void) {
+    static const struct { const char *in; size_t n; const char *out; } cases[] = {
+        {"hi",               2, "\"hi\""},
+        {"\xe4\xb8\xad",     3, "\"\xe4\xb8\xad\""},          /* U+4E2D */
+        {"\xf0\x9f\x9a\x80", 4, "\"\xf0\x9f\x9a\x80\""},      /* U+1F680 */
+        {"\xe0\xa0\x80",     3, "\"\xe0\xa0\x80\""},          /* smallest legal E0 */
+        {"\xed\x9f\xbf",     3, "\"\xed\x9f\xbf\""},          /* last before surrogates */
+        {"\xf0\x90\x80\x80", 4, "\"\xf0\x90\x80\x80\""},      /* U+10000 */
+        {"\xf4\x8f\xbf\xbf", 4, "\"\xf4\x8f\xbf\xbf\""},      /* U+10FFFF */
+        {"\xed\xa0\x80",     3,                               /* UTF-16 surrogate */
+         "\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\""},
+        {"\xe0\x80\x80",     3,                               /* overlong NUL */
+         "\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\""},
+        {"\xf0\x8f\xbf\xbf", 4,                               /* overlong U+FFFF */
+         "\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\""},
+        {"\xf4\x90\x80\x80", 4,                               /* > U+10FFFF */
+         "\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\""},
+        {"\xe4\xb8",         2,                               /* truncated tail */
+         "\"\xef\xbf\xbd\xef\xbf\xbd\""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf b = {0};
+        append_logprob_text_json(&b, cases[i].in, cases[i].n);
+        const size_t want = strlen(cases[i].out);
+        TEST_ASSERT(b.len == want && b.ptr && !memcmp(b.ptr, cases[i].out, want));
+        buf_free(&b);
+    }
+}
+
+
+
 static void pulsar_server_unit_tests_run(void) {
+    test_logprob_token_json_sanitizes_ill_formed_utf8();
     test_kv_disk_default_dir_resolution();
     test_kv_disk_flag_matrix();
     test_kv_cache_open_unusable_dir_disables();

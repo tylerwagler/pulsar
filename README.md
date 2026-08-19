@@ -579,9 +579,13 @@ returns 200 when the model is loaded and serving).
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
-`seed`, `stream`, `stream_options.include_usage`, `tools`, and `tool_choice`.
-Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
-tool calls are mapped back to OpenAI tool calls.
+`seed`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice`,
+`logprobs`, and `top_logprobs` (0–20). Tool schemas are rendered into
+DeepSeek's DSML tool format, and generated DSML tool calls are mapped back to
+OpenAI tool calls. A `logprobs` request decodes with speculative decoding
+disabled — the reported distribution is the target model's at each drawn
+position, which the fused speculative step cannot reconstruct — so it trades
+decode throughput for honest numbers.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
