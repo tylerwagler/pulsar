@@ -974,10 +974,18 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
             s->dspark_pending_qrows_cap = need;
         }
     }
+    /* spec_logits rows are PULSAR_N_VOCAB wide (allocated 16*PULSAR_N_VOCAB,
+     * written and read elsewhere at that stride via gpu_graph_read_spec_logits_row).
+     * Stride the row view by the TARGET vocab, not the drafter's vocab_size:
+     * they are equal on the shipped drafter (markov head 129280 == N_VOCAB), so
+     * this is bit-exact today, but a drafter with a smaller vocab would make
+     * pos>=1 read into the middle of row 0.  vocab_size stays the LENGTH the
+     * markov step consumes. */
+    const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
     bool draft_ok = true;
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
-            g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
+            g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
         draft_ok = base_row &&
             pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
                                              dtree_stats ? &refined2[pos + 1] : NULL,
