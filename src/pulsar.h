@@ -64,7 +64,6 @@ typedef bool (*pulsar_session_cancel_fn)(void *ud);
 
 typedef struct {
     const char *model_path;
-    const char *dspark_path;
     /* Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
      * this opts out (memory saving for sampled-only workloads). */
     bool dspark_disable;
@@ -76,7 +75,6 @@ typedef struct {
     int n_threads;
     uint32_t prefill_chunk;
     int dspark_draft_tokens;
-    float dspark_confidence;
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;

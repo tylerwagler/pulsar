@@ -344,7 +344,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
      * tau 0.35) that does not hold on shipped v5mx at the tau=0.25 default. */
     e->dspark_draft_tokens = opt->dspark_draft_tokens > 0 ? opt->dspark_draft_tokens : 3;
     if (e->dspark_draft_tokens > 16) e->dspark_draft_tokens = 16;
-    e->dspark_confidence = opt->dspark_confidence > 0.0f ? opt->dspark_confidence : 0.5f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -427,18 +426,8 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
-        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, confidence=%.2f)\n",
-                e->dspark_draft_tokens,
-                (double)e->dspark_confidence);
-    } else if (!opt->dspark_disable && opt->dspark_path && opt->dspark_path[0]) {
-        model_open(&e->dspark_model, opt->dspark_path, graph_backend);
-        dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
-        e->dspark_external = true;
-        e->dspark_ready = true;
-        fprintf(stderr, "pulsar: DSpark support model loaded: %s (draft=%d, confidence=%.2f)\n",
-                opt->dspark_path,
-                e->dspark_draft_tokens,
-                (double)e->dspark_confidence);
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d)\n",
+                e->dspark_draft_tokens);
     }
 
     if (graph_backend) {

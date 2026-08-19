@@ -1211,7 +1211,6 @@ struct pulsar_engine {
     pulsar_dspark_weights dspark_weights;
     pulsar_backend backend;
     int dspark_draft_tokens;
-    float dspark_confidence;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
