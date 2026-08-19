@@ -87,10 +87,8 @@ without them. They live on the fork branch above.
 
 ## The remaining tools
 
-`measure_layer_kl.py`, `dump_inventory.py` and `extract_sens.py` fed the retired
-local allocator: engine-measured per-layer promotion KL, a tensor inventory, and
-an imatrix-derived sensitivity proxy. **They currently have no consumer** —
-upstream prices from its own probe/cost stages instead. `measure_layer_kl.py` is
-the one worth keeping on merit, because it measures real end-to-end KL on THIS
-engine rather than a torch proxy, which is a thing upstream cannot do. Kept
-pending a decision; delete them if that decision is "no".
+`measure_layer_kl.py` measures real end-to-end per-layer promotion KL on THIS
+engine rather than a torch proxy, which is a thing upstream cannot do; it is
+kept on that merit. Its former companions (`dump_inventory.py`,
+`extract_sens.py`) fed only the retired local allocator and were deleted
+2026-08-19.

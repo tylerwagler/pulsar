@@ -12,7 +12,8 @@ artifact (0.84%).  This copies the file and rewrites only
   (b) those tensors' data regions, in place, at their existing offsets.
 
 Everything else -- experts, attention, norms, KV -- is byte-copied untouched.
-Same technique as repack_iq2_soa.py, which relies on the same size-identity.
+Same in-place retype-and-rewrite technique as repack_iq2_mmq.py, which relies
+on the same size-identity.
 
 WHY THE DATA COMES FROM SOURCE, NOT FROM THE EXISTING F16
 ---------------------------------------------------------

@@ -56,40 +56,14 @@ are available in the antirez Hugging Face repository:
 https://huggingface.co/antirez/deepseek-v4-gguf/tree/main
 ```
 
-## Repack IQ2_XXS To IQ2_XXS_SOA (type 42)
-
-`IQ2_XXS_SOA` is a load-aligned twin of `IQ2_XXS`: the same 66 B/block content,
-but the per-block `d` scale and the quantised `qs` bytes live in separate planes
-(`q` plane at offset 0, 64 B/block and 16-byte aligned; `d` plane immediately
-after it, 2 B/block).  Identical bit count, byte-identical logits — the only
-thing that changes is that the weight stream can be read with full-width aligned
-loads instead of `LDG.E.U16` pairs.  Worth about +2% prefill on GB10.
-
-```sh
-python3 gguf-tools/repack_iq2_soa.py in.gguf out.gguf \
-    --match ffn_gate_exps,ffn_up_exps,ffn_down_exps
-python3 gguf-tools/verify_iq2_soa.py in.gguf out.gguf   # unpacks back to AoS
-```
-
-`--match` takes a comma-separated list of tensor-name substrings; omit it to
-repack every `IQ2_XXS` tensor.  The verifier unpacks the SoA planes back to the
-original layout and byte-compares, so a clean run proves the values survived.
-Any engine at or after v0.4.0 loads either layout; older builds reject type 42.
-
-**Gate and up must share a layout.**  The fused gate+up kernels read ONE layout,
-so repacking `ffn_gate_exps` without `ffn_up_exps` produces a GGUF the binder
-rejects at load.  Repack the pair together or not at all; `down` is independent.
-
 ## Repack IQ2_XXS To IQ2_XXS_MMQ (type 43)
 
-Type 43 is a SECOND load-aligned twin of `IQ2_XXS`, and it is **not** type 42.
-Both hold the same 66 B/block content, but they are different permutations with
-different readers:
-
-| type | layout | reader |
-|------|--------|--------|
-| 42 `iq2_xxs_soa` | `q` plane first (64 B/block), then `d` plane (2 B/block), no padding | pulsar's own dp4a MoE kernels |
-| 43 `iq2_xxs_mmq` | `d` plane first (2 B/block), pad to 64 B, then a 64 B-aligned `q` plane | the vendored llama.cpp MMQ kernels |
+Type 43 (`iq2_xxs_mmq`) is a load-aligned twin of `IQ2_XXS`: the same
+66 B/block content, permuted so the vendored llama.cpp MMQ kernels can read it
+with full-width aligned loads — `d` plane first (2 B/block), pad to 64 B, then
+a 64 B-aligned `q` plane.  (An earlier twin, type 42 `iq2_xxs_soa`, fed the
+dp4a MoE kernels; both the kernels and its repack scripts have been removed,
+and the engine rejects type 42 at load.)
 
 Type 43 is the layout `repack_iq2_mmq.py` builds offline, so storing it in
 the GGUF is what lets MMQ read routed experts with full-width aligned loads
@@ -106,13 +80,18 @@ the runtime repack cache, which was capacity-bound (~22.9 GiB budget against
 repack.
 
 ```sh
+# Standalone repack for an existing type-16 GGUF. The main artifact rebuild
+# no longer calls this: deepseek4-quantize emits type 43 directly from the
+# format map (see build/rebuild_collapsed.sh).
 python3 gguf-tools/repack_iq2_mmq.py in.gguf out.gguf
 python3 gguf-tools/verify_iq2_mmq_model.py in.gguf out.gguf manifest.txt
 ```
 
 `repack_iq2_mmq.py` converts every 3-D `IQ2_XXS` routed-expert tensor by
-default; `--match` narrows it the same way `repack_iq2_soa.py` does, and gate
-and up must still be converted together.  It asserts per tensor that the
+default; `--match` narrows it to tensors whose names contain one of a
+comma-separated list of substrings, and gate and up must be converted together
+(the fused gate+up kernels read ONE layout, so the binder rejects a mixed
+pair at load; `down` is independent).  It asserts per tensor that the
 aligned size equals the raw size and refuses to grow the file — that assertion
 is the load-bearing check that the dims were read correctly.
 

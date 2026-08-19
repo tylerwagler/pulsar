@@ -1,7 +1,7 @@
 """Minimal read-only GGUF header parser, shared by the in-place splice tools.
 
-Lifted out of repack_iq2_soa.py so tools that only need to read the header do
-not inherit its numpy dependency.
+Standalone so tools that only need to read the header do not inherit a numpy
+dependency.
 
 The one thing this does that a general GGUF reader would not bother with:
 scan() records where each tensor's TYPE FIELD sits in the file (`type_pos`), so
