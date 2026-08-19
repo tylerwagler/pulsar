@@ -22,7 +22,7 @@ static char *read_file(const char *path) {
     long n = ftell(fp);
     if (n < 0) die("ftell failed");
     if (fseek(fp, 0, SEEK_SET) != 0) die("fseek failed");
-    char *buf = malloc((size_t)n + 1);
+    char *buf = (char *)malloc((size_t)n + 1);
     if (!buf) die("out of memory");
     if (n && fread(buf, 1, (size_t)n, fp) != (size_t)n) die("read failed");
     buf[n] = '\0';
@@ -47,19 +47,17 @@ int main(int argc, char **argv) {
     int ctx_size = argc == 5 ? atoi(argv[4]) : 4096;
     if (ctx_size < 1024) ctx_size = 1024;
 
-    ds4_engine_options opt = {
+    pulsar_engine_options opt = {
         .model_path = model_path,
-        .backend = DS4_BACKEND_CUDA,
+        .backend = PULSAR_BACKEND_CUDA,
         .n_threads = 0,
-        .warm_weights = false,
-        .quality = false,
     };
 
-    ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
+    pulsar_engine *engine = NULL;
+    if (pulsar_engine_open(&engine, &opt) != 0) die("failed to open model");
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
+    pulsar_session *session = NULL;
+    if (pulsar_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
 
     FILE *mf = fopen(manifest_path, "rb");
     if (!mf) {
@@ -93,16 +91,16 @@ int main(int argc, char **argv) {
         char *prompt_text = read_file(prompt_path);
         char *cont_text = read_file(cont_path);
 
-        ds4_tokens prompt = {0};
-        ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
-        ds4_tokenize_text(engine, cont_text, &target);
+        pulsar_tokens prompt = {0};
+        pulsar_tokens target = {0};
+        pulsar_encode_chat_prompt(engine, NULL, prompt_text, PULSAR_THINK_NONE, &prompt);
+        pulsar_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);
             return 1;
         }
-        if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        if (pulsar_session_sync(session, &prompt, err, sizeof(err)) != 0) {
             fprintf(stderr, "%s sync failed: %s\n", id, err);
             return 1;
         }
@@ -112,19 +110,19 @@ int main(int argc, char **argv) {
         bool still_matching = true;
         bool first_match = false;
         for (int i = 0; i < target.len; i++) {
-            const int greedy = ds4_session_argmax(session);
+            const int greedy = pulsar_session_argmax(session);
             if (i == 0) first_match = (greedy == target.v[i]);
             if (still_matching && greedy == target.v[i]) lcp++;
             else still_matching = false;
 
-            ds4_token_score score;
-            if (!ds4_session_token_logprob(session, target.v[i], &score)) {
+            pulsar_token_score score;
+            if (!pulsar_session_token_logprob(session, target.v[i], &score)) {
                 fprintf(stderr, "%s logprob failed at target token %d\n", id, i);
                 return 1;
             }
             nll += -(double)score.logprob;
 
-            if (ds4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
+            if (pulsar_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
                 return 1;
             }
@@ -144,8 +142,8 @@ int main(int argc, char **argv) {
                 "%s cases=%d prompt=%d target=%d avg_nll=%.6f lcp=%d\n",
                 id, case_n, prompt.len, target.len, avg, lcp);
 
-        ds4_tokens_free(&prompt);
-        ds4_tokens_free(&target);
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&target);
         free(prompt_text);
         free(cont_text);
     }
@@ -160,7 +158,7 @@ int main(int argc, char **argv) {
 
     fclose(out);
     fclose(mf);
-    ds4_session_free(session);
-    ds4_engine_close(engine);
+    pulsar_session_free(session);
+    pulsar_engine_close(engine);
     return 0;
 }

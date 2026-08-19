@@ -11,7 +11,7 @@ QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib 
 # post-restructure: link against the split engine/cuda TUs (built via the
 # pulsar-bench target, which forces every core object)
 QUALITY_TARGETS := pulsar-bench
-QUALITY_OBJS = ../src/engine/*.o ../src/cuda/*.o ../src/lib/pulsar_help.o
+QUALITY_OBJS = ../src/engine/*.o ../src/cuda/*.o ../src/cuda/mmq/*.o ../src/lib/pulsar_help.o ../src/vendor/*.o
 QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I../src -o
 
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
@@ -103,7 +103,7 @@ deepseek4-quantize: $(QUANTIZE_OBJS) $(QUANTS_OBJS)
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
-	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
+	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.cc $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
 	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o
