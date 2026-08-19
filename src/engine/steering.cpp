@@ -52,12 +52,13 @@ bool gpu_graph_apply_directional_steering_ffn(
 
 
 static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
-    /* Must track the ACTUAL storage formats (raw f16, packed attn comp, MXFP4
-     * indexer) — an f32-priced estimate overshoots ~3x under the default-on
-     * packed formats and needlessly trips the managed-KV (demand-paged) path
-     * at the 512k+ contexts where performance matters most. */
-    const uint64_t raw_elem = sizeof(uint16_t);   /* raw KV ring is __half */
-    uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
+    /* Must track the ACTUAL storage formats (raw PULSAR_ATTN_PACK, packed attn
+     * comp, MXFP4 indexer) — an f32-priced estimate overshoots ~3x under the
+     * default-on packed formats and needlessly trips the managed-KV
+     * (demand-paged) path at the 512k+ contexts where performance matters most.
+     * The raw ring became PULSAR_ATTN_PACK rows (584 B) not f16 (1024 B) in the
+     * KV-packing campaign; match the allocator (gpu_diag raw_bank_bytes). */
+    uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
@@ -97,7 +98,7 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         score_rows = (uint64_t)gpu_graph_prefill_slice();
     }
     uint64_t bytes = kv_cache_bytes +
-                     2ull * comp_cap * score_rows * sizeof(float);
+                     comp_cap * score_rows * sizeof(float);  /* one indexer_scores buffer */
     return bytes;
 }
 

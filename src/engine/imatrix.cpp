@@ -1297,8 +1297,7 @@ pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
             (uint64_t)gpu_graph_prefill_slice() < score_rows) {
             score_rows = (uint64_t)gpu_graph_prefill_slice();
         }
-        m.scratch_bytes = 2ull *
-                          m.comp_cap *
+        m.scratch_bytes = m.comp_cap *           /* one indexer_scores buffer */
                           score_rows *
                           sizeof(float) +
                           attn_stage_cap * PULSAR_N_HEAD_DIM * sizeof(float);
@@ -1357,9 +1356,9 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
 
     const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    /* Raw SWA ring: always f16 rows. */
-    const uint64_t raw_elem_bytes = sizeof(uint16_t);   /* raw KV ring is __half */
-    m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_N_HEAD_DIM * raw_elem_bytes;
+    /* Raw SWA ring: PULSAR_ATTN_PACK rows (584 B), not f16 (1024 B) since the
+     * KV-packing campaign; match the allocator (gpu_diag raw_bank_bytes). */
+    m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 
     /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */
     const uint64_t attn_row_bytes  = gpu_graph_attn_comp_cache_row_bytes();
