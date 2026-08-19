@@ -985,7 +985,31 @@ int pulsar_gpu_init(void) {
          * --default-stream per-thread) so the decode tape is capturable into
          * a CUDA graph; cuBLAS must launch onto the same stream. */
         (void)cublasSetStream(g_cublas, cudaStreamPerThread);
-        (void)cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+        /* f32 MEANS f32 on every cuBLAS call (Tyler, 2026-08-18).
+         *
+         * This line used to say CUBLAS_TF32_TENSOR_OP_MATH, set once at handle
+         * creation with no comment and no measurement, which silently gave a
+         * 10-bit mantissa to every f32 GEMM that reaches cuBLAS:
+         *   - pulsar_gpu_matmul_f32_tensor above the nt cap (n_tok > 4), which
+         *     prefill runs for every F32 weight including the compressor
+         *     projections, so it reached the COMPRESSED KV;
+         *   - attention's four cublasSgemmStridedBatched fallbacks.
+         * Neither call site chose it or could see it.
+         *
+         * It also made the width-4 nt cap a PRECISION cliff on top of the
+         * M-independence contract it was actually there to express: true f32 at
+         * widths 1..4, TF32 above, same weight.  One threshold, two unrelated
+         * meanings.  The contract stays; the precision change goes.
+         *
+         * Set explicitly rather than deleted: DEFAULT_MATH is the cuBLAS default,
+         * but stating it records the decision so the TF32 line does not come back
+         * as a free-looking speedup.
+         *
+         * ⚠ This is a DELIBERATE NUMERICS CHANGE.  It moves every prefill logit
+         * and the compressed KV bytes, so PREFILL_BASELINE_REF moves with it --
+         * that is what the re-baseline in the next commit is for, and why this
+         * is not a cleanup. */
+        (void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
         g_cublas_ready = 1;
     }
     return 1;
