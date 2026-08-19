@@ -55,3 +55,8 @@ gguf-tools/libds4q_reflow.so
 # experiment scratch (run harnesses write logs/progress/json here; not source)
 /tmp-teb/
 *.progress
+/tests/attn_f16_kernel_test
+/tests/attn_f16_banked_test
+/tests/attn_decode_split_test
+/tests/e4m3_staging_probe
+/tests/mxfp8_mma_probe
