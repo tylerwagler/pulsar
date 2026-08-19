@@ -9,7 +9,7 @@
  * by whichever arm a given endpoint's copy-paste happened to include -- every
  * surface accepts temperature/top_p/min_p/top_k/seed identically. logprobs
  * stays endpoint-local (chat only). */
-static int parse_sampling_key(const char *key, const char **p, request *r) {
+int parse_sampling_key(const char *key, const char **p, request *r) {
     if (!strcmp(key, "temperature")) {
         double v = 0.0;
         if (!json_number(p, &v)) return -1;

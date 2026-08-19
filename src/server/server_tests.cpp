@@ -3299,6 +3299,47 @@ static void test_json_skip_has_nesting_limit(void) {
 
 
 
+/* Pin the shared sampling-knob parser every protocol surface routes through.
+ * The bug class this guards: a surface silently dropping a knob (the audit
+ * found /responses dropping seed before the parsers were consolidated onto
+ * this one helper).  Covers the seed edge cases the comment in the parser
+ * calls out: NaN and non-positive -> 0, >= 2^64 -> UINT64_MAX (not UB). */
+static void test_parse_sampling_key_contract(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    const char *p;
+
+    p = "42,";
+    TEST_ASSERT(parse_sampling_key("seed", &p, &r) == 1);
+    TEST_ASSERT(r.seed == 42u);
+    p = "0,";
+    TEST_ASSERT(parse_sampling_key("seed", &p, &r) == 1);
+    TEST_ASSERT(r.seed == 0u);
+    p = "-3,";
+    TEST_ASSERT(parse_sampling_key("seed", &p, &r) == 1);
+    TEST_ASSERT(r.seed == 0u);
+    p = "18446744073709551616,"; /* 2^64: too big for the cast, clamps */
+    TEST_ASSERT(parse_sampling_key("seed", &p, &r) == 1);
+    TEST_ASSERT(r.seed == UINT64_MAX);
+    p = "\"not-a-number\",";
+    TEST_ASSERT(parse_sampling_key("seed", &p, &r) == -1);
+
+    p = "0.7,";
+    TEST_ASSERT(parse_sampling_key("temperature", &p, &r) == 1);
+    TEST_ASSERT(r.temperature > 0.69f && r.temperature < 0.71f);
+    p = "1.5,"; /* out-of-range min_p disables the filter, never greedy-collapses */
+    TEST_ASSERT(parse_sampling_key("min_p", &p, &r) == 1);
+    TEST_ASSERT(r.min_p == 0.0f && r.has_min_p);
+    p = "12,";
+    TEST_ASSERT(parse_sampling_key("top_k", &p, &r) == 1);
+    TEST_ASSERT(r.top_k == 12 && r.has_top_k);
+
+    p = "1,"; /* unknown keys are the caller's problem: 0, untouched pointer */
+    TEST_ASSERT(parse_sampling_key("logprobs", &p, &r) == 0);
+
+    request_free(&r);
+}
+
 /* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
  * duplicate-key idiom `free(x); if (!helper(&p, &x)) goto fail;` cannot
  * double-free x (the fail label frees it again).  A malformed second value on
@@ -5534,6 +5575,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
+    test_parse_sampling_key_contract();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

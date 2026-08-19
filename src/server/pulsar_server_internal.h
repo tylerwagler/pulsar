@@ -1712,6 +1712,10 @@ bool sse_headers(int fd);
 bool sse_error_event(int fd, const request *r, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
 int clamp_usage_tokens(int value, int max);
+/* The one shared sampling-knob parser every protocol surface routes through
+ * (temperature/top_p/min_p/top_k/seed). Non-static so the test suite can pin
+ * its contract -- /responses silently dropping seed is the bug class. */
+int parse_sampling_key(const char *key, const char **p, request *r);
 void resolve_cache_split(int *cache_read, int *cache_write, int total);
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens);
