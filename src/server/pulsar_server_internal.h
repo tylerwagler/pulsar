@@ -1146,7 +1146,6 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     const char *web_search_url; /* see server_config.web_search_url */
-    bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -1398,7 +1397,6 @@ typedef struct server_prefill_progress {
      * server is busy doing prefill. */
     int fd;
     bool stream;
-    bool enable_cors;
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
@@ -1566,7 +1564,6 @@ typedef struct {
      * feature: web_search tool entries are then dropped at parse so the model
      * never emits un-executable calls. */
     const char *web_search_url;
-    bool enable_cors;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -1701,17 +1698,17 @@ void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_pref
                                    const tool_schema_orders *orders);
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                          const tool_schema_orders *orders);
-bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body);
-bool http_error(int fd, bool enable_cors, int code, const char *msg);
+bool http_response(int fd, int code, const char *type, const char *body);
+bool http_error(int fd, int code, const char *msg);
 void request_forced_tool_seed(const request *r, buf *out);
 void request_apply_forced_tool_prefill(request *r);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
-bool http_error_context_length_exceeded(int fd, bool enable_cors,
+bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size);
-bool sse_headers(int fd, bool enable_cors);
+bool sse_headers(int fd);
 bool sse_error_event(int fd, const request *r, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
 int clamp_usage_tokens(int value, int max);
@@ -1781,12 +1778,12 @@ bool responses_sse_finish_live(int fd, const request *r,
                                       const char *finish,
                                       int prompt_tokens, int completion_tokens,
                                       long created_at);
-bool responses_final_response(int fd, bool enable_cors,
+bool responses_final_response(int fd,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens);
-bool final_response(int fd, bool enable_cors,
+bool final_response(int fd,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens,
@@ -1795,7 +1792,7 @@ void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,
                                      const tool_schema_orders *orders,
                                      const char *prior_blocks_json);
-bool anthropic_final_response(int fd, bool enable_cors,
+bool anthropic_final_response(int fd,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens,

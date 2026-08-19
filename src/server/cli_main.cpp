@@ -584,8 +584,6 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cors")) {
-            c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -1177,7 +1175,6 @@ int main(int argc, char **argv) {
                    : "pulsar-server: web_search server tool disabled (no --web-search-url)%s",
                s.web_search_url ? s.web_search_url : "");
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
-    s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                        false /* accept cross-quant restores */, cfg.kv_cache))
@@ -1255,7 +1252,7 @@ int main(int argc, char **argv) {
         if (!at_cap) s.clients++;
         pthread_mutex_unlock(&s.mu);
         if (at_cap) {
-            http_error(fd, s.enable_cors, 503, "too many connections");
+            http_error(fd, 503, "too many connections");
             close(fd);
             continue;
         }

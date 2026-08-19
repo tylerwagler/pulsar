@@ -804,7 +804,7 @@ bool responses_sse_finish_live(int fd, const request *r,
 
 
 
-bool responses_final_response(int fd, bool enable_cors,
+bool responses_final_response(int fd,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
@@ -872,7 +872,7 @@ bool responses_final_response(int fd, bool enable_cors,
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_putc(&b, '}');
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     free(items);
     return ok;
@@ -880,7 +880,7 @@ bool responses_final_response(int fd, bool enable_cors,
 
 
 
-bool final_response(int fd, bool enable_cors,
+bool final_response(int fd,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens,
@@ -919,7 +919,7 @@ bool final_response(int fd, bool enable_cors,
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
     append_openai_timings_json(&b, r);
     buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }

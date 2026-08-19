@@ -616,10 +616,6 @@ including `response.output_text.delta`, function-call argument events, and
 terminal `response.completed` / `response.incomplete` / `response.failed`
 events.
 
-For browser JavaScript clients served from another origin, start the server with
-`--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
-headers; it is independent of which interfaces the server binds.
-
 > **Network exposure.** `pulsar-server` binds **`0.0.0.0` (all interfaces) by
 > default** and has **no authentication** — any host that can reach the port can
 > use the model, the agent tools, and `/metrics`. This is a deliberate

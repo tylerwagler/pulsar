@@ -420,7 +420,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_error_context_length_exceeded(sv[0], false, &r, 16, 16));
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &r, 16, 16));
         shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
@@ -441,7 +441,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_error_context_length_exceeded(sv[0], false, &a, 20, 20));
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &a, 20, 20));
         shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
         TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
@@ -452,76 +452,6 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         close(sv[1]);
     }
     request_free(&a);
-}
-
-
-
-static void test_cors_headers_are_opt_in(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_response(sv[0], false, 200, "application/json", "{}"));
-        shutdown(sv[0], SHUT_WR);
-        char *out = read_socket_text(sv[1]);
-        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
-        TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin") == NULL);
-        free(out);
-        close(sv[0]);
-        close(sv[1]);
-    }
-
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] >= 0 && sv[1] >= 0) {
-        TEST_ASSERT(http_response(sv[0], true, 200, "application/json", "{}"));
-        shutdown(sv[0], SHUT_WR);
-        char *out = read_socket_text(sv[1]);
-        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
-        TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
-        TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, OPTIONS") != NULL);
-        TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: *") != NULL);
-        free(out);
-        close(sv[0]);
-        close(sv[1]);
-    }
-}
-
-
-
-static void test_cors_preflight_response_is_no_content(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
-
-    TEST_ASSERT(http_response(sv[0], true, 204, NULL, ""));
-    shutdown(sv[0], SHUT_WR);
-    char *out = read_socket_text(sv[1]);
-    TEST_ASSERT(strstr(out, "HTTP/1.1 204 No Content") != NULL);
-    TEST_ASSERT(strstr(out, "Content-Length: 0") != NULL);
-    TEST_ASSERT(strstr(out, "Content-Type:") == NULL);
-    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
-
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
-}
-
-
-
-static void test_cors_sse_headers(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
-
-    TEST_ASSERT(sse_headers(sv[0], true));
-    shutdown(sv[0], SHUT_WR);
-    char *out = read_socket_text(sv[1]);
-    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
-    TEST_ASSERT(strstr(out, "Content-Type: text/event-stream") != NULL);
-    TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
-
-    free(out);
-    close(sv[0]);
-    close(sv[1]);
 }
 
 
@@ -688,7 +618,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2, NULL));
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -910,7 +840,7 @@ static void test_responses_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_usage", "OK", NULL, NULL,
+    TEST_ASSERT(responses_final_response(sv[0], &r, "resp_usage", "OK", NULL, NULL,
                                          "stop", 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -5420,9 +5350,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
-    test_cors_headers_are_opt_in();
-    test_cors_preflight_response_is_no_content();
-    test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();

@@ -91,7 +91,7 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 
 
 
-bool anthropic_final_response(int fd, bool enable_cors,
+bool anthropic_final_response(int fd,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens,
@@ -107,7 +107,7 @@ bool anthropic_final_response(int fd, bool enable_cors,
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }

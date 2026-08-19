@@ -258,7 +258,6 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 0.0.0.0 (all interfaces; use 127.0.0.1 for loopback-only)");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
-    opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "The model endpoint id reflects the loaded GGUF shape: deepseek-v4-flash or deepseek-v4-pro (one at a time).");

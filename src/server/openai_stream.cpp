@@ -2,16 +2,7 @@
 
 
 
-static void append_cors_headers(buf *h) {
-    buf_puts(h,
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: *\r\n");
-}
-
-
-
-bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+bool http_response(int fd, int code, const char *type, const char *body) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
@@ -29,7 +20,6 @@ bool http_response(int fd, bool enable_cors, int code, const char *type, const c
         buf_puts(&h, type);
         buf_puts(&h, "\r\n");
     }
-    if (enable_cors) append_cors_headers(&h);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
@@ -39,12 +29,12 @@ bool http_response(int fd, bool enable_cors, int code, const char *type, const c
 
 
 
-bool http_error(int fd, bool enable_cors, int code, const char *msg) {
+bool http_error(int fd, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
     buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
-    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    bool ok = http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -68,7 +58,7 @@ bool request_exceeds_context(const request *r, int ctx_size) {
 
 
 
-bool http_error_context_length_exceeded(int fd, bool enable_cors,
+bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size) {
@@ -97,7 +87,7 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
         buf_printf(&b, "%d", ctx_size);
         buf_puts(&b, "}}\n");
     }
-    bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
+    bool ok = http_response(fd, 400, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -107,13 +97,12 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-bool sse_headers(int fd, bool enable_cors) {
+bool sse_headers(int fd) {
     buf h = {0};
     buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n");
-    if (enable_cors) append_cors_headers(&h);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     buf_free(&h);

@@ -1204,7 +1204,7 @@ bool server::worker_try_bind() {
         if (s->n_queued > 0) s->n_queued--;
         pthread_mutex_unlock(&s->mu);
         j->next = NULL;
-        http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req,
+        http_error_context_length_exceeded(j->fd, &j->req,
                                            j->req.prompt.len, reject_ctx);
         pthread_mutex_lock(&j->mu);
         j->done = true;

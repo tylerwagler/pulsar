@@ -246,7 +246,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
+            if (sse_headers(p->fd)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -315,7 +315,6 @@ void server::send_prefill_failure_response(const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
-    auto *s = this;
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -333,7 +332,7 @@ void server::send_prefill_failure_response(const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    http_error(j->fd, 500, err);
 }
 
 
@@ -532,7 +531,6 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .t0 = rebuild_t0,
             .fd = j->fd,
             .stream = j->req.stream,
-            .enable_cors = s->enable_cors,
             /* Tool checkpoint rebuild only runs after the response stream is
              * already in flight, so the SSE headers were sent long ago.
              * Pre-arm the flag so the progress callback only emits keepalive
@@ -818,7 +816,7 @@ void server::gen_begin(session_slot *sl) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
+        http_error(j->fd, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
         g->phase = GEN_DONE;
         return;
@@ -826,7 +824,7 @@ void server::gen_begin(session_slot *sl) {
                j->req.anthropic_requires_live_tool_state)
     {
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
+        http_error(j->fd, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         g->phase = GEN_DONE;
         return;
@@ -919,7 +917,6 @@ void server::gen_begin(session_slot *sl) {
         .t0 = g->t0,
         .fd = j->fd,
         .stream = j->req.stream,
-        .enable_cors = s->enable_cors,
     };
     snprintf(g->progress.ctx, sizeof(g->progress.ctx), "%s", g->ctx_span);
     log_flags(g->req_flags, sizeof(g->req_flags), responses_protocol,
@@ -1158,7 +1155,7 @@ void server::gen_stream_begin(session_slot *sl) {
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
-        if (!g->progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+        if (!g->progress.headers_sent && !sse_headers(j->fd)) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -2003,7 +2000,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, g->id,
+        anthropic_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
@@ -2011,14 +2008,14 @@ void server::gen_step_finish(session_slot *sl) {
                                  g->completion_total + g->completion,
                                  g->web_rounds_json.ptr);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, g->id,
+        responses_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  g->prompt_tokens,
                                  g->completion_total + g->completion);
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, g->id,
+        final_response(j->fd, &j->req, g->id,
                        parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,

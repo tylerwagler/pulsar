@@ -171,7 +171,7 @@ bool server::send_model(int fd, const char *id) {
     buf b = {0};
     append_model_json(&b, s, id);
     buf_putc(&b, '\n');
-    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -186,7 +186,7 @@ bool server::send_models(int fd) {
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s, server_served_model_id(s));
     buf_puts(&b, "]}\n");
-    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -196,8 +196,7 @@ bool server::send_models(int fd) {
  * so a k8s liveness probe never restarts a server that is merely draining.
  * Lock-free, engine-free (safe on a client thread). */
 bool server::send_liveness(int fd) {
-    auto *s = this;
-    return http_response(fd, s->enable_cors, 200, "application/json",
+    return http_response(fd, 200, "application/json",
                          "{\"status\":\"ok\"}\n");
 }
 
@@ -238,7 +237,7 @@ bool server::send_health(int fd) {
         "\"kv_cache_usage\":%.6f}\n",
         draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
         uptime, n_slots, running, waiting, kv);
-    bool ok = http_response(fd, s->enable_cors, draining ? 503 : 200,
+    bool ok = http_response(fd, draining ? 503 : 200,
                             "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -256,7 +255,7 @@ bool server::send_version(int fd) {
         server_served_model_id(s),
         server_served_model_name(s),
         pulsar_session_ctx(s->sess));
-    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -264,7 +263,6 @@ bool server::send_version(int fd) {
 /* Root banner so a bare GET / (browsers, uptime probes) gets a 200 with the
  * version and a pointer to the real endpoints instead of a 404. */
 bool server::send_root(int fd) {
-    auto *s = this;
     buf b = {0};
     buf_printf(&b,
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
@@ -272,7 +270,7 @@ bool server::send_root(int fd) {
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
         "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\"]}\n",
         PULSAR_VERSION_STR);
-    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -590,7 +588,7 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
 
-    bool ok = http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
+    bool ok = http_response(fd, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -619,12 +617,12 @@ void *client_main(void *arg) {
 
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        http_error(fd, 400, "bad HTTP request");
         goto done;
     }
 
     if (!strcmp(hr.method, "OPTIONS")) {
-        http_response(fd, s->enable_cors, 204, NULL, "");
+        http_response(fd, 204, NULL, "");
         http_request_free(&hr);
         goto done;
     }
@@ -689,13 +687,13 @@ void *client_main(void *arg) {
                                      pulsar_session_ctx(s->sess), &creq,
                                      cerr, sizeof(cerr)))
         {
-            http_error(fd, s->enable_cors, 400, cerr);
+            http_error(fd, 400, cerr);
             http_request_free(&hr);
             goto done;
         }
         buf cb = {0};
         buf_printf(&cb, "{\"input_tokens\":%d}\n", creq.prompt.len);
-        http_response(fd, s->enable_cors, 200, "application/json", cb.ptr);
+        http_response(fd, 200, "application/json", cb.ptr);
         buf_free(&cb);
         request_free(&creq);
         http_request_free(&hr);
@@ -721,14 +719,14 @@ void *client_main(void *arg) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
-        http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        http_error(fd, 404, "unknown endpoint");
         http_request_free(&hr);
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        http_error(fd, 400, err);
         goto done;
     }
     if (!req.model_from_request) {
@@ -736,7 +734,7 @@ void *client_main(void *arg) {
         req.model = xstrdup(server_served_model_id(s));
     }
     if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
+        http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
         request_free(&req);
         goto done;
     }
@@ -775,7 +773,7 @@ void *client_main(void *arg) {
             }
         }
     }
-    if (!enqueued) http_error(fd, s->enable_cors, 503, "server shutting down");
+    if (!enqueued) http_error(fd, 503, "server shutting down");
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);
