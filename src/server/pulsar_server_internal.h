@@ -1811,7 +1811,8 @@ bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens);
 double server_now_sec(void);
-void server_log(pulsar_log_type type, const char *fmt, ...);
+void server_log(pulsar_log_type type, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 int tool_memory_max_entries(const tool_memory *m);
 tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         const char *dsml,

@@ -1791,7 +1791,13 @@ void server::gen_step_finish(session_slot *sl) {
                 size_t dsml_snippet_len = 0;
                 const char *dsml_start = NULL;
                 const char *p;
-                for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len - 20; p++) {
+                /* g->text.len - 20 underflows (size_t) when the text is under
+                 * 20 bytes -- a bare 19-byte short tool-call marker with no
+                 * body reaches here -- making the bound ~2^64 and walking the
+                 * strncmp off the heap buffer. Scan every valid start offset
+                 * instead; g->text is a NUL-terminated buf, so each strncmp is
+                 * self-bounded at the terminator. */
+                for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len; p++) {
                     if ((strncmp(p, PULSAR_TOOL_CALLS_START, strlen(PULSAR_TOOL_CALLS_START)) == 0) ||
                         (strncmp(p, PULSAR_TOOL_CALLS_START_SHORT, strlen(PULSAR_TOOL_CALLS_START_SHORT)) == 0) ||
                         (strncmp(p, "<tool_calls>", 12) == 0)) {
