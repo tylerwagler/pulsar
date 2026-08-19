@@ -1712,6 +1712,7 @@ bool sse_headers(int fd);
 bool sse_error_event(int fd, const request *r, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
 int clamp_usage_tokens(int value, int max);
+void resolve_cache_split(int *cache_read, int *cache_write, int total);
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens);
 /* Emit the additive ",\"timings\":{...}" fragment (leading comma included) from

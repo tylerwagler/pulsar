@@ -471,8 +471,7 @@ static void append_responses_usage_json(buf *b, const request *r,
                                         int input_tokens, int output_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
-    cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
-    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
+    resolve_cache_split(&cached_tokens, &cache_write_tokens, input_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
         "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"

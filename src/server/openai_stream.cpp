@@ -185,14 +185,22 @@ int clamp_usage_tokens(int value, int max) {
     return value;
 }
 
+/* The cache read/write split reported to clients: read is capped at the
+ * prompt size, write at what read leaves. Single-sourced so all three
+ * protocol usage emitters (OpenAI/Anthropic/Responses) apply the same policy
+ * -- the order (read before write) is a contract they must not drift on. */
+void resolve_cache_split(int *cache_read, int *cache_write, int total) {
+    *cache_read = clamp_usage_tokens(*cache_read, total);
+    *cache_write = clamp_usage_tokens(*cache_write, total - *cache_read);
+}
+
 
 
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
-    cached_tokens = clamp_usage_tokens(cached_tokens, prompt_tokens);
-    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cached_tokens);
+    resolve_cache_split(&cached_tokens, &cache_write_tokens, prompt_tokens);
     /* OpenAI defines cached_tokens as prompt tokens retrieved from cache.
      * Newly-prefilled tokens are useful to expose, but they are a DS4 extension
      * and must stay separate so OpenAI-compatible clients do not over-count
