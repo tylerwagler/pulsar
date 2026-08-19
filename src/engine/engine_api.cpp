@@ -249,6 +249,7 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 void pulsar_session_invalidate(pulsar_session *s) { s->invalidate(); }
+void pulsar_session_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
 int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
 int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
 uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) { return s ? s->prefill_quantum_min_suffix() : 0; }

@@ -488,6 +488,10 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void pulsar_session_invalidate(pulsar_session *s);
+/* Trim the committed history back to pos, keeping the KV below it live. For
+ * dropping trailing tokens the client never saw (mid-block speculative stop);
+ * rewound rows are overwritten by the next prefill/eval. */
+void pulsar_session_rewind(pulsar_session *s, int pos);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);

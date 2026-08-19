@@ -1598,9 +1598,23 @@ void server::gen_step_decode(session_slot *sl) {
                  * live KV frontier disagree with every client-visible byte —
                  * the thinking-tool checkpoint binds on exactly that identity
                  * and the next turn would continue over ghost tokens.
-                 * Invalidate, matching the stop-string precedent (a fresh
-                 * prefill rebuilds from the emitted text). */
-                if (ti + 1 < ntok) pulsar_session_invalidate(s->sess);
+                 * REWIND exactly the ghost tail, keeping the live KV for
+                 * everything the client saw. This used to invalidate the
+                 * whole session, which nuked the entire warm conversation on
+                 * every mid-block tool-call stop — under an agentic client
+                 * that ends nearly every turn in a tool call, that was a
+                 * near-coin-flip full re-prefill per turn (root-caused
+                 * 2026-08-19 from the live trace: remember live=0 ->
+                 * no-live-checkpoint -> 19,886-token rebuild). */
+                if (ti + 1 < ntok) {
+                    const int ghost = ntok - (ti + 1);
+                    const int target = pulsar_session_pos(s->sess) - ghost;
+                    pulsar_session_rewind(s->sess, target);
+                    server_log(PULSAR_LOG_KVCACHE,
+                               "pulsar-server: spec block stopped mid-block: "
+                               "rewound %d ghost tokens to pos %d",
+                               ghost, target);
+                }
                 stop_decode = true;
                 break;
             }

@@ -1239,6 +1239,28 @@ void pulsar_session::invalidate() {
 }
 
 
+/* Trim the committed history back to pos WITHOUT touching the KV content
+ * below it. The caller owns the invariant that positions >= pos were never
+ * exposed to the client (ghost tokens from a mid-block speculative stop);
+ * the next prefill/eval overwrites their rows. Restored 2026-08-19: this was
+ * deleted as callerless the same morning, then the spec mid-block stop path
+ * turned out to need exactly it (it was full-session invalidate before,
+ * which threw away the whole live KV on every mid-block tool-call stop). */
+void pulsar_session::rewind(int pos) {
+    auto *s = this;
+    if (pos < 0) pos = 0;
+    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    s->checkpoint.len = pos;
+    s->spec.dspark_n_pending = 0;
+    s->spec.spec_carry_valid = false;
+    spec_quench_reset(s);
+    /* Rewound positions' drafter rows are stale; empty the window (it refills
+     * from the prompt capture on the next prefill, or from commits). */
+    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
+    s->graph.dspark_prompt_n = 0;
+}
+
+
 int pulsar_session::pos() {
     auto *s = this;
     return s->checkpoint.len;

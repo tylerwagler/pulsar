@@ -1603,6 +1603,7 @@ struct pulsar_session {
     int eval_speculative_block(int first_token, int max_tokens, int eos_token,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
     void invalidate();
+    void rewind(int pos);
     int pos();
     int ctx();
     uint32_t prefill_quantum_min_suffix() const;
