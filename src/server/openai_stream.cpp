@@ -39,6 +39,22 @@ bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+/* Anthropic error envelope: the Messages API wraps the error object in a
+ * top-level {"type":"error", ...}, and the Anthropic SDK keys on that
+ * discriminator -- an OpenAI-shaped {"error":{...}} surfaces as a generic
+ * unknown APIError instead of a typed InvalidRequestError. The
+ * context-length path already emits this shape; every other 4xx on the
+ * /v1/messages surface must too. */
+bool http_error_anthropic(int fd, int code, const char *msg) {
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+    json_escape(&b, msg);
+    buf_puts(&b, "}}\n");
+    bool ok = http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 
 
 static const char *context_length_error_param(const request *r) {

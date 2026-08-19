@@ -1699,6 +1699,7 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
                                          const tool_schema_orders *orders);
 bool http_response(int fd, int code, const char *type, const char *body);
 bool http_error(int fd, int code, const char *msg);
+bool http_error_anthropic(int fd, int code, const char *msg);
 void request_forced_tool_seed(const request *r, buf *out);
 void request_apply_forced_tool_prefill(request *r);
 bool request_exceeds_context(const request *r, int ctx_size);

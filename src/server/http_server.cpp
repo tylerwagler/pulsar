@@ -687,7 +687,7 @@ void *client_main(void *arg) {
                                      pulsar_session_ctx(s->sess), &creq,
                                      cerr, sizeof(cerr)))
         {
-            http_error(fd, 400, cerr);
+            http_error_anthropic(fd, 400, cerr);
             http_request_free(&hr);
             goto done;
         }
@@ -704,9 +704,12 @@ void *client_main(void *arg) {
     char err[160];
     bool ok;
     ok = false;
+    bool anthropic_surface;
+    anthropic_surface = false;
     int ctx_size;
     ctx_size = pulsar_session_ctx(s->sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+        anthropic_surface = true;
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -726,7 +729,8 @@ void *client_main(void *arg) {
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, 400, err);
+        if (anthropic_surface) http_error_anthropic(fd, 400, err);
+        else http_error(fd, 400, err);
         goto done;
     }
     if (!req.model_from_request) {

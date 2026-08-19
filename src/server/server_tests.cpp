@@ -456,6 +456,41 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
 
 
 
+/* Generic 4xx on the Anthropic surface must use the {"type":"error", ...}
+ * envelope (the SDK's discriminator), not the OpenAI {"error":{...}} shape --
+ * every /v1/messages parse failure, not just context-length. */
+static void test_error_envelope_shape_per_protocol(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_anthropic(sv[0], 400, "bad field"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+        TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\":") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"message\":\"bad field\"") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error(sv[0], 400, "bad field"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        /* OpenAI shape: NO top-level "type":"error" wrapper */
+        TEST_ASSERT(strstr(out, "{\"error\":{\"message\":") != NULL);
+        TEST_ASSERT(strstr(out, "{\"type\":\"error\"") == NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+
+
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -5397,6 +5432,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
+    test_error_envelope_shape_per_protocol();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
