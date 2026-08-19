@@ -93,10 +93,14 @@ static int g_model_load_progress_tty;
 
 /* One reservation per slot; see pulsar_cuda_scratch.h for why there is more
  * than one.  Indexed by CUDA_SCRATCH_MAIN / CUDA_SCRATCH_MMQ. */
-static void *g_cuda_tmp[CUDA_SCRATCH_SLOTS];
+/* thread_local: the scratch arena is per GPU-submitting thread. A second
+ * decode thread needs its own arena (concurrent submits cannot share one
+ * bump buffer); teardown then frees the calling thread's slots, and a
+ * worker's arena is reclaimed at process exit. Matches g_act_slots. */
+static thread_local void *g_cuda_tmp[CUDA_SCRATCH_SLOTS];
 
 
-static uint64_t g_cuda_tmp_bytes[CUDA_SCRATCH_SLOTS];
+static thread_local uint64_t g_cuda_tmp_bytes[CUDA_SCRATCH_SLOTS];
 
 
 static void *g_model_stage_raw[4];

@@ -1437,6 +1437,11 @@ __global__ static void attention_decode_split_merge_kernel(
 #define PULSAR_DEC_SPLITKV_S 8u
 #define PULSAR_DEC_SPLITKV_MAX_TOKENS 8u
 #define PULSAR_DEC_SPLITKV_MAX_HEADS 128u
+/* CONCURRENCY (multi-stream decode, mid-roadmap): a single shared __device__
+ * partials buffer is safe only while one thread submits decode. It CANNOT be
+ * made thread_local (device globals are per-context, not per-host-thread); a
+ * second concurrent attention launch would clobber these partials. The fix is
+ * per-stream/per-call scratch, not a keyword change. */
 static __device__ float g_dec_splitkv_part_o[PULSAR_DEC_SPLITKV_MAX_TOKENS *
         PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 512u];
 static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *

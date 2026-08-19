@@ -675,6 +675,12 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
  * E4M3 data[in,out]col + swizzled E8M0 scale. one warp per (out,kb). */
 
 
+/* CONCURRENCY (multi-stream decode, mid-roadmap): this map + the g_fp8_fc_*
+ * front cache are mutated on the cold submit path (lazy insert / rehash), so a
+ * second decode thread would hit iterator invalidation. thread_local is the
+ * intended fix, but it must be done together with g_mxfp8_lt_offsets below
+ * (which decides the pre-stored fast path) so the two do not desync -- not a
+ * blind keyword change. Do it as part of the multi-stream work. */
 static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
 
 /* Offsets whose MXFP8 weight is PRE-STORED in the mmap in the exact device

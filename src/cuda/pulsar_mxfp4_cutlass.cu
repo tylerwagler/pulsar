@@ -972,8 +972,11 @@ __global__ static void e4m3_act_pack_kernel(uint8_t *q, uint8_t *sf, const float
 /* Persistent activation round-trip buffers, grown on demand and reused across
  * layers/calls -- single GPU-submission thread, same convention as the other
  * static caches. */
-static float *g_fp4_gemv_actbuf = nullptr;
-static size_t g_fp4_gemv_actbuf_floats = 0;
+/* thread_local: one GPU-submitting thread owns its own scratch; a second
+ * decode thread must not share this grow/free/realloc buffer (double-free +
+ * silent overwrite). Matches the g_act_slots / DsparkReduceBufs convention. */
+static thread_local float *g_fp4_gemv_actbuf = nullptr;
+static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
 // down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
