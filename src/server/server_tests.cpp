@@ -456,6 +456,52 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
 
 
 
+/* logprob_stream_ready is the byte-watermark math that decides which ledger
+ * entries each SSE chunk releases -- the core of the stream-vs-non-stream
+ * concatenation invariant. It advances from lg->streamed while an entry's
+ * end_off is at/below the watermark, so entries release in order, each once,
+ * and never before the chunk that carries their token bytes. A bug here
+ * double-emits or drops a token's logprobs across a chunk boundary. */
+static void test_logprob_stream_ready_watermark(void) {
+    logprob_entry v[4] = {0};
+    v[0].end_off = 3;
+    v[1].end_off = 7;
+    v[2].end_off = 7;   /* two entries share a watermark (a multi-token piece) */
+    v[3].end_off = 12;
+    logprob_ledger lg = {0};
+    lg.enabled = true;
+    lg.v = v;
+    lg.len = 4;
+    lg.streamed = 0;
+
+    /* disabled ledger releases nothing */
+    lg.enabled = false;
+    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 0);
+    lg.enabled = true;
+
+    /* watermark below the first entry: nothing ready */
+    TEST_ASSERT(logprob_stream_ready(&lg, 2) == 0);
+    /* exactly at an end_off releases that entry (<=, not <) */
+    TEST_ASSERT(logprob_stream_ready(&lg, 3) == 1);
+    /* between entries: only those fully covered */
+    TEST_ASSERT(logprob_stream_ready(&lg, 6) == 1);
+    /* both entries sharing end_off=7 release together, never split */
+    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);
+    TEST_ASSERT(logprob_stream_ready(&lg, 11) == 3);
+    /* the terminal SIZE_MAX chunk releases the remainder */
+    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+
+    /* advancing streamed makes it resume, not re-release: entries [0,streamed)
+     * are already on the wire and must not appear again. */
+    lg.streamed = 3;
+    TEST_ASSERT(logprob_stream_ready(&lg, 7) == 3);      /* nothing new at 7 */
+    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4);
+    lg.streamed = 4;
+    TEST_ASSERT(logprob_stream_ready(&lg, SIZE_MAX) == 4); /* all streamed, none left */
+}
+
+
+
 /* Generic 4xx on the Anthropic surface must use the {"type":"error", ...}
  * envelope (the SDK's discriminator), not the OpenAI {"error":{...}} shape --
  * every /v1/messages parse failure, not just context-length. */
@@ -5433,6 +5479,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
     test_error_envelope_shape_per_protocol();
+    test_logprob_stream_ready_watermark();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
