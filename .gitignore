@@ -2,6 +2,7 @@
 /TODO.md
 /gguf/
 *.o
+*.d
 *.dSYM/
 __pycache__/
 *.pyc
