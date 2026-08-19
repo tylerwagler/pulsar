@@ -3,18 +3,18 @@
 
 For each MoE layer L, measures the real end-to-end KL divergence between the
 all-cheap base model and the same model with layer L's routed experts swapped
-(via ds4 --expert-overlay) to the all-rich donor's lossless MXFP4 tensors.
+(via pulsar --expert-overlay) to the all-rich donor's lossless MXFP4 tensors.
 That KL is the distortion layer L's cheap quantization contributes to the
 output distribution == the benefit of promoting it, which is exactly the
 objective an allocator's knapsack trades against bytes.
 
 Method (AURA-era, measured-not-proxied): one --kl-ref-dump run on the base
 (the anchor), then one --kl-score run per layer with the overlay applied.
-Runs are strictly serial (ds4 holds an instance lock). Resumable: layers
+Runs are strictly serial (pulsar holds an instance lock). Resumable: layers
 already present in --out are skipped.
 
 Usage:
-  measure_layer_kl.py --ds4 ./ds4 --base cheap.gguf --donor rich.gguf \
+  measure_layer_kl.py --ds4 ./pulsar --base cheap.gguf --donor rich.gguf \
       --calib gguf-tools/imatrix/dataset/rendered_prompts.txt \
       --out kl.json [--layers 0-42] [--tokens 2048] [--ctx 4096] [--stride 4]
 

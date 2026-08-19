@@ -892,7 +892,7 @@ typedef struct {
  * distinct conversations (measured 3–8 tokens beyond the header across real
  * conversation pairs in the task-#24 bounce repro — 64 gives ~8x margin)
  * while staying an order of magnitude below any warm state worth a slot:
- * the 512-token disk-snapshot floor (--kv-cache-min-tokens) and the
+ * the 512-token disk-snapshot floor (KV_CACHE_DEFAULT_MIN_TOKENS) and the
  * multi-thousand-token preambles the session pool exists for. Used only by
  * the routing decision (server_slot_match_is_trivial); prefill reuse of a
  * chosen slot still honors arbitrarily short common prefixes. */
@@ -1618,11 +1618,10 @@ bool parse_output_config_effort(const char **p, pulsar_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
 const char *server_model_id_from_engine(pulsar_engine *engine);
-/* Advertised model id ("id"/"root"/metrics): --served-model-id override if set,
- * else the built-in id. Must be HF-resolvable for HF-convention tokenizer tools. */
+/* Advertised model id ("id"/"root"/metrics): the built-in id derived from the
+ * loaded GGUF shape. */
 const char *server_served_model_id(const server *s);
-/* Advertised display name ("name"): --served-model-name override if set, else
- * the built-in shape name. Free-form; never used as a tokenizer/repo id. */
+/* Advertised display name ("name"): the built-in shape name. */
 const char *server_served_model_name(const server *s);
 void stop_list_clear(stop_list *stops);
 void stop_list_push(stop_list *stops, char *s);

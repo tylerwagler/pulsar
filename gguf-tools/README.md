@@ -35,7 +35,7 @@ python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 Then collect activation statistics with the DS4 runtime:
 
 ```sh
-./ds4 \
+./pulsar \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat \
@@ -45,7 +45,7 @@ Then collect activation statistics with the DS4 runtime:
 The imatrix file is useful immediately with this DS4 quantizer.  Generic GGUF
 tools need DS4-specific tensor-name mapping and per-expert slicing before they
 can use it correctly.  The accepted imatrix format is the legacy llama.cpp
-binary `.dat` file emitted by `ds4 --imatrix-out`.
+binary `.dat` file emitted by `pulsar --imatrix-out`.
 
 Generating this `.dat` file locally is possible, but slow: it runs the DS4
 prefill graph over the full calibration corpus and reads routed-MoE activation

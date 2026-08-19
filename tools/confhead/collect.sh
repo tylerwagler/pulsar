@@ -7,7 +7,7 @@
 #   out_dir gets: dump.bin, server.log, driver.log, manifest.jsonl, DONE
 #
 # Successor of temp/conf_collect2.sh (the argmax-era collector). Differences:
-# runs the merged v5mx artifact (drafter auto-detected, no --dspark), samples
+# runs the merged v5mx artifact (drafter auto-detected from the merged artifact), samples
 # at request temperature (labels = real p/q accept outcomes), and spans the
 # temp x workload x depth mixture instead of greedy-only ~1k ctx.
 #

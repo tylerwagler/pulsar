@@ -440,9 +440,10 @@ static const char *resolve_gguf_at(const char *dir, const char *name) {
 }
 
 /* Naming convention: gguf/ holds immutable versioned artifacts
- * (ds4flash-<variant>-<mods>-vN.gguf, dspark-<variant>-vN.gguf) plus two
- * ACTIVE-POINTER symlinks — model.gguf and dspark.gguf — that select what a
- * bare `pulsar-server` runs.  Deploy = repoint the symlink. */
+ * (ds4flash-<variant>-<mods>-vN.gguf) plus an ACTIVE-POINTER symlink —
+ * model.gguf — that selects what a bare `pulsar-server` runs (the drafter
+ * ships merged in the artifact, so there is no separate dspark pointer).
+ * Deploy = repoint the symlink. */
 static const char *resolve_default_gguf(const char *pointer) {
     const char *p;
     if ((p = resolve_gguf_at("gguf", pointer)) != NULL) return p;
@@ -490,8 +491,7 @@ static char *server_default_kv_disk_dir(const char *model_path) {
     }
     buf b = {0};
     /* Per the XDG spec a non-absolute XDG_CACHE_HOME is ignored (a relative
-     * value would key the cache off whatever the post---chdir cwd happens to
-     * be). */
+     * value would key the cache off whatever the process cwd happens to be). */
     const char *xdg = getenv("XDG_CACHE_HOME");
     if (xdg && xdg[0] == '/') {
         buf_printf(&b, "%s/ds4/kv-%s", xdg, key);
@@ -505,8 +505,7 @@ static char *server_default_kv_disk_dir(const char *model_path) {
 
 
 
-/* Resolve the effective disk KV cache directory after option parsing (and
- * after --chdir, so a relative model path realpaths from the project tree).
+/* Resolve the effective disk KV cache directory after option parsing.
  * Explicit --kv-disk-dir PATH behaves exactly as before; --kv-disk-dir "" or
  * --no-kv-disk opts out; otherwise the default above is filled in.  An
  * unresolvable or unusable directory must never be fatal — the server runs

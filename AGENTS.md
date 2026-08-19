@@ -98,7 +98,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
   smoke tests, no model required.
 - `./pulsar_test --logprob-vectors` compares against official-API vectors and
   pins `PULSAR_CUDA_PREFILL_CHUNK=2048`.
-- imatrix collection (`--imatrix-dataset` / `--imatrix-out`) requires `--cuda`.
+- imatrix collection uses `--imatrix-dataset` / `--imatrix-out` (CUDA-only, like all inference).
 
 ## Validation Culture
 

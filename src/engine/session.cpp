@@ -153,7 +153,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     auto *e = this;
     if (!e || !dataset_path || !output_path) return 1;
     if (e->backend != PULSAR_BACKEND_CUDA || !e->gpu_ready) {
-        fprintf(stderr, "pulsar: imatrix collection currently requires --cuda\n");
+        fprintf(stderr, "pulsar: imatrix collection requires a CUDA device (GPU init failed)\n");
         return 1;
     }
     if (ctx_size <= 0) ctx_size = 32768;

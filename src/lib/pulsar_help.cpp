@@ -388,7 +388,6 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
             opt(fp, c, "bench", "./pulsar-bench --prompt-file long.txt --ctx-max 32768");
         } else if (tool == PULSAR_HELP_EVAL) {
             opt(fp, c, "eval", "./pulsar-eval --questions 10 --ctx 100000");
-            opt(fp, c, "CPU debug", "./pulsar-eval --cpu --questions 1 --tokens 32");
         } else {
             opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf -c 100000");
         }

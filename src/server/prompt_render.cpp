@@ -335,9 +335,10 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
-    /* Render tool schemas before the client system content so
-     * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
-     * message instead of the much larger tool-schema region. */
+    /* Render tool schemas before the client system content so the cold
+     * boundary-trim (KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS) chops a dynamic
+     * tail from the client message instead of the much larger tool-schema
+     * region. */
     if (tool_schemas && tool_schemas[0]) {
         append_tools_prompt_text(&system, tool_schemas);
     }

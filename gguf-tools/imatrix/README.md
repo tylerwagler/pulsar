@@ -56,7 +56,7 @@ Flash and Pro.
 Flash example:
 
 ```sh
-./ds4 \
+./pulsar \
   -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat \
@@ -66,7 +66,7 @@ Flash example:
 Pro example with a smaller calibration budget:
 
 ```sh
-./ds4 \
+./pulsar \
   -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ds4-small.dat \
@@ -78,7 +78,7 @@ Pro example with a smaller calibration budget:
 Useful smoke-test limits:
 
 ```sh
-./ds4 \
+./pulsar \
   -m MODEL.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out /tmp/ds4-test.imatrix.dat \
