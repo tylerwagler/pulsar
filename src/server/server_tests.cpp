@@ -4941,32 +4941,48 @@ static void test_session_eviction_victim_selection(void) {
  * e2e gates rather than here. */
 static void test_slot_route_trivial_match_decision(void) {
     const int T = PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+    /* Legacy single-threshold behavior: share_ceiling == protect_floor == T. */
     /* zero common vs a warm 5.2k-token conversation: provision (the one
      * case the v0.2.0 gate did handle — behavior kept) */
-    TEST_ASSERT(server_slot_match_is_trivial(0, 5200, T));
+    TEST_ASSERT(server_slot_match_is_trivial(0, 5200, T, T));
     /* trivial common (template header only, the measured bounce shape):
      * THE FIX — a different conversation must not clobber a warm slot */
-    TEST_ASSERT(server_slot_match_is_trivial(4, 5200, T));
-    TEST_ASSERT(server_slot_match_is_trivial(9, 5200, T));
-    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 5200, T));
+    TEST_ASSERT(server_slot_match_is_trivial(4, 5200, T, T));
+    TEST_ASSERT(server_slot_match_is_trivial(9, 5200, T, T));
+    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 5200, T, T));
     /* real common (long shared prefix: a client resending a longer version
      * of the same prompt, or the documented stateless-continuation
      * pattern): reuse the warm slot, never provision away from it */
-    TEST_ASSERT(!server_slot_match_is_trivial(T, 5200, T));
-    TEST_ASSERT(!server_slot_match_is_trivial(5175, 5900, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(T, 5200, T, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(5175, 5900, T, T));
     /* empty slot: nothing to protect, reuse it (never "clobbers") */
-    TEST_ASSERT(!server_slot_match_is_trivial(0, 0, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(0, 0, T, T));
     /* short same-conversation continuation: common covers nearly the whole
      * slot state — stay on the warm slot even though common < T */
-    TEST_ASSERT(!server_slot_match_is_trivial(38, 40, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(38, 40, T, T));
     /* sub-threshold warm tail past the match: clobbering costs a sub-second
      * re-prefill, a fresh provisioning costs seconds — reuse (deliberate
      * semantic change from v0.2.0, which provisioned for pos in (0, T)) */
-    TEST_ASSERT(!server_slot_match_is_trivial(0, T - 1, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(0, T - 1, T, T));
     /* boundary: destroyed tail exactly at the threshold provisions */
-    TEST_ASSERT(server_slot_match_is_trivial(0, T, T));
-    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 2 * T - 1, T));
-    TEST_ASSERT(!server_slot_match_is_trivial(T - 1, 2 * T - 2, T));
+    TEST_ASSERT(server_slot_match_is_trivial(0, T, T, T));
+    TEST_ASSERT(server_slot_match_is_trivial(T - 1, 2 * T - 1, T, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(T - 1, 2 * T - 2, T, T));
+
+    /* Tools-client bounce: two unrelated Claude Code conversations share a
+     * large fixed tool/system prefix. The caller lifts share_ceiling to this
+     * job's anchor (say ~1800 tokens) while protect_floor stays T. A match at
+     * the shared-prefix depth must now read as TRIVIAL and provision fresh,
+     * where the old single-T classifier called it "real" and clobbered. */
+    const int CEIL = 1800;
+    TEST_ASSERT(server_slot_match_is_trivial(1500, 5200, CEIL, T));   /* the fix */
+    TEST_ASSERT(server_slot_match_is_trivial(CEIL - 1, 5200, CEIL, T));
+    /* genuine continuation past the shared scaffolding: not trivial, reuse */
+    TEST_ASSERT(!server_slot_match_is_trivial(CEIL, 5200, CEIL, T));
+    TEST_ASSERT(!server_slot_match_is_trivial(3000, 5200, CEIL, T));
+    /* raised ceiling must NOT change the protect side: a slot with only a
+     * sub-floor tail past a shared-prefix match is still reused, not protected */
+    TEST_ASSERT(!server_slot_match_is_trivial(1500, 1500 + T - 1, CEIL, T));
 }
 
 

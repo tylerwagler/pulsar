@@ -331,11 +331,18 @@ int server::provision_ctx_for_job(const job *j) const {
  * (unit-tested in cli_main.cpp). A candidate slot's token-prefix match is
  * TRIVIAL — grounds to prefer provisioning a fresh slot over reusing (and
  * clobbering) the candidate — only when BOTH hold:
- *   - common < trivial_tokens: the match is no deeper than the rendered
- *     template header plus incidental prologue overlap (threshold derived at
- *     startup, cli_main.cpp / PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS), so it
- *     does not indicate the same conversation;
- *   - slot_pos - common >= trivial_tokens: reuse would destroy a meaningful
+ *   - common < share_ceiling: the match is no deeper than the SHARED PREFIX
+ *     two UNRELATED conversations from the same client render before their
+ *     task-specific content. The static startup floor covers BOS + the
+ *     reasoning-effort preamble, but a tools-advertising client (Claude Code)
+ *     also renders a fixed ~1.7 KB tool-instruction block plus its schemas and
+ *     usually a stable system prompt into that prefix, byte-identical across
+ *     its conversations — hundreds to thousands of tokens the startup constant
+ *     cannot see. So the caller raises share_ceiling to this job's chat anchor
+ *     (the last user marker before the first assistant, i.e. the end of the
+ *     shared scaffolding), and a match no deeper than that does not indicate
+ *     the same conversation;
+ *   - slot_pos - common >= protect_floor: reuse would destroy a meaningful
  *     amount of some conversation's warm KV. When the slot holds less than
  *     that past the match, clobbering costs at worst a sub-threshold
  *     re-prefill (sub-second) — always cheaper than a multi-GiB,
@@ -343,13 +350,16 @@ int server::provision_ctx_for_job(const job *j) const {
  *     same-conversation continuations (whose common covers nearly the whole
  *     slot state) on their warm slot. An empty slot (slot_pos == 0) is
  *     never "clobbered": it is simply free.
+ * protect_floor stays the static startup threshold; only share_ceiling is
+ * lifted per job, so raising the ceiling never changes what counts as a slot
+ * "worth protecting".
  * Deliberate semantic change from v0.2.0 (common == 0 && pos > 0): a slot
  * holding only a sub-threshold warm tail past the match is now reused
  * (clobbered) rather than protected by a fresh provisioning — protecting
  * <threshold tokens of KV is never worth seconds of session create. */
 bool server_slot_match_is_trivial(int common, int slot_pos,
-                                  int trivial_tokens) {
-    return common < trivial_tokens && slot_pos - common >= trivial_tokens;
+                                  int share_ceiling, int protect_floor) {
+    return common < share_ceiling && slot_pos - common >= protect_floor;
 }
 
 
@@ -470,17 +480,36 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                    j->req.prompt_text ? strlen(j->req.prompt_text) : 0);
         return bound;
     }
+    /* The shared-prefix ceiling is per job, not a global constant: a
+     * tools-advertising client renders a large fixed tool/system block before
+     * any task content, so two UNRELATED conversations share far more than the
+     * startup BOS+preamble threshold. This job's chat anchor (end of the shared
+     * scaffolding) is that ceiling; without it, every fresh conversation's
+     * template-deep match reads as "related" and clobbers an unrelated warm
+     * slot (the round-robin bounce under Claude Code). protect_floor stays the
+     * static threshold. */
+    int share_ceiling = s->slot_trivial_common_tokens;
+    const int job_anchor = kv_cache_chat_anchor_pos(&s->kv, &j->req.prompt,
+                                                    pulsar_token_user(s->engine),
+                                                    pulsar_token_assistant(s->engine));
+    if (job_anchor > 0) {
+        const int anchor_ceiling =
+            job_anchor + PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS;
+        if (anchor_ceiling > share_ceiling) share_ceiling = anchor_ceiling;
+    }
     const bool best_clobbers_warm_state =
         best && server_slot_match_is_trivial(best_common,
                                              s->slot_frontier_pos(best),
+                                             share_ceiling,
                                              s->slot_trivial_common_tokens);
     if (!best || best_clobbers_warm_state) {
         if (best_clobbers_warm_state) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: slot routing: best match is trivial "
-                       "(common=%d pos=%d threshold=%d); preferring a fresh slot",
+                       "(common=%d pos=%d ceiling=%d floor=%d anchor=%d); "
+                       "preferring a fresh slot",
                        best_common, s->slot_frontier_pos(best),
-                       s->slot_trivial_common_tokens);
+                       share_ceiling, s->slot_trivial_common_tokens, job_anchor);
         }
         session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j),
                                              refusal);

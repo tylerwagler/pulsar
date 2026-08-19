@@ -1916,7 +1916,7 @@ int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 /* Trivial-match classifier for the router's choose-vs-provision decision
  * (defined in generate.cpp; unit-tested in cli_main.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
-                                         int trivial_tokens);
+                                         int share_ceiling, int protect_floor);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
