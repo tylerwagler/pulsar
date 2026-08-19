@@ -1958,7 +1958,23 @@ void server::gen_step_finish(session_slot *sl) {
         s->thinking_live_clear(sl);
     }
 
-    if (j->req.stream) {
+    if (!strcmp(final_finish, "error")) {
+        /* Internal generation failure (decode / bank-restore / etc.). Do NOT
+         * put finish_reason:"error" on the wire -- it is not a valid enum
+         * value and strict SDKs reject the chunk -- nor return HTTP 200 with
+         * empty content (which reads as a blank successful answer). Streaming:
+         * the 200 event-stream headers are already sent, so emit an SSE error
+         * event, matching the pre-generation failure path. Non-streaming: a
+         * real 500 with the protocol's error envelope. */
+        const char *emsg = g->err[0] ? g->err : "internal generation error";
+        if (j->req.stream) {
+            sse_error_event(j->fd, &j->req, emsg);
+        } else if (j->req.api == API_ANTHROPIC) {
+            http_error_anthropic(j->fd, 500, emsg);
+        } else {
+            http_error(j->fd, 500, emsg);
+        }
+    } else if (j->req.stream) {
         bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
