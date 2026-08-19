@@ -11,7 +11,7 @@ poor wall-clock one).
 
 Stdlib only, matching speed-bench/plot_speed.py.
 
-    ./tests/sse_decode_bench.py --port 8080 --prompt "Write a haiku" --max-tokens 128
+    ./tests/sse_decode_bench.py --port 8000 --prompt "Write a haiku" --max-tokens 128
 
 Emits a JSON record on stdout (--json-out to also write a file).
 
@@ -220,7 +220,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--model", default="ds4flash")
     p.add_argument("--prompt", default="Write a short technical paragraph about cache coherence.")
     p.add_argument("--max-tokens", type=int, default=128)

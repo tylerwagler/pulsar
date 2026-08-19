@@ -17,10 +17,10 @@ short identifiers tokenize differently from prose), so a single prompt shape
 would leave most of the surface unmeasured.
 
     # on a known-good build, once:
-    ./tests/decode_floor_gate.py --port 8080 --write-baseline
+    ./tests/decode_floor_gate.py --port 8000 --write-baseline
 
     # thereafter, per release:
-    ./tests/decode_floor_gate.py --port 8080 --json-out run.json
+    ./tests/decode_floor_gate.py --port 8000 --json-out run.json
 
 Exit status: 0 pass, 1 regression below floor, 2 harness/transport error.
 
@@ -98,7 +98,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--model", default="ds4flash")
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--timeout", type=float, default=900.0)

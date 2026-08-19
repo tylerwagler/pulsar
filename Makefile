@@ -348,8 +348,13 @@ warm-partial-fork-3way: pulsar-server
 # server rather than linking the engine.  Start it with --no-kv-disk: a warm disk
 # checkpoint skips prefill outright, which makes TTFT and wall-clock t/s
 # incomparable between runs.  Override the endpoint with SERVE_HOST/SERVE_PORT.
+# 8000 is where pulsar-server actually runs: tools/claude-harness/pulsar-model-router.py
+# listens on :8100 and relays everything that is not haiku-class to 127.0.0.1:8000, so
+# that is the port the harness, the router and these gates all have to agree on.  This
+# said 8080, which no part of the stack serves -- the gates below defaulted to an
+# endpoint that could only ever refuse the connection.
 SERVE_HOST ?= 127.0.0.1
-SERVE_PORT ?= 8080
+SERVE_PORT ?= 8000
 
 # Decode rate as the stream delivers it, reported alongside wall-clock.
 sse-decode-bench:

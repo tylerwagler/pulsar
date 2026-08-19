@@ -22,7 +22,7 @@ this replaces:
 The planted facts are deterministic in --seed, so a run is reproducible, and
 they are lexically unlike the filler so a hit cannot come from the padding.
 
-    ./tests/context_coherence_probe.py --port 8080 --depths 2048,8192,32768
+    ./tests/context_coherence_probe.py --port 8000 --depths 2048,8192,32768
 
 Exit status: 0 all depths met --min-score, 1 a depth fell below it,
 2 harness/transport error.
@@ -182,7 +182,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--model", default="ds4flash")
     p.add_argument("--depths", default="2048,8192,32768",
                    help="approximate context depths in WORDS (not tokens), comma separated")
