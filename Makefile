@@ -496,7 +496,19 @@ context-coherence-probe:
 # L064 record exactly which bytes moved and the experiment that proved it -- a
 # single-chunk prompt stayed bit-identical while a ring-reading one did not,
 # which is what established that the fast-math scale bucket is not idempotent.
-PREFILL_BASELINE_REF ?= 055239b
+# Re-baselined 2026-08-18 to 1a45cf3, which removed the global TF32 math mode
+# from the cuBLAS handle (f32 GEMMs now compute in f32).  Same rule as every
+# re-baseline above: the anchor is the LAST DELIBERATE NUMERICS CHANGE, and that
+# commit is one.  It moved every prefill logit at every depth and the compressed
+# KV bytes, because prefill runs the f32 arm for the compressor projections.
+#
+# Baseline hygiene, since a re-baseline is the one operation that can hide a bug:
+# 1a45cf3 differs from 86a3358 -- certified 10/10 with accept 0.4237 and comp fnv
+# 56db727d92480249 -- by EXACTLY this one change, and the other nine gates were
+# re-run green on 1a45cf3 BEFORE the blob was regenerated.  Re-baselining off a
+# tree that differs from a certified one by more than the intended change is how
+# a regression becomes the new reference.
+PREFILL_BASELINE_REF ?= 1a45cf3
 PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
