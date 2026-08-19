@@ -926,7 +926,7 @@ to start over cache placement.
 ./pulsar-server --no-kv-disk                           # opt out (or --kv-disk-dir "")
 ```
 
-The disk budget defaults to 4096 MiB (`--kv-disk-space-mb`); least-valuable
+The disk budget defaults to 65536 MiB (`--kv-disk-space-mb`); least-valuable
 checkpoints are evicted when the budget fills. Snapshot behavior is unchanged
 by the default-on switch: files are written with ordinary write + fsync + rename
 into place, and the store validates the model variant and the rendered byte

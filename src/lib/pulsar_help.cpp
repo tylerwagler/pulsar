@@ -282,7 +282,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 4096");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 65536");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
     opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
     opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");

@@ -10,7 +10,12 @@
 
 
 #define PULSAR_KVSTORE_FIXED_HEADER 48u
-#define PULSAR_KVSTORE_DEFAULT_MB 4096
+/* 64 GiB: one full-context Claude Code snapshot is ~3 GiB, so the old 4 GiB
+ * default held ONE conversation and every new one evicted the last
+ * (disk-cache-full churn, observed 2026-08); checkpoints are regenerable
+ * cache on a store with hundreds of GB free, so size for ~20 warm
+ * conversations, not for scarcity. */
+#define PULSAR_KVSTORE_DEFAULT_MB 65536
 #define PULSAR_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 
 #define PULSAR_KVSTORE_EXT_TOOL_MAP          (1u << 0)
