@@ -1590,34 +1590,35 @@ void server::gen_step_decode(session_slot *sl) {
          * the first token), so no meaningful decode-loop overhead. */
         if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
 
+        int emitted = 0;
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            if (s->gen_emit_token(sl, toks[ti])) {
-                /* A speculative block can stop mid-block (tool-call end, stop
-                 * string): tokens ti+1..ntok-1 are already committed to the
-                 * bank's history but never emitted. Leaving them makes the
-                 * live KV frontier disagree with every client-visible byte —
-                 * the thinking-tool checkpoint binds on exactly that identity
-                 * and the next turn would continue over ghost tokens.
-                 * REWIND exactly the ghost tail, keeping the live KV for
-                 * everything the client saw. This used to invalidate the
-                 * whole session, which nuked the entire warm conversation on
-                 * every mid-block tool-call stop — under an agentic client
-                 * that ends nearly every turn in a tool call, that was a
-                 * near-coin-flip full re-prefill per turn (root-caused
-                 * 2026-08-19 from the live trace: remember live=0 ->
-                 * no-live-checkpoint -> 19,886-token rebuild). */
-                if (ti + 1 < ntok) {
-                    const int ghost = ntok - (ti + 1);
-                    const int target = pulsar_session_pos(s->sess) - ghost;
-                    pulsar_session_rewind(s->sess, target);
-                    server_log(PULSAR_LOG_KVCACHE,
-                               "pulsar-server: spec block stopped mid-block: "
-                               "rewound %d ghost tokens to pos %d",
-                               ghost, target);
-                }
+            const bool stop = s->gen_emit_token(sl, toks[ti]);
+            emitted = ti + 1;
+            if (stop) {
                 stop_decode = true;
                 break;
             }
+        }
+        /* A speculative block can end mid-block two ways — a stop inside the
+         * block (tool-call end, stop string) or the length cap exhausting
+         * g->max_tokens partway through — and both leave toks[emitted..ntok)
+         * committed to the bank's history but never emitted. Leaving them
+         * makes the live KV frontier disagree with every client-visible
+         * byte: the thinking-tool checkpoint binds on exactly that identity
+         * and the next turn would continue over ghost tokens. REWIND exactly
+         * the ghost tail, keeping the live KV for everything the client saw.
+         * The stop case used to invalidate the WHOLE session (a near-coin-
+         * flip full re-prefill per agentic turn; root-caused 2026-08-19 from
+         * the live trace: remember live=0 -> no-live-checkpoint ->
+         * 19,886-token rebuild), and the length case had NO handling at all. */
+        if (emitted < ntok) {
+            const int ghost = ntok - emitted;
+            const int target = pulsar_session_pos(s->sess) - ghost;
+            pulsar_session_rewind(s->sess, target);
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: spec block ended mid-block (%s): "
+                       "rewound %d ghost tokens to pos %d",
+                       stop_decode ? "stop" : "length cap", ghost, target);
         }
         if (stop_decode) break;
     }
