@@ -114,12 +114,6 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
     return v;
 }
 
-static pulsar_backend parse_backend(const char *s) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar: invalid backend: %s\n", s);
-    fprintf(stderr, "pulsar: valid backends are: cuda\n");
-    exit(2);
-}
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
@@ -1636,10 +1630,6 @@ static cli_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

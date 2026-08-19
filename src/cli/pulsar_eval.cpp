@@ -1551,12 +1551,6 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++*i];
 }
 
-static pulsar_backend parse_backend(const char *s, const char *opt) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "pulsar-eval: valid backends are: cuda\n");
-    exit(2);
-}
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
@@ -1620,10 +1614,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.pause_ms = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

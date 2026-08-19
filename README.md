@@ -1158,7 +1158,7 @@ binary; the `--dump-*` probes live on the `pulsar` development CLI (`make pulsar
 ./pulsar-server --trace /tmp/pulsar-trace.txt ...
 ./pulsar --dump-tokens -p "..."
 ./pulsar --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./pulsar --dump-logits /tmp/logits.json --cuda --nothink --prompt-file prompt.txt
+./pulsar --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as

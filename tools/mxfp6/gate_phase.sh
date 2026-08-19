@@ -29,7 +29,7 @@ for pair in "$@"; do
     mkdir -p "$outdir"
     if ! wait_for_ram; then say "ABORT $outdir: RAM never freed"; exit 1; fi
     say "dump: $model -> $outdir"
-    "$BENCH" -m "$model" --cuda --prompt-file "$PROMPT" \
+    "$BENCH" -m "$model" --prompt-file "$PROMPT" \
         --ctx-start 64 --ctx-max 2048 --gen-tokens 0 \
         --dump-frontier-logits-dir "$outdir" \
         --csv "$outdir/bench.csv" >> "$LOG" 2>&1

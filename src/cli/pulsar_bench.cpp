@@ -88,12 +88,6 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++*i];
 }
 
-static pulsar_backend parse_backend(const char *s, const char *opt) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "pulsar-bench: valid backends are: cuda\n");
-    exit(2);
-}
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
@@ -184,10 +178,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--warm-weights")) {

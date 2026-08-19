@@ -52,7 +52,7 @@ for f in "$SUITE"/*.txt; do
     js="$OUT/jsonl/$name.jsonl"
     if [ -f "$js" ]; then echo "   skip $name (done)"; continue; fi
     echo "   -- $name"
-    "$BIN" -m "$MODEL" --cuda --ctx "$CTX" --kl-stride "$STRIDE" \
+    "$BIN" -m "$MODEL" --ctx "$CTX" --kl-stride "$STRIDE" \
         --kl-file "$f" --kl-ref-dump "$klrf"
     python3 "$TOOLS/pulsar_kldump_to_jsonl.py" "$klrf" \
         --name "$name" --topk "$TOPK" \

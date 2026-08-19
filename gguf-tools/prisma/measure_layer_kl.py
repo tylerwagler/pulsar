@@ -119,7 +119,7 @@ def main():
     layers = parse_layers(a.layers)
     results = json.load(open(a.out)) if os.path.exists(a.out) else {}
 
-    common = [a.ds4, "-m", a.base, "--cuda", "--kl-file", a.calib,
+    common = [a.ds4, "-m", a.base, "--kl-file", a.calib,
               "-n", str(a.tokens), "-c", str(a.ctx), "--kl-stride", str(a.stride)]
 
     if not os.path.exists(ref_dump):

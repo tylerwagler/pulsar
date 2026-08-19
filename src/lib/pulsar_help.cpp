@@ -382,7 +382,7 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
     title(fp, c, "Examples");
     if (topic_is(topic, "runtime")) {
         if (tool == PULSAR_HELP_SERVER) {
-            opt(fp, c, "CUDA API", "./pulsar-server -m ds4flash.gguf --cuda --ctx 100000");
+            opt(fp, c, "CUDA API", "./pulsar-server -m ds4flash.gguf --ctx 100000");
         } else if (tool == PULSAR_HELP_AGENT) {
             opt(fp, c, "agent", "./pulsar-agent -m ds4flash.gguf --ctx 100000");
         } else if (tool == PULSAR_HELP_BENCH) {
@@ -391,7 +391,7 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
             opt(fp, c, "eval", "./pulsar-eval --questions 10 --ctx 100000");
             opt(fp, c, "CPU debug", "./pulsar-eval --cpu --questions 1 --tokens 32");
         } else {
-            opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf --cuda -c 100000");
+            opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf -c 100000");
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./pulsar -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");

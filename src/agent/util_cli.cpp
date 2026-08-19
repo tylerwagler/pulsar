@@ -160,11 +160,6 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 
 
-static pulsar_backend parse_backend(const char *s) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-agent: invalid backend: %s\n", s);
-    exit(2);
-}
 
 
 
@@ -257,10 +252,6 @@ agent_config parse_options(int argc, char **argv) {
             c.gen.think_mode = PULSAR_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
-        } else if (!strcmp(arg, "--backend")) {
-            c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {

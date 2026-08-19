@@ -417,15 +417,6 @@ void usage(FILE *fp, const char *topic) {
 
 
 
-static pulsar_backend parse_backend_arg(const char *s, const char *arg) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: invalid %s value: %s", arg, s);
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: valid server backends are: cuda");
-    exit(2);
-}
-
-
-
 static pulsar_backend default_server_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
@@ -608,10 +599,6 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--backend")) {
-            c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else {
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: unknown option: %s", arg);
             usage(stderr, NULL);
