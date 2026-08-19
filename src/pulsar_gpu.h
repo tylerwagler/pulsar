@@ -613,17 +613,19 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Gathered dequant of n_sel rows selected by `rows` (indices into a cap_rows MX
- * cache) into f32 `out`: [n_sel][head_dim] when transpose==0, or [head_dim][n_sel]
- * when transpose!=0 (builds a PV V^T operand). The attention gather primitive. */
-int pulsar_gpu_dsv4_indexer_qat_tensor(
+/* Fused rope + QAT for the indexer q projection: one launch replacing the
+ * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that
+ * sequence (shared rotation device fn, same QAT body, same order). */
+int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
         pulsar_gpu_tensor *x,
-        uint32_t          n_rows,
-        uint32_t          head_dim);
+        uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions);
 
 /* QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
  * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
- * bit-identical to pulsar_gpu_dsv4_indexer_qat_tensor. */
+ * bit-identical to the fused rope+QAT entry above. */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,

@@ -1424,7 +1424,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM,
                                                           g->batch_qr_norm,
                                                           n_tokens);
-            if (ok) ok = pulsar_gpu_rope_tail_tensor(g->batch_indexer_q,
+            /* Fused rope + QAT: one launch over batch_indexer_q instead of the
+             * old rope_tail + qat pair (bit-exact, see the kernel note). */
+            if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->batch_indexer_q,
                                                     n_tokens,
                                                     PULSAR_N_INDEXER_HEAD,
                                                     PULSAR_N_INDEXER_HEAD_DIM,
@@ -1439,9 +1441,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                     PULSAR_ROPE_YARN_BETA_FAST,
                                                     PULSAR_ROPE_YARN_BETA_SLOW,
                                                     mseq ? g->batch_positions : NULL) != 0;
-            if (ok) ok = pulsar_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
-                                                          n_tokens * PULSAR_N_INDEXER_HEAD,
-                                                          PULSAR_N_INDEXER_HEAD_DIM) != 0;
             if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_indexer_weights,
                                               model,
                                               layer->indexer_proj,

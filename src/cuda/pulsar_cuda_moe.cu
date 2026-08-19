@@ -457,13 +457,16 @@ __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uin
 
 /* One block per sorted-pair slot s: locate its expert e (offsets[e] <= s < offsets[e+1]), place
  * the token's activation row at padded row padded_off[e] + (s - offsets[e]), record the routing
- * weight and the originating pair index (padded_pair[R]) for the later scatter. */
+ * weight and the originating pair index (padded_pair[R]). The grouped path also records the
+ * INVERSE map (pair_slot[pair] = R) so its reduction reads the padded GEMM output directly;
+ * the mixed path passes pair_slot = NULL and still scatters through padded_pair. */
 /* row_src_tok[R] records which token row R came from, so a consumer that already
  * has that token encoded (the CUTLASS path reads the activation cache's E4M3)
  * can gather the codes itself.  When it does, x_gathered is NULL and the f32 row
  * copy below -- the expensive half of this kernel -- is skipped entirely. */
 __global__ static void moe_padded_gather_kernel(
         float *x_gathered, float *w_gathered, int32_t *padded_pair, int32_t *row_src_tok,
+        int32_t *pair_slot,
         const float *x, const float *weights,
         const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *padded_off,
         uint32_t pair_count, uint32_t n_total, uint32_t n_expert, uint32_t in_dim) {
@@ -488,8 +491,32 @@ __global__ static void moe_padded_gather_kernel(
     if (threadIdx.x == 0) {
         w_gathered[R] = weights[pair];
         padded_pair[R] = (int32_t)pair;
+        if (pair_slot) pair_slot[pair] = (int32_t)R;
         if (row_src_tok) row_src_tok[R] = (int32_t)tok;
     }
+}
+
+/* Per-token reduction reading the grouped GEMM's 128-row-padded output
+ * DIRECTLY through the pair->padded-row map, in the same ascending-expert
+ * order as moe_sum_kernel: identical values, identical addition order,
+ * bit-exact. This is what lets the grouped path skip the scatter's full
+ * round trip of the flat down buffer (a write + re-read of
+ * n_tokens*n_expert*out_dim f32 per layer). Rows a pair never claimed carry
+ * -1, matching the padded_pair<0 convention, and contribute nothing. */
+__global__ static void moe_sum_padded_kernel(
+        float *out, const float *ffn_out, const int32_t *pair_slot,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const int32_t R = pair_slot[(uint64_t)tok * n_expert + e];
+        if (R >= 0) acc += ffn_out[(uint64_t)R * out_dim + row];
+    }
+    out[gid] = acc;
 }
 
 /* One block per padded row R: scatter the pre-weighted FFN result back to the flat down buffer at
@@ -574,6 +601,7 @@ static int routed_moe_launch_cutlass_grouped(
     const uint64_t xg_bytes = cached_act ? 0 : padded_upper * expert_in_dim * sizeof(float);
     const uint64_t wg_bytes = padded_upper * sizeof(float);
     const uint64_t ppair_bytes = padded_upper * sizeof(int32_t);
+    const uint64_t pslot_bytes = (uint64_t)pair_count * sizeof(int32_t);
     const uint64_t rsrc_bytes = cached_act ? padded_upper * sizeof(int32_t) : 0;
     const uint64_t ffn_bytes = padded_upper * out_dim * sizeof(float);
     const uint64_t grp_bytes = pulsar_cutlass_grouped_moe_scratch_bytes(
@@ -594,6 +622,7 @@ static int routed_moe_launch_cutlass_grouped(
         cutlass_moe_align_up(xg_bytes, align) +
         cutlass_moe_align_up(wg_bytes, align) +
         cutlass_moe_align_up(ppair_bytes, align) +
+        cutlass_moe_align_up(pslot_bytes, align) +
         cutlass_moe_align_up(rsrc_bytes, align) +
         cutlass_moe_align_up(ffn_bytes, align) +
         cutlass_moe_align_up(grp_bytes, align);
@@ -608,10 +637,11 @@ static int routed_moe_launch_cutlass_grouped(
     float    *x_gathered   = (float *)cuda_arena_take(&ar, xg_bytes, align);
     float    *w_gathered   = (float *)cuda_arena_take(&ar, wg_bytes, align);
     int32_t  *padded_pair  = (int32_t *)cuda_arena_take(&ar, ppair_bytes, align);
+    int32_t  *pair_slot    = (int32_t *)cuda_arena_take(&ar, pslot_bytes, align);
     int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_bytes, align);
     float    *ffn_out      = (float *)cuda_arena_take(&ar, ffn_bytes, align);
     uint8_t  *grp_scratch  = (uint8_t *)cuda_arena_take(&ar, grp_bytes, align);
-    if (!grp_scratch) return 0;   /* take() latches: one check covers all eleven */
+    if (!grp_scratch) return 0;   /* take() latches: one check covers all twelve */
     /* The two flag-dependent operands, exactly as before. */
     if (cached_act) x_gathered = NULL;
     else            row_src_tok = NULL;
@@ -622,6 +652,9 @@ static int routed_moe_launch_cutlass_grouped(
     if (ok && x_gathered) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_bytes), "moe_grouped wg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_bytes), "moe_grouped ppair clear");
+    /* -1: a pair the gather never claims must read as "no row" in the padded
+     * sum, not as padded row 0. Every real pair is written by the gather. */
+    if (ok) ok = cuda_ok(cudaMemsetAsync(pair_slot, 0xFF, pslot_bytes), "moe_grouped pslot clear");
     /* -1 everywhere: rows the gather never visits ARE the padding rows, and the
      * E4M3 gather zero-fills exactly those (what the pre-zeroed f32 rows gave). */
     if (ok && row_src_tok) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_bytes),
@@ -644,6 +677,7 @@ static int routed_moe_launch_cutlass_grouped(
     }
     if (ok) {
         moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, row_src_tok,
+                pair_slot,
                 (const float *)x->ptr, (const float *)weights->ptr,
                 sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped gather launch");
@@ -657,17 +691,16 @@ static int routed_moe_launch_cutlass_grouped(
                 act_q, act_sf, act_kbp, row_src_tok);
         if (rc != 0) return 0;
     }
-    if (ok) {
-        moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>((float *)down->ptr, ffn_out,
-                padded_pair, (uint32_t)padded_upper, out_dim);
-        ok = cuda_ok(cudaGetLastError(), "moe_grouped padded scatter launch");
-    }
     if (!ok) return 0;
 
+    /* Reduce straight from the padded GEMM output through pair_slot -- the
+     * flat `down` buffer is NOT touched on this path (its scatter + re-read
+     * used to move 2*n_tokens*n_expert*out_dim f32 per layer for nothing).
+     * The per-expert fallback and the MMQ arms still write `down`. */
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
-    moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-            (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-    return cuda_ok(cudaGetLastError(), "moe_grouped sum launch");
+    moe_sum_padded_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+            (float *)out->ptr, ffn_out, pair_slot, out_dim, n_expert, n_tokens);
+    return cuda_ok(cudaGetLastError(), "moe_grouped padded sum launch");
 }
 
 /* Grouped single-launch path, with the legacy per-expert loop kept as the
@@ -979,6 +1012,7 @@ static int routed_moe_launch_mixed40(
              * pulsar_cutlass_grouped_proj, which has its own packer and no
              * pre-encoded-activation entry yet, so it still gathers f32. */
             moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, NULL,
+                    NULL /* pair_slot: this path scatters, no inverse map */,
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");

@@ -712,7 +712,8 @@ bool gpu_graph_encode_decode_layer(
                                                               indexer_q_dim,
                                                               g->qr_norm,
                                                               1);
-                if (ok) ok = pulsar_gpu_rope_tail_tensor(g->indexer_q, 1,
+                /* Fused rope + QAT, mirroring the prefill site. */
+                if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->indexer_q, 1,
                                                         PULSAR_N_INDEXER_HEAD,
                                                         PULSAR_N_INDEXER_HEAD_DIM,
                                                         PULSAR_N_ROT,
@@ -726,9 +727,6 @@ bool gpu_graph_encode_decode_layer(
                                                         PULSAR_ROPE_YARN_BETA_FAST,
                                                         PULSAR_ROPE_YARN_BETA_SLOW,
                                                         NULL) != 0;
-                if (ok) ok = pulsar_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
-                                                              PULSAR_N_INDEXER_HEAD,
-                                                              PULSAR_N_INDEXER_HEAD_DIM) != 0;
                 if (ok) ok = gpu_graph_matmul_plain_tensor(g->indexer_weights, model,
                                                              layer->indexer_proj,
                                                              PULSAR_N_EMBD, PULSAR_N_INDEXER_HEAD,

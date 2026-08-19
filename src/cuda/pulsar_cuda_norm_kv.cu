@@ -268,6 +268,47 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0) {
 
 
 
+/* One rope rotation pair, in place at tail[i], tail[i+1]. The SINGLE authority
+ * for the tail-rope math: rope_tail_kernel and the fused indexer rope+QAT
+ * kernel both call this, so the two launch shapes cannot drift numerically.
+ * Returns the rotated pair through r0/r1 for callers with an epilogue. */
+__device__ static void rope_tail_rotate_pair_dev(
+        float *tail, uint32_t i, uint32_t n_rot, uint32_t rope_pos,
+        uint32_t n_ctx_orig, int inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float *out_r0, float *out_r1) {
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+
+    float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float x0 = tail[i];
+    float x1 = tail[i + 1];
+    const float r0 = x0 * c - x1 * s;
+    const float r1 = x0 * s + x1 * c;
+    tail[i] = r0;
+    tail[i + 1] = r1;
+    *out_r0 = r0;
+    *out_r1 = r1;
+}
+
 __global__ static void rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -305,36 +346,12 @@ __global__ static void rope_tail_kernel(
     uint32_t n_nope = head_dim - n_rot;
     uint32_t i = pair * 2;
 
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1), corr1);
-    }
-
     const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t * pos_stride;
-    float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
-    float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
-    float mscale = attn_factor;
-    if (ext_factor != 0.0f) {
-        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    float c = cosf(theta) * mscale;
-    float s = sinf(theta) * mscale;
-    if (inverse) s = -s;
-
     float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
-    float x0 = tail[i];
-    float x1 = tail[i + 1];
-    const float r0 = x0 * c - x1 * s;
-    const float r1 = x0 * s + x1 * c;
-    tail[i] = r0;
-    tail[i + 1] = r1;
+    float r0, r1;
+    rope_tail_rotate_pair_dev(tail, i, n_rot, rope_pos, n_ctx_orig, inverse,
+                              freq_base, freq_scale, ext_factor, attn_factor,
+                              beta_fast, beta_slow, &r0, &r1);
 
     if (gact_data) {
         /* One warp is one (t, h) and covers pair 0..n_rot/2-1, i.e. head dims
@@ -730,14 +747,39 @@ __device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
 }
 
 
-__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
+/* Fused indexer-q epilogue: rope the tail, then the Hadamard+FP4 QAT
+ * round-trip, one 128-thread block per (token, head) row. Replaces the two
+ * back-to-back launches over the same tensor (rope_tail_kernel then
+ * indexer_hadamard_fp4_kernel), saving a full read+write of the buffer. The
+ * rotation is the SAME device function rope_tail_kernel runs and the QAT
+ * body is the same code as indexer_hadamard_fp4_kernel, in the same order,
+ * so the result is bit-exact vs the two-launch sequence; the __syncthreads
+ * between the phases stands in for the old kernel boundary (one block owns
+ * the whole row, so a block-local barrier is equivalent). */
+__global__ static void indexer_rope_hadamard_fp4_kernel(
+        float *x, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, int inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow,
+        const int32_t * __restrict__ positions) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
 
+    float *xr = x + (uint64_t)row * head_dim;
+    if (tid < n_rot / 2u) {
+        const uint32_t t = row / n_head;
+        const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        float r0, r1;
+        rope_tail_rotate_pair_dev(xr + (head_dim - n_rot), tid * 2u, n_rot, rope_pos,
+                                  n_ctx_orig, inverse, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast, beta_slow,
+                                  &r0, &r1);
+    }
+    __syncthreads();
+
     __shared__ float vals[128];
     __shared__ float absbuf[128];
-    float *xr = x + (uint64_t)row * head_dim;
     indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
 
     float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
@@ -745,7 +787,7 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale))) * scale;
 }
 
-/* Same QAT transform as indexer_hadamard_fp4_kernel (bit-identical f32 result
+/* Same QAT transform as indexer_rope_hadamard_fp4_kernel minus the rope (bit-identical f32 result
  * written back to x), additionally emitting the row in MXKV FP4 layout — E2M1
  * nibble pairs low-nibble-first followed by one E8M0 byte per 32-block — so a
  * packed indexer cache stores exactly the values the f32 path would.  The E8M0
@@ -1174,17 +1216,28 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
 
 
 
-int pulsar_gpu_dsv4_indexer_qat_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
-    if (!x || n_rows == 0 || head_dim != 128u ||
+/* Fused rope + QAT for the indexer q projection: one launch instead of the
+ * rope_tail + qat pair over the same tensor. n_rows = n_tok * n_head. */
+int pulsar_gpu_dsv4_indexer_rope_qat_tensor(pulsar_gpu_tensor *x,
+        uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
+    const uint32_t n_rows = n_tok * n_head;
+    if (!x || n_rows == 0 || head_dim != 128u || n_rot > head_dim || (n_rot & 1) ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
-    return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
+    if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+    indexer_rope_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr,
+            n_rows, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+            positions ? (const int32_t *)positions->ptr : NULL);
+    return cuda_ok(cudaGetLastError(), "indexer_rope_hadamard_fp4 launch");
 }
 
-/* QAT + pack: roundtrip n_rows f32 rows of x in place (identical to
- * pulsar_gpu_dsv4_indexer_qat_tensor) and store the MXKV FP4 packed rows into
+/* QAT + pack: roundtrip n_rows f32 rows of x in place (the same QAT the fused
+ * rope+QAT entry applies) and store the MXKV FP4 packed rows into
  * `packed` at rows [out_row0, out_row0 + n_rows). */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
                                                     pulsar_gpu_tensor *packed,
