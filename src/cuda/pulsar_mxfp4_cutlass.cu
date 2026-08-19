@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include "pulsar_gpu.h"
+#include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -261,10 +262,6 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
  * rather than exported because it is the on-disk-free layout of a device buffer
  * this TU only READS -- and the two must agree, so it is spelled out identically
  * and asserted by the bit-exactness of the gather against the pack path. */
-__device__ __forceinline__ int mx_sfoff_src(int row, int kb, int KBp) {
-  return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
-         + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
-}
 
 /* Gather ALREADY-E4M3 activations straight into the grouped GEMM's A operand.
  *
@@ -302,7 +299,7 @@ __global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
   }
   const int4 *s = reinterpret_cast<const int4*>(src_q + (size_t)src * K + (size_t)kb * 32);
   d[0] = s[0]; d[1] = s[1];
-  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[mx_sfoff_src(src, kb, src_kbp)]);
+  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[pulsar_mx_sfoff(src, kb, src_kbp)]);
 }
 
 static void gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
@@ -874,7 +871,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
     const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
     const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
-    const float sa = A8 ? gemv_sf_val(xsf[mx_sfoff_src(xrow, k0 >> 5, xkbp)]) : 0.f;
+    const float sa = A8 ? gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]) : 0.f;
     #pragma unroll
     for (int j = 0; j < 8; j++) {
       const float xv = A8 ? (__half2float((__half)xt8[k0 + j]) * sa) : xt[k0 + j];

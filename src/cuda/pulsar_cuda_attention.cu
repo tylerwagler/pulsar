@@ -110,7 +110,13 @@ __global__ static void attention_prefill_raw_kernel(
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    uint32_t raw_count = t + 1 < window ? t + 1 : window;
+    /* window==0 means unlimited, as the mixed/softmax/decode kernels all treat
+     * it (:172, :251, :309, :450) -- their convention is "all rows k<=t
+     * visible". This kernel's old `min(t+1, window)` instead yielded 0 rows at
+     * window==0, disagreeing with its own softmax normalizer (:251) and
+     * corrupting the row if a full-attention config ever reached the raw tier.
+     * For window>0 this is bit-identical to min(t+1, window). */
+    uint32_t raw_count = (window != 0u && window < t + 1u) ? window : t + 1u;
     uint32_t raw_start = t + 1 - raw_count;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[256];

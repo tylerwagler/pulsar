@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 
 
 
@@ -197,7 +198,6 @@ __global__ static void matmul_bf16_kernel(
  * perplexity gate; int8 requant is what this change removes). The contiguous
  * 32-element inner loop is what nvcc vectorizes — a lane-per-element
  * (mmvq-style) mapping profiled 2.2x slower. Returns wscale*sum(e4m3*x). */
-__device__ __forceinline__ int mx_sfoff(int row, int kb, int KBp);   /* defined below */
 
 
 /* De-interleaved MXFP8 block dot: contiguous 32-E4M3 block (aligned) + separate
@@ -284,7 +284,7 @@ enum { PULSAR_FP8MX_ROWS = 4 };
  * it is a template parameter rather than a second kernel. A8 implies DEINT: the
  * raw 33B reader has no E4M3-activation form and the launcher never pairs them.
  * xdata/xscale are the per-slot cache layout (flat [in_dim] at n_tok 1, scale
- * at mx_sfoff(0, kb, xKBp)) -- NOT the group-major grouped layout the "a"
+ * at pulsar_mx_sfoff(0, kb, xKBp)) -- NOT the group-major grouped layout the "a"
  * projection uses. Two caches, two layouts, one letter apart in the call. */
 template<bool DEINT, bool A8 = false>
 __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
@@ -325,7 +325,7 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
                     *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
                 }
             }
-            const unsigned char xsb = A8 ? xscale[mx_sfoff(0, (int)b, xKBp)] : (unsigned char)0;
+            const unsigned char xsb = A8 ? xscale[pulsar_mx_sfoff(0, (int)b, xKBp)] : (unsigned char)0;
 #pragma unroll
             for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 if (r >= nr) continue;
@@ -333,12 +333,12 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
                     const uint32_t rw = (uint32_t)(row0 + r);
                     acc[r] += dev_dot_fp8mx_deint_block_a8(
                             wdata + (uint64_t)rw * in_dim + i0,
-                            wscale[mx_sfoff((int)rw, (int)b, KBp)],
+                            wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)],
                             xdata + i0, xsb);
                 } else if (DEINT) {
                     const uint32_t rw = (uint32_t)(row0 + r);
                     acc[r] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * in_dim + i0,
-                                                        wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
+                                                        wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)], xb);
                 } else {
                     acc[r] += dev_dot_fp8mx_xreg_block(wr + (r * blocks + b) * 33u, xb);
                 }
@@ -415,7 +415,7 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
                     if (DEINT) {
                         const uint32_t rw = (uint32_t)(row0 + r);
                         acc[r] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
-                                                            wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
+                                                            wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)], xb);
                     } else {
                         acc[r] += dev_dot_fp8mx_xreg_block(wr + (r * blocks + b) * 33u, xb);
                     }
@@ -488,14 +488,14 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
     const unsigned char *xs = xscale + group * scale_slab;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
-        const unsigned char xsb = xs[mx_sfoff((int)tok, (int)b, xKBp)];
+        const unsigned char xsb = xs[pulsar_mx_sfoff((int)tok, (int)b, xKBp)];
 #pragma unroll
         for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
             if (r >= nr) continue;
             const uint32_t rw = (uint32_t)(row0 + r);
             acc[r] += dev_dot_fp8mx_deint_block_a8(
                     wdata + (uint64_t)rw * group_dim + i0,
-                    wscale[mx_sfoff((int)rw, (int)b, KBp)],
+                    wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)],
                     xr + i0, xsb);
         }
     }
@@ -551,7 +551,7 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
             for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 const uint32_t rw = (uint32_t)(row0 + r);
                 acc[r][t] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
-                                                       wscale[mx_sfoff((int)rw, (int)b, KBp)], xb);
+                                                       wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)], xb);
             }
         }
     }
@@ -634,10 +634,6 @@ static inline int mx_rup(int x, int n) { return (x + n - 1) / n * n; }
 static inline size_t mx_a256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 
-__device__ __forceinline__ int mx_sfoff(int row, int kb, int KBp) {
-    return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
-           + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
-}
 
 
 /* X[rows,K] f32 -> E4M3 data[K,rows]col + swizzled E8M0 scale. one warp per (row,kb). */
@@ -651,7 +647,7 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
     int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
     if (se < -127) se = -127; if (se > 127) se = 127;
     data[(size_t)(kb * 32 + lane) + (size_t)row * K] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
-    if (lane == 0) scale[mx_sfoff(row, kb, KBp)] = (unsigned char)(se + 127);
+    if (lane == 0) scale[pulsar_mx_sfoff(row, kb, KBp)] = (unsigned char)(se + 127);
 }
 
 
@@ -671,7 +667,7 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
     int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
     if (se < -127) se = -127; if (se > 127) se = 127;
     data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
-    if (lane == 0) scale[(size_t)g * scale_slab + mx_sfoff(tok, kb, KBp)] = (unsigned char)(se + 127);
+    if (lane == 0) scale[(size_t)g * scale_slab + pulsar_mx_sfoff(tok, kb, KBp)] = (unsigned char)(se + 127);
 }
 
 
@@ -682,7 +678,7 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
 static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
 
 /* Offsets whose MXFP8 weight is PRE-STORED in the mmap in the exact device
- * layout (de-interleaved E4M3 data + mx_sfoff-swizzled E8M0 scale, contiguous:
+ * layout (de-interleaved E4M3 data + pulsar_mx_sfoff-swizzled E8M0 scale, contiguous:
  * [data (in*out B)][scale]). For these the resolver skips cudaMalloc+convert and
  * points cuBLASLt straight at g_model_device_base+offset. Populated once at load
  * (cold path); the resolved fp8_mx_weight is then cached in g_fp8_mx_by_offset
@@ -881,7 +877,7 @@ static mxfp8_act_cache_t *act_slot_find(const void *ptr, uint64_t n_tok, uint64_
  *
  * Taking a prefix is safe because the encoding is ROW-LOCAL in both halves: the
  * quantiser reduces amax per (row, kb) warp and stores data at row*K + k, and
- * mx_sfoff(row, kb, KBp) is a function of row, kb and KBp only -- never of the
+ * pulsar_mx_sfoff(row, kb, KBp) is a function of row, kb and KBp only -- never of the
  * total row count.  So rows [0, need) of a width-N block are BYTE-IDENTICAL to
  * a width-need block, and consuming the prefix makes the A8 arms genuinely
  * M-independent rather than only appearing so at the widths a gate happens to
@@ -981,7 +977,7 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                  sx_bytes, "act scale")) {
         return 0;
     }
-    /* The quantizer memsets the scale slab because mx_sfoff leaves holes when
+    /* The quantizer memsets the scale slab because pulsar_mx_sfoff leaves holes when
      * rows/blocks are not multiples of 128/4; a producer filling only the live
      * (row, kb) pairs must do the same or the GEMM reads stale swizzle slots. */
     if (cudaMemsetAsync(s->sx, 0, sx_bytes, 0) != cudaSuccess) return 0;
@@ -1041,7 +1037,7 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
         !mxfp8_act_cache_reserve((void **)&g_gact.sx, &g_gact.sx_cap, scale_bytes, "gact scale")) {
         return 0;
     }
-    /* Same reason as the non-grouped slot: mx_sfoff leaves holes, and the
+    /* Same reason as the non-grouped slot: pulsar_mx_sfoff leaves holes, and the
      * producers here fill only the (row, kb) pairs they own -- and they own
      * them in TWO passes (attn_f16 the nope blocks, rope_tail the rope tail),
      * so a stale byte between them would survive into the GEMM. */
@@ -1090,7 +1086,14 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
                                             const void **scale,
                                             int *kbp) {
     if (!ptr || !data || !scale || !kbp) return 0;
-    mxfp8_act_cache_t *s = act_slot_find(ptr, n_tok, in_dim);
+    /* Consumer lookup must be prefix-tolerant (act_slot_find_rows), not the
+     * exact-key act_slot_find: this reader (the MoE A8 path) can ask for fewer
+     * rows than the norm armed in a fused mixed step, and the encoding is
+     * row-local so rows [0,n_tok) of a wider block are byte-identical. Exact
+     * matching there would miss and silently drop to a re-encode -- the same
+     * M-dependence GATE 4 caught for the in-file GEMM consumers. Same slot at
+     * equal widths, so bit-exact on today's paths. */
+    mxfp8_act_cache_t *s = act_slot_find_rows(ptr, n_tok, in_dim);
     if (!s || !s->valid || !s->xq || !s->sx) return 0;
     *data  = s->xq;
     *scale = s->sx;
@@ -1439,7 +1442,7 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
         int k = base + lane * 4;                       /* this lane's 4 in-positions */
         uint32_t packed = *(const uint32_t *)(row + k);
         int kb = k >> 5;                               /* 32-elem block for these 4 */
-        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);  /* 2^(e-127), no SFU */
+        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);  /* 2^(e-127), no SFU */
         const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
         const float *xk = x + k;
         #pragma unroll
@@ -1487,8 +1490,8 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(float *out, const __nv_fp8_e4m
         uint32_t wpk = *(const uint32_t *)(row + k);
         uint32_t apk = *(const uint32_t *)(xq + k);
         int kb = k >> 5;
-        float sw = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
-        float sa = __int_as_float((uint32_t)xs[mx_sfoff(xrow, kb, xKBp)] << 23);
+        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
+        float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(xrow, kb, xKBp)] << 23);
         const float s = sw * sa;
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
@@ -1528,7 +1531,7 @@ __global__ static void mxfp8_mmvq_deint_pair_kernel(
         int k = base + lane * 4;
         uint32_t packed = *(const uint32_t *)(row + k);
         int kb = k >> 5;
-        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
         const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
         const float *xk = x + k;
         #pragma unroll
@@ -1560,7 +1563,7 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
         int k = base + lane * 4;
         uint32_t packed = *(const uint32_t *)(row + k);
         int kb = k >> 5;
-        float sc = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
         const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
         const float *xk = x + k;
         #pragma unroll
@@ -1615,12 +1618,12 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(float *out, const __nv_fp8_
         int k = base + lane * 4;
         uint32_t wpk = *(const uint32_t *)(row + k);
         int kb = k >> 5;
-        float sw = __int_as_float((uint32_t)scale[mx_sfoff(o, kb, KBp)] << 23);
+        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         #pragma unroll
         for (int t = 0; t < NT; t++) {
             uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
-            float sa = __int_as_float((uint32_t)xs[mx_sfoff(t, kb, xKBp)] << 23);
+            float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
             const float s = sw * sa;
             const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
             #pragma unroll
@@ -2381,7 +2384,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, data_bytes_a8, 256);
         unsigned char *sx = (unsigned char *)cuda_arena_take(&ar, scale_n, 256);
         if (sx) {   /* take() latches, so sx != NULL implies xq != NULL */
-            /* mx_sfoff leaves holes; the GEMV reads only the (tok, kb) pairs the
+            /* pulsar_mx_sfoff leaves holes; the GEMV reads only the (tok, kb) pairs the
              * quantiser fills, but zero the slab so a hole can never carry a
              * stale byte from a previous call's larger shape. */
             cudaMemsetAsync(sx, 0, scale_n, cudaStreamPerThread);
