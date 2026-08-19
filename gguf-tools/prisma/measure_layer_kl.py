@@ -98,7 +98,7 @@ def run_ds4(args, cmd, log_name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4")
+    ap.add_argument("--ds4", default="./pulsar")
     ap.add_argument("--base", required=True, help="all-cheap base GGUF (the anchor)")
     ap.add_argument("--donor", required=True, help="all-rich donor GGUF for overlays")
     ap.add_argument("--calib", required=True, help="calibration text file")

@@ -123,7 +123,7 @@ def add_rows(total: list[list[float]], rows: list[list[float]]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4", help="path to the ds4 CLI")
+    ap.add_argument("--ds4", default="./pulsar", help="path to the pulsar CLI")
     ap.add_argument("--model", default="ds4flash.gguf", help="GGUF model path")
     ap.add_argument("--good-file", required=True,
                     help="desired/target prompts, one per line")
