@@ -477,20 +477,6 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
-int pulsar_cutlass_proj_scratch(float *out, const float *x,
-    const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
-    uint8_t *scratch, size_t scratch_bytes){
-  size_t xA_off,xSF_off,xSF_n,ws_off,ws_bytes;
-  size_t need=proj_scratch_layout(T,in_dim,out_dim,&xA_off,&xSF_off,&xSF_n,&ws_off,&ws_bytes);
-  if(!scratch || scratch_bytes<need) return -1;
-  uint8_t *xA=scratch+xA_off;
-  ElementSF *xSF=reinterpret_cast<ElementSF*>(scratch+xSF_off);
-  void *ws=ws_bytes?(void*)(scratch+ws_off):nullptr;
-  if(xSF_n) cudaMemsetAsync(xSF,0,xSF_n*sizeof(ElementSF));
-  pack_activation(xA,xSF,x,T,in_dim);
-  return run_gemm(out, xA, xSF, W_d, reinterpret_cast<const ElementSF*>(W_sf), T, out_dim, in_dim, ws);
-}
-
 // ---- extern-C expert FFN (standalone/test convenience): allocates+frees its own scratch and
 // synchronizes before returning. The engine never calls this -- it calls the scratch variant
 // above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
@@ -1152,45 +1138,6 @@ void pulsar_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1
 size_t pulsar_cutlass_weight_sf_count(int N, int K){
   auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
   return cute::size(cute::filter_zeros(lSFB));
-}
-
-// Packed E2M1 weight-data byte count for a weight of shape (N=out, K=in): 2 nibbles/byte.
-size_t pulsar_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
-
-// ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
-// weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout.
-// LAYOUT FIX (2026-07-08): the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles
-// -- logical (n,k) at nibble k + n*K, byte n*(K/2) + k/2 -- verified empirically against
-// pulsar_cutlass_pack_source, whose data section is an identity copy of the source's row-major
-// e2m1 bytes (temp/fp4gemv_test.cu). The previous "(n + k*N)/2 ColumnMajor" math here did NOT
-// match pack_source despite the old comment's claim, so the opt-in PULSAR_MOE_FP4_PREFILL path
-// was feeding scrambled weights to the GEMM. One thread per (row, 32-block) owns 16 whole
-// output bytes -> no cross-thread nibble RMW race. ----
-template<class TSFB>
-__global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *W, int N, int K){
-  int nblk = K/32;
-  long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
-  if (idx >= (long)N*nblk) return;
-  int n = (int)(idx / nblk), kb = (int)(idx % nblk);
-  const float *w = W + (size_t)n*K + (size_t)kb*32;
-  float mx=0.f;
-  for (int i=0;i<32;i++) mx=fmaxf(mx,fabsf(w[i]));
-  int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-127)e=-127; if(e>127)e=127;
-  float s=exp2f((float)e);
-  tSFB(n, kb*32, 0) = ElementSF::bitcast((uint8_t)(e+127));
-  uint8_t *ob = B_data + (size_t)n*(K/2) + (size_t)kb*16;
-  for (int i=0;i<16;i++){
-    uint8_t lo = d_to_e2m1(w[2*i]/s);
-    uint8_t hi = d_to_e2m1(w[2*i+1]/s);
-    ob[i] = (uint8_t)(lo | (hi<<4));
-  }
-}
-
-void pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
-  int nb = N*(K/32), t=128, b=(nb+t-1)/t;
-  pack_weight_f32_kernel<<<b,t>>>(Bd, tSFB, W, N, K);   // legacy default stream
 }
 
 #ifdef PULSAR_MXFP4_REPACK_CLI

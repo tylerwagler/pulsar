@@ -1289,11 +1289,18 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
         return 1;
     }
     pulsar_engine *e = s->engine;
-    if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+    /* Steady-state decode must reuse preallocated scratch, never touch the host
+     * heap. The guard is a no-op unless PULSAR_ALLOC_GUARD is set, so this is
+     * free in production; armed, it makes any xmalloc/xrealloc inside the decode
+     * fatal. Only the eval is guarded -- token_vec_push below legitimately grows
+     * the checkpoint. */
+    pulsar_alloc_guard_begin("decode");
+    const bool decode_ok = gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
-                                        s->logits))
-    {
+                                        s->logits);
+    pulsar_alloc_guard_end();
+    if (!decode_ok) {
         snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
         s->checkpoint_valid = false;
         return 1;

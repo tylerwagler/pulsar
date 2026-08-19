@@ -1277,9 +1277,6 @@ int pulsar_cutlass_grouped_moe(
  * projection of the uniform grouped path. Caller gathers x contiguously (T = tokens for that
  * expert) and sizes scratch once via pulsar_cutlass_proj_scratch_bytes(). No allocation, no sync. */
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
-int pulsar_cutlass_proj_scratch(float *out, const float *x,
-        const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
-        uint8_t *scratch, size_t scratch_bytes);
 
 /* Grouped single-projection W4A8 GEMM for MIXED layers -- one device-built ptr-array grouped GEMM
  * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
@@ -1304,13 +1301,9 @@ int pulsar_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *s
         const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
 
-/* Runtime dequant->fp4 weight packer for the 2-bit prefill path: quantizes a dequantized f32
- * weight [N,K] (N rows of K, RowMajor) to MXFP4 on-device (LOSSY) into CUTLASS B layout
- * (packed E2M1 `Bd` + swizzled ue8m0 `Bsf`), byte-identical to pulsar_cutlass_pack_source so the
- * FFN above consumes it unchanged. N must be even. Sizes below give the two output regions. */
-size_t pulsar_cutlass_weight_data_bytes(int N, int K);
+/* Swizzled ue8m0 scale-factor element count for a CUTLASS B weight of shape (N,K);
+ * used by the offline repack CLI alongside pulsar_cutlass_pack_source. */
 size_t pulsar_cutlass_weight_sf_count(int N, int K);
-void   pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

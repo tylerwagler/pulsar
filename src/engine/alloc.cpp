@@ -8,7 +8,14 @@ namespace pulsar {
 
 class AllocGuard {
 public:
+    /* Only arms when PULSAR_ALLOC_GUARD is set in the environment, so the
+     * begin/end call sites are a hard no-op in production and the guard is an
+     * opt-in developer tool: `PULSAR_ALLOC_GUARD=1` makes any host allocation
+     * inside a guarded phase fatal, to catch a decode step that has stopped
+     * reusing its preallocated scratch. Read once. */
     void begin(const char *phase) {
+        static const int armed = getenv("PULSAR_ALLOC_GUARD") != nullptr;
+        if (!armed) return;
         phase_ = phase;
         enabled_ = true;
     }
