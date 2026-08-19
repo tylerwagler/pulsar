@@ -51,3 +51,7 @@ __pycache__/
 
 # built on demand by gguf-tools/reflow_artifact.py from the codec sources
 gguf-tools/libds4q_reflow.so
+
+# experiment scratch (run harnesses write logs/progress/json here; not source)
+/tmp-teb/
+*.progress
