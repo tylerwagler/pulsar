@@ -1047,7 +1047,6 @@ typedef struct {
     pulsar_gpu_tensor *batch_routed_down;
     pulsar_gpu_tensor *batch_routed_out;
     pulsar_gpu_tensor *batch_ffn_out;
-    bool materialize_ffn_out;
     pulsar_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
@@ -2668,53 +2667,6 @@ static inline uint16_t f32_to_f16(float f) {
     const uint32_t round = mant & 0x1fffu;
     if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
     return (uint16_t)half;
-#endif
-}
-
-static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    for (; i + 8 <= n; i += 8) {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
-    }
-    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < n; i++) acc += a[i] * b[i];
-    return acc;
-#else
-    float acc = 0.0f;
-    for (uint32_t i = 0; i < n; i++) acc += a[i] * b[i];
-    return acc;
-#endif
-}
-
-static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    const float32x4_t av = vdupq_n_f32(a);
-    for (; i + 8 <= n; i += 8) {
-        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     av, vld1q_f32(x + i)));
-        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
-    }
-    for (; i < n; i++) y[i] += a * x[i];
-#else
-    for (uint32_t i = 0; i < n; i++) y[i] += a * x[i];
-#endif
-}
-
-static inline void scale_f32(float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    const float32x4_t av = vdupq_n_f32(a);
-    for (; i + 8 <= n; i += 8) {
-        vst1q_f32(x + i,     vmulq_f32(vld1q_f32(x + i),     av));
-        vst1q_f32(x + i + 4, vmulq_f32(vld1q_f32(x + i + 4), av));
-    }
-    for (; i < n; i++) x[i] *= a;
-#else
-    for (uint32_t i = 0; i < n; i++) x[i] *= a;
 #endif
 }
 

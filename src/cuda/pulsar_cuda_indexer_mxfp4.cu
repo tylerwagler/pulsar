@@ -67,7 +67,6 @@
  * Padding by one word breaks the period without changing any addressing math
  * beyond the stride constant. */
 #define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
-#define IDX_BSTRIDE   ((IDX_HEAD_DIM / 2u) + 4u) /*  68 B (global cache row) */
 /* Shared B is stored LANE-MAJOR, not row-major: 64 B per compressed row, laid
  * out as [tig][slab][half] halfwords.  The MMA's B fragment wants, for lane
  * group position tig, the halfword at row byte (slab*16 + half*8 + tig*2) --

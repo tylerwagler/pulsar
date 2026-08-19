@@ -39,7 +39,6 @@
 #endif
 
 #define CUDA_QK_K 256
-#define PULSAR_CUDA_UNUSED __attribute__((unused))
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -193,8 +192,6 @@ __device__ __forceinline__ static float pulsar_w_load_f32_or_bf16(const void *w,
 __device__ __forceinline__ static float pulsar_wt_load(const float *p, uint64_t i) { return p[i]; }
 __device__ __forceinline__ static float pulsar_wt_load(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
 
-/* Bytes per element of the above, for the range checks that accompany them. */
-__host__ __device__ __forceinline__ static uint64_t pulsar_wt_bytes_f32(void) { return 4; }
 
 /* pulsar_w_load_f16_or_bf16<BF16> lived here: the false arm read __half. It had
  * no callers, and the artifact has had ZERO F16 tensors since the source-format
@@ -277,13 +274,6 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 __device__ static __forceinline__ float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
-    }
-    return v;
-}
-
-__device__ static __forceinline__ float warp_max_f32(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
     }
     return v;
 }

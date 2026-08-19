@@ -1361,19 +1361,6 @@ void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w
 
 
 
-static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if (n == 32) {
-        int32x4_t acc = vdupq_n_s32(0);
-        acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
-        acc = vdotq_s32(acc, vld1q_s8(a + 16), vld1q_s8(b + 16));
-        return vaddvq_s32(acc);
-    }
-#endif
-    int32_t sum = 0;
-    for (uint64_t i = 0; i < n; i++) sum += (int32_t)a[i] * (int32_t)b[i];
-    return sum;
-}
 
 
 

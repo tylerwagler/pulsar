@@ -203,7 +203,6 @@ void gpu_graph_debug_dump_i32_tensor(
 
 bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t pos) {
     return gpu_graph_directional_steering_ffn_enabled(g) ||
-           g->materialize_ffn_out ||
            gpu_graph_debug_wants("ffn_out", il, pos);
 }
 
