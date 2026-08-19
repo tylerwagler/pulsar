@@ -741,7 +741,7 @@ __global__ static void moe_swiglu_gathered_kernel(
     if (i >= n) return;
     float g = gate_g[i], u = up_g[i];
     if (clamp > 1.0e-6f) { if (g > clamp) g = clamp; if (u > clamp) u = clamp; if (u < -clamp) u = -clamp; }
-    mid_g[i] = (g / (1.0f + expf(-g))) * u * w_g[i / mid_dim];   /* same order as qwarp32 line 487 */
+    mid_g[i] = (g / (1.0f + expf(-g))) * u * w_g[i / mid_dim];   /* SwiGLU order matches the other MoE gate/up paths */
 }
 
 /* 128-padded gather of a PAIR-LAYOUT f32 buffer (src[pair*dim]) into the grouped-GEMM activation

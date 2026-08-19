@@ -1814,7 +1814,7 @@ bool gpu_graph_alloc_raw_cap(
     /* NOTE (task #64): these look debug-only — the qwarp32 kernels' stores are
      * read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
      * routed_moe_*_impl rejects NULL gate/up (`if (!gate_w || !up_w || !down_w)
-     * return 0;`, six sites in moe.cu). Keep them allocated unconditionally.
+     * return 0;`, four sites in moe.cu). Keep them allocated unconditionally.
      *
      * The second reason given here was that the batch path reused gate->ptr as
      * cuda_block_q8_K staging for quantized mid.  That is gone: the int8
