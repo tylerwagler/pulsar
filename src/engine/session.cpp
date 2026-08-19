@@ -1,12 +1,6 @@
 #include "pulsar_engine_internal.h"
 
 
-
-
-
-
-
-
 int pulsar_engine::routed_quant_bits() {
     auto *e = this;
     if (!e) return 0;
@@ -38,16 +32,6 @@ int pulsar_engine::routed_quant_bits() {
 }
 
 
-
-bool pulsar_engine::has_output_head() {
-    auto *e = this;
-    return e && weights_have_output_head(&e->weights);
-}
-
-
-
-
-
 bool pulsar_engine::has_dspark() {
     auto *e = this;
     return e && e->dspark_ready;
@@ -58,25 +42,16 @@ int pulsar_engine_dspark_draft_tokens(pulsar_engine *e) {
 }
 
 
-
 const pulsar_tokens *pulsar_session::tokens() {
     auto *s = this;
     return s ? &s->checkpoint : NULL;
 }
 
 
-
-
-
-
-
-
-
 void pulsar_engine::dump_tokens(const pulsar_tokens *tokens) {
     auto *e = this;
     e->vocab.dump_tokens(tokens);  /* the pulsar_vocab member */
 }
-
 
 
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
@@ -95,7 +70,6 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
     model_close(&model);
     return 0;
 }
-
 
 
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
@@ -135,14 +109,12 @@ static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out
 }
 
 
-
 static char *imatrix_trim_block(char *p, char *end) {
     while (p < end && isspace((unsigned char)*p)) p++;
     while (end > p && isspace((unsigned char)end[-1])) end--;
     *end = '\0';
     return p;
 }
-
 
 
 int pulsar_engine::collect_imatrix(const char *dataset_path,
@@ -282,7 +254,6 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 }
 
 
-
 int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
         int                n_predict,
         int                ctx_size,
@@ -313,16 +284,6 @@ int pulsar_engine::generate_argmax(const pulsar_tokens  *prompt,
     }
     return 1;
 }
-
-
-
-
-
-
-
-
-
-
 
 
 int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
@@ -561,19 +522,16 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
 }
 
 
-
 void pulsar_engine::summary() {
     auto *e = this;
     model_summary(&e->model);
 }
 
 
-
 int pulsar_engine::vocab_size() {
     auto *e = this;
     return e ? e->vocab.n_vocab : 0;
 }
-
 
 
 /* The engine's logits ROW WIDTH — the shape profile's n_vocab, which is what
@@ -585,7 +543,6 @@ int pulsar_engine::logits_width() const {
     auto *e = this;
     return e ? (int)PULSAR_N_VOCAB : 0;
 }
-
 
 
 const char *pulsar_engine::model_name() {
@@ -609,7 +566,6 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
 }
 
 
-
 /* Per-SESSION cumulative DSpark counters (accepted/draft/drafts/gen). Same
  * semantics as pulsar_engine_spec_metrics but scoped to one session, so a caller
  * can diff a snapshot across a single request for a per-response accept-rate.
@@ -629,15 +585,6 @@ void pulsar_session::spec_metrics(pulsar_spec_metrics *out) const {
 }
 
 
-
-int pulsar_engine::layer_count() {
-    auto *e = this;
-    (void)e;
-    return (int)PULSAR_N_LAYER;
-}
-
-
-
 uint64_t pulsar_engine::weights_resident_bytes() {
     auto *e = this;
     if (!e) return 0;
@@ -653,30 +600,11 @@ uint64_t pulsar_engine::weights_resident_bytes() {
 }
 
 
-
-uint32_t pulsar_engine::layer_compress_ratio(uint32_t layer) {
-    auto *e = this;
-    (void)e;
-    if (layer >= PULSAR_N_LAYER) return 0;
-    return pulsar_layer_compress_ratio(layer);
-}
-
-
-
-uint64_t pulsar_engine::hidden_f32_values() {
-    auto *e = this;
-    (void)e;
-    return (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-}
-
-
-
 int pulsar_engine::model_id() {
     auto *e = this;
     (void)e;
     return (int)PULSAR_MODEL_VARIANT;
 }
-
 
 
 void pulsar_engine::destroy() {
@@ -696,7 +624,6 @@ void pulsar_engine::destroy() {
     free(e->directional_steering_file);
     free(e);
 }
-
 
 
 int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
@@ -749,11 +676,9 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
 }
 
 
-
 uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
     return s ? s->resident_bytes : 0;
 }
-
 
 
 /* TRUE total per-session GPU byte cost of pulsar_session_create at this context
@@ -806,8 +731,6 @@ uint64_t pulsar_session::touched_kv_bytes() const {
 }
 
 
-
-
 void pulsar_session::destroy() {
     auto *s = this;
     if (!s) return;
@@ -822,14 +745,12 @@ void pulsar_session::destroy() {
 }
 
 
-
 void pulsar_session::set_progress(pulsar_session_progress_fn fn, void *ud) {
     auto *s = this;
     if (!s) return;
     s->progress = fn;
     s->progress_ud = ud;
 }
-
 
 
 void pulsar_session::set_display_progress(pulsar_session_progress_fn fn, void *ud) {
@@ -840,7 +761,6 @@ void pulsar_session::set_display_progress(pulsar_session_progress_fn fn, void *u
 }
 
 
-
 void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
     auto *s = this;
     if (!s) return;
@@ -849,23 +769,13 @@ void pulsar_session::set_cancel(pulsar_session_cancel_fn fn, void *ud) {
 }
 
 
-
 static bool pulsar_session_cancelled(pulsar_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
 
-
 static bool pulsar_session_cancelled_cb(void *ud) {
     return pulsar_session_cancelled((pulsar_session *)ud);
-}
-
-
-
-void pulsar_session::report_progress(const char *event, int current, int total) {
-    auto *s = this;
-    if (!s || !s->progress || !event) return;
-    s->progress(s->progress_ud, event, current, total);
 }
 
 
@@ -879,7 +789,6 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
     }
     if (p->user) p->user(p->user_ud, event, current, total);
 }
-
 
 
 /* Bring the live backend state to exactly the supplied token prefix.
@@ -1047,7 +956,6 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
 }
 
 
-
 /* Return true when canonicalization would replace already-sampled tokens.
  *
  * A DS4 session checkpoint is more than a token vector: the backend state also
@@ -1060,7 +968,6 @@ bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, in
     if (common > live_len || common > canonical_len) return true;
     return common < live_len;
 }
-
 
 
 /* Replace the live suffix after a shared prefix.
@@ -1111,7 +1018,6 @@ pulsar_session_rewrite_result pulsar_session::rewrite_from_common(const pulsar_t
 }
 
 
-
 int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
     auto *s = this;
     if (!s->checkpoint_valid) return 0;
@@ -1122,12 +1028,10 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
 }
 
 
-
 int pulsar_session::argmax() {
     auto *s = this;
     return sample_argmax(s->logits, PULSAR_N_VOCAB);
 }
-
 
 
 int pulsar_session::argmax_excluding(int excluded_id) {
@@ -1147,7 +1051,6 @@ int pulsar_session::argmax_excluding(int excluded_id) {
 }
 
 
-
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
@@ -1158,13 +1061,11 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 
-
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     auto *s = this;
     return sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k, top_p,
                               min_p, rng, &s->sample_scratch);
 }
-
 
 
 /* Row-based twins of the two session logprob readers below, in the same
@@ -1213,7 +1114,6 @@ int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
 }
 
 
-
 int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
                              pulsar_token_score *out) {
     if (!logits || !out || n_vocab <= 0 || token < 0 || token >= n_vocab) return 0;
@@ -1238,7 +1138,6 @@ int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
 }
 
 
-
 int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
     auto *s = this;
     if (!s) return 0;
@@ -1246,13 +1145,11 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
 }
 
 
-
 int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
     auto *s = this;
     if (!s) return 0;
     return pulsar_logits_token_logprob(s->logits, (int)PULSAR_N_VOCAB, token, out);
 }
-
 
 
 int pulsar_session::copy_logits(float *out, int cap) {
@@ -1263,14 +1160,12 @@ int pulsar_session::copy_logits(float *out, int cap) {
 }
 
 
-
 int pulsar_session::set_logits(const float *logits, int n) {
     auto *s = this;
     if (!s || !logits || n != (int)PULSAR_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
-
 
 
 int pulsar_session::eval(int token, char *err, size_t errlen) {
@@ -1313,20 +1208,11 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
 }
 
 
-
-
-
-
-
 void pulsar_session::note_committed_tokens(const int *toks, int n) {
     auto *s = this;
     if (!s || !toks || n <= 0) return;
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, toks[i]);
 }
-
-
-
-
 
 
 void pulsar_session::invalidate() {
@@ -1353,28 +1239,10 @@ void pulsar_session::invalidate() {
 }
 
 
-
-void pulsar_session::rewind(int pos) {
-    auto *s = this;
-    if (pos < 0) pos = 0;
-    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
-    s->checkpoint.len = pos;
-    s->spec.dspark_n_pending = 0;
-    s->spec.spec_carry_valid = false;
-    spec_quench_reset(s);
-    /* Rewound positions' drafter rows are stale; empty the window (it refills
-     * from the prompt capture on the next prefill, or from commits). */
-    for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
-    s->graph.dspark_prompt_n = 0;
-}
-
-
-
 int pulsar_session::pos() {
     auto *s = this;
     return s->checkpoint.len;
 }
-
 
 
 int pulsar_session::ctx() {
@@ -1383,11 +1251,9 @@ int pulsar_session::ctx() {
 }
 
 
-
 int pulsar_session_prefill_cap(pulsar_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
-
 
 
 /* Multi-session serving: is interrupting pulsar_session_sync() at a chunk

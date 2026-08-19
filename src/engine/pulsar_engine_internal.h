@@ -1247,10 +1247,7 @@ struct pulsar_engine {
     int vocab_size();
     int logits_width() const;
     const char *model_name();
-    int layer_count();
     void spec_metrics(pulsar_spec_metrics *out);
-    uint32_t layer_compress_ratio(uint32_t layer);
-    uint64_t hidden_f32_values();
     int model_id();
     bool is_pruned() const;
     uint64_t session_cost_bytes(int ctx_size);
@@ -1268,7 +1265,6 @@ struct pulsar_engine {
                         int ctx_size, int max_prompts, int max_tokens);
     void dump_tokens(const pulsar_tokens *tokens);
     int routed_quant_bits();
-    bool has_output_head();
     bool has_dspark();
 };
 
@@ -1562,7 +1558,6 @@ struct pulsar_session {
     void set_progress(pulsar_session_progress_fn fn, void *ud);
     void set_display_progress(pulsar_session_progress_fn fn, void *ud);
     void set_cancel(pulsar_session_cancel_fn fn, void *ud);
-    void report_progress(const char *event, int current, int total);
     void spec_metrics(pulsar_spec_metrics *out) const;
     uint64_t touched_kv_bytes() const;
     bool bank_free_physical(uint32_t bank);
@@ -1608,7 +1603,6 @@ struct pulsar_session {
     int eval_speculative_block(int first_token, int max_tokens, int eos_token,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
     void invalidate();
-    void rewind(int pos);
     int pos();
     int ctx();
     uint32_t prefill_quantum_min_suffix() const;
