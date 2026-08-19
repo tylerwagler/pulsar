@@ -52,6 +52,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 
 #define AF16_MT         2u        /* M-tiles per block */
@@ -393,6 +394,63 @@ static void attn_f16_kernel(
         }
     }
 
+    /* ---- L037 lever 1: double-buffered RAW-byte tile staging ------------
+     * Each ATTN_PACK row is AF16_ROWB bytes = a whole number of aligned
+     * 8-byte chunks; the NEXT tile's rows stream into the other buffer via
+     * cp.async while the CURRENT tile runs its MMA/softmax phases, which is
+     * what finally overlaps the load/store unit with the tensor pipe (the
+     * serial version measured pipe_tensor 6-8% vs LSU ~33%). The decode
+     * below reads the staged bytes with the SAME arithmetic the global-read
+     * version used (attn_comp_pack_ld's math, one decoder for the one
+     * format), so this stage is byte movement only -- bit-exact. The
+     * resolver mirrors the old per-element source logic one-for-one: raw
+     * ring rows (sRawRows/raw_start), then comp rows with the topk bad-row
+     * masking; a row outside the tile stages nothing and decodes to zero,
+     * exactly as before. */
+    #define AF16_ROWB (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))
+    __shared__ __align__(16) uint8_t sRawB[2][AF16_ROWS][AF16_ROWB];
+    __shared__ const uint8_t *sSrc[2][AF16_ROWS];
+    __shared__ uint8_t sBadStage[2][AF16_ROWS];
+    #define AF16_STAGE_TILE(BUF, ROW0)                                        \
+    do {                                                                      \
+        const uint32_t _nr = (ROW0) < n_score                                 \
+            ? min(AF16_ROWS, n_score - (ROW0)) : 0u;                          \
+        if (tid < AF16_ROWS) {                                                \
+            const uint32_t _r = tid;                                          \
+            const uint32_t _sr = (ROW0) + _r;                                 \
+            const uint8_t *_p = NULL;                                         \
+            bool _bad = false;                                                \
+            if (_r < _nr) {                                                   \
+                if (_sr < raw_count) {                                        \
+                    const uint32_t _rr = ring ? sRawRows[_sr]                 \
+                                              : (raw_start + _sr);            \
+                    _p = (const uint8_t *)raw_kv + (uint64_t)_rr * AF16_ROWB; \
+                } else {                                                      \
+                    uint32_t _ci = _sr - raw_count;                           \
+                    if (topk) {                                               \
+                        const int32_t _c = topk[(uint64_t)t * top_k + _ci];   \
+                        _bad = !(_c >= 0 && (uint32_t)_c < sVisComp);         \
+                        _ci = _bad ? 0u : (uint32_t)_c;                       \
+                    }                                                         \
+                    _p = (const uint8_t *)comp_src +                          \
+                         ((uint64_t)comp_base + _ci) * AF16_ROWB;             \
+                }                                                             \
+            }                                                                 \
+            sSrc[BUF][_r] = _p;                                               \
+            sBadStage[BUF][_r] = _bad ? 1u : 0u;                              \
+        }                                                                     \
+        __syncthreads();                                                      \
+        for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 8u);            \
+             _c += AF16_THREADS) {                                            \
+            const uint32_t _r = _c / (AF16_ROWB / 8u);                        \
+            const uint32_t _off = (_c % (AF16_ROWB / 8u)) * 8u;               \
+            if (sSrc[BUF][_r])                                                \
+                __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
+                                        sSrc[BUF][_r] + _off, 8);             \
+        }                                                                     \
+        __pipeline_commit();                                                  \
+    } while (0)
+
     /* ---- running softmax state + output accumulator --------------------- */
     if (tid < AF16_HPB) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
     float acc[AF16_MT][AF16_DPW / 8u][4];
@@ -403,78 +461,48 @@ static void attn_f16_kernel(
             acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.0f;
     __syncthreads();
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += AF16_ROWS) {
+    AF16_STAGE_TILE(0u, 0u);
+    for (uint32_t row0 = 0, tix = 0; row0 < n_score; row0 += AF16_ROWS, tix++) {
         const uint32_t nr = min(AF16_ROWS, n_score - row0);
+        const uint32_t buf = tix & 1u;
+        const int have_next = row0 + AF16_ROWS < n_score;
+        if (have_next) AF16_STAGE_TILE(buf ^ 1u, row0 + AF16_ROWS);
+        /* Leave the just-committed next-tile group in flight; wait only for
+         * the group that filled THIS buffer. */
+        __pipeline_wait_prior(have_next ? 1 : 0);
+        __syncthreads();
 
-        /* ---- stage the tile, converting to fp16 -------------------------
-         * FOUR elements per iteration, not two.  The packed path decodes a
-         * uint32 of four E4M3 bytes against ONE scale byte, the way the f32
-         * kernel does; reading them one element at a time through
-         * attn_comp_pack_ld costs four scattered BYTE loads where the format
-         * should have saved bandwidth, and measured 2.3x SLOWER than the f32
-         * shadow it was meant to beat.  The unpacked paths get a float4 out of
-         * the same restructuring. */
+        /* ---- decode the staged tile to fp16 -----------------------------
+         * Same restructured decode as before (a uint32 of four E4M3 bytes
+         * against one scale byte, bf16 rope tail), now reading smem the
+         * cp.async stage filled. Raw and comp rows are the SAME format, so
+         * the two old source arms collapse into this one decoder. */
         for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 4u; i += AF16_THREADS) {
             const uint32_t r = i / (AF16_DIM / 4u);
             const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
-            bool bad = false;
-            if (r < nr) {
-                const uint32_t sr = row0 + r;
-                if (sr < raw_count) {
-                    const uint32_t rr = ring ? sRawRows[sr] : (raw_start + sr);
-                    /* PULSAR_ATTN_PACK rows, decoded with attn_comp_pack_ld --
-                     * the same function the scalar kernels and the compressed
-                     * pool use, so there is one decoder for the one format. This
-                     * read the ring as __half until 2026-08-17 and would have
-                     * read packed bytes as halves without complaint; the f32 arm
-                     * beside it went with the format flag. */
-                    f0 = attn_comp_pack_ld(raw_kv, rr, d4 + 0u, AF16_DIM);
-                    f1 = attn_comp_pack_ld(raw_kv, rr, d4 + 1u, AF16_DIM);
-                    f2 = attn_comp_pack_ld(raw_kv, rr, d4 + 2u, AF16_DIM);
-                    f3 = attn_comp_pack_ld(raw_kv, rr, d4 + 3u, AF16_DIM);
+            if (r < nr && sSrc[buf][r]) {
+                const uint8_t *pr = sRawB[buf][r];
+                const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
+                if (d4 < n_nope) {
+                    const float sc = __uint_as_float(
+                        (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
+                    const uint32_t w = *(const uint32_t *)(pr + d4);
+                    f0 = attn_pack_e4m3(w & 0xffu, sc);
+                    f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
+                    f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
+                    f3 = attn_pack_e4m3(w >> 24, sc);
                 } else {
-                    uint32_t ci = sr - raw_count;
-                    if (topk) {
-                        const int32_t c = topk[(uint64_t)t * top_k + ci];
-                        /* An out-of-range selection is not row 0 -- it is NO row.
-                         * The load still happens (row 0 keeps the access in range
-                         * and the branch uniform), but the row is flagged and its
-                         * score is masked to -INF below, so it contributes zero
-                         * instead of injecting an unselected position into the
-                         * output and double-counting row 0 when row 0 was also
-                         * legitimately selected. */
-                        bad = !(c >= 0 && (uint32_t)c < sVisComp);
-                        ci = bad ? 0u : (uint32_t)c;
-                    }
-                    const uint64_t crow = (uint64_t)comp_base + ci;
-                    {
-                        const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
-                        const uint8_t *pr = (const uint8_t *)comp_src +
-                            crow * PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);
-                        if (d4 < n_nope) {
-                            const float sc = __uint_as_float(
-                                (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
-                            const uint32_t w = *(const uint32_t *)(pr + d4);
-                            f0 = attn_pack_e4m3(w & 0xffu, sc);
-                            f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
-                            f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
-                            f3 = attn_pack_e4m3(w >> 24, sc);
-                        } else {
-                            const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
-                                PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
-                            const uint32_t o = d4 - n_nope;
-                            f0 = __bfloat162float(rope[o]);
-                            f1 = __bfloat162float(rope[o + 1u]);
-                            f2 = __bfloat162float(rope[o + 2u]);
-                            f3 = __bfloat162float(rope[o + 3u]);
-                        }
-                    }
+                    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
+                        PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
+                    const uint32_t o = d4 - n_nope;
+                    f0 = __bfloat162float(rope[o]);
+                    f1 = __bfloat162float(rope[o + 1u]);
+                    f2 = __bfloat162float(rope[o + 2u]);
+                    f3 = __bfloat162float(rope[o + 3u]);
                 }
             }
-            /* Exactly one thread per row has d4 == 0, so this writes each row's
-             * flag once without a clearing pass or an extra barrier. */
-            if (d4 == 0u) sRowBad[r] = bad ? 1u : 0u;
+            if (d4 == 0u) sRowBad[r] = (r < nr) ? sBadStage[buf][r] : 0u;
             __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
             dst[0] = make_half2(__float2half(f0), __float2half(f1));
             dst[1] = make_half2(__float2half(f2), __float2half(f3));
