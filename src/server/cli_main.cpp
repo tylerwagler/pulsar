@@ -253,18 +253,6 @@ static int parse_int_arg(const char *s, const char *opt) {
 
 
 
-static int parse_nonneg_int_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (!s[0] || *end || v < 0 || v > INT_MAX) {
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: invalid value for %s: %s", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-
-
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -572,7 +560,6 @@ static server_config parse_options(int argc, char **argv) {
          * to classic full-charge admission (1M => N=1 single session). */
         .ctx_size = 1048576,
         .default_tokens = 393216,
-        .tool_memory_max_ids = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -587,26 +574,12 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--served-model-id")) {
-            c.served_model_id = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--served-model-name")) {
-            c.served_model_name = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
-        } else if (!strcmp(arg, "--dspark")) {
-            c.engine.dspark_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark-draft")) {
             c.engine.dspark_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--dspark-confidence")) {
-            c.engine.dspark_confidence = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
-            c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--chdir")) {
-            c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -625,34 +598,10 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
-            c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
-            c.kv_cache.cold_max_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-continued-interval-tokens")) {
-            c.kv_cache.continued_interval_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-boundary-trim-tokens")) {
-            c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
-            c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-sys-prefix-margin-tokens")) {
-            c.kv_cache.sys_prefix_margin_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
-            c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--web-search-url")) {
             c.web_search_url = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--tool-memory-max-ids")) {
-            c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (v <= 0) {
-                server_log(PULSAR_LOG_DEFAULT,
-                           "pulsar-server: --prefill-chunk must be positive");
-                exit(2);
-            }
-            c.engine.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -673,13 +622,6 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
-    if (c.kv_cache.cold_max_tokens > 0 &&
-        c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
-    {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
-        exit(2);
-    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -692,17 +634,6 @@ static server_config parse_options(int argc, char **argv) {
         if (m) {
             c.engine.model_path = m;
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: default model %s", m);
-        }
-    }
-    if (!c.engine.dspark_path) {
-        /* Say nothing when this finds no file: the main artifact may still
-         * carry a merged drafter (dspark.* tensors), which only the engine
-         * open can see.  The authoritative speculation line is logged after
-         * pulsar_engine_open in main(). */
-        const char *d = resolve_default_gguf("dspark.gguf");
-        if (d) {
-            c.engine.dspark_path = d;
-            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: default drafter %s", d);
         }
     }
     return c;
@@ -722,11 +653,6 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
-    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to chdir to %s: %s",
-                   cfg.chdir_path, strerror(errno));
-        return 1;
-    }
     server_resolve_kv_disk_dir(&cfg);
 
     pulsar_engine *engine = NULL;
@@ -737,16 +663,15 @@ int main(int argc, char **argv) {
      * into the main artifact), so the state is logged here, never at parse. */
     if (pulsar_engine_has_dspark(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: speculative decoding active (%s drafter, draft depth %d)%s",
-                   cfg.engine.dspark_path ? cfg.engine.dspark_path : "merged",
+                   "pulsar-server: speculative decoding active (merged drafter, draft depth %d)%s",
                    pulsar_engine_dspark_draft_tokens(engine),
                    getenv("PULSAR_DSPARK_DISABLE")
                        ? " -- PULSAR_DSPARK_DISABLE set, generations will not speculate"
                        : "");
     } else {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: no drafter (--dspark, gguf/dspark.gguf, or merged "
-                   "dspark.* tensors); running without speculative decoding");
+                   "pulsar-server: no dspark.* tensors in the artifact; "
+                   "running without speculative decoding");
     }
 
     log_context_memory(cfg.engine.backend,
@@ -987,8 +912,6 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    s.served_model_id = cfg.served_model_id;      /* --served-model-id override (id) */
-    s.served_model_name = cfg.served_model_name;  /* --served-model-name override (name) */
     s.started = time(NULL);          /* uptime origin reported by /health */
     /* Slot 0 is provisioned here at the configured --ctx-size over the ONE
      * session (s.sess). Tier-2: if the created session is bank-pooled
@@ -1256,11 +1179,11 @@ int main(int argc, char **argv) {
                    ? "pulsar-server: web_search server tool ENABLED (backend %s)"
                    : "pulsar-server: web_search server tool disabled (no --web-search-url)%s",
                s.web_search_url ? s.web_search_url : "");
-    s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                       cfg.kv_cache_reject_different_quant, cfg.kv_cache))
+                       false /* accept cross-quant restores */, cfg.kv_cache))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in
          * kv_cache_open; state the consequence once and serve without disk

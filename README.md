@@ -425,9 +425,8 @@ Pulsar has exactly one drafter: **DSpark**. The earlier MTP drafter path
 was removed rather than kept as a semi-supported variant. The drafter's
 tensors ship merged inside the main model GGUF and the engine auto-enables
 speculative decoding when it detects them at load — no extra file or flag
-needed. `--no-dspark` opts out, and `--dspark PATH` still loads a split
-drafter file. The `pulsar-bench` development tool intentionally measures the
-plain-decode baseline.
+needed. `--no-dspark` opts out. The `pulsar-bench` development tool
+intentionally measures the plain-decode baseline.
 
 Acceptance is **exact sampled acceptance at all temperatures**: a draft token
 is accepted with its filtered target probability, and on rejection the engine
@@ -477,9 +476,10 @@ speed, never the sampled output distribution.
 ## Prefill chunking
 
 Prefill chunking is configurable and affects the KV checkpoint/logit path.
-Sessions prefill long prompts in 4096-token chunks by default; use the server's
-`--prefill-chunk N` (or `PULSAR_CUDA_PREFILL_CHUNK=N`) to compare another chunk
-size, for example `2048` to match the strict official-vector checkpoint path,
+Sessions prefill long prompts in 4096-token chunks by default; use
+`PULSAR_CUDA_PREFILL_CHUNK=N` (or `pulsar-bench --prefill-chunk N`) to compare
+another chunk size, for example `2048` to match the strict official-vector
+checkpoint path,
 or `0` to prefill a prompt as one whole batch when memory allows. Changing the
 chunk changes the KV checkpoint/logit path, so compare it as an explicit run
 configuration. Chunked GPU prefill reuses the same range-capable layer-major
@@ -508,18 +508,9 @@ identical greedy requests), so published numbers should be taken pinned —
 pair with `--no-kv-disk` for a fully cold protocol.  Production leaves the
 pin off: the reuse is the TTFT win.
 
-Use `--chdir /path/to/pulsar` when launching `pulsar-server` from another directory,
-so relative runtime paths such as the default `./ds4flash.gguf` model and
-`dir-steering/` data resolve from the project tree.
-
-Two flags (v0.3.1) control how the model is *named* to clients, independently:
-`--served-model-id ID` sets the id reported in `/v1/models` (`id` and `root`),
-`/version`, and the `/metrics` label — default `deepseek-v4-flash`. Point it at an
-HF repo path (e.g. `--served-model-id org/Model`) so HF-convention benchmark
-tooling that treats the model id as the tokenizer id (llama-benchy et al.)
-resolves the tokenizer with no extra config. `--served-model-name NAME` sets the
-human display name (`/v1/models` `name`, `/version` `model_name`) — free-form, may
-contain spaces, and is never used as a tokenizer id. Neither affects the KV cache
+The model id reported in `/v1/models`, `/version`, and the `/metrics` label is
+derived from the loaded GGUF shape (`deepseek-v4-flash` / `deepseek-v4-pro`);
+the display name is the model's shape name. Neither affects the KV cache
 (keyed by gguf path + numeric model id) or request acceptance (the incoming
 `model` field is not validated).
 
@@ -930,9 +921,9 @@ The disk budget defaults to 65536 MiB (`--kv-disk-space-mb`); least-valuable
 checkpoints are evicted when the budget fills. Snapshot behavior is unchanged
 by the default-on switch: files are written with ordinary write + fsync + rename
 into place, and the store validates the model variant and the rendered byte
-prefix before restoring (quant bits are recorded and logged, but mismatches are
-refused only with `--kv-cache-reject-different-quant`; the per-artifact default
-directory is what keeps different builds' checkpoints apart). Note that on unified-memory hosts (GB10) the
+prefix before restoring (quant bits are recorded and logged, not refused;
+the per-artifact default directory is what keeps different builds'
+checkpoints apart). Note that on unified-memory hosts (GB10) the
 checkpoint writes pass through the host page cache, which competes with GPU
 memory — the usual `sync; echo 3 > /proc/sys/vm/drop_caches` discipline before
 a model load still applies; pass `--no-kv-disk` if you want none of that
@@ -950,7 +941,7 @@ that already maps the model.
 
 Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
 IDs, so client JSON history can be rendered back to the exact sampled text. The
-RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
+RAM map keeps up to 100000 IDs (oldest pruned first).
 Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
 canonical JSON-to-DSML rendering.
 
@@ -1068,9 +1059,9 @@ The cache stores checkpoints at four moments:
 
 Cold saves intentionally trim a small token suffix and align down to a prefill
 chunk boundary. This avoids common BPE boundary retokenization misses when a
-future request appends text to the same prompt. The defaults are conservative:
-store prefixes of at least 512 tokens, cold-save prompts up to 30000 tokens,
-trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
+future request appends text to the same prompt. The policy is fixed and
+conservative: store prefixes of at least 512 tokens, cold-save prompts up to
+30000 tokens, trim 32 tail tokens, and align to 2048-token chunks.
 
 Continued saves use the same alignment and are written only when the live graph
 naturally reaches an absolute frontier. With the defaults this means roughly
@@ -1078,17 +1069,8 @@ every 10k tokens, independent of where the first cold checkpoint landed, so long
 generations leave restart points behind without persisting the fragile final few
 tokens.
 
-- `--kv-cache-min-tokens`
-- `--kv-cache-cold-max-tokens`
-- `--kv-cache-continued-interval-tokens`
-- `--kv-cache-boundary-trim-tokens`
-- `--kv-cache-boundary-align-tokens`
-- `--tool-memory-max-ids`
-- `--disable-exact-dsml-tool-replay`
-
-By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
-when you want strict same-quant reuse only.
+Checkpoints may be reused across the 2-bit and 4-bit routed-expert
+variants if the rendered prefix matches (quant bits are recorded and logged).
 
 The cache directory is disposable. If behavior looks suspicious, stop the
 server and remove it. You can investigate what is cached with hexdump as

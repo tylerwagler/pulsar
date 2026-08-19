@@ -147,16 +147,13 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 pulsar_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-    opt(fp, c, "--served-model-id ID", "Model id in /v1/models(id,root),/version,/metrics (default deepseek-v4-flash). Set to an HF repo path so HF tools (llama-benchy tokenizer) resolve it.");
-    opt(fp, c, "--served-model-name NAME", "Human display name in /v1/models(name)/version (default: model shape name). Free-form; never used as a tokenizer id.");
     if (tool != PULSAR_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
-    if (tool == PULSAR_HELP_SERVER) {
-        opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+    if (tool != PULSAR_HELP_SERVER) {
+        opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
+        opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     }
-    opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
-    opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != PULSAR_HELP_BENCH) {
             opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
@@ -283,16 +280,8 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 65536");
-    opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
-    opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
-    opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");
-    opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
-    opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
-    opt(fp, c, "--kv-cache-sys-prefix-margin-tokens N", "Cut the shared-preamble checkpoint this far below the chat anchor, clearing client-injected preamble jitter. Default: 2048");
-    opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--web-search-url URL", "SearXNG endpoint for the Anthropic web_search server tool (env: PULSAR_WEB_SEARCH_URL). Unset drops web_search tool entries.");
-    opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
     fputc('\n', fp);
 }
 

@@ -398,13 +398,11 @@ const char *server_model_id_from_engine(pulsar_engine *engine) {
 }
 
 const char *server_served_model_id(const server *s) {
-    return s->served_model_id ? s->served_model_id
-                              : server_model_id_from_engine(s->engine);
+    return server_model_id_from_engine(s->engine);
 }
 
 const char *server_served_model_name(const server *s) {
-    return s->served_model_name ? s->served_model_name
-                                : pulsar_engine_model_name(s->engine);
+    return pulsar_engine_model_name(s->engine);
 }
 
 
