@@ -383,6 +383,12 @@ context-coherence-probe:
 #      PREFILL_BASELINE_REF into a detached worktree, copies THIS tree's gate
 #      source + Makefile into it (the harness must be identical; only the
 #      engine/kernels may differ), builds there, and dumps the blob.
+#      Since 2026-08-19 (L046) the blob is COMMITTED under tests/test-vectors/,
+#      so step 1 is needed only when RE-ANCHORING — a fresh clone runs step 2
+#      directly.  Caveat that killed the old bootstrap: copying THIS Makefile
+#      into the ref's worktree only links if the ref's vendor/object layout is
+#      compatible with it, so keep the anchor recent (it should be anyway: the
+#      anchor is the last shipped numerics change).
 #   2. `make cuda-prefill-gate`           — after every D2R increment.
 # Each step loads the model once (~35 s) and prefills 2*(512+2048+4096) tokens.
 # Re-baselined 2026-07-26 to the v0.3.1 shipped commit: the old 8aa9d35 blob
@@ -497,7 +503,15 @@ context-coherence-probe:
 # single-chunk prompt stayed bit-identical while a ring-reading one did not,
 # which is what established that the fast-math scale bucket is not idempotent.
 PREFILL_BASELINE_REF ?= 055239b
-PREFILL_BASELINE     ?= temp/prefill_bitexact_baseline.bin
+# The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
+# with no bootstrap step, and the gate's guarantee no longer depends on a loose
+# file surviving in somebody's tree. The name carries the anchor ref, and the
+# default composes from PREFILL_BASELINE_REF so the two cannot drift apart:
+# re-anchoring = update the REF above, `make cuda-prefill-gate-baseline` (dumps
+# straight to the new tracked name), then commit the blob + this line together.
+# The blob is ~2.5 MB and self-describing (ref stamp + model header + token FNV;
+# see tests/prefill_bitexact_gate.cpp and the .md next to the blob).
+PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
 # worktree; normalise the expected ref through the same abbreviation so the
