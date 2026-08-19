@@ -37,7 +37,6 @@ typedef struct {
     uint32_t prefill_chunk;
     double step_mul;
     const char *dump_frontier_logits_dir;
-    bool warm_weights;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -180,8 +179,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.warm_weights = true;
         } else {
             fprintf(stderr, "pulsar-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -355,7 +352,6 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .warm_weights = cfg.warm_weights,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) return 1;

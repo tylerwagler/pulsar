@@ -915,31 +915,4 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
 
 
 
-/* Optional startup pass that touches tensor pages before timing generation. */
-void model_warm_weights(const pulsar_model *m) {
-    const uint64_t start = m->tensor_data_pos;
-    const uint64_t end = m->size;
-    if (start >= end) return;
-
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    const uint8_t *p = m->map;
-    volatile uint64_t checksum = 0;
-    const double t0 = now_sec();
-
-    fprintf(stderr, "pulsar: warming mapped tensor pages: %.2f GiB\n",
-            (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
-
-#if defined(POSIX_MADV_WILLNEED)
-    (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
-#endif
-
-    for (uint64_t off = start; off < end; off += page) {
-        checksum += p[off];
-    }
-    checksum += p[end - 1];
-
-    const double t1 = now_sec();
-    fprintf(stderr, "pulsar: warmed tensor pages in %.3fs (checksum=%llu)\n",
-            t1 - t0, (unsigned long long)checksum);
-}
 

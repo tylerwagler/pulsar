@@ -1717,7 +1717,6 @@ uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *over
 bool accelerator_prepare_expert_overlay(pulsar_backend backend,
                                         const pulsar_model *base,
                                         const pulsar_model *overlay);
-void model_warm_weights(const pulsar_model *m);
 
 /* Mapping that owns a tensor's payload: the overlay file's map for
  * --expert-overlay swapped tensors, the base model's map otherwise. */

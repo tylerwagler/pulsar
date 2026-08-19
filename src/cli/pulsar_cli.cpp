@@ -1671,8 +1671,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.think_mode = PULSAR_THINK_NONE;
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "pulsar: use pulsar-server for the HTTP server\n");
             exit(2);

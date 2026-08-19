@@ -80,7 +80,6 @@ typedef struct {
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
-    bool warm_weights;
     bool inspect_only;
 } pulsar_engine_options;
 

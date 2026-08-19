@@ -364,7 +364,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend);
-    if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
     config_validate_model(&e->model);
     if (opt->expert_overlay && opt->expert_overlay[0]) {

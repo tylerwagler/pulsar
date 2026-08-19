@@ -1310,7 +1310,6 @@ typedef struct {
     int soft_limit_think_close_rank;
     pulsar_think_mode think_mode;
     bool plain;
-    bool warm_weights;
     bool self_test_extractors;
 } eval_config;
 
@@ -1621,8 +1620,6 @@ static eval_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
             c.think_mode = PULSAR_THINK_LOW;
         } else if (!strcmp(arg, "--think-high")) {
@@ -4100,7 +4097,6 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .warm_weights = cfg.warm_weights,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) {
