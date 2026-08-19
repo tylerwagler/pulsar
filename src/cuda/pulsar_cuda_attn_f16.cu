@@ -63,6 +63,9 @@
 #define AF16_WARPS     16u
 #define AF16_THREADS  (AF16_WARPS * 32u)
 #define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
+#define AF16_ROWB     (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))
+/* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
+#define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
 
@@ -407,8 +410,14 @@ static void attn_f16_kernel(
      * ring rows (sRawRows/raw_start), then comp rows with the topk bad-row
      * masking; a row outside the tile stages nothing and decodes to zero,
      * exactly as before. */
-    #define AF16_ROWB (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))
-    __shared__ __align__(16) uint8_t sRawB[2][AF16_ROWS][AF16_ROWB];
+    /* The double buffer lives in DYNAMIC shared memory: adding its ~18.7 KB
+     * to the kernel's static declarations blew the 48 KB static cap
+     * (ptxas 0xc540 > 0xc000). The GB10 has 101 KB per SM; the launchers
+     * opt in via cudaFuncAttributeMaxDynamicSharedMemorySize and pass
+     * AF16_DYNSMEM_BYTES at launch. */
+    extern __shared__ __align__(16) uint8_t af16_dynsmem[];
+    uint8_t (*sRawB)[AF16_ROWS][AF16_ROWB] =
+        (uint8_t (*)[AF16_ROWS][AF16_ROWB])af16_dynsmem;
     __shared__ const uint8_t *sSrc[2][AF16_ROWS];
     __shared__ uint8_t sBadStage[2][AF16_ROWS];
     #define AF16_STAGE_TILE(BUF, ROW0)                                        \
@@ -745,6 +754,24 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     return on;
 }
 
+/* One-time dynamic-smem opt-in for attn_f16_kernel: static shared alone is
+ * capped at 48 KB, so the tile double-buffer's bytes must be granted here.
+ * Fail-loud: a refused grant means the launch would silently get 0 dynamic
+ * bytes and fault, so the caller refuses instead. */
+static int af16_dynsmem_ok(void) {
+    static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
+    if (state == 0) {
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        state = (e == cudaSuccess) ? 1 : -1;
+        if (state < 0)
+            fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
+                    cudaGetErrorString(e));
+    }
+    return state > 0;
+}
+
 int pulsar_gpu_attn_f16_tier_on(void) {
     static const int env_on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
     return env_on && af16_device_supported();
@@ -794,9 +821,10 @@ int pulsar_gpu_attention_f16_prefill_mx(
                         "n_nope=%u\n", n_head, n_groups, n_nope);
         return 0;
     }
+    if (!af16_dynsmem_ok()) return 0;
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
+    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
@@ -875,8 +903,9 @@ int pulsar_gpu_attention_f16_indexed(
      * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
      * matches rather than silently differing. */
     if (!af16_device_supported()) return 0;
+    if (!af16_dynsmem_ok()) return 0;
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv, comp_kv,
+    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, pos0, n_raw, raw_cap,
