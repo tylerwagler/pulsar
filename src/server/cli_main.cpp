@@ -695,14 +695,14 @@ static server_config parse_options(int argc, char **argv) {
         }
     }
     if (!c.engine.dspark_path) {
+        /* Say nothing when this finds no file: the main artifact may still
+         * carry a merged drafter (dspark.* tensors), which only the engine
+         * open can see.  The authoritative speculation line is logged after
+         * pulsar_engine_open in main(). */
         const char *d = resolve_default_gguf("dspark.gguf");
         if (d) {
             c.engine.dspark_path = d;
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: default drafter %s", d);
-        } else {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: no drafter found (gguf/dspark.gguf); "
-                       "running without speculative decoding");
         }
     }
     return c;
@@ -731,6 +731,23 @@ int main(int argc, char **argv) {
 
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
+
+    /* The one authoritative speculation line: only the opened engine knows
+     * whether a drafter exists (an external gguf OR dspark.* tensors merged
+     * into the main artifact), so the state is logged here, never at parse. */
+    if (pulsar_engine_has_dspark(engine)) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: speculative decoding active (%s drafter, draft depth %d)%s",
+                   cfg.engine.dspark_path ? cfg.engine.dspark_path : "merged",
+                   pulsar_engine_dspark_draft_tokens(engine),
+                   getenv("PULSAR_DSPARK_DISABLE")
+                       ? " -- PULSAR_DSPARK_DISABLE set, generations will not speculate"
+                       : "");
+    } else {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: no drafter (--dspark, gguf/dspark.gguf, or merged "
+                   "dspark.* tensors); running without speculative decoding");
+    }
 
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
