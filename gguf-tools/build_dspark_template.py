@@ -11,7 +11,8 @@ E2M1+E8M0 source):
   gguf-tools/deepseek4-quantize \\
     --hf HF_DIR --template dspark_template.gguf --out dspark.gguf \\
     --experts cutlass_mxfp4 $(cat gguf-tools/dspark_type_flags.txt)
-Then splice into the main model with gguf-tools/merge_dspark_gguf.py.
+Then pass the result to the main build as --dspark-template (the standalone
+merge_dspark_gguf.py splice step is retired).
 
 The dspark_type_flags.txt overrides are REQUIRED, but as of 2026-08-15 they no
 longer force f32 on the norms and gates. The engine reads bf16 for those now, so
@@ -126,8 +127,9 @@ def make_kvs(cfg):
     F = cfg['moe_intermediate_size']
     eps = cfg.get('rms_norm_eps', 1e-6)
     # The 3 draft sublayers target the last 3 main-model layers; the engine's
-    # dspark_weights_bind() reads these KVs and merge_dspark_gguf requires
-    # them (a merged artifact without them fails to bind the drafter).
+    # dspark_weights_bind() reads these KVs and the quantizer's dspark-template
+    # merge requires them (a merged artifact without them fails to bind the
+    # drafter).
     L = cfg['num_hidden_layers']
     kvs = [
         ('general.architecture', VAL_STRING, 'deepseek_v4_dspark'),

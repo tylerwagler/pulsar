@@ -28,12 +28,77 @@ Exit 0 = clean, 1 = a plain twin is present (message names the tensors).
 """
 import argparse
 import collections
-import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from merge_dspark_gguf import Reader
+ALIGN = 32
+
+# kv value type ids -> fixed size (bytes); 8=string, 9=array handled apart
+SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def align_up(v, a):
+    return (v + a - 1) // a * a
+
+
+class Reader:
+    """Full GGUF reader keeping raw kv/info bytes. Moved here from the retired
+    merge_dspark_gguf.py (superseded by deepseek4-quantize --dspark-template);
+    this gate was its last consumer."""
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        assert self.f.read(4) == b"GGUF", f"{path}: not a GGUF"
+        self.version = self.u32()
+        assert self.version == 3, f"{path}: GGUF v{self.version} unsupported"
+        self.n_tensors = self.u64()
+        self.n_kv = self.u64()
+        self.kv = []       # (key, raw_bytes_of_entire_entry)
+        for _ in range(self.n_kv):
+            start = self.f.tell()
+            key = self.s()
+            t = self.u32()
+            self.skip_val(t)
+            end = self.f.tell()
+            self.f.seek(start)
+            self.kv.append((key, self.f.read(end - start)))
+        self.tensors = []  # (name, dims, type, offset, raw_info_bytes)
+        for _ in range(self.n_tensors):
+            start = self.f.tell()
+            name = self.s()
+            nd = self.u32()
+            dims = [self.u64() for _ in range(nd)]
+            ttype = self.u32()
+            off = self.u64()
+            end = self.f.tell()
+            self.f.seek(start)
+            self.tensors.append((name, dims, ttype, off, self.f.read(end - start)))
+        self.alignment = ALIGN
+        for key, raw in self.kv:
+            if key == "general.alignment":
+                # last 4 bytes of a u32 kv entry are the value
+                self.alignment = struct.unpack("<I", raw[-4:])[0]
+        self.data_pos = align_up(self.f.tell(), self.alignment)
+        self.f.seek(0, 2)
+        self.file_size = self.f.tell()
+
+    def u32(self): return struct.unpack("<I", self.f.read(4))[0]
+    def u64(self): return struct.unpack("<Q", self.f.read(8))[0]
+    def s(self):   return self.f.read(self.u64()).decode()
+
+    def skip_val(self, t):
+        if t == 8:
+            self.f.read(self.u64())
+        elif t == 9:
+            et = self.u32()
+            n = self.u64()
+            if et == 8:
+                for _ in range(n):
+                    self.f.read(self.u64())
+            else:
+                self.f.read(SCALAR[et] * n)
+        else:
+            self.f.read(SCALAR[t])
 
 T_IQ2_XXS, T_FP8_E4M3, T_MXFP4 = 16, 38, 39
 T_CUTLASS_MXFP4, T_MXFP8_LT, T_IQ2_SOA, T_IQ2_MMQ = 40, 41, 42, 43

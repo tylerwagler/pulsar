@@ -251,9 +251,13 @@ The DSpark drafter always ships **inside** the checkpoint as the `mtp.*` weight
 block (4,705 tensors) — there is no separate drafter repo or file. Check the
 weight index, not filenames.
 
-**Drafter-only fixes do not need a rebuild.** `merge_dspark_gguf.py` preserves the
-main region byte-for-byte, so `unmerge_dspark_gguf.py` + fix + re-merge is far
-cheaper than re-quantizing (a from-scratch rebuild once crawled at ~38 min/layer).
+**Drafter-only fixes rerun step 2 with the fixed drafter template.** The old
+`merge_dspark_gguf.py`/`unmerge_dspark_gguf.py` shortcut (unmerge + fix +
+re-merge without touching the main region) was deleted 2026-08-19 along with
+the standalone merge step it belonged to; the quantizer's `--dspark-template`
+pass is the only supported way to combine main + drafter now. It preserves
+the main region byte-for-byte just the same, so the cost of a drafter fix is
+one quantizer pass, not a from-scratch rebuild.
 
 ## 3. Gates before anything is served
 
