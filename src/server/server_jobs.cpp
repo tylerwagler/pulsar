@@ -1255,7 +1255,7 @@ void server::gen_decode_init(session_slot *sl) {
      * distribution left to report for an accepted draft token, and the
      * drafter's own is a different model — so the choice is fewer tokens per
      * second, never a number from the wrong distribution. */
-    g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL && !j->req.logprobs;
+    g->dspark_spec_enabled = !j->req.logprobs;
     /* Entries from a superseded attempt (tool-error recovery, a web_search
      * round) go with the text they described: gen_decode_init discards
      * g->text, so the ledger restarts with it. */

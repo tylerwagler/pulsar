@@ -693,7 +693,7 @@ entry and expects the backend to run the search mid-request. Point the server
 at a SearXNG-compatible JSON endpoint and it will:
 
 ```sh
-./pulsar-server --web-search-url http://searxng.local:8888   # or PULSAR_WEB_SEARCH_URL
+./pulsar-server --web-search-url http://searxng.local:8888
 ```
 
 With a backend configured, `web_search_*` tool entries are recognized and

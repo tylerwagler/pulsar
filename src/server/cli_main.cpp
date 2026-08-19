@@ -644,11 +644,8 @@ int main(int argc, char **argv) {
      * into the main artifact), so the state is logged here, never at parse. */
     if (pulsar_engine_has_dspark(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: speculative decoding active (merged drafter, draft depth %d)%s",
-                   pulsar_engine_dspark_draft_tokens(engine),
-                   getenv("PULSAR_DSPARK_DISABLE")
-                       ? " -- PULSAR_DSPARK_DISABLE set, generations will not speculate"
-                       : "");
+                   "pulsar-server: speculative decoding active (merged drafter, draft depth %d)",
+                   pulsar_engine_dspark_draft_tokens(engine));
     } else {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: no dspark.* tensors in the artifact; "
@@ -1151,8 +1148,7 @@ int main(int argc, char **argv) {
      * Anthropic web_search server tool is executed here against this
      * SearXNG-compatible endpoint; unset => web_search tool entries are
      * dropped at parse. */
-    s.web_search_url = cfg.web_search_url ? cfg.web_search_url
-                                          : getenv("PULSAR_WEB_SEARCH_URL");
+    s.web_search_url = cfg.web_search_url;
     if (s.web_search_url && !s.web_search_url[0]) s.web_search_url = NULL;
     server_log(PULSAR_LOG_DEFAULT,
                s.web_search_url
