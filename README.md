@@ -579,15 +579,16 @@ position, which the fused speculative step cannot reconstruct — so it trades
 decode throughput for honest numbers.
 
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
-`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
+`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `top_k`,
+`min_p`, `seed`, `stream`,
 and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
 Responses continuations bound to live state when possible, and can fall back to
 the same DSML rendering and KV prefix reuse used by chat completions.
 
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
-`temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
-controls. Tool uses are returned as Anthropic `tool_use` blocks.
+`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stream`, `stop_sequences`,
+and thinking controls. Tool uses are returned as Anthropic `tool_use` blocks.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than

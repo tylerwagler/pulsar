@@ -2,6 +2,49 @@
 
 
 
+/* Shared sampling-knob parsing for every request surface. Returns 1 if `key`
+ * was a sampling knob and its value was consumed, 0 if it is not a sampling
+ * knob (caller keeps matching), -1 on a malformed value (caller frees key and
+ * goes to its error label). One definition so a knob is never silently dropped
+ * by whichever arm a given endpoint's copy-paste happened to include -- every
+ * surface accepts temperature/top_p/min_p/top_k/seed identically. logprobs
+ * stays endpoint-local (chat only). */
+static int parse_sampling_key(const char *key, const char **p, request *r) {
+    if (!strcmp(key, "temperature")) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return -1;
+        r->temperature = (float)v;
+        r->has_temperature = true;
+    } else if (!strcmp(key, "top_p")) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return -1;
+        r->top_p = (float)v;
+        r->has_top_p = true;
+    } else if (!strcmp(key, "min_p")) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return -1;
+        /* out-of-range disables the filter, matching the engine sampler
+         * (sample_top_p_min_p); an unvalidated min_p>1 collapses to greedy. */
+        if (v < 0.0 || v > 1.0) v = 0.0;
+        r->min_p = (float)v;
+        r->has_min_p = true;
+    } else if (!strcmp(key, "top_k")) {
+        if (!json_int(p, &r->top_k)) return -1;
+        r->has_top_k = true;
+    } else if (!strcmp(key, "seed")) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return -1;
+        /* NaN fails v>0; +inf or >=2^64 would be UB in the cast. */
+        r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
+                : v > 0.0                                 ? UINT64_MAX
+                                                          : 0;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -16,6 +59,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     bool got_thinking = false;
     bool got_top_logprobs = false;
     bool thinking_enabled = true;
+    int skr = 0;
     pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -74,42 +118,11 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            if (skr < 0) {
                 free(key);
                 goto bad;
             }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* Same convention as top_p's range handling in the engine
-             * samplers (sample_top_p_min_p): an out-of-range value disables
-             * the filter instead of erroring.  Unvalidated, min_p > 1
-             * silently collapses sampling to greedy (only the max-prob
-             * candidate survives the cutoff). */
-            if (v < 0.0 || v > 1.0) v = 0.0;
-            r->min_p = (float)v;
-            r->has_min_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
         } else if (!strcmp(key, "logprobs")) {
             /* OpenAI SDKs send an explicit null for "not set" on both logprobs
              * fields, so accept it as absent rather than as malformed JSON. */
@@ -135,16 +148,6 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
                                    && v == (double)(int)v) ? (int)v : -1;
                 got_top_logprobs = true;
             }
-        } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
-            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
-                    : v > 0.0                                 ? UINT64_MAX
-                                                              : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -269,6 +272,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     bool tool_choice_forced = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    int skr = 0;
     pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     char *system = NULL;
@@ -380,28 +384,11 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            if (skr < 0) {
                 free(key);
                 goto bad;
             }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1193,6 +1180,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    int skr = 0;
     pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
@@ -1301,22 +1289,11 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            if (skr < 0) {
                 free(key);
                 goto bad;
             }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1502,6 +1479,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
+    int skr = 0;
     pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
 
     json_ws(&p);
@@ -1535,52 +1513,11 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            if (skr < 0) {
                 free(key);
                 goto bad;
             }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* Same convention as top_p's range handling in the engine
-             * samplers (sample_top_p_min_p): an out-of-range value disables
-             * the filter instead of erroring.  Unvalidated, min_p > 1
-             * silently collapses sampling to greedy (only the max-prob
-             * candidate survives the cutoff). */
-            if (v < 0.0 || v > 1.0) v = 0.0;
-            r->min_p = (float)v;
-            r->has_min_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
-        } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
-            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
-                    : v > 0.0                                 ? UINT64_MAX
-                                                              : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);

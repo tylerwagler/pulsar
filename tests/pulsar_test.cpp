@@ -2474,24 +2474,31 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(!r.has_min_p && r.min_p == PULSAR_DEFAULT_MIN_P);
     request_free(&r);
 
-    /* Anthropic messages: temperature/top_p/top_k (the API has no min_p) */
+    /* Anthropic messages: every knob is now accepted (shared parse_sampling_key)
+     * -- min_p and seed used to be silently dropped here. */
     TEST_ASSERT(parse_anthropic_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
-        "\"max_tokens\":64,\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40}",
+        "\"max_tokens\":64,\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40,"
+        "\"min_p\":0.1,\"seed\":123}",
         128, 32768, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_k && r.top_k == 40);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
-    TEST_ASSERT(!r.has_min_p && r.min_p == PULSAR_DEFAULT_MIN_P);
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.1f);
+    TEST_ASSERT(r.seed == 123);
     request_free(&r);
 
-    /* Responses: temperature/top_p */
+    /* Responses: every knob is now accepted -- top_k/min_p/seed used to be
+     * dropped, leaving a client's seed silently non-reproducible. */
     TEST_ASSERT(parse_responses_request(engine, NULL,
-        "{\"input\":\"hi\",\"temperature\":0.35,\"top_p\":0.9}",
+        "{\"input\":\"hi\",\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40,"
+        "\"min_p\":0.1,\"seed\":123}",
         128, 32768, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
-    TEST_ASSERT(!r.has_top_k && !r.has_min_p);
+    TEST_ASSERT(r.has_top_k && r.top_k == 40);
+    TEST_ASSERT(r.has_min_p && r.min_p == 0.1f);
+    TEST_ASSERT(r.seed == 123);
     request_free(&r);
 
     /* Legacy completions: all four knobs; explicit values EQUAL to the
