@@ -1018,10 +1018,13 @@ static int routed_moe_launch_mixed40(
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
             if (ok && pulsar_cutlass_grouped_proj(gate_g, x_gathered, (const uint8_t *)gate_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0) != 0) ok = 0;
+            /* reuse_packed_a: same x_gathered, same scratch, same layout -- the
+             * up leg consumes the gate leg's E4M3 encoding instead of packing
+             * the identical values a second time. */
             if (ok && pulsar_cutlass_grouped_proj(up_g, x_gathered, (const uint8_t *)up_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 1) != 0) ok = 0;
             if (ok) {
                 uint64_t n = padded_upper * expert_mid_dim;
                 moe_swiglu_gathered_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(
@@ -1106,7 +1109,7 @@ static int routed_moe_launch_mixed40(
             ok = cuda_ok(cudaGetLastError(), "mixed40B mid gather");
             if (ok && pulsar_cutlass_grouped_proj(out_g, mid_g, (const uint8_t *)down_w,
                     down_expert_bytes, down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0) != 0) ok = 0;
             if (ok) {
                 moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
                         (uint32_t)padded_upper, out_dim);

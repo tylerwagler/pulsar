@@ -2348,6 +2348,11 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                n_tokens) != 0;
     }
     if (ok) {
+        /* ARM-DEPENDENT: batch_routed_up is only written by the MMQ arms
+         * (where it serves as raw-gate scratch); on 40/40-grouped and mixed
+         * case-A layers this dump shows a PREVIOUS layer's bytes. Same below
+         * for ffn_moe_down: the grouped path sums straight from its padded
+         * GEMM output and never touches batch_routed_down. */
         gpu_graph_debug_dump_tensor("ffn_moe_up_clamped", g->batch_routed_up,
                                       (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim, il, pos0);
     }

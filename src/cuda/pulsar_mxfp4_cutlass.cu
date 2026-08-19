@@ -763,7 +763,7 @@ int pulsar_cutlass_grouped_proj(
     const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-    uint8_t *scratch, size_t scratch_bytes){
+    uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a){
   size_t xA_off,xSF_off,xSF_bytes,arr_off,ws_off,ws_bytes;
   size_t need = grouped_proj_layout(padded_total, n_total_expert, in_dim,
                                     &xA_off,&xSF_off,&xSF_bytes,&arr_off,&ws_off,&ws_bytes);
@@ -773,8 +773,15 @@ int pulsar_cutlass_grouped_proj(
   ElementSF *xSF = reinterpret_cast<ElementSF*>(scratch + xSF_off);
   GArrays g = g_arrays_place(scratch + arr_off, n_total_expert);
   void *ws = ws_bytes ? (void*)(scratch + ws_off) : nullptr;
-  cudaMemsetAsync(xSF, 0, xSF_bytes);
-  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  /* The gate/up pair runs this GEMM twice on ONE gathered activation; the
+   * layout above is a pure function of (padded_total, in_dim), so the second
+   * call finds the first call's xA/xSF at the same offsets and skips the
+   * whole encode (it used to pack the identical values twice). g_build_arrays
+   * only READS xA/xSF, so nothing between the calls can have touched them. */
+  if (!reuse_packed_a) {
+    cudaMemsetAsync(xSF, 0, xSF_bytes);
+    pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  }
   long pmt = grouped_per_mtile_sfA(in_dim);
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   g_build_arrays<<<bb,bt>>>(g.prob, g.ptrA,g.dA,g.ptrSFA,g.lSFA, g.ptrB,g.dB,g.ptrSFB,g.lSFB,

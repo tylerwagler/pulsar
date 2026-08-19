@@ -1284,13 +1284,16 @@ size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
  * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
  * active expert (W_base+e*W_stride data, +W_data_bytes swizzled SFB). No host readback, no per-expert
  * sync; bit-identical to the per-expert single-proj path (same pack + gather order + GEMM). Padding
- * rows must be pre-zeroed. Caller sizes scratch once via pulsar_cutlass_grouped_proj_scratch_bytes(). */
+ * rows must be pre-zeroed. Caller sizes scratch once via pulsar_cutlass_grouped_proj_scratch_bytes().
+ * reuse_packed_a: skip the E4M3 activation pack and consume the encoding a PREVIOUS call left in
+ * this same scratch -- valid only when x_gathered, padded_total, in_dim and scratch are identical
+ * to that call's (the gate/up pair over one gathered activation). Ends the case-A double-encode. */
 size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim);
 int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
         const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
         int n_total_expert, int in_dim, int out_dim,
         const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-        uint8_t *scratch, size_t scratch_bytes);
+        uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a);
 
 /* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
