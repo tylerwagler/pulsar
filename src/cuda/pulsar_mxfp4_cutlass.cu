@@ -235,7 +235,10 @@ __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t
 __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
   long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
   float g=gate[i], u=up[i];
-  if(clamp>1.0e-6f){ if(g>clamp)g=clamp; if(u>clamp)u=clamp; if(u<-clamp)u=-clamp; }
+  /* fminf/fmaxf form, matching the hc_router twin EXACTLY: identical to the
+   * if-chain on finite inputs, but agrees on NaN too (fminf(NaN,c)=c, where
+   * the if-chain left NaN) -- the twins must not diverge on any input. */
+  if(clamp>1.0e-6f){ g=fminf(g,clamp); u=fminf(fmaxf(u,-clamp),clamp); }
   float s=g/(1.f+expf(-g));
   mid[i]=s*u*w[i/mid_dim];
 }
