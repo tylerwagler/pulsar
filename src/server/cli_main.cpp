@@ -598,8 +598,6 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
-            c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--web-search-url")) {
             c.web_search_url = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-file")) {
@@ -1165,7 +1163,6 @@ int main(int argc, char **argv) {
                    PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
     }
     s.default_tokens = cfg.default_tokens;
-    s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     /* One startup read (env fallback for the flag), no hot-path getenv: the
      * resolved URL is consulted per request, never per token.  Set => the
      * Anthropic web_search server tool is executed here against this
@@ -1192,10 +1189,6 @@ int main(int argc, char **argv) {
                    "pulsar-server: disk KV cache disabled (directory %s unusable); "
                    "serving without disk restore",
                    cfg.kv_disk_dir);
-    }
-    if (s.disable_exact_dsml_tool_replay) {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
     }
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);

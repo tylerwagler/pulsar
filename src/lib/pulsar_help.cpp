@@ -280,7 +280,6 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 65536");
-    opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--web-search-url URL", "SearXNG endpoint for the Anthropic web_search server tool (env: PULSAR_WEB_SEARCH_URL). Unset drops web_search tool entries.");
     fputc('\n', fp);
 }

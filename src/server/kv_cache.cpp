@@ -165,7 +165,7 @@ bool server::kv_tool_map_serialized_size(const char *text,
                                         uint64_t *bytes_out) {
     auto *s = this;
     if (bytes_out) *bytes_out = 0;
-    if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return true;
+    if (!s || !text || !text[0]) return true;
 
     pthread_mutex_lock(&s->tool_mu);
     bool ok = s->kv_tool_map_measure_locked(text, NULL, bytes_out);
@@ -179,7 +179,7 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
                               uint64_t *written_bytes) {
     auto *s = this;
     if (written_bytes) *written_bytes = 0;
-    if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
+    if (!s || !fp || !text || !text[0]) return true;
 
     pulsar::ScopedLock lk(&s->tool_mu);
     uint32_t count = 0;
@@ -229,7 +229,7 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
 
 int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay || !fp) return 0;
+    if (!s || !fp) return 0;
     uint8_t h[KV_TOOL_MAP_HEADER];
     size_t n = fread(h, 1, sizeof(h), fp);
     if (n == 0 && feof(fp)) return 0;
@@ -292,7 +292,7 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 
 void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
+    if (!s || !s->kv.enabled || !msgs) return;
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;

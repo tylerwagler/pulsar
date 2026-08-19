@@ -494,7 +494,7 @@ session_slot *server::anthropic_live_slot_for_ids(const stop_list *ids) {
 
 bool server::tool_memory_has_id(const char *id) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
+    if (!s || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
     bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
     pthread_mutex_unlock(&s->tool_mu);
@@ -518,8 +518,7 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
 
 void server::tool_memory_remember(const tool_calls *calls) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay ||
-        !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
+    if (!s || !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
@@ -533,8 +532,7 @@ void server::tool_memory_remember(const tool_calls *calls) {
 void server::tool_memory_put_source(const char *id, const char *dsml,
                                    tool_memory_source source) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay ||
-        !id || !id[0] || !dsml || !dsml[0]) return;
+    if (!s || !id || !id[0] || !dsml || !dsml[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     tool_memory_put_locked(&s->tool_mem, id, dsml, source);
     pthread_mutex_unlock(&s->tool_mu);
@@ -557,7 +555,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
                                            tool_replay_stats *stats) {
     auto *s = this;
     if (!msgs) return;
-    if (!s || s->disable_exact_dsml_tool_replay) {
+    if (!s) {
         if (stats) {
             for (int i = 0; i < msgs->len; i++) {
                 tool_calls *calls = &msgs->v[i].calls;

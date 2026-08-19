@@ -2865,10 +2865,6 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
 
     TEST_ASSERT(!s.should_canonicalize_tool_checkpoint(&calls));
 
-    s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
-
-    s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_dsml);
     calls.raw_dsml = NULL;
     TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
@@ -3060,49 +3056,6 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
 
     tool_calls_free(&calls);
     request_free(&r);
-}
-
-
-
-static void test_exact_dsml_tool_replay_can_be_disabled(void) {
-    const char *dsml =
-        "\n\n<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-
-    server s = {0};
-    pthread_mutex_init(&s.tool_mu, NULL);
-    s.tool_memory_put("call_disabled", dsml);
-    s.disable_exact_dsml_tool_replay = true;
-
-    chat_msgs msgs = {0};
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    tool_call tc = {0};
-    tc.id = xstrdup("call_disabled");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"canonical\"}");
-    tool_calls_push(&assistant.calls, tc);
-    chat_msgs_push(&msgs, assistant);
-
-    tool_replay_stats stats = {0};
-    s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
-    TEST_ASSERT(stats.canonical == 1);
-    TEST_ASSERT(stats.missing_ids == 1);
-
-    FILE *fp = tmpfile();
-    TEST_ASSERT(fp != NULL);
-    uint64_t bytes = 123;
-    TEST_ASSERT(s.kv_tool_map_write(fp, dsml, &bytes));
-    TEST_ASSERT(bytes == 0);
-
-    if (fp) fclose(fp);
-    chat_msgs_free(&msgs);
-    tool_memory_free(&s.tool_mem);
-    pthread_mutex_destroy(&s.tool_mu);
 }
 
 
@@ -5509,7 +5462,6 @@ static void pulsar_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
-    test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();

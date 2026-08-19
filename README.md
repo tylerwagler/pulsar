@@ -643,9 +643,9 @@ tool ID back, the prompt renderer uses the exact DSML bytes the model sampled,
 not a freshly formatted approximation. This map can also be saved inside KV
 cache files, so exact replay survives server restarts for cached histories.
 
-**Canonicalization is only the backup path**. If the exact DSML block is missing,
-or exact replay is disabled with `--disable-exact-dsml-tool-replay`, the server
-renders a deterministic DSML form from the JSON tool object. After a tool-call
+**Canonicalization is only the backup path**. If the exact DSML block is
+missing, the server renders a deterministic DSML form from the JSON tool
+object. After a tool-call
 turn, it compares the live sampled token stream with the prompt that the next
 client request will render. If needed, it rewrites the live checkpoint, or
 falls back to an older disk KV snapshot and replays only the suffix. This keeps
@@ -941,9 +941,8 @@ that already maps the model.
 
 Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
 IDs, so client JSON history can be rendered back to the exact sampled text. The
-RAM map keeps up to 100000 IDs (oldest pruned first).
-Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
-canonical JSON-to-DSML rendering.
+RAM map keeps up to 100000 IDs (oldest pruned first); when an ID is missing,
+the server falls back to canonical JSON-to-DSML rendering.
 
 On disk, a cache file is:
 

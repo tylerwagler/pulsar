@@ -1145,7 +1145,6 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
-    bool disable_exact_dsml_tool_replay;
     const char *web_search_url; /* see server_config.web_search_url */
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -1562,7 +1561,6 @@ typedef struct {
     bool kv_disk_disable;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
-    bool disable_exact_dsml_tool_replay;
     /* Base URL of the SearXNG-compatible backend for the Anthropic web_search
      * server tool (e.g. http://searxng.defense.lan:8888). NULL disables the
      * feature: web_search tool entries are then dropped at parse so the model
