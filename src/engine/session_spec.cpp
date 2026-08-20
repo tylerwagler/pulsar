@@ -897,7 +897,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
  * assembled, frontier snapshotted, checkpoint pushed), the verify forward
  * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
  * the batched lane), and round_end (walk, state, emit, redraft). */
-typedef struct {
+typedef struct pulsar_spec_round {
     uint32_t K;
     uint32_t n_batch;
     int saved_len;
@@ -1429,4 +1429,103 @@ int pulsar_session::eval_speculative_block(int first_token,
     return pulsar_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
                                                  0.0f, 0, 1.0f, 0.0f, NULL,
                                                  accepted, accepted_cap, err, errlen);
+}
+
+/* ---- plan-34 inc 6: the batched-lane round API (pulsar.h) --------------- */
+
+pulsar_spec_round *pulsar_spec_round_new(void) {
+    return (pulsar_spec_round *)xmalloc(sizeof(pulsar_spec_round));
+}
+
+void pulsar_spec_round_free(pulsar_spec_round *r) {
+    free(r);
+}
+
+/* The carry-or-sample head of generate_speculative, verbatim: forward the
+ * carry when it is valid at these params and this position, else draw fresh
+ * from the live logits. The caller owns the EOS short-circuit. */
+int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
+                               int top_k, float top_p, float min_p,
+                               uint64_t *rng) {
+    int first;
+    const bool carry_params_match =
+        s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
+        s->spec.spec_carry_top_p == top_p && s->spec.spec_carry_min_p == min_p;
+    const bool carry_pos_match = s->spec.spec_carry_pos == (int32_t)s->checkpoint.len;
+    if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
+        first = (int)s->spec.spec_carry_token;
+        s->spec.spec_carry_valid = false;
+    } else {
+        s->spec.spec_carry_valid = false;
+        first = sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k,
+                                   top_p, min_p, rng, &s->sample_scratch);
+    }
+    return first;
+}
+
+int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
+                                 int first_token, int max_tokens, int accepted_cap,
+                                 float temperature, int top_k, float top_p,
+                                 float min_p, char *err, size_t errlen) {
+    return spec_round_begin(s, first_token, max_tokens, accepted_cap,
+                            temperature, top_k, top_p, min_p, r, err, errlen);
+}
+
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
+                                  int first_token, pulsar_multiseq_req *out) {
+    for (uint32_t i = 0; i < r->n_batch; i++) {
+        out[i].bank = bank;
+        out[i].pos = r->saved_len + (int32_t)i;
+        out[i].token = i == 0 ? first_token : (int)r->pend[i - 1];
+    }
+    return r->n_batch;
+}
+
+/* Row source over the server-held ALL_ROWS logits block. */
+typedef struct {
+    const float *rows;
+    uint32_t row0;
+} spec_block_rows;
+
+static bool spec_row_read_block(void *ud, uint32_t row, float *out) {
+    const spec_block_rows *b = (const spec_block_rows *)ud;
+    memcpy(out, b->rows + ((size_t)b->row0 + row) * PULSAR_N_VOCAB,
+           (size_t)PULSAR_N_VOCAB * sizeof(float));
+    return true;
+}
+
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
+                               int first_token, int eos_token,
+                               float temperature, int top_k, float top_p,
+                               float min_p, uint64_t *rng,
+                               const float *rows, uint32_t row0,
+                               int *accepted, int accepted_cap,
+                               char *err, size_t errlen) {
+    /* Greedy walk consumes per-row argmaxes; the classic forward computes
+     * them on-device, the shared block computes them here. Draft i is judged
+     * against round-local row i (the row that PREDICTS it). */
+    for (uint32_t i = 0; i < r->K && i < 16u; i++) {
+        r->row_tops[i] = (int)sample_argmax(
+                rows + ((size_t)row0 + i) * PULSAR_N_VOCAB, PULSAR_N_VOCAB);
+    }
+    spec_block_rows src = { rows, row0 };
+    return spec_round_end(s, r, first_token, eos_token,
+                          temperature, top_k, top_p, min_p, rng,
+                          spec_row_read_block, &src, row0,
+                          0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
+                          accepted, accepted_cap, err, errlen);
+}
+
+void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
+    s->graph.dspark_capture_batch_n = n_rows;
+    s->graph.spec_comp_save_n = n_rows;
+}
+
+void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
+    /* Mirror the fused loop's forward-failure branch: drop the pushed rows,
+     * restore the frontier, release the snapshot. */
+    s->checkpoint.len = r->saved_len;
+    (void)spec_frontier_restore(&r->frontier, s);
+    spec_frontier_free(&r->frontier);
+    s->checkpoint_valid = false;
 }
