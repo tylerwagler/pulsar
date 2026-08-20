@@ -92,13 +92,18 @@ void *pulsar_gpu_batched_copy_prepare(pulsar_gpu_tensor **dst, pulsar_gpu_tensor
 int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
 void pulsar_gpu_batched_copy_free(void *handle);
 
+/* Command-tape bracket. There is NO CUDA-graph capture behind this: the
+ * decode graph tape was measured at a +0.6% ceiling on GB10 (decode is
+ * 98.9% GPU-busy, so replay has nothing to reclaim) and removed --
+ * begin_commands returns 1 unconditionally, end_commands synchronizes.
+ * The pair survives because callers bracket their encode regions with it.
+ * An earlier comment here described a capture pair and a
+ * PULSAR_CUDA_NO_GRAPHS opt-out, neither of which exists anywhere in the
+ * tree; upstream ds4 independently measured the same ~0.5% and turned
+ * graphs off by default on integrated Blackwell. */
 int pulsar_gpu_begin_commands(void);
 int pulsar_gpu_flush_commands(void);
 int pulsar_gpu_end_commands(void);
-/* Decode CUDA-graph capture pair: begin returns 1 when the tape is being
- * captured (end replays it as one graph launch and syncs); 0 means graphs
- * are disabled (PULSAR_CUDA_NO_GRAPHS / unsupported) and the caller must use
- * the plain begin/end_commands pair instead. */
 int pulsar_gpu_synchronize(void);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
