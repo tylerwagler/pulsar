@@ -1804,6 +1804,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
+            if (rows + pulsar_session_spec_next_rows_max(pool) > 16u) {
+                /* Over the shared-forward row budget: sit this sweep out
+                 * BEFORE the base draw or round_begin touch anything -- the
+                 * carry (possibly a rejection residual, whose exact emission
+                 * the acceptance proof needs) and the pendings stay intact
+                 * for the bank's next turn. */
+                pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
+                continue;
+            }
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
             const int first = pulsar_session_spec_next_base(pool, temp, top_k,
@@ -1830,16 +1839,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            const uint32_t nb = pulsar_spec_round_fill_reqs(rounds[i], sl->bank,
-                                                         first, reqs + rows);
-            if (rows + nb > 16u) {
-                /* Over the shared-forward row budget: this bank sits the
-                 * round out (abort releases its snapshot; its pendings were
-                 * consumed by begin, so it re-drafts on its next turn). */
+            if (rows + pulsar_spec_round_n_rows(rounds[i]) > 16u) {
+                /* Unreachable: the pre-begin budget check bounds n_batch from
+                 * above (begin only trims). Defensive backstop, checked
+                 * BEFORE fill_reqs writes, so a future change to begin's row
+                 * math cannot overflow reqs[]. */
                 pulsar_session_spec_round_abort(pool, rounds[i]);
                 pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
                 continue;
             }
+            const uint32_t nb = pulsar_spec_round_fill_reqs(rounds[i], sl->bank,
+                                                         first, reqs + rows);
             row0s[m] = rows;
             first_tok[m] = first;
             live_idx[m] = i;
@@ -2257,9 +2267,12 @@ void *worker_main(void *arg) {
         /* inc 6: the SPEC batched lane -- rounds, not tokens -- when every
          * batchable decode slot can speculate and no plain batch is mid-
          * flight (no lane switch mid-conversation; same reconciliation rule
-         * as classic->batched). Slots with spec off (logprobs requests,
-         * quench latched into plain) keep the whole group on the plain lane
-         * this quantum rather than splitting the sweep. */
+         * as classic->batched). Slots with spec off (logprobs requests) keep
+         * the whole group on the plain lane this quantum rather than
+         * splitting the sweep. A bank whose yield-quench has latched stays in
+         * this lane but degrades naturally to 1-row rounds: round_end's
+         * redraft respects the latch, so its pendings stay empty -- correct
+         * output, base-token rounds, only the per-row capture as overhead. */
         bool all_spec = pulsar_engine_has_dspark(s->engine) && n_dec >= 2 &&
                         n_batched == 0;
         for (int i = 0; all_spec && i < n_dec; i++) {

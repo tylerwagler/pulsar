@@ -1279,7 +1279,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
          * generate_speculative call consumes before routing plain. */
-        if (dspark_stats)
+        if (dspark_stats && t0 > 0.0)
             fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);
         return n_accept;
@@ -1288,7 +1288,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     const uint32_t keep = spec_round_redraft(s, next_base, main_x_ready,
                                              n_batch, commit,
                                              temperature, top_k, top_p, min_p, rng);
-    if (dspark_stats)
+    /* t0 == 0 marks a lane whose forward ran outside this round (the batched
+     * lane) -- step_ms would print the epoch, so skip the line there. */
+    if (dspark_stats && t0 > 0.0)
         fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
                 n_batch, commit, keep, (now_sec() - t0) * 1000.0);
     return n_accept;
@@ -1471,6 +1473,10 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
                             temperature, top_k, top_p, min_p, r, err, errlen);
 }
 
+uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
+    return r->n_batch;
+}
+
 uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
                                   int first_token, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
@@ -1514,6 +1520,15 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           spec_row_read_block, &src, row0,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                           accepted, accepted_cap, err, errlen);
+}
+
+uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
+    /* Upper bound on the next round's n_batch: begin's guards (base-token,
+     * position, params, caps) only ever TRIM K from dspark_n_pending, so
+     * 1 + pending is safe to budget against before consuming anything. */
+    uint32_t k = s->spec.dspark_n_pending;
+    if (k > 16u) k = 16u;
+    return 1u + k;
 }
 
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {

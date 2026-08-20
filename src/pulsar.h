@@ -485,6 +485,12 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank);
 typedef struct pulsar_spec_round pulsar_spec_round;
 pulsar_spec_round *pulsar_spec_round_new(void);
 void pulsar_spec_round_free(pulsar_spec_round *r);
+/* Upper bound on the rows the next round on the live bank will contribute to
+ * a shared forward (1 base + pending drafts, before begin's trims). Check the
+ * row budget against this BEFORE pulsar_session_spec_next_base: the base draw
+ * consumes the carry, and a rejection-residual carry must be emitted exactly
+ * (the acceptance proof depends on it), not discarded and redrawn. */
+uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
 /* The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
  * generate_speculative does. */
@@ -495,6 +501,10 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
                                  int first_token, int max_tokens, int accepted_cap,
                                  float temperature, int top_k, float top_p,
                                  float min_p, char *err, size_t errlen);
+/* Rows a begun round will occupy (1 + surviving drafts). Check the caller's
+ * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
+ * entries unconditionally. */
+uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
 /* Rows this round contributes to the shared forward: n_batch reqs
  * (first_token at the pre-round frontier, then the pending drafts). Returns
  * the row count written. */
