@@ -1320,6 +1320,7 @@ struct server {
     bool worker_try_bind();
     void worker_finish_slot(session_slot *sl);
     void worker_batched_decode_quantum(session_slot **dec, int n);
+    void worker_spec_batched_quantum(session_slot **dec, int n);
     session_slot * worker_find_fuse_prefill();
     void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
     session_slot * provision_bank(provision_refusal *refusal);

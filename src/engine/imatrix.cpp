@@ -1113,11 +1113,18 @@ int gpu_graph_decode_multiseq_batch(
      * no wasted K-row prefill head GEMM). Decode-bank logits are byte-identical to a
      * decode-only step either way. max_head_runs == 0 (all runs) preserves inc-3/4
      * behavior exactly. */
-    uint32_t head_runs = (max_head_runs == 0u || max_head_runs > n_runs)
+    /* Inc 6 (ALL_ROWS): head EVERY batch row -- logits row k == batch row k.
+     * This is by construction the single-block identity path over the whole
+     * batch (rows [0, n_active) head in place, no last-of-run gather), which
+     * is what the batched speculative verify's accept walk consumes. */
+    const bool head_all_rows = (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS);
+    uint32_t head_runs = head_all_rows ? n_active
+                       : (max_head_runs == 0u || max_head_runs > n_runs)
                        ? n_runs : max_head_runs;
     bool head_single_block = true;
-    for (uint32_t r = 0; r < head_runs; r++)
-        if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
+    if (!head_all_rows)
+        for (uint32_t r = 0; r < head_runs; r++)
+            if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {

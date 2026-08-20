@@ -516,11 +516,13 @@ bool server::send_metrics(int fd) {
      * the spec lane feeds the spec_decode_* counters. Without this a scraper
      * cannot tell a genuine acceptance rate from a stale one left over from
      * the last single-request stretch. */
-    static const char *const lane_names[] = { "idle", "spec", "batched" };
-    const int lane = (decode_lane >= 0 && decode_lane <= 2) ? decode_lane : 0;
-    buf_puts(&b, "# HELP pulsar:decode_lane Active decode lane (state set; spec_decode_* only advance on \"spec\").\n");
+    /* inc 6: lane 3 = spec-batched (rounds through one shared forward);
+     * spec_decode_* counters advance on BOTH "spec" and "spec-batched". */
+    static const char *const lane_names[] = { "idle", "spec", "batched", "spec-batched" };
+    const int lane = (decode_lane >= 0 && decode_lane <= 3) ? decode_lane : 0;
+    buf_puts(&b, "# HELP pulsar:decode_lane Active decode lane (state set; spec_decode_* advance on \"spec\" and \"spec-batched\").\n");
     buf_puts(&b, "# TYPE pulsar:decode_lane gauge\n");
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
         buf_printf(&b, "pulsar:decode_lane{lane=\"%s\"} %d\n", lane_names[i], i == lane ? 1 : 0);
     buf_puts(&b, "# HELP pulsar:spec_max_live Decode-bank count at or below which the spec lane runs.\n");
     buf_puts(&b, "# TYPE pulsar:spec_max_live gauge\n");

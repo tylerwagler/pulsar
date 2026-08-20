@@ -823,6 +823,18 @@ typedef struct {
      * drafter is loaded; the graph's dspark_raw_cache[i]/dspark_prompt_h[i]
      * become bank views into these, swapped by gpu_graph_bank_repoint so the
      * spec path transparently uses the active bank's ring.  NULL otherwise. */
+    /* plan-34 inc 6: per-bank SPEC FRONTIER SNAPSHOT lanes (same shapes as
+     * askv/assc/iskv/issc). The batched spec round snapshots EVERY decode
+     * bank before the shared verify forward, so the single-set spec_* buffers
+     * cannot hold them all; under banks the graph's spec_attn/index_state_*
+     * become bank views into these, re-sliced by gpu_graph_bank_repoint
+     * exactly like the live-state views (repoint already drops the baked
+     * batched-copy tables, so the snapshot fast path re-prepares per bank).
+     * NULL when the pool is spec-less. */
+    pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *spec_issc[PULSAR_MAX_LAYER];
     uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * PULSAR_ATTN_PACK row (584 B) */
     uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
     pulsar_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
@@ -2365,12 +2377,16 @@ bool gpu_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits);
+/* save_row0 (inc 6, W2): the first row of THIS session's positions within
+ * the verify forward's comp-save buffers. Classic single-bank rounds pass 0;
+ * the batched lane passes the bank's row offset in the shared batch. */
 bool gpu_graph_dspark_compressor_rollforward(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
         const pulsar_weights *weights,
         uint32_t          pos0,
-        uint32_t          n_positions);
+        uint32_t          n_positions,
+        uint32_t          save_row0);
 bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path);
 void imatrix_collector_free(pulsar_imatrix_collector *c);
 bool imatrix_collector_save(

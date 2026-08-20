@@ -431,6 +431,13 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
  * is unobservable AND lets the head take the single-block identity path (no
  * two-block gather/resync, no wasted K-row prefill head GEMM). *out_n_rows is then
  * the emitted count (== min(n_runs, max_head_runs), with 0 meaning n_runs). */
+/* max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS (plan-34 inc 6): emit logits for
+ * EVERY row of the batch, logits row k == batch row k, *out_n_rows == n_rows.
+ * This is the batched-speculative-verify contract: a run of K draft rows needs
+ * all K logit rows for the accept walk, not just the run's last. The head takes
+ * the identity path over the whole batch (no gather). Requires n_rows <= the
+ * spec-logits row capacity (16); rejected (return 1) otherwise. */
+#define PULSAR_MSEQ_HEAD_ALL_ROWS 0xffffffffu
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
@@ -457,6 +464,70 @@ int  pulsar_session_bank_count(pulsar_session *s);
 int  pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank);
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank);
+
+/* plan-34 inc 6: batched speculative rounds. One ROUND verifies one bank's
+ * pending drafts against a forward the CALLER runs -- the fused classic loop
+ * and the server's batched lane share every line of round logic; only the
+ * forward differs (classic verify vs one shared decode_mixed ALL_ROWS step
+ * covering every decode bank's rows).
+ *
+ * Flow per bank, under bank_state_restore(bank):
+ *   first = pulsar_session_spec_next_base(...);        // carry or fresh draw
+ *   pulsar_session_spec_round_begin(...);              // guards, snapshot, push
+ *   pulsar_spec_round_fill_reqs(...);                  // rows for decode_mixed
+ * then ONE pulsar_session_decode_mixed(ALL_ROWS) over all banks' rows, then
+ * per bank under bank_state_restore(bank):
+ *   pulsar_session_spec_round_end(...);                // walk, state, redraft
+ *   pulsar_session_bank_state_save(bank);              // persist trimmed truth
+ * A round that was begun but whose forward failed MUST be aborted
+ * (pulsar_session_spec_round_abort) or the frontier snapshot leaks and the
+ * checkpoint keeps unverified rows. */
+typedef struct pulsar_spec_round pulsar_spec_round;
+pulsar_spec_round *pulsar_spec_round_new(void);
+void pulsar_spec_round_free(pulsar_spec_round *r);
+/* Upper bound on the rows the next round on the live bank will contribute to
+ * a shared forward (1 base + pending drafts, before begin's trims). Check the
+ * row budget against this BEFORE pulsar_session_spec_next_base: the base draw
+ * consumes the carry, and a rejection-residual carry must be emitted exactly
+ * (the acceptance proof depends on it), not discarded and redrawn. */
+uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
+/* The carry-or-sample base draw (the head of generate_speculative). Never
+ * returns EOS handling -- the caller checks and short-circuits like
+ * generate_speculative does. */
+int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
+                               int top_k, float top_p, float min_p,
+                               uint64_t *rng);
+int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
+                                 int first_token, int max_tokens, int accepted_cap,
+                                 float temperature, int top_k, float top_p,
+                                 float min_p, char *err, size_t errlen);
+/* Rows a begun round will occupy (1 + surviving drafts). Check the caller's
+ * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
+ * entries unconditionally. */
+uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
+/* Rows this round contributes to the shared forward: n_batch reqs
+ * (first_token at the pre-round frontier, then the pending drafts). Returns
+ * the row count written. */
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
+                                  int first_token, pulsar_multiseq_req *out);
+/* Finish the round against the shared forward's logits block: `rows` points
+ * at the block, and this round's rows start at block row `row0` (row stride =
+ * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
+ * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
+ * computed host-side from the block. */
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
+                               int first_token, int eos_token,
+                               float temperature, int top_k, float top_p,
+                               float min_p, uint64_t *rng,
+                               const float *rows, uint32_t row0,
+                               int *accepted, int accepted_cap,
+                               char *err, size_t errlen);
+void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
+/* Arm (n_rows > 0) or disarm (0) the drafter anchor capture + Stage-B comp
+ * saves for the NEXT batched forward -- the shared verify step saves every
+ * row so each bank's round_end can consume its slice. Mirrors what the fused
+ * loop does around its own forward. */
+void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
 /* Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live

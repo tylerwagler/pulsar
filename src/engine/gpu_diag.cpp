@@ -389,12 +389,14 @@ uint64_t gpu_graph_session_bytes_banked(
         const uint64_t attn_state = (uint64_t)coff * PULSAR_N_HEAD_DIM *
                                     coff * ratio * f32;
         total += n_banks * 2ull * attn_state;             /* layer_attn_state_kv/score */
-        if (enable_spec) total += 2ull * attn_state;      /* spec_attn_state_kv/score */
+        /* inc 6: banked pools carry a snapshot lane PER BANK (batched spec
+         * verify snapshots every decode bank before the shared forward). */
+        if (enable_spec) total += (n_banks > 0 ? n_banks : 1) * 2ull * attn_state;
         if (ratio == 4) {
             const uint64_t index_state = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM *
                                          coff * ratio * f32;
             total += n_banks * 2ull * index_state;        /* layer_index_state_kv/score */
-            if (enable_spec) total += 2ull * index_state; /* spec_index_state_kv/score */
+            if (enable_spec) total += (n_banks > 0 ? n_banks : 1) * 2ull * index_state;
         }
     }
 
@@ -605,7 +607,8 @@ static bool gpu_graph_bank_slabs_alloc(
         pulsar_gpu_graph      *g,
         uint32_t              n_banks,
         bool                  managed_kv_cache,
-        const gpu_graph_dims *dz) {
+        const gpu_graph_dims *dz,
+        bool                  enable_spec) {
     pulsar_bank_slabs *b = &g->banks;
     /* The raw KV ring is PULSAR_ATTN_PACK rows: 584 B at head_dim 512, the same
       * 448 E4M3 + 8 scale + 64 bf16 layout the compressed pool uses. It was
@@ -650,6 +653,13 @@ static bool gpu_graph_bank_slabs_alloc(
         }
         b->askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
         b->assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        if (enable_spec) {
+            /* No fill: a snapshot always writes a lane before its restore
+             * reads it, and nothing else reads these. */
+            b->spec_askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+            b->spec_assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+            ok = ok && b->spec_askv[il] && b->spec_assc[il];
+        }
         /* Device base-pointer table (indexed by seq_id) the batched READ kernels
          * use instead of base + seq_id*comp_cap over one slab. */
         if (ok) b->comp_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
@@ -676,6 +686,11 @@ static bool gpu_graph_bank_slabs_alloc(
             }
             b->iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
             b->issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            if (enable_spec) {
+                b->spec_iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                b->spec_issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                ok = ok && b->spec_iskv[il] && b->spec_issc[il];
+            }
             if (ok) b->index_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
             ok = ok && b->iskv[il] && b->issc[il] && b->index_bases[il] &&
                  pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
@@ -1047,6 +1062,20 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
                 b->astate_bank_bytes[il]);
         ok = g->layer_attn_comp_cache[il] && g->layer_attn_state_kv[il] &&
              g->layer_attn_state_score[il];
+        /* inc 6: the spec frontier snapshot lanes follow the live views, so
+         * the snapshot machinery (incl. its re-prepared copy tables) is
+         * bank-correct with no call-site changes. */
+        if (ok && b->spec_askv[il]) {
+            pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
+            pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
+            g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
+                    b->spec_askv[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                    b->astate_bank_bytes[il]);
+            g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
+                    b->spec_assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                    b->astate_bank_bytes[il]);
+            ok = g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
+        }
         if (ok && ratio == 4) {
             pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
             pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
@@ -1059,6 +1088,16 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
             g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
                     b->issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
                     b->istate_bank_bytes[il]);
+            if (b->spec_iskv[il]) {
+                pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
+                pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
+                g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                        b->spec_iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+                g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                        b->spec_issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+            }
             ok = g->layer_index_comp_cache[il] && g->layer_index_state_kv[il] &&
                  g->layer_index_state_score[il];
         }
@@ -1665,7 +1704,7 @@ bool gpu_graph_alloc_raw_cap(
      * allocations, and all single-session code runs unmodified. */
     const uint32_t n_banks = gpu_graph_bank_pool_n();
     if (n_banks >= 2u &&
-        !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz)) {
+        !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz, enable_spec)) {
         gpu_graph_free(g);
         return false;
     }
@@ -1719,8 +1758,15 @@ bool gpu_graph_alloc_raw_cap(
                 g->layer_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
             if (enable_spec) {
-                g->spec_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                if (banked) {
+                    g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.spec_askv[il], 0, g->banks.astate_bank_bytes[il]);
+                    g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
+                            g->banks.spec_assc[il], 0, g->banks.astate_bank_bytes[il]);
+                } else {
+                    g->spec_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                    g->spec_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                }
             }
             /* Banked mode primes every bank's state lanes at slab alloc. */
             if (!banked && g->layer_attn_state_kv[il]) {
@@ -1751,8 +1797,15 @@ bool gpu_graph_alloc_raw_cap(
                     g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
                 if (enable_spec) {
-                    g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    if (banked) {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_iskv[il], 0, g->banks.istate_bank_bytes[il]);
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_issc[il], 0, g->banks.istate_bank_bytes[il]);
+                    } else {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    }
                 }
                 if (!banked && g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&

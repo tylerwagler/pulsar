@@ -428,6 +428,98 @@ static bool spec_timeslice_run(int n, int steps, double *secs,
     return ok;
 }
 
+
+/* HARD GATE (plan-34 inc 6): the ALL_ROWS head mode may change ONLY the
+ * emission set, never the values. Two identical fresh states run the same
+ * verify-shaped batch (bank0 = a 3-row run, bank1 = 1 row); the last-of-run
+ * call emits 2 rows, the ALL_ROWS call emits 4, and the rows both modes emit
+ * must be BYTE-identical (same forward, same hidden rows, same head -- the
+ * mode only selects which rows are headed). This is the contract the batched
+ * speculative verify's accept walk stands on. */
+static bool check_all_rows_head_mode(void) {
+    const int vocab = (int)PULSAR_N_VOCAB;
+    float *rows_lor = (float *)malloc((size_t)2 * vocab * sizeof(float));
+    float *rows_all = (float *)malloc((size_t)4 * vocab * sizeof(float));
+    if (!rows_lor || !rows_all) { free(rows_lor); free(rows_all); return false; }
+    bool ok = true;
+    int tok0 = -1, tok1 = -1;
+    for (int mode = 0; ok && mode < 2; mode++) {
+        pulsar_session *s = NULL;
+        if (pulsar_session_create(&s, g_e, 4096) != 0) { ok = false; break; }
+        pulsar_gpu_graph *g = &s->graph;
+        if (gpu_graph_bank_pool_count(g) < 2) {
+            fprintf(stderr, "all-rows gate: pool too small\n");
+            pulsar_session_free(s);
+            ok = false;
+            break;
+        }
+        char err[256];
+        for (int k = 0; ok && k < 2; k++) {
+            if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
+            pulsar_session_invalidate(s);
+            pulsar_tokens p;
+            ok = make_prompt(k, &p);
+            if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) ok = false;
+            if (ok) {
+                gpu_graph_bank_counters_capture(g, (uint32_t)k);
+                if (k == 0) tok0 = pulsar_session_argmax(s);
+                else        tok1 = pulsar_session_argmax(s);
+            }
+            pulsar_tokens_free(&p);
+        }
+        if (!ok) { pulsar_session_free(s); break; }
+        /* bank0: 3-row teacher-forced run (draft shape); bank1: 1 row. The
+         * token VALUES only need to be legal and identical across the two
+         * modes -- the invariant under test is emission, not quality. */
+        pulsar_multiseq_req reqs[4];
+        for (int j = 0; j < 3; j++) {
+            reqs[j].bank = 0u;
+            reqs[j].pos = g_prompt_len[0] + j;
+            reqs[j].token = tok0;
+        }
+        reqs[3].bank = 1u;
+        reqs[3].pos = g_prompt_len[1];
+        reqs[3].token = tok1;
+        uint32_t got = 0;
+        const int rc = pulsar_session_decode_mixed(s, reqs, 4u,
+                mode == 0 ? rows_lor : rows_all,
+                (mode == 0 ? 2 : 4) * vocab, &got,
+                mode == 0 ? 0u : PULSAR_MSEQ_HEAD_ALL_ROWS,
+                err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "all-rows gate: decode_mixed mode %d failed (rc=%d): %s\n",
+                    mode, rc, err);
+            ok = false;
+        } else if (got != (mode == 0 ? 2u : 4u)) {
+            fprintf(stderr, "all-rows gate: mode %d emitted %u rows (want %u)\n",
+                    mode, got, mode == 0 ? 2u : 4u);
+            ok = false;
+        }
+        pulsar_session_free(s);
+    }
+    if (ok) {
+        const size_t rb = (size_t)vocab * sizeof(float);
+        const int d_last = memcmp(rows_all + (size_t)2 * vocab, rows_lor, rb);
+        const int d_b1   = memcmp(rows_all + (size_t)3 * vocab, rows_lor + (size_t)1 * vocab, rb);
+        CHECK(d_last == 0,
+              "ALL_ROWS row 2 (bank0 run-last) != last-of-run row 0 -- the head "
+              "mode changed VALUES, not just the emission set");
+        CHECK(d_b1 == 0,
+              "ALL_ROWS row 3 (bank1) != last-of-run row 1 -- the head mode "
+              "changed VALUES, not just the emission set");
+        int finite = 1;
+        for (int j = 0; j < 2 * vocab; j += 977)
+            if (!(rows_all[j] == rows_all[j])) finite = 0;
+        CHECK(finite, "ALL_ROWS intermediate rows contain NaN");
+        if (d_last == 0 && d_b1 == 0 && finite)
+            printf("ALL-ROWS HEAD MODE: emission-only (rows byte-identical to "
+                   "last-of-run; 4 rows emitted, intermediates finite)\n");
+    }
+    free(rows_lor);
+    free(rows_all);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
@@ -617,6 +709,8 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    if (!check_all_rows_head_mode()) CHECK(0, "all-rows head-mode gate failed to run");
 
     if (!check_stale_classic_fails_loud()) CHECK(0, "stale-classic guard check failed to run");
 
