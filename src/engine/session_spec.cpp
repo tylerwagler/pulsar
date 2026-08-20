@@ -575,6 +575,324 @@ static bool spec_row_read_classic(void *ud, uint32_t row, float *out) {
     return gpu_graph_read_spec_logits_row((pulsar_gpu_graph *)ud, row, out);
 }
 
+/* inc-6 W5: the redraft block, extracted from the fused loop verbatim
+ * (the no-draft guard stays with the caller -- it owns hit_eos/eos_token).
+ * Best-effort: any failure returns 0 pendings and the step is still a
+ * success (the original early-return contract). Recomputes the drafter
+ * locals internally so the batched lane can call it per bank under repoint
+ * with that bank's carry as next_base; n_batch/commit feed only the
+ * diagnostic dumps. Returns `keep`, the confidence-trimmed pending count it
+ * stashed (the caller's step_ms diagnostic reads it). W2 threads the bank's
+ * batch-row offset into the spec_logits views and seed/draft-forward calls
+ * in here. */
+static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
+                                   bool main_x_ready,
+                                   uint32_t n_batch, int commit,
+                                   float temperature, int top_k, float top_p,
+                                   float min_p, uint64_t *rng) {
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    const pulsar_dspark_weights *w = &e->dspark_weights;
+    const uint32_t embed_dim = 256;
+    const uint32_t vocab_size = w->vocab_size;
+    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
+    const void *dmap = e->dspark_model.map;
+    const uint64_t dsize = e->dspark_model.size;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
+    static int dtree_stats_env = -1;
+    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
+    uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
+    if (n_draft > 16u) n_draft = 16u;
+    if (n_draft == 0u) return 0;
+    /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
+     * NOTE: no seed here -- the committed positions' rows were seeded above
+     * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
+     * processed as batch position 0.
+     *
+     * main_x is NOT re-projected here.  It used to be, "for clarity", after the
+     * seeding loop had already left it at exactly this value — 3 sync copies, a
+     * gemv and a norm per step for a value we already had.  The invariant is
+     * checked at main_x_ready above, and seed_draft_kv only reads main_x, so
+     * nothing between there and here can disturb it. */
+    if (!main_x_ready)
+        return 0;   /* drafting is best-effort; the step already succeeded */
+    int32_t draft_ids[16];
+    draft_ids[0] = (int32_t)next_base;
+    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
+    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
+                                        &e->dspark_model, &e->dspark_weights,
+                                        g->spec_logits, draft_ids, n_draft))
+        return 0;
+
+    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
+    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return 0;
+    int32_t refined[17];
+    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
+     * are sampled: this is the runner-up to the markov ARGMAX, which is no
+     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
+     * longer means "target's correction == drafter's #2 given #1 rejected" —
+     * the p2 table in memory was measured under argmax drafting. Diagnostic
+     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
+    int32_t refined2[17];
+    refined[0] = (int32_t)next_base;
+    refined2[0] = -1;
+    /* Temperature-matched draft sampling: draw each draft from the refined
+     * logits filtered at the REQUEST's params (q) instead of taking the
+     * drafter's argmax, so the verify walk can use min(1, p/q) — whose
+     * acceptance is not capped at p(mode).
+     *
+     * temperature <= 0 keeps the argmax path untouched: no readback, no
+     * dist_build, and — critically — no rng draw, so the greedy token stream
+     * stays byte-identical (dist_build would collapse to a point mass, but
+     * pulsar_sample_dist_draw would still consume an rng word and shift the
+     * stream). It is also the fast path we do not want to slow down.
+     *
+     * The vocab check is a correctness guard, not an optimization: p is built
+     * over PULSAR_N_VOCAB target logits and q over the drafter's vocab_size. If
+     * they disagree the two are not distributions over the same space (and the
+     * row copy would overrun), so fall back to argmax proposals + the
+     * deterministic accept rule, which needs no q. */
+    const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
+    if (sample_drafts) {
+        /* n_draft rows, not 16: the depth is fixed per engine
+         * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
+         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
+        const uint32_t need = n_draft * PULSAR_N_VOCAB;
+        if (s->dspark_pending_qrows_cap < need) {
+            free(s->dspark_pending_qrows);
+            s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
+            s->dspark_pending_qrows_cap = need;
+        }
+    }
+    /* spec_logits rows are PULSAR_N_VOCAB wide (allocated 16*PULSAR_N_VOCAB,
+     * written and read elsewhere at that stride via gpu_graph_read_spec_logits_row).
+     * Stride the row view by the TARGET vocab, not the drafter's vocab_size:
+     * they are equal on the shipped drafter (markov head 129280 == N_VOCAB), so
+     * this is bit-exact today, but a drafter with a smaller vocab would make
+     * pos>=1 read into the middle of row 0.  vocab_size stays the LENGTH the
+     * markov step consumes. */
+    const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    bool draft_ok = true;
+    for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
+        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
+            g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
+        draft_ok = base_row &&
+            pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
+                                             dtree_stats ? &refined2[pos + 1] : NULL,
+                                             base_row, dmap, dsize,
+                                             w->markov_w1->abs_offset,
+                                             w->markov_w2->abs_offset,
+                                             refined[pos], vocab_size, embed_dim,
+                                             w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                             w->markov_w2->type == PULSAR_TENSOR_BF16);
+        pulsar_gpu_tensor_free(base_row);
+        if (!draft_ok || !sample_drafts) continue;
+        /* Read this position's refined logits back BEFORE the next markov step
+         * overwrites the single-row scratch, and keep the row: the residual
+         * needs the full q of whichever position rejects, which is not known
+         * until verify. (This full-vocab D2H per draft position is the
+         * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
+        float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
+        if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+            draft_ok = false;
+            break;
+        }
+        pulsar_sample_dist q;
+        pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
+                              &s->sample_scratch, &q);
+        const int drawn = pulsar_sample_dist_draw(&q, rng);
+        refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
+        s->spec.dspark_pending_q[pos] = pulsar_sample_dist_prob(&q, drawn);
+        /* Diagnostic: how much proposal entropy is there actually? The whole
+         * premise of temperature-matched drafting is that q is a DISTRIBUTION.
+         * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
+         * degenerates to the deterministic rule, and Item 1 is a no-op. */
+        if (dspark_stats)
+            fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
+                            "drawn_is_argmax=%d\n",
+                    pos, q.n, (double)q.probs[0],
+                    (double)s->spec.dspark_pending_q[pos], drawn == q.ids[0]);
+        pulsar_sample_dist_free(&q);
+    }
+    if (!draft_ok) return 0;
+
+    /* Offline-validation / confidence-training dump (same hook as the legacy
+     * loop, which the production fused path previously never reached). Emitted
+     * after markov refine, while batch_ffn_cur still holds the post-hc_head
+     * hidden rows the confidence kernel consumes. */
+    dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
+
+    /* On-policy trajectory dump (PULSAR_DSPARK_DUMP_ONPOLICY=<max steps>,
+     * _PATH=<file>): self-contained per-step records for teacher-forcing the
+     * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
+     * "remaining acceptance gap is on-policy distribution" (torch matches the
+     * engine's level on identical data) from "engine draft-forward middle is
+     * numerically wrong" (torch scores much higher). Record: {pos, next_base,
+     * n_draft, n_batch, commit, refined[n_draft+1], th[n_batch][3][4096] f32};
+     * batch row m holds the anchor hiddens of position pos-1-commit+m; rows
+     * 0..commit are the committed positions, row commit the drafting anchor. */
+    {
+        static int opsteps = -1;
+        if (opsteps < 0) {
+            const char *e2 = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
+            opsteps = e2 && e2[0] ? atoi(e2) : 0;
+        }
+        static int opdone = 0;
+        /* Read once, and only if the already-cached step budget says this dump
+         * is live at all — the previous form called getenv every spec step even
+         * when opsteps was 0, i.e. always, for everyone. */
+        static const char *oppath = NULL;
+        static int oppath_read = 0;
+        if (opsteps > 0 && !oppath_read) {
+            oppath_read = 1;
+            const char *p = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
+            oppath = (p && p[0]) ? p : NULL;
+        }
+        if (opdone < opsteps && oppath) {
+            FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
+            if (f2) {
+                int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
+                                    (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
+                fwrite(hdr2, sizeof(int32_t), 5, f2);
+                fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
+                float *row2 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
+                for (uint32_t m2 = 0; m2 < n_batch; m2++) {
+                    for (int sl = 0; sl < 3; sl++) {
+                        memset(row2, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
+                        (void)pulsar_gpu_tensor_read(g->dspark_target_h_batch[sl],
+                                                  (uint64_t)m2 * PULSAR_N_EMBD * sizeof(float),
+                                                  row2,
+                                                  (uint64_t)PULSAR_N_EMBD * sizeof(float));
+                        fwrite(row2, sizeof(float), PULSAR_N_EMBD, f2);
+                    }
+                }
+                free(row2);
+                /* Bug-#4 localization payload (PULSAR_DSPARK_DUMP_RING=1): the
+                 * drafter's context-KV ring + counters as the NEXT draft
+                 * forward will read them (post-seeding for this step's
+                 * commits), plus this step's block outputs (cur_hc rows).
+                 * Lets the torch reference attend over the ENGINE'S OWN ring
+                 * to split "seed rows wrong" from "block compute wrong". */
+                static int dump_ring = -1;
+                if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
+                if (dump_ring) {
+                    /* The drafter ring is PULSAR_ATTN_PACK rows (584 B) as of
+                     * 157cd1d, not f32.  This asked for DRAFT_WINDOW*head_dim
+                     * floats -- more bytes than the ring now holds -- and the
+                     * read is (void)-cast, so it would have written a block of
+                     * ZEROS to the dump and looked like an empty ring.  It now
+                     * dumps the packed bytes, so the record is the ring's real
+                     * contents; a reader decodes nope as e4m3 * 2^(e8-127) and
+                     * rope as bf16, per PULSAR_ATTN_PACK_ROWBYTES. */
+                    const uint64_t ring_bytes =
+                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+                    uint8_t *ring = (uint8_t *)xmalloc(ring_bytes);
+                    for (int li2 = 0; li2 < 3; li2++) {
+                        int32_t nr = (int32_t)g->dspark_n_raw[li2];
+                        fwrite(&nr, sizeof(int32_t), 1, f2);
+                        memset(ring, 0, ring_bytes);
+                        if (!pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes))
+                            fprintf(stderr, "pulsar: DSPARK_DUMP_RING read failed for layer %d\n", li2);
+                        fwrite(ring, 1, ring_bytes, f2);
+                    }
+                    free(ring);
+                    const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+                    float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
+                    for (uint32_t p2 = 0; p2 < n_draft; p2++) {
+                        memset(hcrow, 0, hcw2 * sizeof(float));
+                        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
+                                                      hcrow, hcw2);
+                        fwrite(hcrow, sizeof(float), hcw2, f2);
+                    }
+                    free(hcrow);
+                }
+                fclose(f2);
+                opdone++;
+            }
+        }
+    }
+
+    /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
+     * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
+     * can bucket by the actual confidence at every drafted position (collect
+     * with PULSAR_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
+    uint32_t keep = n_draft;
+    float conf[16];
+    bool have_conf = false;
+    {
+        const float tau = dspark_conf_sched_tau();
+        if (tau > 0.0f || dtree_stats) {
+            /* Persistent graph-owned scratch (n_draft is clamped to 16 above):
+             * the alloc/free pair here ran every fused spec step and each
+             * cudaMalloc/cudaFree serializes the device, which is exactly the
+             * pattern already retired in gpu_decode's dspark projection. */
+            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
+            pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
+            if (conf_dev && tok_dev &&
+                pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
+                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
+                                                      dmap, dsize,
+                                                      w->markov_w1->abs_offset,
+                                                      w->confidence_proj->abs_offset,
+                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size,
+                                                      w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                                      w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
+                pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
+                have_conf = true;
+                if (tau > 0.0f) {
+                    uint32_t k = 0;
+                    while (k < n_draft && conf[k] >= tau) k++;
+                    keep = k;   /* 0 pending = next step is a plain n=1 forward */
+                }
+            }
+        }
+    }
+    s->spec.dspark_pending_base = (int32_t)next_base;
+    s->spec.dspark_n_pending = keep;
+    for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
+    /* The proposal rule and the exact params these drafts were sampled under.
+     * Stamped unconditionally, in the same straight-line block as
+     * dspark_n_pending above — this is the only site that makes pendings
+     * non-zero, so a populated dspark_pending_q[]/qrows pool (filled in the
+     * drafting loop above, under sample_drafts) always has its params alongside
+     * it. Three consumers: the verify walk picks its accept rule from the flag,
+     * next step's params guard compares against the params, and — load-bearing —
+     * the residual rebuilds q from the qrows under THESE params, so the stored
+     * accept denominator and the residual describe one proposal. */
+    s->spec.dspark_pending_sampled = sample_drafts;
+    s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
+    s->spec.dspark_pending_temp = temperature;
+    s->spec.dspark_pending_top_k = top_k;
+    s->spec.dspark_pending_top_p = top_p;
+    s->spec.dspark_pending_min_p = min_p;
+    if (dtree_stats)
+        for (uint32_t i = 0; i < keep; i++) {
+            s->spec.dspark_pending_alt[i] = refined2[i + 1];
+            s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
+        }
+
+    /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
+     * position whose confidence lands in the ~[0.25,0.65] split band (where a
+     * confidence-gated sibling row could pay), and where the first such split
+     * point falls. next_base sits at abs position s->checkpoint.len; drafted
+     * position pos is next_base+1+pos. */
+    if (dtree_stats && have_conf) {
+        int firstmid = -1;
+        for (uint32_t i = 0; i < n_draft; i++)
+            if (conf[i] >= 0.25f && conf[i] <= 0.65f) { firstmid = (int)i; break; }
+        char cbuf[160];
+        int off = 0;
+        for (uint32_t i = 0; i < n_draft && off < (int)sizeof(cbuf) - 8; i++)
+            off += snprintf(cbuf + off, sizeof(cbuf) - off, "%s%.3f",
+                            i ? "," : "", (double)conf[i]);
+        fprintf(stderr, "DTREE_MID base_pos=%d nd=%u firstmid=%d conf=[%s]\n",
+                (int)s->checkpoint.len, n_draft, firstmid, cbuf);
+    }
+
+    return keep;
+}
+
 static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
                                               int max_tokens, int eos_token,
                                               float temperature, int top_k,
@@ -585,11 +903,6 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;
-    const uint32_t embed_dim = 256;
-    const uint32_t vocab_size = w->vocab_size;
-    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
-    const void *dmap = e->dspark_model.map;
-    const uint64_t dsize = e->dspark_model.size;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     static int dtree_stats_env = -1;
@@ -920,21 +1233,6 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    /* inc-6 W5 (NEXT SESSION, after the pinned 11167f1 gate run is green):
-     * everything from here to the end of the pendings/dtree stash is the
-     * REDRAFT BLOCK, to be extracted as
-     *   spec_round_redraft(s, next_base, main_x_ready,
-     *                      temperature, top_k, top_p, min_p, rng)
-     * recomputing internally: e, g, w = &e->dspark_weights, dmap/dsize from
-     * e->dspark_model, vocab_size/embed_dim from the markov head dims,
-     * n_draft, and the dspark_stats/dtree_stats statics. Boundaries: starts
-     * at this n_draft line, ends after the dtree mid-band diagnostic; the
-     * only values flowing OUT are the s->spec.* pendings/carry stashes it
-     * writes itself. The batched lane calls it per bank under repoint with
-     * next_base = that bank's carry; row sources inside (spec_logits views)
-     * are already absolute-row-indexed, so the bank's row offset must be
-     * threaded to the gpu_graph_dspark_draft_forward spec_logits view and
-     * dspark_seed_from_batch_row calls -- W2's offset params land here. */
     uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     if (n_draft > 16u) n_draft = 16u;
     if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
@@ -947,291 +1245,9 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         return n_accept;
     }
 
-    /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
-     * NOTE: no seed here -- the committed positions' rows were seeded above
-     * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
-     * processed as batch position 0.
-     *
-     * main_x is NOT re-projected here.  It used to be, "for clarity", after the
-     * seeding loop had already left it at exactly this value — 3 sync copies, a
-     * gemv and a norm per step for a value we already had.  The invariant is
-     * checked at main_x_ready above, and seed_draft_kv only reads main_x, so
-     * nothing between there and here can disturb it. */
-    if (!main_x_ready)
-        return n_accept;   /* drafting is best-effort; the step already succeeded */
-    int32_t draft_ids[16];
-    draft_ids[0] = (int32_t)next_base;
-    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
-    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
-                                        &e->dspark_model, &e->dspark_weights,
-                                        g->spec_logits, draft_ids, n_draft))
-        return n_accept;
-
-    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
-    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
-    int32_t refined[17];
-    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
-     * are sampled: this is the runner-up to the markov ARGMAX, which is no
-     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
-     * longer means "target's correction == drafter's #2 given #1 rejected" —
-     * the p2 table in memory was measured under argmax drafting. Diagnostic
-     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
-    int32_t refined2[17];
-    refined[0] = (int32_t)next_base;
-    refined2[0] = -1;
-    /* Temperature-matched draft sampling: draw each draft from the refined
-     * logits filtered at the REQUEST's params (q) instead of taking the
-     * drafter's argmax, so the verify walk can use min(1, p/q) — whose
-     * acceptance is not capped at p(mode).
-     *
-     * temperature <= 0 keeps the argmax path untouched: no readback, no
-     * dist_build, and — critically — no rng draw, so the greedy token stream
-     * stays byte-identical (dist_build would collapse to a point mass, but
-     * pulsar_sample_dist_draw would still consume an rng word and shift the
-     * stream). It is also the fast path we do not want to slow down.
-     *
-     * The vocab check is a correctness guard, not an optimization: p is built
-     * over PULSAR_N_VOCAB target logits and q over the drafter's vocab_size. If
-     * they disagree the two are not distributions over the same space (and the
-     * row copy would overrun), so fall back to argmax proposals + the
-     * deterministic accept rule, which needs no q. */
-    const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
-    if (sample_drafts) {
-        /* n_draft rows, not 16: the depth is fixed per engine
-         * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
-         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
-        const uint32_t need = n_draft * PULSAR_N_VOCAB;
-        if (s->dspark_pending_qrows_cap < need) {
-            free(s->dspark_pending_qrows);
-            s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
-            s->dspark_pending_qrows_cap = need;
-        }
-    }
-    /* spec_logits rows are PULSAR_N_VOCAB wide (allocated 16*PULSAR_N_VOCAB,
-     * written and read elsewhere at that stride via gpu_graph_read_spec_logits_row).
-     * Stride the row view by the TARGET vocab, not the drafter's vocab_size:
-     * they are equal on the shipped drafter (markov head 129280 == N_VOCAB), so
-     * this is bit-exact today, but a drafter with a smaller vocab would make
-     * pos>=1 read into the middle of row 0.  vocab_size stays the LENGTH the
-     * markov step consumes. */
-    const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
-    bool draft_ok = true;
-    for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
-        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
-            g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
-        draft_ok = base_row &&
-            pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
-                                             dtree_stats ? &refined2[pos + 1] : NULL,
-                                             base_row, dmap, dsize,
-                                             w->markov_w1->abs_offset,
-                                             w->markov_w2->abs_offset,
-                                             refined[pos], vocab_size, embed_dim,
-                                             w->markov_w1->type == PULSAR_TENSOR_BF16,
-                                             w->markov_w2->type == PULSAR_TENSOR_BF16);
-        pulsar_gpu_tensor_free(base_row);
-        if (!draft_ok || !sample_drafts) continue;
-        /* Read this position's refined logits back BEFORE the next markov step
-         * overwrites the single-row scratch, and keep the row: the residual
-         * needs the full q of whichever position rejects, which is not known
-         * until verify. (This full-vocab D2H per draft position is the
-         * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
-        float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
-        if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
-            draft_ok = false;
-            break;
-        }
-        pulsar_sample_dist q;
-        pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
-                              &s->sample_scratch, &q);
-        const int drawn = pulsar_sample_dist_draw(&q, rng);
-        refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
-        s->spec.dspark_pending_q[pos] = pulsar_sample_dist_prob(&q, drawn);
-        /* Diagnostic: how much proposal entropy is there actually? The whole
-         * premise of temperature-matched drafting is that q is a DISTRIBUTION.
-         * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
-         * degenerates to the deterministic rule, and Item 1 is a no-op. */
-        if (dspark_stats)
-            fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
-                            "drawn_is_argmax=%d\n",
-                    pos, q.n, (double)q.probs[0],
-                    (double)s->spec.dspark_pending_q[pos], drawn == q.ids[0]);
-        pulsar_sample_dist_free(&q);
-    }
-    if (!draft_ok) return n_accept;
-
-    /* Offline-validation / confidence-training dump (same hook as the legacy
-     * loop, which the production fused path previously never reached). Emitted
-     * after markov refine, while batch_ffn_cur still holds the post-hc_head
-     * hidden rows the confidence kernel consumes. */
-    dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
-
-    /* On-policy trajectory dump (PULSAR_DSPARK_DUMP_ONPOLICY=<max steps>,
-     * _PATH=<file>): self-contained per-step records for teacher-forcing the
-     * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
-     * "remaining acceptance gap is on-policy distribution" (torch matches the
-     * engine's level on identical data) from "engine draft-forward middle is
-     * numerically wrong" (torch scores much higher). Record: {pos, next_base,
-     * n_draft, n_batch, commit, refined[n_draft+1], th[n_batch][3][4096] f32};
-     * batch row m holds the anchor hiddens of position pos-1-commit+m; rows
-     * 0..commit are the committed positions, row commit the drafting anchor. */
-    {
-        static int opsteps = -1;
-        if (opsteps < 0) {
-            const char *e2 = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
-            opsteps = e2 && e2[0] ? atoi(e2) : 0;
-        }
-        static int opdone = 0;
-        /* Read once, and only if the already-cached step budget says this dump
-         * is live at all — the previous form called getenv every spec step even
-         * when opsteps was 0, i.e. always, for everyone. */
-        static const char *oppath = NULL;
-        static int oppath_read = 0;
-        if (opsteps > 0 && !oppath_read) {
-            oppath_read = 1;
-            const char *p = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
-            oppath = (p && p[0]) ? p : NULL;
-        }
-        if (opdone < opsteps && oppath) {
-            FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
-            if (f2) {
-                int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
-                                    (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
-                fwrite(hdr2, sizeof(int32_t), 5, f2);
-                fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
-                float *row2 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
-                for (uint32_t m2 = 0; m2 < n_batch; m2++) {
-                    for (int sl = 0; sl < 3; sl++) {
-                        memset(row2, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-                        (void)pulsar_gpu_tensor_read(g->dspark_target_h_batch[sl],
-                                                  (uint64_t)m2 * PULSAR_N_EMBD * sizeof(float),
-                                                  row2,
-                                                  (uint64_t)PULSAR_N_EMBD * sizeof(float));
-                        fwrite(row2, sizeof(float), PULSAR_N_EMBD, f2);
-                    }
-                }
-                free(row2);
-                /* Bug-#4 localization payload (PULSAR_DSPARK_DUMP_RING=1): the
-                 * drafter's context-KV ring + counters as the NEXT draft
-                 * forward will read them (post-seeding for this step's
-                 * commits), plus this step's block outputs (cur_hc rows).
-                 * Lets the torch reference attend over the ENGINE'S OWN ring
-                 * to split "seed rows wrong" from "block compute wrong". */
-                static int dump_ring = -1;
-                if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
-                if (dump_ring) {
-                    /* The drafter ring is PULSAR_ATTN_PACK rows (584 B) as of
-                     * 157cd1d, not f32.  This asked for DRAFT_WINDOW*head_dim
-                     * floats -- more bytes than the ring now holds -- and the
-                     * read is (void)-cast, so it would have written a block of
-                     * ZEROS to the dump and looked like an empty ring.  It now
-                     * dumps the packed bytes, so the record is the ring's real
-                     * contents; a reader decodes nope as e4m3 * 2^(e8-127) and
-                     * rope as bf16, per PULSAR_ATTN_PACK_ROWBYTES. */
-                    const uint64_t ring_bytes =
-                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-                    uint8_t *ring = (uint8_t *)xmalloc(ring_bytes);
-                    for (int li2 = 0; li2 < 3; li2++) {
-                        int32_t nr = (int32_t)g->dspark_n_raw[li2];
-                        fwrite(&nr, sizeof(int32_t), 1, f2);
-                        memset(ring, 0, ring_bytes);
-                        if (!pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes))
-                            fprintf(stderr, "pulsar: DSPARK_DUMP_RING read failed for layer %d\n", li2);
-                        fwrite(ring, 1, ring_bytes, f2);
-                    }
-                    free(ring);
-                    const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-                    float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
-                    for (uint32_t p2 = 0; p2 < n_draft; p2++) {
-                        memset(hcrow, 0, hcw2 * sizeof(float));
-                        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
-                                                      hcrow, hcw2);
-                        fwrite(hcrow, sizeof(float), hcw2, f2);
-                    }
-                    free(hcrow);
-                }
-                fclose(f2);
-                opdone++;
-            }
-        }
-    }
-
-    /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
-     * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
-     * can bucket by the actual confidence at every drafted position (collect
-     * with PULSAR_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
-    uint32_t keep = n_draft;
-    float conf[16];
-    bool have_conf = false;
-    {
-        const float tau = dspark_conf_sched_tau();
-        if (tau > 0.0f || dtree_stats) {
-            /* Persistent graph-owned scratch (n_draft is clamped to 16 above):
-             * the alloc/free pair here ran every fused spec step and each
-             * cudaMalloc/cudaFree serializes the device, which is exactly the
-             * pattern already retired in gpu_decode's dspark projection. */
-            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
-            pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
-            if (conf_dev && tok_dev &&
-                pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
-                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
-                                                      dmap, dsize,
-                                                      w->markov_w1->abs_offset,
-                                                      w->confidence_proj->abs_offset,
-                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size,
-                                                      w->markov_w1->type == PULSAR_TENSOR_BF16,
-                                                      w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
-                pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
-                have_conf = true;
-                if (tau > 0.0f) {
-                    uint32_t k = 0;
-                    while (k < n_draft && conf[k] >= tau) k++;
-                    keep = k;   /* 0 pending = next step is a plain n=1 forward */
-                }
-            }
-        }
-    }
-    s->spec.dspark_pending_base = (int32_t)next_base;
-    s->spec.dspark_n_pending = keep;
-    for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
-    /* The proposal rule and the exact params these drafts were sampled under.
-     * Stamped unconditionally, in the same straight-line block as
-     * dspark_n_pending above — this is the only site that makes pendings
-     * non-zero, so a populated dspark_pending_q[]/qrows pool (filled in the
-     * drafting loop above, under sample_drafts) always has its params alongside
-     * it. Three consumers: the verify walk picks its accept rule from the flag,
-     * next step's params guard compares against the params, and — load-bearing —
-     * the residual rebuilds q from the qrows under THESE params, so the stored
-     * accept denominator and the residual describe one proposal. */
-    s->spec.dspark_pending_sampled = sample_drafts;
-    s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
-    s->spec.dspark_pending_temp = temperature;
-    s->spec.dspark_pending_top_k = top_k;
-    s->spec.dspark_pending_top_p = top_p;
-    s->spec.dspark_pending_min_p = min_p;
-    if (dtree_stats)
-        for (uint32_t i = 0; i < keep; i++) {
-            s->spec.dspark_pending_alt[i] = refined2[i + 1];
-            s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
-        }
-
-    /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
-     * position whose confidence lands in the ~[0.25,0.65] split band (where a
-     * confidence-gated sibling row could pay), and where the first such split
-     * point falls. next_base sits at abs position s->checkpoint.len; drafted
-     * position pos is next_base+1+pos. */
-    if (dtree_stats && have_conf) {
-        int firstmid = -1;
-        for (uint32_t i = 0; i < n_draft; i++)
-            if (conf[i] >= 0.25f && conf[i] <= 0.65f) { firstmid = (int)i; break; }
-        char cbuf[160];
-        int off = 0;
-        for (uint32_t i = 0; i < n_draft && off < (int)sizeof(cbuf) - 8; i++)
-            off += snprintf(cbuf + off, sizeof(cbuf) - off, "%s%.3f",
-                            i ? "," : "", (double)conf[i]);
-        fprintf(stderr, "DTREE_MID base_pos=%d nd=%u firstmid=%d conf=[%s]\n",
-                (int)s->checkpoint.len, n_draft, firstmid, cbuf);
-    }
-
+    const uint32_t keep = spec_round_redraft(s, next_base, main_x_ready,
+                                             n_batch, commit,
+                                             temperature, top_k, top_p, min_p, rng);
     if (dspark_stats)
         fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
                 n_batch, commit, keep, (now_sec() - t0) * 1000.0);
