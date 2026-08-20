@@ -757,8 +757,9 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     if (!m || !m->map || m->size == 0) return false;
     /* Register each MXFP8 weight's offset so the workhorse matmul executes
      * ONLY registered tensors (per-tensor routing; unregistered offsets are
-     * rejected at dispatch). Runs before the DIRECT_MODEL early-out so it
-     * applies in the mmap path too. */
+     * rejected at dispatch). Runs before the weight-cache early-out so it
+     * applies in the mmap path too. (Said "the DIRECT_MODEL early-out" when
+     * that switch existed; the alternative load strategies are gone -- L030.) */
     uint64_t n_fp8 = 0, n_fp8_lt = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
