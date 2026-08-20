@@ -2208,9 +2208,10 @@ bool gpu_graph_encode_layer_ffn_batch(
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
     {
-        /* Same f16 epilogue as the attention norm above: batch_ffn_norm feeds
-         * the router-logits F16 GEMM, which would otherwise narrow the whole
-         * [n_tokens x n_embd] tensor in a separate bandwidth-bound pass. */
+        /* Same E4M3 epilogue as the attention norm above: batch_ffn_norm feeds
+         * the router-logits and shared-expert MXFP8 GEMMs, which would otherwise
+         * quantize the whole [n_tokens x n_embd] tensor in a separate
+         * bandwidth-bound pass. */
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD,
                                                         &ffn_norm_q, &ffn_norm_sf,
                                                         &ffn_norm_kbp)) {

@@ -437,26 +437,15 @@ int pulsar_gpu_rms_norm_plain_tensor(
         uint32_t                n,
         float                   eps);
 
-/* Same, but also fills out_h (n*rows __half) from the registers that produce the
- * f32 result.  batch_flat_hc feeds a 16384-wide F16 GEMM, so the separate
- * narrowing pass it replaces moves ~400 MB per call at a 4096-token prefill.
- * Bit-exact: identical __float2half of the identical value.  out_h may be NULL. */
-/* Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
- * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
 /* Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
  * i.e. how far our int8 activations sit from the source's own format.  <0 on
  * failure. */
 double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
 
+/* Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
+ * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
 
-
-
-/* True only when the plain-F16 matmul is guaranteed to consume the CACHED f16
- * activation, so the producer may skip its f32 store.  Conservative by design. */
-
-/* note_f16(), plus a record that the f32 store was skipped so f32 readers of
- * that buffer fail loudly instead of consuming a store that never happened. */
 /* Reserve the activation cache's E4M3 slots and hand back both device pointers
  * plus the scale pitch, so a producer can emit the MX encoding from its own
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
@@ -1382,10 +1371,17 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
-/* Same, but also fills norm_out_h (n_embd*rows __half) from the same registers
- * that produce the f32 norm_out, so the F16 GEMM consumers do not need a
- * separate f32_to_f16 pass over the tensor.  Bit-exact: identical __float2half
- * of the identical value.  norm_out_h may be NULL. */
+/* Same, but also emits norm_out's E4M3 + swizzled E8M0 encoding (norm_out_q,
+ * norm_out_sf, pitch norm_out_kbp) from the same registers that produce the f32
+ * norm_out, so the MXFP8 consumers do not need a separate quantize pass over
+ * the tensor.  Bit-exact: fmaxf is exact and max is order-independent, so any
+ * reduction order yields the same amax, shared exponent and E4M3 bytes.
+ * norm_out_q/sf may be NULL, in which case only the f32 norm_out is written.
+ *
+ * NOTE the _f16 in the name is a MISNOMER kept for call-site stability: this
+ * emitted __half until the F16 weights were retired (2026-08-16) and it has
+ * emitted E4M3 ever since.  There is no f16 anything on this path -- the
+ * shipped artifact contains ZERO F16 tensors.  See ledger L079. */
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
@@ -1410,8 +1406,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         int                     norm_w_bf16);
 
 
-/* Fused plain-RMSNorm + f16 HC-mix GEMV (decode, n_tok == 1).  Byte-identical
- * to rms_norm_plain_tensor() followed by matmul_f16_tensor(); see the kernel
+/* Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
+ * rms_norm_plain_tensor() followed by the matmul for `w_type`; see the kernel
  * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
  * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32. */
 int pulsar_gpu_hc_norm_mix_tensor(
