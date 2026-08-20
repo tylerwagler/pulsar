@@ -38,6 +38,12 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 NVCCFLAGS += $(PULSAR_DEPFLAGS)
+# Append-only hook for probe builds (e.g. L003's tile sweep:
+#   make pulsar NVCC_EXTRA='-DPULSAR_MXFP4_TILE_M=64')
+# Deliberately APPEND rather than let a caller override NVCCFLAGS wholesale:
+# overriding it silently drops --use_fast_math and -arch, which would make a
+# probe measure a different compiler configuration than the one that ships.
+override NVCCFLAGS += $(NVCC_EXTRA)
 
 # HC_F32=1 (-DPULSAR_HC_F32) used to restore f32 residual carriers: the control
 # build that proved the BF16 storage narrowing was a pure no-op. That flip
