@@ -431,6 +431,13 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
  * is unobservable AND lets the head take the single-block identity path (no
  * two-block gather/resync, no wasted K-row prefill head GEMM). *out_n_rows is then
  * the emitted count (== min(n_runs, max_head_runs), with 0 meaning n_runs). */
+/* max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS (plan-34 inc 6): emit logits for
+ * EVERY row of the batch, logits row k == batch row k, *out_n_rows == n_rows.
+ * This is the batched-speculative-verify contract: a run of K draft rows needs
+ * all K logit rows for the accept walk, not just the run's last. The head takes
+ * the identity path over the whole batch (no gather). Requires n_rows <= the
+ * spec-logits row capacity (16); rejected (return 1) otherwise. */
+#define PULSAR_MSEQ_HEAD_ALL_ROWS 0xffffffffu
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs,
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
