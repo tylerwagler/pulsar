@@ -298,7 +298,25 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
         if (!pulsar_gpu_tensor_read(g->dspark_bulk_h[s], 0, host,
                                  (uint64_t)cap_n * PULSAR_N_EMBD * sizeof(float)))
             return;
-        fwrite(host, sizeof(float), (size_t)cap_n * PULSAR_N_EMBD, f);
+        if (g->distill_top_ids) {
+            /* plan-92 P1: in collection mode the hidden streams go to disk as
+             * f16 -- the pilot measured 49.5 KB/token in f32 (495 GB for a
+             * 10M-token corpus); f16 halves the dominant term and the
+             * training loss reads f16 anyway. Host-side convert; the teacher
+             * section's magic doubles as the format marker (a dump with the
+             * PDT1 section has f16 hidden streams, without it f32 -- the
+             * pre-P0 consumer-less format is unchanged). */
+            uint16_t *h16 = (uint16_t *)host;
+            const float *src = host;
+            const size_t cnt = (size_t)cap_n * PULSAR_N_EMBD;
+            for (size_t i2 = 0; i2 < cnt; i2++) {
+                const _Float16 v = (_Float16)src[i2];
+                memcpy(&h16[i2], &v, sizeof(uint16_t));
+            }
+            fwrite(h16, sizeof(uint16_t), cnt, f);
+        } else {
+            fwrite(host, sizeof(float), (size_t)cap_n * PULSAR_N_EMBD, f);
+        }
     }
     /* plan-92 P0: the teacher section, appended per chunk when collection
      * mode is on. Layout after the hidden streams above:

@@ -18,9 +18,18 @@ with open(path, "rb") as f:
             break
         cap_n, start = struct.unpack("<II", hdr)
         toks = np.frombuffer(f.read(4 * cap_n), dtype=np.int32)
-        hidden = [np.frombuffer(f.read(4 * cap_n * n_embd), dtype=np.float32)
-                  .reshape(cap_n, n_embd) for _ in range(3)]
+        # P1 format: collection-mode dumps store the hidden streams as f16
+        # (teacher magic follows); pre-P0 dumps are f32 with no magic. Probe:
+        # try f16 first, fall back to f32 on a magic mismatch.
+        probe_pos = f.tell()
+        hidden = [np.frombuffer(f.read(2 * cap_n * n_embd), dtype=np.float16)
+                  .astype(np.float32).reshape(cap_n, n_embd) for _ in range(3)]
         magic_raw = f.read(4)
+        if len(magic_raw) == 4 and struct.unpack("<I", magic_raw)[0] != MAGIC:
+            f.seek(probe_pos)
+            hidden = [np.frombuffer(f.read(4 * cap_n * n_embd), dtype=np.float32)
+                      .reshape(cap_n, n_embd) for _ in range(3)]
+            magic_raw = f.read(4)
         if len(magic_raw) < 4:
             print("chunk %d: NO teacher section (pre-P0 format?)" % chunks)
             break
