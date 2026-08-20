@@ -1522,6 +1522,17 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           accepted, accepted_cap, err, errlen);
 }
 
+uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
+                                        float out[16]) {
+    if (!s || !s->bank_carry || bank >= s->bank_carry_n) return 0;
+    const pulsar_bank_carry *c = &s->bank_carry[bank];
+    if (!c->valid) return 0;
+    uint32_t n = c->spec.dspark_n_pending;
+    if (n > 16u) n = 16u;
+    for (uint32_t i = 0; i < n; i++) out[i] = c->spec.dspark_pending_conf[i];
+    return n;
+}
+
 uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
     /* Upper bound on the next round's n_batch: begin's guards (base-token,
      * position, params, caps) only ever TRIM K from dspark_n_pending, so
