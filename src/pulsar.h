@@ -491,6 +491,14 @@ void pulsar_spec_round_free(pulsar_spec_round *r);
  * consumes the carry, and a rejection-residual carry must be emitted exactly
  * (the acceptance proof depends on it), not discarded and redrawn. */
 uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
+/* L049 adaptive per-bank K: bank `bank`'s pending-draft confidences from the
+ * SAVED carry -- no bank switch, valid at sweep start where every bank was
+ * saved at the previous round's end. Writes up to 16 per-position acceptance
+ * confidences to out[] and returns the pending count (0 = no saved state or
+ * no pendings; the bank still gets its base row). The allocation these feed
+ * is an UPPER bound on K -- round_begin's own validity trims still apply. */
+uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
+                                        float out[16]);
 /* The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
  * generate_speculative does. */
