@@ -148,6 +148,10 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.assc[il]);
         pulsar_gpu_tensor_free(g->banks.iskv[il]);
         pulsar_gpu_tensor_free(g->banks.issc[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
