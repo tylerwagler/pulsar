@@ -920,6 +920,21 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
+    /* inc-6 W5 (NEXT SESSION, after the pinned 11167f1 gate run is green):
+     * everything from here to the end of the pendings/dtree stash is the
+     * REDRAFT BLOCK, to be extracted as
+     *   spec_round_redraft(s, next_base, main_x_ready,
+     *                      temperature, top_k, top_p, min_p, rng)
+     * recomputing internally: e, g, w = &e->dspark_weights, dmap/dsize from
+     * e->dspark_model, vocab_size/embed_dim from the markov head dims,
+     * n_draft, and the dspark_stats/dtree_stats statics. Boundaries: starts
+     * at this n_draft line, ends after the dtree mid-band diagnostic; the
+     * only values flowing OUT are the s->spec.* pendings/carry stashes it
+     * writes itself. The batched lane calls it per bank under repoint with
+     * next_base = that bank's carry; row sources inside (spec_logits views)
+     * are already absolute-row-indexed, so the bank's row offset must be
+     * threaded to the gpu_graph_dspark_draft_forward spec_logits view and
+     * dspark_seed_from_batch_row calls -- W2's offset params land here. */
     uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     if (n_draft > 16u) n_draft = 16u;
     if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
