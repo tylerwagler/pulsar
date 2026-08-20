@@ -706,3 +706,133 @@ int pulsar_gpu_minp_prefilter_rows(
         (int32_t *)out->ptr, (uint32_t)out_stride);
     return cuda_ok(cudaGetLastError(), "minp prefilter launch");
 }
+
+/* --- plan-92 P0: per-row teacher top-64 + tail logsumexp ---------------------
+ * One block per logits row. Selection: each thread keeps a local top-8 over
+ * its strided slice (~505 elems at N_VOCAB/256), the 2048 candidates go to
+ * smem, and 64 rounds of block argmax pick the winners. Exactness is VERIFIED
+ * (a slice holding >8 of the global top-64 would drop one): a final count of
+ * elements above the selected floor bumps `inexact` if it exceeds 64 -- with
+ * real logits this never fires, and the counter makes "never" checkable.
+ * tail_lse = log(sumexp(all) - sumexp(top64)) + max, so the training loss can
+ * renormalize the non-top mass exactly. Collection-rate code: clarity over
+ * throughput. */
+__global__ static void distill_top64_lse_kernel(
+        const float *logits,      /* [n_rows, vocab] */
+        uint32_t vocab,
+        int32_t *top_ids,         /* [cap, 64], written at row0+row */
+        uint16_t *top_vals,       /* f16 bits */
+        uint16_t *tail_lse,       /* f16 bits */
+        int32_t *inexact,
+        uint32_t row0) {
+    constexpr int kThreads = 256, kLocal = 8, kTop = 64;
+    const uint32_t row = blockIdx.x;
+    const float *x = logits + (uint64_t)row * vocab;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_red[kThreads];
+    /* pass 1: row max */
+    float mx = -INFINITY;
+    for (uint32_t i = tid; i < vocab; i += kThreads) mx = fmaxf(mx, x[i]);
+    s_red[tid] = mx; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] = fmaxf(s_red[tid], s_red[tid + s]);
+        __syncthreads();
+    }
+    const float rmax = s_red[0]; __syncthreads();
+
+    /* pass 2: local top-8 + sumexp */
+    float lv[kLocal]; int li[kLocal];
+    for (int j = 0; j < kLocal; j++) { lv[j] = -INFINITY; li[j] = -1; }
+    float sumexp = 0.0f;
+    for (uint32_t i = tid; i < vocab; i += kThreads) {
+        const float v = x[i];
+        sumexp += __expf(v - rmax);
+        if (v > lv[kLocal - 1]) {
+            int j = kLocal - 1;
+            while (j > 0 && v > lv[j - 1]) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; j--; }
+            lv[j] = v; li[j] = (int)i;
+        }
+    }
+    s_red[tid] = sumexp; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    const float total_sumexp = s_red[0]; __syncthreads();
+
+    __shared__ float c_val[kThreads * kLocal];
+    __shared__ int   c_id[kThreads * kLocal];
+    for (int j = 0; j < kLocal; j++) {
+        c_val[tid * kLocal + j] = lv[j];
+        c_id[tid * kLocal + j]  = li[j];
+    }
+    __syncthreads();
+
+    /* 64 rounds of block argmax over the 2048 candidates */
+    __shared__ int s_arg[kThreads];
+    __shared__ float s_sel_floor;
+    __shared__ float s_top_sumexp;
+    if (tid == 0) s_top_sumexp = 0.0f;
+    for (int t = 0; t < kTop; t++) {
+        float bv = -INFINITY; int bi = -1;
+        for (int j = tid; j < kThreads * kLocal; j += kThreads) {
+            if (c_val[j] > bv) { bv = c_val[j]; bi = j; }
+        }
+        s_red[tid] = bv; s_arg[tid] = bi; __syncthreads();
+        for (int s = kThreads / 2; s > 0; s >>= 1) {
+            if (tid < s && s_red[tid + s] > s_red[tid]) {
+                s_red[tid] = s_red[tid + s]; s_arg[tid] = s_arg[tid + s];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const int w = s_arg[0];
+            const float wv = c_val[w];
+            top_ids[(uint64_t)(row0 + row) * kTop + t] = c_id[w];
+            top_vals[(uint64_t)(row0 + row) * kTop + t] = __half_as_ushort(__float2half(wv));
+            s_top_sumexp += __expf(wv - rmax);
+            c_val[w] = -INFINITY;
+            if (t == kTop - 1) s_sel_floor = wv;
+        }
+        __syncthreads();
+    }
+
+    /* verify: exact top-64 requires <= 64 elements above the floor */
+    uint32_t above = 0;
+    for (uint32_t i = tid; i < vocab; i += kThreads) above += x[i] > s_sel_floor ? 1u : 0u;
+    s_red[tid] = (float)above; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        if ((int)s_red[0] > kTop) atomicAdd(inexact, 1);
+        const float tail = total_sumexp - s_top_sumexp;
+        const float lse = tail > 0.0f ? logf(tail) + rmax : -INFINITY;
+        tail_lse[row0 + row] = __half_as_ushort(__float2half(lse));
+    }
+}
+
+int pulsar_gpu_distill_top64_tensor(
+        const pulsar_gpu_tensor *logits_rows,
+        uint32_t n_rows,
+        uint32_t vocab,
+        pulsar_gpu_tensor *top_ids,
+        pulsar_gpu_tensor *top_vals,
+        pulsar_gpu_tensor *tail_lse,
+        pulsar_gpu_tensor *inexact,
+        uint32_t row0) {
+    if (!logits_rows || !top_ids || !top_vals || !tail_lse || !inexact ||
+        n_rows == 0 || vocab == 0)
+        return 0;
+    if (logits_rows->bytes < (uint64_t)n_rows * vocab * sizeof(float)) return 0;
+    if (top_ids->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(int32_t)) return 0;
+    if (top_vals->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(uint16_t)) return 0;
+    if (tail_lse->bytes < (uint64_t)(row0 + n_rows) * sizeof(uint16_t)) return 0;
+    distill_top64_lse_kernel<<<n_rows, 256>>>(
+        (const float *)logits_rows->ptr, vocab,
+        (int32_t *)top_ids->ptr, (uint16_t *)top_vals->ptr,
+        (uint16_t *)tail_lse->ptr, (int32_t *)inexact->ptr, row0);
+    return cuda_ok(cudaGetLastError(), "distill top64 lse");
+}

@@ -2012,6 +2012,20 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         uint32_t               n_hc,
         uint32_t               n_tokens);
 
+/* plan-92 P0: per-row teacher top-64 ids + f16 logits + f16 tail logsumexp
+ * over a block of logits rows, written at row offset row0 of the chunk-sized
+ * output tensors. `inexact` counts (never observed, verified per row) cases
+ * where the candidate union missed the exact top-64. Collection-rate code. */
+int pulsar_gpu_distill_top64_tensor(
+        const pulsar_gpu_tensor *logits_rows,
+        uint32_t               n_rows,
+        uint32_t               vocab,
+        pulsar_gpu_tensor       *top_ids,
+        pulsar_gpu_tensor       *top_vals,
+        pulsar_gpu_tensor       *tail_lse,
+        pulsar_gpu_tensor       *inexact,
+        uint32_t               row0);
+
 /** DSpark confidence head: per block position, confidence that the draft is
  * accepted. hidden = post-hc_head drafter hidden [n_positions, hidden_dim];
  * token_ids = block token per position; markov_w1/proj resolved from the dspark

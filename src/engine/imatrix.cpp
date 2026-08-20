@@ -308,6 +308,32 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
             return;
         fwrite(host, sizeof(float), (size_t)cap_n * PULSAR_N_EMBD, f);
     }
+    /* plan-92 P0: the teacher section, appended per chunk when collection
+     * mode is on. Layout after the hidden streams above:
+     *   u32 magic 0x50445431 ("PDT1") | i32 inexact_total (cumulative)
+     *   | cap_n x 64 i32 top ids | cap_n x 64 u16 f16 top logits
+     *   | cap_n u16 f16 tail logsumexp
+     * The loader keys on the magic; a dump without it is hidden-states-only
+     * (the pre-P0 format, unchanged). */
+    if (g->distill_top_ids) {
+        const uint32_t magic = 0x50445431u;
+        int32_t inexact = 0;
+        (void)pulsar_gpu_tensor_read(g->distill_inexact, 0, &inexact, sizeof(inexact));
+        fwrite(&magic, sizeof(magic), 1, f);
+        fwrite(&inexact, sizeof(inexact), 1, f);
+        if (!pulsar_gpu_tensor_read(g->distill_top_ids, 0, host,
+                                 (uint64_t)cap_n * 64 * sizeof(int32_t)))
+            return;
+        fwrite(host, sizeof(int32_t), (size_t)cap_n * 64, f);
+        if (!pulsar_gpu_tensor_read(g->distill_top_vals, 0, host,
+                                 (uint64_t)cap_n * 64 * sizeof(uint16_t)))
+            return;
+        fwrite(host, sizeof(uint16_t), (size_t)cap_n * 64, f);
+        if (!pulsar_gpu_tensor_read(g->distill_tail_lse, 0, host,
+                                 (uint64_t)cap_n * sizeof(uint16_t)))
+            return;
+        fwrite(host, sizeof(uint16_t), (size_t)cap_n, f);
+    }
     fflush(f);
 }
 
@@ -622,6 +648,40 @@ static bool gpu_graph_prefill_layer_major_inner(
         return false;
     }
     if (show_progress) fputc('\n', stderr);
+
+    /* plan-92 P0 teacher dump: all-rows output head in <=16-row sub-batches
+     * (spec_logits is the 16-row block), top-64 + tail-lse per row into the
+     * chunk-sized distill buffers; dspark_bulk_drain emits both streams.
+     * Runs only in collection mode (buffers allocated iff PULSAR_DISTILL_DUMP
+     * was set at graph alloc) and only on drafter-armed chunks, AFTER the
+     * layer loop -- the head's scratch reuse of the batch FFN buffers is
+     * legitimate exactly here. */
+    if (g->distill_top_ids && g->dspark_bulk_n) {
+        const uint64_t hcd = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+        const uint64_t vocab_dim = weights->output->dim[1];
+        pulsar_gpu_tensor *saved_batch = g->batch_cur_hc;
+        for (uint32_t r0 = 0; ok && r0 < n_tokens; r0 += 16u) {
+            const uint32_t nr = n_tokens - r0 < 16u ? n_tokens - r0 : 16u;
+            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(saved_batch,
+                    (uint64_t)r0 * hcd * PULSAR_HC_ELT_SIZE,
+                    (uint64_t)nr * hcd * PULSAR_HC_ELT_SIZE);
+            ok = v != NULL;
+            if (ok) {
+                g->batch_cur_hc = v;
+                ok = pulsar_gpu_begin_commands() != 0;
+                if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
+                                                             nr, vocab_dim);
+                if (ok) ok = pulsar_gpu_distill_top64_tensor(g->spec_logits, nr,
+                                (uint32_t)vocab_dim, g->distill_top_ids,
+                                g->distill_top_vals, g->distill_tail_lse,
+                                g->distill_inexact, r0) != 0;
+                if (ok) ok = pulsar_gpu_end_commands() != 0;
+                g->batch_cur_hc = saved_batch;
+                pulsar_gpu_tensor_free(v);
+            }
+        }
+        if (!ok) return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;

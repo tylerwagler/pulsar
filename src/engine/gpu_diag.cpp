@@ -2223,6 +2223,27 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
             (uint64_t)g->prefill_cap * PULSAR_N_EMBD * sizeof(float));
         ok = ok && g->dspark_bulk_h[i];
     }
+    /* plan-92 P0 teacher dump: allocated only when the collection mode is on
+     * (env read once here, not per token -- [[no-hot-path-flags]]). ~1.1 MiB
+     * at prefill_cap 4096. */
+    {
+        const char *dd = getenv("PULSAR_DISTILL_DUMP");
+        if (dd && dd[0]) {
+            g->distill_top_ids = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * 64 * sizeof(int32_t));
+            g->distill_top_vals = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * 64 * sizeof(uint16_t));
+            g->distill_tail_lse = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * sizeof(uint16_t));
+            g->distill_inexact = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+            ok = ok && g->distill_top_ids && g->distill_top_vals &&
+                 g->distill_tail_lse && g->distill_inexact;
+            if (ok) {
+                const int32_t z = 0;
+                ok = pulsar_gpu_tensor_write(g->distill_inexact, 0, &z, sizeof(z)) != 0;
+            }
+        }
+    }
     /* Prompt-window ring: last <=128 prompt positions' anchor hiddens. */
     g->dspark_prompt_n = 0;
     for (int i = 0; i < 3; i++) {
