@@ -1199,7 +1199,8 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
              * seed from the batch capture. */
             ok_state = gpu_graph_dspark_compressor_rollforward(g, &e->model, &e->weights,
                                                                (uint32_t)saved_len,
-                                                               (uint32_t)(1 + commit));
+                                                               (uint32_t)(1 + commit),
+                                                               0u /* classic: own the whole save */);
             if (ok_state) {
                 s->checkpoint.len = saved_len + 1 + commit;
                 for (int m = 0; ok_state && m <= commit; m++)

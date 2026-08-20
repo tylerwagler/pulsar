@@ -2377,12 +2377,16 @@ bool gpu_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits);
+/* save_row0 (inc 6, W2): the first row of THIS session's positions within
+ * the verify forward's comp-save buffers. Classic single-bank rounds pass 0;
+ * the batched lane passes the bank's row offset in the shared batch. */
 bool gpu_graph_dspark_compressor_rollforward(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
         const pulsar_weights *weights,
         uint32_t          pos0,
-        uint32_t          n_positions);
+        uint32_t          n_positions,
+        uint32_t          save_row0);
 bool imatrix_collector_init(pulsar_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path);
 void imatrix_collector_free(pulsar_imatrix_collector *c);
 bool imatrix_collector_save(

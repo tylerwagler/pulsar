@@ -2558,10 +2558,11 @@ bool gpu_graph_dspark_compressor_rollforward(
         const pulsar_model  *model,
         const pulsar_weights *weights,
         uint32_t          pos0,
-        uint32_t          n_positions) {
+        uint32_t          n_positions,
+        uint32_t          save_row0) {
     if (!g || !model || !weights) return false;
     if (n_positions == 0) return true;
-    if (n_positions > 17u || !g->spec_comp_scratch_row) return false;
+    if (save_row0 + n_positions > 17u || !g->spec_comp_scratch_row) return false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -2579,8 +2580,8 @@ bool gpu_graph_dspark_compressor_rollforward(
         if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) return false;
         for (uint32_t t = 0; t < n_positions; t++) {
             const uint32_t pos = pos0 + t;
-            pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], t, comp_width);
-            pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], t, comp_width);
+            pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
+            pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, comp_width);
             bool ok = kv_view && sc_view &&
                 pulsar_gpu_compressor_update_tensor(kv_view, sc_view,
                         g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
@@ -2599,8 +2600,8 @@ bool gpu_graph_dspark_compressor_rollforward(
             pulsar_gpu_tensor_free(kv_view);
             if (!ok) return false;
             if (ratio == 4 && g->spec_icomp_kv_save[il]) {
-                pulsar_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], t, index_width);
-                pulsar_gpu_tensor *isc = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], t, index_width);
+                pulsar_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, index_width);
+                pulsar_gpu_tensor *isc = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, index_width);
                 ok = ikv && isc &&
                     pulsar_gpu_compressor_update_tensor(ikv, isc,
                             g->layer_index_state_kv[il], g->layer_index_state_score[il],
