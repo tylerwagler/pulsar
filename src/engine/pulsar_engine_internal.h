@@ -960,6 +960,14 @@ typedef struct {
      * the prefill path and cleared by the drain; 0 everywhere else. */
     pulsar_gpu_tensor *dspark_bulk_h[3];
     uint32_t dspark_bulk_n;
+    /* plan-92 P0 teacher dump (PULSAR_DISTILL_DUMP, env-once at graph alloc):
+     * per-position teacher top-64 ids/logits + tail logsumexp for the chunk,
+     * filled by the all-rows head sweep after the prefill layer loop and
+     * drained alongside dspark_bulk_h. NULL when the mode is off. */
+    pulsar_gpu_tensor *distill_top_ids;    /* [prefill_cap, 64] i32 */
+    pulsar_gpu_tensor *distill_top_vals;   /* [prefill_cap, 64] f16 bits */
+    pulsar_gpu_tensor *distill_tail_lse;   /* [prefill_cap] f16 bits */
+    pulsar_gpu_tensor *distill_inexact;    /* [1] i32: top-64 verify misses */
     /* Prompt-window capture for drafter seeding: the anchor hiddens of the
      * last <=128 prompt positions, kept as a position%128 ring so the fused
      * loop can seed the drafter's context window at generation start (the

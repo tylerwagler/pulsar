@@ -55,6 +55,12 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->dspark_target_h[i]);
         pulsar_gpu_tensor_free(g->dspark_raw_cache[i]);
         pulsar_gpu_tensor_free(g->dspark_bulk_h[i]);
+        if (i == 0) {
+            pulsar_gpu_tensor_free(g->distill_top_ids);
+            pulsar_gpu_tensor_free(g->distill_top_vals);
+            pulsar_gpu_tensor_free(g->distill_tail_lse);
+            pulsar_gpu_tensor_free(g->distill_inexact);
+        }
         pulsar_gpu_tensor_free(g->dspark_prompt_h[i]);
         pulsar_gpu_tensor_free(g->dspark_target_h_batch[i]);
     }
