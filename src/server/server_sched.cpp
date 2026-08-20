@@ -1793,10 +1793,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
          * their base row. When everything fits, every slot is admitted and
          * the lane behaves exactly as before this allocator existed. */
         int k_alloc[PULSAR_SESSION_POOL_CAP];
+        bool k_overflow = false;
         {
             float surv[PULSAR_SESSION_POOL_CAP][16];
             uint32_t npend[PULSAR_SESSION_POOL_CAP];
             int n_live = 0;
+            uint32_t demand = 0;
             for (int i = 0; i < n; i++) {
                 k_alloc[i] = 0;
                 npend[i] = 0;
@@ -1812,20 +1814,34 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                     surv[i][j2] = p;
                 }
                 npend[i] = np;
+                demand += 1u + np;
             }
-            int budget = 16 - n_live;   /* base rows are owed unconditionally */
-            while (budget > 0) {
-                int bi = -1;
-                float bv = -1.0f;
-                for (int i = 0; i < n; i++) {
-                    if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > bv) {
-                        bv = surv[i][k_alloc[i]];
-                        bi = i;
+            /* ISOLATION INVARIANT (the lane gate caught the first version of
+             * this violating it): the carry-derived pending counts can be
+             * stale or inherited from a bank's PREVIOUS request, so a cap
+             * derived from them must never bind when the budget does not --
+             * otherwise a bank's round shape couples to its partner's bank
+             * history. When everything fits, every bank gets the old
+             * unconditional cap and the sweep is bit-identical to the
+             * pre-allocator lane; the ranked allocation engages ONLY on
+             * overflow, where the old behavior (arbitrary whole-bank
+             * sit-out) was itself partner-coupled and strictly worse. */
+            k_overflow = demand > 16u;
+            if (k_overflow) {
+                int budget = 16 - n_live;   /* base rows are owed unconditionally */
+                while (budget > 0) {
+                    int bi = -1;
+                    float bv = -1.0f;
+                    for (int i = 0; i < n; i++) {
+                        if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > bv) {
+                            bv = surv[i][k_alloc[i]];
+                            bi = i;
+                        }
                     }
+                    if (bi < 0) break;
+                    k_alloc[bi]++;
+                    budget--;
                 }
-                if (bi < 0) break;
-                k_alloc[bi]++;
-                budget--;
             }
         }
         /* ---- assemble: per bank, base draw + round begin + rows ---------- */
@@ -1853,7 +1869,10 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (rows + 1u + (uint32_t)k_alloc[i] > 16u) {
+            const uint32_t k_cap_rows = k_overflow
+                ? 1u + (uint32_t)k_alloc[i]
+                : pulsar_session_spec_next_rows_max(pool);
+            if (rows + k_cap_rows > 16u) {
                 /* Over the shared-forward row budget even at the allocated
                  * K (can only happen when an earlier bank EOS'd/errored and
                  * the sweep shape shifted): sit this sweep out BEFORE the
@@ -1885,7 +1904,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * upper bound, never a promise. */
             if (pulsar_session_spec_round_begin(pool, rounds[i], first,
                                              g->max_tokens - g->completion,
-                                             k_alloc[i] + 1,
+                                             k_overflow ? k_alloc[i] + 1
+                                                        : (int)(sizeof(accepted) / sizeof(accepted[0])),
                                              temp, top_k, top_p, min_p,
                                              err, sizeof err) != 0) {
                 snprintf(g->err, sizeof g->err, "spec round begin failed: %s", err);
