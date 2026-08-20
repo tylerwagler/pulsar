@@ -505,6 +505,76 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
  * Greedy-only, like the legacy block (generate.cpp gates on temperature<=0).
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
+
+/* plan-34 inc 6 (step 2a): the accept walk, extracted PURE from the fused
+ * loop. Consumes logit rows through `read_row` (row index is round-local:
+ * 0..K-1 are the draft rows), decides the accepted prefix and -- for the
+ * sampled rule -- draws the rejecting position's residual carry. Touches NO
+ * session state beyond the sampling scratch; this is the function the
+ * batched lane calls once per bank over a SHARED forward's rows, with
+ * read_row pointing into that batch's ALL_ROWS logits at the bank's offset.
+ * The rules are verbatim from the fused loop (greedy argmax match; sampled
+ * p/q with the draft-time-params q rebuild -- see the walk comment there). */
+typedef bool (*spec_row_read_fn)(void *ud, uint32_t row, float *out);
+
+static int spec_accept_walk(pulsar_session *s,
+                            spec_row_read_fn read_row, void *read_ud,
+                            const int *row_tops,
+                            const int32_t *pend, uint32_t K, bool pend_sampled,
+                            float temperature, int top_k, float top_p, float min_p,
+                            uint64_t *rng, int *out_carry_tok) {
+    int commit = 0;
+    int carry_tok = -1;
+    if (temperature <= 0.0f || K == 0) {
+        while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
+    } else {
+        if (!s->spec_row_scratch)
+            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
+        float *row_logits = s->spec_row_scratch;
+        while (commit < (int)K) {
+            if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
+                *out_carry_tok = -1;
+                return -1;
+            }
+            pulsar_sample_dist dist;
+            pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
+                                  top_p, min_p, &s->sample_scratch, &dist);
+            const bool accepted_row = pend_sampled
+                ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
+                                            s->spec.dspark_pending_q[commit], rng)
+                : pulsar_sample_dist_accept(&dist, (int)pend[commit], rng);
+            if (accepted_row) {
+                pulsar_sample_dist_free(&dist);
+                commit++;
+                continue;
+            }
+            if (pend_sampled) {
+                pulsar_sample_dist qd;
+                pulsar_sample_dist_build(s->dspark_pending_qrows +
+                                          (size_t)commit * PULSAR_N_VOCAB,
+                                      PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
+                                      s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
+                                      s->spec.dspark_pending_min_p,
+                                      &s->sample_scratch, &qd);
+                carry_tok = pulsar_sample_dist_draw_residual(&dist, &qd,
+                                                          &s->sample_scratch, rng);
+                pulsar_sample_dist_free(&qd);
+            } else {
+                carry_tok = pulsar_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
+            }
+            pulsar_sample_dist_free(&dist);
+            break;
+        }
+    }
+    *out_carry_tok = carry_tok;
+    return commit;
+}
+
+/* Classic row source: the live graph's spec_logits rows. */
+static bool spec_row_read_classic(void *ud, uint32_t row, float *out) {
+    return gpu_graph_read_spec_logits_row((pulsar_gpu_graph *)ud, row, out);
+}
+
 static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
                                               int max_tokens, int eos_token,
                                               float temperature, int top_k,
@@ -655,72 +725,20 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
      *     pend[i] excluded. Capped at p_i(mode).
      * The rejected row's replacement becomes the carry token. All three paths
      * yield the exact per-token target distribution. */
-    int commit = 0;
     int carry_tok = -1;
-    if (temperature <= 0.0f || K == 0) {
-        while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
-    } else {
-        if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
-        float *row_logits = s->spec_row_scratch;
-        bool walk_ok = true;
-        while (commit < (int)K) {
-            if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, row_logits)) {
-                walk_ok = false;
-                break;
-            }
-            pulsar_sample_dist dist;
-            pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &s->sample_scratch, &dist);
-            const bool accepted_row = pend_sampled
-                ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
-                                            s->spec.dspark_pending_q[commit], rng)
-                : pulsar_sample_dist_accept(&dist, (int)pend[commit], rng);
-            if (accepted_row) {
-                pulsar_sample_dist_free(&dist);
-                commit++;
-                continue;
-            }
-            if (pend_sampled) {
-                /* Rebuild THIS position's q from the refined-logits row AND the
-                 * params stored at draft time. Both halves of the rule must name
-                 * the SAME proposal: the accept denominator above is the stored
-                 * scalar q(pend[i]) computed under the draft-time params, so the
-                 * residual's q must be rebuilt under those params too — not the
-                 * live ones. dist_build is pure, so feeding it the persisted row
-                 * + the persisted params reproduces the draft-time q bit-exactly,
-                 * by construction rather than by the params guard's coincidence
-                 * (never recomputed from live drafter state, which has advanced).
-                 * Only the one rejecting position pays this — the walk stops
-                 * here. */
-                pulsar_sample_dist qd;
-                pulsar_sample_dist_build(s->dspark_pending_qrows +
-                                          (size_t)commit * PULSAR_N_VOCAB,
-                                      PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
-                                      s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
-                                      s->spec.dspark_pending_min_p,
-                                      &s->sample_scratch, &qd);
-                /* Holding two dists over one scratch is safe by dist_build's
-                 * aliasing contract: out->ids/probs never point into scratch. */
-                carry_tok = pulsar_sample_dist_draw_residual(&dist, &qd,
-                                                          &s->sample_scratch, rng);
-                pulsar_sample_dist_free(&qd);
-            } else {
-                carry_tok = pulsar_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
-            }
-            pulsar_sample_dist_free(&dist);
-            break;
-        }
-        /* row_logits is the session-owned reusable row — not freed here. */
-        if (!walk_ok) {
-            s->checkpoint.len = saved_len;
-            (void)spec_frontier_restore(&frontier, s);
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen, "DSpark sampled-accept logits readback failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
+    const int commit_rc = spec_accept_walk(s, spec_row_read_classic, g,
+                                           row_tops, pend, K, pend_sampled,
+                                           temperature, top_k, top_p, min_p,
+                                           rng, &carry_tok);
+    if (commit_rc < 0) {
+        s->checkpoint.len = saved_len;
+        (void)spec_frontier_restore(&frontier, s);
+        spec_frontier_free(&frontier);
+        snprintf(err, errlen, "DSpark sampled-accept logits readback failed");
+        s->checkpoint_valid = false;
+        return -1;
     }
+    int commit = commit_rc;
 
     /* Ghost-token guard: never commit drafts PAST an accepted EOS. The
      * emission loop below stops at EOS, but the checkpoint trim uses commit —
