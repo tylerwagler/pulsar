@@ -1,5 +1,6 @@
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
+#include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
 
 
 
