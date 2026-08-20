@@ -1349,13 +1349,27 @@ bool server::gen_emit_token(session_slot *sl, int token) {
                    "distribution after %d tokens; logprobs dropped for this request",
                    g->ctx_span, g->completion);
     }
+    const bool was_thinking = g->thinking.inside;
     g->thinking.feed(piece, piece_len);
+    /* L077 (stop-in-reasoning): client stop sequences describe the VISIBLE
+     * answer, not the reasoning stream -- matching them inside <think>
+     * truncates mid-block and, with no </think> ever emitted, the finish
+     * parse routes everything to reasoning_content and the client gets an
+     * empty answer. Suppress matching while inside, and on the close jump
+     * the scan to the start of the closing piece (the tracker reports no
+     * byte offset, so at most the think-tail bytes of that one piece stay
+     * scannable -- the conservative side of the boundary). */
+    if (was_thinking && !g->thinking.inside) {
+        const size_t close_base = g->text.len - piece_len;
+        if (g->stop_scan_from < close_base) g->stop_scan_from = close_base;
+    }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
     }
 
     size_t stop_pos = 0, stop_len = 0;
-    bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
+    bool hit_stop = !g->thinking.inside &&
+                    stop_list_find_from(&j->req.stops, g->text.ptr,
                                         g->stop_scan_from,
                                         &stop_pos, &stop_len);
     size_t stream_len = hit_stop ?
@@ -1642,6 +1656,12 @@ void server::gen_step_finish(session_slot *sl) {
         snprintf(g->err, sizeof(g->err), "shutdown requested");
     }
 
+    /* L077 (tool-call truncation): when the tag repair below completes a
+     * LENGTH-CAPPED call, the emitted arguments are well-formed JSON with a
+     * silently cut-off value -- the finish reason is the client's ONLY signal
+     * that the turn was cut (openai_stream.cpp's finalize comment already
+     * states this contract; the unconditional "tool_calls" relabel broke it). */
+    bool truncated_tool_repair = false;
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
     {
@@ -1667,6 +1687,7 @@ void server::gen_step_finish(session_slot *sl) {
                 g->text.cap = g->text.len ? g->text.len + 1 : 0;
                 g->saw_tool_end = true;
                 completed_truncation = true;
+                if (strcmp(g->finish, "length") == 0) truncated_tool_repair = true;
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
                            g->ctx_span,
@@ -1863,7 +1884,10 @@ void server::gen_step_finish(session_slot *sl) {
                 tool_calls_free(&parsed_calls);
                 return; /* result spliced; phase reset to GEN_DECODE_INIT */
             }
-            final_finish = "tool_calls";
+            /* L077: a length-capped, tag-repaired call reports "length" -- the
+             * repaired calls are still emitted (replayed transcripts stay
+             * parseable), but the label must not claim a complete call. */
+            final_finish = truncated_tool_repair ? "length" : "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
             s->responses_live_clear(sl);
         }
