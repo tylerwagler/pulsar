@@ -893,13 +893,33 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     return keep;
 }
 
-static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
-                                              int max_tokens, int eos_token,
-                                              float temperature, int top_k,
-                                              float top_p, float min_p,
-                                              uint64_t *rng,
-                                              int *accepted, int accepted_cap,
-                                              char *err, size_t errlen) {
+/* inc-6: one speculative ROUND's state, threaded between round_begin (rows
+ * assembled, frontier snapshotted, checkpoint pushed), the verify forward
+ * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
+ * the batched lane), and round_end (walk, state, emit, redraft). */
+typedef struct {
+    uint32_t K;
+    uint32_t n_batch;
+    int saved_len;
+    bool pend_sampled;
+    int32_t pend[16];
+    int32_t pend_alt[16];
+    float pend_conf[16];
+    int row_tops[16];
+    pulsar_spec_frontier frontier;
+} pulsar_spec_round;
+
+/* Assemble the round: load/guard the pendings, seed the prompt window if
+ * fresh, snapshot the frontier, push first_token + pendings onto the
+ * checkpoint. Body verbatim from the fused loop; the locals it declared are
+ * now reference-bound round fields so the batched lane can run one round
+ * per bank around a shared forward. Returns 0 or -1 (snapshot failure,
+ * session poisoned) exactly as before. */
+static int spec_round_begin(pulsar_session *s, int first_token,
+                            int max_tokens, int accepted_cap,
+                            float temperature, int top_k, float top_p, float min_p,
+                            pulsar_spec_round *r,
+                            char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
     const pulsar_dspark_weights *w = &e->dspark_weights;
@@ -907,14 +927,20 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     static int dtree_stats_env = -1;
     const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
-    const double t0 = dspark_stats ? now_sec() : 0.0;
-    int n_accept = 0;
-
+    memset(r, 0, sizeof(*r));
+    uint32_t &K = r->K;
+    uint32_t &n_batch = r->n_batch;
+    int &saved_len = r->saved_len;
+    bool &pend_sampled = r->pend_sampled;
+    int32_t (&pend)[16] = r->pend;
+    int32_t (&pend_alt)[16] = r->pend_alt;
+    float (&pend_conf)[16] = r->pend_conf;
+    pulsar_spec_frontier &frontier = r->frontier;
+    (void)pend_alt; (void)pend_conf; (void)pend_sampled; (void)n_batch;
     /* Pending drafts continue from the greedy base we predicted last step; if
      * the caller committed something else (tool injection, sampling change),
      * they are stale. */
-    int32_t pend[16];
-    uint32_t K = s->spec.dspark_n_pending;
+    K = s->spec.dspark_n_pending;
     if (K > 16u) K = 16u;
     if (K && s->spec.dspark_pending_base != (int32_t)first_token) K = 0;
     /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
@@ -949,13 +975,11 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     if (K && !pending_params_match) K = 0;
     /* Proposal rule the pendings were drafted under; the verify walk must apply
      * the matching rule (see dspark_pending_sampled). */
-    const bool pend_sampled = K ? s->spec.dspark_pending_sampled : false;
+    pend_sampled = K ? s->spec.dspark_pending_sampled : false;
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
     for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.dspark_pending[i];
     /* DTree Phase 0: carry last step's drafter #2 + conf for these pendings. */
-    int32_t pend_alt[16];
-    float pend_conf[16];
     if (dtree_stats)
         for (uint32_t i = 0; i < K; i++) {
             pend_alt[i] = s->spec.dspark_pending_alt[i];
@@ -963,7 +987,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         }
     s->spec.dspark_n_pending = 0;
     s->spec.spec_carry_valid = false;
-    const uint32_t n_batch = 1u + K;
+    n_batch = 1u + K;
 
     /* Prompt-window seeding (one-time per prompt): fresh drafter state + a
      * captured prompt window -> replay the last <=128 prompt positions into
@@ -994,7 +1018,6 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         g->dspark_prompt_n = 0;   /* consumed; commits take over from here */
     }
 
-    pulsar_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     if (!spec_frontier_snapshot(&frontier, s)) {
         snprintf(err, errlen, "DSpark fused frontier snapshot failed");
@@ -1002,29 +1025,45 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         return -1;
     }
 
-    const int saved_len = s->checkpoint.len;
+    saved_len = s->checkpoint.len;
     token_vec_push(&s->checkpoint, first_token);
     for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, (int)pend[i]);
+    return 0;
+}
 
-    /* ONE batched forward: base decode + draft verify + anchor capture. */
-    int row_tops[16];
-    g->dspark_capture_batch_n = n_batch;
-    g->spec_comp_save_n = n_batch;   /* Stage-B: save per-position comp projections */
-    bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
-                                           &s->checkpoint,
-                                           (uint32_t)saved_len, n_batch,
-                                           K ? row_tops : NULL, NULL);
-    g->dspark_capture_batch_n = 0;
-    g->spec_comp_save_n = 0;
-    if (!ok) {
-        s->checkpoint.len = saved_len;
-        (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        snprintf(err, errlen, "DSpark fused verify failed");
-        s->checkpoint_valid = false;
-        return -1;
-    }
-
+/* Finish the round over an already-run verify forward: accept walk, EOS
+ * clamp, metrics, quench, logits refresh, carry, state seed/rollback, emit,
+ * pendings redraft. Body verbatim from the fused loop with three seams for
+ * the batched lane: `read_row`/`read_ud` name the forward's logit rows
+ * (classic: spec_logits; batched: the shared ALL_ROWS block at the bank's
+ * offset), and `row0` is this round's first row in the forward's
+ * capture/comp-save buffers (classic: 0). Owns r->frontier's lifetime on
+ * every path. Returns tokens emitted, or -1 (session poisoned). */
+static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
+                          int first_token, int eos_token,
+                          float temperature, int top_k, float top_p, float min_p,
+                          uint64_t *rng,
+                          spec_row_read_fn read_row, void *read_ud, uint32_t row0,
+                          double t0,
+                          int *accepted, int accepted_cap,
+                          char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
+    static int dtree_stats_env = -1;
+    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
+    int n_accept = 0;
+    const uint32_t K = r->K;
+    const uint32_t n_batch = r->n_batch;
+    const int saved_len = r->saved_len;
+    const bool pend_sampled = r->pend_sampled;
+    int32_t (&pend)[16] = r->pend;
+    int32_t (&pend_alt)[16] = r->pend_alt;
+    float (&pend_conf)[16] = r->pend_conf;
+    int (&row_tops)[16] = r->row_tops;
+    pulsar_spec_frontier &frontier = r->frontier;
+    (void)pend_alt; (void)pend_conf; (void)t0; (void)dspark_stats;
     /* Accept the longest prefix the target agrees with. Greedy: row i's
      * argmax must equal pend[i]. Sampled: exact speculative sampling under the
      * request's FILTERED target distribution p_i, with the rule matched to how
@@ -1039,7 +1078,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
      * The rejected row's replacement becomes the carry token. All three paths
      * yield the exact per-token target distribution. */
     int carry_tok = -1;
-    const int commit_rc = spec_accept_walk(s, spec_row_read_classic, g,
+    const int commit_rc = spec_accept_walk(s, read_row, read_ud,
                                            row_tops, pend, K, pend_sampled,
                                            temperature, top_k, top_p, min_p,
                                            rng, &carry_tok);
@@ -1137,7 +1176,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         }
 
     /* Refresh s->logits to the last committed position's distribution. */
-    if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, s->logits)) {
+    if (!read_row(read_ud, (uint32_t)commit, s->logits)) {
         s->checkpoint.len = saved_len;
         (void)spec_frontier_restore(&frontier, s);
         spec_frontier_free(&frontier);
@@ -1176,7 +1215,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
          * target_h = the drafting hidden. */
         s->checkpoint.len = saved_len + 1 + commit;
         for (int m = 0; ok_state && m <= commit && m < (int)n_batch; m++)
-            ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
+            ok_state = dspark_seed_from_batch_row(s, row0 + (uint32_t)m);
     } else {
         /* Partial/zero accept: target state includes rejected positions.
          * Stage A: restore the pre-batch frontier and replay the committed
@@ -1200,11 +1239,11 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
             ok_state = gpu_graph_dspark_compressor_rollforward(g, &e->model, &e->weights,
                                                                (uint32_t)saved_len,
                                                                (uint32_t)(1 + commit),
-                                                               0u /* classic: own the whole save */);
+                                                               row0);
             if (ok_state) {
                 s->checkpoint.len = saved_len + 1 + commit;
                 for (int m = 0; ok_state && m <= commit; m++)
-                    ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
+                    ok_state = dspark_seed_from_batch_row(s, row0 + (uint32_t)m);
             }
         }
     }
@@ -1253,6 +1292,51 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
                 n_batch, commit, keep, (now_sec() - t0) * 1000.0);
     return n_accept;
+}
+
+static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
+                                              int max_tokens, int eos_token,
+                                              float temperature, int top_k,
+                                              float top_p, float min_p,
+                                              uint64_t *rng,
+                                              int *accepted, int accepted_cap,
+                                              char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
+    const double t0 = dspark_stats ? now_sec() : 0.0;
+
+    pulsar_spec_round r;
+    {
+        const int brc = spec_round_begin(s, first_token, max_tokens, accepted_cap,
+                                         temperature, top_k, top_p, min_p, &r,
+                                         err, errlen);
+        if (brc != 0) return brc;
+    }
+
+    /* ONE batched forward: base decode + draft verify + anchor capture. */
+    g->dspark_capture_batch_n = r.n_batch;
+    g->spec_comp_save_n = r.n_batch;   /* Stage-B: save per-position comp projections */
+    bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                           &s->checkpoint,
+                                           (uint32_t)r.saved_len, r.n_batch,
+                                           r.K ? r.row_tops : NULL, NULL);
+    g->dspark_capture_batch_n = 0;
+    g->spec_comp_save_n = 0;
+    if (!ok) {
+        s->checkpoint.len = r.saved_len;
+        (void)spec_frontier_restore(&r.frontier, s);
+        spec_frontier_free(&r.frontier);
+        snprintf(err, errlen, "DSpark fused verify failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    return spec_round_end(s, &r, first_token, eos_token,
+                          temperature, top_k, top_p, min_p, rng,
+                          spec_row_read_classic, g, 0u, t0,
+                          accepted, accepted_cap, err, errlen);
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
