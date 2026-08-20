@@ -1596,8 +1596,31 @@ int pulsar_gpu_attention_decode_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
+/* L037 lever 3 fallback: a wrapper received RAW q (q_prep != NULL) but is
+ * about to hand it to a NON-f16 consumer -- apply the standalone norm+rope
+ * now and continue exactly as the pre-fusion code did. Placed immediately
+ * above every such consumer; the fused f16 calls pass q_prep through
+ * instead. A missed site is a wrong answer the prefill/frontier gates catch,
+ * not a slow path. */
+static int attention_q_prep_apply(const pulsar_gpu_tensor *q, uint32_t n_tokens,
+                                  uint32_t n_head, uint32_t head_dim,
+                                  uint32_t pos0, const pulsar_gpu_tensor *positions,
+                                  const pulsar_gpu_q_prep *qp) {
+    return pulsar_gpu_head_rms_norm_rope_tail_tensor((pulsar_gpu_tensor *)q,
+            n_tokens, n_head, head_dim, qp->n_rot, pos0, qp->n_ctx_orig, false,
+            qp->freq_base, qp->freq_scale, qp->ext_factor, qp->attn_factor,
+            qp->beta_fast, qp->beta_slow, qp->eps, positions);
+}
+#define ATTN_Q_PREP_FALLBACK(qt, ntok, pos0v, posv) \
+    do { if (q_prep) { \
+        if (!attention_q_prep_apply((qt), (ntok), n_head, head_dim, (pos0v), (posv), q_prep)) \
+            return 0; \
+        q_prep = NULL; \
+    } } while (0)
+
 int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim,
-        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out) {
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out,
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep) {
     if (mx_out) *mx_out = 0;
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
@@ -1608,6 +1631,10 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* The dense f16 launch does not carry per-token positions, so a banked
+     * batch that somehow routes here must norm the old way (rope by t would
+     * be silently wrong). Dense zero-prefix batches pass positions == NULL. */
+    if (positions) ATTN_Q_PREP_FALLBACK(q, n_tokens, 0u, positions);
     /* One-shot branch report, same as the mixed path. This is the RAW entry;
      * pulsar-bench showed real prefill never reaches the mixed launch, so this
      * is where production prefill attention is actually served. */
@@ -1651,7 +1678,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                     (const float *)raw_kv->ptr, NULL,
                     n_tokens, 0u, window, 1u, n_head, head_dim,
                     gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
-                    0u, n_tokens)) {
+                    0u, n_tokens, q_prep)) {
                 if (mx_out && gact_data) *mx_out = 1;
                 return 1;
             }
@@ -1660,6 +1687,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
             return 0;
         }
     }
+    ATTN_Q_PREP_FALLBACK(q, n_tokens, 0u, NULL);
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -1776,7 +1804,8 @@ static int attention_decode_batch_launch(
         const pulsar_gpu_tensor *seq_id,
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
-        uint32_t                n_banks) {
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep) {
     /* Descriptor (banked) mode: both per-row arrays or neither; the KV
      * operands are whole bank pools, so byte bounds scale by n_banks and the
      * uint32 row ABI (seq*cap + local) must not overflow.  The scalar
@@ -1841,6 +1870,7 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
+        ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
         if (head_dim == 512u) {
             return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
@@ -1877,12 +1907,13 @@ static int attention_decode_batch_launch(
                     n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
                     0u, window, ratio, n_head, head_dim,
                     (const int *)positions_ptr, (const int *)seq_id_ptr,
-                    comp_bank_ptrs_ptr, comp_cap, kernel_n_banks))
+                    comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, q_prep))
                 return 1;
             fprintf(stderr, "pulsar: fp16 continued-prefill attention FAILED; "
                             "refusing to fall through\n");
             return 0;
         }
+        ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
         return attention_decode_heads8_launch((float *)heads->ptr, sinks,
                 (const float *)q->ptr, (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
@@ -1892,6 +1923,7 @@ static int attention_decode_batch_launch(
                 comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
                 "attention decode window launch");
     }
+    ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                  sinks,
@@ -1904,9 +1936,11 @@ static int attention_decode_batch_launch(
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
-int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim,
+        const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep) {
     return pulsar_gpu_attention_prefill_raw_heads_mx_tensor(heads, model_map, model_size, sinks_offset,
-                                                            q, raw_kv, n_tokens, window, n_head, head_dim, NULL, NULL, 0, 0u, 0u, 0u, NULL);
+                                                            q, raw_kv, n_tokens, window, n_head, head_dim, NULL, NULL, 0, 0u, 0u, 0u, NULL,
+                                                            positions, q_prep);
 }
 
 int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
@@ -1928,12 +1962,14 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         const pulsar_gpu_tensor *positions,
         const pulsar_gpu_tensor *seq_id,
         uint32_t                comp_cap,
-        uint32_t                n_banks) {
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, non_causal, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim,
-                                      positions, seq_id, NULL /* raw path: no comp */, comp_cap, n_banks);
+                                      positions, seq_id, NULL /* raw path: no comp */, comp_cap, n_banks,
+                                      q_prep);
 }
 
 int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -1959,12 +1995,14 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *seq_id,
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
-        uint32_t                n_banks) {
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, non_causal,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim,
-                                      positions, seq_id, comp_bank_ptrs, comp_cap, n_banks);
+                                      positions, seq_id, comp_bank_ptrs, comp_cap, n_banks,
+                                      q_prep);
 }
 
 int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -1991,7 +2029,8 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *seq_id,
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
-        uint32_t                n_banks) {
+        uint32_t                n_banks,
+        const pulsar_gpu_q_prep *q_prep) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
      * per-bank ring capacity, rejections fail-loud).  NOTE: banked rows are NO
@@ -2138,12 +2177,13 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                     (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
                     raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
                     (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
-                    comp_cap, descr ? n_banks : 1u))
+                    comp_cap, descr ? n_banks : 1u, q_prep))
                 return 1;
             fprintf(stderr, "pulsar: fp16 indexed attention FAILED; refusing to "
                             "fall through to the f32 kernel\n");
             return 0;
         }
+        ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
         {   /* the two-pass rb4 alternative is gone; this is the only arm */
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
@@ -2171,6 +2211,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
     }
+    ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                   sinks,
@@ -2210,7 +2251,8 @@ static int attention_prefill_mixed_launch(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        const pulsar_gpu_q_prep *q_prep) {
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
         (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
@@ -2271,13 +2313,14 @@ static int attention_prefill_mixed_launch(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
                     (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : NULL,
-                    n_tokens, n_comp, window, ratio, n_head, head_dim))
+                    n_tokens, n_comp, window, ratio, n_head, head_dim, q_prep))
                 return 1;
             fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
                             "fall through to the f32 kernel\n");
             return 0;
         }
     }
+    ATTN_Q_PREP_FALLBACK(q, n_tokens, 0u, NULL);
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
@@ -2389,9 +2432,11 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        const pulsar_gpu_q_prep *q_prep) {
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+                                       n_comp, window, ratio, n_head, head_dim,
+                                       q_prep);
 }
 

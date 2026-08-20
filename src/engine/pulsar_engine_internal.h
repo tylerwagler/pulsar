@@ -1028,6 +1028,13 @@ typedef struct {
     pulsar_gpu_tensor *batch_qr;
     pulsar_gpu_tensor *batch_qr_norm;
     pulsar_gpu_tensor *batch_q;
+    /* L037 lever 3: when q_prep_active, batch_q holds RAW head projections
+     * for the current layer and every attention call this chunk passes
+     * &q_prep so the f16 kernel fuses norm+rope into its Q load (non-f16
+     * consumers apply the standalone kernel via the dispatch fallback).
+     * Set per layer at the Q-path norm decision in gpu_prefill. */
+    pulsar_gpu_q_prep q_prep;
+    int q_prep_active;
     pulsar_gpu_tensor *batch_kv_raw;
     pulsar_gpu_tensor *batch_kv;
     /* The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.

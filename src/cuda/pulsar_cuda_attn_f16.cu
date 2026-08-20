@@ -48,8 +48,11 @@
  */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_rope.cuh"
 
 #include <cstdio>
+#include <cstring>
+#include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 
 #define AF16_MT         2u        /* M-tiles per block */
@@ -60,6 +63,9 @@
 #define AF16_WARPS     16u
 #define AF16_THREADS  (AF16_WARPS * 32u)
 #define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
+#define AF16_ROWB     (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))
+/* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
+#define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
 
@@ -113,6 +119,29 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
 #ifndef AF16_MINBLK
 #define AF16_MINBLK 1
 #endif
+/* Build one packed f16 pair from RAW q: RMS-scale both elements, rope-rotate
+ * when the pair sits in the tail. c0 is even and n_nope is even, so a pair
+ * never straddles the nope/rope boundary and one c0 >= n_nope test covers
+ * both elements. The rotation is the shared core every tail-rope consumer
+ * uses (pulsar_cuda_rope.cuh) -- a transcribed copy here is how bit-exactness
+ * would die. */
+__device__ static inline uint32_t af16_pack_qraw(
+        const float *qrow, uint32_t c0, float scale, uint32_t q_nope,
+        const pulsar_gpu_q_prep qp, uint32_t rope_pos,
+        float corr0, float corr1) {
+    float x0 = qrow[c0] * scale;
+    float x1 = qrow[c0 + 1u] * scale;
+    if (c0 >= q_nope) {
+        float r0, r1;
+        rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
+                                  qp.freq_base, qp.freq_scale, qp.ext_factor,
+                                  qp.attn_factor, corr0, corr1, &r0, &r1);
+        x0 = r0;
+        x1 = r1;
+    }
+    return af16_pack(x0, x1);
+}
+
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
         float *__restrict__ heads,            /* [n_tokens][n_head][512] */
@@ -155,7 +184,12 @@ static void attn_f16_kernel(
          * batch and gact_ntok the batch's total row count -- they are the row
          * and the stride the "a" GEMM will read with, and are NOT the kernel's
          * own n_tokens unless the launch covers the whole batch. */
-        uint32_t gact_tok0, uint32_t gact_ntok) {
+        uint32_t gact_tok0, uint32_t gact_ntok,
+        /* L037 lever 3: when q_raw != 0, `q` holds RAW head projections and
+         * this kernel applies the per-head RMS norm and tail rope itself at
+         * Q-fragment build, bit-exactly matching head_rms_norm_rope_tail
+         * (shared rope core, replicated reduction -- see the prologue). */
+        pulsar_gpu_q_prep qp, int q_raw) {
 #if !PULSAR_ATTN_F16_MMA
     (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
@@ -165,6 +199,7 @@ static void attn_f16_kernel(
     (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
     (void)n_groups; (void)n_nope;
     (void)gact_tok0; (void)gact_ntok;
+    (void)qp; (void)q_raw;
 #else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
@@ -298,10 +333,49 @@ static void attn_f16_kernel(
     const uint32_t job = warp & 3u;
     const uint32_t mtile = job >> 1u, ntile = job & 1u;
     const uint32_t kgrp = warp >> 2u;                   /* 0..3 */
+    /* L037 lever 3 prologue: per-head RMS scales for the block's 32 rows,
+     * computed with EXACTLY the standalone kernel's reduction (thread-local
+     * strided 2-element square sums, then a 256-wide power-of-two tree --
+     * head_rms_norm_rope_tail_kernel runs at blockDim 256), two rows per
+     * pass across this block's 512 threads. Bit-exactness of the whole
+     * fusion hangs on this loop matching that kernel operation-for-
+     * operation; change either together or the prefill gate goes red. */
+    __shared__ float sQscale[AF16_HPB];
+    float q_corr0 = 0.0f, q_corr1 = 0.0f;
+    if (q_raw) {
+        __shared__ float sQpart[2][256];
+        const uint32_t half = tid >> 8u;     /* which of the pass's two rows */
+        const uint32_t vtid = tid & 255u;    /* the standalone kernel's tid */
+        for (uint32_t r2 = 0; r2 < AF16_HPB; r2 += 2u) {
+            const float *xr = q + ((uint64_t)t * n_head + hbase + r2 + half) * AF16_DIM;
+            float sum = 0.0f;
+            for (uint32_t i = vtid; i < AF16_DIM; i += 256u) {
+                float v = xr[i];
+                sum += v * v;
+            }
+            sQpart[half][vtid] = sum;
+            __syncthreads();
+            for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+                if (vtid < stride) sQpart[half][vtid] += sQpart[half][vtid + stride];
+                __syncthreads();
+            }
+            if (vtid == 0u)
+                sQscale[r2 + half] = rsqrtf(sQpart[half][0] / (float)AF16_DIM + qp.eps);
+            __syncthreads();
+        }
+        if (qp.ext_factor != 0.0f)
+            rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base,
+                               qp.beta_fast, qp.beta_slow, &q_corr0, &q_corr1);
+    }
+
     uint32_t qf[AF16_KPW][4];
     {
         const uint64_t qbase =
             ((uint64_t)t * n_head + hbase + mtile * AF16_HEADS) * AF16_DIM;
+        const uint32_t q_nope = AF16_DIM - qp.n_rot;
+        const uint32_t q_rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        const float sa = q_raw ? sQscale[mtile * AF16_HEADS + g] : 0.0f;
+        const float sb = q_raw ? sQscale[mtile * AF16_HEADS + g + 8u] : 0.0f;
         #pragma unroll
         for (uint32_t s = 0; s < AF16_KPW; s++) {
             const uint32_t k0 = (kgrp * AF16_KPW + s) * 16u;
@@ -309,12 +383,82 @@ static void attn_f16_kernel(
             const uint32_t c0 = k0 + tg * 2u, c1 = k0 + tg * 2u + 8u;
             const float *qa = q + qbase + (uint64_t)hA * AF16_DIM;
             const float *qb = q + qbase + (uint64_t)hB * AF16_DIM;
-            qf[s][0] = af16_pack(qa[c0], qa[c0 + 1u]);
-            qf[s][1] = af16_pack(qb[c0], qb[c0 + 1u]);
-            qf[s][2] = af16_pack(qa[c1], qa[c1 + 1u]);
-            qf[s][3] = af16_pack(qb[c1], qb[c1 + 1u]);
+            if (q_raw) {
+                qf[s][0] = af16_pack_qraw(qa, c0, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][1] = af16_pack_qraw(qb, c0, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][2] = af16_pack_qraw(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][3] = af16_pack_qraw(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+            } else {
+                qf[s][0] = af16_pack(qa[c0], qa[c0 + 1u]);
+                qf[s][1] = af16_pack(qb[c0], qb[c0 + 1u]);
+                qf[s][2] = af16_pack(qa[c1], qa[c1 + 1u]);
+                qf[s][3] = af16_pack(qb[c1], qb[c1 + 1u]);
+            }
         }
     }
+
+    /* ---- L037 lever 1: double-buffered RAW-byte tile staging ------------
+     * Each ATTN_PACK row is AF16_ROWB bytes = a whole number of aligned
+     * 8-byte chunks; the NEXT tile's rows stream into the other buffer via
+     * cp.async while the CURRENT tile runs its MMA/softmax phases, which is
+     * what finally overlaps the load/store unit with the tensor pipe (the
+     * serial version measured pipe_tensor 6-8% vs LSU ~33%). The decode
+     * below reads the staged bytes with the SAME arithmetic the global-read
+     * version used (attn_comp_pack_ld's math, one decoder for the one
+     * format), so this stage is byte movement only -- bit-exact. The
+     * resolver mirrors the old per-element source logic one-for-one: raw
+     * ring rows (sRawRows/raw_start), then comp rows with the topk bad-row
+     * masking; a row outside the tile stages nothing and decodes to zero,
+     * exactly as before. */
+    /* The double buffer lives in DYNAMIC shared memory: adding its ~18.7 KB
+     * to the kernel's static declarations blew the 48 KB static cap
+     * (ptxas 0xc540 > 0xc000). The GB10 has 101 KB per SM; the launchers
+     * opt in via cudaFuncAttributeMaxDynamicSharedMemorySize and pass
+     * AF16_DYNSMEM_BYTES at launch. */
+    extern __shared__ __align__(16) uint8_t af16_dynsmem[];
+    uint8_t (*sRawB)[AF16_ROWS][AF16_ROWB] =
+        (uint8_t (*)[AF16_ROWS][AF16_ROWB])af16_dynsmem;
+    __shared__ const uint8_t *sSrc[2][AF16_ROWS];
+    __shared__ uint8_t sBadStage[2][AF16_ROWS];
+    #define AF16_STAGE_TILE(BUF, ROW0)                                        \
+    do {                                                                      \
+        const uint32_t _nr = (ROW0) < n_score                                 \
+            ? min(AF16_ROWS, n_score - (ROW0)) : 0u;                          \
+        if (tid < AF16_ROWS) {                                                \
+            const uint32_t _r = tid;                                          \
+            const uint32_t _sr = (ROW0) + _r;                                 \
+            const uint8_t *_p = NULL;                                         \
+            bool _bad = false;                                                \
+            if (_r < _nr) {                                                   \
+                if (_sr < raw_count) {                                        \
+                    const uint32_t _rr = ring ? sRawRows[_sr]                 \
+                                              : (raw_start + _sr);            \
+                    _p = (const uint8_t *)raw_kv + (uint64_t)_rr * AF16_ROWB; \
+                } else {                                                      \
+                    uint32_t _ci = _sr - raw_count;                           \
+                    if (topk) {                                               \
+                        const int32_t _c = topk[(uint64_t)t * top_k + _ci];   \
+                        _bad = !(_c >= 0 && (uint32_t)_c < sVisComp);         \
+                        _ci = _bad ? 0u : (uint32_t)_c;                       \
+                    }                                                         \
+                    _p = (const uint8_t *)comp_src +                          \
+                         ((uint64_t)comp_base + _ci) * AF16_ROWB;             \
+                }                                                             \
+            }                                                                 \
+            sSrc[BUF][_r] = _p;                                               \
+            sBadStage[BUF][_r] = _bad ? 1u : 0u;                              \
+        }                                                                     \
+        __syncthreads();                                                      \
+        for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 8u);            \
+             _c += AF16_THREADS) {                                            \
+            const uint32_t _r = _c / (AF16_ROWB / 8u);                        \
+            const uint32_t _off = (_c % (AF16_ROWB / 8u)) * 8u;               \
+            if (sSrc[BUF][_r])                                                \
+                __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
+                                        sSrc[BUF][_r] + _off, 8);             \
+        }                                                                     \
+        __pipeline_commit();                                                  \
+    } while (0)
 
     /* ---- running softmax state + output accumulator --------------------- */
     if (tid < AF16_HPB) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
@@ -326,78 +470,48 @@ static void attn_f16_kernel(
             acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.0f;
     __syncthreads();
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += AF16_ROWS) {
+    AF16_STAGE_TILE(0u, 0u);
+    for (uint32_t row0 = 0, tix = 0; row0 < n_score; row0 += AF16_ROWS, tix++) {
         const uint32_t nr = min(AF16_ROWS, n_score - row0);
+        const uint32_t buf = tix & 1u;
+        const int have_next = row0 + AF16_ROWS < n_score;
+        if (have_next) AF16_STAGE_TILE(buf ^ 1u, row0 + AF16_ROWS);
+        /* Leave the just-committed next-tile group in flight; wait only for
+         * the group that filled THIS buffer. */
+        __pipeline_wait_prior(have_next ? 1 : 0);
+        __syncthreads();
 
-        /* ---- stage the tile, converting to fp16 -------------------------
-         * FOUR elements per iteration, not two.  The packed path decodes a
-         * uint32 of four E4M3 bytes against ONE scale byte, the way the f32
-         * kernel does; reading them one element at a time through
-         * attn_comp_pack_ld costs four scattered BYTE loads where the format
-         * should have saved bandwidth, and measured 2.3x SLOWER than the f32
-         * shadow it was meant to beat.  The unpacked paths get a float4 out of
-         * the same restructuring. */
+        /* ---- decode the staged tile to fp16 -----------------------------
+         * Same restructured decode as before (a uint32 of four E4M3 bytes
+         * against one scale byte, bf16 rope tail), now reading smem the
+         * cp.async stage filled. Raw and comp rows are the SAME format, so
+         * the two old source arms collapse into this one decoder. */
         for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 4u; i += AF16_THREADS) {
             const uint32_t r = i / (AF16_DIM / 4u);
             const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
-            bool bad = false;
-            if (r < nr) {
-                const uint32_t sr = row0 + r;
-                if (sr < raw_count) {
-                    const uint32_t rr = ring ? sRawRows[sr] : (raw_start + sr);
-                    /* PULSAR_ATTN_PACK rows, decoded with attn_comp_pack_ld --
-                     * the same function the scalar kernels and the compressed
-                     * pool use, so there is one decoder for the one format. This
-                     * read the ring as __half until 2026-08-17 and would have
-                     * read packed bytes as halves without complaint; the f32 arm
-                     * beside it went with the format flag. */
-                    f0 = attn_comp_pack_ld(raw_kv, rr, d4 + 0u, AF16_DIM);
-                    f1 = attn_comp_pack_ld(raw_kv, rr, d4 + 1u, AF16_DIM);
-                    f2 = attn_comp_pack_ld(raw_kv, rr, d4 + 2u, AF16_DIM);
-                    f3 = attn_comp_pack_ld(raw_kv, rr, d4 + 3u, AF16_DIM);
+            if (r < nr && sSrc[buf][r]) {
+                const uint8_t *pr = sRawB[buf][r];
+                const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
+                if (d4 < n_nope) {
+                    const float sc = __uint_as_float(
+                        (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
+                    const uint32_t w = *(const uint32_t *)(pr + d4);
+                    f0 = attn_pack_e4m3(w & 0xffu, sc);
+                    f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
+                    f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
+                    f3 = attn_pack_e4m3(w >> 24, sc);
                 } else {
-                    uint32_t ci = sr - raw_count;
-                    if (topk) {
-                        const int32_t c = topk[(uint64_t)t * top_k + ci];
-                        /* An out-of-range selection is not row 0 -- it is NO row.
-                         * The load still happens (row 0 keeps the access in range
-                         * and the branch uniform), but the row is flagged and its
-                         * score is masked to -INF below, so it contributes zero
-                         * instead of injecting an unselected position into the
-                         * output and double-counting row 0 when row 0 was also
-                         * legitimately selected. */
-                        bad = !(c >= 0 && (uint32_t)c < sVisComp);
-                        ci = bad ? 0u : (uint32_t)c;
-                    }
-                    const uint64_t crow = (uint64_t)comp_base + ci;
-                    {
-                        const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
-                        const uint8_t *pr = (const uint8_t *)comp_src +
-                            crow * PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);
-                        if (d4 < n_nope) {
-                            const float sc = __uint_as_float(
-                                (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
-                            const uint32_t w = *(const uint32_t *)(pr + d4);
-                            f0 = attn_pack_e4m3(w & 0xffu, sc);
-                            f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
-                            f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
-                            f3 = attn_pack_e4m3(w >> 24, sc);
-                        } else {
-                            const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
-                                PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
-                            const uint32_t o = d4 - n_nope;
-                            f0 = __bfloat162float(rope[o]);
-                            f1 = __bfloat162float(rope[o + 1u]);
-                            f2 = __bfloat162float(rope[o + 2u]);
-                            f3 = __bfloat162float(rope[o + 3u]);
-                        }
-                    }
+                    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
+                        PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
+                    const uint32_t o = d4 - n_nope;
+                    f0 = __bfloat162float(rope[o]);
+                    f1 = __bfloat162float(rope[o + 1u]);
+                    f2 = __bfloat162float(rope[o + 2u]);
+                    f3 = __bfloat162float(rope[o + 3u]);
                 }
             }
-            /* Exactly one thread per row has d4 == 0, so this writes each row's
-             * flag once without a clearing pass or an extra barrier. */
-            if (d4 == 0u) sRowBad[r] = bad ? 1u : 0u;
+            if (d4 == 0u) sRowBad[r] = (r < nr) ? sBadStage[buf][r] : 0u;
             __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
             dst[0] = make_half2(__float2half(f0), __float2half(f1));
             dst[1] = make_half2(__float2half(f2), __float2half(f3));
@@ -640,6 +754,29 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     return on;
 }
 
+/* One-time dynamic-smem opt-in for attn_f16_kernel: static shared alone is
+ * capped at 48 KB, so the tile double-buffer's bytes must be granted here.
+ * Fail-loud: a refused grant means the launch would silently get 0 dynamic
+ * bytes and fault, so the caller refuses instead. */
+static int af16_dynsmem_ok(void) {
+    static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
+    if (state == 0) {
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        state = (e == cudaSuccess) ? 1 : -1;
+        if (state < 0)
+            fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
+                    cudaGetErrorString(e));
+    }
+    return state > 0;
+}
+
+int pulsar_gpu_attn_f16_tier_on(void) {
+    static const int env_on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
+    return env_on && af16_device_supported();
+}
+
 int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
@@ -647,8 +784,23 @@ int pulsar_gpu_attention_f16_prefill_mx(
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
-        uint32_t gact_tok0, uint32_t gact_ntok) {
+        uint32_t gact_tok0, uint32_t gact_ntok,
+        const pulsar_gpu_q_prep *q_prep) {
     if (!heads || !sinks || !q || !raw_kv) return 0;
+    pulsar_gpu_q_prep qp;
+    memset(&qp, 0, sizeof qp);
+    if (q_prep) {
+        /* The fused Q load owns the whole nope/rope split: refuse shapes the
+         * fragment-pair math cannot cover rather than rope the wrong dims. */
+        if (q_prep->n_rot == 0u || (q_prep->n_rot & 1u) ||
+            q_prep->n_rot > AF16_DIM || ((AF16_DIM - q_prep->n_rot) & 1u)) {
+            fprintf(stderr, "pulsar: attn f16 cannot fuse q norm+rope for n_rot=%u\n",
+                    q_prep->n_rot);
+            return 0;
+        }
+        qp = *q_prep;
+    }
+
     if (head_dim != AF16_DIM) return 0;
     if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
     if (n_tokens == 0u) return 0;
@@ -669,9 +821,10 @@ int pulsar_gpu_attention_f16_prefill_mx(
                         "n_nope=%u\n", n_head, n_groups, n_nope);
         return 0;
     }
+    if (!af16_dynsmem_ok()) return 0;
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
+    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
@@ -679,7 +832,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
                                             gact_kbp, gact_slab, n_groups, n_nope,
-                                            gact_tok0, gact_ntok);
+                                            gact_tok0, gact_ntok,
+                                            qp, q_prep != NULL);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -688,11 +842,13 @@ int pulsar_gpu_attention_f16_prefill(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim) {
+        uint32_t n_head, uint32_t head_dim,
+        const pulsar_gpu_q_prep *q_prep) {
     return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
                                                n_head, head_dim,
-                                               NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
+                                               NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
+                                               q_prep);
 }
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
@@ -708,11 +864,26 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks) {
+        uint32_t comp_cap, uint32_t n_banks,
+        const pulsar_gpu_q_prep *q_prep) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
     if (n_comp != 0u && !comp_kv) return 0;
+    pulsar_gpu_q_prep qp;
+    memset(&qp, 0, sizeof qp);
+    if (q_prep) {
+        /* The fused Q load owns the whole nope/rope split: refuse shapes the
+         * fragment-pair math cannot cover rather than rope the wrong dims. */
+        if (q_prep->n_rot == 0u || (q_prep->n_rot & 1u) ||
+            q_prep->n_rot > AF16_DIM || ((AF16_DIM - q_prep->n_rot) & 1u)) {
+            fprintf(stderr, "pulsar: attn f16 cannot fuse q norm+rope for n_rot=%u\n",
+                    q_prep->n_rot);
+            return 0;
+        }
+        qp = *q_prep;
+    }
+
     /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
     if ((positions != NULL) != (seq_id != NULL)) return 0;
     /* comp_cap is the PER-BANK comp-row stride, so it is only meaningful when
@@ -732,8 +903,9 @@ int pulsar_gpu_attention_f16_indexed(
      * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
      * matches rather than silently differing. */
     if (!af16_device_supported()) return 0;
+    if (!af16_dynsmem_ok()) return 0;
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv, comp_kv,
+    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, pos0, n_raw, raw_cap,
@@ -742,6 +914,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
                                             positions ? n_banks : 1u, 1,
-                                            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
+                                            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
+                                            qp, q_prep != NULL);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }

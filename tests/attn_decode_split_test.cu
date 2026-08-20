@@ -57,13 +57,22 @@ int pulsar_gpu_attention_f16_indexed(float *, const float *, const float *,
         const float *, const float *, const int *, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, int, const int *, const int *, const void * const *, uint32_t,
-        uint32_t, int) {
+        uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_indexed hit\n"); exit(97);
 }
 int pulsar_gpu_attention_f16_prefill(float *, const float *, const float *,
         const float *, const float *, uint32_t, uint32_t, uint32_t, uint32_t,
-        uint32_t, uint32_t, int) {
+        uint32_t, uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_prefill hit\n"); exit(97);
+}
+/* The dispatch's q_prep fallback calls the norm+rope launcher; this test
+ * never passes q_prep, so the stub is unreachable -- but the LINK needs it
+ * (a missing symbol here left a garbage half-linked binary that a later
+ * gate run executed as a shell script). */
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *, uint32_t, uint32_t,
+        uint32_t, uint32_t, uint32_t, uint32_t, bool, float, float, float, float,
+        float, float, float, const pulsar_gpu_tensor *) {
+    fprintf(stderr, "stub head_rms_norm_rope_tail hit\n"); exit(97);
 }
 
 struct Case {

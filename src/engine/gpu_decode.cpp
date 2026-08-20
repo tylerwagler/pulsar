@@ -845,7 +845,8 @@ bool gpu_graph_encode_decode_layer(
                     NULL,
                     NULL,
                     0,
-                    1) != 0;
+                    1,
+                                          NULL /* q pre-normed */) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -1480,7 +1481,8 @@ bool gpu_graph_dspark_draft_forward(
             0,
             PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
             1,
-            NULL, NULL, 0, 1) != 0;
+            NULL, NULL, 0, 1,
+                                          NULL /* q pre-normed */) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
                                              (uint64_t)n_draft * PULSAR_N_HEAD * PULSAR_N_HEAD_DIM, li, pos0);

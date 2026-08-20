@@ -231,7 +231,8 @@ static int check_dspark_non_causal_attention(void) {
                                                                     n_tokens, 0,
                                                                     n_raw, raw_cap, 0,
                                                                     0, n_head, head_dim, 0,
-                                                                    NULL, NULL, 0, 1);
+                                                                    NULL, NULL, 0, 1,
+                                          NULL /* q pre-normed */);
         int ok_nc = pulsar_gpu_attention_decode_raw_batch_heads_tensor(heads_nc,
                                                                      sinks,
                                                                      n_head * sizeof(float),
@@ -241,7 +242,8 @@ static int check_dspark_non_causal_attention(void) {
                                                                      n_tokens, 0,
                                                                      n_raw, raw_cap, 0,
                                                                      0, n_head, head_dim, 1,
-                                                                     NULL, NULL, 0, 1);
+                                                                     NULL, NULL, 0, 1,
+                                          NULL /* q pre-normed */);
         if (ok_c && ok_nc && pulsar_gpu_synchronize() &&
             pulsar_gpu_tensor_read(heads_c, 0, heads_causal, heads_count * sizeof(float)) &&
             pulsar_gpu_tensor_read(heads_nc, 0, heads_non_causal, heads_count * sizeof(float))) {
@@ -532,14 +534,16 @@ static int mb_run_case(const char *label,
                     q, raw_slab, comp_slab, topk,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, top_k, window, ratio, n_head, head_dim,
-                    positions, seq_id, NULL, comp_cap, n_banks);
+                    positions, seq_id, NULL, comp_cap, n_banks,
+                                          NULL /* q pre-normed */);
         } else {
             ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                     heads, sinks, (uint64_t)n_head * sizeof(float), 0,
                     q, raw_slab, n_comp_superset ? comp_slab : NULL,
                     n_rows, 0, window, raw_cap, 0,
                     n_comp_superset, window, ratio, n_head, head_dim, 0,
-                    positions, seq_id, NULL, comp_cap, n_banks);
+                    positions, seq_id, NULL, comp_cap, n_banks,
+                                          NULL /* q pre-normed */);
         }
         if (!ok || !pulsar_gpu_synchronize() ||
             !pulsar_gpu_tensor_read(heads, 0, out_batch, q_count * sizeof(float))) {
@@ -611,14 +615,16 @@ static int mb_run_case(const char *label,
                         q_ref, raw_view, comp_view, tk_ref,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, top_k, window, ratio, n_head, head_dim,
-                        NULL, NULL, NULL, 0, 1);
+                        NULL, NULL, NULL, 0, 1,
+                                          NULL /* q pre-normed */);
             } else {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
                         h_ref, sinks, (uint64_t)n_head * sizeof(float), 0,
                         q_ref, raw_view, row->ref_n_comp ? comp_view : NULL,
                         ref_rows, pos0, n_raw, raw_cap, raw_start,
                         row->ref_n_comp, window, ratio, n_head, head_dim, 0,
-                        NULL, NULL, NULL, 0, 1);
+                        NULL, NULL, NULL, 0, 1,
+                                          NULL /* q pre-normed */);
             }
         }
         ok = ok && pulsar_gpu_synchronize() &&
@@ -811,7 +817,8 @@ static int check_multibank_decode_attention(void) {
                         q2, raw_slab, comp_slab,
                         2, 0, window, raw_cap, 0,
                         25, window, ratio, n_head, head_dim, 0,
-                        p2, s2, NULL, comp_cap, n_banks) &&
+                        p2, s2, NULL, comp_cap, n_banks,
+                                          NULL /* q pre-normed */) &&
                 pulsar_gpu_synchronize() &&
                 pulsar_gpu_tensor_read(h2, 0, out2, 2 * row_f32 * sizeof(float))) {
                 dead_rc = 0;
