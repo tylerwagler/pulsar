@@ -590,6 +590,52 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
 
+    /* plan-31b phase A: whole-box reconciliation -- the signed gap between
+     * what the BOX says this process consumed since a post-boot baseline and
+     * what the engine's own tensor census explains. A growing residual is a
+     * leak or a phantom the per-allocation est==actual assert cannot see
+     * (it checks each allocation, not the sum of everything else). Pure
+     * reporting: no admission decision reads it. Page-cache drift from the
+     * file-backed model IS included -- interpret trends, not absolutes.
+     * Baseline self-captures once, >=60s after the listener came up, so
+     * load-time churn stays out of the window. */
+    {
+        static uint64_t base_avail_kib = 0;
+        static uint64_t base_census = 0;
+        static bool base_set = false;
+        static const char *const akey[] = {"MemAvailable:"};
+        uint64_t avail_kib[1] = {0};
+        FILE *mf = fopen("/proc/meminfo", "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                if (!strncmp(line, akey[0], strlen(akey[0]))) {
+                    unsigned long long v = 0;
+                    if (sscanf(line + strlen(akey[0]), " %llu kB", &v) == 1)
+                        avail_kib[0] = v;
+                }
+            }
+            fclose(mf);
+        }
+        const uint64_t census = pulsar_gpu_tensor_alloc_bytes_current();
+        if (!base_set && s->started && time(NULL) - s->started >= 60 &&
+            avail_kib[0] > 0) {
+            base_avail_kib = avail_kib[0];
+            base_census = census;
+            base_set = true;
+        }
+        if (base_set && avail_kib[0] > 0) {
+            const long long box_delta =
+                ((long long)base_avail_kib - (long long)avail_kib[0]) * 1024ll;
+            const long long census_delta =
+                (long long)census - (long long)base_census;
+            buf_puts(&b, "# HELP pulsar:mem_reconcile_residual_bytes Box consumption since baseline minus census-explained bytes (signed; page-cache drift included).\n");
+            buf_puts(&b, "# TYPE pulsar:mem_reconcile_residual_bytes gauge\n");
+            buf_printf(&b, "pulsar:mem_reconcile_residual_bytes %lld\n",
+                       box_delta - census_delta);
+        }
+    }
+
     bool ok = http_response(fd, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
     return ok;
