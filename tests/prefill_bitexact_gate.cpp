@@ -501,6 +501,18 @@ static int fidelity_row(const float *cur, const float *ref, int width,
     return pass;
 }
 
+/* Ref strings come from `git rev-parse --short`, whose length is a property of
+ * the REPO that ran it (object count decides how many chars disambiguate), not
+ * of the commit: the blob's stamp and this run's expectation can legitimately
+ * be 7 and 8 chars of the same sha.  Provenance therefore matches on the
+ * common prefix -- never fewer than 7 chars, which keeps a self-baseline just
+ * as detectable as the exact compare did. */
+static int ref_matches(const char *a, const char *b) {
+    const size_t la = strlen(a), lb = strlen(b);
+    const size_t n = la < lb ? la : lb;
+    return n >= 7 && strncmp(a, b, n) == 0;
+}
+
 /* Everything about the blob that does NOT need the engine: magic, version and
  * provenance.  Called before pulsar_engine_open so the likeliest misuses (a stale
  * blob, or one re-dumped from the tree under test) fail instantly instead of
@@ -523,7 +535,7 @@ static int precheck_baseline(const char *path, const char *expect_ref) {
         return 0;
     }
     bh.build_ref[REF_LEN - 1] = '\0';
-    if (strcmp(bh.build_ref, expect_ref) != 0) {
+    if (!ref_matches(bh.build_ref, expect_ref)) {
         fprintf(stderr,
                 "PREFILL GATE FAIL: baseline provenance mismatch.\n"
                 "  blob %s was built from ref '%s'\n"
@@ -567,7 +579,7 @@ static int load_baseline(const char *path, const char *expect_ref,
     /* Provenance: the blob must come from the ref the caller expects, NOT from
      * the tree under test.  This is what stops a self-baseline passing forever. */
     bh.build_ref[REF_LEN - 1] = '\0';
-    if (strcmp(bh.build_ref, expect_ref) != 0) {
+    if (!ref_matches(bh.build_ref, expect_ref)) {
         fprintf(stderr,
                 "PREFILL GATE FAIL: baseline provenance mismatch.\n"
                 "  blob %s was built from ref '%s'\n"
