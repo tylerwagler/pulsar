@@ -539,7 +539,7 @@ context-coherence-probe:
 # L064 record exactly which bytes moved and the experiment that proved it -- a
 # single-chunk prompt stayed bit-identical while a ring-reading one did not,
 # which is what established that the fast-math scale bucket is not idempotent.
-PREFILL_BASELINE_REF ?= 80b990b
+PREFILL_BASELINE_REF ?= baeb3589
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
