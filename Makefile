@@ -51,6 +51,26 @@ override NVCCFLAGS += $(NVCC_EXTRA)
 # only a comment in tests/attn_indexed_bench.cu -- so it went on 2026-08-17.
 # The carriers are BF16, full stop, and pulsar_hc_t has one definition.
 
+# An object is stale when the FLAGS that produced it change, not only when a
+# source does -- and nothing in make's dependency graph sees CUDA_ARCH.  That
+# gap is how an sm_75 object silently linked into an sm_120f binary
+# (2026-08-21): make saw every .o newer than its .cu and did nothing, and the
+# only recovery was `rm src/cuda/*.o` by hand.  It is also why the gates reach
+# for `-B`: a blunt rebuild-everything, because there was no way to say
+# "rebuild if the compiler configuration moved".
+#
+# This stamp says it.  It holds the full nvcc invocation signature, so arch,
+# --use_fast_math and NVCC_EXTRA probe flags all invalidate objects; it is
+# rewritten ONLY when that signature actually changes, so it does not churn
+# timestamps on every make.  Deliberately NOT applied to the host compiler:
+# CXXFLAGS carries PULSAR_VERSION_STR, which moves every commit and would
+# rebuild the world for nothing.
+CUDA_FLAG_STAMP := .build/cuda-flags.stamp
+CUDA_FLAG_SIG   := $(NVCC) $(NVCCFLAGS)
+$(shell mkdir -p $(dir $(CUDA_FLAG_STAMP)) 2>/dev/null; \
+        [ "$$(cat $(CUDA_FLAG_STAMP) 2>/dev/null)" = "$(CUDA_FLAG_SIG)" ] || \
+        printf '%s' "$(CUDA_FLAG_SIG)" > $(CUDA_FLAG_STAMP))
+
 CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
@@ -574,7 +594,10 @@ cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
 cuda-prefill-gate:
-	$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	# NOT -B any more.  Staleness is fully expressed now: headers via -MMD -MP
+	# + `-include $(PULSAR_DEPS)`, compiler configuration via CUDA_FLAG_STAMP.
+	# -B rebuilt the entire engine twice per suite to cover the flag axis alone.
+	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
 
@@ -610,7 +633,7 @@ cuda-reference-gate:
 		echo "        (blobs live outside the repo; without them this gate grades nothing)"; \
 	else \
 		set -e; \
-		$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
+		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
 		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 			$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
 			$(PULSAR_REF_TOL) --known-high 512,30464; \
@@ -701,21 +724,32 @@ gates-quick:
 	else printf '\nQUICK GATES FAILED\n'; fi; \
 	exit $$rc
 
+# The sub-makes below get -j explicitly: a recipe's $(MAKE) does not inherit a
+# jobserver through the shell for-loop, so without this every compile a gate
+# triggers is SERIAL.
+GATE_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
+
 gates:
-	@rc=0; passed=""; failed=""; \
+	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
 	for g in $(GATE_TARGETS); do \
 	  printf '\n\033[1m=== %s ===\033[0m\n' "$$g"; \
-	  if $(MAKE) --no-print-directory "$$g" CUDA_ARCH=sm_120f \
+	  t0=$$(date +%s); \
+	  if $(MAKE) -j$(GATE_JOBS) --no-print-directory "$$g" CUDA_ARCH=sm_120f \
 	        FRONTIER_MODEL="$(FRONTIER_MODEL)" SPEC_GATE_MODEL="$(SPEC_GATE_MODEL)" \
 	        CUTLASS_DIR="$(CUTLASS_DIR)"; then \
 	    passed="$$passed $$g"; \
 	  else \
 	    failed="$$failed $$g"; rc=1; \
 	  fi; \
+	  times="$$times $$g:$$(( $$(date +%s) - t0 ))"; \
 	done; \
 	printf '\n===================== GATE SUMMARY =====================\n'; \
 	for g in $$passed; do printf '  PASS  %s\n' "$$g"; done; \
 	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
+	printf '\n  seconds per gate (slowest first):\n'; \
+	for e in $$times; do printf '    %6s  %s\n' "$${e##*:}" "$${e%%:*}"; done \
+	  | sort -rn; \
+	printf '\n  suite total: %s s\n' "$$(( $$(date +%s) - suite0 ))"; \
 	if [ $$rc -eq 0 ]; then printf '\nALL GATES PASS\n'; \
 	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
 	exit $$rc
@@ -806,7 +840,7 @@ tests/prefill_bitexact_gate.o: tests/prefill_bitexact_gate.cpp src/pulsar.h
 tests/spec_sampling_gate.o: tests/spec_sampling_gate.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/spec_sampling_gate.cpp
 
-src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc src/cuda/pulsar_cuda_mx.cuh
+src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src/cuda/pulsar_iq2_tables_cuda.inc src/cuda/pulsar_cuda_mx.cuh $(CUDA_FLAG_STAMP)
 	$(NVCC) $(NVCCFLAGS) $(MMQ_CPPFLAGS) -Isrc -c -o $@ $<
 
 # Vendored llama.cpp MMQ TUs: templated C++17, own include root, and they do not
@@ -818,13 +852,13 @@ src/cuda/%.o: src/cuda/%.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h src
 # vendored headers is cheap here: these rebuild in seconds relative to a gate run.
 MMQ_HDRS := $(wildcard src/cuda/mmq/*.cuh) $(wildcard src/cuda/mmq/*.h)
 
-src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS)
+src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda \
 		-diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda/mmq -c -o $@ $<
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
-src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h
+src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
@@ -876,6 +910,7 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
+	rm -rf .build
 	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
