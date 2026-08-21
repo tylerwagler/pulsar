@@ -698,10 +698,11 @@ GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-attn-gates cuda-prefi
                cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
-               cuda-mixed-neutrality-gate cuda-spec-sampling-gate
+               cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide \
+               cuda-spec-sampling-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
-# pre-merge instrument -- 14 gates, each loading ~76 GiB of weights, with
+# pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
 # spec_sampling alone running 2x2500 trajectories; it is the wrong tool to sit
 # and watch after every edit.  These four are the ones that actually catch a
 # numerics or dispatch regression:
