@@ -59,7 +59,8 @@ __device__ static inline float4 raw_kv_ld4(const float *raw_kv, uint64_t row,
  * hoisted, e4m3 bytes fetched four at a time as one uint32 (rows are 4-byte
  * aligned: 584-byte stride).  Accumulation order is identical to the scalar
  * d-ascending loop, so the result is bit-identical. */
-__device__ static inline float attn_pack_dot_full(const float *qh, const float *comp_kv, uint64_t row, uint32_t head_dim, float dot) {
+template <typename QT>
+__device__ static inline float attn_pack_dot_full(const QT *qh, const float *comp_kv, uint64_t row, uint32_t head_dim, float dot) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint8_t *pr = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const uint8_t *psc = pr + n_nope;
@@ -69,39 +70,41 @@ __device__ static inline float attn_pack_dot_full(const float *qh, const float *
         for (uint32_t i = 0; i < PULSAR_FP8_KV_BLOCK / 4u; i++) {
             const uint32_t w = pw[i];
             const uint32_t d = off + i * 4u;
-            dot += qh[d + 0u] * attn_pack_e4m3(w & 0xffu, scale);
-            dot += qh[d + 1u] * attn_pack_e4m3((w >> 8) & 0xffu, scale);
-            dot += qh[d + 2u] * attn_pack_e4m3((w >> 16) & 0xffu, scale);
-            dot += qh[d + 3u] * attn_pack_e4m3(w >> 24, scale);
+            dot += q_load<QT>(qh, d + 0u) * attn_pack_e4m3(w & 0xffu, scale);
+            dot += q_load<QT>(qh, d + 1u) * attn_pack_e4m3((w >> 8) & 0xffu, scale);
+            dot += q_load<QT>(qh, d + 2u) * attn_pack_e4m3((w >> 16) & 0xffu, scale);
+            dot += q_load<QT>(qh, d + 3u) * attn_pack_e4m3(w >> 24, scale);
         }
     }
     const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) dot += qh[n_nope + d] * __bfloat162float(rope[d]);
+    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) dot += q_load<QT>(qh, n_nope + d) * __bfloat162float(rope[d]);
     return dot;
 }
 
 /* Packed-row dot walked d = lane, lane+8, ... by one thread (8-lane strided
  * kernels): per-64-block scale hoisted (8 dims per block per thread share it).
  * Same d-ascending visit order as the plain strided loop — bit-identical. */
-__device__ static inline float attn_pack_dot_lane8(const float *qh, const float *comp_kv, uint64_t row, uint32_t lane, uint32_t head_dim, float dot) {
+template <typename QT>
+__device__ static inline float attn_pack_dot_lane8(const QT *qh, const float *comp_kv, uint64_t row, uint32_t lane, uint32_t head_dim, float dot) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint8_t *pr = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const uint8_t *psc = pr + n_nope;
     for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
         const float scale = __uint_as_float((uint32_t)psc[off / PULSAR_FP8_KV_BLOCK] << 23);
         for (uint32_t d = off + lane; d < off + PULSAR_FP8_KV_BLOCK; d += 8u) {
-            dot += qh[d] * attn_pack_e4m3(pr[d], scale);
+            dot += q_load<QT>(qh, d) * attn_pack_e4m3(pr[d], scale);
         }
     }
     const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += qh[d] * __bfloat162float(rope[d - n_nope]);
+    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u) dot += q_load<QT>(qh, d) * __bfloat162float(rope[d - n_nope]);
     return dot;
 }
 
+template <typename QT>
 __global__ static void attention_prefill_raw_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const QT *q,
         const float *raw_kv,
         uint32_t n_tokens,
         uint32_t window,
@@ -118,7 +121,7 @@ __global__ static void attention_prefill_raw_kernel(
      * For window>0 this is bit-identical to min(t+1, window). */
     uint32_t raw_count = (window != 0u && window < t + 1u) ? window : t + 1u;
     uint32_t raw_start = t + 1 - raw_count;
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[256];
     __shared__ float partial[128];
     __shared__ float max_s;
@@ -128,7 +131,7 @@ __global__ static void attention_prefill_raw_kernel(
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
+        for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
         scores[r] = dot * scale;
         local_max = fmaxf(local_max, scores[r]);
     }
@@ -159,10 +162,11 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
+template <typename QT>
 __global__ static void attention_prefill_mixed_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const QT *q,
         const float *raw_kv,
         const float *comp_kv,
         uint32_t n_tokens,
@@ -174,7 +178,7 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
@@ -189,7 +193,7 @@ __global__ static void attention_prefill_mixed_kernel(
 
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
+        for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
         scores[r] = dot * scale;
         local_max = fmaxf(local_max, scores[r]);
     }
@@ -413,10 +417,11 @@ __global__ static void attention_prefill_unpack_heads_kernel(
  * from classic — that is the mid-prefill-bank case the driver must never
  * co-schedule.  positions == NULL && seq_id == NULL degenerates to the
  * classic single-cache scalar path bit-exactly. */
+template <typename QT>
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const QT *q,
         const float *raw_kv,
         const float *comp_kv,
         uint32_t non_causal,
@@ -471,7 +476,7 @@ __global__ static void attention_decode_mixed_kernel(
                              : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[PULSAR_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
@@ -513,7 +518,7 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
             const uint64_t rrow = (uint64_t)raw_rows[r];
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * raw_kv_ld(raw_kv, rrow, d, head_dim);
+            for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, rrow, d, head_dim);
             scores[r] = dot * scale;
             local_max = fmaxf(local_max, scores[r]);
         }
@@ -541,7 +546,7 @@ __global__ static void attention_decode_mixed_kernel(
                     float dot = 0.0f;
                     if (row < raw_count) {
                         const uint64_t rrow = (uint64_t)raw_rows[row];
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, rrow, d, head_dim);
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, rrow, d, head_dim);
                     } else {
                         dot = attn_pack_dot_lane8(qh, comp_src, comp_base + c_idx, qlane, head_dim, dot);
                     }
@@ -613,10 +618,11 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+template <typename QT>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const QT *q,
         const float *raw_kv,
         const float *comp_kv,
         const int32_t *topk,
@@ -672,7 +678,7 @@ __global__ static void attention_indexed_mixed_kernel(
         visible_comp = (qpos + 1u) / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[768];
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
@@ -745,7 +751,7 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
             const uint64_t rrow = (uint64_t)raw_rows[r];
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * raw_kv_ld(raw_kv, rrow, d, head_dim);
+            for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, rrow, d, head_dim);
             scores[r] = dot * scale;
             local_max = fmaxf(local_max, scores[r]);
         }
@@ -758,7 +764,7 @@ __global__ static void attention_indexed_mixed_kernel(
                 float dot = 0.0f;
                 if (row < raw_count) {
                     const uint64_t rrow = (uint64_t)raw_rows[row];
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * raw_kv_ld(raw_kv, rrow, d, head_dim);
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, rrow, d, head_dim);
                 } else {
                     dot = attn_pack_dot_lane8(qh, comp_src, comp_base + comp_rows[row - raw_count], qlane, head_dim, dot);
                 }
@@ -852,7 +858,7 @@ template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
 __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const float *q,   /* heads8: float4-vectorised, not templated -- see L045 */
         const float *raw_kv,
         const float *comp_kv,
         const int32_t *topk,
@@ -1093,7 +1099,7 @@ __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
-        const float *q,
+        const float *q,   /* heads8: float4-vectorised, not templated -- see L045 */
         const float *raw_kv,
         const float *comp_kv,
         uint32_t non_causal,

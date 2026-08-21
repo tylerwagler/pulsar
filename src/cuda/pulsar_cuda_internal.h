@@ -108,6 +108,38 @@ static inline int pulsar_env_tier_on(const char *name) {
     return !(v && v[0] == '0' && v[1] == '\0');
 }
 
+/* ---- Q-buffer element access (L045) -------------------------------------
+ *
+ * batch_q is migrating f32 -> f16.  The STORAGE narrows; the ARITHMETIC does
+ * not.  Every kernel templated on QT below loads to f32, accumulates in f32,
+ * and narrows only at the store -- so the <float> instantiation is bit-identical
+ * to the code that shipped, and the <__half> one differs by exactly one
+ * round-to-nearest-even per stored element.
+ *
+ * That distinction is the whole reason this is templated rather than rewritten:
+ * the f32 arm must remain provable by the byte-exact prefill gate while the f16
+ * arm is graded by cuda-reference-gate, which is a different contract.
+ *
+ * ⚠ The head RMS norm reads this buffer to form a SUM OF SQUARES over head_dim.
+ * Under q_prep_active batch_q holds UNNORMALISED q_b output -- the widest
+ * magnitudes in the activation path -- so the <__half> arm narrows the inputs
+ * to that reduction, not merely its result.  Measured neutral at mid depths
+ * (L045 stage 1), but it is a fidelity change and must never be described as
+ * bit-exact. */
+template <typename QT>
+__device__ __forceinline__ float q_load(const QT *p, uint64_t i);
+template <>
+__device__ __forceinline__ float q_load<float>(const float *p, uint64_t i) { return p[i]; }
+template <>
+__device__ __forceinline__ float q_load<__half>(const __half *p, uint64_t i) { return __half2float(p[i]); }
+
+template <typename QT>
+__device__ __forceinline__ void q_store(QT *p, uint64_t i, float v);
+template <>
+__device__ __forceinline__ void q_store<float>(float *p, uint64_t i, float v) { p[i] = v; }
+template <>
+__device__ __forceinline__ void q_store<__half>(__half *p, uint64_t i, float v) { p[i] = __float2half(v); }
+
 /* e4m3 byte * scale by pure bit math — bit-identical to the textbook
  * decode (1 + mant/8)*2^(exp-7) * scale with the sign applied (normals become
  * that exact float built directly from its bit pattern;
