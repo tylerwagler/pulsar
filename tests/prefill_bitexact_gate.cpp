@@ -175,6 +175,7 @@
  *
  * usage: ./tests/prefill_bitexact_gate MODEL --dump  FILE
  *        ./tests/prefill_bitexact_gate MODEL --check FILE EXPECTED_BASELINE_REF
+ *        ./tests/prefill_bitexact_gate MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
  */
@@ -377,18 +378,37 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
+/* ⚠ NOT canonical FNV-1a: the offset basis below is the canonical
+ * 14695981039346656037 (0xCBF29CE484222325) with its LAST DIGIT DROPPED — a
+ * typo that predates every baseline blob.  It is a perfectly fine hash and
+ * every blob this file ever wrote is self-consistent with it, so changing it
+ * would force a full baseline re-anchor for zero information.  It only
+ * matters when an EXTERNAL party must compute the same value — which is why
+ * --check-reference uses fnv1a_ref() below instead.  (Found 2026-08-21 when
+ * the reference blobs, hashed canonically in python, refused to match.) */
 static uint64_t fnv1a(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
-    uint64_t h = 1469598103934665603ull;
+    uint64_t h = 1469598103934665603ull;   /* sic — see comment above */
+    for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Canonical FNV-1a 64, for artifacts produced OUTSIDE this file (the
+ * reference-capture blobs and tokens.bin hash with this basis). */
+static uint64_t fnv1a_ref(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t h = 14695981039346656037ull;  /* 0xCBF29CE484222325 */
     for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
 
 /* One from-scratch prefill of `depth` tokens through a FRESH session; the
- * session is torn down before returning so nothing carries between depths. */
-static int prefill_logits(uint32_t depth, float *out, int width) {
+ * session is torn down before returning so nothing carries between depths.
+ * `ctx` is GATE_CTX for the byte/fidelity modes; --check-reference passes a
+ * larger one because the reference blob carries depths past 8192. */
+static int prefill_logits_ctx(uint32_t depth, float *out, int width, int ctx) {
     pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, g_e, GATE_CTX) != 0) {
+    if (pulsar_session_create(&s, g_e, ctx) != 0) {
         fprintf(stderr, "PREFILL GATE: session_create failed (depth %u)\n", depth);
         return 0;
     }
@@ -415,6 +435,10 @@ static int prefill_logits(uint32_t depth, float *out, int width) {
         return 0;
     }
     return 1;
+}
+
+static int prefill_logits(uint32_t depth, float *out, int width) {
+    return prefill_logits_ctx(depth, out, width, GATE_CTX);
 }
 
 /* Report the first byte difference and the worst float difference in a row.
@@ -499,6 +523,163 @@ static int fidelity_row(const float *cur, const float *ref, int width,
     if (kl > kl_tol)
         fprintf(stderr, "  depth %u: KL %.3e exceeds tol %.3e\n", depth, kl, kl_tol);
     return pass;
+}
+
+/* ---- --check-reference: divergence vs an EXTERNAL engine's logits ----------
+ *
+ * The blob here is NOT one of ours: it comes from the official checkpoint served
+ * by a second engine (vLLM on a rented box — see
+ * pulsar-notes/reference-capture/README.md for the capture protocol and the
+ * 2026-08-21 blobs).  That changes three contracts relative to --check-fidelity:
+ *
+ *   1. TOKEN AUTHORITY IS A FILE.  The gate's own tokenizer path
+ *      (pulsar_tokenize_text) and the CLI's --dump-tokens path produce
+ *      DIFFERENT id streams for the same text (measured 2026-08-20: fnv
+ *      0xfba1... vs 0x1a55... over the same 6144-token prefix), so
+ *      re-tokenizing here would silently compare against the wrong prompt.
+ *      Both sides prefill ids loaded from the SAME tokens.bin (int32 LE); the
+ *      blob's prompt_fnv over the deepest depth is required to match the
+ *      file's, so a wrong pairing fails loud before the model loads.
+ *   2. SHAPES DIFFER.  The reference row width is the true vocab (129,280);
+ *      ours is pulsar_engine_logits_width, a padded stride.  Depths come from
+ *      the REFERENCE header (it carries rows past GATE_CTX, e.g. 30464), and
+ *      the compare runs over min(ref_width, our_width) columns — the padded
+ *      tail lanes carry no information and are excluded.
+ *   3. NO PROVENANCE REF, NO TEETH BY DEFAULT.  build_ref in a reference blob
+ *      names the other engine ("vllm-0.27.1"), printed but not matched — the
+ *      self-baseline attack --check guards against cannot arise from a blob we
+ *      cannot produce.  Without [KL_TOL] the mode is REPORT-ONLY (exit 0
+ *      unless infrastructure fails): the first run against a new reference
+ *      ESTABLISHES the divergence budget, it does not enforce one.  With
+ *      [KL_TOL] it enforces top-1 match + KL <= tol per depth, same as
+ *      --check-fidelity.
+ *
+ * What the number means: this reference is MATCHED-PRECISION cross-engine
+ * (the checkpoint ships MXFP4 experts; there is no higher-precision release),
+ * so KL here is divergence-from-another-implementation on identical weights —
+ * decisive for changes to OUR arithmetic (fast-math, accumulation formats,
+ * storage narrowing: L072/L045/L079), a budget anchor rather than an oracle
+ * for quant-quality absolutes.  Determinism re-runs are skipped: that property
+ * belongs to --check, and doubling a 30k-token prefill buys nothing here. */
+static int run_check_reference(const char *model, const char *ref_path,
+                               const char *tokens_path, double kl_tol,
+                               int enforce) {
+    /* Load the reference blob in full (its shape is the run's shape). */
+    FILE *fp = fopen(ref_path, "rb");
+    if (!fp) { fprintf(stderr, "cannot read reference blob %s\n", ref_path); return 1; }
+    blob_header rh;
+    if (fread(&rh, sizeof(rh), 1, fp) != 1) {
+        fprintf(stderr, "reference %s: short header\n", ref_path);
+        fclose(fp);
+        return 1;
+    }
+    if (memcmp(rh.magic, BLOB_MAGIC, 8) != 0 || rh.version != BLOB_VERSION ||
+        rh.n_depths == 0 || rh.n_depths > MAX_DEPTHS || rh.width == 0) {
+        fprintf(stderr, "reference %s: bad magic/version/shape\n", ref_path);
+        fclose(fp);
+        return 1;
+    }
+    rh.build_ref[REF_LEN - 1] = '\0';
+    const size_t ref_n = (size_t)rh.n_depths * (size_t)rh.width;
+    float *ref_rows = (float *)calloc(ref_n, sizeof(float));
+    if (!ref_rows) { fclose(fp); fprintf(stderr, "oom\n"); return 1; }
+    if (fread(ref_rows, sizeof(float), ref_n, fp) != ref_n) {
+        fprintf(stderr, "reference %s: short body\n", ref_path);
+        fclose(fp);
+        free(ref_rows);
+        return 1;
+    }
+    fclose(fp);
+
+    /* Token authority: the shared int32 LE id file, fnv-locked to the blob. */
+    size_t tok_bytes = 0;
+    char *tok_raw = read_file(tokens_path, &tok_bytes);
+    if (!tok_raw || tok_bytes < sizeof(int) || (tok_bytes % sizeof(int)) != 0) {
+        fprintf(stderr, "tokens file %s: unreadable or not a whole number of int32s\n",
+                tokens_path);
+        free(tok_raw);
+        free(ref_rows);
+        return 1;
+    }
+    const int n_toks = (int)(tok_bytes / sizeof(int));
+    const uint32_t deepest = rh.depths[rh.n_depths - 1];
+    if (n_toks < (int)deepest) {
+        fprintf(stderr, "tokens file %s: %d ids, reference needs %u\n",
+                tokens_path, n_toks, deepest);
+        free(tok_raw);
+        free(ref_rows);
+        return 1;
+    }
+    const uint64_t fnv = fnv1a_ref(tok_raw, (size_t)deepest * sizeof(int));
+    if (fnv != rh.prompt_fnv) {
+        fprintf(stderr,
+                "REFERENCE GATE FAIL: token/blob mismatch — fnv over the first %u ids "
+                "of %s is %016llx but the reference blob was captured for %016llx.\n"
+                "  (wrong tokens.bin for this blob, or a re-tokenized prompt; the two "
+                "sides would silently compare different prompts)\n",
+                deepest, tokens_path, (unsigned long long)fnv,
+                (unsigned long long)rh.prompt_fnv);
+        free(tok_raw);
+        free(ref_rows);
+        return 1;
+    }
+
+    pulsar_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = model;
+    opt.backend = PULSAR_BACKEND_CUDA;
+    opt.prefill_chunk = 4096;   /* production parity, as in the byte gate */
+    opt.dspark_disable = true;
+    if (pulsar_engine_open(&g_e, &opt) != 0) {
+        fprintf(stderr, "engine open failed\n");
+        free(tok_raw);
+        free(ref_rows);
+        return 1;
+    }
+    const int width = pulsar_engine_logits_width(g_e);
+    if (width <= 0) { fprintf(stderr, "bad logits width %d\n", width); return 1; }
+    const int ncmp = (int)rh.width < width ? (int)rh.width : width;
+
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_toks.v = (int *)tok_raw;
+    g_toks.len = g_toks.cap = n_toks;
+
+    /* Smallest 4096-multiple that clears the deepest row, plus one chunk of
+     * headroom for the session's own accounting. */
+    const int ref_ctx = (int)(((deepest + 4095u) / 4096u + 1u) * 4096u);
+
+    printf("reference compare: blob=%s (engine '%s', %u depths, width %u)\n"
+           "  tokens=%s (%d ids, fnv %016llx OK)  ncmp=%d  ctx=%d  %s\n",
+           ref_path, rh.build_ref, rh.n_depths, rh.width,
+           tokens_path, n_toks, (unsigned long long)fnv, ncmp, ref_ctx,
+           enforce ? "ENFORCING" : "report-only (no tolerance enforced)");
+
+    float *row = (float *)calloc((size_t)width, sizeof(float));
+    if (!row) { fprintf(stderr, "oom\n"); return 1; }
+    int fail = 0;
+    for (uint32_t i = 0; i < rh.n_depths; i++) {
+        const float *ref_row = ref_rows + (size_t)i * (size_t)rh.width;
+        int ref_finite = 1;
+        for (int j = 0; j < ncmp; j++) if (!isfinite(ref_row[j])) { ref_finite = 0; break; }
+        if (!ref_finite) {
+            fprintf(stderr, "REFERENCE GATE FAIL: reference row for depth %u has "
+                            "non-finite logits — blob damaged or mis-captured\n",
+                    rh.depths[i]);
+            fail = 1;
+            continue;
+        }
+        if (!prefill_logits_ctx(rh.depths[i], row, width, ref_ctx)) return 1;
+        if (!row_is_sane(row, width, rh.depths[i])) { fail = 1; continue; }
+        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol) && enforce) fail = 1;
+    }
+
+    printf("\nREFERENCE GATE: %s\n",
+           fail ? "FAIL" : (enforce ? "PASS" : "REPORT COMPLETE"));
+    free(row);
+    free(ref_rows);
+    pulsar_tokens_free(&g_toks);
+    pulsar_engine_close(g_e);
+    return fail ? 1 : 0;
 }
 
 /* Ref strings come from `git rev-parse --short`, whose length is a property of
@@ -624,12 +805,28 @@ static int load_baseline(const char *path, const char *expect_ref,
 
 int main(int argc, char **argv) {
     if (argc < 4 || (strcmp(argv[2], "--dump") && strcmp(argv[2], "--check") &&
-                     strcmp(argv[2], "--check-fidelity"))) {
+                     strcmp(argv[2], "--check-fidelity") &&
+                     strcmp(argv[2], "--check-reference"))) {
         fprintf(stderr, "usage: %s MODEL --dump  FILE\n"
                         "       %s MODEL --check FILE EXPECTED_BASELINE_REF\n"
-                        "       %s MODEL --check-fidelity FILE EXPECTED_BASELINE_REF [KL_TOL]\n",
-                argv[0], argv[0], argv[0]);
+                        "       %s MODEL --check-fidelity FILE EXPECTED_BASELINE_REF [KL_TOL]\n"
+                        "       %s MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]\n",
+                argv[0], argv[0], argv[0], argv[0]);
         return 2;
+    }
+    if (strcmp(argv[2], "--check-reference") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "%s --check-reference requires REF.bin and TOKENS.bin — the "
+                            "reference blob and the int32 token file it was captured "
+                            "against (see pulsar-notes/reference-capture/)\n", argv[0]);
+            return 2;
+        }
+        const int enforce = argc >= 6;
+        const double tol = enforce ? atof(argv[5]) : 1e30;
+        scrub_numerics_env();
+        printf("prefill reference gate: this binary built from ref '%s'\n",
+               PULSAR_GATE_BUILD_REF);
+        return run_check_reference(argv[1], argv[3], argv[4], tol, enforce);
     }
     const char *model = argv[1];
     const int dumping = strcmp(argv[2], "--dump") == 0;
