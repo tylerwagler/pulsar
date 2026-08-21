@@ -490,7 +490,7 @@ static void diff_row(const float *cur, const float *ref, int width, uint32_t dep
  * holds at every depth AND KL <= tol at every depth.  Softmax/KL accumulate in
  * double so the metric itself does not round. */
 static int fidelity_row(const float *cur, const float *ref, int width,
-                        uint32_t depth, double kl_tol) {
+                        uint32_t depth, double kl_tol, int known_high) {
     double maxg = -1e300, maxc = -1e300;
     int arg_g = 0, arg_c = 0;
     for (int i = 0; i < width; i++) {
@@ -512,7 +512,12 @@ static int fidelity_row(const float *cur, const float *ref, int width,
     if (kl < 0.0) kl = 0.0;   /* fp noise can push a ~0 KL slightly negative */
     const double rms = sqrt(sse / (double)width);
     const int top1_ok = (arg_g == arg_c);
-    const int pass = top1_ok && kl <= kl_tol;
+    /* TOP-1 is enforced at EVERY depth including known-high ones: a divergence
+     * that moves the argmax is a different class of event from one that only
+     * widens KL, and exempting a row from the KL ceiling must never exempt it
+     * from that.  known_high only relaxes the KL half. */
+    const int kl_ok = (kl <= kl_tol) || known_high;
+    const int pass = top1_ok && kl_ok;
     printf("  depth %4u: top1 %s (golden argmax=%d current=%d)  KL=%.3e  logit_rms=%.3e  max|d|=%.3e  -> %s\n",
            depth, top1_ok ? "MATCH" : "FLIP", arg_g, arg_c, kl, rms, maxabs,
            pass ? "OK" : "FAIL");
@@ -520,8 +525,17 @@ static int fidelity_row(const float *cur, const float *ref, int width,
         fprintf(stderr, "  depth %u: TOP-1 FLIPPED golden=%d current=%d — a storage-precision "
                         "change moved the predicted token; investigate before accepting\n",
                 depth, arg_g, arg_c);
-    if (kl > kl_tol)
+    if (kl > kl_tol && !known_high)
         fprintf(stderr, "  depth %u: KL %.3e exceeds tol %.3e\n", depth, kl, kl_tol);
+    if (known_high && kl > kl_tol)
+        printf("  depth %4u: KL %.3e over tol %.3e but depth is KNOWN-HIGH — "
+               "informational, top-1 still enforced\n", depth, kl, kl_tol);
+    /* A known-high row that has come back under tolerance should stop being
+     * exempt, or the list calcifies and silently protects a future regression.
+     * Report it rather than failing: tightening the list is a deliberate edit. */
+    if (known_high && kl <= kl_tol)
+        printf("  depth %4u: KNOWN-HIGH but KL %.3e is now WITHIN tol %.3e — "
+               "drop it from --known-high\n", depth, kl, kl_tol);
     return pass;
 }
 
@@ -561,9 +575,15 @@ static int fidelity_row(const float *cur, const float *ref, int width,
  * storage narrowing: L072/L045/L079), a budget anchor rather than an oracle
  * for quant-quality absolutes.  Determinism re-runs are skipped: that property
  * belongs to --check, and doubling a 30k-token prefill buys nothing here. */
+static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
+    for (int i = 0; i < n; i++) if (list[i] == d) return 1;
+    return 0;
+}
+
 static int run_check_reference(const char *model, const char *ref_path,
                                const char *tokens_path, double kl_tol,
-                               int enforce) {
+                               int enforce,
+                               const uint32_t *known_high, int n_known_high) {
     /* Load the reference blob in full (its shape is the run's shape). */
     FILE *fp = fopen(ref_path, "rb");
     if (!fp) { fprintf(stderr, "cannot read reference blob %s\n", ref_path); return 1; }
@@ -670,7 +690,8 @@ static int run_check_reference(const char *model, const char *ref_path,
         }
         if (!prefill_logits_ctx(rh.depths[i], row, width, ref_ctx)) return 1;
         if (!row_is_sane(row, width, rh.depths[i])) { fail = 1; continue; }
-        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol) && enforce) fail = 1;
+        const int kh = depth_in_list(rh.depths[i], known_high, n_known_high);
+        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh) && enforce) fail = 1;
     }
 
     printf("\nREFERENCE GATE: %s\n",
@@ -821,12 +842,42 @@ int main(int argc, char **argv) {
                             "against (see pulsar-notes/reference-capture/)\n", argv[0]);
             return 2;
         }
-        const int enforce = argc >= 6;
-        const double tol = enforce ? atof(argv[5]) : 1e30;
+        /* [KL_TOL] [--known-high d1,d2,...]
+         * known-high names depths whose KL is a documented, not-yet-explained
+         * outlier (see ledger L080: shallow and file-end rows where a flat
+         * next-token distribution amplifies small numeric differences).  They
+         * keep the TOP-1 contract and lose only the KL ceiling.  Naming them
+         * explicitly is the point: a blanket tolerance loose enough to pass
+         * them would be 1e4x too loose for the mid rows and would protect
+         * nothing. */
+        uint32_t known_high[32];
+        int n_known_high = 0;
+        int enforce = 0;
+        double tol = 1e30;
+        for (int a = 5; a < argc; a++) {
+            if (strncmp(argv[a], "--known-high", 12) == 0) {
+                const char *list = strchr(argv[a], '=');
+                if (!list && a + 1 < argc) list = argv[++a]; else if (list) list++;
+                for (const char *p = list; p && *p && n_known_high < 32; ) {
+                    known_high[n_known_high++] = (uint32_t)strtoul(p, NULL, 10);
+                    const char *c = strchr(p, ',');
+                    p = c ? c + 1 : NULL;
+                }
+            } else {
+                tol = atof(argv[a]);
+                enforce = 1;
+            }
+        }
         scrub_numerics_env();
         printf("prefill reference gate: this binary built from ref '%s'\n",
                PULSAR_GATE_BUILD_REF);
-        return run_check_reference(argv[1], argv[3], argv[4], tol, enforce);
+        if (n_known_high) {
+            printf("  known-high depths (top-1 enforced, KL informational):");
+            for (int i = 0; i < n_known_high; i++) printf(" %u", known_high[i]);
+            printf("\n");
+        }
+        return run_check_reference(argv[1], argv[3], argv[4], tol, enforce,
+                                   known_high, n_known_high);
     }
     const char *model = argv[1];
     const int dumping = strcmp(argv[2], "--dump") == 0;
@@ -989,7 +1040,9 @@ int main(int argc, char **argv) {
         printf("\nfidelity compare vs golden (KL tol %.3e):\n", kl_tol);
         for (uint32_t i = 0; i < N_DEPTHS; i++) {
             const size_t off = (size_t)i * (size_t)width;
-            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol)) fail = 1;
+            /* --check-fidelity has no known-high concept: it compares against OUR
+             * own golden, where every depth is expected to meet the tolerance. */
+            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0)) fail = 1;
         }
         printf("\nPREFILL FIDELITY GATE: %s\n", fail ? "FAIL" : "PASS");
         free(base);

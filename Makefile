@@ -578,6 +578,40 @@ cuda-prefill-gate:
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
 
+# Cross-engine fidelity gate: grade prefill logits against the vLLM reference
+# blobs from the B300 capture.  This is the only gate that measures us against
+# something we did not produce -- every other gate compares us to ourselves,
+# which cannot catch an error we make consistently.
+#
+# The blobs are ~4.6 MB and live OUTSIDE this repo (pulsar-notes is private and
+# stays that way), so the path comes from PULSAR_REF_DIR.  When it is unset or
+# the blobs are missing this SKIPS LOUDLY rather than passing: a gate that
+# quietly succeeds when its fixture is absent is worse than no gate, which is
+# exactly the hole L078's golden fixture fell into.
+#
+# Tolerance 1e-4 clears the six mid rows with 10-100x headroom (measured
+# 2026-08-21 on a provenanced binary: 3.5e-7 .. 9.9e-6, top-1 matched).
+# --known-high names the three rows whose KL is a documented, not-yet-explained
+# outlier -- shallow and file-end positions where a flat next-token
+# distribution amplifies small numeric differences (ledger L080).  They keep
+# the TOP-1 contract and lose only the KL ceiling; a blanket tolerance loose
+# enough to pass them would be ~1e4x too loose for the mid rows and would
+# protect nothing.
+PULSAR_REF_TOL ?= 1e-4
+cuda-reference-gate:
+	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
+		echo "  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir"; \
+		echo "        (blobs live outside the repo; without them this gate grades nothing)"; \
+		exit 0; \
+	fi
+	$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
+		$(PULSAR_REF_TOL) --known-high 512,30464
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+		$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
+		$(PULSAR_REF_TOL) --known-high 3840
+
 # NOTE: `git worktree add` does not populate submodules, so the baseline build
 # is pointed at THIS tree's CUTLASS pin (a header-only include path).
 cuda-prefill-gate-baseline:
@@ -624,6 +658,7 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
 #   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
 GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-attn-gates cuda-prefill-gate \
+	cuda-reference-gate \
                cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
