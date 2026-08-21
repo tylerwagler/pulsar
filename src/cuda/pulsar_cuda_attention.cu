@@ -854,11 +854,11 @@ __global__ static void attention_indexed_mixed_kernel(
 #endif
 #define PULSAR_ATTN_LB __launch_bounds__(512, PULSAR_ATTN_MIN_BLOCKS)
 
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, typename QT>
 __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
-        const float *q,   /* heads8: float4-vectorised, not templated -- see L045 */
+        const QT *q,
         const float *raw_kv,
         const float *comp_kv,
         const int32_t *topk,
@@ -959,16 +959,16 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
     if (comp_count > 512u) comp_count = 512u;
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+    const QT *qrow = valid_head
+        ? (q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
     if (valid_head) {
-        q0 = q4[lane +  0u];
-        q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u];
-        q3 = q4[lane + 96u];
+        q0 = q_load4<QT>(qrow, lane +  0u);
+        q1 = q_load4<QT>(qrow, lane + 32u);
+        q2 = q_load4<QT>(qrow, lane + 64u);
+        q3 = q_load4<QT>(qrow, lane + 96u);
     }
 
     float max_s = -INFINITY;
@@ -1093,13 +1093,15 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 #endif
 
 /* The release line's occupancy cap (__launch_bounds__, +8.9% prefill,
- * bit-exact -- 1d2ef4f). */
+ * bit-exact -- 1d2ef4f).  The cap stays on the templated form: it is the
+ * thing that bought the +8.9%, and dropping it while changing the Q load
+ * would confound two effects. */
+template <typename QT>
 __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
-
-__global__ static void attention_decode_mixed_heads8_online_kernel(
+static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
-        const float *q,   /* heads8: float4-vectorised, not templated -- see L045 */
+        const QT *q,
         const float *raw_kv,
         const float *comp_kv,
         uint32_t non_causal,
@@ -1249,16 +1251,16 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     uint32_t row_hi = row_lo + rows_per_split;
     if (row_hi > n_score) row_hi = n_score;
     const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+    const QT *qrow = valid_head
+        ? (q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
     if (valid_head) {
-        q0 = q4[lane +  0u];
-        q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u];
-        q3 = q4[lane + 96u];
+        q0 = q_load4<QT>(qrow, lane +  0u);
+        q1 = q_load4<QT>(qrow, lane + 32u);
+        q2 = q_load4<QT>(qrow, lane + 64u);
+        q3 = q_load4<QT>(qrow, lane + 96u);
     }
 
     float max_s = -INFINITY;
