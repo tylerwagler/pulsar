@@ -863,15 +863,16 @@ static int routed_moe_launch_mixed40(
      * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
      * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
     /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
-     * per-token (non-grouped) path across the whole row range (<=8 rows; note
-     * PULSAR_MSEQ_MAX is 16, so this bound is the cap, not the constant):
+     * per-token (non-grouped) path across the whole row range (up to
+     * PULSAR_GPU_MNEUTRAL_ROWS_MAX, static_assert-tied to PULSAR_MSEQ_MAX):
      * the grouped path's per-expert group sizes depend on the batch composition,
      * so a co-scheduled decode bank's expert output would shift with the batch
      * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
-     * output independent of M); buffers are sized by n_tokens, so 5..8 are safe.
+     * output independent of M) and buffers are sized by n_tokens, so any armed
+     * width is safe on the same argument that covered 5..8.
      * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
     const int use_grouped = pulsar_gpu_matmul_batch_mneutral()
-            ? (n_tokens > 8u) : (n_tokens > 4u);
+            ? (n_tokens > PULSAR_GPU_MNEUTRAL_ROWS_MAX) : (n_tokens > 4u);
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
 
     /* model weight bases */
@@ -1643,10 +1644,11 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
      * row's expert output is invariant to co-scheduled rows ONLY if it takes the
      * M-independent per-token path — but the grouped GEMM's per-expert group sizes
      * depend on the whole batch. So: run the PER-TOKEN path over the decode prefix
-     * (n_tokens=n_dec<=8 keeps the GEMV/non-grouped dispatch) and the GROUPED path
-     * over the prefill suffix (K>8), offsetting every per-token buffer by n_dec rows.
-     *   - Pass 1 keeps the flag = n_dec (nonzero) so the cap-8 dispatch picks the
-     *     per-token path for n_dec<=8; n_tokens==n_dec => it does NOT re-split.
+     * (n_tokens=n_dec<=PULSAR_GPU_MNEUTRAL_ROWS_MAX keeps the GEMV/non-grouped
+     * dispatch) and the GROUPED path over the prefill suffix, offsetting every
+     * per-token buffer by n_dec rows.
+     *   - Pass 1 keeps the flag = n_dec (nonzero) so the capped dispatch picks the
+     *     per-token path for any armed n_dec; n_tokens==n_dec => it does NOT re-split.
      *   - Pass 2 clears the flag so it (a) does not re-split and (b) is BYTE-
      *     IDENTICAL to an inc-3 pure-prefill MoE of the same K rows (grouped path,
      *     which reads no flag). The flag is restored before returning so the rest of

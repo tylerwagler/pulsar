@@ -1782,18 +1782,19 @@ void cuda_fp8_weight_cache_clear(void) {
  * emits at that width. No kernel logic is duplicated. */
 static int g_mneutral_rows = 0;
 void pulsar_gpu_matmul_set_batch_mneutral(int n) {
-    /* The neutrality caps below are hard 8s.  PULSAR_MSEQ_MAX is 16, so a wider
-     * batched step would quietly take a different kernel for the rows past 8 --
-     * exactly the "same op, two numerics, chosen by width" shape this codebase
-     * keeps getting bitten by.  Not reachable at today's session limits; say so
-     * if it ever becomes reachable rather than discovering it in a divergence. */
-    if (n > 8) {
+    /* The armed nt-caps cover PULSAR_GPU_MNEUTRAL_ROWS_MAX rows, and the engine
+     * static_asserts PULSAR_MSEQ_MAX against it -- so this branch is unreachable
+     * from the batched lane.  It stays as a fail-loud guard for any OTHER caller:
+     * rows past the cap would take a batch-shape-dependent GEMM, the "same op,
+     * two numerics, chosen by width" shape this codebase keeps getting bitten by. */
+    if (n > (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
         static int warned = 0;
         if (!warned) {
             warned = 1;
             fprintf(stderr, "pulsar: WARNING batched step of %d rows exceeds the "
-                            "m-neutral cap of 8 -- rows past 8 take a different "
-                            "GEMM and neutrality is not guaranteed\n", n);
+                            "m-neutral cap of %u -- rows past the cap take a different "
+                            "GEMM and neutrality is not guaranteed\n",
+                            n, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
         }
     }
     g_mneutral_rows = (n > 0) ? n : 0;
@@ -1803,12 +1804,6 @@ void pulsar_gpu_matmul_set_batch_mneutral(int n) {
  * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
  * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
 int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
-
-
-/* True only when the plain-F16 matmul is GUARANTEED to take the cuBLAS branch
- * that consumes the cached f16 activation.  Deliberately conservative: a mixed
- * batch splits into a <=8-row decode prefix that runs the NT kernel straight
- * off the f32 buffer, so any m-neutral split disqualifies the whole call. */
 
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
@@ -1926,17 +1921,15 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * The width-6 verify win is real but belongs entirely to moe_gemv_cap
          * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
         static const int gemv_max_n = 4;
-        /* inc 2: raise the custom-nt cap to 8 for a batched step so
-         * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
-         * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
-         * decode-only lane (n_tok<=4), which take the identical cases 2/3/4 below. */
-        /* ⚠ 8 IS NOT PULSAR_MSEQ_MAX.  It was, when this was written; the
-         * constant is now 16 (pulsar_engine_internal.h) and this cap did not
-         * follow.  A batched step wider than 8 rows silently leaves the
-         * M-independent kernel for cuBLASLt, i.e. mixed-batch neutrality stops
-         * holding above 8 -- see the warning in pulsar_gpu_matmul_set_batch_mneutral. */
-        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : (uint64_t)gemv_max_n;
-        if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= 8 &&
+        /* inc 2: raise the custom-nt cap for a batched step so armed widths keep
+         * the M-independent kernel instead of cuBLASLt. Default cap (gemv_max_n=4)
+         * is unchanged for classic prefill (never armed) and for the decode-only
+         * lane (n_tok<=4), which take the identical cases 2/3/4 below. The armed
+         * cap is PULSAR_GPU_MNEUTRAL_ROWS_MAX, static_assert-tied to
+         * PULSAR_MSEQ_MAX (it drifted once: caps stayed 8 while MSEQ went 16). */
+        const uint64_t nt_cap = (g_mneutral_rows > 0)
+                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)gemv_max_n;
+        if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= PULSAR_GPU_MNEUTRAL_ROWS_MAX &&
             in_dim % 128 == 0) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
@@ -1979,7 +1972,15 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     case 5: if (out_f16) PULSAR_FP8_NT_A8(5, __half); else PULSAR_FP8_NT_A8(5, float); break;
                     case 6: if (out_f16) PULSAR_FP8_NT_A8(6, __half); else PULSAR_FP8_NT_A8(6, float); break;
                     case 7: if (out_f16) PULSAR_FP8_NT_A8(7, __half); else PULSAR_FP8_NT_A8(7, float); break;
-                    default: if (out_f16) PULSAR_FP8_NT_A8(8, __half); else PULSAR_FP8_NT_A8(8, float); break;
+                    case 8: if (out_f16) PULSAR_FP8_NT_A8(8, __half); else PULSAR_FP8_NT_A8(8, float); break;
+                    case 9: if (out_f16) PULSAR_FP8_NT_A8(9, __half); else PULSAR_FP8_NT_A8(9, float); break;
+                    case 10: if (out_f16) PULSAR_FP8_NT_A8(10, __half); else PULSAR_FP8_NT_A8(10, float); break;
+                    case 11: if (out_f16) PULSAR_FP8_NT_A8(11, __half); else PULSAR_FP8_NT_A8(11, float); break;
+                    case 12: if (out_f16) PULSAR_FP8_NT_A8(12, __half); else PULSAR_FP8_NT_A8(12, float); break;
+                    case 13: if (out_f16) PULSAR_FP8_NT_A8(13, __half); else PULSAR_FP8_NT_A8(13, float); break;
+                    case 14: if (out_f16) PULSAR_FP8_NT_A8(14, __half); else PULSAR_FP8_NT_A8(14, float); break;
+                    case 15: if (out_f16) PULSAR_FP8_NT_A8(15, __half); else PULSAR_FP8_NT_A8(15, float); break;
+                    default: if (out_f16) PULSAR_FP8_NT_A8(16, __half); else PULSAR_FP8_NT_A8(16, float); break;   /* n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX */
                     }
                     #undef PULSAR_FP8_NT_A8
                     return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
@@ -1994,7 +1995,15 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 case 5: if (out_f16) PULSAR_FP8_NT(5, __half); else PULSAR_FP8_NT(5, float); break;
                 case 6: if (out_f16) PULSAR_FP8_NT(6, __half); else PULSAR_FP8_NT(6, float); break;
                 case 7: if (out_f16) PULSAR_FP8_NT(7, __half); else PULSAR_FP8_NT(7, float); break;
-                default: if (out_f16) PULSAR_FP8_NT(8, __half); else PULSAR_FP8_NT(8, float); break;   /* n_tok == 8 */
+                case 8: if (out_f16) PULSAR_FP8_NT(8, __half); else PULSAR_FP8_NT(8, float); break;
+                case 9: if (out_f16) PULSAR_FP8_NT(9, __half); else PULSAR_FP8_NT(9, float); break;
+                case 10: if (out_f16) PULSAR_FP8_NT(10, __half); else PULSAR_FP8_NT(10, float); break;
+                case 11: if (out_f16) PULSAR_FP8_NT(11, __half); else PULSAR_FP8_NT(11, float); break;
+                case 12: if (out_f16) PULSAR_FP8_NT(12, __half); else PULSAR_FP8_NT(12, float); break;
+                case 13: if (out_f16) PULSAR_FP8_NT(13, __half); else PULSAR_FP8_NT(13, float); break;
+                case 14: if (out_f16) PULSAR_FP8_NT(14, __half); else PULSAR_FP8_NT(14, float); break;
+                case 15: if (out_f16) PULSAR_FP8_NT(15, __half); else PULSAR_FP8_NT(15, float); break;
+                default: if (out_f16) PULSAR_FP8_NT(16, __half); else PULSAR_FP8_NT(16, float); break;   /* n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX */
                 }
                 #undef PULSAR_FP8_NT
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
@@ -2336,7 +2345,8 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
      * larger than the f32 arm's, not smaller" until 2026-08-17, which was true
      * and was the bug. */
     {
-        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
+        const uint64_t nt_cap = (g_mneutral_rows > 0)
+                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : 4u;
         if (n_tok >= 2 && n_tok <= nt_cap) {
             dim3 g((unsigned)out_dim);
             #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
@@ -2349,7 +2359,15 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
             case 5: PULSAR_NT_LAUNCH(5); break;
             case 6: PULSAR_NT_LAUNCH(6); break;
             case 7: PULSAR_NT_LAUNCH(7); break;
-            default: PULSAR_NT_LAUNCH(8); break;
+            case 8: PULSAR_NT_LAUNCH(8); break;
+            case 9: PULSAR_NT_LAUNCH(9); break;
+            case 10: PULSAR_NT_LAUNCH(10); break;
+            case 11: PULSAR_NT_LAUNCH(11); break;
+            case 12: PULSAR_NT_LAUNCH(12); break;
+            case 13: PULSAR_NT_LAUNCH(13); break;
+            case 14: PULSAR_NT_LAUNCH(14); break;
+            case 15: PULSAR_NT_LAUNCH(15); break;
+            default: PULSAR_NT_LAUNCH(16); break;   /* n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX */
             }
             #undef PULSAR_NT_LAUNCH
             return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
@@ -2431,7 +2449,8 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
      * so each token's output is bit-identical to running it alone. The gate
      * raises the cap to 8 via g_mneutral_rows, exactly as the f16 twin does. */
     {
-        const uint64_t nt_cap = (g_mneutral_rows > 0) ? 8u : 4u;
+        const uint64_t nt_cap = (g_mneutral_rows > 0)
+                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : 4u;
         if (n_tok >= 2 && n_tok <= nt_cap) {
             dim3 g((unsigned)out_dim);
             #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, float><<<g, 256>>>( \
@@ -2443,7 +2462,15 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
             case 5: PULSAR_NT_LAUNCH(5); break;
             case 6: PULSAR_NT_LAUNCH(6); break;
             case 7: PULSAR_NT_LAUNCH(7); break;
-            default: PULSAR_NT_LAUNCH(8); break;
+            case 8: PULSAR_NT_LAUNCH(8); break;
+            case 9: PULSAR_NT_LAUNCH(9); break;
+            case 10: PULSAR_NT_LAUNCH(10); break;
+            case 11: PULSAR_NT_LAUNCH(11); break;
+            case 12: PULSAR_NT_LAUNCH(12); break;
+            case 13: PULSAR_NT_LAUNCH(13); break;
+            case 14: PULSAR_NT_LAUNCH(14); break;
+            case 15: PULSAR_NT_LAUNCH(15); break;
+            default: PULSAR_NT_LAUNCH(16); break;   /* n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX */
             }
             #undef PULSAR_NT_LAUNCH
             return cuda_ok(cudaGetLastError(), "matmul_f32 nt launch");

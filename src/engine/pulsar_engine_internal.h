@@ -773,6 +773,15 @@ typedef struct {
  * simultaneously-decoding sessions takes the slower lane (correct, and
  * rare at the ~4-stream saturation point). */
 #define PULSAR_MSEQ_MAX 16u
+/* Every decode row of a batched step must fit the M-neutral kernel paths, or
+ * rows past the cap silently take a batch-shape-dependent GEMM (this exact
+ * drift happened once: the caps were written when MSEQ_MAX was 8 and did not
+ * follow it to 16). The build refuses the drift now. */
+static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
+              "PULSAR_MSEQ_MAX exceeds the M-neutral kernel row cap; extend the "
+              "NT kernel instantiations in pulsar_cuda_matmul.cu and the MoE "
+              "boundary in pulsar_cuda_moe.cu, then raise "
+              "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
 
 /* Fixed per-bank KV slabs: per layer, one contiguous allocation per cache
  * kind, bank-major, stride = one bank's single-session capacity.  When the

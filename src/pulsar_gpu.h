@@ -443,6 +443,15 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         int                     mid_kbp);
 
 
+/* Widest decode prefix the M-neutral kernel paths cover.  ONE authority: the
+ * armed nt-caps in pulsar_cuda_matmul.cu, the MoE grouped/non-grouped boundary
+ * (pulsar_cuda_moe.cu), and the PULSAR_MSEQ_MAX static_assert in the engine all
+ * reference this.  A batched step's decode rows past this width would take a
+ * batch-shape-dependent GEMM instead of the per-row-independent kernels — the
+ * "same op, two numerics, chosen by width" bug family — so growing
+ * PULSAR_MSEQ_MAX past it must FAIL THE BUILD, not warn at runtime. */
+#define PULSAR_GPU_MNEUTRAL_ROWS_MAX 16u
+
 /* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
  * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
  * rows run through the M-independent custom per-token kernels (byte-identical
