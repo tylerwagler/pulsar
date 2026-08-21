@@ -894,14 +894,16 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        PULSAR_ROPE_YARN_BETA_FAST,
                                                        PULSAR_ROPE_YARN_BETA_SLOW,
                                                        PULSAR_RMS_EPS,
-                                                       mseq ? g->batch_positions : NULL) != 0;
+                                                       mseq ? g->batch_positions : NULL,
+                                                   /* q_f16: */ 0) != 0;
         }
         if (!prefill_q_norm_rope_fused) {
             if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->batch_q,
                                                         n_tokens,
                                                         PULSAR_N_HEAD,
                                                         PULSAR_N_HEAD_DIM,
-                                                        PULSAR_RMS_EPS) != 0;
+                                                        PULSAR_RMS_EPS,
+                                                        /* q_f16: */ 0) != 0;
             if (ok) {
                 gpu_graph_debug_dump_tensor("Qnorm", g->batch_q,
                                               (uint64_t)n_tokens * q_dim, il, pos0);

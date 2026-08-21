@@ -164,13 +164,46 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
 
 
 
-__global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
+/* ---- Q-buffer element access (L045) -------------------------------------
+ *
+ * batch_q is migrating f32 -> f16.  The STORAGE narrows; the ARITHMETIC does
+ * not.  Every kernel templated on QT below loads to f32, accumulates in f32,
+ * and narrows only at the store -- so the <float> instantiation is bit-identical
+ * to the code that shipped, and the <__half> one differs by exactly one
+ * round-to-nearest-even per stored element.
+ *
+ * That distinction is the whole reason this is templated rather than rewritten:
+ * the f32 arm must remain provable by the byte-exact prefill gate while the f16
+ * arm is graded by cuda-reference-gate, which is a different contract.
+ *
+ * ⚠ The head RMS norm reads this buffer to form a SUM OF SQUARES over head_dim.
+ * Under q_prep_active batch_q holds UNNORMALISED q_b output -- the widest
+ * magnitudes in the activation path -- so the <__half> arm narrows the inputs
+ * to that reduction, not merely its result.  Measured neutral at mid depths
+ * (L045 stage 1), but it is a fidelity change and must never be described as
+ * bit-exact. */
+template <typename QT>
+__device__ __forceinline__ float q_load(const QT *p, uint64_t i);
+template <>
+__device__ __forceinline__ float q_load<float>(const float *p, uint64_t i) { return p[i]; }
+template <>
+__device__ __forceinline__ float q_load<__half>(const __half *p, uint64_t i) { return __half2float(p[i]); }
+
+template <typename QT>
+__device__ __forceinline__ void q_store(QT *p, uint64_t i, float v);
+template <>
+__device__ __forceinline__ void q_store<float>(float *p, uint64_t i, float v) { p[i] = v; }
+template <>
+__device__ __forceinline__ void q_store<__half>(__half *p, uint64_t i, float v) { p[i] = __float2half(v); }
+
+template <typename QT>
+__global__ static void head_rms_norm_kernel(QT *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
-    float *xr = x + (uint64_t)row * head_dim;
+    QT *xr = x + (uint64_t)row * head_dim;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = xr[i];
+        float v = q_load<QT>(xr, i);
         sum += v * v;
     }
     __shared__ float partial[256];
@@ -181,7 +214,8 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
         __syncthreads();
     }
     float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] *= scale;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x)
+        q_store<QT>(xr, i, q_load<QT>(xr, i) * scale);
 }
 
 
@@ -193,8 +227,9 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 /* positions (both RoPE kernels): per-row absolute query positions for banked
  * multi-session batches; NULL degenerates to the classic consecutive pos0+t
  * rule bit-exactly (same arithmetic on the same value). */
+template <typename QT>
 __global__ static void head_rms_norm_rope_tail_kernel(
-        float *x,
+        QT *x,
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
@@ -214,10 +249,10 @@ __global__ static void head_rms_norm_rope_tail_kernel(
     if (row >= n_tok * n_head) return;
     uint32_t t = row / n_head;
     const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
-    float *xr = x + (uint64_t)row * head_dim;
+    QT *xr = x + (uint64_t)row * head_dim;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = xr[i];
+        float v = q_load<QT>(xr, i);
         sum += v * v;
     }
     __shared__ float partial[256];
@@ -230,7 +265,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
     const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
-        xr[i] *= scale;
+        q_store<QT>(xr, i, q_load<QT>(xr, i) * scale);
     }
 
     float corr0 = 0.0f, corr1 = 0.0f;
@@ -255,11 +290,14 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float c = cosf(theta) * mscale;
         float s = sinf(theta) * mscale;
         if (inverse) s = -s;
-        float *tail = xr + n_nope;
-        float x0 = tail[i] * scale;
-        float x1 = tail[i + 1] * scale;
-        tail[i] = x0 * c - x1 * s;
-        tail[i + 1] = x0 * s + x1 * c;
+        /* The rotation itself stays in f32 for both instantiations; only the
+         * two stores narrow.  Rotating in f16 would compound the rounding
+         * across the pair and is not what the fp16-storage change is. */
+        QT *tail = xr + n_nope;
+        float x0 = q_load<QT>(tail, i) * scale;
+        float x1 = q_load<QT>(tail, i + 1) * scale;
+        q_store<QT>(tail, i,     x0 * c - x1 * s);
+        q_store<QT>(tail, i + 1, x0 * s + x1 * c);
     }
 }
 
@@ -1178,18 +1216,30 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 
 
 
-int pulsar_gpu_head_rms_norm_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
-    if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
+/* q_f16: batch_q's element type. 0 = f32 (what ships today, bit-identical to
+ * the untemplated kernel this replaced); 1 = __half (L045). Passed EXPLICITLY
+ * rather than inferred from the tensor: pulsar_gpu_tensor carries no element
+ * type, and inferring one from ->bytes would silently mis-dispatch a view. */
+int pulsar_gpu_head_rms_norm_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps, int q_f16) {
+    const uint64_t elts = (uint64_t)n_tok * n_head * head_dim;
+    const size_t esz = q_f16 ? sizeof(__half) : sizeof(float);
+    if (!x || x->bytes < elts * esz) return 0;
+    if (q_f16) head_rms_norm_kernel<__half><<<n_tok * n_head, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, eps);
+    else       head_rms_norm_kernel<float ><<<n_tok * n_head, 256>>>((float  *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
 
 
-int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions, int q_f16) {
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+    const size_t esz = q_f16 ? sizeof(__half) : sizeof(float);
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
-        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, positions ? (const int32_t *)positions->ptr : NULL);
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * esz) return 0;
+    const int32_t *pos = positions ? (const int32_t *)positions->ptr : NULL;
+    if (q_f16)
+        head_rms_norm_rope_tail_kernel<__half><<<n_tok * n_head, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
+    else
+        head_rms_norm_rope_tail_kernel<float><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 

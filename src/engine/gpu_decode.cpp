@@ -494,10 +494,11 @@ bool gpu_graph_encode_decode_layer(
                                                    PULSAR_ROPE_YARN_BETA_FAST,
                                                    PULSAR_ROPE_YARN_BETA_SLOW,
                                                    PULSAR_RMS_EPS,
-                                                   NULL) != 0;
+                                                   NULL,
+                                                   /* q_f16: */ 0) != 0;
     }
     if (!decode_q_norm_rope_fused) {
-        if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS) != 0;
+        if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS, /* q_f16: */ 0) != 0;
         if (ok) {
             gpu_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
         }
@@ -1430,7 +1431,8 @@ bool gpu_graph_dspark_draft_forward(
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
-            NULL) != 0;
+            NULL,
+                                                   /* q_f16: */ 0) != 0;
 
         /* --- KV projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
