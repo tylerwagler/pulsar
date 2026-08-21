@@ -176,6 +176,7 @@
  * usage: ./tests/prefill_bitexact_gate MODEL --dump  FILE
  *        ./tests/prefill_bitexact_gate MODEL --check FILE EXPECTED_BASELINE_REF
  *        ./tests/prefill_bitexact_gate MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]
+ *            [--known-high d1,d2,...] [--known-flip d1,d2,...]
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
  */
@@ -490,7 +491,8 @@ static void diff_row(const float *cur, const float *ref, int width, uint32_t dep
  * holds at every depth AND KL <= tol at every depth.  Softmax/KL accumulate in
  * double so the metric itself does not round. */
 static int fidelity_row(const float *cur, const float *ref, int width,
-                        uint32_t depth, double kl_tol, int known_high) {
+                        uint32_t depth, double kl_tol, int known_high,
+                        int known_flip) {
     double maxg = -1e300, maxc = -1e300;
     int arg_g = 0, arg_c = 0;
     for (int i = 0; i < width; i++) {
@@ -517,10 +519,24 @@ static int fidelity_row(const float *cur, const float *ref, int width,
      * widens KL, and exempting a row from the KL ceiling must never exempt it
      * from that.  known_high only relaxes the KL half. */
     const int kl_ok = (kl <= kl_tol) || known_high;
-    const int pass = top1_ok && kl_ok;
+    /* known_flip: a NAMED per-depth allowance for an argmax flip, and nothing
+     * else -- the KL contract is untouched.  Added for story@512 (L084): the
+     * TF32 removal moved EVERY depth toward the reference (512 itself 0.697 ->
+     * 0.643) and crossed a 0.25-logit near-tie on the L080 outlier row, golden
+     * argmax landing at rank #2.  A flip that rides an overall improvement on
+     * an already-degenerate depth is churn, not regression -- but that verdict
+     * lives HERE, per depth, with the evidence printed below, never in a
+     * loosened default. */
+    const int top1_pass = top1_ok || known_flip;
+    const int pass = top1_pass && kl_ok;
     printf("  depth %4u: top1 %s (golden argmax=%d current=%d)  KL=%.3e  logit_rms=%.3e  max|d|=%.3e  -> %s\n",
-           depth, top1_ok ? "MATCH" : "FLIP", arg_g, arg_c, kl, rms, maxabs,
-           pass ? "OK" : "FAIL");
+           depth, top1_ok ? "MATCH" : (known_flip ? "FLIP (KNOWN)" : "FLIP"),
+           arg_g, arg_c, kl, rms, maxabs, pass ? "OK" : "FAIL");
+    /* Same self-tightening rule as --known-high: an exemption that is no
+     * longer needed must say so, or the list protects a future regression. */
+    if (known_flip && top1_ok)
+        printf("  depth %4u: KNOWN-FLIP but top-1 MATCHES — drop it from --known-flip\n",
+               depth);
     if (!top1_ok) {
         /* A flip's SEVERITY is the gap, not the fact of it.  On a known-high
          * depth the whole distribution already sits far from the reference, so
@@ -537,7 +553,7 @@ static int fidelity_row(const float *cur, const float *ref, int width,
         printf("  depth %4u: FLIP DETAIL  golden argmax now ranks #%d in current logits\n",
                depth, rank_g);
     }
-    if (!top1_ok)
+    if (!top1_ok && !known_flip)
         fprintf(stderr, "  depth %u: TOP-1 FLIPPED golden=%d current=%d — a storage-precision "
                         "change moved the predicted token; investigate before accepting\n",
                 depth, arg_g, arg_c);
@@ -599,7 +615,8 @@ static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
 static int run_check_reference(const char *model, const char *ref_path,
                                const char *tokens_path, double kl_tol,
                                int enforce,
-                               const uint32_t *known_high, int n_known_high) {
+                               const uint32_t *known_high, int n_known_high,
+                               const uint32_t *known_flip, int n_known_flip) {
     /* Load the reference blob in full (its shape is the run's shape). */
     FILE *fp = fopen(ref_path, "rb");
     if (!fp) { fprintf(stderr, "cannot read reference blob %s\n", ref_path); return 1; }
@@ -707,7 +724,8 @@ static int run_check_reference(const char *model, const char *ref_path,
         if (!prefill_logits_ctx(rh.depths[i], row, width, ref_ctx)) return 1;
         if (!row_is_sane(row, width, rh.depths[i])) { fail = 1; continue; }
         const int kh = depth_in_list(rh.depths[i], known_high, n_known_high);
-        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh) && enforce) fail = 1;
+        const int kf = depth_in_list(rh.depths[i], known_flip, n_known_flip);
+        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh, kf) && enforce) fail = 1;
     }
 
     printf("\nREFERENCE GATE: %s\n",
@@ -868,6 +886,12 @@ int main(int argc, char **argv) {
          * nothing. */
         uint32_t known_high[32];
         int n_known_high = 0;
+        /* --known-flip: depths where an argmax flip is a documented near-tie
+         * (gap + rank printed by the flip detail), accepted by name.  KL is
+         * still enforced there; only the top-1 half relaxes.  The dual of
+         * --known-high, and just as deliberately narrow. */
+        uint32_t known_flip[32];
+        int n_known_flip = 0;
         int enforce = 0;
         double tol = 1e30;
         for (int a = 5; a < argc; a++) {
@@ -876,6 +900,14 @@ int main(int argc, char **argv) {
                 if (!list && a + 1 < argc) list = argv[++a]; else if (list) list++;
                 for (const char *p = list; p && *p && n_known_high < 32; ) {
                     known_high[n_known_high++] = (uint32_t)strtoul(p, NULL, 10);
+                    const char *c = strchr(p, ',');
+                    p = c ? c + 1 : NULL;
+                }
+            } else if (strncmp(argv[a], "--known-flip", 12) == 0) {
+                const char *list = strchr(argv[a], '=');
+                if (!list && a + 1 < argc) list = argv[++a]; else if (list) list++;
+                for (const char *p = list; p && *p && n_known_flip < 32; ) {
+                    known_flip[n_known_flip++] = (uint32_t)strtoul(p, NULL, 10);
                     const char *c = strchr(p, ',');
                     p = c ? c + 1 : NULL;
                 }
@@ -892,8 +924,14 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n_known_high; i++) printf(" %u", known_high[i]);
             printf("\n");
         }
+        if (n_known_flip) {
+            printf("  known-flip depths (KL enforced, argmax flip accepted by name):");
+            for (int i = 0; i < n_known_flip; i++) printf(" %u", known_flip[i]);
+            printf("\n");
+        }
         return run_check_reference(argv[1], argv[3], argv[4], tol, enforce,
-                                   known_high, n_known_high);
+                                   known_high, n_known_high,
+                                   known_flip, n_known_flip);
     }
     const char *model = argv[1];
     const int dumping = strcmp(argv[2], "--dump") == 0;

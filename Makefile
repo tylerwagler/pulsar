@@ -642,7 +642,7 @@ cuda-reference-gate:
 		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
 		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 			$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-			$(PULSAR_REF_TOL) --known-high 512,30464; \
+			$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512; \
 		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 			$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
 			$(PULSAR_REF_TOL) --known-high 3840; \
