@@ -969,9 +969,21 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
     if (!ptr) return 0;
     const mxfp8_act_cache_t *cover = act_slot_find_rows(ptr, n_tok, in_dim);
     if (cover && cover->valid && cover->xq && cover->sx) return 0;   /* served from cache */
+    /* Matching the BASE pointer is not enough.  Consumers reach these buffers
+     * through offset VIEWS -- gpu_prefill.cpp:143 takes the last four rows of
+     * batch_attn_norm for the ratio-4 compressor rebuild and hands them to a
+     * plain matmul at n_tok=4.  A view keys no slot, so an equality test sees
+     * nothing and the GEMM quantizes from bytes that were never written.  Test
+     * CONTAINMENT in the skipped buffer's extent instead.
+     * (Cf. the standing lesson that consumers bypass the accessor: the bug
+     * always lives in the gap between the API and the raw buffer.) */
     for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
         const mxfp8_act_cache_t *s = &g_act_slots[i];
-        if (s->key_ptr == ptr && s->f32_absent) return 1;
+        if (!s->f32_absent || !s->key_ptr) continue;
+        const char *base = (const char *)s->key_ptr;
+        const char *end  = base + s->key_ntok * s->key_in_dim * sizeof(float);
+        const char *p    = (const char *)ptr;
+        if (p >= base && p < end) return 1;
     }
     return 0;
 }
