@@ -425,7 +425,11 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
     }
     float s = g / (1.0f + expf(-g));
     const float v = s * u * weight;
-    out[i] = v;
+    /* `out` is NULL when the launcher was told the f32 store is dead -- the
+     * MXFP8 consumer reads the encoding below instead.  The branch is uniform
+     * across the whole launch, so it costs nothing in a bandwidth-bound
+     * kernel, and it removes the widest store this kernel makes. */
+    if (out) out[i] = v;
     if (out_q) {
         pulsar_mx_emit_block(v, i % mid_dim, i / mid_dim, mid_dim, out_kbp, out_q, out_sf);
     }
@@ -475,11 +479,22 @@ __global__ static void directional_steering_project_kernel(
 
 int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
                                 uint32_t n, float clamp, float weight,
-                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim) {
+                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
+                                int skip_f32) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
+    /* skip_f32 without an encoding to replace it would write NOTHING and leave
+     * the consumer reading stale bytes.  Same failure shape as a skipped
+     * emission, so it gets the same treatment: refuse, do not silently
+     * downgrade to storing f32 (that would hide a caller bug behind a
+     * correct-looking run). */
+    if (skip_f32 && !out_q) {
+        fprintf(stderr, "pulsar: swiglu asked to skip the f32 store with no E4M3 slot "
+                        "(n=%u mid_dim=%u) -- refusing\n", n, mid_dim);
+        return 0;
+    }
     /* FAIL LOUD rather than silently skip the emission: the caller arms the
      * activation cache off the same slot pointer, so a skipped emission leaves
      * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
@@ -490,7 +505,23 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
                         "(need n %% 256 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
         return 0;
     }
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
+    /* Announce once per shape.  A byte-identical gate cannot tell "the store
+     * was skipped" from "the skip never fired", and a silently-inert
+     * optimisation looks exactly like a working one -- same reason the A8 GEMV
+     * arms announce themselves in pulsar_cuda_matmul.cu. */
+    if (skip_f32) {
+        static uint32_t seen_n[8] = {0};
+        static int n_seen = 0;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_n[i] == n) { known = 1; break; }
+        if (!known && n_seen < 8) {
+            seen_n[n_seen++] = n;
+            fprintf(stderr, "pulsar: swiglu f32 store SKIPPED (n=%u mid_dim=%u, %.1f MiB/layer)\n",
+                    n, mid_dim, (double)n * sizeof(float) / (1024.0 * 1024.0));
+        }
+    }
+    swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                            (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
                                             (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
@@ -515,9 +546,14 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
                                         gate_offset, in_dim, out_dim, x, 1) &&
            pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
                                         up_offset, in_dim, out_dim, x, 1) &&
-           /* One row here, so n == out_dim and the MX row width IS out_dim. */
+           /* One row here, so n == out_dim and the MX row width IS out_dim.
+            * skip_f32 = 0 deliberately: this is the DECODE path, where the
+            * store is one row (8 KiB, not 32 MiB) and so is worth nothing,
+            * while the arms that could read it are the n==1 GEMVs rather than
+            * the single cuBLASLt path prefill takes.  The prefill call site in
+            * gpu_prefill.cpp is where the store is actually dead. */
            pulsar_gpu_swiglu_mx_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f,
-                                       mid_q, mid_sf, mid_kbp, (uint32_t)out_dim);
+                                       mid_q, mid_sf, mid_kbp, (uint32_t)out_dim, 0);
 }
 
 

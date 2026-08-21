@@ -849,6 +849,12 @@ struct mxfp8_act_cache_t {
     int            valid_b;      /* xb holds the bf16 conversion of that (ptr,shape) */
     __nv_bfloat16 *xb;
     size_t         xb_cap;
+    /* The producer emitted the E4M3 encoding and SKIPPED the f32 store, so the
+     * f32 buffer holds stale bytes from a previous call.  Any arm that would
+     * read it must fail loudly instead: a skipped store read as an operand is a
+     * well-formed WRONG answer, not a crash.  See the invariant at
+     * act_f32_absent_hazard(). */
+    int            f32_absent;
     uint64_t       lru;          /* eviction stamp; 0 = never used */
 };
 static thread_local mxfp8_act_cache_t g_act_slots[PULSAR_ACT_SLOTS];
@@ -922,7 +928,7 @@ static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint
         s->key_in_dim = in_dim;
         s->lru        = ++g_act_clock;
     }
-    s->valid = 0; s->valid_b = 0;
+    s->valid = 0; s->valid_b = 0; s->f32_absent = 0;
     return s;
 }
 
@@ -935,8 +941,43 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void) {
         g_act_slots[i].key_ptr    = NULL;
         g_act_slots[i].valid      = 0;
         g_act_slots[i].valid_b    = 0;
+        g_act_slots[i].f32_absent = 0;
     }
     g_act_cur = NULL;
+}
+
+/* Returns 1 when this call is about to read an f32 buffer whose store was
+ * SKIPPED -- either because no slot covers these rows, or because the covering
+ * slot's encoding went invalid (eviction: PULSAR_ACT_SLOTS is finite and the
+ * cache is LRU).
+ *
+ * The invariant that makes one check sufficient, verified arm by arm in
+ * cuda_matmul_mxfp8_tensor_labeled: when a covering slot is `valid`, EVERY arm
+ * takes an A8 variant -- the n==1 GEMV, the n_tok 2..8 NT kernels
+ * (mxfp8_mmvq_deint_nt_a8_kernel, chosen on `ac8nt && ac8nt->valid`), the pair
+ * kernel (which gives up its launch fusion rather than run W8A32 on an armed
+ * buffer), and the cuBLASLt path (which reuses ac->xq/ac->sx).  f32 is read
+ * ONLY when no covering slot is valid.  So the entire hazard is
+ * `f32_absent && !valid`, independent of which arm would have run.
+ *
+ * This is a BACKSTOP, not the mechanism.  In a correct layer it never fires:
+ * the producer skips only when it is itself emitting the encoding, and the
+ * arm/note follow the emission with no intervening arm.  It exists because that
+ * adjacency is a LIFETIME ORDER inside the layer, and reordering the layer
+ * would otherwise turn a silent wrong answer loose rather than a loud stop. */
+static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_dim) {
+    if (!ptr) return 0;
+    const mxfp8_act_cache_t *cover = act_slot_find_rows(ptr, n_tok, in_dim);
+    if (cover && cover->valid && cover->xq && cover->sx) return 0;   /* served from cache */
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        const mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (s->key_ptr == ptr && s->f32_absent) return 1;
+    }
+    return 0;
+}
+
+void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(void) {
+    if (g_act_cur) g_act_cur->f32_absent = 1;
 }
 
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
@@ -1168,6 +1209,16 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
         if (!ws) return 0;   /* take() latches: one check covers all three */
     }
     if (!ac || !ac->valid) {
+        /* About to quantize FROM f32.  If that store was skipped, these bytes
+         * are whatever the last call left behind -- stop instead of computing a
+         * well-formed wrong answer.  (Reached when the outer dispatch was
+         * bypassed, or when the slot went invalid between arm and use.) */
+        if (act_f32_absent_hazard(x->ptr, n_tok, in_dim)) {
+            fprintf(stderr, "pulsar: fp8_mx '%s' quantizing from an f32 activation whose store "
+                            "was SKIPPED (in_dim=%llu n_tok=%llu) -- refusing.\n",
+                    label ? label : "?", (unsigned long long)in_dim, (unsigned long long)n_tok);
+            return 0;
+        }
         cudaMemsetAsync(sx, 0, sx_bytes, 0);
         int warps = ntok * (int)KB;
         mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
@@ -1738,6 +1789,33 @@ int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
+    /* Backstop for a producer that emitted E4M3 and skipped its f32 store.
+     * Fail LOUD rather than multiply stale bytes: per the standing rule, a
+     * wrong answer is worse than a stop. */
+    if (act_f32_absent_hazard(x->ptr, n_tok, in_dim)) {
+        fprintf(stderr, "pulsar: mxfp8 '%s' would read the f32 activation of a buffer whose "
+                        "store was SKIPPED (in_dim=%llu out_dim=%llu n_tok=%llu) -- refusing. "
+                        "The producer emitted E4M3 and dropped the f32; something invalidated "
+                        "or evicted that encoding before this GEMM.\n",
+                label ? label : "?", (unsigned long long)in_dim,
+                (unsigned long long)out_dim, (unsigned long long)n_tok);
+        return 0;
+    }
+    /* The mixed-batch split below recurses on OFFSET row pointers, which key no
+     * slot, so BOTH halves quantize from f32 -- including the half whose store
+     * was skipped.  The check above cannot see that case (the base pointer is
+     * covered by a valid slot), so it is made here, where the split is decided. */
+    if (g_mneutral_rows > 0 && (uint64_t)g_mneutral_rows < n_tok) {
+        for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+            if (g_act_slots[i].key_ptr == x->ptr && g_act_slots[i].f32_absent) {
+                fprintf(stderr, "pulsar: mxfp8 '%s' mixed-batch split (n_dec=%d of %llu) on a "
+                                "buffer whose f32 store was SKIPPED -- refusing; the split "
+                                "halves cannot reach the E4M3 cache.\n",
+                        label ? label : "?", g_mneutral_rows, (unsigned long long)n_tok);
+                return 0;
+            }
+        }
+    }
     /* inc 4 prefix-split: 0<n_dec<n_tok => mixed decode+prefill batch. Run the
      * decode prefix [0,n_dec) in the M-independent (decode) regime and the prefill
      * suffix [n_dec,n_tok) in the tensor-core (prefill) regime, by recursing with

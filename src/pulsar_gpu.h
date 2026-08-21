@@ -470,6 +470,14 @@ void pulsar_gpu_mxfp8_gact_disarm(void);
 /* Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 
+/* Record that the producer ALSO skipped this buffer's f32 store, so the f32
+ * bytes are stale.  Call only after note_mxfp8(), and only from a producer that
+ * actually emitted the encoding -- the two must be gated on the SAME predicate,
+ * or the GEMM reads a store that was never written and returns a well-formed
+ * wrong answer.  Every f32-reading arm of the mxfp8 family checks this and
+ * fails loudly rather than run. */
+void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(void);
+
 /* Hand back the E4M3 encoding this buffer already carries, or 0 if the cache
  * holds none for (ptr, n_tok, in_dim). Lets a consumer that would otherwise
  * quantize the f32 copy reuse the producer's encoding instead -- the routed-MoE
@@ -1072,7 +1080,14 @@ int pulsar_gpu_attention_output_low_tensor(
  * emitted from the epilogue into the activation-cache slots, so the shared_down
  * GEMM never runs a separate quantize pass over the mid tensor.  `mid_dim` is
  * the row width (the launch is flat over n = rows * mid_dim, so the MX row/col
- * must be recovered by division).  NULL slots give the plain behaviour. */
+ * must be recovered by division).  NULL slots give the plain behaviour.
+ *
+ * `skip_f32` additionally drops the f32 store of `out`, leaving the encoding as
+ * the buffer's ONLY content -- the dead-store half of the same one-two that
+ * took the f16 side from +2.5% to +6.6% (see d967327).  Requires out_q: without
+ * an encoding the kernel would write nothing at all, so that combination is
+ * refused rather than silently downgraded.  The caller must arm the cache and
+ * call both note_mxfp8() and note_f32_skipped() straight after. */
 int pulsar_gpu_swiglu_mx_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *gate,
@@ -1083,7 +1098,8 @@ int pulsar_gpu_swiglu_mx_tensor(
         void                   *out_q,
         void                   *out_sf,
         int                     out_kbp,
-        uint32_t                mid_dim);
+        uint32_t                mid_dim,
+        int                     skip_f32);
 
 int pulsar_gpu_add_tensor(
         pulsar_gpu_tensor       *out,

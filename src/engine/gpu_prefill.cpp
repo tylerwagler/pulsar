@@ -2323,6 +2323,22 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                         &shmid_q, &shmid_sf, &shmid_kbp)) { \
             shmid_q = NULL; shmid_sf = NULL; shmid_kbp = 0; \
         } \
+        /* DEAD-STORE ELIMINATION. batch_shared_mid's only reader is the MXFP8 \
+         * shared_down GEMM immediately below, and the swiglu epilogue hands it \
+         * the E4M3 encoding directly, so the f32 store has no consumer at all. \
+         * Dropping it removes n_tokens*shared_dim*4 B per layer (32 MiB at a \
+         * 4096-token chunk, ~1.4 GB across 43 layers) and is BIT-EXACT: the \
+         * encoding written is byte-for-byte what it was before. \
+         * \
+         * Gated on the SAME predicate as the emission (shmid_q non-NULL), per \
+         * the rule that cost this exact file a wrong answer once already -- a \
+         * fusion whose arm and emission use different predicates arms the \
+         * cache off a buffer it never wrote. The arm/note pair follows on the \
+         * next two lines with no intervening arm, which is what makes the \
+         * consumer's cache hit certain rather than likely; \
+         * act_f32_absent_hazard() in pulsar_cuda_matmul.cu is the loud \
+         * backstop if that adjacency is ever broken by reordering. */ \
+        const int shmid_skip_f32 = (shmid_q != NULL); \
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
@@ -2330,9 +2346,11 @@ bool gpu_graph_encode_layer_ffn_batch(
                                              PULSAR_SWIGLU_CLAMP_EXP, \
                                              1.0f, \
                                              shmid_q, shmid_sf, shmid_kbp, \
-                                             (uint32_t)shared_dim) != 0; \
+                                             (uint32_t)shared_dim, \
+                                             shmid_skip_f32) != 0; \
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, (uint64_t)shared_dim); \
         if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
+        if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(); \
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \
