@@ -598,19 +598,26 @@ cuda-prefill-gate:
 # enough to pass them would be ~1e4x too loose for the mid rows and would
 # protect nothing.
 PULSAR_REF_TOL ?= 1e-4
+# ⚠ ONE SHELL, DELIBERATELY.  Each make recipe LINE gets its own shell, so an
+# `exit 0` in a guard on the first line exits only that line and make runs the
+# rest anyway -- which is exactly how the first version of this target failed
+# `make gates` with "cannot read reference blob /story.ref.bin" whenever
+# PULSAR_REF_DIR was unset (i.e. by default).  The guard and the work must sit
+# in the same shell for the skip to be a skip.
 cuda-reference-gate:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
 		echo "  SKIP  cuda-reference-gate: set PULSAR_REF_DIR to the reference-capture dir"; \
 		echo "        (blobs live outside the repo; without them this gate grades nothing)"; \
-		exit 0; \
+	else \
+		set -e; \
+		$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
+		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+			$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
+			$(PULSAR_REF_TOL) --known-high 512,30464; \
+		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+			$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
+			$(PULSAR_REF_TOL) --known-high 3840; \
 	fi
-	$(MAKE) -B tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
-	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
-		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-		$(PULSAR_REF_TOL) --known-high 512,30464
-	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
-		$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
-		$(PULSAR_REF_TOL) --known-high 3840
 
 # NOTE: `git worktree add` does not populate submodules, so the baseline build
 # is pointed at THIS tree's CUTLASS pin (a header-only include path).
