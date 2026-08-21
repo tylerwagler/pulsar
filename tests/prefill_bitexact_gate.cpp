@@ -1096,7 +1096,7 @@ int main(int argc, char **argv) {
             const size_t off = (size_t)i * (size_t)width;
             /* --check-fidelity has no known-high concept: it compares against OUR
              * own golden, where every depth is expected to meet the tolerance. */
-            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0)) fail = 1;
+            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0, 0)) fail = 1;
         }
         printf("\nPREFILL FIDELITY GATE: %s\n", fail ? "FAIL" : "PASS");
         free(base);
