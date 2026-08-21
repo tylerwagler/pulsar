@@ -112,6 +112,13 @@ static inline int pulsar_env_tier_on(const char *name) {
  * float today, __half at the flip. */
 typedef float pulsar_q_t;
 
+/* The cudaDataType the stored Q presents to cuBLAS.  Derived from pulsar_q_t
+ * rather than written out, so a GEMM's operand type can never drift from the
+ * buffer it reads -- that failure mode is a silent wrong answer, not a fault.
+ * Compile-time constant: it folds, so this is not a hot-path branch. */
+static const cudaDataType_t PULSAR_Q_CUDA_TYPE =
+        (sizeof(pulsar_q_t) == sizeof(float)) ? CUDA_R_32F : CUDA_R_16F;
+
 /* ---- Q-buffer element access (L045) -------------------------------------
  *
  * batch_q is migrating f32 -> f16.  The STORAGE narrows; the ARITHMETIC does

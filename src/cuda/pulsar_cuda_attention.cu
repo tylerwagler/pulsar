@@ -1708,14 +1708,30 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         const uint64_t kv_count = (uint64_t)n_tokens * head_dim;
         const uint64_t kv_bytes = kv_count * sizeof(float);
         const uint64_t out_bytes = out_count * sizeof(float);
+        /* The score GEMM's operands must agree in type, so a narrowed Q needs an
+         * f16 KV operand.  Staging KV (n_keys*head_dim, stride 0 across heads)
+         * rather than widening Q (n_tok*n_head*head_dim) is ~128x less work:
+         * 4 MiB against 512 MiB at a 4096-token prefill.  It is also EXACT --
+         * the packed KV is E4M3 with a power-of-two block scale, so every value
+         * fits f16's mantissa and range with nothing to round.
+         * The value GEMM below keeps the f32 copy: its B operand is post-softmax
+         * P, and narrowing THAT would be a real precision change. */
+        const uint64_t kv16_bytes = (sizeof(pulsar_q_t) == sizeof(float))
+                                  ? 0ull : kv_count * sizeof(__half);
         const uint64_t tmp_bytes = ((kv_bytes + 255u) & ~255ull) +
-                                   ((score_bytes + 255u) & ~255ull) + out_bytes;
+                                   ((score_bytes + 255u) & ~255ull) + out_bytes +
+                                   ((kv16_bytes + 255u) & ~255ull);
         cuda_arena ar;
         if (!cuda_arena_begin(&ar, tmp_bytes, "attention raw cublas")) return 0;
         float *tmp     = (float *)cuda_arena_take(&ar, kv_bytes, 256);
         float *scores  = (float *)cuda_arena_take(&ar, score_bytes, 256);
         float *out_tmp = (float *)cuda_arena_take(&ar, out_bytes, 256);
         if (!out_tmp) return 0;   /* take() latches: one check covers all three */
+        __half *kv16 = NULL;
+        if (kv16_bytes) {
+            kv16 = (__half *)cuda_arena_take(&ar, kv16_bytes, 256);
+            if (!kv16) return 0;
+        }
         const float *kv_mat = (const float *)raw_kv->ptr;
         {
             attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
@@ -1729,26 +1745,33 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
             if (!cuda_ok(cudaGetLastError(), "attention raw f16 expand launch")) return 0;
             kv_mat = tmp;
         }
+        const void *score_a = kv_mat;
+        if (kv16) {
+            attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
+                    NULL,
+                    (const float *)raw_kv->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_tokens,
+                    0,
+                    head_dim,
+                    kv16);
+            if (!cuda_ok(cudaGetLastError(), "attention raw kv f16 pack launch")) return 0;
+            score_a = kv16;
+        }
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      kv_mat,
-                                                      (int)head_dim,
-                                                      0,
-                                                      (const pulsar_q_t *)q->ptr,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
+        /* Ex rather than Sgemm so the operands follow the stored Q type.  The
+         * accumulator and output stay f32; only the operand encoding moves. */
+        cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)n_keys, (int)n_tokens, (int)head_dim,
+                &alpha,
+                score_a,      PULSAR_Q_CUDA_TYPE, (int)head_dim, (long long)0,
+                q->ptr,       PULSAR_Q_CUDA_TYPE, (int)(n_head * head_dim), (long long)head_dim,
+                &beta,
+                scores,       CUDA_R_32F,         (int)n_keys, (long long)n_keys * n_tokens,
+                (int)n_head,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention raw score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_raw_softmax_kernel<<<sgrid, 256>>>(scores, sinks, n_tokens, window, n_keys);
@@ -2338,15 +2361,31 @@ static int attention_prefill_mixed_launch(
         const uint64_t kv_bytes = kv_count * sizeof(float);
         const uint64_t score_bytes = score_count * sizeof(float);
         const uint64_t out_bytes = out_count * sizeof(float);
+        /* The score GEMM's operands must agree in type, so a narrowed Q needs an
+         * f16 KV operand.  Staging KV (n_keys*head_dim, stride 0 across heads)
+         * rather than widening Q (n_tok*n_head*head_dim) is ~128x less work:
+         * 4 MiB against 512 MiB at a 4096-token prefill.  It is also EXACT --
+         * the packed KV is E4M3 with a power-of-two block scale, so every value
+         * fits f16's mantissa and range with nothing to round.
+         * The value GEMM below keeps the f32 copy: its B operand is post-softmax
+         * P, and narrowing THAT would be a real precision change. */
+        const uint64_t kv16_bytes = (sizeof(pulsar_q_t) == sizeof(float))
+                                  ? 0ull : kv_count * sizeof(__half);
         const uint64_t tmp_bytes = ((kv_bytes + 255u) & ~255ull) +
-                                   ((score_bytes + 255u) & ~255ull) + out_bytes;
+                                   ((score_bytes + 255u) & ~255ull) + out_bytes +
+                                   ((kv16_bytes + 255u) & ~255ull);
         cuda_arena ar;
         if (!cuda_arena_begin(&ar, tmp_bytes, "attention mixed cublas")) return 0;
         float *kv      = (float *)cuda_arena_take(&ar, kv_bytes, 256);
         float *scores  = (float *)cuda_arena_take(&ar, score_bytes, 256);
         float *out_tmp = (float *)cuda_arena_take(&ar, out_bytes, 256);
         if (!out_tmp) return 0;   /* take() latches: one check covers all three */
-        const float *q_eff = (const pulsar_q_t *)q->ptr;
+        __half *kv16 = NULL;
+        if (kv16_bytes) {
+            kv16 = (__half *)cuda_arena_take(&ar, kv16_bytes, 256);
+            if (!kv16) return 0;
+        }
+        const void *q_eff = (const pulsar_q_t *)q->ptr;
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
@@ -2356,27 +2395,34 @@ static int attention_prefill_mixed_launch(
                 head_dim,
                 NULL);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
+        const void *score_a = kv;
+        if (kv16) {
+            attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
+                    NULL,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    n_tokens,
+                    n_comp,
+                    head_dim,
+                    kv16);
+            if (!cuda_ok(cudaGetLastError(), "attention mixed kv f16 pack launch")) return 0;
+            score_a = kv16;
+        }
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
         cublasStatus_t st;
-            st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      kv,
-                                                      (int)head_dim,
-                                                      0,
-                                                      q_eff,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
+            /* Ex rather than Sgemm so the operands follow the stored Q type;
+             * accumulator and output stay f32. */
+            st = cublasGemmStridedBatchedEx(g_cublas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)n_keys, (int)n_tokens, (int)head_dim,
+                &alpha,
+                score_a,      PULSAR_Q_CUDA_TYPE, (int)head_dim, (long long)0,
+                q_eff,        PULSAR_Q_CUDA_TYPE, (int)(n_head * head_dim), (long long)head_dim,
+                &beta,
+                scores,       CUDA_R_32F,         (int)n_keys, (long long)n_keys * n_tokens,
+                (int)n_head,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention mixed score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
