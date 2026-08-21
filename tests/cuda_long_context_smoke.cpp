@@ -122,7 +122,8 @@ static int check_decode_attention_overflow_path(void) {
     }
 
     pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
+    /* Attention Q: stored element size, not f32 (L045). */
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
     pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
@@ -131,7 +132,7 @@ static int check_decode_attention_overflow_path(void) {
     pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc((uint64_t)n_comp * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
     if (heads && q && raw && raw_f32 && comp && comp_f32 &&
-        pulsar_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        pulsar_gpu_tensor_write_q_f32(q, 0, q_host, q_count) &&
         pulsar_gpu_tensor_write(raw_f32, 0, raw_host, raw_count * sizeof(float)) &&
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, n_raw, 0, n_raw,
                                             head_dim, NULL, NULL, 1) &&
@@ -212,12 +213,13 @@ static int check_dspark_non_causal_attention(void) {
 
     pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
     pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * q_count * sizeof(float));
+    /* Attention Q: stored element size, not f32 (L045). */
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * q_count * PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
     if (heads_c && heads_nc && q && raw && raw_f32 &&
-        pulsar_gpu_tensor_write(q, 0, q_host, (uint64_t)n_tokens * q_count * sizeof(float)) &&
+        pulsar_gpu_tensor_write_q_f32(q, 0, q_host, (uint64_t)n_tokens * q_count) &&
         pulsar_gpu_tensor_write(raw_f32, 0, raw_host, raw_count * sizeof(float)) &&
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, raw_cap, 0, n_raw,
                                             head_dim, NULL, NULL, 1)) {
@@ -509,14 +511,15 @@ static int mb_run_case(const char *label,
         sid_host[r] = (int32_t)rows[r].bank;
     }
 
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
+    /* Attention Q: stored element size, not f32 (L045).  heads stays f32. */
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *topk = NULL;
     int rc = 1;
     if (!q || !heads || !positions || !seq_id ||
-        !pulsar_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !pulsar_gpu_tensor_write_q_f32(q, 0, q_host, q_count) ||
         !pulsar_gpu_tensor_write(positions, 0, pos_host, n_rows * sizeof(int32_t)) ||
         !pulsar_gpu_tensor_write(seq_id, 0, sid_host, n_rows * sizeof(int32_t))) goto done;
     if (indexed) {

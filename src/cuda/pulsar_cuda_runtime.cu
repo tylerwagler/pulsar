@@ -1202,6 +1202,25 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 
 
 
+/* The write counterpart of pulsar_read_q_f32: host f32 in, stored Q element
+ * type out.  Exists so host code -- tests, tools -- can fill a Q buffer
+ * without a second copy of the conversion living outside this file. */
+int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
+                                  const float *src, uint64_t n) {
+    if (!tensor || !src) return 0;
+    const uint64_t off = off_elems * PULSAR_Q_ELT_SIZE;
+    const uint64_t bytes = n * PULSAR_Q_ELT_SIZE;
+    if (off > tensor->bytes || bytes > tensor->bytes - off) return 0;
+    if (sizeof(pulsar_q_t) == sizeof(float))
+        return pulsar_gpu_tensor_write(tensor, off, src, bytes);
+    pulsar_q_t *h = (pulsar_q_t *)malloc((size_t)bytes);
+    if (!h) return 0;
+    for (uint64_t i = 0; i < n; i++) h[i] = (pulsar_q_t)src[i];
+    const int rc = pulsar_gpu_tensor_write(tensor, off, h, bytes);
+    free(h);
+    return rc;
+}
+
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");

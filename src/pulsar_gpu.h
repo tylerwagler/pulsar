@@ -99,6 +99,13 @@ uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor);
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count);
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+
+/* Fill a Q buffer from host f32, converting to the stored Q element type.
+ * Host callers cannot see pulsar_q_t (it is CUDA-only), so a plain
+ * tensor_write of floats into a narrowed Q buffer is both an overrun and a
+ * reinterpretation -- and it compiles.  `n` counts ELEMENTS, not bytes. */
+int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
+                                  const float *src, uint64_t n);
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
