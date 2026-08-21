@@ -144,7 +144,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -365,6 +365,12 @@ cuda-reap-router-audit:
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
 cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+
+# Wide variant: 12 decode banks exercises the armed M-neutral kernel range past
+# 8 (the l048-ntcap-16 coverage) — NT instantiations 9..16 and the MoE
+# non-grouped path at those widths, same byte-identity demand as the 2-bank run.
+cuda-mixed-neutrality-gate-wide: tests/mixed_neutrality_gate
+	PULSAR_GATE_NDEC=12 PULSAR_MSEQ_BANKS=13 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # plan-33 inc B: 3-way output-equality harness (server-level; see the script).
 warm-fork-3way: pulsar-server

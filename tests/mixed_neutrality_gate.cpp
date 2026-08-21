@@ -31,7 +31,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define N_DEC 2                 /* decode banks (per-token MoE path; gate-4 uses >=2) */
+/* Decode-bank count is runtime-selectable: PULSAR_GATE_NDEC (default 2, the
+ * historical gate). The wide variant (e.g. 12) exercises the armed M-neutral
+ * range past 8 — the l048-ntcap-16 coverage this gate previously could not
+ * see: with n_dec > 8 the decode prefix runs the NT kernels' 9..16
+ * instantiations and the MoE non-grouped path at those widths, and gate 4
+ * still demands byte-identity vs the decode-only step of the same width. */
+#define N_DEC_MAX ((int)PULSAR_MSEQ_MAX - 1)   /* +1 bank goes to the prefill run */
+static int g_n_dec = 2;
 #define C0    128               /* prefill bank's classic first chunk (lifts frontier off 0) */
 #define K_PRE 64                /* prefill run length; >8 => grouped MoE suffix taken */
 #define PBASE 700               /* prefill bank token region (distinct from decode banks) */
@@ -40,9 +47,27 @@ static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
 static int g_fail;
 
-/* decode banks 0..N_DEC-1: distinct prompt regions (isolated KV). */
-static const int g_off[N_DEC] = {0, 401};
-static const int g_len[N_DEC] = {130, 258};
+/* decode banks 0..g_n_dec-1: distinct prompt regions (isolated KV). The first
+ * two are the historical fixtures (default run byte-identical to the old
+ * 2-bank gate); extras are generated deterministically inside [0, PBASE). */
+static int g_off[N_DEC_MAX] = {0, 401};
+static int g_len[N_DEC_MAX] = {130, 258};
+
+static void init_banks(void) {
+    const char *e = getenv("PULSAR_GATE_NDEC");
+    if (e && *e) {
+        int v = atoi(e);
+        if (v < 2 || v > N_DEC_MAX) {
+            fprintf(stderr, "PULSAR_GATE_NDEC=%d out of range [2,%d]\n", v, N_DEC_MAX);
+            exit(2);
+        }
+        g_n_dec = v;
+    }
+    for (int k = 2; k < g_n_dec; k++) {
+        g_off[k] = (k * 137) % 450;            /* distinct-ish regions; overlap is */
+        g_len[k] = 100 + (k * 37) % 140;       /* harmless (per-bank KV isolation) */
+    }
+}
 
 static char *read_file(const char *p, size_t *n) {
     FILE *f = fopen(p, "rb"); if (!f) return NULL;
@@ -65,15 +90,15 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
     const uint32_t n_pre_bank = (K > 0) ? 1u : 0u;
-    const uint32_t need_banks = (uint32_t)N_DEC + n_pre_bank;
+    const uint32_t need_banks = (uint32_t)g_n_dec + n_pre_bank;
     bool ok = gpu_graph_bank_pool_count(g) >= need_banks;
     if (!ok) fprintf(stderr, "pool too small: %u < %u (set PULSAR_MSEQ_BANKS)\n",
                      gpu_graph_bank_pool_count(g), need_banks);
     char err[256];
-    int argtok[N_DEC];
+    int argtok[N_DEC_MAX];
 
     /* decode banks: sync prompt, capture frontier, record next token. */
-    for (int k = 0; ok && k < N_DEC; k++) {
+    for (int k = 0; ok && k < g_n_dec; k++) {
         if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
         pulsar_session_invalidate(s);
         pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
@@ -87,7 +112,7 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
      * off 0 (step_begin rejects pos-0), then the K prefill rows extend [C0,C0+K). */
     const int *pptr = g_toks.v + PBASE;
     if (ok && K > 0) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)N_DEC)) ok = false;
+        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)g_n_dec)) ok = false;
         if (ok) {
             pulsar_session_invalidate(s);
             pulsar_tokens p = { .v = (int *)pptr, .len = C0, .cap = C0 };
@@ -95,28 +120,28 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
                 fprintf(stderr, "prefill bank first-chunk sync failed: %s\n", err); ok = false;
             }
         }
-        if (ok) gpu_graph_bank_counters_capture(g, (uint32_t)N_DEC);
+        if (ok) gpu_graph_bank_counters_capture(g, (uint32_t)g_n_dec);
     }
 
-    const uint32_t n_rows = (uint32_t)N_DEC + (K > 0 ? (uint32_t)K : 0u);
+    const uint32_t n_rows = (uint32_t)g_n_dec + (K > 0 ? (uint32_t)K : 0u);
     pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
     float *logits = ok ? (float *)malloc((size_t)n_rows * vocab * sizeof(float)) : NULL;
     if (ok && (!reqs || !logits)) ok = false;
     if (ok) {
-        for (int k = 0; k < N_DEC; k++) {
+        for (int k = 0; k < g_n_dec; k++) {
             reqs[k].bank = (uint32_t)k; reqs[k].pos = g_len[k]; reqs[k].token = argtok[k];
         }
         for (int j = 0; j < K; j++) {
-            reqs[N_DEC + j].bank = (uint32_t)N_DEC;
-            reqs[N_DEC + j].pos = C0 + j;
-            reqs[N_DEC + j].token = pptr[C0 + j];
+            reqs[g_n_dec + j].bank = (uint32_t)g_n_dec;
+            reqs[g_n_dec + j].pos = C0 + j;
+            reqs[g_n_dec + j].token = pptr[C0 + j];
         }
         uint32_t n_runs = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, n_rows, logits, (int)(n_rows * vocab),
                                                 &n_runs, head_cap, err, sizeof err);
         if (rc != 0) { fprintf(stderr, "decode_mixed(K=%d) failed rc=%d: %s\n", K, rc, err); ok = false; }
         else {
-            const uint32_t full_runs = (uint32_t)N_DEC + (K > 0 ? 1u : 0u);
+            const uint32_t full_runs = (uint32_t)g_n_dec + (K > 0 ? 1u : 0u);
             const uint32_t exp_runs = (head_cap == 0u || head_cap > full_runs) ? full_runs : head_cap;
             if (n_runs != exp_runs) {
                 fprintf(stderr, "n_runs=%u expected %u (head_cap=%u split boundary wrong)\n",
@@ -126,9 +151,9 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
         }
         if (ok) {
             /* logits rows: [bank0, bank1, (prefill-last)] in run order. */
-            memcpy(dec_rows, logits, (size_t)N_DEC * vocab * sizeof(float));
+            memcpy(dec_rows, logits, (size_t)g_n_dec * vocab * sizeof(float));
             if (K > 0 && pre_row)
-                memcpy(pre_row, logits + (size_t)N_DEC * vocab, (size_t)vocab * sizeof(float));
+                memcpy(pre_row, logits + (size_t)g_n_dec * vocab, (size_t)vocab * sizeof(float));
         }
     }
     free(reqs); free(logits);
@@ -169,36 +194,37 @@ int main(int argc, char **argv) {
     pulsar_engine_options o; memset(&o, 0, sizeof o);
     o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
     if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    init_banks();
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only "
-           "formats)  (n_dec=%d K=%d)\n", N_DEC, K_PRE);
+           "formats)  (n_dec=%d K=%d)\n", g_n_dec, K_PRE);
 
     size_t tl = 0; char *txt = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!txt) { fprintf(stderr, "prompt read failed\n"); return 1; }
     memset(&g_toks, 0, sizeof g_toks);
     pulsar_tokenize_text(g_e, txt, &g_toks); free(txt);
     int need = PBASE + C0 + K_PRE + 1;
-    for (int k = 0; k < N_DEC; k++) if (g_off[k] + g_len[k] > need) need = g_off[k] + g_len[k];
+    for (int k = 0; k < g_n_dec; k++) if (g_off[k] + g_len[k] > need) need = g_off[k] + g_len[k];
     if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
 
     const int vocab = (int)PULSAR_N_VOCAB;
-    float *ref_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* decode-only M=N_DEC */
-    float *mix_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
-    float *lv1_dec = (float *)malloc((size_t)N_DEC * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
+    float *ref_dec = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));   /* decode-only M=N_DEC */
+    float *mix_dec = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));   /* fused M=N_DEC+K, full head */
+    float *lv1_dec = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));   /* fused M=N_DEC+K, LEVER-1 head */
     float *mix_pre = (float *)malloc((size_t)vocab * sizeof(float));           /* fused prefill last */
     float *cls_pre = (float *)malloc((size_t)vocab * sizeof(float));           /* classic-resume last */
     int cls_next = -1;
 
     if (!fused_step_logits(0,     0u,             ref_dec, NULL))    { fprintf(stderr, "GATE FAIL: decode-only reference run failed\n"); g_fail = 1; goto done; }
     if (!fused_step_logits(K_PRE, 0u,             mix_dec, mix_pre)) { fprintf(stderr, "GATE FAIL: fused mixed run (full head) failed\n"); g_fail = 1; goto done; }
-    if (!fused_step_logits(K_PRE, (uint32_t)N_DEC, lv1_dec, NULL))   { fprintf(stderr, "GATE FAIL: fused mixed run (LEVER-1 head) failed\n"); g_fail = 1; goto done; }
+    if (!fused_step_logits(K_PRE, (uint32_t)g_n_dec, lv1_dec, NULL))   { fprintf(stderr, "GATE FAIL: fused mixed run (LEVER-1 head) failed\n"); g_fail = 1; goto done; }
     if (!classic_resume(K_PRE, cls_pre, &cls_next))  { fprintf(stderr, "GATE FAIL: classic-resume reference failed\n"); g_fail = 1; goto done; }
 
     /* GATE 4: each decode bank byte-identical decode-only vs fused (full head). */
-    for (int k = 0; k < N_DEC; k++) {
+    for (int k = 0; k < g_n_dec; k++) {
         const long d = first_diff(mix_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
         if (d < 0) {
             printf("GATE 4 NEUTRALITY: decode bank %d logits M=%d (decode-only) == M=%d (+%d-row prefill) "
-                   "BYTE-IDENTICAL\n", k, N_DEC, N_DEC + K_PRE, K_PRE);
+                   "BYTE-IDENTICAL\n", k, g_n_dec, g_n_dec + K_PRE, K_PRE);
         } else {
             fprintf(stderr, "GATE 4 FAIL: decode bank %d logits DIFFER at float %ld (%.9g vs %.9g) — "
                     "co-scheduling a %d-row prefill perturbed a decode bank\n",
@@ -211,7 +237,7 @@ int main(int argc, char **argv) {
      * head SKIPPED, single-block identity head path) must yield decode-bank logits
      * BYTE-IDENTICAL to decode-only — the prefill's intermediate logits are never
      * consumed, and skipping them must not perturb the decode banks. */
-    for (int k = 0; k < N_DEC; k++) {
+    for (int k = 0; k < g_n_dec; k++) {
         const long d = first_diff(lv1_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
         if (d < 0) {
             printf("GATE 4b LEVER-1: decode bank %d logits (intermediate fused, head-skip) == decode-only "
@@ -240,9 +266,9 @@ int main(int argc, char **argv) {
     /* GATE 3: split boundary. n_dec>=2 => per-token MoE prefix; K>8 => grouped MoE suffix. */
     printf("GATE 3 MoE SPLIT: n_dec=%d (per-token MoE, rows [0,%d)) | K=%d>8 (grouped MoE, rows [%d,%d)) | "
            "per-token->grouped switch at row %d %s\n",
-           N_DEC, N_DEC, K_PRE, N_DEC, N_DEC + K_PRE, N_DEC,
-           (N_DEC >= 2 && K_PRE > 8) ? "OK" : "MISCONFIGURED");
-    if (!(N_DEC >= 2 && K_PRE > 8)) { fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>8)\n"); g_fail = 1; }
+           g_n_dec, g_n_dec, K_PRE, g_n_dec, g_n_dec + K_PRE, g_n_dec,
+           (g_n_dec >= 2 && K_PRE > 8) ? "OK" : "MISCONFIGURED");
+    if (!(g_n_dec >= 2 && K_PRE > 8)) { fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>8)\n"); g_fail = 1; }
 
 done:
     free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);
