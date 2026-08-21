@@ -521,6 +521,22 @@ static int fidelity_row(const float *cur, const float *ref, int width,
     printf("  depth %4u: top1 %s (golden argmax=%d current=%d)  KL=%.3e  logit_rms=%.3e  max|d|=%.3e  -> %s\n",
            depth, top1_ok ? "MATCH" : "FLIP", arg_g, arg_c, kl, rms, maxabs,
            pass ? "OK" : "FAIL");
+    if (!top1_ok) {
+        /* A flip's SEVERITY is the gap, not the fact of it.  On a known-high
+         * depth the whole distribution already sits far from the reference, so
+         * the argmax can ride a near-tie; print the neighborhood so "churn
+         * between near-equals" and "the golden token sank" are distinguishable
+         * without a second instrumented run. */
+        printf("  depth %4u: FLIP DETAIL  cur[%d]=%.6f  cur[%d]=%.6f  (gap %.6f)  "
+               "golden[%d]=%.6f  golden[%d]=%.6f\n",
+               depth, arg_c, cur[arg_c], arg_g, cur[arg_g],
+               (double)cur[arg_c] - (double)cur[arg_g],
+               arg_g, ref[arg_g], arg_c, ref[arg_c]);
+        int rank_g = 1;   /* rank of the GOLDEN argmax in OUR logits */
+        for (int i = 0; i < width; i++) if (cur[i] > cur[arg_g]) rank_g++;
+        printf("  depth %4u: FLIP DETAIL  golden argmax now ranks #%d in current logits\n",
+               depth, rank_g);
+    }
     if (!top1_ok)
         fprintf(stderr, "  depth %u: TOP-1 FLIPPED golden=%d current=%d — a storage-precision "
                         "change moved the predicted token; investigate before accepting\n",
