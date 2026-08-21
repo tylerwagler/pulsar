@@ -43,6 +43,28 @@
 #define PULSAR_HC_ELT_SIZE 2u
 
 
+/* Q activation storage precision (L045).  batch_q is the largest activation in
+ * the model -- pc * n_head * head_dim, 512 MiB at a 4096-token prefill -- and
+ * it exists largely to be read back and narrowed: the shipped attention tier
+ * packs Q to __half for HMMA on the very next instruction.  Storing it f32 is
+ * over-precision against a source whose activations are narrower still.
+ *
+ * Same shape as PULSAR_HC_ELT_SIZE above: this macro is the stored element
+ * size for the host stride/offset math, pulsar_q_t is the matching CUDA type,
+ * and the kernels load to f32 and accumulate in f32 regardless -- only the
+ * STORAGE narrows.  Both Q buffers (batch_q and the single-token q) use it, so
+ * there is exactly ONE Q element type in the engine rather than two sharing
+ * kernels.
+ *
+ * ⚠ NOT bit-exact when narrowed, unlike the HC flip: under q_prep_active
+ * batch_q holds UNNORMALISED q_b output and the per-head sum of squares is
+ * taken from it, so narrowing moves the inputs to a reduction rather than just
+ * its storage.  Measured neutral against the cross-engine reference (L045
+ * stage 1); it is cuda-reference-gate that certifies this, not the byte-exact
+ * prefill gate. */
+#define PULSAR_Q_ELT_SIZE 4u
+
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================

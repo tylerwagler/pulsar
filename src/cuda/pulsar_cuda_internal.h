@@ -108,6 +108,10 @@ static inline int pulsar_env_tier_on(const char *name) {
     return !(v && v[0] == '0' && v[1] == '\0');
 }
 
+/* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
+ * float today, __half at the flip. */
+typedef float pulsar_q_t;
+
 /* ---- Q-buffer element access (L045) -------------------------------------
  *
  * batch_q is migrating f32 -> f16.  The STORAGE narrows; the ARITHMETIC does

@@ -74,6 +74,21 @@ pulsar_gpu_tensor *gpu_graph_tensor_row_view(
 }
 
 
+/* Row view into a Q buffer (L045). Same as gpu_graph_tensor_row_view but
+ * strides by PULSAR_Q_ELT_SIZE — use this (not the generic helper) for
+ * batch_q and q. The generic one strides by sizeof(float), which against a
+ * narrowed buffer lands at double the intended offset: a silent wrong answer,
+ * not a fault. Same reasoning as gpu_graph_hc_row_view below. */
+pulsar_gpu_tensor *gpu_graph_q_row_view(
+        pulsar_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values) {
+    return pulsar_gpu_tensor_view(base,
+                                 (uint64_t)row * row_values * PULSAR_Q_ELT_SIZE,
+                                 row_values * PULSAR_Q_ELT_SIZE);
+}
+
+
 /* Row view into an HC residual CARRIER buffer (BF16 storage; task #62). Same as
  * gpu_graph_tensor_row_view but strides by PULSAR_HC_ELT_SIZE, not sizeof(float) —
  * use this (not the generic helper) for cur_hc/next_hc/after_*_hc bases. */
@@ -452,9 +467,11 @@ static bool gpu_graph_indexed_attention_span(
     pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
             (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
             (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
+    /* BYTE offset and BYTE length -- must follow the Q element size, or a
+     * narrowed buffer is viewed at double the intended offset. */
     pulsar_gpu_tensor *sq_view = pulsar_gpu_tensor_view(g->batch_q,
-            (uint64_t)s0 * q_dim * sizeof(float),
-            (uint64_t)sn * q_dim * sizeof(float));
+            (uint64_t)s0 * q_dim * PULSAR_Q_ELT_SIZE,
+            (uint64_t)sn * q_dim * PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *sh_view = pulsar_gpu_tensor_view(g->batch_heads,
             (uint64_t)s0 * q_dim * sizeof(float),
             (uint64_t)sn * q_dim * sizeof(float));
@@ -2004,7 +2021,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                 }
 
-                pulsar_gpu_tensor *q_view = gpu_graph_tensor_row_view(g->batch_q, t, q_dim);
+                pulsar_gpu_tensor *q_view = gpu_graph_q_row_view(g->batch_q, t, q_dim);
                 pulsar_gpu_tensor *kv_cache_view = gpu_graph_tensor_row_view(g->batch_kv, t, PULSAR_N_HEAD_DIM);
                 pulsar_gpu_tensor *heads_view = gpu_graph_tensor_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_cache_view && heads_view;
