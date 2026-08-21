@@ -495,7 +495,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_out */
     total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
     total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_ffn_cur/norm */
-    total += 3ull * pc * dz.shared_dim * f32;             /* batch_shared_gate/up/mid */
+    total += pc * dz.shared_dim * (f32 + 2ull * 2u);      /* batch_shared_mid f32 + gate/up f16 (L033) */
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_shared_out */
     total += 2ull * pc * PULSAR_N_EXPERT * f32;              /* batch_router_logits/probs */
     total += pc * PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
@@ -1953,8 +1953,14 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_after_attn_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_ffn_cur = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_ffn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
-    g->batch_shared_gate = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_up = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
+    /* L033 increment 2: gate/up staging is F16.  Sole producer is the mxfp8
+     * GEMM (writes __half whenever the out tensor's esz is 2, on every arm —
+     * the L045 machinery), sole consumer is the swiglu fold's f16-load
+     * instantiation; decode's fused shared-expert path uses its own f32
+     * scratch and never sees these.  NOT bit-exact (swiglu's inputs are
+     * f16-rounded): graded by cuda-reference-gate, not the byte gate. */
+    g->batch_shared_gate = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, sizeof(uint16_t));
+    g->batch_shared_up = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, sizeof(uint16_t));
     g->batch_shared_mid = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_router_logits = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT * sizeof(float));

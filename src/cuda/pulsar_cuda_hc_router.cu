@@ -413,12 +413,29 @@ __global__ static void router_select_warp_topk_kernel(
  * This kernel is launched FLAT over n = rows * mid_dim, so the MX (row, col)
  * has to be recovered by division.  mid_dim is a multiple of 32, so a warp's
  * 32 consecutive i never straddle a row and are 32-aligned within it. */
-__global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight,
+/* Gate/up loads for the templated swiglu below.  The float overload is a
+ * plain load — the float instantiation is instruction-identical to the
+ * pre-template kernel.  The __half overload DEFUSES the narrow-store edge
+ * (L033 increment 1): the gate clamp below is UPPER-bound-only, so a
+ * large-negative gate that overflowed f16 to -inf would give
+ * s = -inf/(1+expf(+inf)) = -inf/inf = NaN where the f32 path yields -0.
+ * Pulling ±inf to ±max-finite keeps swiglu(-huge) ≈ -0 (the f32 answer) and
+ * is the IDENTITY on every finite stored value; NaN is deliberately left to
+ * propagate exactly as the f32 path would. */
+__device__ static inline float swiglu_act_load(const float *p, uint32_t i) { return p[i]; }
+__device__ static inline float swiglu_act_load(const __half *p, uint32_t i) {
+    float v = __half2float(p[i]);
+    if (isinf(v)) v = copysignf(65504.0f, v);
+    return v;
+}
+
+template <typename AT>
+__global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, uint32_t n, float clamp, float weight,
                                      __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = gate[i];
-    float u = up[i];
+    float g = swiglu_act_load(gate, i);
+    float u = swiglu_act_load(up, i);
     if (clamp > 1.0e-6f) {
         g = fminf(g, clamp);
         u = fminf(fmaxf(u, -clamp), clamp);
@@ -481,10 +498,22 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
                                 uint32_t n, float clamp, float weight,
                                 void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
                                 int skip_f32) {
+    /* gate/up carry their own element size (L033 increment 2: prefill stages
+     * them f16; decode's fused path passes f32 scratch and takes the float
+     * instantiation untouched).  They must AGREE — one f16 and one f32 means a
+     * caller narrowed half a pair, the [[L035]] shape. */
+    const uint32_t act_esz = pulsar_tensor_esz(gate);
     if (!out || !gate || !up ||
+        act_esz != pulsar_tensor_esz(up) ||
+        (act_esz != sizeof(float) && act_esz != sizeof(__half)) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
-        gate->bytes < (uint64_t)n * sizeof(float) ||
-        up->bytes < (uint64_t)n * sizeof(float)) return 0;
+        gate->bytes < (uint64_t)n * act_esz ||
+        up->bytes < (uint64_t)n * act_esz) {
+        if (gate && up && pulsar_tensor_esz(gate) != pulsar_tensor_esz(up))
+            fprintf(stderr, "pulsar: swiglu gate/up element sizes disagree (%u vs %u) -- refusing\n",
+                    pulsar_tensor_esz(gate), pulsar_tensor_esz(up));
+        return 0;
+    }
     /* skip_f32 without an encoding to replace it would write NOTHING and leave
      * the consumer reading stale bytes.  Same failure shape as a skipped
      * emission, so it gets the same treatment: refuse, do not silently
@@ -520,9 +549,24 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
                     n, mid_dim, (double)n * sizeof(float) / (1024.0 * 1024.0));
         }
     }
-    swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
-                                            (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
-                                            (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    if (act_esz == sizeof(__half)) {
+        /* Announce once: a byte gate cannot distinguish "reading the f16
+         * staging" from "the narrowing never went live" (same rule as the
+         * skip announcement above). */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: swiglu reading F16 gate/up staging (n=%u mid_dim=%u)\n",
+                    n, mid_dim);
+        }
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const __half *)gate->ptr, (const __half *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    } else {
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    }
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 
