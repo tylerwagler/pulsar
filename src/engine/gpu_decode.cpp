@@ -48,6 +48,28 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
     return rc;
 }
 
+/* The same, for the stored Q buffer (f16 since L045).  A plain f32 read
+ * would take n*sizeof(float) bytes from a buffer holding
+ * n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read, and one the type system
+ * cannot catch because a pulsar_gpu_tensor carries no element type. */
+static_assert(PULSAR_Q_ELT_SIZE == 2u,
+              "pulsar_read_q_f32 decodes f16; update it if the Q element type moves");
+int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
+                      float *out, uint64_t n) {
+    uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
+    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_Q_ELT_SIZE,
+                                 tmp, n * PULSAR_Q_ELT_SIZE);
+    if (rc == 0) {
+        /* Same contract as the HC reader: a failed read leaves tmp
+         * uninitialised, so do NOT convert it into the caller's buffer. */
+        free(tmp);
+        return 0;
+    }
+    for (uint64_t i = 0; i < n; i++) out[i] = f16_to_f32(tmp[i]);
+    free(tmp);
+    return rc;
+}
+
 
 
 
@@ -456,9 +478,9 @@ bool gpu_graph_encode_decode_layer(
     if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
-                                              g->qr_norm, 1, /* out_f16: */ 0) != 0;
+                                              g->qr_norm, 1, PULSAR_Q_OUT_F16) != 0;
     if (ok) {
-        gpu_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
+        gpu_graph_debug_dump_q_tensor("Qraw", g->q, q_dim, il, pos);
     }
     bool decode_q_norm_rope_fused = false;
     if (ok) {
@@ -494,7 +516,7 @@ bool gpu_graph_encode_decode_layer(
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
-        gpu_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
+        gpu_graph_debug_dump_q_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (ok) ok = pulsar_gpu_rope_tail_tensor(g->kv, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM,
                                             PULSAR_N_ROT, pos,
@@ -1840,7 +1862,10 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok) {
+        uint64_t                n_tok,
+        /* 1 when `out` stores f16.  Per call site rather than hardcoded:
+         * this wrapper serves both f32 destinations and the f16 Q. */
+        int                     out_f16) {
     (void)module;
     (void)il;
     (void)pos0;
@@ -1851,7 +1876,7 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
                                                  in_dim,
                                                  out_dim,
                                                  x,
-                                                 n_tok, /* out_f16: */ 0) != 0;
+                                                 n_tok, out_f16) != 0;
     return ok;
 }
 

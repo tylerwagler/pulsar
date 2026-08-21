@@ -62,7 +62,14 @@
  * its storage.  Measured neutral against the cross-engine reference (L045
  * stage 1); it is cuda-reference-gate that certifies this, not the byte-exact
  * prefill gate. */
-#define PULSAR_Q_ELT_SIZE 4u
+#define PULSAR_Q_ELT_SIZE 2u
+
+/* Whether a GEMM writing the stored Q buffer must emit f16.  Derived from
+ * the element size rather than written out at each call site: these are the
+ * same fact, and when they disagreed the GEMM wrote f32 into a half-sized
+ * buffer -- a 2x overrun that compiles clean, since a pulsar_gpu_tensor
+ * carries no element type. */
+#define PULSAR_Q_OUT_F16 ((int)(PULSAR_Q_ELT_SIZE == 2u))
 
 
 /* =========================================================================

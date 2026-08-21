@@ -110,7 +110,7 @@ static inline int pulsar_env_tier_on(const char *name) {
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
  * float today, __half at the flip. */
-typedef float pulsar_q_t;
+typedef __half pulsar_q_t;
 
 /* The cudaDataType the stored Q presents to cuBLAS.  Derived from pulsar_q_t
  * rather than written out, so a GEMM's operand type can never drift from the

@@ -757,7 +757,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                       PULSAR_N_EMBD,
                                                       q_rank,
                                                       g->batch_attn_norm,
-                                                      n_tokens);
+                                                      n_tokens,
+                                                      0);
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
@@ -773,7 +774,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           PULSAR_N_EMBD,
                                                           PULSAR_N_HEAD_DIM,
                                                           g->batch_attn_norm,
-                                                          n_tokens);
+                                                          n_tokens,
+                                                          0);
         if (ok) {
             gpu_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -850,9 +852,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           q_rank,
                                                           q_dim,
                                                           g->batch_qr_norm,
-                                                          n_tokens);
+                                                          n_tokens,
+                                                          PULSAR_Q_OUT_F16);
         if (ok) {
-            gpu_graph_debug_dump_tensor("Qraw", g->batch_q,
+            gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         PULSAR_CUDA_PROFILE_Q_STAGE("q_b");
@@ -923,7 +926,7 @@ bool gpu_graph_encode_layer_attention_batch(
         }
         PULSAR_CUDA_PROFILE_Q_STAGE("head_norm");
         if (ok) {
-            gpu_graph_debug_dump_tensor("Qcur", g->batch_q,
+            gpu_graph_debug_dump_q_tensor("Qcur", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         PULSAR_CUDA_PROFILE_Q_STAGE("rope");
@@ -2321,7 +2324,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
                                                           g->batch_ffn_norm, \
-                                                          n_tokens); \
+                                                          n_tokens, \
+                                                          0); \
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
@@ -2331,7 +2335,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           PULSAR_N_EMBD, \
                                                           shared_dim, \
                                                           g->batch_ffn_norm, \
-                                                          n_tokens); \
+                                                          n_tokens, \
+                                                          0); \
         PULSAR_CUDA_PROFILE_FFN_STAGE("shared_gate_up"); \
         void *shmid_q = NULL, *shmid_sf = NULL; int shmid_kbp = 0; \
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
@@ -2386,7 +2391,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                               shared_dim, \
                                                                               PULSAR_N_EMBD, \
                                                                               g->batch_shared_mid, \
-                                                                              n_tokens); \
+                                                                              n_tokens, \
+                                                                              0); \
         PULSAR_CUDA_PROFILE_FFN_STAGE("shared_down"); \
         if (ok) { \
             gpu_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out, \

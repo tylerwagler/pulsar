@@ -1808,6 +1808,27 @@ int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
 
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label, int out_f16) {
+    /* out_f16 and the destination's element size are two statements of one
+     * fact, kept in different files.  When they disagreed this wrote f32 into a
+     * half-sized Q buffer and nothing complained -- so bound it here rather
+     * than trust every call site to keep them in step.
+     *
+     * This is a BOUNDS check, not a format check, and the difference matters:
+     * batch buffers are sized for the full prefill capacity, so a wrong
+     * out_f16 against one of them only trips once n_tok passes half that
+     * capacity.  It catches every decode-shaped case outright (n_tok == 1 into
+     * an exactly-sized buffer) and the large prefill batches; it cannot see a
+     * mismatch that still happens to fit. */
+    if (out) {
+        const uint64_t need = out_dim * n_tok * (out_f16 ? sizeof(__half) : sizeof(float));
+        if (out->bytes < need) {
+            fprintf(stderr, "pulsar: mxfp8 matmul '%s' would write %llu bytes into a "
+                            "%llu-byte output (out_f16=%d) -- refusing\n",
+                    label ? label : "?", (unsigned long long)need,
+                    (unsigned long long)out->bytes, out_f16);
+            return 0;
+        }
+    }
     if (!out || !x || !model_map) return 0;
     /* Backstop for a producer that emitted E4M3 and skipped its f32 store.
      * Fail LOUD rather than multiply stale bytes: per the standing rule, a

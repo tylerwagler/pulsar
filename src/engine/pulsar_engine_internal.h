@@ -2031,6 +2031,12 @@ void gpu_graph_debug_dump_hc_tensor(
         uint64_t          n_elems,
         uint32_t          il,
         uint32_t          pos);
+void gpu_graph_debug_dump_q_tensor(
+        const char       *name,
+        pulsar_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos);
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -2307,7 +2313,8 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
+        uint64_t                n_tok,
+        int                     out_f16);
 uint32_t gpu_graph_token_split_after_layers(void);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
@@ -2325,6 +2332,8 @@ pulsar_gpu_tensor *gpu_graph_q_row_view(
         uint64_t          row_values);
 /* Read an HC residual carrier (BF16 storage; task #62) into an f32 host buffer,
  * expanding each sample. Dev-only (parity self-test + env-gated DSpark dumps). */
+int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
+                      float *out, uint64_t n);
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n);
 /* f32 -> HC carrier bytes (RNE, matches the GPU __float2bfloat16 store). */

@@ -161,6 +161,43 @@ void gpu_graph_debug_dump_hc_tensor(
     }
 }
 
+/* Same dump for the stored Q buffer (f16 since L045).  As with the HC
+ * carrier, the plain f32 dump above would read n*sizeof(float) from a
+ * buffer holding n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read -- so Q
+ * MUST come through here.
+ *
+ * Q is also deliberately out of the range-sweep census that the f32 dump
+ * runs: that census reads f32 and exists to decide what to narrow, which
+ * for Q is now an answered question. */
+void gpu_graph_debug_dump_q_tensor(
+        const char       *name,
+        pulsar_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos) {
+    if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+
+    if (pulsar_gpu_synchronize() == 0) {
+        fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
+    if (pulsar_read_q_f32(t, 0, buf, n_elems) != 0) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, buf, n_elems)) {
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+        }
+    }
+    free(buf);
+
+    if (pulsar_gpu_begin_commands() == 0) {
+        fprintf(stderr, "pulsar: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
 
 
 
