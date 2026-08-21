@@ -787,7 +787,11 @@ bool gpu_graph_encode_layer_attention_batch(
          * two cannot disagree.  Unlike batch_attn_norm there is no offset
          * VIEW of this buffer anywhere (checked), which is what makes it
          * eliminable at all. */
+        /* Same mixed-batch condition as the shared_mid skip below -- see the
+         * comment there for why the cache-lookup invariant does not cover the
+         * prefix split. */
         const bool qr_skip_f32 = (qr_norm_q != NULL) &&
+                                 pulsar_gpu_matmul_batch_mneutral() == 0 &&
                                  !gpu_graph_debug_wants("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
@@ -2353,7 +2357,17 @@ bool gpu_graph_encode_layer_ffn_batch(
          * consumer's cache hit certain rather than likely; \
          * act_f32_absent_hazard() in pulsar_cuda_matmul.cu is the loud \
          * backstop if that adjacency is ever broken by reordering. */ \
-        const int shmid_skip_f32 = (shmid_q != NULL); \
+        /* ⚠ AND mixed-batch must be DISARMED.  cuda-mixed-neutrality-gate \
+         * caught this: at n_dec=2 of 66 the mxfp8 dispatch splits the batch \
+         * and recurses on OFFSET row pointers, which key no cache slot, so \
+         * BOTH halves quantize from f32 -- the store we just skipped.  The \
+         * backstop refused (correctly) and the GEMM failed.  d967327's \
+         * predicate required g_mneutral_rows == 0 for exactly this reason; \
+         * dropping it was my error.  The invariant "valid => every arm takes \
+         * A8" holds only for arms that LOOK UP the cache, and the split does \
+         * not. */ \
+        const int shmid_skip_f32 = (shmid_q != NULL) && \
+                                   pulsar_gpu_matmul_batch_mneutral() == 0; \
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \
