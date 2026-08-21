@@ -776,6 +776,19 @@ bool gpu_graph_encode_layer_attention_batch(
                                                         &qr_norm_kbp)) {
             qr_norm_q = NULL; qr_norm_sf = NULL; qr_norm_kbp = 0;
         }
+        /* DEAD-STORE ELIMINATION.  Both readers of batch_qr_norm are MXFP8
+         * GEMMs (attn_q_b below, and the indexer's q_b) and both take the
+         * E4M3 the norm emits, so the f32 store has no arithmetic consumer.
+         *
+         * It does have a DIAGNOSTIC one: the "q_lora_norm" dump just below
+         * reads the buffer as f32.  A dump that silently shows bytes from a
+         * previous call is worse than no dump, so the skip yields to it --
+         * checked with the same debug predicate the dump itself uses, so the
+         * two cannot disagree.  Unlike batch_attn_norm there is no offset
+         * VIEW of this buffer anywhere (checked), which is what makes it
+         * eliminable at all. */
+        const bool qr_skip_f32 = (qr_norm_q != NULL) &&
+                                 !gpu_graph_debug_wants("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
                                                              model->map,
@@ -791,9 +804,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              qr_norm_q,
                                                              qr_norm_sf,
                                                              qr_norm_kbp,
-        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16,
+                                                             qr_skip_f32) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_tokens, (uint64_t)q_rank);
         if (ok && qr_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        if (ok && qr_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora_norm", g->batch_qr_norm,

@@ -563,7 +563,13 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         void                   *q_out_sf,
         int                     q_out_kbp,
         int                     q_w_bf16,
-        int                     kv_w_bf16);
+        int                     kv_w_bf16,
+        /* Drop q_out's f32 store, leaving the E4M3 emission as the buffer's
+         * only content.  Requires q_out_q.  The caller must arm the cache and
+         * call note_mxfp8() + note_f32_skipped() straight after, and must NOT
+         * set this while a debug dump of that tensor is active -- the dump
+         * reads f32 and would silently show stale bytes. */
+        int                     q_skip_f32);
 
 int pulsar_gpu_head_rms_norm_tensor(
         pulsar_gpu_tensor *x,

@@ -131,7 +131,11 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     if (row >= rows || which > 1u) return;
     const uint32_t n = which == 0u ? q_n : kv_n;
     const float *xr = (which == 0u ? q : kv) + (uint64_t)row * n;
-    float *orow = (which == 0u ? q_out : kv_out) + (uint64_t)row * n;
+    /* q_out is NULL when the caller declared the f32 store dead (the MXFP8
+     * consumers read the E4M3 emitted below instead).  Select the base BEFORE
+     * offsetting: NULL + row*n is undefined behaviour, not a harmless NULL. */
+    float *obase = (which == 0u ? q_out : kv_out);
+    float *orow = obase ? obase + (uint64_t)row * n : NULL;
     const bool is_q = (which == 0u);
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -151,7 +155,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         const float wv = is_q ? pulsar_w_load_f32_or_bf16<QWBF16>(q_w, i)
                               : pulsar_w_load_f32_or_bf16<KVWBF16>(kv_w, i);
         const float v = xr[i] * scale * wv;
-        orow[i] = v;
+        if (orow) orow[i] = v;
         if (emit_mx) {
             pulsar_mx_emit_block(v, i, row, n, q_out_kbp, q_out_q, q_out_sf);
         }
@@ -1097,7 +1101,8 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         void                   *q_out_sf,
         int                     q_out_kbp,
         int                     q_w_bf16,
-        int                     kv_w_bf16) {
+        int                     kv_w_bf16,
+        int                     q_skip_f32) {
     const uint64_t q_w_bytes = (uint64_t)q_n * pulsar_w_elt_bytes(q_w_bf16);
     const uint64_t kv_w_bytes = (uint64_t)kv_n * pulsar_w_elt_bytes(kv_w_bf16);
     if (!q_out || !q || !kv_out || !kv || !model_map ||
@@ -1127,10 +1132,30 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
                         "(needs a multiple of 256)\n", q_n);
         return 0;
     }
+    /* Same shape as the emission guard above: skipping the store without an
+     * encoding to replace it writes NOTHING and leaves the consumer reading
+     * whatever the previous call left behind.  Refuse rather than silently
+     * downgrade to storing f32, which would hide the caller's bug. */
+    if (q_skip_f32 && !q_out_q) {
+        fprintf(stderr, "pulsar: qkv rms norm asked to skip the q f32 store with no "
+                        "E4M3 slot (q_n=%u) -- refusing\n", q_n);
+        return 0;
+    }
+    if (q_skip_f32) {
+        static uint32_t seen_n[8] = {0};
+        static int n_seen = 0;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_n[i] == q_n) { known = 1; break; }
+        if (!known && n_seen < 8) {
+            seen_n[n_seen++] = q_n;
+            fprintf(stderr, "pulsar: qr_norm f32 store SKIPPED (q_n=%u rows=%u, %.1f MiB)\n",
+                    q_n, rows, (double)q_n * rows * sizeof(float) / (1024.0 * 1024.0));
+        }
+    }
     dim3 grid(rows, 2u, 1u);
 #define PULSAR_QKV_NORM_LAUNCH(A, B)                    \
     dsv4_qkv_rms_norm_rows_kernel<A, B><<<grid, 256>>>( \
-            (float *)q_out->ptr,                        \
+            q_skip_f32 ? NULL : (float *)q_out->ptr,    \
             (const float *)q->ptr,                      \
             q_w,                                        \
             q_n,                                        \

@@ -442,7 +442,8 @@ bool gpu_graph_encode_decode_layer(
                                                              1,
                                                              PULSAR_RMS_EPS,
                                                              qn_q, qn_sf, qn_kbp,
-        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16, layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16,
+                                                             /* q_skip_f32: */ 0) != 0;
     }
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->qr_norm, 1, (uint64_t)q_rank);
     if (ok && qn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
