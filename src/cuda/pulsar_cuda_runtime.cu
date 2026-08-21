@@ -1073,6 +1073,15 @@ uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
 }
 
+/* Allocate n_elems of esz bytes each, recording esz on the tensor so no
+ * consumer has to be told the element type separately. */
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz) {
+    if (esz == 0) esz = 4u;
+    pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(n_elems * esz);
+    if (t) t->esz = esz;
+    return t;
+}
+
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1152,6 +1161,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->esz = base->esz;   /* a view of a narrowed buffer is still narrowed */
     return t;
 }
 

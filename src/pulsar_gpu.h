@@ -64,12 +64,6 @@
  * prefill gate. */
 #define PULSAR_Q_ELT_SIZE 2u
 
-/* Whether a GEMM writing the stored Q buffer must emit f16.  Derived from
- * the element size rather than written out at each call site: these are the
- * same fact, and when they disagreed the GEMM wrote f32 into a half-sized
- * buffer -- a 2x overrun that compiles clean, since a pulsar_gpu_tensor
- * carries no element type. */
-#define PULSAR_Q_OUT_F16 ((int)(PULSAR_Q_ELT_SIZE == 2u))
 
 
 /* =========================================================================
@@ -91,6 +85,10 @@ void pulsar_gpu_cleanup(void);
  * cost; the server ledger commits that actual. */
 uint64_t pulsar_gpu_tensor_alloc_bytes_current(void);
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
+/* n_elems * esz bytes, with esz recorded on the tensor.  Use this for any
+ * buffer whose elements are not f32; consumers then derive the type from
+ * the tensor instead of being handed a flag that can disagree with it. */
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz);
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
@@ -372,12 +370,12 @@ int pulsar_gpu_matmul_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok,
-        /* out_f16: write D as __half instead of float (L045).  Applies to EVERY
+        /* The output element type is read from `out` itself (see
+         * pulsar_gpu_tensor_alloc_elt), not passed here.  It applies to EVERY
          * arm -- cuBLASLt and the mmvq/NT kernels alike -- because a buffer
          * written from two widths (prefill chunk vs drafter n_draft) must not
-         * end up holding two element types.  0 = f32, what ships today. */
-        int                     out_f16);
+         * end up holding two element types. */
+        uint64_t                n_tok);
 
 /* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */
@@ -646,11 +644,10 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps,
-        const pulsar_gpu_tensor *positions,
-        /* q_f16: batch_q element type, 0 = f32 (ships today), 1 = __half (L045).
-         * The RMS reduction and the rope rotation both stay in f32 either way;
-         * only the stores narrow. */
-        int q_f16);
+        /* The Q element type is read from `x` itself, not passed here.  The
+         * RMS reduction and the rope rotation stay in f32 either way; only
+         * the stores narrow. */
+        const pulsar_gpu_tensor *positions);
 
 int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
         pulsar_gpu_tensor *x,

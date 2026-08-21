@@ -1166,9 +1166,12 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 
 
 
-int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions, int q_f16) {
+int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
-    const size_t esz = q_f16 ? sizeof(__half) : sizeof(float);
+    /* Derived from the buffer, never passed in.  Passing it was how decode
+     * came to hand an f16 Q to the f32 kernel. */
+    const size_t esz = pulsar_tensor_esz(x);
+    const int q_f16 = (esz == sizeof(__half));
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * esz) return 0;
     const int32_t *pos = positions ? (const int32_t *)positions->ptr : NULL;

@@ -432,7 +432,7 @@ bool gpu_graph_encode_decode_layer(
                                                                     PULSAR_N_EMBD,
                                                                     q_rank,
                                                                     g->attn_norm,
-                                                                    1, /* out_f16: */ 0) != 0;
+                                                                    1) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
@@ -443,7 +443,7 @@ bool gpu_graph_encode_decode_layer(
         if (ok && !qkv_pair_projected) ok = pulsar_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
                                                   layer->attn_kv->abs_offset,
                                                   PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-                                                  g->attn_norm, 1, /* out_f16: */ 0) != 0;
+                                                  g->attn_norm, 1) != 0;
         if (ok) {
             gpu_graph_debug_dump_tensor("KVraw", g->kv_raw, PULSAR_N_HEAD_DIM, il, pos);
         }
@@ -478,7 +478,7 @@ bool gpu_graph_encode_decode_layer(
     if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
-                                              g->qr_norm, 1, PULSAR_Q_OUT_F16) != 0;
+                                              g->qr_norm, 1) != 0;
     if (ok) {
         gpu_graph_debug_dump_q_tensor("Qraw", g->q, q_dim, il, pos);
     }
@@ -500,8 +500,7 @@ bool gpu_graph_encode_decode_layer(
                                                    PULSAR_ROPE_YARN_BETA_FAST,
                                                    PULSAR_ROPE_YARN_BETA_SLOW,
                                                    PULSAR_RMS_EPS,
-                                                   NULL,
-                                                   /* q_f16: */ 0) != 0;
+                                                   NULL) != 0;
     }
     /* The separate head-norm + rope-tail pair here was reachable ONLY via a
      * "Qnorm" dump request, and the fused kernel never materialises that
@@ -1105,7 +1104,7 @@ bool gpu_graph_encode_decode_layer(
         ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_out, model->map, model->size,
                                           layer->ffn_down_shexp->abs_offset,
                                           shared_dim, PULSAR_N_EMBD,
-                                          g->shared_mid, 1, /* out_f16: */ 0) != 0;
+                                          g->shared_mid, 1) != 0;
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
@@ -1191,7 +1190,7 @@ bool gpu_graph_dspark_project_main_x(
                                           dspark_model->size,
                                           w->main_proj->abs_offset,
                                           concat_dim, E,
-                                          target_concat, 1, /* out_f16: */ 0) != 0;
+                                          target_concat, 1) != 0;
     }
 
     if (ok) {
@@ -1243,7 +1242,7 @@ void gpu_graph_dspark_seed_draft_kv(
                                           dspark_model->size,
                                           w->layer[li].attn_kv->abs_offset,
                                           PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-                                          g->dspark_main_x, 1, /* out_f16: */ 0)) {
+                                          g->dspark_main_x, 1)) {
             seeded = false;
             break;
         }
@@ -1417,7 +1416,7 @@ bool gpu_graph_dspark_draft_forward(
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_qr, dspark_model->map, dspark_model->size,
             layer->attn_q_a->abs_offset,
-            PULSAR_N_EMBD, q_rank, g->batch_attn_norm, n_draft, /* out_f16: */ 0) != 0;
+            PULSAR_N_EMBD, q_rank, g->batch_attn_norm, n_draft) != 0;
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
             g->batch_qr_norm, g->batch_qr,
             dspark_model->map, dspark_model->size,
@@ -1428,7 +1427,7 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_q, dspark_model->map, dspark_model->size,
             layer->attn_q_b->abs_offset,
             q_rank, PULSAR_N_HEAD * PULSAR_N_HEAD_DIM,
-            g->batch_qr_norm, n_draft, /* out_f16: */ 0) != 0;
+            g->batch_qr_norm, n_draft) != 0;
         /* Q head-norm + RoPE */
         if (ok) ok = pulsar_gpu_head_rms_norm_rope_tail_tensor(
             g->batch_q, n_draft,
@@ -1436,15 +1435,14 @@ bool gpu_graph_dspark_draft_forward(
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
-            NULL,
-                                                   /* q_f16: */ 0) != 0;
+            NULL) != 0;
 
         /* --- KV projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_kv_raw, dspark_model->map, dspark_model->size,
             layer->attn_kv->abs_offset,
             PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-            g->batch_attn_norm, n_draft, /* out_f16: */ 0) != 0;
+            g->batch_attn_norm, n_draft) != 0;
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
             g->batch_kv, g->batch_kv_raw,
             dspark_model->map, dspark_model->size,
@@ -1634,7 +1632,7 @@ bool gpu_graph_encode_output_head(
         else
             ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
                                             weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, g->output_norm, 1, /* out_f16: */ 0) != 0;
+                                            vocab_dim, g->output_norm, 1) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, PULSAR_N_LAYER, 0);
@@ -1733,7 +1731,7 @@ bool gpu_graph_encode_output_head_batch(
         else
             ok = pulsar_gpu_matmul_mxfp8_tensor(logits, model->map, model->size,
                                             weights->output->abs_offset, PULSAR_N_EMBD,
-                                            vocab_dim, output_norm, n_tokens, /* out_f16: */ 0) != 0;
+                                            vocab_dim, output_norm, n_tokens) != 0;
     }
 
     pulsar_gpu_tensor_free(logits);
@@ -1796,7 +1794,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
         else
             ok = pulsar_gpu_matmul_mxfp8_tensor(logits, base_model->map, base_model->size,
                                              bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                             output_norm, n_tokens, /* out_f16: */ 0) != 0;
+                                             output_norm, n_tokens) != 0;
     }
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
@@ -1837,7 +1835,7 @@ bool gpu_graph_matmul_plain_tensor(
      * arm is what makes that repack legal. */
     if (w->type == PULSAR_TENSOR_FP8_E4M3 || w->type == PULSAR_TENSOR_MXFP8_LT) {
         return pulsar_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
-                                            w->abs_offset, in_dim, out_dim, x, n_tok, /* out_f16: */ 0) != 0;
+                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
     /* Reached only if a type is IN pulsar_weight_is_plain_or_mxfp8 but has no
      * arm above -- i.e. the two drifted. Say which, because the old message
@@ -1862,10 +1860,7 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok,
-        /* 1 when `out` stores f16.  Per call site rather than hardcoded:
-         * this wrapper serves both f32 destinations and the f16 Q. */
-        int                     out_f16) {
+        uint64_t                n_tok) {
     (void)module;
     (void)il;
     (void)pos0;
@@ -1876,7 +1871,7 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
                                                  in_dim,
                                                  out_dim,
                                                  x,
-                                                 n_tok, out_f16) != 0;
+                                                 n_tok) != 0;
     return ok;
 }
 

@@ -1173,8 +1173,12 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
 
 static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
-        uint64_t n_tok, const char *label, int out_f16) {
+        uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
+    /* Derived from the destination, never passed in: the two cannot
+     * disagree if only one of them exists. */
+    const int out_f16 = (pulsar_tensor_esz(out) == sizeof(__half));
+
     uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const size_t out_esz = out_f16 ? sizeof(__half) : sizeof(float);
@@ -1807,18 +1811,14 @@ int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
  * off the f32 buffer, so any m-neutral split disqualifies the whole call. */
 
 
-static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label, int out_f16) {
-    /* out_f16 and the destination's element size are two statements of one
-     * fact, kept in different files.  When they disagreed this wrote f32 into a
-     * half-sized Q buffer and nothing complained -- so bound it here rather
-     * than trust every call site to keep them in step.
-     *
-     * This is a BOUNDS check, not a format check, and the difference matters:
-     * batch buffers are sized for the full prefill capacity, so a wrong
-     * out_f16 against one of them only trips once n_tok passes half that
-     * capacity.  It catches every decode-shaped case outright (n_tok == 1 into
-     * an exactly-sized buffer) and the large prefill batches; it cannot see a
-     * mismatch that still happens to fit. */
+static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    /* Derived from the destination, never passed in: the two cannot
+     * disagree if only one of them exists. */
+    const int out_f16 = (pulsar_tensor_esz(out) == sizeof(__half));
+    /* A pure bounds check.  It no longer guards a format mismatch -- out_f16 is
+     * derived from `out` itself now, so the two cannot disagree -- but n_tok
+     * can still exceed what the destination holds, and that is worth catching
+     * loudly rather than scribbling past the end. */
     if (out) {
         const uint64_t need = out_dim * n_tok * (out_f16 ? sizeof(__half) : sizeof(float));
         if (out->bytes < need) {
@@ -1868,19 +1868,19 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * element size, or the suffix lands at the wrong offset. */
             const uint64_t inb = in_dim * sizeof(float);
             const uint64_t outb = out_dim * (out_f16 ? sizeof(__half) : sizeof(float));
-            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
-                                       out->bytes - n_dec * outb, 0 };
-            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
-                                       x->bytes - n_dec * inb, 0 };
+            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
+            pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
+            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
+                                                             out->bytes - n_dec * outb);
+            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
+                                                             x->bytes - n_dec * inb);
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;   /* decode prefix: n_dec == n_tok' => all custom */
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_pre, n_dec, label, out_f16);
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec, label);
             g_mneutral_rows = 0;            /* prefill suffix: tensor-core */
             int r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label, out_f16);
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label);
             g_mneutral_rows = saved;
             return r1 && r2;
         }
@@ -2004,7 +2004,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * through to the per-token mmvq kernel below. */
         if (n_tok > 1 &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
-                weight_offset, in_dim, out_dim, x, n_tok, label, out_f16)) return 1;
+                weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
         const unsigned wpb = 8;  /* output rows per block */
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -2086,9 +2086,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
 
 
 
-int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, int out_f16) {
+int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, weight_offset,
-                                           in_dim, out_dim, x, n_tok, "mxfp8", out_f16);
+                                           in_dim, out_dim, x, n_tok, "mxfp8");
 }
 
 
@@ -2154,9 +2154,9 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
         }
     }
     return cuda_matmul_mxfp8_tensor_labeled(out0, model_map, model_size, weight0_offset,
-                                           in_dim, out0_dim, x, n_tok, "mxfp8_pair0", 0) &&
+                                           in_dim, out0_dim, x, n_tok, "mxfp8_pair0") &&
            cuda_matmul_mxfp8_tensor_labeled(out1, model_map, model_size, weight1_offset,
-                                           in_dim, out1_dim, x, n_tok, "mxfp8_pair1", 0);
+                                           in_dim, out1_dim, x, n_tok, "mxfp8_pair1");
 }
 
 
@@ -2269,12 +2269,12 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
-                                       out->bytes - n_dec * outb, 0 };
-            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
-                                       x->bytes - n_dec * inb, 0 };
+            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
+            pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
+            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
+                                                             out->bytes - n_dec * outb);
+            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
+                                                             x->bytes - n_dec * inb);
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
             int r1 = pulsar_gpu_matmul_bf16_tensor(&out_pre, model_map, model_size,
@@ -2392,12 +2392,12 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
-            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
-                                       out->bytes - n_dec * outb, 0 };
-            pulsar_gpu_tensor x_suf   = { (char *)x->ptr + n_dec * inb,
-                                       x->bytes - n_dec * inb, 0 };
+            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
+            pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
+            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
+                                                             out->bytes - n_dec * outb);
+            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
+                                                             x->bytes - n_dec * inb);
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
             int r1 = pulsar_gpu_matmul_f32_tensor(&out_pre, model_map, model_size,
@@ -2599,11 +2599,11 @@ int pulsar_gpu_attention_output_batch_tensor(
             const uint64_t headb = (uint64_t)n_groups * group_dim * sizeof(float);
             const uint64_t lowb  = low_dim * sizeof(float);
             const uint64_t outb  = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
-            pulsar_gpu_tensor low_pre = { low->ptr, low->bytes, 0 };
+            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
+            pulsar_gpu_tensor low_pre = pulsar_tensor_subview(low, 0, low->bytes);
             pulsar_gpu_tensor hd_pre  = { heads->ptr, heads->bytes, 0 };
-            pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb, out->bytes - n_dec * outb, 0 };
-            pulsar_gpu_tensor low_suf = { (char *)low->ptr + n_dec * lowb, low->bytes - n_dec * lowb, 0 };
+            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb, out->bytes - n_dec * outb);
+            pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
             pulsar_gpu_tensor hd_suf  = { (char *)heads->ptr + n_dec * headb, heads->bytes - n_dec * headb, 0 };
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
@@ -2691,7 +2691,7 @@ int pulsar_gpu_attention_output_batch_tensor(
                                            out_dim,
                                            low,
                                            n_tokens,
-                                           "attn_output_b", 0);
+                                           "attn_output_b");
 }
 
 

@@ -2313,8 +2313,7 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok,
-        int                     out_f16);
+        uint64_t                n_tok);
 uint32_t gpu_graph_token_split_after_layers(void);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,

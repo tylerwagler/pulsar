@@ -203,7 +203,34 @@ struct pulsar_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    /* Bytes per element.  0 = unspecified, which reads as f32: that keeps
+     * every pre-existing alloc meaning exactly what it meant, so only a
+     * buffer that is NOT f32 has to say so, once, where it is created.
+     *
+     * This field exists because the alternative -- every consumer taking an
+     * out_f16/q_f16 flag, every bound writing sizeof(float), every view
+     * restating the stride -- produced eight distinct defects in one
+     * narrowing, all of them type-legal and all of them silent. */
+    uint32_t esz;
 };
+
+/* The element size to actually use.  Never read t->esz directly. */
+static inline uint32_t pulsar_tensor_esz(const pulsar_gpu_tensor *t) {
+    return (t && t->esz) ? t->esz : 4u;
+}
+
+/* Stack sub-view that INHERITS the base's element size.  The hand-rolled
+ * aggregate initialisers this replaces dropped it, which silently retyped a
+ * narrowed buffer as f32 halfway through a split. */
+static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b,
+                                                     uint64_t off, uint64_t bytes) {
+    pulsar_gpu_tensor t;
+    t.ptr = (char *)b->ptr + off;
+    t.bytes = bytes;
+    t.owner = 0;
+    t.esz = b->esz;
+    return t;
+}
 
 /* Constant-fill of an f32 device buffer.  This lived TWICE, byte-identical and
  * `static`, in pulsar_cuda_norm_kv.cu and pulsar_cuda_runtime.cu -- one of the

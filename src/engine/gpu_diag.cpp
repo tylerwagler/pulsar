@@ -1747,7 +1747,7 @@ bool gpu_graph_alloc_raw_cap(
     }
     const bool banked = g->banks.n_banks != 0;
 
-    g->cur_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier (BF16); task #62 */
+    g->cur_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier (BF16); task #62 */
     g->flat_hc = pulsar_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->hc_mix = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
     g->hc_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
@@ -1762,7 +1762,7 @@ bool gpu_graph_alloc_raw_cap(
     g->attn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->qr = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
     g->qr_norm = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->q = pulsar_gpu_tensor_alloc(q_dim * PULSAR_Q_ELT_SIZE);
+    g->q = pulsar_gpu_tensor_alloc_elt(q_dim, PULSAR_Q_ELT_SIZE);
     g->kv_raw = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     g->kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
@@ -1890,7 +1890,7 @@ bool gpu_graph_alloc_raw_cap(
     g->heads = pulsar_gpu_tensor_alloc(q_dim * sizeof(float));
     g->attn_low = pulsar_gpu_tensor_alloc(low_dim * sizeof(float));
     g->attn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_attn_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->after_attn_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->ffn_cur = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->shared_gate = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
@@ -1915,7 +1915,7 @@ bool gpu_graph_alloc_raw_cap(
     g->routed_mid = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
     g->routed_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_ffn_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->after_ffn_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->output_pre = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_embd = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
@@ -1930,8 +1930,8 @@ bool gpu_graph_alloc_raw_cap(
      * only), which left the multiseq driver rejecting every step whenever
      * speculation was off. */
     g->spec_logits = pulsar_gpu_tensor_alloc(16ull * PULSAR_N_VOCAB * sizeof(float));
-    g->batch_cur_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
-    g->batch_next_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->batch_cur_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->batch_next_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_hc_mix = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
@@ -1939,7 +1939,7 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_attn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_qr = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_q = pulsar_gpu_tensor_alloc(pc * q_dim * PULSAR_Q_ELT_SIZE);
+    g->batch_q = pulsar_gpu_tensor_alloc_elt(pc * q_dim, PULSAR_Q_ELT_SIZE);
     g->batch_kv_raw = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HEAD_DIM * sizeof(float));
     g->batch_kv = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HEAD_DIM * sizeof(float));
     g->batch_kv_pack = pulsar_gpu_tensor_alloc(pc * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
@@ -1950,7 +1950,7 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_heads = pulsar_gpu_tensor_alloc(pc * q_dim * sizeof(float));
     g->batch_attn_low = pulsar_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
-    g->batch_after_attn_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->batch_after_attn_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_ffn_cur = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_ffn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_shared_gate = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));

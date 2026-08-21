@@ -543,9 +543,9 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         void                   *mid_sf,
         int                     mid_kbp) {
     return pulsar_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
-                                        gate_offset, in_dim, out_dim, x, 1, /* out_f16: */ 0) &&
+                                        gate_offset, in_dim, out_dim, x, 1) &&
            pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
-                                        up_offset, in_dim, out_dim, x, 1, /* out_f16: */ 0) &&
+                                        up_offset, in_dim, out_dim, x, 1) &&
            /* One row here, so n == out_dim and the MX row width IS out_dim.
             * skip_f32 = 0 deliberately: this is the DECODE path, where the
             * store is one row (8 KiB, not 32 MiB) and so is worth nothing,
@@ -923,7 +923,7 @@ int pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(
         uint32_t                n_hc) {
     return pulsar_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
                                         weight_offset, in_dim, out_dim,
-                                        shared_mid, 1, /* out_f16: */ 0) &&
+                                        shared_mid, 1) &&
            pulsar_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
                                                 residual_hc, split, n_embd, n_hc);
 }

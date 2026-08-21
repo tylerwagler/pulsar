@@ -1617,8 +1617,7 @@ static int attention_q_prep_apply(const pulsar_gpu_tensor *q, uint32_t n_tokens,
     return pulsar_gpu_head_rms_norm_rope_tail_tensor((pulsar_gpu_tensor *)q,
             n_tokens, n_head, head_dim, qp->n_rot, pos0, qp->n_ctx_orig, false,
             qp->freq_base, qp->freq_scale, qp->ext_factor, qp->attn_factor,
-            qp->beta_fast, qp->beta_slow, qp->eps, positions,
-                                                   /* q_f16: */ 0);
+            qp->beta_fast, qp->beta_slow, qp->eps, positions);
 }
 #define ATTN_Q_PREP_FALLBACK(qt, ntok, pos0v, posv) \
     do { if (q_prep) { \
