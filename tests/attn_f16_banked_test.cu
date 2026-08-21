@@ -57,6 +57,7 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cmath>
 #include <vector>
 #include <random>
+#include "attn_pack_fixture.h"
 
 /* Encode a CONSTANT row in ATTN_PACK layout.  0.25/0.5/0.75/1.0 are all exact
  * in E4M3 with a unit block scale, so the packed row decodes to exactly the
@@ -137,12 +138,12 @@ int main(int argc, char **argv) {
             for (uint32_t r = 0; r < comp_cap; r++)
                 pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
-    float *dq, *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
-    cudaMalloc(&dq, q.size()*4); cudaMalloc(&draw, rawp.size());
+    pulsar_q_t *dq;
+    float *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
+    dq = fixture_upload_q(q); cudaMalloc(&draw, rawp.size());
     cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
     cudaMalloc(&dout, out.size()*4); cudaMalloc(&dtk, tk.size()*4);
     cudaMalloc(&dpos, pos.size()*4); cudaMalloc(&dseq, seq.size()*4);
-    cudaMemcpy(dq, q.data(), q.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dcomp, comp.data(), comp.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size()*4, cudaMemcpyHostToDevice);

@@ -80,4 +80,31 @@ static inline float host_bf16_widen(uint16_t bits) {
     float f; std::memcpy(&f, &u, sizeof f); return f;
 }
 
+
+/* ---- Q upload in the engine's stored element type -------------------------
+ *
+ * Fixtures must NOT assume Q is f32.  pulsar_q_t narrowed to __half (L045), and
+ * a fixture that cudaMemcpys floats into that buffer keeps compiling and
+ * running while handing the kernel garbage.  The quiet variant is worse: the
+ * decode kernels are TEMPLATED on the Q type, so a `float *` argument deduces
+ * QT=float and the gate certifies an instantiation the engine never launches --
+ * green, and measuring nothing.
+ *
+ * Going through here ties the fixture to pulsar_q_t by construction. */
+static inline void fixture_q_set(float &d, float v)  { d = v; }
+static inline void fixture_q_set(__half &d, float v) { d = __float2half(v); }
+
+static inline pulsar_q_t *fixture_upload_q(const std::vector<float> &q) {
+    pulsar_q_t *d = NULL;
+    if (cudaMalloc(&d, q.size() * sizeof(pulsar_q_t)) != cudaSuccess) return NULL;
+    std::vector<pulsar_q_t> h(q.size());
+    for (size_t i = 0; i < q.size(); i++) fixture_q_set(h[i], q[i]);
+    if (cudaMemcpy(d, h.data(), h.size() * sizeof(pulsar_q_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d);
+        return NULL;
+    }
+    return d;
+}
+
 #endif /* PULSAR_TESTS_ATTN_PACK_FIXTURE_H */

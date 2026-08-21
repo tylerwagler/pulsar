@@ -242,12 +242,12 @@ int main(int argc, char **argv) {
     }
 
     /* ---- kernel ----------------------------------------------------------- */
-    float *dq, *dkv, *dckv, *ds, *dout;
-    cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dkv, rawp.size());
+    pulsar_q_t *dq;
+    float *dkv, *dckv, *ds, *dout;
+    dq = fixture_upload_q(q); cudaMalloc(&dkv, rawp.size());
     cudaMalloc(&dckv, ckvp.size());
     cudaMemcpy(dckv, ckvp.data(), ckvp.size(), cudaMemcpyHostToDevice);
     cudaMalloc(&ds, sinks.size() * 4); cudaMalloc(&dout, out.size() * 4);
-    cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dkv, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);

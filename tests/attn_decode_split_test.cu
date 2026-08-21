@@ -177,18 +177,18 @@ int main() {
         }
         if (c.name[7] == 'e' && c.n_tokens >= 3) seq[2] = (int32_t)c.n_banks; /* evicted */
 
-        float *draw, *dcomp, *dq, *ds, *dgold, *dsplit;
+        pulsar_q_t *dq;
+        float *draw, *dcomp, *ds, *dgold, *dsplit;
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
         cudaMalloc(&draw, rawp.size());
         cudaMalloc(&dcomp, compp.size());
-        cudaMalloc(&dq, q.size() * 4);
+        dq = fixture_upload_q(q);
         cudaMalloc(&ds, sinks.size() * 4);
         cudaMalloc(&dgold, q.size() * 4);
         cudaMalloc(&dsplit, q.size() * 4);
         cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
-        cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
         cudaMemset(dgold, 0xe5, q.size() * 4);
         cudaMemset(dsplit, 0x5e, q.size() * 4);
