@@ -329,7 +329,12 @@ int pulsar_gpu_matmul_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
+        uint64_t                n_tok,
+        /* out_f16: write D as __half instead of float (L045).  Applies to EVERY
+         * arm -- cuBLASLt and the mmvq/NT kernels alike -- because a buffer
+         * written from two widths (prefill chunk vs drafter n_draft) must not
+         * end up holding two element types.  0 = f32, what ships today. */
+        int                     out_f16);
 
 /* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */

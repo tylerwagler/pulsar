@@ -1173,11 +1173,12 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
 
 static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
-        uint64_t n_tok, const char *label) {
+        uint64_t n_tok, const char *label, int out_f16) {
     if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
     uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const size_t out_esz = out_f16 ? sizeof(__half) : sizeof(float);
+    if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * out_esz) return 0;
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
@@ -1249,7 +1250,8 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulHeuristicResult_t h;
-    };
+        int out_f16;   /* D layout dtype: 0 = CUDA_R_32F, 1 = CUDA_R_16F (L045) */
+};
     /* thread_local for the same reason as the dspark reduce buffers: round-robin
      * eviction below DESTROYS the cuBLASLt descriptors in the slot it takes, so
      * as a process global a second submitting thread could destroy handles this
@@ -1262,11 +1264,12 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     lt_shape_cache *e = NULL;
     for (int i = 0; i < 16; i++) {
         if (cache[i].valid && cache[i].in_dim == in_dim &&
-            cache[i].out_dim == out_dim && cache[i].ntok == ntok) { e = &cache[i]; break; }
+            cache[i].out_dim == out_dim && cache[i].ntok == ntok &&
+            cache[i].out_f16 == out_f16) { e = &cache[i]; break; }
     }
     if (!e) {
         lt_shape_cache ne = {};
-        ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
+        ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok; ne.out_f16 = out_f16;
         if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
@@ -1281,7 +1284,10 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
         cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
         cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_8F_E4M3, in_dim, out_dim, in_dim);
         cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, in_dim, ntok, in_dim);
-        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
+        /* The heuristic is selected AGAINST this layout, so an f16 D gets its own
+         * algo -- that is where the measured -39% on q_b comes from, not from
+         * writing fewer bytes alone. */
+        cublasLtMatrixLayoutCreate(&ne.ld, out_f16 ? CUDA_R_16F : CUDA_R_32F, out_dim, ntok, out_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
         /* determinism: forbid split-K reduction algos (atomic/parallel
@@ -1499,7 +1505,8 @@ static int cuda_attention_output_a_mx_gemm(
  * per step -> 128-wide coalesced loads vs the raw 33B-interleaved kernel's misaligned
  * 1-byte/thread reads. Numerically identical (same fp8 bytes, same raw E8M0 scale byte).
  * Requires in_dim % 128 == 0 (all MLA/shared/head dims qualify); else fall back to raw. */
-__global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *data,
+template <typename OT>
+__global__ static void mxfp8_mmvq_deint_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                const unsigned char *scale, const float *x,
                                                int in_dim, int out_dim, int KBp) {
     int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
@@ -1518,7 +1525,7 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
         for (int j = 0; j < 4; j++) acc += __half2float((__half)q[j]) * sc * xk[j];
     }
     for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
-    if (lane == 0) out[o] = acc;
+    if (lane == 0) q_store<OT>(out, o, acc);
 }
 
 
@@ -1543,7 +1550,8 @@ __global__ static void mxfp8_mmvq_deint_kernel(float *out, const __nv_fp8_e4m3 *
  * loaded once per lane per step.  The activation is a single row, so its
  * scale row is xrow -- the cache holds the whole (n_tok, in_dim) block, so a
  * per-token launch must say which row it is reading. */
-__global__ static void mxfp8_mmvq_deint_a8_kernel(float *out, const __nv_fp8_e4m3 *data,
+template <typename OT>
+__global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                   const unsigned char *scale,
                                                   const __nv_fp8_e4m3 *xq,
                                                   const unsigned char *xs,
@@ -1570,7 +1578,7 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(float *out, const __nv_fp8_e4m
         }
     }
     for (int s2 = 16; s2 > 0; s2 >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s2);
-    if (lane == 0) out[o] = acc;
+    if (lane == 0) q_store<OT>(out, o, acc);
 }
 
 
@@ -1607,7 +1615,7 @@ __global__ static void mxfp8_mmvq_deint_pair_kernel(
         for (int j = 0; j < 4; j++) acc += __half2float((__half)q[j]) * sc * xk[j];
     }
     for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
-    if (lane == 0) out[o] = acc;
+    if (lane == 0) out[o] = acc;   /* pair kernel: gate/up, stays f32 (L045) */
 }
 
 
@@ -1617,8 +1625,8 @@ __global__ static void mxfp8_mmvq_deint_pair_kernel(
  * (NT x weight traffic). Per-token multiply/accumulate order matches
  * mxfp8_mmvq_deint_kernel exactly, so each token's output is bit-identical to the
  * n=1 kernel run on that token alone. */
-template <int NT>
-__global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m3 *data,
+template <int NT, typename OT>
+__global__ static void mxfp8_mmvq_deint_nt_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                   const unsigned char *scale, const float *x,
                                                   int in_dim, int out_dim, int KBp) {
     int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
@@ -1646,7 +1654,7 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
     for (int t = 0; t < NT; t++) {
         float a = acc[t];
         for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
-        if (lane == 0) out[(size_t)t * out_dim + o] = a;
+        if (lane == 0) q_store<OT>(out, (size_t)t * out_dim + o, a);
     }
 }
 
@@ -1670,8 +1678,8 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(float *out, const __nv_fp8_e4m
  * The activation cache is row-major [rows, K] (mxfp8_quant_act_kernel stores at
  * row*K + k), so a lane's 4 elements stay contiguous per token and the scale row
  * is simply the token index. */
-template <int NT>
-__global__ static void mxfp8_mmvq_deint_nt_a8_kernel(float *out, const __nv_fp8_e4m3 *data,
+template <int NT, typename OT>
+__global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                      const unsigned char *scale,
                                                      const __nv_fp8_e4m3 *xq,
                                                      const unsigned char *xs,
@@ -1705,7 +1713,7 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(float *out, const __nv_fp8_
     for (int t = 0; t < NT; t++) {
         float a = acc[t];
         for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
-        if (lane == 0) out[(size_t)t * out_dim + o] = a;
+        if (lane == 0) q_store<OT>(out, (size_t)t * out_dim + o, a);
     }
 }
 
@@ -1799,7 +1807,7 @@ int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
  * off the f32 buffer, so any m-neutral split disqualifies the whole call. */
 
 
-static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label, int out_f16) {
     if (!out || !x || !model_map) return 0;
     /* Backstop for a producer that emitted E4M3 and skipped its f32 store.
      * Fail LOUD rather than multiply stale bytes: per the standing rule, a
@@ -1835,7 +1843,10 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
     {
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
-            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
+            /* Row strides are BYTES: the output half must follow the OUTPUT
+             * element size, or the suffix lands at the wrong offset. */
+            const uint64_t inb = in_dim * sizeof(float);
+            const uint64_t outb = out_dim * (out_f16 ? sizeof(__half) : sizeof(float));
             pulsar_gpu_tensor out_pre = { out->ptr, out->bytes, 0 };
             pulsar_gpu_tensor x_pre   = { x->ptr,   x->bytes,   0 };
             pulsar_gpu_tensor out_suf = { (char *)out->ptr + n_dec * outb,
@@ -1845,10 +1856,10 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;   /* decode prefix: n_dec == n_tok' => all custom */
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_pre, n_dec, label);
+                    weight_offset, in_dim, out_dim, &x_pre, n_dec, label, out_f16);
             g_mneutral_rows = 0;            /* prefill suffix: tensor-core */
             int r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label);
+                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label, out_f16);
             g_mneutral_rows = saved;
             return r1 && r2;
         }
@@ -1930,32 +1941,32 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                                     (unsigned long long)in_dim, (unsigned long long)out_dim);
                         }
                     }
-                    #define PULSAR_FP8_NT_A8(N) mxfp8_mmvq_deint_nt_a8_kernel<N><<<grid, wpb * 32>>>( \
-                            (float *)out->ptr, bw->data, bw->scale, ac8nt->xq, ac8nt->sx, \
+                    #define PULSAR_FP8_NT_A8(N, OT) mxfp8_mmvq_deint_nt_a8_kernel<N, OT><<<grid, wpb * 32>>>( \
+                            (OT *)out->ptr, bw->data, bw->scale, ac8nt->xq, ac8nt->sx, \
                             (int)in_dim, (int)out_dim, KBp, xKBp)
                     switch (n_tok) {
-                    case 2: PULSAR_FP8_NT_A8(2); break;
-                    case 3: PULSAR_FP8_NT_A8(3); break;
-                    case 4: PULSAR_FP8_NT_A8(4); break;
-                    case 5: PULSAR_FP8_NT_A8(5); break;
-                    case 6: PULSAR_FP8_NT_A8(6); break;
-                    case 7: PULSAR_FP8_NT_A8(7); break;
-                    default: PULSAR_FP8_NT_A8(8); break;
+                    case 2: if (out_f16) PULSAR_FP8_NT_A8(2, __half); else PULSAR_FP8_NT_A8(2, float); break;
+                    case 3: if (out_f16) PULSAR_FP8_NT_A8(3, __half); else PULSAR_FP8_NT_A8(3, float); break;
+                    case 4: if (out_f16) PULSAR_FP8_NT_A8(4, __half); else PULSAR_FP8_NT_A8(4, float); break;
+                    case 5: if (out_f16) PULSAR_FP8_NT_A8(5, __half); else PULSAR_FP8_NT_A8(5, float); break;
+                    case 6: if (out_f16) PULSAR_FP8_NT_A8(6, __half); else PULSAR_FP8_NT_A8(6, float); break;
+                    case 7: if (out_f16) PULSAR_FP8_NT_A8(7, __half); else PULSAR_FP8_NT_A8(7, float); break;
+                    default: if (out_f16) PULSAR_FP8_NT_A8(8, __half); else PULSAR_FP8_NT_A8(8, float); break;
                     }
                     #undef PULSAR_FP8_NT_A8
                     return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
                 }
-                #define PULSAR_FP8_NT(N) mxfp8_mmvq_deint_nt_kernel<N><<<grid, wpb * 32>>>( \
-                        (float *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
+                #define PULSAR_FP8_NT(N, OT) mxfp8_mmvq_deint_nt_kernel<N, OT><<<grid, wpb * 32>>>( \
+                        (OT *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
                         (int)in_dim, (int)out_dim, KBp)
                 switch (n_tok) {
-                case 2: PULSAR_FP8_NT(2); break;
-                case 3: PULSAR_FP8_NT(3); break;
-                case 4: PULSAR_FP8_NT(4); break;
-                case 5: PULSAR_FP8_NT(5); break;
-                case 6: PULSAR_FP8_NT(6); break;
-                case 7: PULSAR_FP8_NT(7); break;
-                default: PULSAR_FP8_NT(8); break;   /* n_tok == 8 */
+                case 2: if (out_f16) PULSAR_FP8_NT(2, __half); else PULSAR_FP8_NT(2, float); break;
+                case 3: if (out_f16) PULSAR_FP8_NT(3, __half); else PULSAR_FP8_NT(3, float); break;
+                case 4: if (out_f16) PULSAR_FP8_NT(4, __half); else PULSAR_FP8_NT(4, float); break;
+                case 5: if (out_f16) PULSAR_FP8_NT(5, __half); else PULSAR_FP8_NT(5, float); break;
+                case 6: if (out_f16) PULSAR_FP8_NT(6, __half); else PULSAR_FP8_NT(6, float); break;
+                case 7: if (out_f16) PULSAR_FP8_NT(7, __half); else PULSAR_FP8_NT(7, float); break;
+                default: if (out_f16) PULSAR_FP8_NT(8, __half); else PULSAR_FP8_NT(8, float); break;   /* n_tok == 8 */
                 }
                 #undef PULSAR_FP8_NT
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
@@ -1965,7 +1976,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * through to the per-token mmvq kernel below. */
         if (n_tok > 1 &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
-                weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+                weight_offset, in_dim, out_dim, x, n_tok, label, out_f16)) return 1;
         const unsigned wpb = 8;  /* output rows per block */
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -2047,9 +2058,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
 
 
 
-int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, int out_f16) {
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, weight_offset,
-                                           in_dim, out_dim, x, n_tok, "mxfp8");
+                                           in_dim, out_dim, x, n_tok, "mxfp8", out_f16);
 }
 
 
@@ -2115,9 +2126,9 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
         }
     }
     return cuda_matmul_mxfp8_tensor_labeled(out0, model_map, model_size, weight0_offset,
-                                           in_dim, out0_dim, x, n_tok, "mxfp8_pair0") &&
+                                           in_dim, out0_dim, x, n_tok, "mxfp8_pair0", 0) &&
            cuda_matmul_mxfp8_tensor_labeled(out1, model_map, model_size, weight1_offset,
-                                           in_dim, out1_dim, x, n_tok, "mxfp8_pair1");
+                                           in_dim, out1_dim, x, n_tok, "mxfp8_pair1", 0);
 }
 
 
@@ -2652,7 +2663,7 @@ int pulsar_gpu_attention_output_batch_tensor(
                                            out_dim,
                                            low,
                                            n_tokens,
-                                           "attn_output_b");
+                                           "attn_output_b", 0);
 }
 
 
