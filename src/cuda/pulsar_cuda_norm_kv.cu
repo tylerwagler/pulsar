@@ -1910,20 +1910,14 @@ __global__ static void range_stats_kernel(const float *x, uint64_t n,
  * measure for a dot product: for y = sum(w_i x_i) over many terms the relative
  * error of y goes as sigma_delta/sigma, not as the per-element relative error
  * (which near-zero entries dominate while contributing nothing to y). */
-__device__ static inline float dev_to_e4m3(float v) {
-    if (v == 0.0f || !isfinite(v)) return v;
-    const float a = fabsf(v);
-    float e = floorf(log2f(a));
-    if (e < -6.0f) e = -6.0f;
-    if (e >  8.0f) e =  8.0f;
-    const float step = exp2f(e - 3.0f);          /* 3 mantissa bits */
-    float q = rintf(a / step) * step;
-    if (q > 448.0f) q = 448.0f;
-    return v < 0.0f ? -q : q;
-}
-
-/* One warp per 32-element block: block max -> q8_1 scale, then accumulate
- * sum((q8-e4m3)^2) and sum(e4m3^2). */
+/* One warp per 32-element block: block max -> q8_1 scale AND the ue8m0 shared
+ * exponent, then accumulate sum((q8-e4m3)^2) and sum(e4m3^2).
+ *
+ * The hand-rolled dev_to_e4m3() that used to live here is gone: it clamped at
+ * 448 with no block scale, which is what produced the saturation artefact
+ * described below.  The E4M3 leg now goes through the engine's own
+ * pulsar_mx_encode(), so the reference is the format we would actually store
+ * rather than a second implementation of it that can drift. */
 __global__ static void act_int8_vs_e4m3_kernel(const float *x, uint64_t n,
                                                double *acc_num, double *acc_den) {
     const uint64_t blk = (uint64_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
@@ -1935,7 +1929,24 @@ __global__ static void act_int8_vs_e4m3_kernel(const float *x, uint64_t n,
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
     const float scale = (a > 0.0f) ? (a / 127.0f) : 1.0f;
     const float vq8   = isfinite(v) ? rintf(v / scale) * scale : 0.0f;
-    const float ve4   = isfinite(v) ? dev_to_e4m3(v) : 0.0f;
+    /* BLOCK-SCALED on BOTH legs.  This used to be a raw dev_to_e4m3(v), i.e.
+     * per-32-block-scaled int8 compared against UNSCALED E4M3 -- and E4M3 tops
+     * out at 448, so every tensor with a larger amax saturated the reference
+     * and the metric exploded.  Measured 2026-08-20, the artefact tracked the
+     * overage exactly: ffn_moe_down and ffn_moe_out (amax 1.70e4, 38x over)
+     * read 329.8% and 328.2%, ffn_shexp (955.9, 2.1x over) read 7.14%, and
+     * every in-range tensor read 2.7-4.0%.
+     *
+     * That bias ran precisely the wrong way: the metric exists to show how far
+     * our int8 activations sit from the source's E4M3, and it made E4M3 look
+     * catastrophic exactly on the wide-dynamic-range tensors where a floating
+     * format beats a linear one.  Use the same ue8m0 shared exponent the
+     * engine actually stores (pulsar_mx_shared_exp / _encode), so the
+     * comparison is the one the A8 decision depends on. */
+    const int   se    = pulsar_mx_shared_exp(a);
+    const float ve4   = isfinite(v)
+                      ? (float)pulsar_mx_encode(v, se) * exp2f((float)se)
+                      : 0.0f;
     const float d     = vq8 - ve4;
     double num = (i < n) ? (double)d * (double)d : 0.0;
     double den = (i < n) ? (double)ve4 * (double)ve4 : 0.0;
