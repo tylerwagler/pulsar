@@ -247,7 +247,10 @@ typedef struct {
 int pulsar_gpu_attn_f16_tier_on(void);
 
 int pulsar_gpu_attention_f16_prefill_mx(
-        float *heads, const float *sinks, const float *q,
+        /* q: stored Q, PULSAR_Q_ELT_SIZE bytes per element.  Opaque here so the
+         * public header does not pull in cuda_fp16.h; the concrete type is
+         * pulsar_q_t in pulsar_cuda_internal.h.  Pass tensor->ptr. */
+        float *heads, const float *sinks, const void *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
@@ -259,7 +262,9 @@ int pulsar_gpu_attention_f16_prefill_mx(
 int pulsar_gpu_attention_f16_prefill(
         float                   *heads,
         const float             *sinks,
-        const float             *q,
+        /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
+         * need not include cuda_fp16.h.  Pass tensor->ptr. */
+        const void              *q,
         const float             *raw_kv,
         const float             *comp_kv,
         uint32_t                n_tokens,
@@ -279,7 +284,9 @@ int pulsar_gpu_attention_f16_prefill(
 int pulsar_gpu_attention_f16_indexed(
         float                   *heads,
         const float             *sinks,
-        const float             *q,
+        /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
+         * need not include cuda_fp16.h.  Pass tensor->ptr. */
+        const void              *q,
         const float             *raw_kv,
         const float             *comp_kv,
         const int               *topk,

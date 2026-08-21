@@ -790,7 +790,7 @@ int pulsar_gpu_attn_f16_tier_on(void) {
 }
 
 int pulsar_gpu_attention_f16_prefill_mx(
-        float *heads, const float *sinks, const float *q,
+        float *heads, const float *sinks, const void *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
@@ -836,7 +836,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
     if (!af16_dynsmem_ok()) return 0;
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv,
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
@@ -851,7 +851,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
 }
 
 int pulsar_gpu_attention_f16_prefill(
-        float *heads, const float *sinks, const float *q,
+        float *heads, const float *sinks, const void *q,
         const float *raw_kv, const float *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
@@ -870,7 +870,7 @@ int pulsar_gpu_attention_f16_prefill(
  * comp rows are ATTN_PACK, always -- the format parameter is gone (see the note
  * on the kernel).  A 0 here is a real failure, never a silent shape demotion. */
 int pulsar_gpu_attention_f16_indexed(
-        float *heads, const float *sinks, const float *q,
+        float *heads, const float *sinks, const void *q,
         const float *raw_kv, const float *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
@@ -917,7 +917,7 @@ int pulsar_gpu_attention_f16_indexed(
     if (!af16_device_supported()) return 0;
     if (!af16_dynsmem_ok()) return 0;
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, q, raw_kv, comp_kv,
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, pos0, n_raw, raw_cap,

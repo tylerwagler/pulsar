@@ -1456,7 +1456,7 @@ static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *
         PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 2u];
 
 static int attention_decode_heads8_launch(
-        float *heads, const float *sinks, const float *q, const float *raw_kv,
+        float *heads, const float *sinks, const pulsar_q_t *q, const float *raw_kv,
         const float *comp_kv, uint32_t non_causal, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
         uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
