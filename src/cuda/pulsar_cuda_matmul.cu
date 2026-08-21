@@ -1888,9 +1888,16 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
     if (g_fp8_offsets.count(weight_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes = out_dim * fblocks * 33;
+        /* No out->bytes term here: the guard at the top of this function
+         * already bounds the destination, and does it in the ELEMENT SIZE
+         * THIS CALL WILL WRITE.  A second copy that hardcoded sizeof(float)
+         * lived here and refused every f16 output whose n_tok passed half the
+         * buffer's capacity -- silently, since a refusal is "did not encode"
+         * rather than an error.  That cost a bisect: it made the Q narrowing
+         * look depth-dependent (fine at 512 and 2048, dead at 4096) when the
+         * real variable was n_tok against the allocation. */
         if (weight_offset > model_size || fbytes > model_size - weight_offset ||
-            x->bytes < n_tok * in_dim * sizeof(float) ||
-            out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+            x->bytes < n_tok * in_dim * sizeof(float)) return 0;
         /* Small batches (spec-decode verify, n_tok 2..4): batched GEMV over the
          * de-interleaved weight. One weight-row read serves all tokens, vs the
          * tensor-core tile path which is latency-bound at these shapes (the
