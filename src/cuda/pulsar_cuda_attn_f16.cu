@@ -125,12 +125,13 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
  * both elements. The rotation is the shared core every tail-rope consumer
  * uses (pulsar_cuda_rope.cuh) -- a transcribed copy here is how bit-exactness
  * would die. */
+template <typename QT>
 __device__ static inline uint32_t af16_pack_qraw(
-        const float *qrow, uint32_t c0, float scale, uint32_t q_nope,
+        const QT *qrow, uint32_t c0, float scale, uint32_t q_nope,
         const pulsar_gpu_q_prep qp, uint32_t rope_pos,
         float corr0, float corr1) {
-    float x0 = qrow[c0] * scale;
-    float x1 = qrow[c0 + 1u] * scale;
+    float x0 = q_load<QT>(qrow, c0) * scale;
+    float x1 = q_load<QT>(qrow, c0 + 1u) * scale;
     if (c0 >= q_nope) {
         float r0, r1;
         rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
@@ -142,11 +143,12 @@ __device__ static inline uint32_t af16_pack_qraw(
     return af16_pack(x0, x1);
 }
 
+template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
         float *__restrict__ heads,            /* [n_tokens][n_head][512] */
         const float *__restrict__ sinks,      /* [n_head] */
-        const float *__restrict__ q,          /* [n_tokens][n_head][512] */
+        const QT *__restrict__ q,             /* [n_tokens][n_head][512], f32 or __half */
         const float *__restrict__ raw_kv,     /* PULSAR_ATTN_PACK rows */
         const float *__restrict__ comp_kv,    /* PULSAR_ATTN_PACK rows; may alias raw.
                                                * ⚠ THE POINTER TYPE LIES: these are
@@ -347,10 +349,10 @@ static void attn_f16_kernel(
         const uint32_t half = tid >> 8u;     /* which of the pass's two rows */
         const uint32_t vtid = tid & 255u;    /* the standalone kernel's tid */
         for (uint32_t r2 = 0; r2 < AF16_HPB; r2 += 2u) {
-            const float *xr = q + ((uint64_t)t * n_head + hbase + r2 + half) * AF16_DIM;
+            const QT *xr = q + ((uint64_t)t * n_head + hbase + r2 + half) * AF16_DIM;
             float sum = 0.0f;
             for (uint32_t i = vtid; i < AF16_DIM; i += 256u) {
-                float v = xr[i];
+                float v = q_load<QT>(xr, i);
                 sum += v * v;
             }
             sQpart[half][vtid] = sum;
@@ -381,18 +383,18 @@ static void attn_f16_kernel(
             const uint32_t k0 = (kgrp * AF16_KPW + s) * 16u;
             const uint32_t hA = g, hB = g + 8u;         /* the fragment's two rows */
             const uint32_t c0 = k0 + tg * 2u, c1 = k0 + tg * 2u + 8u;
-            const float *qa = q + qbase + (uint64_t)hA * AF16_DIM;
-            const float *qb = q + qbase + (uint64_t)hB * AF16_DIM;
+            const QT *qa = q + qbase + (uint64_t)hA * AF16_DIM;
+            const QT *qb = q + qbase + (uint64_t)hB * AF16_DIM;
             if (q_raw) {
-                qf[s][0] = af16_pack_qraw(qa, c0, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][1] = af16_pack_qraw(qb, c0, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][2] = af16_pack_qraw(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
-                qf[s][3] = af16_pack_qraw(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][0] = af16_pack_qraw<QT>(qa, c0, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][1] = af16_pack_qraw<QT>(qb, c0, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][2] = af16_pack_qraw<QT>(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][3] = af16_pack_qraw<QT>(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
             } else {
-                qf[s][0] = af16_pack(qa[c0], qa[c0 + 1u]);
-                qf[s][1] = af16_pack(qb[c0], qb[c0 + 1u]);
-                qf[s][2] = af16_pack(qa[c1], qa[c1 + 1u]);
-                qf[s][3] = af16_pack(qb[c1], qb[c1 + 1u]);
+                qf[s][0] = af16_pack(q_load<QT>(qa, c0), q_load<QT>(qa, c0 + 1u));
+                qf[s][1] = af16_pack(q_load<QT>(qb, c0), q_load<QT>(qb, c0 + 1u));
+                qf[s][2] = af16_pack(q_load<QT>(qa, c1), q_load<QT>(qa, c1 + 1u));
+                qf[s][3] = af16_pack(q_load<QT>(qb, c1), q_load<QT>(qb, c1 + 1u));
             }
         }
     }
@@ -761,9 +763,19 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
 static int af16_dynsmem_ok(void) {
     static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
     if (state == 0) {
-        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel,
+        /* ⚠ THE GRANT IS PER-INSTANTIATION.  attn_f16_kernel is templated on
+         * batch_q's element type (L045), and a missing grant does not fail
+         * loudly at build time -- the launch gets 0 dynamic bytes and faults,
+         * exactly as the comment above warns.  So BOTH instantiations are
+         * granted here even though only <float> is launched today: the f16
+         * flip must not be able to forget this. */
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<float>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 (int)AF16_DYNSMEM_BYTES);
+        cudaError_t e16 = cudaFuncSetAttribute(attn_f16_kernel<__half>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        if (e == cudaSuccess && e16 != cudaSuccess) e = e16;
         state = (e == cudaSuccess) ? 1 : -1;
         if (state < 0)
             fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
