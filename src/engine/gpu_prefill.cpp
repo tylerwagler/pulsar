@@ -839,28 +839,17 @@ bool gpu_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         PULSAR_CUDA_PROFILE_Q_STAGE("q_b");
-        const bool prefill_q_norm_debug = gpu_graph_debug_wants("Qnorm", il, pos0);
-    if (prefill_q_norm_debug) {
-        /* ⚠ A DUMP REQUEST IS CHANGING THE KERNEL PATH.  Asking for "Qnorm"
-         * forces the separate norm and rope kernels because the fused one never
-         * materialises the intermediate.  The numbers you are about to dump are
-         * therefore NOT the numbers production computes.  Say so -- diagnosing a
-         * numeric problem with a dump produced by a different kernel is how an
-         * afternoon disappears. */
-        static int warned_qnorm_prefill = 0;
-        if (!warned_qnorm_prefill) {
-            warned_qnorm_prefill = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING Qnorm dump disables the fused norm+rope "
-                    "kernel -- dumped prefill values differ from a normal run\n");
-        }
-    }
         /* Deferring norm+rope into the attention Q load leaves batch_q RAW,
-         * so any dump of the normed intermediate ("Qnorm" or "Qcur") forces
-         * the materializing paths below -- same doctrine as the warning
-         * above: a dump request changes the kernel path and says so. */
-        const bool prefill_q_defer = !prefill_q_norm_debug &&
-                                     !gpu_graph_debug_wants("Qcur", il, pos0) &&
+         * so a "Qcur" dump -- the only Q dump left -- still forces the fused
+         * kernel: the normed+roped Q otherwise exists only inside the
+         * attention kernel's registers. */
+        /* A "Qcur" dump still forces the materialising path -- under defer
+         * batch_q holds RAW q_b output and the normed+roped Q exists only
+         * inside the attention kernel's registers, so there is nothing to
+         * dump without computing it somewhere.  That at least lands on the
+         * FUSED kernel, which is a real fallback path (non-f16 hardware,
+         * PULSAR_CUDA_ATTN_F16=0), not a debug-only one. */
+        const bool prefill_q_defer = !gpu_graph_debug_wants("Qcur", il, pos0) &&
                                      pulsar_gpu_attn_f16_tier_on();
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
@@ -877,7 +866,7 @@ bool gpu_graph_encode_layer_attention_batch(
             g->q_prep.beta_slow = PULSAR_ROPE_YARN_BETA_SLOW;
             g->q_prep_active = 1;
             prefill_q_norm_rope_fused = true;   /* deferred into attention */
-        } else if (ok && !prefill_q_norm_debug) {
+        } else if (ok) {
             prefill_q_norm_rope_fused =
                 pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
                                                        n_tokens,
@@ -897,36 +886,25 @@ bool gpu_graph_encode_layer_attention_batch(
                                                        mseq ? g->batch_positions : NULL,
                                                    /* q_f16: */ 0) != 0;
         }
-        if (!prefill_q_norm_rope_fused) {
-            if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->batch_q,
-                                                        n_tokens,
-                                                        PULSAR_N_HEAD,
-                                                        PULSAR_N_HEAD_DIM,
-                                                        PULSAR_RMS_EPS,
-                                                        /* q_f16: */ 0) != 0;
-            if (ok) {
-                gpu_graph_debug_dump_tensor("Qnorm", g->batch_q,
-                                              (uint64_t)n_tokens * q_dim, il, pos0);
-            }
-            PULSAR_CUDA_PROFILE_Q_STAGE("head_norm");
-            if (ok) ok = pulsar_gpu_rope_tail_tensor(g->batch_q,
-                                                    n_tokens,
-                                                    PULSAR_N_HEAD,
-                                                    PULSAR_N_HEAD_DIM,
-                                                    PULSAR_N_ROT,
-                                                    pos0,
-                                                    compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                    false,
-                                                    freq_base,
-                                                    freq_scale,
-                                                    ext_factor,
-                                                    attn_factor,
-                                                    PULSAR_ROPE_YARN_BETA_FAST,
-                                                    PULSAR_ROPE_YARN_BETA_SLOW,
-                                                    mseq ? g->batch_positions : NULL) != 0;
-        } else {
-            PULSAR_CUDA_PROFILE_Q_STAGE("head_norm");
+        /* The separate head-norm + rope-tail pair that used to live here was
+         * reachable ONLY by asking for a "Qnorm" dump: the fused kernel never
+         * materialises that intermediate, so the dump request forced a
+         * different pair of kernels and the dumped numbers were, by the file's
+         * own warning, not the numbers production computes.  A debug
+         * affordance that changes what it observes cannot diagnose what it
+         * observes, so it is gone along with the "Qnorm" dump.  Prefill Q now
+         * has exactly two paths: deferred into attention (shipped) and the
+         * fused kernel (fallback).  L045 stage 2.
+         *
+         * If the post-norm/pre-rope intermediate is ever genuinely needed, the
+         * honest way to get it is an optional store from the SHIPPED kernel,
+         * not a second code path that only debuggers take. */
+        if (!prefill_q_norm_rope_fused && ok) {
+            fprintf(stderr, "pulsar: prefill Q reached neither the deferred nor the fused "
+                            "norm+rope path -- refusing rather than leaving Q unnormalised\n");
+            ok = false;
         }
+        PULSAR_CUDA_PROFILE_Q_STAGE("head_norm");
         if (ok) {
             gpu_graph_debug_dump_tensor("Qcur", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);

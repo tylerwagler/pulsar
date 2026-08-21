@@ -460,24 +460,8 @@ bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    const bool decode_q_norm_debug = gpu_graph_debug_wants("Qnorm", il, pos);
-    if (decode_q_norm_debug) {
-        /* ⚠ A DUMP REQUEST IS CHANGING THE KERNEL PATH.  Asking for "Qnorm"
-         * forces the separate norm and rope kernels because the fused one never
-         * materialises the intermediate.  The numbers you are about to dump are
-         * therefore NOT the numbers production computes.  Say so -- diagnosing a
-         * numeric problem with a dump produced by a different kernel is how an
-         * afternoon disappears. */
-        static int warned_qnorm_decode = 0;
-        if (!warned_qnorm_decode) {
-            warned_qnorm_decode = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING Qnorm dump disables the fused norm+rope "
-                    "kernel -- dumped decode values differ from a normal run\n");
-        }
-    }
     bool decode_q_norm_rope_fused = false;
-    if (ok && !decode_q_norm_debug) {
+    if (ok) {
         decode_q_norm_rope_fused =
             pulsar_gpu_head_rms_norm_rope_tail_tensor(g->q,
                                                    1,
@@ -497,17 +481,16 @@ bool gpu_graph_encode_decode_layer(
                                                    NULL,
                                                    /* q_f16: */ 0) != 0;
     }
-    if (!decode_q_norm_rope_fused) {
-        if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS, /* q_f16: */ 0) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
-        }
-        if (ok) ok = pulsar_gpu_rope_tail_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                                PULSAR_N_ROT, pos,
-                                                compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                false, freq_base, freq_scale, ext_factor, attn_factor,
-                                                PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
-                                                NULL) != 0;
+    /* The separate head-norm + rope-tail pair here was reachable ONLY via a
+     * "Qnorm" dump request, and the fused kernel never materialises that
+     * intermediate -- so the dump forced different kernels and, by this file's
+     * own former warning, produced numbers production does not compute.
+     * Removed with the dump: a debug affordance that changes what it observes
+     * cannot diagnose what it observes.  L045 stage 2. */
+    if (!decode_q_norm_rope_fused && ok) {
+        fprintf(stderr, "pulsar: decode Q norm+rope did not run -- refusing rather than "
+                        "leaving Q unnormalised\n");
+        ok = false;
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("q_path");
     if (ok) {

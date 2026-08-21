@@ -196,27 +196,6 @@ __device__ __forceinline__ void q_store<float>(float *p, uint64_t i, float v) { 
 template <>
 __device__ __forceinline__ void q_store<__half>(__half *p, uint64_t i, float v) { p[i] = __float2half(v); }
 
-template <typename QT>
-__global__ static void head_rms_norm_kernel(QT *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_tok * n_head) return;
-    QT *xr = x + (uint64_t)row * head_dim;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = q_load<QT>(xr, i);
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x)
-        q_store<QT>(xr, i, q_load<QT>(xr, i) * scale);
-}
 
 
 
@@ -1216,18 +1195,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 
 
 
-/* q_f16: batch_q's element type. 0 = f32 (what ships today, bit-identical to
- * the untemplated kernel this replaced); 1 = __half (L045). Passed EXPLICITLY
- * rather than inferred from the tensor: pulsar_gpu_tensor carries no element
- * type, and inferring one from ->bytes would silently mis-dispatch a view. */
-int pulsar_gpu_head_rms_norm_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps, int q_f16) {
-    const uint64_t elts = (uint64_t)n_tok * n_head * head_dim;
-    const size_t esz = q_f16 ? sizeof(__half) : sizeof(float);
-    if (!x || x->bytes < elts * esz) return 0;
-    if (q_f16) head_rms_norm_kernel<__half><<<n_tok * n_head, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, eps);
-    else       head_rms_norm_kernel<float ><<<n_tok * n_head, 256>>>((float  *)x->ptr, n_tok, n_head, head_dim, eps);
-    return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
-}
 
 
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions, int q_f16) {

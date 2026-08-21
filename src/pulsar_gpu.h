@@ -571,15 +571,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
          * reads f32 and would silently show stale bytes. */
         int                     q_skip_f32);
 
-/* q_f16 selects batch_q's element type: 0 = f32 (ships today), 1 = __half
- * (L045). Storage narrows; the sum of squares still accumulates in f32. */
-int pulsar_gpu_head_rms_norm_tensor(
-        pulsar_gpu_tensor *x,
-        uint32_t          n_tok,
-        uint32_t          n_head,
-        uint32_t          head_dim,
-        float             eps,
-        int               q_f16);
 
 /* positions (both RoPE entries below): optional int32 [n_tok] DEVICE array of
  * per-row absolute positions for multi-session banked batches (rows of
