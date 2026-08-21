@@ -123,7 +123,7 @@ static int check_decode_attention_overflow_path(void) {
 
     pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     /* Attention Q: stored element size, not f32 (L045). */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
     pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
@@ -214,7 +214,7 @@ static int check_dspark_non_causal_attention(void) {
     pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
     pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
     /* Attention Q: stored element size, not f32 (L045). */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * q_count * PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tokens * q_count, PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
@@ -512,7 +512,7 @@ static int mb_run_case(const char *label,
     }
 
     /* Attention Q: stored element size, not f32 (L045).  heads stays f32. */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(q_count * PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
     pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
@@ -580,7 +580,8 @@ static int mb_run_case(const char *label,
             ? pulsar_gpu_tensor_view(comp_slab, (uint64_t)row->bank * comp_bank_bytes,
                                   comp_bank_bytes)
             : NULL;
-        pulsar_gpu_tensor *q_ref = pulsar_gpu_tensor_alloc((uint64_t)ref_rows * row_f32 * sizeof(float));
+        /* Attention Q, same as the batch side: element size, not f32. */
+        pulsar_gpu_tensor *q_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_Q_ELT_SIZE);
         pulsar_gpu_tensor *h_ref = pulsar_gpu_tensor_alloc((uint64_t)ref_rows * row_f32 * sizeof(float));
         pulsar_gpu_tensor *tk_ref = indexed
             ? pulsar_gpu_tensor_alloc((uint64_t)ref_rows * top_k * sizeof(int32_t))
@@ -598,8 +599,8 @@ static int mb_run_case(const char *label,
                 q_ref_host[i] = 0.01f;
             memcpy(q_ref_host + (uint64_t)(ref_rows - 1) * row_f32,
                    q_host + (uint64_t)r * row_f32, row_f32 * sizeof(float));
-            ok = pulsar_gpu_tensor_write(q_ref, 0, q_ref_host,
-                                      (uint64_t)ref_rows * row_f32 * sizeof(float));
+            ok = pulsar_gpu_tensor_write_q_f32(q_ref, 0, q_ref_host,
+                                           (uint64_t)ref_rows * row_f32);
             if (ok && indexed) {
                 for (uint32_t rr = 0; rr < ref_rows; rr++)
                     memcpy(tk_ref_host + (uint64_t)rr * top_k,
