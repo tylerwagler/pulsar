@@ -715,16 +715,13 @@ bool gpu_graph_encode_layer_attention_batch(
          * LAST FOUR rows stay f32 either way: the ratio-4 compressor rebuild
          * reads them through an offset view (gpu_prefill.cpp:143). */
         attn_norm_keep_from = 0u;
-        /* ⚠ SKIP PARKED 2026-08-22 (predicate forced off; machinery kept).
-         * First gated flight corrupted every prefill logit: a DIRECT-KERNEL
-         * reader outside both hazard-checked GEMM arms consumes these f32
-         * rows (prime suspect: the MoE gather/re-encode on the mixed case-A
-         * layers).  My reader census covered the matmul arms and the tail
-         * view -- "grep the buffer, not the accessor", and I grepped the
-         * accessor.  Re-enable ONLY behind a census of every direct float*
-         * consumer of batch_attn_norm/batch_ffn_norm, each either served by
-         * an encoding or hazard-checked. */
-        if (0 && attn_norm_q && attn_norm_b &&
+        /* RE-ENABLED 2026-08-22 after the L089 direct-consumer census: every
+         * batch_attn_norm consumer resolves to a GEMM arm (served by the
+         * E4M3/bf16 encodings or hazard-checked) plus the kept-row tail view.
+         * The corrupting first flight had BOTH skips on; the direct-kernel
+         * reader that caused it is on the FFN side (routed MoE reads
+         * batch_ffn_norm raw), whose skip stays parked below. */
+        if (attn_norm_q && attn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled() && n_tokens >= 4u) {
             attn_norm_keep_from = n_tokens - 4u;
@@ -2299,7 +2296,12 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the output head's scratch view (the L035 site) -- WRITES its rows
          * before reading them, so it never sees ours. */
         ffn_norm_keep_from = 0u;
-        /* ⚠ SKIP PARKED 2026-08-22 -- see the attn twin above. */
+        /* ⚠ SKIP PARKED 2026-08-22 (L089): the routed MoE entry takes
+         * batch_ffn_norm RAW (this file ~:2505) and moe.cu reads the f32 on
+         * its gather/quantize arms (grouped-miss, mixed case-A, MMQ handover
+         * miss).  Re-enable only when those paths are served by the
+         * producer's encoding or hazard-checked -- this is the reader that
+         * corrupted the first flight. */
         if (0 && ffn_norm_q && ffn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled()) {
