@@ -555,7 +555,9 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
  * or the GEMM reads a store that was never written and returns a well-formed
  * wrong answer.  Every f32-reading arm of the mxfp8 family checks this and
  * fails loudly rather than run. */
-void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(void);
+/* keep_from: rows below it were skipped; rows >= keep it.  A full skip
+ * passes the arming n_tok. */
+void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from);
 
 /* Hand back the E4M3 encoding this buffer already carries, or 0 if the cache
  * holds none for (ptr, n_tok, in_dim). Lets a consumer that would otherwise

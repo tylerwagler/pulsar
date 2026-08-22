@@ -855,6 +855,12 @@ struct mxfp8_act_cache_t {
      * well-formed WRONG answer, not a crash.  See the invariant at
      * act_f32_absent_hazard(). */
     int            f32_absent;
+    /* Rows < this had their f32 store skipped; rows >= are present.  A
+     * full skip sets it to key_ntok.  Exists because the first flight of
+     * the bf16 backstop refused the ratio-4 tail rebuild -- a read of the
+     * four rows the skip deliberately KEPT -- and a boolean cannot tell
+     * the kept tail from the skipped body. */
+    uint32_t       f32_keep_from;
     uint64_t       lru;          /* eviction stamp; 0 = never used */
 };
 static thread_local mxfp8_act_cache_t g_act_slots[PULSAR_ACT_SLOTS];
@@ -987,7 +993,7 @@ static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint
         s->key_in_dim = in_dim;
         s->lru        = ++g_act_clock;
     }
-    s->valid = 0; s->valid_b = 0; s->f32_absent = 0;
+    s->valid = 0; s->valid_b = 0; s->f32_absent = 0; s->f32_keep_from = 0;
     return s;
 }
 
@@ -1001,6 +1007,7 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void) {
         g_act_slots[i].valid      = 0;
         g_act_slots[i].valid_b    = 0;
         g_act_slots[i].f32_absent = 0;
+        g_act_slots[i].f32_keep_from = 0;
     }
     g_act_cur = NULL;
 }
@@ -1042,13 +1049,27 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
         const char *base = (const char *)s->key_ptr;
         const char *end  = base + s->key_ntok * s->key_in_dim * sizeof(float);
         const char *p    = (const char *)ptr;
-        if (p >= base && p < end) return 1;
+        if (p < base || p >= end) continue;
+        /* Row-granular: the skip may deliberately KEEP a tail (the ratio-4
+         * rebuild reads the last four rows of attn_norm).  Absent rows are
+         * [0, f32_keep_from); a read is hazardous only if it TOUCHES them.
+         * The read's row extent is computed in the SLOT's stride -- if the
+         * reader's in_dim disagrees with the slot's, fall back to refusing,
+         * because a stride mismatch means we cannot reason about rows at all. */
+        const uint64_t off = (uint64_t)(p - base);
+        if (in_dim != s->key_in_dim ||
+            (off % (s->key_in_dim * sizeof(float))) != 0) return 1;
+        const uint64_t start_row = off / (s->key_in_dim * sizeof(float));
+        if (start_row < s->f32_keep_from) return 1;
     }
     return 0;
 }
 
-void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(void) {
-    if (g_act_cur) g_act_cur->f32_absent = 1;
+void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
+    if (g_act_cur) {
+        g_act_cur->f32_absent    = 1;
+        g_act_cur->f32_keep_from = keep_from;
+    }
 }
 
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so

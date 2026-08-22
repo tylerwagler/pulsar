@@ -776,7 +776,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * wrote into the cache's slot IS current for this exact tensor. */
     if (ok && attn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && attn_norm_b) pulsar_gpu_bf16_act_note(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD);
-    if (ok && attn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
+    if (ok && attn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(attn_norm_keep_from);
     PULSAR_CUDA_PROFILE_ATTN_STAGE("norm");
     PULSAR_CUDA_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
@@ -860,7 +860,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              qr_skip_f32) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_tokens, (uint64_t)q_rank);
         if (ok && qr_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-        if (ok && qr_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
+        if (ok && qr_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n_tokens);
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("q_lora_norm", g->batch_qr_norm,
@@ -2343,7 +2343,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && ffn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && ffn_norm_b) pulsar_gpu_bf16_act_note(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
-    if (ok && ffn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
+    if (ok && ffn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(ffn_norm_keep_from);
     if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_router_logits,
                                               model,
                                               layer->ffn_gate_inp,
@@ -2450,7 +2450,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                              shmid_skip_f32) != 0; \
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_shared_mid, n_tokens, (uint64_t)shared_dim); \
         if (ok && shmid_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8(); \
-        if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(); \
+        if (ok && shmid_skip_f32) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(n_tokens); \
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("shared_down", \
                                                                               il, \
                                                                               pos0, \
