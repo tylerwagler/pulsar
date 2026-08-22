@@ -483,7 +483,9 @@ uint64_t gpu_graph_session_bytes_banked(
     total += 2ull * pc * dz.hc_dim * hc;                  /* batch_cur/next_hc (carriers) */
     total += pc * dz.hc_dim * f32;                        /* batch_flat_hc (RMSNorm out, f32) */
     total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
-    total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_attn_cur/norm */
+    total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_norm */
+    if (gpu_graph_debug_dump_enabled())
+        total += pc * PULSAR_N_EMBD * f32;                   /* batch_attn_cur (dump-only) */
     total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
     total += pc * dz.q_dim * PULSAR_Q_ELT_SIZE;           /* batch_q */
     total += 2ull * pc * PULSAR_N_HEAD_DIM * f32;            /* batch_kv_raw/kv */
@@ -1935,7 +1937,13 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_hc_mix = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_attn_cur = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
+    /* Dump-only carrier (L090.1): its WRITE has been dump-gated NULL since the
+     * dead-store pass, but the 64 MiB allocation never followed.  Confirmed by
+     * the D2 hand census: zero non-debug readers.  Allocate it only when a
+     * dump can actually want it, and keep the budget line in step -- the
+     * session ledger asserts est == actual. */
+    g->batch_attn_cur = gpu_graph_debug_dump_enabled()
+            ? pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float)) : NULL;
     g->batch_attn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_qr = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
@@ -2017,7 +2025,8 @@ bool gpu_graph_alloc_raw_cap(
                     g->prefill_tokens && g->spec_logits &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
-                    g->batch_attn_cur && g->batch_attn_norm &&
+                    (g->batch_attn_cur || !gpu_graph_debug_dump_enabled()) &&
+                    g->batch_attn_norm &&
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
@@ -2117,6 +2126,16 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
                 g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
                 ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
             }
+        }
+        /* Shared emit sink for BOTH compressors (L090.2): sized by the attention
+         * head dim but also handed to the indexer roll-forward.  Safe only
+         * while the indexer row fits; both are runtime shape values, so say it
+         * loudly instead of assuming it quietly. */
+        if (PULSAR_N_INDEXER_HEAD_DIM > PULSAR_N_HEAD_DIM) {
+            fprintf(stderr, "pulsar: spec_comp_scratch_row sized for head_dim=%u but "
+                            "indexer head_dim=%u exceeds it -- refusing graph alloc\n",
+                    (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_INDEXER_HEAD_DIM);
+            return false;
         }
         g->spec_comp_scratch_row = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         ok = ok && g->spec_comp_scratch_row;

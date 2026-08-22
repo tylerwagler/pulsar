@@ -1395,9 +1395,9 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_hc_mix, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
         pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
             g->batch_hc_split, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
-        pulsar_gpu_tensor *attn_cur_view = pulsar_gpu_tensor_view(
+        pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_draft * PULSAR_N_EMBD * sizeof(float));
-        ok = hc_mix_view && hc_split_view && attn_cur_view;
+        ok = hc_mix_view && hc_split_view && ffn_cur_view;
         /* RMS norm: flat HC from batch_cur_hc */
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
             g->batch_flat_hc, g->batch_cur_hc,
@@ -1409,7 +1409,7 @@ bool gpu_graph_dspark_draft_forward(
             hc_dim, mix_hc, g->batch_flat_hc, n_draft);
         /* HC split + weighted sum → attn_cur (E-dim) */
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(
-            attn_cur_view, hc_split_view, hc_mix_view,
+            ffn_cur_view, hc_split_view, hc_mix_view,
             g->batch_cur_hc,
             dspark_model->map, dspark_model->size,
             layer->hc_attn_scale->abs_offset,
@@ -1418,7 +1418,7 @@ bool gpu_graph_dspark_draft_forward(
             PULSAR_N_HC_SINKHORN_ITER, PULSAR_HC_EPS) != 0;
         /* Input RMS norm → batch_attn_norm */
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
-            g->batch_attn_norm, attn_cur_view,
+            g->batch_attn_norm, ffn_cur_view,
             dspark_model->map, dspark_model->size,
             layer->attn_norm->abs_offset,
             PULSAR_N_EMBD, n_draft, PULSAR_RMS_EPS,
@@ -1570,7 +1570,7 @@ bool gpu_graph_dspark_draft_forward(
          * free them each layer or they leak on every speculative block. */
         pulsar_gpu_tensor_free(hc_mix_view);
         pulsar_gpu_tensor_free(hc_split_view);
-        pulsar_gpu_tensor_free(attn_cur_view);
+        pulsar_gpu_tensor_free(ffn_cur_view);
     }
 
     g->comp_ratio_override = prev_comp;
