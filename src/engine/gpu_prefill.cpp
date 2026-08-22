@@ -715,7 +715,16 @@ bool gpu_graph_encode_layer_attention_batch(
          * LAST FOUR rows stay f32 either way: the ratio-4 compressor rebuild
          * reads them through an offset view (gpu_prefill.cpp:143). */
         attn_norm_keep_from = 0u;
-        if (attn_norm_q && attn_norm_b &&
+        /* ⚠ SKIP PARKED 2026-08-22 (predicate forced off; machinery kept).
+         * First gated flight corrupted every prefill logit: a DIRECT-KERNEL
+         * reader outside both hazard-checked GEMM arms consumes these f32
+         * rows (prime suspect: the MoE gather/re-encode on the mixed case-A
+         * layers).  My reader census covered the matmul arms and the tail
+         * view -- "grep the buffer, not the accessor", and I grepped the
+         * accessor.  Re-enable ONLY behind a census of every direct float*
+         * consumer of batch_attn_norm/batch_ffn_norm, each either served by
+         * an encoding or hazard-checked. */
+        if (0 && attn_norm_q && attn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled() && n_tokens >= 4u) {
             attn_norm_keep_from = n_tokens - 4u;
@@ -2290,7 +2299,8 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the output head's scratch view (the L035 site) -- WRITES its rows
          * before reading them, so it never sees ours. */
         ffn_norm_keep_from = 0u;
-        if (ffn_norm_q && ffn_norm_b &&
+        /* ⚠ SKIP PARKED 2026-08-22 -- see the attn twin above. */
+        if (0 && ffn_norm_q && ffn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled()) {
             ffn_norm_keep_from = n_tokens;
