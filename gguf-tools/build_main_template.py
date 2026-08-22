@@ -182,11 +182,13 @@ F32_SOURCE = {
 }
 
 # NOT in the group: indexer.attn_q_b.weight is F8_E4M3 upstream (21 tensors).
-# f16 already represents every e4m3 value exactly -- 10 mantissa bits against
-# e4m3's 3, and f16's range covers e4m3's -- so storing it F16 costs nothing in
-# fidelity, only 2x the bytes. BF16 would be exact too, so moving it buys
-# nothing. The real fix is to keep it fp8 end to end, which is an A8-campaign
-# item and an engine change, not a template type flip.
+# ✅ RESOLVED (verified against the serving artifact 2026-08-22): these ship as
+# MXFP8_LT (type 41), zero-copy, consumed by the mxfp8 arm against E4M3
+# activations -- fp8 end to end, storage and compute. This comment used to
+# describe the F16-storage era and call the fix "an A8-campaign item"; the
+# engine arm landed 2026-08-17 and the -lt artifact carries the repack. The
+# stale version of this paragraph sent one more audit chasing settled work,
+# which is why it now records the resolution instead of the plan.
 
 
 # 1-D tensors the checkpoint holds in BF16. The rest of the 1-D set --
