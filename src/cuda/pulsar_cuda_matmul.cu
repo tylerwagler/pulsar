@@ -2398,6 +2398,20 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
                                                               "bf16 activations");
     if (!xbb) return 0;
     if (!hb || !hb->valid_b) {
+        /* Shape census for L086 T3 (producer-emits-bf16): each unique
+         * (n_tok, in_dim) prints once, so the 169 convert launches the D1
+         * profile counted become attributable to producers without a rerun.
+         * Same announce discipline as the skip/tier prints in this file. */
+        static uint64_t seen_shapes[8];
+        static int n_seen = 0;
+        const uint64_t shape_key = (n_tok << 32) | in_dim;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_shapes[i] == shape_key) { known = 1; break; }
+        if (!known && n_seen < 8) {
+            seen_shapes[n_seen++] = shape_key;
+            fprintf(stderr, "pulsar: bf16 act convert shape n_tok=%llu in_dim=%llu (T3 census)\n",
+                    (unsigned long long)n_tok, (unsigned long long)in_dim);
+        }
         f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
                                                             (const float *)x->ptr, xb_count);
         if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
