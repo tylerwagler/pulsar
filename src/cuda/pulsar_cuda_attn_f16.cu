@@ -106,6 +106,23 @@ __device__ __forceinline__ static void af16_mma(
 }
 #endif
 
+/* Load a pair of ADJACENT stored-Q elements as one packed-f16 fragment word.
+ * For f32 storage this converts; for __half storage the bytes are already the
+ * fragment encoding, so it is a single aligned 4-byte load -- the old path
+ * round-tripped half->float->half for nothing (L086 T7).  Alignment: callers
+ * pass even element indices off 256-aligned row bases. */
+template <typename QT>
+__device__ __forceinline__ static uint32_t af16_load_pair(const QT *p, uint32_t i);
+template <>
+__device__ __forceinline__ uint32_t af16_load_pair<float>(const float *p, uint32_t i) {
+    return (uint32_t)__half_as_ushort(__float2half(p[i])) |
+           ((uint32_t)__half_as_ushort(__float2half(p[i + 1u])) << 16);
+}
+template <>
+__device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint32_t i) {
+    return *(const uint32_t *)(p + i);
+}
+
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half(lo)) |
            ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);
@@ -391,10 +408,10 @@ static void attn_f16_kernel(
                 qf[s][2] = af16_pack_qraw<QT>(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
                 qf[s][3] = af16_pack_qraw<QT>(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
             } else {
-                qf[s][0] = af16_pack(q_load<QT>(qa, c0), q_load<QT>(qa, c0 + 1u));
-                qf[s][1] = af16_pack(q_load<QT>(qb, c0), q_load<QT>(qb, c0 + 1u));
-                qf[s][2] = af16_pack(q_load<QT>(qa, c1), q_load<QT>(qa, c1 + 1u));
-                qf[s][3] = af16_pack(q_load<QT>(qb, c1), q_load<QT>(qb, c1 + 1u));
+                qf[s][0] = af16_load_pair<QT>(qa, c0);
+                qf[s][1] = af16_load_pair<QT>(qb, c0);
+                qf[s][2] = af16_load_pair<QT>(qa, c1);
+                qf[s][3] = af16_load_pair<QT>(qb, c1);
             }
         }
     }
