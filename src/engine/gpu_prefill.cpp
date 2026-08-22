@@ -677,6 +677,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * construction -- cublasSgemm needs exactly the store it was skipping. */
     void *attn_norm_q = NULL, *attn_norm_sf = NULL; int attn_norm_kbp = 0;
     void *attn_norm_b = NULL;
+    uint32_t attn_norm_keep_from = 0u;
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -708,6 +709,25 @@ bool gpu_graph_encode_layer_attention_batch(
                                             &attn_norm_b)) {
             attn_norm_b = NULL;
         }
+        /* Same predicate family as shmid_skip_f32, same 7b6448b lesson: the
+         * mixed-batch split's offset views read f32 and key no cache slot, so
+         * the skip requires the split disarmed.  Dumps read f32 too.  The
+         * LAST FOUR rows stay f32 either way: the ratio-4 compressor rebuild
+         * reads them through an offset view (gpu_prefill.cpp:143). */
+        attn_norm_keep_from = 0u;
+        if (attn_norm_q && attn_norm_b &&
+            pulsar_gpu_matmul_batch_mneutral() == 0 &&
+            !gpu_graph_debug_dump_enabled() && n_tokens >= 4u) {
+            attn_norm_keep_from = n_tokens - 4u;
+            static int announced_ans = 0;
+            if (!announced_ans) {
+                announced_ans = 1;
+                fprintf(stderr, "pulsar: attn_norm f32 store SKIPPED except last 4 rows "
+                                "(n_tok=%u, %.1f MiB/layer)\n", n_tokens,
+                        (double)attn_norm_keep_from * PULSAR_N_EMBD * sizeof(float) /
+                        (1024.0 * 1024.0));
+            }
+        }
         /* The pre-norm carrier is a dead store unless a dump wants it -- see
          * the kernel's `out` note. */
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
@@ -718,6 +738,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  attn_norm_sf,
                                                                  attn_norm_kbp,
                                                                  attn_norm_b,
+                                                                 attn_norm_keep_from,
                                                                  hc_split_view,
                                                                  hc_mix_view,
                                                                  g->batch_cur_hc,
@@ -755,6 +776,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * wrote into the cache's slot IS current for this exact tensor. */
     if (ok && attn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && attn_norm_b) pulsar_gpu_bf16_act_note(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD);
+    if (ok && attn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
     PULSAR_CUDA_PROFILE_ATTN_STAGE("norm");
     PULSAR_CUDA_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
@@ -2235,6 +2257,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
     void *ffn_norm_b = NULL;
+    uint32_t ffn_norm_keep_from = 0u;
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
@@ -2263,6 +2286,23 @@ bool gpu_graph_encode_layer_ffn_batch(
                                             &ffn_norm_b)) {
             ffn_norm_b = NULL;
         }
+        /* ffn_norm keeps NO f32 rows under the skip: its one offset reuse --
+         * the output head's scratch view (the L035 site) -- WRITES its rows
+         * before reading them, so it never sees ours. */
+        ffn_norm_keep_from = 0u;
+        if (ffn_norm_q && ffn_norm_b &&
+            pulsar_gpu_matmul_batch_mneutral() == 0 &&
+            !gpu_graph_debug_dump_enabled()) {
+            ffn_norm_keep_from = n_tokens;
+            static int announced_fns = 0;
+            if (!announced_fns) {
+                announced_fns = 1;
+                fprintf(stderr, "pulsar: ffn_norm f32 store SKIPPED "
+                                "(n_tok=%u, %.1f MiB/layer)\n", n_tokens,
+                        (double)n_tokens * PULSAR_N_EMBD * sizeof(float) /
+                        (1024.0 * 1024.0));
+            }
+        }
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                                                                  gpu_graph_debug_wants("hc_ffn_pre", il, pos0)
                                                                      ? ffn_cur_view : NULL,
@@ -2271,6 +2311,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  ffn_norm_sf,
                                                                  ffn_norm_kbp,
                                                                  ffn_norm_b,
+                                                                 ffn_norm_keep_from,
                                                                  hc_split_view,
                                                                  hc_mix_view,
                                                                  g->batch_after_attn_hc,
@@ -2302,6 +2343,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && ffn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && ffn_norm_b) pulsar_gpu_bf16_act_note(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
+    if (ok && ffn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped();
     if (ok) ok = gpu_graph_matmul_plain_tensor(g->batch_router_logits,
                                               model,
                                               layer->ffn_gate_inp,

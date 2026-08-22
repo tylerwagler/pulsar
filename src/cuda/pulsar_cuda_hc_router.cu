@@ -187,6 +187,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         unsigned char *norm_out_sf,
         int norm_out_kbp,
         __nv_bfloat16 *norm_out_b,
+        uint32_t norm_f32_keep_from,
         float *split,
         const float *mix,
         const pulsar_hc_t *residual_hc,
@@ -243,10 +244,16 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         const float v = (col < n_embd)
                 ? (accs[u] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col)) : 0.0f;
         if (col < n_embd) {
-            norm_out[obase + col] = v;
-            /* The bf16 copy, from the same register value -- the fourth
-             * emission beside f32/f16/E4M3, so the BF16-weight GEMMs stop
-             * paying a separate whole-tensor convert (L086 T3). */
+            /* Row-conditional f32: below keep_from every consumer reads an
+             * emitted encoding (E4M3 slot / bf16 slot), so the f32 write is a
+             * dead store.  Rows >= keep_from stay f32 for the readers that
+             * genuinely want those bytes -- the ratio-4 compressor rebuild
+             * reads the LAST FOUR rows through an offset view.  The engine
+             * passes 0 (store all) unless its skip predicate holds. */
+            if (t >= norm_f32_keep_from) norm_out[obase + col] = v;
+            /* The bf16 copy, from the same register value -- an emission
+             * beside f32/E4M3, so the BF16-weight GEMMs stop paying a
+             * separate whole-tensor convert (L086 T3). */
             if (norm_out_b) norm_out_b[obase + col] = __float2bfloat16(v);
         }
         /* Warp-uniform: every lane must reach the shuffle.  BLK is a multiple of
@@ -783,6 +790,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         void                    *norm_out_sf,
         int                      norm_out_kbp,
         void                    *norm_out_b,
+        uint32_t                 norm_f32_keep_from,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
@@ -853,6 +861,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
                 (unsigned char *)norm_out_sf,                                        \
                 norm_out_kbp,                                                        \
                 (__nv_bfloat16 *)norm_out_b,                                         \
+                norm_f32_keep_from,                                                  \
                 (float *)split->ptr,                                                 \
                 (const float *)mix->ptr,                                             \
                 (const pulsar_hc_t *)residual_hc->ptr,                               \

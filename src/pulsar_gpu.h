@@ -1500,6 +1500,10 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         int                      norm_out_kbp,
         /* bf16 copy of norm_out (act-cache xb slot); NULL = skip (L086 T3) */
         void                    *norm_out_b,
+        /* f32 rows below this index are DEAD STORES and skipped; 0 = store all.
+         * Pass nonzero ONLY with note_f32_skipped() so the fallback backstop
+         * fails loud instead of reading unwritten bytes. */
+        uint32_t                 norm_f32_keep_from,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,

@@ -2441,6 +2441,16 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
                                 : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
                                                                   "bf16 activations");
     if (!xbb) return 0;
+    /* The mxfp8 arms have carried this backstop since the f32 skips landed;
+     * the bf16 arm converts FROM f32 and had none, so a skipped store plus an
+     * unexpected miss here would convert unwritten bytes in silence. */
+    if (!xb_pre && (!hb || !hb->valid_b) &&
+        act_f32_absent_hazard(x->ptr, n_tok, in_dim)) {
+        fprintf(stderr, "pulsar: bf16 activation convert would read a SKIPPED f32 "
+                        "store (n_tok=%llu in_dim=%llu) -- refusing\n",
+                (unsigned long long)n_tok, (unsigned long long)in_dim);
+        return 0;
+    }
     if (!xb_pre && (!hb || !hb->valid_b)) {
         /* Shape census for L086 T3 (producer-emits-bf16): each unique
          * (n_tok, in_dim) prints once, so the 169 convert launches the D1
