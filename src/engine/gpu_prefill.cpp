@@ -2301,13 +2301,12 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the output head's scratch view (the L035 site) -- WRITES its rows
          * before reading them, so it never sees ours. */
         ffn_norm_keep_from = 0u;
-        /* ⚠ SKIP PARKED 2026-08-22 (L089): the routed MoE entry takes
-         * batch_ffn_norm RAW (this file ~:2505) and moe.cu reads the f32 on
-         * its gather/quantize arms (grouped-miss, mixed case-A, MMQ handover
-         * miss).  Re-enable only when those paths are served by the
-         * producer's encoding or hazard-checked -- this is the reader that
-         * corrupted the first flight. */
-        if (0 && ffn_norm_q && ffn_norm_b &&
+        /* RE-ENABLED 2026-08-22 behind the L089 fail-loud guards: every MoE
+         * tier that gathers or stages from raw f32 now REFUSES when the
+         * store was skipped (PULSAR_MOE_F32_GUARD, moe.cu).  The corrupting
+         * reader class can no longer answer wrong -- it can only fail loud,
+         * and the gate decides which tiers are warm. */
+        if (ffn_norm_q && ffn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled()) {
             ffn_norm_keep_from = n_tokens;

@@ -112,6 +112,9 @@ static inline int pulsar_env_tier_on(const char *name) {
  * float today, __half at the flip. */
 typedef __half pulsar_q_t;
 
+uint32_t pulsar_gpu_act_f32_first_present_row(const void *ptr, uint64_t n_tok,
+                                              uint64_t in_dim);
+
 /* The cudaDataType the stored Q presents to cuBLAS.  Derived from pulsar_q_t
  * rather than written out, so a GEMM's operand type can never drift from the
  * buffer it reads -- that failure mode is a silent wrong answer, not a fault.

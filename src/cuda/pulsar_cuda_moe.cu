@@ -1,6 +1,20 @@
 #include "pulsar_cuda_internal.h"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
+
+/* Every MoE tier below that gathers or stages from the raw f32 activation must
+ * refuse if that buffer's f32 stores were skipped (L089): a gather reads
+ * arbitrary rows, so ANY absent row is a silent wrong answer.  The corrupting
+ * first flight of the ffn store-skip came through exactly these reads. */
+#define PULSAR_MOE_F32_GUARD(xptr, ntok, indim, tag)                             \
+    do {                                                                          \
+        if (pulsar_gpu_act_f32_first_present_row((xptr), (ntok), (indim))) {      \
+            fprintf(stderr, "pulsar: %s would gather from a SKIPPED f32 store "   \
+                            "(n_tok=%u in_dim=%u) -- refusing\n",                \
+                    (tag), (unsigned)(ntok), (unsigned)(indim));                  \
+            return 0;                                                             \
+        }                                                                         \
+    } while (0)
 #endif
 
 
@@ -414,6 +428,7 @@ static int routed_moe_launch_cutlass(
             const uint32_t pair_offset = e_offset + done;
             const uint32_t count = (e_count - done < T_max) ? (e_count - done) : T_max;
 
+            PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe per-expert gather");
             moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
@@ -676,6 +691,8 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped padded offsets launch");
     }
     if (ok) {
+        if (x_gathered)
+            PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe grouped uncached gather");
         moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, row_src_tok,
                 pair_slot,
                 (const float *)x->ptr, (const float *)weights->ptr,
@@ -1012,6 +1029,7 @@ static int routed_moe_launch_mixed40(
             /* row_src_tok = NULL: the mixed-40 path goes through
              * pulsar_cutlass_grouped_proj, which has its own packer and no
              * pre-encoded-activation entry yet, so it still gathers f32. */
+            PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe mixed40 gather");
             moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, NULL,
                     NULL /* pair_slot: this path scatters, no inverse map */,
                     (const float *)x->ptr, (const float *)weights->ptr,
@@ -1248,6 +1266,8 @@ static int routed_moe_try_mmq_gate_up(
                                                  &act_q, &act_sf, &act_kbp)) {
         act_q = NULL; act_sf = NULL; act_kbp = 0;
     }
+    if (!act_q)
+        PULSAR_MOE_F32_GUARD(x_f32, n_tokens, expert_in_dim, "moe MMQ staging (handover miss)");
     const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
         gate_w, up_w, x_f32, selected_ptr, gate_raw, up_raw,
         (int)expert_mid_dim, (int)expert_in_dim,

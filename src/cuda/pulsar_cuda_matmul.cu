@@ -1065,6 +1065,16 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
     return 0;
 }
 
+/* Do rows [0, n_tok) of this buffer have their f32 stores present?  Returns
+ * the first PRESENT row (0 = all present).  For gather-style consumers that
+ * read arbitrary rows, ANY nonzero return is fatal -- they must be served by
+ * an encoding instead.  Exported for the MoE tiers (L089 FFN half). */
+uint32_t pulsar_gpu_act_f32_first_present_row(const void *ptr, uint64_t n_tok,
+                                              uint64_t in_dim) {
+    mxfp8_act_cache_t *s = act_slot_find_rows(ptr, n_tok, in_dim);
+    return (s && s->f32_absent) ? s->f32_keep_from : 0u;
+}
+
 void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     if (g_act_cur) {
         g_act_cur->f32_absent    = 1;
