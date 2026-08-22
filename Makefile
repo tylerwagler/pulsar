@@ -596,6 +596,12 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 # Still the right tool for an A/B against a known-good binary (it is what proved
 # the L035 act-cache bug); making it a gate needs a recorded per-depth baseline
 # blob from a reference commit, on the cuda-prefill-gate pattern.
+# The two-minute semantic check that was missing on 2026-08-22: greedy chat
+# answer through the engine, asserting content no us-vs-us comparison can fake.
+# See tests/chat_smoke_gate.py's header for the salad it exists to catch.
+cuda-chat-smoke-gate: pulsar
+	python3 tests/chat_smoke_gate.py $(FRONTIER_MODEL) ./pulsar
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
@@ -693,7 +699,8 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
 #   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
-GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-attn-gates cuda-prefill-gate \
+GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-chat-smoke-gate \
+	cuda-attn-gates cuda-prefill-gate \
 	cuda-reference-gate \
                cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \

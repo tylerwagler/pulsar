@@ -2186,18 +2186,39 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     }
                 }
                 const int xKBp = mx_rup((int)(in_dim / 32), 4);
-                for (uint64_t t = 0; t < n_tok; t++)
-                    mxfp8_mmvq_deint_a8_kernel<<<grid, wpb * 32>>>(
-                            (float *)out->ptr + t * out_dim,
-                            w->data, w->scale,
-                            ac8->xq + t * in_dim, ac8->sx,
-                            (int)in_dim, (int)out_dim, KBp, xKBp, (int)t);
+                /* The GEMV arms were the NINTH element-type defect, and the
+                 * one that broke SERVING while every gate stayed green: both
+                 * kernels are templated on OT, but these launches hardcoded
+                 * (float *), deducing OT=float and writing 4-byte rows into
+                 * the f16 Q buffer -- a 2x overwrite whose garbage both sides
+                 * of every us-vs-us decode gate shared byte-for-byte.  Found
+                 * by a serving curl, step-1 BOS cliff, 2026-08-22. */
+                for (uint64_t t = 0; t < n_tok; t++) {
+                    if (out_f16)
+                        mxfp8_mmvq_deint_a8_kernel<<<grid, wpb * 32>>>(
+                                (__half *)out->ptr + t * out_dim,
+                                w->data, w->scale,
+                                ac8->xq + t * in_dim, ac8->sx,
+                                (int)in_dim, (int)out_dim, KBp, xKBp, (int)t);
+                    else
+                        mxfp8_mmvq_deint_a8_kernel<<<grid, wpb * 32>>>(
+                                (float *)out->ptr + t * out_dim,
+                                w->data, w->scale,
+                                ac8->xq + t * in_dim, ac8->sx,
+                                (int)in_dim, (int)out_dim, KBp, xKBp, (int)t);
+                }
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint a8");
             }
-            for (uint64_t t = 0; t < n_tok; t++)
-                mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim,
-                        w->data, w->scale, (const float *)x->ptr + t * in_dim,
-                        (int)in_dim, (int)out_dim, KBp);
+            for (uint64_t t = 0; t < n_tok; t++) {
+                if (out_f16)
+                    mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((__half *)out->ptr + t * out_dim,
+                            w->data, w->scale, (const float *)x->ptr + t * in_dim,
+                            (int)in_dim, (int)out_dim, KBp);
+                else
+                    mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim,
+                            w->data, w->scale, (const float *)x->ptr + t * in_dim,
+                            (int)in_dim, (int)out_dim, KBp);
+            }
             return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint");
         }
         /* No raw arm any more.  It read 33B-interleaved blocks for plain
