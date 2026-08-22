@@ -519,6 +519,15 @@ int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double
 /* Reserve the activation cache's E4M3 slots and hand back both device pointers
  * plus the scale pitch, so a producer can emit the MX encoding from its own
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
+/* Producer-side BF16 activation slot (L086 T3): reserve the bf16 copy's
+ * storage for (x, n_tok, in_dim) so an epilogue can write it, then note() to
+ * mark it valid once the kernel succeeded.  matmul_bf16_tensor then skips its
+ * convert-on-miss for this exact key. */
+int pulsar_gpu_bf16_act_slot(const pulsar_gpu_tensor *x,
+                             uint64_t n_tok, uint64_t in_dim, void **xb_out);
+void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
+                              uint64_t n_tok, uint64_t in_dim);
+
 int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          uint64_t n_tok, uint64_t in_dim,
                                          void **data_out, void **scale_out,
@@ -1489,6 +1498,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         void                    *norm_out_q,
         void                    *norm_out_sf,
         int                      norm_out_kbp,
+        /* bf16 copy of norm_out (act-cache xb slot); NULL = skip (L086 T3) */
+        void                    *norm_out_b,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,

@@ -372,13 +372,18 @@ bool gpu_graph_encode_decode_layer(
          * W8A32 survived.  FIDELITY, not speed -- a GEMV's traffic is dominated
          * by the weight matrix, not the shared activation vector. */
         void *an_q = NULL, *an_sf = NULL; int an_kbp = 0;
+        void *an_b = NULL;
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->attn_norm, 1, PULSAR_N_EMBD,
                                                         &an_q, &an_sf, &an_kbp)) {
             an_q = NULL; an_sf = NULL; an_kbp = 0;
         }
+        if (ok && !pulsar_gpu_bf16_act_slot(g->attn_norm, 1, PULSAR_N_EMBD, &an_b)) {
+            an_b = NULL;
+        }
         ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->attn_cur,
                                                          g->attn_norm,
                                                          an_q, an_sf, an_kbp,
+                                                         an_b,
                                                          g->hc_split,
                                                          g->hc_mix,
                                                          g->cur_hc,
@@ -396,6 +401,7 @@ bool gpu_graph_encode_decode_layer(
         layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->attn_norm, 1, PULSAR_N_EMBD);
         if (ok && an_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        if (ok && an_b) pulsar_gpu_bf16_act_note(g->attn_norm, 1, PULSAR_N_EMBD);
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
@@ -951,13 +957,18 @@ bool gpu_graph_encode_decode_layer(
         /* Same A8 emission as the attention norm above: batch_ffn_norm feeds
          * the router logits and the shared gate/up GEMVs. */
         void *fn_q = NULL, *fn_sf = NULL; int fn_kbp = 0;
+        void *fn_b = NULL;
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->ffn_norm, 1, PULSAR_N_EMBD,
                                                         &fn_q, &fn_sf, &fn_kbp)) {
             fn_q = NULL; fn_sf = NULL; fn_kbp = 0;
         }
+        if (ok && !pulsar_gpu_bf16_act_slot(g->ffn_norm, 1, PULSAR_N_EMBD, &fn_b)) {
+            fn_b = NULL;
+        }
         ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->ffn_cur,
                                                          g->ffn_norm,
                                                          fn_q, fn_sf, fn_kbp,
+                                                         fn_b,
                                                          g->hc_split,
                                                          g->hc_mix,
                                                          g->after_attn_hc,
@@ -975,6 +986,7 @@ bool gpu_graph_encode_decode_layer(
         layer->ffn_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->ffn_norm, 1, PULSAR_N_EMBD);
         if (ok && fn_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        if (ok && fn_b) pulsar_gpu_bf16_act_note(g->ffn_norm, 1, PULSAR_N_EMBD);
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {

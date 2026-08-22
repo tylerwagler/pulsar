@@ -1105,6 +1105,35 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
     return 1;
 }
 
+/* BF16 half of the activation slot: producer-side reservation and validity.
+ *
+ * matmul_bf16_tensor stages a bf16 copy of its f32 activation on every call
+ * (exact-key cached, convert-on-miss).  These two let the PRODUCER of that
+ * activation write the bf16 copy from registers instead -- the same move the
+ * f16 and E4M3 slots already made -- so the standalone convert kernel never
+ * runs for buffers whose producer emits.  The note takes the explicit key
+ * rather than riding g_act_cur: arm/disarm pairing is delicate (L035) and
+ * this file should not grow a second dependent on it. */
+int pulsar_gpu_bf16_act_slot(const pulsar_gpu_tensor *x,
+                             uint64_t n_tok, uint64_t in_dim, void **xb_out) {
+    if (!x || n_tok == 0 || in_dim == 0 || !xb_out) return 0;
+    mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
+    if (!s) return 0;
+    if (!mxfp8_act_cache_reserve((void **)&s->xb, &s->xb_cap,
+                                 (size_t)(n_tok * in_dim) * sizeof(__nv_bfloat16),
+                                 "act bf16")) {
+        return 0;
+    }
+    *xb_out = s->xb;
+    return 1;
+}
+
+void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
+                              uint64_t n_tok, uint64_t in_dim) {
+    mxfp8_act_cache_t *s = x ? act_slot_find(x->ptr, n_tok, in_dim) : NULL;
+    if (s) s->valid_b = 1;
+}
+
 /* GROUPED activation cache -- the attn-output "a" projection only.
  *
  * Separate from the slot array above because the grouped encoding has a
