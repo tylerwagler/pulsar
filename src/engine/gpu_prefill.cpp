@@ -665,11 +665,16 @@ bool gpu_graph_encode_layer_attention_batch(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
             g->batch_hc_split, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
-    pulsar_gpu_tensor *attn_cur_view = pulsar_gpu_tensor_view(
-            g->batch_attn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+    /* batch_attn_cur is dump-only and NULL when dumps are off (L090.1); the
+     * view must follow, and the ok-chain must not treat that NULL as failure. */
+    pulsar_gpu_tensor *attn_cur_view = g->batch_attn_cur
+            ? pulsar_gpu_tensor_view(g->batch_attn_cur, 0,
+                                  (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float))
+            : NULL;
     pulsar_gpu_tensor *after_attn_hc_view = pulsar_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
-    bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    bool ok = hc_mix_view && hc_split_view && after_attn_hc_view &&
+              (attn_cur_view || !g->batch_attn_cur);
     /* The f16 activation slot and its flat_hc_skip_f32 companion are gone with
      * the last F16 weight (2026-08-16).  They existed so an F16 mix GEMM could
      * read a 2-byte activation and the widest f32 store in the layer could be
