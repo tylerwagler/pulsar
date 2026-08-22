@@ -2417,16 +2417,31 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
      * cache lacked, because there a miss changed the ARM and therefore the
      * arithmetic. */
     const uint64_t xb_count = n_tok * in_dim;
-    mxfp8_act_cache_t *hb = act_slot_find(x->ptr, n_tok, in_dim);
+    /* Prefix-tolerant READ first -- the same move (and the same safety
+     * argument) as the A8 consumer's act_slot_find_rows: the bf16 encoding is
+     * elementwise and xb is row-major contiguous, so rows [0, n_tok) of a
+     * WIDER valid block are byte-identical to a block staged at exactly
+     * n_tok.  Not a rare case: the mixed-batch prefix split hands this
+     * function the SAME base pointer at n_dec rows while the producer armed
+     * the full batch width, so the exact-key lookup made every split prefix a
+     * guaranteed miss (the T3 census showed them as the surviving
+     * n_tok=1..8 converts). */
+    __nv_bfloat16 *xb_pre = NULL;
+    {
+        mxfp8_act_cache_t *hw = act_slot_find_rows(x->ptr, n_tok, in_dim);
+        if (hw && hw->valid_b && hw->xb) xb_pre = hw->xb;
+    }
+    mxfp8_act_cache_t *hb = xb_pre ? NULL : act_slot_find(x->ptr, n_tok, in_dim);
     if (hb && !mxfp8_act_cache_reserve((void **)&hb->xb, &hb->xb_cap,
                                        xb_count * sizeof(__nv_bfloat16), "act bf16")) {
         hb = NULL;
     }
-    __nv_bfloat16 *xbb = hb ? hb->xb
-                            : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
-                                                              "bf16 activations");
+    __nv_bfloat16 *xbb = xb_pre ? xb_pre
+                       : hb     ? hb->xb
+                                : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
+                                                                  "bf16 activations");
     if (!xbb) return 0;
-    if (!hb || !hb->valid_b) {
+    if (!xb_pre && (!hb || !hb->valid_b)) {
         /* Shape census for L086 T3 (producer-emits-bf16): each unique
          * (n_tok, in_dim) prints once, so the 169 convert launches the D1
          * profile counted become attributable to producers without a rerun.
