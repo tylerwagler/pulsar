@@ -2306,7 +2306,16 @@ bool gpu_graph_encode_layer_ffn_batch(
          * store was skipped (PULSAR_MOE_F32_GUARD, moe.cu).  The corrupting
          * reader class can no longer answer wrong -- it can only fail loud,
          * and the gate decides which tiers are warm. */
-        if (ffn_norm_q && ffn_norm_b &&
+        /* PER-LAYER (L089): the mixed-type MoE tier (gate type != down type,
+         * 7 of 43 layers) gathers from raw f32 and has no cached-act path --
+         * its guard fired by name on the first flight.  Matching-type layers
+         * (grouped 40/40, MMQ 43/43) are served by the exact-key E4M3
+         * handover, so the skip applies there and the f32 store stays on the
+         * mixed layers until their gather learns the encoding.  The moe.cu
+         * guards remain as the permanent backstop either way. */
+        const int ffn_moe_served = layer->ffn_gate_exps && layer->ffn_down_exps &&
+                                   layer->ffn_gate_exps->type == layer->ffn_down_exps->type;
+        if (ffn_norm_q && ffn_norm_b && ffn_moe_served &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled()) {
             ffn_norm_keep_from = n_tokens;
