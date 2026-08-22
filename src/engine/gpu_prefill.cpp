@@ -2315,7 +2315,14 @@ bool gpu_graph_encode_layer_ffn_batch(
          * guards remain as the permanent backstop either way. */
         const int ffn_moe_served = layer->ffn_gate_exps && layer->ffn_down_exps &&
                                    layer->ffn_gate_exps->type == layer->ffn_down_exps->type;
-        if (ffn_norm_q && ffn_norm_b && ffn_moe_served &&
+        /* WIDE CHUNKS ONLY (flight-4 verdict): with the skip on, a
+         * chunk-boundary depth (4102 -> second chunk n_tokens=6) corrupts
+         * while single-chunk 4096 passes, and NO guard fires -- so a sixth,
+         * still-unnamed f32 reader is active only at small n.  The small-n
+         * arms are the decode-shaped ones; a chunk-2 skip is worth ~nothing
+         * in bytes; and gating n_tokens > 8 both sidesteps the reader and
+         * pins it small-n-only for the follow-up hunt. */
+        if (ffn_norm_q && ffn_norm_b && ffn_moe_served && n_tokens > 8u &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_debug_dump_enabled()) {
             ffn_norm_keep_from = n_tokens;
