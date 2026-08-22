@@ -2463,8 +2463,28 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         for (int i = 0; i < n_seen; i++) if (seen_shapes[i] == shape_key) { known = 1; break; }
         if (!known && n_seen < 8) {
             seen_shapes[n_seen++] = shape_key;
-            fprintf(stderr, "pulsar: bf16 act convert shape n_tok=%llu in_dim=%llu (T3 census)\n",
-                    (unsigned long long)n_tok, (unsigned long long)in_dim);
+            /* WHY did this convert run?  The T3b prefix-read should have
+             * served base-pointer prefixes from the producer's entry, yet the
+             * census shapes survived the nibble run unchanged -- so name the
+             * miss instead of theorizing: does ANY slot cover this pointer,
+             * and if one does, which half of the validity failed? */
+            const mxfp8_act_cache_t *cov = act_slot_find_rows(x->ptr, n_tok, in_dim);
+            int contained = 0;
+            for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+                const mxfp8_act_cache_t *sl = &g_act_slots[i];
+                if (!sl->key_ptr) continue;
+                const char *b = (const char *)sl->key_ptr;
+                if ((const char *)x->ptr >= b &&
+                    (const char *)x->ptr < b + sl->key_ntok * sl->key_in_dim * sizeof(float)) {
+                    contained = 1;
+                    break;
+                }
+            }
+            fprintf(stderr, "pulsar: bf16 act convert shape n_tok=%llu in_dim=%llu "
+                            "(T3 census: cover=%d valid_b=%d xb=%d contained=%d)\n",
+                    (unsigned long long)n_tok, (unsigned long long)in_dim,
+                    cov != NULL, cov ? cov->valid_b : 0, cov ? (cov->xb != NULL) : 0,
+                    contained);
         }
         f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
                                                             (const float *)x->ptr, xb_count);
