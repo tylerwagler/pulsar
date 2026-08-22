@@ -1068,6 +1068,11 @@ static int routed_moe_launch_mixed40(
             if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &gq, &gsf, &gkbp)) {
                 gq = NULL; gsf = NULL; gkbp = 0;
             }
+            /* The FIFTH f32 reader the census missed (found by the depth-4102
+             * chunk-boundary failure): the GEMV fallback round-trips from raw
+             * f32 when the handover misses.  Same rule as the other four. */
+            if (!gq)
+                PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe GEMV staging (handover miss)");
             if (pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
