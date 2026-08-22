@@ -665,10 +665,13 @@ int ds4_mmq_moe_pair_impl(
     {
     char *src1_e4m3 = (char *)cuda_arena_take(&ar, nbytes_src1_act, 256);
 
-    /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only now;
-     * q8_1 exists solely for the generic MMQ fallback (another quant type, or
-     * D2R declining at launch) and is staged lazily below, so the common IQ2
-     * path never writes a format it does not use. */
+    /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only.
+     * ⚠ This comment used to add "q8_1 exists solely for the generic MMQ
+     * fallback ... staged lazily below" -- that staging is DELETED (see the
+     * fail-closed note at the sibling site above: every way d2r can be false
+     * is a defect, and both live staging branches below are E4M3).  The prose
+     * outlived the code by four days; prose claiming a format exists is how
+     * L065 and L002 each got a wrong ledger row, so it dies here too. */
     static int d2r_iq2_avail_cc = -1;
     static int d2r_iq2_avail = 0;
     if (d2r_iq2_avail_cc != cc) {
