@@ -2277,6 +2277,13 @@ static int attention_prefill_mixed_launch(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
+        void                    *gact_data,
+        void                    *gact_scale,
+        int                      gact_kbp,
+        uint32_t                 gact_slab,
+        uint32_t                 n_groups,
+        uint32_t                 n_nope,
+        int                     *mx_out,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -2284,6 +2291,7 @@ static int attention_prefill_mixed_launch(
         uint32_t                n_head,
         uint32_t                head_dim,
         const pulsar_gpu_q_prep *q_prep) {
+    if (mx_out) *mx_out = 0;   /* set only by a successful fp16-tier emission */
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
         (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
@@ -2340,12 +2348,21 @@ static int attention_prefill_mixed_launch(
                 fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
                                 "(default; PULSAR_CUDA_ATTN_F16=0 opts out; operands rounded to fp16)\n");
             }
-            if (pulsar_gpu_attention_f16_prefill(
+            /* Same emission contract as the raw-window twin: only the fp16
+             * tier may write the grouped encoding, and a decline falls
+             * through with *mx_out unset so the caller's quantize pass runs
+             * instead of reading a half-written slab. */
+            if (pulsar_gpu_attention_f16_prefill_mx(
                     (float *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
                     (const float *)raw_kv->ptr,
                     n_comp ? (const float *)comp_kv->ptr : NULL,
-                    n_tokens, n_comp, window, ratio, n_head, head_dim, q_prep))
+                    n_tokens, n_comp, window, ratio, n_head, head_dim,
+                    gact_data, gact_scale, gact_kbp,
+                    gact_slab, n_groups, n_nope,
+                    0u, n_tokens, q_prep)) {
+                if (mx_out && gact_data) *mx_out = 1;
                 return 1;
+            }
             fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
                             "fall through to the f32 kernel\n");
             return 0;
@@ -2481,6 +2498,13 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
+        void                    *gact_data,
+        void                    *gact_scale,
+        int                      gact_kbp,
+        uint32_t                 gact_slab,
+        uint32_t                 n_groups,
+        uint32_t                 n_nope,
+        int                     *mx_out,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -2489,7 +2513,10 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                head_dim,
         const pulsar_gpu_q_prep *q_prep) {
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, n_tokens,
+                                       q, raw_kv, comp_kv,
+                                       gact_data, gact_scale, gact_kbp,
+                                       gact_slab, n_groups, n_nope, mx_out,
+                                       n_tokens,
                                        n_comp, window, ratio, n_head, head_dim,
                                        q_prep);
 }

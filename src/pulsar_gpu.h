@@ -1093,6 +1093,18 @@ int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         const pulsar_gpu_tensor *q,
         const pulsar_gpu_tensor *raw_kv,
         const pulsar_gpu_tensor *comp_kv,
+        /* gact_*: grouped E4M3 emission for the attn-output "a" GEMM, same
+         * contract as the raw _mx entry: NULL = no emission; *mx_out set to 1
+         * ONLY when the fp16 tier ran and wrote the encoding.  The mixed tier
+         * is the per-layer traffic carrier, so this is where the emission
+         * matters (the raw entry runs twice a prefill, this one per layer). */
+        void                    *gact_data,
+        void                    *gact_scale,
+        int                      gact_kbp,
+        uint32_t                 gact_slab,
+        uint32_t                 n_groups,
+        uint32_t                 n_nope,
+        int                     *mx_out,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,

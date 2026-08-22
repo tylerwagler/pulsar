@@ -1901,6 +1901,17 @@ bool gpu_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
         if (ok && zero_prefix && !topk_prefill_needed && n_comp != 0) {
+            /* Whole batch goes through this ONE call, so the completeness
+             * requirement the raw site documents holds here by construction:
+             * either the fp16 tier writes the encoding for every token or
+             * mx_out stays 0 and the "a" GEMM quantizes as before.  This is
+             * the per-layer traffic carrier -- the raw site runs twice a
+             * prefill, this one for every layer (L039 item 2; D1 measured the
+             * quantize pass it replaces at 117 ms / 43 launches). */
+            if (!pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
+                                            &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
+                gact_data = NULL; gact_scale = NULL; gact_kbp = 0; gact_slab = 0;
+            }
             ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        model->map,
                                                                        model->size,
@@ -1920,6 +1931,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * attention_prefill_pack_mixed_kv_kernel. */
                                                                        mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                                                                             : g->layer_attn_comp_cache[il],
+                                                                       gact_data, gact_scale, gact_kbp,
+                                                                       (uint32_t)gact_slab, n_groups,
+                                                                       PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
+                                                                       &gact_emitted,
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -1927,6 +1942,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        PULSAR_N_HEAD,
                                                                        PULSAR_N_HEAD_DIM,
                                           g->q_prep_active ? &g->q_prep : NULL) != 0;
+            if (!gact_emitted) { gact_data = NULL; gact_scale = NULL; }
             if (ok) batch_attention_done = true;
         }
     }
