@@ -1,8 +1,8 @@
 // pulsar_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
-// packed to MXFP4 on-device at runtime. Path: pack(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
-// Build (standalone test):  nvcc -std=c++17 -arch=sm_120f --expt-relaxed-constexpr --expt-extended-lambda
-//                           -DPULSAR_MXFP4_STANDALONE -I cutlass/include -I cutlass/tools/util/include ...
+// quantized to E4M3 (+ue8m0 block scales) on-device -- W4A8, matching the source model's
+// activation format.  Path: pack/roundtrip(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
+// (This header claimed "activations packed to MXFP4" from the pre-W4A8 era until 2026-08-22.)
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -220,14 +220,15 @@ __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 
 __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
 // mid = silu(clamp(gate)) * clamp(up) * routing_weight.
 // TWIN of swiglu_kernel in pulsar_cuda_hc_router.cu, and deliberately a
-// separate copy: this TU builds standalone (-DPULSAR_MXFP4_STANDALONE) and
-// does not take pulsar_cuda_internal.h, so the two cannot share a definition
-// without coupling them. They MUST agree on the arithmetic above.
+// separate copy: this TU deliberately does not take pulsar_cuda_internal.h
+// (it is the one CUTLASS-including TU and keeps its include surface minimal),
+// so the two cannot share a definition without coupling them. They MUST agree on the arithmetic above.
 // Two differences that are intentional, not drift: the routing weight is a
 // per-row array here and a scalar there, and the engine's twin carries an
 // E4M3 + E8M0 epilogue that this one does not -- which is why the CUTLASS
-// down path re-quantises mid through e4m3_act_roundtrip_kernel instead of
-// reading the producer's encoding.
+// down path re-quantises mid (the grouped/GEMM path via pack_activation, the
+// GEMV path via e4m3_act_roundtrip_kernel) instead of reading the producer's
+// encoding.
 // This cited `pulsar_cuda.cu:10827-10835` until 2026-08-17 to assert the
 // agreement. That file does not exist -- the engine was split up long ago --
 // so the reference had been unfollowable, and the invariant uncheckable,
@@ -794,8 +795,9 @@ int pulsar_cutlass_grouped_proj(
 // The grouped CUTLASS path costs ~2.8 ms per rich layer at n_tokens=3: per-expert GEMM
 // launches at M<=3 run far off roofline, behind a blocking per-layer offsets readback.
 // These GEMVs read the packed weights directly: one launch for gate+up+swiglu, one for
-// down, no readback, no sort, and f32 activations (no fp4 activation quant -- tighter
-// numerics than the GEMM path's fp4 x fp4).
+// down, no readback, no sort.  Activations are E4M3 (the A8 arms; the producer's grouped
+// encoding when armed, an on-the-spot roundtrip otherwise) -- the SAME format the GEMM
+// path quantizes to, so the two paths differ in launch shape, not operand numerics.
 // Data layout (see pulsar_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
 // (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
 // (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
@@ -1113,7 +1115,11 @@ int pulsar_cutlass_gemv_down(
    * element, so a 32-wide MX block spans four CTAs and no epilogue can see its
    * amax.  What CAN go is the dequantise: pack once and let the GEMV read the
    * bytes, instead of writing 4 bytes per element that hold 1 byte of value. */
-  const size_t need_floats = (midq_elems + (size_t)nb * 4u + 3u) / 4u;
+  /* Bytes needed: midq_elems E4M3 payload + nb ue8m0 scale BYTES (one per
+   * 32-value block), expressed in the buffer's float units.  This budgeted
+   * nb*4 -- four bytes per scale byte -- until the types sweep: conservative,
+   * never corrupting, but a unit error all the same. */
+  const size_t need_floats = (midq_elems + (size_t)nb + 3u) / 4u;
   if (!gemv_actbuf_ensure(need_floats)) return 1;
   uint8_t *midq8 = (uint8_t *)g_fp4_gemv_actbuf;
   uint8_t *midsf = midq8 + midq_elems;
@@ -1200,165 +1206,9 @@ int main(int argc, char **argv){
 }
 #endif
 
-#ifdef PULSAR_MXFP4_STANDALONE
-#include <vector>
-#include <random>
-#include <cmath>
-// host MXFP4 quant (matches device): returns dequantized value array + packs into B ColumnMajor layout.
-static const float hE2M1[16]={0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-static uint8_t h_nib(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){float d=fabsf(v-hE2M1[n]); if(d<best){best=d;bn=n;}} return bn; }
-// Pack weight W[out,in] (row-major float) -> B data+SF in CUTLASS ColumnMajor(B) layout for shape (N=out,K=in). Fill dq.
-static void host_pack_weight(std::vector<uint8_t>& Bd, std::vector<ElementSF>& Bsf, std::vector<float>& dq,
-                             const std::vector<float>& W, int N, int K){
-  auto lB  = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
-  auto layB = make_layout(make_shape(N,K,1), lB);
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1)); // M unused for SFB shape? use N,K
-  Bd.assign((size_t)N*K/2,0); dq.assign((size_t)N*K,0.f);
-  Bsf.assign(cute::size(cute::filter_zeros(lSFB)), ElementSF::bitcast(127));
-  auto tB  = make_tensor(recast_ptr<cutlass::float_e2m1_t>((uint8_t*)Bd.data()), layB);
-  auto tSFB= make_tensor(Bsf.data(), lSFB);
-  for(int n=0;n<N;n++) for(int kb=0;kb<K/32;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(W[(size_t)n*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    tSFB(n, kb*32, 0)=ElementSF::bitcast((uint8_t)(e+127));
-    for(int i=0;i<32;i++){ int k=kb*32+i; uint8_t nb=h_nib(W[(size_t)n*K+k]/sc); tB(n,k,0)=cutlass::float_e2m1_t::bitcast(nb); dq[(size_t)n*K+k]=hE2M1[nb]*sc; }
-  }
-}
-static void host_quant_act(const std::vector<float>& X, std::vector<float>& dq, int M, int K){
-  dq.assign((size_t)M*K,0.f);
-  for(int m=0;m<M;m++) for(int kb=0;kb<K/32;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(X[(size_t)m*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    for(int i=0;i<32;i++){ int k=kb*32+i; uint8_t nb=h_nib(X[(size_t)m*K+k]/sc); dq[(size_t)m*K+k]=hE2M1[nb]*sc; }
-  }
-}
-// host: float weight [N,K] -> SOURCE-format arrays (E2M1 [N,K/2] + E8M0 [N,K/32]), same quant as host_pack_weight
-static void host_to_source(const std::vector<float>& W, std::vector<uint8_t>& e2, std::vector<uint8_t>& e8, int N, int K){
-  int nblk=K/32; e2.assign((size_t)N*(K/2),0); e8.assign((size_t)N*nblk,0);
-  for(int n=0;n<N;n++) for(int kb=0;kb<nblk;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(W[(size_t)n*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    e8[(size_t)n*nblk+kb]=(uint8_t)(e+127);
-    uint8_t* row=e2.data()+(size_t)n*(K/2)+kb*16;
-    for(int i=0;i<16;i++){ int k=kb*32+i*2; uint8_t lo=h_nib(W[(size_t)n*K+k]/sc), hi=h_nib(W[(size_t)n*K+k+1]/sc); row[i]=(uint8_t)(lo|(hi<<4)); }
-  }
-}
-// Multi-expert grouped-GEMM self-check: several experts, tokens round-robin-routed (n_expert=1),
-// run the grouped entry end-to-end (gather to 128-padded rows -> grouped gate/up/down -> scatter)
-// and compare per-token output to a double-precision CPU oracle. Catches SF-slice/offset bugs.
-static int run_grouped_selfcheck(){
-  // E experts total but tokens routed ONLY to a subset -> the rest carry count==0 (M==0 groups),
-  // exactly like a real prefill chunk where not every expert is hit. Verifies the grouped kernel
-  // tolerates empty groups (else the on-model path would silently fall back to the per-expert loop).
-  const int E=8, T=311, in_dim=256, mid_dim=256, out_dim=256; const float clamp=4.0f;
-  const int active[4]={1,3,4,6};   // experts 0,2,5,7 stay empty
-  std::mt19937 rng(11); std::normal_distribution<float> nd(0.f,1.f);
-  std::vector<float> X((size_t)T*in_dim); for(auto&v:X) v=nd(rng);
-  std::vector<std::vector<float>> Wg(E),Wu(E),Wd(E),dqWg(E),dqWu(E),dqWd(E);
-  std::vector<std::vector<uint8_t>> Bgd(E),Bud(E),Bdd(E);
-  std::vector<std::vector<ElementSF>> Bgs(E),Bus(E),Bds(E);
-  for(int e=0;e<E;e++){
-    Wg[e].resize((size_t)mid_dim*in_dim); Wu[e].resize((size_t)mid_dim*in_dim); Wd[e].resize((size_t)out_dim*mid_dim);
-    for(auto&v:Wg[e])v=nd(rng)*0.3f; for(auto&v:Wu[e])v=nd(rng)*0.3f; for(auto&v:Wd[e])v=nd(rng)*0.3f;
-    host_pack_weight(Bgd[e],Bgs[e],dqWg[e],Wg[e],mid_dim,in_dim);
-    host_pack_weight(Bud[e],Bus[e],dqWu[e],Wu[e],mid_dim,in_dim);
-    host_pack_weight(Bdd[e],Bds[e],dqWd[e],Wd[e],out_dim,mid_dim);
-  }
-  // routing: round-robin token->expert; per-token routing weight
-  std::vector<int> sel(T); std::vector<float> route(T);
-  for(int t=0;t<T;t++){ sel[t]=active[t%4]; route[t]=0.5f+std::abs(nd(rng))*0.5f; }
-  std::vector<uint32_t> counts(E,0); for(int t=0;t<T;t++) counts[sel[t]]++;
-  std::vector<uint32_t> padoff(E); uint32_t run=0; for(int e=0;e<E;e++){ padoff[e]=run; run+=(counts[e]+127u)/128u*128u; }
-  const int padded_total=(int)run;
-  // gather to padded rows (per-expert running index), record padded row per token for scatter
-  std::vector<float> xg((size_t)padded_total*in_dim,0.f), wg((size_t)padded_total,0.f);
-  std::vector<int> tok_row(T); std::vector<uint32_t> cur=padoff;
-  for(int t=0;t<T;t++){ uint32_t R=cur[sel[t]]++; tok_row[t]=(int)R;
-    for(int k=0;k<in_dim;k++) xg[(size_t)R*in_dim+k]=X[(size_t)t*in_dim+k]; wg[R]=route[t]; }
-  // oracle (double precision) per token
-  std::vector<float> dqX; host_quant_act(X,dqX,T,in_dim);
-  std::vector<float> mid((size_t)T*mid_dim), ref((size_t)T*out_dim,0.f), dqMid;
-  for(int t=0;t<T;t++){ int e=sel[t];
-    for(int j=0;j<mid_dim;j++){ double g=0,u=0; for(int k=0;k<in_dim;k++){ g+=(double)dqX[(size_t)t*in_dim+k]*dqWg[e][(size_t)j*in_dim+k]; u+=(double)dqX[(size_t)t*in_dim+k]*dqWu[e][(size_t)j*in_dim+k]; }
-      float gf=(float)g,uf=(float)u; if(clamp>1e-6f){if(gf>clamp)gf=clamp;if(uf>clamp)uf=clamp;if(uf<-clamp)uf=-clamp;} mid[(size_t)t*mid_dim+j]=(gf/(1.f+expf(-gf)))*uf*route[t]; } }
-  host_quant_act(mid,dqMid,T,mid_dim);
-  for(int t=0;t<T;t++){ int e=sel[t]; for(int o=0;o<out_dim;o++){ double a=0; for(int j=0;j<mid_dim;j++) a+=(double)dqMid[(size_t)t*mid_dim+j]*dqWd[e][(size_t)o*mid_dim+j]; ref[(size_t)t*out_dim+o]=(float)a; } }
-  // build device weight blobs [data||sf] per expert, stride = data + sf
-  const size_t gdata=(size_t)mid_dim*in_dim/2, gsf=Bgs[0].size()*sizeof(ElementSF);
-  const size_t ddata=(size_t)out_dim*mid_dim/2, dsf=Bds[0].size()*sizeof(ElementSF);
-  const uint64_t gstride=gdata+gsf, dstride=ddata+dsf;
-  std::vector<uint8_t> gate_blob((size_t)E*gstride), up_blob((size_t)E*gstride), down_blob((size_t)E*dstride);
-  for(int e=0;e<E;e++){
-    memcpy(gate_blob.data()+e*gstride, Bgd[e].data(), gdata); memcpy(gate_blob.data()+e*gstride+gdata, Bgs[e].data(), gsf);
-    memcpy(up_blob.data()  +e*gstride, Bud[e].data(), gdata); memcpy(up_blob.data()  +e*gstride+gdata, Bus[e].data(), gsf);
-    memcpy(down_blob.data()+e*dstride, Bdd[e].data(), ddata); memcpy(down_blob.data()+e*dstride+ddata, Bds[e].data(), dsf);
-  }
-  uint8_t *dGate,*dUp,*dDown; cudaMalloc(&dGate,gate_blob.size()); cudaMalloc(&dUp,up_blob.size()); cudaMalloc(&dDown,down_blob.size());
-  cudaMemcpy(dGate,gate_blob.data(),gate_blob.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dUp,up_blob.data(),up_blob.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dDown,down_blob.data(),down_blob.size(),cudaMemcpyHostToDevice);
-  float *dXg,*dWg2,*dFfn; cudaMalloc(&dXg,xg.size()*4); cudaMalloc(&dWg2,wg.size()*4); cudaMalloc(&dFfn,(size_t)padded_total*out_dim*4);
-  cudaMemcpy(dXg,xg.data(),xg.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dWg2,wg.data(),wg.size()*4,cudaMemcpyHostToDevice);
-  uint32_t *dCounts,*dPadoff; cudaMalloc(&dCounts,E*4); cudaMalloc(&dPadoff,E*4);
-  cudaMemcpy(dCounts,counts.data(),E*4,cudaMemcpyHostToDevice); cudaMemcpy(dPadoff,padoff.data(),E*4,cudaMemcpyHostToDevice);
-  size_t sb=pulsar_cutlass_grouped_moe_scratch_bytes(padded_total,E,in_dim,mid_dim,out_dim);
-  uint8_t *dScr; cudaMalloc(&dScr,sb);
-  int rc=pulsar_cutlass_grouped_moe(dFfn,dXg,dWg2,dGate,dUp,dDown,gstride,gdata,dstride,ddata,
-        clamp,E,in_dim,mid_dim,out_dim,dCounts,dPadoff,padded_total,dScr,sb);
-  cudaDeviceSynchronize();
-  std::vector<float> ffn((size_t)padded_total*out_dim); cudaMemcpy(ffn.data(),dFfn,ffn.size()*4,cudaMemcpyDeviceToHost);
-  double maxrel=0,maxabs=0; int bad=0;
-  for(int t=0;t<T;t++){ const float*o=ffn.data()+(size_t)tok_row[t]*out_dim; const float*r=ref.data()+(size_t)t*out_dim;
-    for(int c=0;c<out_dim;c++){ double a=fabs((double)o[c]-r[c]); double rr=a/(fabs(r[c])+1e-3); if(rr>maxrel)maxrel=rr; if(a>maxabs)maxabs=a; if(rr>0.05&&a>0.1)bad++; } }
-  printf("grouped(E=%d T=%d padded=%d): rc=%d max_rel=%.5f max_abs=%.4f bad=%d -> %s\n",
-         E,T,padded_total,rc,maxrel,maxabs,bad,(rc==0&&bad==0)?"PASS":"FAIL");
-  cudaFree(dGate);cudaFree(dUp);cudaFree(dDown);cudaFree(dXg);cudaFree(dWg2);cudaFree(dFfn);cudaFree(dCounts);cudaFree(dPadoff);cudaFree(dScr);
-  return (rc==0&&bad==0)?0:1;
-}
-
-int main(int argc,char**argv){
-  int T=256,in_dim=2048,mid_dim=1408,out_dim=2048;
-  if(argc>=5){T=atoi(argv[1]);in_dim=atoi(argv[2]);mid_dim=atoi(argv[3]);out_dim=atoi(argv[4]);}
-  std::mt19937 rng(7); std::normal_distribution<float> nd(0.f,1.f);
-  std::vector<float> X((size_t)T*in_dim), Wg((size_t)mid_dim*in_dim), Wu((size_t)mid_dim*in_dim), Wd((size_t)out_dim*mid_dim);
-  for(auto&v:X)v=nd(rng); for(auto&v:Wg)v=nd(rng)*0.3f; for(auto&v:Wu)v=nd(rng)*0.3f; for(auto&v:Wd)v=nd(rng)*0.3f;
-  // host-pack weights + dequant refs
-  std::vector<uint8_t> Wgd,Wud,Wdd; std::vector<ElementSF> Wgsf,Wusf,Wdsf; std::vector<float> dqWg,dqWu,dqWd,dqX;
-  host_pack_weight(Wgd,Wgsf,dqWg,Wg,mid_dim,in_dim);
-  host_pack_weight(Wud,Wusf,dqWu,Wu,mid_dim,in_dim);
-  host_pack_weight(Wdd,Wdsf,dqWd,Wd,out_dim,mid_dim);
-  host_quant_act(X,dqX,T,in_dim);
-  // validate source packer: float->(E2M1,E8M0)->CUTLASS must equal float->CUTLASS (byte-identical)
-  { std::vector<uint8_t> e2,e8; host_to_source(Wg,e2,e8,mid_dim,in_dim);
-    std::vector<uint8_t> Bd2(Wgd.size(),0); std::vector<ElementSF> Bsf2(Wgsf.size(),ElementSF::bitcast(127));
-    pulsar_cutlass_pack_source(Bd2.data(),Bsf2.data(),e2.data(),e8.data(),mid_dim,in_dim);
-    int dd=memcmp(Bd2.data(),Wgd.data(),Wgd.size());
-    int ds=memcmp(Bsf2.data(),Wgsf.data(),Wgsf.size()*sizeof(ElementSF));
-    printf("pack_source(E2M1+E8M0->CUTLASS) check: data=%s sf=%s\n", dd==0?"MATCH":"DIFFER", ds==0?"MATCH":"DIFFER"); }
-  // reference FFN using the same quantized values
-  std::vector<float> gate((size_t)T*mid_dim),up((size_t)T*mid_dim),mid((size_t)T*mid_dim),dqMid,ref((size_t)T*out_dim,0.f);
-  std::vector<float> W_route(T); for(auto&v:W_route) v=0.5f+std::abs(nd(rng))*0.5f;  // per-token routing weight
-  float clamp = 4.0f;
-  for(int t=0;t<T;t++)for(int j=0;j<mid_dim;j++){ double g=0,u=0; for(int k=0;k<in_dim;k++){ g+=(double)dqX[(size_t)t*in_dim+k]*dqWg[(size_t)j*in_dim+k]; u+=(double)dqX[(size_t)t*in_dim+k]*dqWu[(size_t)j*in_dim+k]; } gate[(size_t)t*mid_dim+j]=(float)g; up[(size_t)t*mid_dim+j]=(float)u; }
-  for(int t=0;t<T;t++)for(int j=0;j<mid_dim;j++){ size_t i=(size_t)t*mid_dim+j; float g=gate[i],u=up[i]; if(clamp>1e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;} float s=g/(1.f+expf(-g)); mid[i]=s*u*W_route[t]; }
-  host_quant_act(mid,dqMid,T,mid_dim);
-  for(int t=0;t<T;t++)for(int o=0;o<out_dim;o++){ double a=0; for(int j=0;j<mid_dim;j++) a+=(double)dqMid[(size_t)t*mid_dim+j]*dqWd[(size_t)o*mid_dim+j]; ref[(size_t)t*out_dim+o]=(float)a; }
-  // device buffers
-  float *dX,*dOut,*dWr; cudaMalloc(&dX,X.size()*4); cudaMalloc(&dOut,(size_t)T*out_dim*4); cudaMalloc(&dWr,(size_t)T*4);
-  cudaMemcpy(dX,X.data(),X.size()*4,cudaMemcpyHostToDevice);
-  cudaMemcpy(dWr,W_route.data(),(size_t)T*4,cudaMemcpyHostToDevice);
-  uint8_t *dWg,*dWu,*dWd; ElementSF *dWgs,*dWus,*dWds;
-  cudaMalloc(&dWg,Wgd.size()); cudaMalloc(&dWu,Wud.size()); cudaMalloc(&dWd,Wdd.size());
-  cudaMalloc(&dWgs,Wgsf.size()*sizeof(ElementSF)); cudaMalloc(&dWus,Wusf.size()*sizeof(ElementSF)); cudaMalloc(&dWds,Wdsf.size()*sizeof(ElementSF));
-  cudaMemcpy(dWg,Wgd.data(),Wgd.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWu,Wud.data(),Wud.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWd,Wdd.data(),Wdd.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dWgs,Wgsf.data(),Wgsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWus,Wusf.data(),Wusf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWds,Wdsf.data(),Wdsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice);
-  int rc=pulsar_cutlass_expert_ffn(dOut,dX,dWg,dWgs,dWu,dWus,dWd,dWds,dWr,clamp,T,in_dim,mid_dim,out_dim);
-  std::vector<float> got((size_t)T*out_dim); cudaMemcpy(got.data(),dOut,(size_t)T*out_dim*4,cudaMemcpyDeviceToHost);
-  double maxrel=0,maxabs=0; int bad=0;
-  for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-ref[i]); double r=a/(fabs(ref[i])+1e-3); if(r>maxrel)maxrel=r; if(a>maxabs)maxabs=a; if(r>0.05&&a>0.1)bad++; }
-  printf("rc=%d  max_rel=%.5f max_abs=%.4f bad=%d/%zu  -> %s\n", rc,maxrel,maxabs,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
-  int single_fail = (rc==0&&bad==0)?0:1;
-  int grouped_fail = run_grouped_selfcheck();
-  return (single_fail==0 && grouped_fail==0)?0:1;
-}
-#endif
+/* An #ifdef PULSAR_MXFP4_STANDALONE self-check main() lived here until the
+ * 2026-08-22 types sweep.  Nothing ever defined the macro, its oracle modelled
+ * activations as FP4 (pre-W4A8), and it no longer compiled -- its
+ * pulsar_cutlass_grouped_moe call was four arguments short.  A silently absent
+ * self-check over exactly the format it was meant to pin is worse than none;
+ * the living oracle is temp/fp4gemv_test.cu plus the gate suite. */
