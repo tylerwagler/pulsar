@@ -730,7 +730,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * batch_ffn_norm raw), whose skip stays parked below. */
         if (attn_norm_q && attn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
-            !gpu_graph_debug_dump_enabled() && n_tokens >= 4u) {
+            !gpu_graph_f32_store_observed_any() && n_tokens >= 4u) {
             attn_norm_keep_from = n_tokens - 4u;
             static int announced_ans = 0;
             if (!announced_ans) {
@@ -744,7 +744,7 @@ bool gpu_graph_encode_layer_attention_batch(
         /* The pre-norm carrier is a dead store unless a dump wants it -- see
          * the kernel's `out` note. */
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
-                                                                 gpu_graph_debug_wants("hc_attn_pre", il, pos0)
+                                                                 gpu_graph_f32_store_observed("hc_attn_pre", il, pos0)
                                                                      ? attn_cur_view : NULL,
                                                                  g->batch_attn_norm,
                                                                  attn_norm_q,
@@ -853,7 +853,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * prefix split. */
         const bool qr_skip_f32 = (qr_norm_q != NULL) &&
                                  pulsar_gpu_matmul_batch_mneutral() == 0 &&
-                                 !gpu_graph_debug_wants("q_lora_norm", il, pos0);
+                                 !gpu_graph_f32_store_observed("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
                                                              model->map,
@@ -910,7 +910,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * dump without computing it somewhere.  That at least lands on the
          * FUSED kernel, which is a real fallback path (non-f16 hardware,
          * PULSAR_CUDA_ATTN_F16=0), not a debug-only one. */
-        const bool prefill_q_defer = !gpu_graph_debug_wants("Qcur", il, pos0) &&
+        const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0) &&
                                      pulsar_gpu_attn_f16_tier_on();
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
@@ -2321,7 +2321,7 @@ bool gpu_graph_encode_layer_ffn_batch(
          * pins it small-n-only for the follow-up hunt. */
         if (ffn_norm_q && ffn_norm_b && ffn_moe_served && n_tokens > 8u &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
-            !gpu_graph_debug_dump_enabled()) {
+            !gpu_graph_f32_store_observed_any()) {
             ffn_norm_keep_from = n_tokens;
             static int announced_fns = 0;
             if (!announced_fns) {
@@ -2333,7 +2333,7 @@ bool gpu_graph_encode_layer_ffn_batch(
             }
         }
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
-                                                                 gpu_graph_debug_wants("hc_ffn_pre", il, pos0)
+                                                                 gpu_graph_f32_store_observed("hc_ffn_pre", il, pos0)
                                                                      ? ffn_cur_view : NULL,
                                                                  g->batch_ffn_norm,
                                                                  ffn_norm_q,
@@ -2383,7 +2383,7 @@ bool gpu_graph_encode_layer_ffn_batch(
 
     if (ok) ok = pulsar_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
-                                                      gpu_graph_debug_wants("ffn_moe_probs", il, pos0)
+                                                      gpu_graph_f32_store_observed("ffn_moe_probs", il, pos0)
                                                           ? g->batch_router_probs : NULL,
                                                       model->map,
                                                       model->size,

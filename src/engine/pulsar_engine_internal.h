@@ -2035,6 +2035,12 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
  * uses this to skip buffers that exist only to be dumped. */
 bool gpu_graph_debug_dump_enabled(void);
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
+/* The predicate every f32 store-skip must use: true when EITHER observer (the
+ * dump or the range sweep) will read the bytes.  See the definition's comment
+ * -- the sweep reads through dump_tensor's own early branch, so debug_wants
+ * alone is not the question.  _any() is the coarse, per-name-less twin. */
+bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos);
+bool gpu_graph_f32_store_observed_any(void);
 void gpu_graph_debug_dump_hc_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,

@@ -83,6 +83,29 @@ void range_sweep_report(void) {
 }
 }  /* namespace */
 
+/* "Will anything OBSERVE these f32 bytes?" -- the question every f32
+ * store-skip actually has to ask, which is NOT the same question as "should
+ * this tensor be written to a dump file".
+ *
+ * There are TWO observers, and only one of them is the file dump:
+ * gpu_graph_debug_dump_tensor's FIRST branch (below) is the range sweep, and
+ * it reads the tensor and returns BEFORE gpu_graph_debug_wants is ever
+ * consulted.  So a skip gated on debug_wants alone hands the sweep dead bytes
+ * -- including its int8_vs_e4m3 column, which is the metric narrowing
+ * decisions are made from, and which has already been wrong once (1836c39).
+ *
+ * Every store-skip gates on THESE, never on the dump predicates directly.
+ * Named for the invariant rather than for either observer, so adding a third
+ * observer is one edit here instead of a hunt through the skip sites. */
+bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos) {
+    return range_sweep_on() || gpu_graph_debug_wants(name, il, pos);
+}
+
+bool gpu_graph_f32_store_observed_any(void) {
+    return range_sweep_on() || gpu_graph_debug_dump_enabled();
+}
+
+
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -240,7 +263,7 @@ void gpu_graph_debug_dump_i32_tensor(
 
 bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t pos) {
     return gpu_graph_directional_steering_ffn_enabled(g) ||
-           gpu_graph_debug_wants("ffn_out", il, pos);
+           gpu_graph_f32_store_observed("ffn_out", il, pos);
 }
 
 
@@ -485,7 +508,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * dz.hc_dim * f32;                        /* batch_flat_hc (RMSNorm out, f32) */
     total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_norm */
-    if (gpu_graph_debug_dump_enabled())
+    if (gpu_graph_f32_store_observed_any())
         total += pc * PULSAR_N_EMBD * f32;                   /* batch_attn_cur (dump-only) */
     total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
     total += pc * dz.q_dim * PULSAR_Q_ELT_SIZE;           /* batch_q */
@@ -1946,7 +1969,7 @@ bool gpu_graph_alloc_raw_cap(
      * the D2 hand census: zero non-debug readers.  Allocate it only when a
      * dump can actually want it, and keep the budget line in step -- the
      * session ledger asserts est == actual. */
-    g->batch_attn_cur = gpu_graph_debug_dump_enabled()
+    g->batch_attn_cur = gpu_graph_f32_store_observed_any()
             ? pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float)) : NULL;
     g->batch_attn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_qr = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
@@ -2031,7 +2054,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->prefill_tokens && g->spec_logits &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
                     g->batch_hc_mix && g->batch_hc_split &&
-                    (g->batch_attn_cur || !gpu_graph_debug_dump_enabled()) &&
+                    (g->batch_attn_cur || !gpu_graph_f32_store_observed_any()) &&
                     g->batch_attn_norm &&
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
