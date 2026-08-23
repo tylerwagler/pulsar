@@ -325,7 +325,7 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
                     *(float4 *)&xb[k * 4] = *(const float4 *)&x[i0 + (uint32_t)k * 4u];
                 }
             }
-            const unsigned char xsb = A8 ? xscale[pulsar_mx_sfoff(0, (int)b, xKBp)] : (unsigned char)0;
+            const unsigned char xsb = A8 ? xscale[pulsar_mx_act_sfoff(0, (int)b, xKBp)] : (unsigned char)0;
 #pragma unroll
             for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 if (r >= nr) continue;
@@ -488,7 +488,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
     const unsigned char *xs = xscale + group * scale_slab;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
-        const unsigned char xsb = xs[pulsar_mx_sfoff((int)tok, (int)b, xKBp)];
+        const unsigned char xsb = xs[pulsar_mx_act_sfoff((int)tok, (int)b, xKBp)];
 #pragma unroll
         for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
             if (r >= nr) continue;
@@ -646,7 +646,7 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
     const int se = pulsar_mx_shared_exp(a);
     data[(size_t)(kb * 32 + lane) + (size_t)row * K] = pulsar_mx_encode(v, se);
-    if (lane == 0) scale[pulsar_mx_sfoff(row, kb, KBp)] = pulsar_mx_scale_byte(se);
+    if (lane == 0) scale[pulsar_mx_act_sfoff(row, kb, KBp)] = pulsar_mx_scale_byte(se);
 }
 
 
@@ -665,7 +665,7 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
     const int se = pulsar_mx_shared_exp(a);
     data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = pulsar_mx_encode(v, se);
-    if (lane == 0) scale[(size_t)g * scale_slab + pulsar_mx_sfoff(tok, kb, KBp)] = pulsar_mx_scale_byte(se);
+    if (lane == 0) scale[(size_t)g * scale_slab + pulsar_mx_act_sfoff(tok, kb, KBp)] = pulsar_mx_scale_byte(se);
 }
 
 
@@ -1689,7 +1689,7 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *
         uint32_t apk = *(const uint32_t *)(xq + k);
         int kb = k >> 5;
         float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
-        float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(xrow, kb, xKBp)] << 23);
+        float sa = __int_as_float((uint32_t)xs[pulsar_mx_act_sfoff(xrow, kb, xKBp)] << 23);
         const float s = sw * sa;
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
@@ -1785,7 +1785,7 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
         #pragma unroll
         for (int t = 0; t < NT; t++) {
             uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
-            float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
+            float sa = __int_as_float((uint32_t)xs[pulsar_mx_act_sfoff(t, kb, xKBp)] << 23);
             const float s = sw * sa;
             const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
             #pragma unroll

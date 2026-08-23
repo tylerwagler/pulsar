@@ -366,7 +366,7 @@ __global__ static void rope_tail_kernel(
         if ((lane & 15u) == 0u) {
             const uint32_t kb = hh * (head_dim / 32u) + (d0 / 32u);
             gact_scale[(size_t)grp * gact_slab +
-                       pulsar_mx_sfoff((int)t, (int)kb, gact_kbp)] = pulsar_mx_scale_byte(se);
+                       pulsar_mx_act_sfoff((int)t, (int)kb, gact_kbp)] = pulsar_mx_scale_byte(se);
         }
     }
 }

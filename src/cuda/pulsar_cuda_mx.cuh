@@ -37,6 +37,29 @@
  *     live (row, kb) pairs leaves stale swizzle slots for the GEMM to read.
  *     pulsar_gpu_mxfp8_act_cache_e4m3_slot() does that memset. */
 
+/* ---- TWO scale-plane layouts, deliberately ---------------------------------
+ *
+ * One function used to serve both, and that is why a second activation packer
+ * appeared: the two objects have opposite access patterns.
+ *
+ *   ACTIVATIONS are read ONE ROW AT A TIME (GEMV at n=1, NT at n<=16).  The
+ *   128x4 tiling below does nothing for them -- at n=1 it scatters 4 contiguous
+ *   bytes then jumps 508 -- and it forces a zero-the-holes contract and an
+ *   oversized slab.  They get a plain row-major plane.
+ *
+ *   WEIGHT scales are read TILE-AT-A-TIME (many output rows per GEMM tile),
+ *   which is what the 128x4 / 512 B grouping is for.  They keep it.
+ *
+ * ⚠ act_sfoff requires kbp == blocks-per-row (NOT rounded up), so that it
+ * agrees byte-for-byte with e4m3_act_pack_kernel's sf[b] and with the down
+ * GEMV arm's xsf[k0>>5] over a per-slot base.  Every in_dim we run is a
+ * multiple of 128, so blocks-per-row is already a multiple of 4 and the
+ * rounded and unrounded values coincide -- but pass the unrounded one. */
+__device__ __forceinline__ static long pulsar_mx_act_sfoff(int row, int kb, int kbp) {
+    return (long)row * kbp + kb;
+}
+
+/* Weight-scale plane: 128 rows x 4 blocks tiled into 512-byte groups. */
 __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
@@ -80,7 +103,7 @@ __device__ __forceinline__ static void pulsar_mx_emit_block(
     const int se = pulsar_mx_shared_exp(a);
     data[(size_t)row * stride + col] = pulsar_mx_encode(v, se);
     if ((threadIdx.x & 31u) == 0u) {
-        scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
+        scale[pulsar_mx_act_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
     }
 }
 

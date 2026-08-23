@@ -169,7 +169,7 @@ static __global__ void ds4_gather_mmq_e4m3(
     unsigned char sb = 0;
     if (i0 < ne00) {
         q = *(const uchar4 *)(src_q + (size_t)src_row * ne00 + i00);
-        sb = src_sf[pulsar_mx_sfoff((int)src_row, (int)(i00 >> 5), src_kbp)];
+        sb = src_sf[pulsar_mx_act_sfoff((int)src_row, (int)(i00 >> 5), src_kbp)];
     }
 
     const int nwrite = scatter ? n_expert_used : 1;

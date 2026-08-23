@@ -728,9 +728,9 @@ static void attn_f16_kernel(
                     const uint32_t kba = hha * (AF16_DIM / 32u) + warp;
                     const uint32_t kbb = hhb * (AF16_DIM / 32u) + warp;
                     gact_scale[(size_t)gra * gact_slab +
-                               pulsar_mx_sfoff((int)arow, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
+                               pulsar_mx_act_sfoff((int)arow, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
                     gact_scale[(size_t)grb * gact_slab +
-                               pulsar_mx_sfoff((int)arow, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
+                               pulsar_mx_act_sfoff((int)arow, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
                 }
             }
         }
