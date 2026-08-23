@@ -8,7 +8,11 @@
  * Design + measurements: docs/indexer-mxfp4-scorer.md
  * Instruction contract:  tests/idx_mxfp4_probe.cu   (every constant below is
  *                        measured on GB10, not read off a spec)
- * Operand choice:        tests/idx_quant_fidelity.cc (E4M3 for Q, measured)
+ * Operand choice:        e2m1 for BOTH operands since L090.4 -- Q arrives as
+ *                        the producer's packed FP4, so staging is a nibble
+ *                        spread, not an encode.  (tests/idx_quant_fidelity.cc
+ *                        measured E4M3-for-Q against unquantised Q, before the
+ *                        producer's FP4 crush made the choice moot.)
  *
  *   score[t][c] = ( sum_h ReLU(q[t,h,:] . k[c,:]) * w[t,h] ) * scale
  *
@@ -91,33 +95,9 @@
 #define IDX_TOKGROUP  8u
 #define IDX_THREADS   256u         /* 8 warps: 4 per token */
 
-/* ---- E4M3 encode (host-side rules, device-side implementation) ----------- */
-
-__device__ __forceinline__ static uint8_t idx_f32_to_e4m3(float v) {
-    /* Round-to-nearest onto the E4M3 grid: 4-bit exponent (bias 7), 3 mantissa
-     * bits, max finite 448.  __nv_cvt_float_to_fp8 exists but pulls in a header
-     * this TU does not otherwise need, and this is off the hot path (one
-     * conversion per Q element per tile). */
-    const float a = fabsf(v);
-    const uint32_t sign = (v < 0.0f) ? 0x80u : 0x00u;
-    if (!(a > 0.0f)) return (uint8_t)sign;              /* zero or NaN-in -> 0 */
-    if (a >= 448.0f) return (uint8_t)(sign | 0x7Eu);    /* saturate to max finite */
-    int e;
-    frexpf(a, &e);              /* a = m * 2^e, m in [0.5,1) -> exponent is e-1 */
-    e -= 1;
-    if (e < -6) {                                        /* subnormal */
-        const float step = ldexpf(1.0f, -9);
-        int m = (int)(a / step + 0.5f);
-        if (m > 7) m = 7;
-        return (uint8_t)(sign | (uint32_t)m);
-    }
-    const float step = ldexpf(1.0f, e - 3);
-    int m = (int)(a / step + 0.5f) - 8;                  /* strip implicit bit */
-    int ee = e + 7;
-    if (m > 7) { m = 0; ee += 1; }                       /* rounded up a binade */
-    if (ee > 15) return (uint8_t)(sign | 0x7Eu);
-    return (uint8_t)(sign | ((uint32_t)ee << 3) | (uint32_t)m);
-}
+/* (The E4M3 encode helpers idx_f32_to_e4m3 / idx_amax_shift lived here until
+ * the e2m1 operand switch: Q staging is a nibble spread now and this TU
+ * encodes nothing.) */
 
 /* ---- the MMA ------------------------------------------------------------ */
 
@@ -129,7 +109,7 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
 #if PULSAR_IDX_MXFP4_MMA
     const uint16_t bid = 0, tid = 0;
     asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0 "
         /* D and C are the SAME registers: "+f" read-write operands, referenced
          * twice.  Declaring them as separate "=f" outputs and "f" inputs let the
          * compiler allocate two accumulator sets and copy between them on every
@@ -151,103 +131,53 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
 #endif
 }
 
-/* ---- Q pre-pack --------------------------------------------------------- */
+/* ---- Q pre-stage -------------------------------------------------------- */
 /* Q is shared by every compressed tile of a token, but the scorer runs one
- * block per (token, 64-comp tile) -- so quantising Q inside the scorer repeats
- * the whole 64x128 amax-scan-and-encode ceil(n_comp/64) times per token.  At
- * n_comp=512 that is 8x redundant scalar work, and it dominated: the first
- * version measured 1.367 ms/launch against the old kernel's 0.550 ms average,
- * at roughly 3 TFLOP/s -- i.e. the tensor cores were idling behind the encode.
- *
- * Hoisting it into its own pass is why Entrpi ships a separate
- * indexer_mxf4_encode_rows_kernel (12.83 ms) next to its scorer (4.94 ms).
- *
- * And it is the whole remaining cost.  Sweeping n_comp with n_tokens fixed
- * separates the two: the runtime is linear in n_comp with slope 1.23e-4 ms per
- * compressed row and an intercept of 0.270 ms.  Only the slope is the GEMM, so
- * at n_comp=512 the GEMM is 0.063 ms -- 34 TMAC/s, already competitive -- and
- * the intercept, 82% of the launch, is this pack.  Every "the scorer runs at
- * 6.5 TMAC/s" figure before that sweep divided total MACs by a runtime that was
- * mostly this kernel, which is why tiling and occupancy work kept returning
- * single-digit percent.
- *
- * ONE WARP PER (token, head) ROW.  The previous version put one thread on each
- * 32-element scale block, so a thread walked 128 contiguous bytes while its
- * neighbour started 128 B away: every warp-wide load fanned out into 32 separate
- * transactions and the kernel ran at 78 GB/s against ~273 GB/s of bandwidth.
- * With a warp on the row, lane L takes elements 4L..4L+3 as one float4, the
- * warp covers the 512 B row in a single coalesced access, and the eight lanes
- * spanning a scale block reduce their amax by shuffle instead of one thread
- * scanning 32 values serially.  The e4m3 result stores the same way: four bytes
- * per lane, 128 B per warp, one transaction. */
-__device__ __forceinline__ static int idx_amax_shift(float amax) {
-    if (!(amax > 0.0f)) return -127;
-    /* frexp's e is (unbiased exponent + 1), so se = (e-1)-8 is just a constant
-     * off the stored exponent field -- no need to call frexpf for it. */
-    const uint32_t ef = (__float_as_uint(amax) >> 23) & 0xFFu;
-    if (ef != 0u) return (int)ef - 135;            /* e4m3 emax = 8 */
-    int e; frexpf(amax, &e); return (e - 1) - 8;   /* subnormal amax: rare */
+ * block per (token, 64-comp tile) -- so preparing Q inside the scorer would
+ * repeat the work ceil(n_comp/64) times per token; it stays hoisted into its
+ * own pass (the same reason Entrpi ships a separate encode-rows kernel).
+ * The pass used to be an ENCODE (f32 -> amax scan -> e4m3), and its cost was
+ * measured to dominate the launch (intercept 0.270 ms = 82% at n_comp=512,
+ * slope 1.23e-4 ms/row = the GEMM).  Since the e2m1 switch it is a nibble
+ * SPREAD of the producer's packed rows -- 68 B read, 132 B written per row,
+ * no arithmetic -- so the old encode-cost analysis is retired with it. */
+
+/* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
+ * at bits [5:2], which is where the measured contract says the MMA reads them. */
+__device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
+    return (((x & 0x000Fu)) | ((x & 0x00F0u) << 4) |
+            ((x & 0x0F00u) << 8) | ((x & 0xF000u) << 12)) << 2;
 }
 
-/* Decode 4 consecutive values of one MXKV-FP4 packed row (68 B: 64 nibble
- * bytes + 4 E8M0 scale bytes).  TWIN of idx_q_load4 in pulsar_cuda_indexer.cu,
- * and deliberately a separate copy: this TU keeps its include surface to
- * pulsar_gpu.h (see the swiglu twin note in pulsar_mxfp4_cutlass.cu).  They
- * MUST agree on the E2M1 value table and the scale decode. */
-__device__ static inline float4 idx_qp_load4_local(const pulsar_mxkv_pack_t *qp,
-                                                   uint64_t row, uint32_t lane) {
-    static const float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    const uint8_t *r = (const uint8_t *)qp + row * (IDX_HEAD_DIM / 2u + IDX_KSLABS);
-    const uint32_t d0 = lane * 4u;
-    const float scale = __uint_as_float((uint32_t)r[(IDX_HEAD_DIM / 2u) + (d0 >> 5u)] << 23);
-    const uint8_t b0 = r[d0 >> 1u], b1 = r[(d0 >> 1u) + 1u];
-    float4 v;
-    const uint8_t n0 = (uint8_t)(b0 & 0xfu), n1 = (uint8_t)(b0 >> 4);
-    const uint8_t n2 = (uint8_t)(b1 & 0xfu), n3 = (uint8_t)(b1 >> 4);
-    v.x = (n0 & 8u) ? -kE2M1[n0 & 7u] * scale : kE2M1[n0 & 7u] * scale;
-    v.y = (n1 & 8u) ? -kE2M1[n1 & 7u] * scale : kE2M1[n1 & 7u] * scale;
-    v.z = (n2 & 8u) ? -kE2M1[n2 & 7u] * scale : kE2M1[n2 & 7u] * scale;
-    v.w = (n3 & 8u) ? -kE2M1[n3 & 7u] * scale : kE2M1[n3 & 7u] * scale;
-    return v;
-}
-
+/* Q operand staging, native-format (L090.4 follow-up, Tyler's rule: a value
+ * that is FP4 travels as FP4).  The producer's packed row already holds the
+ * E2M1 codes and E8M0 scales; the MMA takes e2m1 operands in 8-bit containers
+ * (nibble at bits [5:2], decoding 4x nominal -- the measured contract above).
+ * So "staging" is a nibble spread plus a scale-byte rebias:
+ *   sf_hw = s - 1   (+1 for the 128-vs-127 bias, -2 for the 4x container),
+ * the SAME rebias the K side applies to its identical rows.  Nothing is
+ * decoded and nothing is re-encoded: no amax, no rounding, no second scale
+ * derivation anywhere in the scorer.
+ * (The old e4m3 staging decoded the row to f32 and re-encoded; E4M3-for-Q was
+ * measured in tests/idx_quant_fidelity.cc against UNQUANTISED Q, a premise the
+ * producer's FP4 crush has since made moot -- on-grid values encode exactly
+ * either way, so this change is value-identical and strictly simpler.) */
 __global__ __launch_bounds__(256, 4)
-static void idx_pack_q_kernel(
-        uint8_t *__restrict__ qa,            /* [n_tokens][heads][128] e4m3 */
-        uint8_t *__restrict__ qsf,           /* [n_tokens][heads][4]   ue8m0 */
-        const pulsar_mxkv_pack_t *__restrict__ q,
+static void idx_expand_q_kernel(
+        uint8_t *__restrict__ qa,            /* [n_tokens][heads][128] e2m1-in-byte */
+        uint8_t *__restrict__ qsf,           /* [n_tokens][heads][4]   ue8m0 (rebiased) */
+        const pulsar_mxkv_pack_t *__restrict__ q,   /* packed 68 B rows */
         uint32_t n_rows) {                   /* n_tokens * IDX_HEADS */
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row  = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (row >= n_rows) return;
-
-    /* qa and q share the [row][...] layout, so the row index needs no decompose
-     * into (token, head) at all.  q is the producer's packed E2M1 row; the
-     * decoded values are bit-identical to the f32 the old container held, so
-     * the E4M3 bytes this kernel emits are unchanged (L090.4). */
-    const float4 v = idx_qp_load4_local(q, row, lane);
-
-    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-    /* Lanes 8b..8b+7 hold scale block b, so xor over the low three lane bits
-     * reduces within the block and leaves every lane with its own block's amax. */
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
-
-    const int se = idx_amax_shift(amax);
+    const uint8_t *r = (const uint8_t *)q + (uint64_t)row * (IDX_HEAD_DIM / 2u + IDX_KSLABS);
+    const uint32_t two = *(const uint16_t *)(r + lane * 2u);   /* 4 nibbles, dims 4*lane.. */
+    ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = idx_spread4(two);
     if ((lane & 7u) == 0u) {
-        int byte = se + 128;                   /* hw applies 2^(byte-128) */
-        if (byte < 0) byte = 0;
-        if (byte > 255) byte = 255;
-        qsf[(uint64_t)row * IDX_KSLABS + (lane >> 3u)] = (uint8_t)byte;
+        const int b = (int)r[(IDX_HEAD_DIM / 2u) + (lane >> 3u)] - 1;
+        qsf[(uint64_t)row * IDX_KSLABS + (lane >> 3u)] = (uint8_t)(b < 0 ? 0 : b);
     }
-
-    const float inv = ldexpf(1.0f, -se);
-    const uint32_t w = (uint32_t)idx_f32_to_e4m3(v.x * inv) |
-                       ((uint32_t)idx_f32_to_e4m3(v.y * inv) << 8) |
-                       ((uint32_t)idx_f32_to_e4m3(v.z * inv) << 16) |
-                       ((uint32_t)idx_f32_to_e4m3(v.w * inv) << 24);
-    ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = w;
 }
 
 /* The D5 E4M3 round-trip (idx_q_e4m3_roundtrip_kernel + its wrapper) lived
@@ -257,13 +187,6 @@ static void idx_pack_q_kernel(
  * same bytes, so the unification is structural and the round-trip -- an
  * identity on values already crushed to the FP4 grid -- had nothing left to
  * do. */
-
-/* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
- * at bits [5:2], which is where the measured contract says the MMA reads them. */
-__device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
-    return (((x & 0x000Fu)) | ((x & 0x00F0u) << 4) |
-            ((x & 0x0F00u) << 8) | ((x & 0xF000u) << 12)) << 2;
-}
 
 /* ---- kernel ------------------------------------------------------------- */
 
@@ -290,7 +213,7 @@ __device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
 __global__ __launch_bounds__(IDX_THREADS, IDX_MINBLK)
 static void idx_scores_mxfp4_kernel(
         float *__restrict__ scores,          /* [n_tokens][n_comp] */
-        const uint8_t *__restrict__ qa,      /* [n_tokens][heads][128] e4m3 */
+        const uint8_t *__restrict__ qa,      /* [n_tokens][heads][128] e2m1-in-byte */
         const uint8_t *__restrict__ qsf,     /* [n_tokens][heads][4]   ue8m0 */
         const float *__restrict__ weights,   /* [n_tokens][heads] */
         const uint8_t *__restrict__ comp,    /* [n_comp][68] MXKV-FP4 rows */
@@ -533,8 +456,8 @@ int pulsar_gpu_indexer_scores_mxfp4(
 
     /* One warp per (token, head) row, 8 warps per block. */
     const uint32_t pack_rows = n_tokens * IDX_HEADS;
-    idx_pack_q_kernel<<<(pack_rows + 7u) / 8u, 256>>>(qa, qsf, q, pack_rows);
-    if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q pack launch")) return 0;
+    idx_expand_q_kernel<<<(pack_rows + 7u) / 8u, 256>>>(qa, qsf, q, pack_rows);
+    if (!cuda_ok(cudaGetLastError(), "indexer mxfp4 Q expand launch")) return 0;
 
     dim3 grid((n_comp + IDX_NTILE - 1u) / IDX_NTILE,
               (n_tokens + IDX_TOKGROUP - 1u) / IDX_TOKGROUP, 1);
