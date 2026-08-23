@@ -727,7 +727,11 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          out_row0,
         uint32_t          n_rows,
         uint32_t          head_dim,
-        uint32_t          n_rot);
+        uint32_t          n_rot,
+        /* keep_f32: write the dequantised values back into the f32 staging.
+         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
+         * gpu_graph_f32_store_observed_any() (L094). */
+        bool              keep_f32);
 
 /* Fused rope + QAT for the indexer q projection: one launch replacing the
  * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that
@@ -748,7 +752,11 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         pulsar_gpu_tensor *packed,
         uint32_t          out_row0,
         uint32_t          n_rows,
-        uint32_t          head_dim);
+        uint32_t          head_dim,
+        /* keep_f32: write the dequantised values back into the f32 staging.
+         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
+         * gpu_graph_f32_store_observed_any() (L094). */
+        bool              keep_f32);
 
 /* Tell the indexer score kernels the indexer compressed cache is stored
  * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
@@ -815,7 +823,11 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot);
+        uint32_t          n_rot,
+        /* keep_f32: write the dequantised values back into the f32 staging.
+         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
+         * gpu_graph_f32_store_observed_any() (L094). */
+        bool              keep_f32);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * pulsar_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is

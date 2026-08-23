@@ -111,7 +111,8 @@ static bool gpu_graph_decode_kv_store(
                                              raw_cap,
                                              raw_row,
                                              PULSAR_N_HEAD_DIM,
-                                             PULSAR_N_ROT) != 0;
+                                             PULSAR_N_ROT,
+                                             gpu_graph_f32_store_observed_any()) != 0;
 }
 
 
@@ -173,9 +174,12 @@ bool gpu_graph_commit_attn_comp_stage(
         uint32_t       rows) {
     {
         /* Quantize+pack the `rows` f32 rows staged in attn_comp_stage into the
-         * packed comp cache at first_row.  The kernel also fp8-roundtrips the
-         * stage rows in place (identical to the plain quantize the f32 path
-         * runs), so the stage keeps the exact f32-pipeline values.  This MUST
+         * packed comp cache at first_row.  The kernel CAN also fp8-roundtrip
+         * the stage rows in place so the stage keeps the exact f32-pipeline
+         * values -- but attn_comp_stage has no compute reader (every use is an
+         * output target or the offset-0 row view feeding a "KVcompress" dump),
+         * so that writeback is observer-only and now runs only when one is
+         * watching (L094).  The pack itself MUST
          * be the only fp8 quantize of the row: re-quantizing an already-
          * roundtripped block is NOT bit-idempotent when the block amax sits on
          * a scale boundary (the recomputed scale can shift one step and
@@ -191,7 +195,8 @@ bool gpu_graph_commit_attn_comp_stage(
         if (pulsar_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
                                                     g->layer_attn_comp_cache[il],
                                                     first_row, rows,
-                                                    PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
+                                                    PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                                                    gpu_graph_f32_store_observed_any()) == 0) {
             return false;
         }
         /* plan-33 inc C: byte-replace the ratio-4 boundary row after any commit
@@ -218,7 +223,8 @@ bool gpu_graph_commit_attn_comp_stage_bank(
     if (!cache) return false;
     const bool ok = pulsar_gpu_attn_pack_quantize_store_tensor(
             g->attn_comp_stage, cache, first_row, rows,
-            PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
+            PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+            gpu_graph_f32_store_observed_any()) != 0;
     pulsar_gpu_tensor_free(cache);
     /* plan-33 inc C: boundary-row restore for the explicit-bank commit path. */
     return ok && gpu_graph_emit_keep_restore(g, il, bank, first_row, rows, false);
@@ -691,7 +697,8 @@ bool gpu_graph_encode_decode_layer(
                                                                g->layer_index_comp_cache[il],
                                                                index_row,
                                                                1,
-                                                               PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                               PULSAR_N_INDEXER_HEAD_DIM,
+                                                               gpu_graph_f32_store_observed_any()) != 0;
                     pulsar_gpu_tensor_free(index_row_view);
                 }
                 /* plan-33 inc C: boundary-row restore (decode-fallback site). */

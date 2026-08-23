@@ -1005,14 +1005,22 @@ bool gpu_graph_encode_layer_attention_batch(
      * (pulsar_gpu_store_raw_kv_batch_packed_tensor), so the agreement is
      * structural and there is nothing left to argue about.
      *
-     * The in-place round-trip of batch_kv still matters: the compressor reads it
-     * afterwards and must see the values attention sees, not the wider ones. */
+     * ⚠ The in-place round-trip of batch_kv is KEPT, but not for the reason
+     * this comment used to give.  It said "the compressor reads it afterwards"
+     * -- that is FALSE (verified 2026-08-23): the attention compressor's inputs
+     * are batch_comp_kv/batch_comp_sc, produced by GEMMs on batch_attn_norm,
+     * and nothing in that chain touches batch_kv.  The real reader is the
+     * per-token fallback at the bottom of this file, which re-quantises a row
+     * view of batch_kv into the raw ring -- itself the double-quantise this
+     * file's header warns about.  Point that site at batch_kv_pack's row and
+     * this argument becomes NULL too (L094 item 4). */
     if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->batch_kv,
                                                            g->batch_kv_pack,
                                                            0u,
                                                            n_tokens,
                                                            PULSAR_N_HEAD_DIM,
-                                                           PULSAR_N_ROT) != 0;
+                                                           PULSAR_N_ROT,
+                                                           true) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -1564,7 +1572,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                 g->layer_index_comp_cache[il],
                                                                 0,
                                                                 n_comp,
-                                                                PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                PULSAR_N_INDEXER_HEAD_DIM,
+                                                                gpu_graph_f32_store_observed_any()) != 0;
                     /* plan-33 inc C: boundary-row restore (whole-prefill site). */
                     if (ok) ok = gpu_graph_emit_keep_restore(g, il,
                             g->banks.n_banks ? g->banks.cur_bank : 0u, 0, n_comp, true);
@@ -1675,7 +1684,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                     idx_dst,
                                                                     index_before,
                                                                     index_chunk,
-                                                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                    PULSAR_N_INDEXER_HEAD_DIM,
+                                                                    gpu_graph_f32_store_observed_any()) != 0;
                         /* plan-33 inc C: boundary-row restore (chunked emit site —
                          * the replay-from-R path that recomputes row R/4). */
                         if (ok) ok = gpu_graph_emit_keep_restore(g, il, bank,
@@ -1778,7 +1788,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                 : g->layer_index_comp_cache[il],
                                                                            index_row,
                                                                            1,
-                                                                           PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                                                                           PULSAR_N_INDEXER_HEAD_DIM,
+                                                                           gpu_graph_f32_store_observed_any()) != 0;
                                 pulsar_gpu_tensor_free(index_row_view);
                             }
                             /* plan-33 inc C: boundary-row restore (banked emit). */

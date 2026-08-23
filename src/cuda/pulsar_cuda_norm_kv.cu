@@ -768,7 +768,8 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
  * exponent clamp only differs from the unpacked path outside [2^-127, 2^127]
  * scales, which the 7e-38 amax floor already makes unreachable. */
 __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
-                                                        uint32_t n_rows, uint32_t head_dim) {
+                                                        uint32_t n_rows, uint32_t head_dim,
+                                                        int keep_f32) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
@@ -784,7 +785,10 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
     e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
     float scale = exp2f((float)(e8 - 127));
     uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
-    xr[tid] = dsv4_e2m1fn_decode_dev(nib, scale);
+    /* The dequantised writeback is for OBSERVERS only -- the packed rows below
+     * are what every consumer reads (L094).  Skipped unless a dump or the
+     * range sweep will actually look at the staging. */
+    if (keep_f32) xr[tid] = dsv4_e2m1fn_decode_dev(nib, scale);
     nib_sh[tid] = nib;
     __syncthreads();
 
@@ -1190,7 +1194,8 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                                        uint32_t out_row0,
                                                        uint32_t n_rows,
                                                        uint32_t head_dim,
-                                                       uint32_t n_rot) {
+                                                       uint32_t n_rot,
+                                                       bool keep_f32) {
     if (!x || !packed || n_rows == 0 ||
         n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
         ((head_dim - n_rot) % PULSAR_FP8_KV_BLOCK) != 0 ||
@@ -1198,7 +1203,8 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
         packed->bytes < ((uint64_t)out_row0 + n_rows) * PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
         return 0;
     }
-    attn_pack_store_kernel<<<n_rows, 64>>>((float *)x->ptr, (const float *)x->ptr,
+    attn_pack_store_kernel<<<n_rows, 64>>>(keep_f32 ? (float *)x->ptr : NULL,
+                                          (const float *)x->ptr,
                                           (uint8_t *)packed->ptr,
                                            out_row0, n_rows, head_dim, n_rot,
                                            NULL, NULL, 0u, 0u);
@@ -1243,7 +1249,8 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
                                                     pulsar_gpu_tensor *packed,
                                                     uint32_t out_row0,
                                                     uint32_t n_rows,
-                                                    uint32_t head_dim) {
+                                                    uint32_t head_dim,
+                                                    bool keep_f32) {
     const uint64_t rowbytes = PULSAR_MXKV_FP4_ROWBYTES(128u);
     if (!x || !packed || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
@@ -1253,7 +1260,7 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
     indexer_hadamard_fp4_pack_kernel<<<n_rows, 128>>>(
             (float *)x->ptr,
             (uint8_t *)packed->ptr + (uint64_t)out_row0 * rowbytes,
-            n_rows, head_dim);
+            n_rows, head_dim, keep_f32 ? 1 : 0);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_pack launch");
 }
 
@@ -1299,15 +1306,17 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          head_dim,
-        uint32_t          n_rot) {
+        uint32_t          n_rot,
+        bool              keep_f32) {
     if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
         raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    /* One row, packed, with the ring's own modulo. The f32 staging is rounded in
-     * place so it keeps holding exactly what the packed row decodes to -- the
-     * invariant fp8_kv_quantize_store_kernel used to provide, now provided by
-     * the same kernel the compressed pool uses. */
-    attn_pack_store_kernel<<<1, 64>>>((float *)kv->ptr, (const float *)kv->ptr,
+    /* One row, packed, with the ring's own modulo.  The f32 staging round-trip
+     * is OBSERVER-ONLY (L094): the packed row is what every consumer reads, so
+     * keep_f32 buys the invariant that the staging still decodes to the packed
+     * values -- which only a dump or the range sweep ever checks. */
+    attn_pack_store_kernel<<<1, 64>>>(keep_f32 ? (float *)kv->ptr : NULL,
+                                      (const float *)kv->ptr,
                                       (uint8_t *)raw_cache->ptr,
                                       raw_row, 1u, head_dim, n_rot,
                                       NULL, NULL, 1u, raw_cap);
