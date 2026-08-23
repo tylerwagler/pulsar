@@ -64,6 +64,19 @@
  * prefill gate. */
 #define PULSAR_Q_ELT_SIZE 2u
 
+/* Shared-expert gate/up staging element size (L033 increment 2).  Same
+ * contract as the two above: this is the STORED width the alloc, the byte
+ * budget, and any host stride math must agree on; the producer (the mxfp8
+ * GEMM) and the consumer (the swiglu fold) both derive their kernel type from
+ * the tensor's esz at runtime, never from this macro.  f16 today. */
+#define PULSAR_SHARED_ACT_ELT_SIZE 2u
+
+/* spec_logits row capacity.  The multi-row logits slab is sized to the
+ * deepest speculative verify / multiseq head the engine ever emits
+ * (PULSAR_MSEQ_MAX), NOT to prefill_cap -- guards on row indices must check
+ * against THIS, or the 16 lives only in a comment. */
+#define PULSAR_SPEC_LOGITS_ROWS 16u
+
 
 
 /* =========================================================================

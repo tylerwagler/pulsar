@@ -109,8 +109,15 @@ static inline int pulsar_env_tier_on(const char *name) {
 }
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
- * float today, __half at the flip. */
+ * __half since the L045 flip. */
 typedef __half pulsar_q_t;
+
+/* The typedef and the host-side byte macro live in different headers and are
+ * both authorities on the same fact.  HC already has this bridge (below); Q --
+ * the buffer whose width mismatch actually shipped as defect nine -- did not:
+ * changing either alone compiled clean. */
+static_assert(sizeof(pulsar_q_t) == PULSAR_Q_ELT_SIZE,
+              "pulsar_q_t and PULSAR_Q_ELT_SIZE state the same width; move both or neither");
 
 uint32_t pulsar_gpu_act_f32_first_present_row(const void *ptr, uint64_t n_tok,
                                               uint64_t in_dim);

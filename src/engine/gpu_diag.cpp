@@ -476,7 +476,7 @@ uint64_t gpu_graph_session_bytes_banked(
      * (gpu_graph_decode_multiseq_batch) both read their rows out of it, and
      * those paths must work with speculation disabled (--no-dspark,
      * pulsar-bench/pulsar-eval/agent, or any model without a merged drafter). */
-    total += 16ull * PULSAR_N_VOCAB * f32;                   /* spec_logits */
+    total += (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_N_VOCAB * f32; /* spec_logits */
 
     /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
      * the non-KV cost (~4 GiB at pc=4096 on Flash). */
@@ -497,7 +497,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_out */
     total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
     total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_ffn_cur/norm */
-    total += pc * dz.shared_dim * (f32 + 2ull * 2u);      /* batch_shared_mid f32 + gate/up f16 (L033) */
+    total += pc * dz.shared_dim * (f32 + 2ull * PULSAR_SHARED_ACT_ELT_SIZE); /* batch_shared_mid f32 + gate/up f16 (L033) */
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_shared_out */
     total += 2ull * pc * PULSAR_N_EXPERT * f32;              /* batch_router_logits/probs */
     total += pc * PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
@@ -1931,7 +1931,7 @@ bool gpu_graph_alloc_raw_cap(
      * only by gpu_graph_init_dspark_target (session create, dspark_ready
      * only), which left the multiseq driver rejecting every step whenever
      * speculation was off. */
-    g->spec_logits = pulsar_gpu_tensor_alloc(16ull * PULSAR_N_VOCAB * sizeof(float));
+    g->spec_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_N_VOCAB * sizeof(float));
     g->batch_cur_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_next_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -1967,8 +1967,8 @@ bool gpu_graph_alloc_raw_cap(
      * instantiation; decode's fused shared-expert path uses its own f32
      * scratch and never sees these.  NOT bit-exact (swiglu's inputs are
      * f16-rounded): graded by cuda-reference-gate, not the byte gate. */
-    g->batch_shared_gate = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, sizeof(uint16_t));
-    g->batch_shared_up = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, sizeof(uint16_t));
+    g->batch_shared_gate = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, PULSAR_SHARED_ACT_ELT_SIZE);
+    g->batch_shared_up = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, PULSAR_SHARED_ACT_ELT_SIZE);
     g->batch_shared_mid = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_router_logits = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT * sizeof(float));

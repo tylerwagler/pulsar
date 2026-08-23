@@ -879,7 +879,11 @@ bool gpu_graph_verify_suffix_tops(
         uint32_t               n_tokens,
         int                   *row_tops,
         float                 *row_logits) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    /* spec_logits holds PULSAR_SPEC_LOGITS_ROWS rows, not prefill_cap: the slab
+     * cap was previously asserted only in prose, and a deeper request failed at
+     * the read bounds with a generic error instead of here. */
+    if (n_tokens == 0 || n_tokens > g->prefill_cap ||
+        n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
@@ -1095,6 +1099,8 @@ int gpu_graph_decode_multiseq_batch(
      * DECODE-ONLY (every run length 1 => n_runs == n_active) keeps the identity
      * layout and the SINGLE-BLOCK layers+head path => byte-identical to before
      * (the inc-1/inc-2 gates must stay green). */
+    static_assert(PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS,
+                  "one last-row logit per bank run must fit the spec_logits slab");
     int last_idx[PULSAR_MSEQ_MAX];
     uint32_t n_runs = 0;
     for (uint32_t t = 0; t < n_active; t++) {
@@ -1181,7 +1187,7 @@ int gpu_graph_decode_multiseq_batch(
 
 
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits) {
-    if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
+    if (!g || !g->spec_logits || !logits || row >= PULSAR_SPEC_LOGITS_ROWS) return false;
     const uint64_t row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
     return pulsar_gpu_tensor_read(g->spec_logits,
                                  (uint64_t)row * row_bytes,

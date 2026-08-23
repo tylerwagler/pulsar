@@ -50,8 +50,9 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 /* The same, for the stored Q buffer (f16 since L045).  A plain f32 read
  * would take n*sizeof(float) bytes from a buffer holding
- * n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read, and one the type system
- * cannot catch because a pulsar_gpu_tensor carries no element type. */
+ * n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read.  (The tensor's esz field
+ * records the width now, but tensor_read is deliberately byte-oriented, so
+ * this wrapper is still the only f32-decoding host read of a Q buffer.) */
 static_assert(PULSAR_Q_ELT_SIZE == 2u,
               "pulsar_read_q_f32 decodes f16; update it if the Q element type moves");
 int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
@@ -1670,7 +1671,8 @@ bool gpu_graph_encode_output_head_batch(
         const pulsar_weights     *weights,
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap ||
+        n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     pulsar_gpu_tensor *output_pre = NULL;
@@ -1770,7 +1772,8 @@ bool gpu_graph_encode_dspark_output_head_batch(
         const pulsar_weights        *bw,
         uint32_t                  n_tokens,
         uint64_t                  vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap ||
+        n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     pulsar_gpu_tensor *output_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));

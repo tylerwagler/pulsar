@@ -2115,6 +2115,10 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
     const void * const *comp_bank_ptrs_ptr =
         (descr && comp_bank_ptrs) ? (const void * const *)comp_bank_ptrs->ptr : NULL;
+    /* comp_selected is WRITTEN as uint32_t by the indexer; read here as
+     * int32_t.  Same width, and every value is a row index < n_comp << 2^31,
+     * so the signedness restatement cannot change a bit -- noted so the next
+     * format change treats the pair as one fact. */
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     /* Launch-path dispatch flags: read the environment once per process. */
     static const int no_indexed_heads8 = getenv("PULSAR_CUDA_NO_INDEXED_HEADS8") != NULL;
