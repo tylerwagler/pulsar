@@ -923,9 +923,15 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         return;
     }
 
+    /* A/B: `int` here means "one 32-bit register holding four E4M3 bytes",
+     * not an integer element -- the packing is done by iq2_pack_e4m3_quad and
+     * load_B_tile.  C is genuinely f32 (the FFMA accumulator).  It was
+     * tile<16,8,int> -- a leftover of the deleted s8/s32 arm -- which was
+     * harmless only because tile::ne is T-independent and only ne/get_i/get_j
+     * are ever read; the stated type now matches what flows. */
     using tile_A = ggml_cuda_mma::tile<16, 8, int>;
     using tile_B = ggml_cuda_mma::tile<8, 8, int>;
-    using tile_C = ggml_cuda_mma::tile<16, 8, int>;
+    using tile_C = ggml_cuda_mma::tile<16, 8, float>;
 
     /* s_act / act_iter_base / act_stage etc. were s_q8 / q8_iter_base / q8_stage
      * until 2026-08-18.  The bytes have been E4M3 since the A8 campaign; only

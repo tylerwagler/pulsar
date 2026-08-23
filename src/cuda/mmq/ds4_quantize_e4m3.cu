@@ -101,7 +101,11 @@ static __global__ void ds4_quantize_mmq_e4m3(
             const int64_t i = ids[(int64_t)blockIdx.x * n_expert_used + slot];
             ib = k_block * ne1 + i;
         } else {
-            const int64_t ib0 = blockIdx.z * ((int64_t)gridDim.x * gridDim.y * blockDim.x / QK8_1);
+            /* Blocks per z-slice: each thread packs 4 values, DS4_ACT_BLOCK_VALS
+             * values per block.  This read "/ QK8_1" until the types sweep:
+             * numerically identical only because 4*QK8_1 == DS4_ACT_BLOCK_VALS,
+             * and inert only because every live launch has gridDim.z == 1. */
+            const int64_t ib0 = blockIdx.z * ((int64_t)gridDim.x * gridDim.y * blockDim.x * 4 / DS4_ACT_BLOCK_VALS);
             ib = ib0 + k_block * ne1 + blockIdx.x;
         }
         uchar4 *yqs4 = (uchar4 *)y[ib].qs;
@@ -176,7 +180,11 @@ static __global__ void ds4_gather_mmq_e4m3(
             const int64_t i = ids[(int64_t)blockIdx.x * n_expert_used + slot];
             ib = k_block * ne1 + i;
         } else {
-            const int64_t ib0 = blockIdx.z * ((int64_t)gridDim.x * gridDim.y * blockDim.x / QK8_1);
+            /* Blocks per z-slice: each thread packs 4 values, DS4_ACT_BLOCK_VALS
+             * values per block.  This read "/ QK8_1" until the types sweep:
+             * numerically identical only because 4*QK8_1 == DS4_ACT_BLOCK_VALS,
+             * and inert only because every live launch has gridDim.z == 1. */
+            const int64_t ib0 = blockIdx.z * ((int64_t)gridDim.x * gridDim.y * blockDim.x * 4 / DS4_ACT_BLOCK_VALS);
             ib = ib0 + k_block * ne1 + blockIdx.x;
         }
         uchar4 *yqs4 = (uchar4 *)y[ib].qs;

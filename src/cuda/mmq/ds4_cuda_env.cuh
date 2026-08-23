@@ -39,7 +39,7 @@
                                 // `static const __device__`.  DECL alone declares
                                 // the block layouts but defines no table, and the
                                 // table block is #if'd out rather than erroring.
-#include "ggml-common.h"      // block_q*/block_iq* layouts + QK8_1, still vendored
+#include "ggml-common.h"   // iq2xxs_grid (the table is EMITTED here; see its header)
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)

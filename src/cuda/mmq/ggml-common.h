@@ -5,6 +5,8 @@
 // authors) on 2026-08-18.  The vendored original was 1,911 lines of quant block
 // layouts and dequant tables; an empty-shim compile of every built MMQ TU found
 // this engine referencing exactly TWO things from it: QK8_1 and iq2xxs_grid.
+// (2026-08-22: the E4M3 staging kernels stopped sizing with QK8_1 -- the last
+// consumer -- so the define is gone too and only iq2xxs_grid remains.)
 //
 // Everything else was block_q*/block_iq* struct definitions and grids for quant
 // types we do not run.  They were inert -- no code, no cost at runtime -- but
@@ -22,8 +24,6 @@
 #pragma once
 
 #include <cstdint>
-
-#define QK8_1 32
 
 #if defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {

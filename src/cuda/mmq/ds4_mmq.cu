@@ -333,7 +333,6 @@ int ds4_mmq_moe_impl(
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = 1;             // src1 rows per channel (one per token)
     const int64_t ne12         = n_tokens;      // src1 channels (= tokens)
-    const int64_t blck         = ggml_blck_size(type);
 
     /* Every buffer this call needs, sized up front, taken from ONE arena on the
      * MMQ scratch slot.  Sizing has to be hoisted above the first take because
@@ -600,7 +599,6 @@ int ds4_mmq_moe_pair_impl(
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = 1;
     const int64_t ne12         = n_tokens;
-    const int64_t blck         = ggml_blck_size(type);
 
     const size_t nbytes_src1_act =
         ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
