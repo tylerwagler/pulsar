@@ -71,8 +71,40 @@ $(shell mkdir -p $(dir $(CUDA_FLAG_STAMP)) 2>/dev/null; \
         [ "$$(cat $(CUDA_FLAG_STAMP) 2>/dev/null)" = "$(CUDA_FLAG_SIG)" ] || \
         printf '%s' "$(CUDA_FLAG_SIG)" > $(CUDA_FLAG_STAMP))
 
+# CUTLASS: EXTERNAL, header-only, and deliberately NOT a git submodule -- see
+# cutlass.pin for why (a symlinked submodule path made `git checkout` fail or
+# silently clobber, which cost three gate runs and a bad dev push on
+# 2026-08-23).  Override CUTLASS_DIR to point anywhere; `make cutlass` clones
+# the pinned sha if you have nothing.
 CUTLASS_DIR ?= $(CURDIR)/cutlass
 CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+CUTLASS_PIN_SHA := $(shell sed -n 's/^sha=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
+CUTLASS_PIN_URL := $(shell sed -n 's/^url=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
+
+# Fail EARLY and by name.  Without this the failure is a wall of
+# "cutlass/cutlass.h: No such file" from the middle of a parallel build, which
+# is how an empty cutlass/ directory went unnoticed repeatedly.
+.PHONY: cutlass-check cutlass
+cutlass-check:
+	@[ -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" ] || { \
+	  echo "ERROR: CUTLASS headers not found at CUTLASS_DIR=$(CUTLASS_DIR)"; \
+	  echo "       expected $(CUTLASS_DIR)/include/cutlass/cutlass.h"; \
+	  echo "       run 'make cutlass', or set CUTLASS_DIR=/path/to/cutlass"; \
+	  echo "       pinned sha: $(CUTLASS_PIN_SHA)"; exit 1; }
+	@if [ -e "$(CUTLASS_DIR)/.git" ] && [ -n "$(CUTLASS_PIN_SHA)" ]; then \
+	  have=$$(git -C "$(CUTLASS_DIR)" rev-parse HEAD 2>/dev/null); \
+	  [ "$$have" = "$(CUTLASS_PIN_SHA)" ] || \
+	    echo "WARNING: CUTLASS at $(CUTLASS_DIR) is $$have, pin says $(CUTLASS_PIN_SHA)"; \
+	fi
+
+# Clone/checkout the pinned CUTLASS into CUTLASS_DIR (default ./cutlass).
+cutlass:
+	@if [ ! -e "$(CUTLASS_DIR)/.git" ]; then \
+	  git clone --filter=blob:none "$(CUTLASS_PIN_URL)" "$(CUTLASS_DIR)"; fi
+	@git -C "$(CUTLASS_DIR)" fetch --depth=1 origin "$(CUTLASS_PIN_SHA)" 2>/dev/null || \
+	 git -C "$(CUTLASS_DIR)" fetch origin
+	@git -C "$(CUTLASS_DIR)" checkout -q "$(CUTLASS_PIN_SHA)"
+	@echo "CUTLASS at $(CUTLASS_DIR) -> $(CUTLASS_PIN_SHA)"
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 
 PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor
@@ -654,8 +686,9 @@ cuda-reference-gate:
 			$(PULSAR_REF_TOL) --known-high 3840; \
 	fi
 
-# NOTE: `git worktree add` does not populate submodules, so the baseline build
-# is pointed at THIS tree's CUTLASS pin (a header-only include path).
+# NOTE: CUTLASS is an external header-only include path (never a submodule, and
+# never populated by `git worktree add`), so the baseline build is pointed at
+# THIS tree's CUTLASS_DIR.
 cuda-prefill-gate-baseline:
 	git worktree remove --force $(PREFILL_BASELINE_WT) 2>/dev/null || true
 	rm -rf $(PREFILL_BASELINE_WT)
@@ -872,7 +905,7 @@ src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 
 # CUTLASS MXFP4 tensor-core expert FFN (GB10/sm_120f). Requires -arch=sm_120f (family mode) for the
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
-src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP)
+src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP) | cutlass-check
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)

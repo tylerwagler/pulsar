@@ -220,12 +220,19 @@ weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
-Then build (the `cutlass/` submodule is required):
+CUTLASS is an external, header-only dependency. It is deliberately **not** a
+git submodule (see `cutlass.pin`); fetch the pinned revision once, anywhere you
+like, and point `CUTLASS_DIR` at it:
 
 ```sh
-git submodule update --init cutlass
+make cutlass               # clones the pinned sha into ./cutlass
+# ...or reuse a clone you already have:
+#   make cuda-spark CUTLASS_DIR=$HOME/cutlass
 make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
 ```
+
+The build checks the headers exist before compiling the CUTLASS translation
+unit, and warns if the clone's HEAD does not match `cutlass.pin`.
 
 `./ds4flash.gguf` is the default model path used by `pulsar-server`. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./pulsar-server --help` for the

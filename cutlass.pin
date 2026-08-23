@@ -1,0 +1,34 @@
+# CUTLASS pin.  Header-only dependency: the build wants only
+#   -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+#
+# This was a git SUBMODULE until 2026-08-23 and it cost more than it bought.
+# Nothing used it AS a submodule -- `git worktree add` never populates one, and
+# sparky shares a single clone via a SYMLINK at the submodule path, which git
+# refuses to tolerate: every `git checkout` either failed with
+#   error: expected submodule path 'cutlass' not to be a symbolic link
+# or silently replaced the symlink with an empty directory.  On 2026-08-23 that
+# made three consecutive gate runs test a STALE TREE while reporting 18/18, and
+# put an ungated broken commit on dev.  Git no longer manages this path, so a
+# checkout cannot fight the filesystem over it.
+#
+# This follows the precedent already set by src/cuda/mmq/VENDOR.md, which made
+# the same call for the llama.cpp MMQ kernels: an external build dependency
+# should not be something git has to manage.
+#
+# The Makefile checks the headers exist before compiling the CUTLASS TU and
+# WARNS if the clone's HEAD != this sha (that check found the dev box and
+# sparky on different revisions the day it was written).
+#
+# This sha is v4.7.0, the LATEST release as of 2026-08-23.  (sparky was already
+# on it; the dev box was a release behind on v4.6.1 and AGENTS.md claimed
+# v4.5.2 -- three machines, three answers, which is why the pin now exists.)
+#
+# POLICY: track the latest CUTLASS *release tag*, not main.  main carries
+# untagged daily churn through the MXFP4 expert GEMM we depend on, and a
+# moving dependency there is not something the gate suite can protect us
+# from.  Bumping this sha is a real change: it is NOT byte-exact, so it
+# needs a full gate run AND a decode A/B (see L096) before it lands.
+#
+# Point CUTLASS_DIR at a clone of this sha, or run `make cutlass`.
+url=https://github.com/NVIDIA/cutlass.git
+sha=dcf215af68a2d08d305076c152a06f201728cd53

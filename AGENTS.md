@@ -61,7 +61,9 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
 - `src/vendor/` — linenoise, rax.
 - `tests/` — test runners; `pulsar_test.cpp` and `pulsar_agent_test.cpp` are unity builds
   that `#include` the server/agent source lists.
-- `cutlass/` — git submodule (v4.5.2), **required** for the MXFP4 expert path.
+- `cutlass/` — EXTERNAL header-only dependency, **required** for the MXFP4
+  expert path. Deliberately **not** a git submodule (see `cutlass.pin` for the
+  rationale and the pinned sha); `CUTLASS_DIR` may point anywhere.
 - `gguf-tools/` — offline quantization/imatrix tooling that produces the GGUFs
   this fork loads.
 
@@ -73,7 +75,8 @@ Everything else stays `static`. The cross-module surface is `src/pulsar.h`,
 ## Build
 
 ```sh
-git submodule update --init cutlass   # once
+make cutlass                          # once: clone the pinned CUTLASS
+                                      # (or set CUTLASS_DIR=/path/to/cutlass)
 make cuda-spark          # DGX Spark / GB10 (CUDA_ARCH=sm_120f)
 make cuda-generic        # other local CUDA GPUs (CUDA_ARCH=native)
 make cuda CUDA_ARCH=sm_N # explicit -arch, e.g. cross-builds
