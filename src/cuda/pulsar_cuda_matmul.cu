@@ -2284,9 +2284,17 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
         const uint64_t fblocks = (in_dim + 31) / 32;
         const uint64_t fbytes0 = out0_dim * fblocks * 33;
         const uint64_t fbytes1 = out1_dim * fblocks * 33;
+        /* This kernel is untemplated f32-out/f32-in; the byte bounds alone
+         * would accept an oversized narrowed buffer (defect nine's shape), so
+         * the format is checked, not just the size.  A mismatch falls through
+         * to the unfused labeled calls, which derive their output type from
+         * the tensor. */
         const bool bounds_ok =
             weight0_offset <= model_size && fbytes0 <= model_size - weight0_offset &&
             weight1_offset <= model_size && fbytes1 <= model_size - weight1_offset &&
+            pulsar_tensor_esz(x) == sizeof(float) &&
+            pulsar_tensor_esz(out0) == sizeof(float) &&
+            pulsar_tensor_esz(out1) == sizeof(float) &&
             x->bytes >= in_dim * sizeof(float) &&
             out0->bytes >= out0_dim * sizeof(float) &&
             out1->bytes >= out1_dim * sizeof(float);
@@ -2446,6 +2454,11 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
     if (weight_bytes > model_size - weight_offset) return 0;
+    /* Format check, not just size: these arms store f32 through an
+     * untemplated float*, and an oversized narrowed batch buffer at small
+     * n_tok would pass a pure byte bound (defect nine's shape). */
+    if (pulsar_tensor_esz(x) != sizeof(float) ||
+        pulsar_tensor_esz(out) != sizeof(float)) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
@@ -2639,6 +2652,11 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
     if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
     uint64_t weight_bytes = weight_elems * sizeof(float);
     if (weight_bytes > model_size - weight_offset) return 0;
+    /* Format check, not just size: these arms store f32 through an
+     * untemplated float*, and an oversized narrowed batch buffer at small
+     * n_tok would pass a pure byte bound (defect nine's shape). */
+    if (pulsar_tensor_esz(x) != sizeof(float) ||
+        pulsar_tensor_esz(out) != sizeof(float)) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
@@ -2835,10 +2853,11 @@ int pulsar_gpu_attention_output_batch_tensor(
             const uint64_t outb  = out_dim * sizeof(float);
             pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
             pulsar_gpu_tensor low_pre = pulsar_tensor_subview(low, 0, low->bytes);
-            pulsar_gpu_tensor hd_pre  = { heads->ptr, heads->bytes, 0 };
+            pulsar_gpu_tensor hd_pre  = pulsar_tensor_subview(heads, 0, heads->bytes);
             pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb, out->bytes - n_dec * outb);
             pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
-            pulsar_gpu_tensor hd_suf  = { (char *)heads->ptr + n_dec * headb, heads->bytes - n_dec * headb, 0 };
+            pulsar_gpu_tensor hd_suf  = pulsar_tensor_subview(heads, n_dec * headb,
+                                                             heads->bytes - n_dec * headb);
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
             int r1 = pulsar_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,

@@ -1186,6 +1186,7 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_t
 
 int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;   /* untemplated f32 in-place */
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
@@ -1275,6 +1276,10 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
 int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    /* Untemplated f32 in-place kernel; the byte bound alone would accept an
+     * oversized narrowed buffer.  The f16-aware twin is head_rms_norm_rope_tail
+     * above -- keep the two from drifting. */
+    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     /* The MX epilogue owns exactly the blocks covering [head_dim - n_rot,
      * head_dim), so that range must BE whole MX blocks and a warp must map to
