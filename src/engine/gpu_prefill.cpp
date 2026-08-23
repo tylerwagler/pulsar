@@ -1005,22 +1005,22 @@ bool gpu_graph_encode_layer_attention_batch(
      * (pulsar_gpu_store_raw_kv_batch_packed_tensor), so the agreement is
      * structural and there is nothing left to argue about.
      *
-     * ⚠ The in-place round-trip of batch_kv is KEPT, but not for the reason
-     * this comment used to give.  It said "the compressor reads it afterwards"
-     * -- that is FALSE (verified 2026-08-23): the attention compressor's inputs
-     * are batch_comp_kv/batch_comp_sc, produced by GEMMs on batch_attn_norm,
-     * and nothing in that chain touches batch_kv.  The real reader is the
-     * per-token fallback at the bottom of this file, which re-quantises a row
-     * view of batch_kv into the raw ring -- itself the double-quantise this
-     * file's header warns about.  Point that site at batch_kv_pack's row and
-     * this argument becomes NULL too (L094 item 4). */
+     * The in-place round-trip of batch_kv is OBSERVER-ONLY now.  It carried a
+     * comment claiming "the compressor reads it afterwards" -- FALSE (verified
+     * 2026-08-23): the attention compressor's inputs are
+     * batch_comp_kv/batch_comp_sc, produced by GEMMs on batch_attn_norm, and
+     * nothing in that chain touches batch_kv.  Its one real reader was the
+     * per-token fallback below, which re-quantised a row of this buffer into
+     * the ring; that now scatters the packed bytes instead, so after this pack
+     * the only thing that ever looks at batch_kv is a dump or the range sweep
+     * (L094 item 4).  ~8 MiB x 43 layers of stores per chunk. */
     if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->batch_kv,
                                                            g->batch_kv_pack,
                                                            0u,
                                                            n_tokens,
                                                            PULSAR_N_HEAD_DIM,
                                                            PULSAR_N_ROT,
-                                                           true) != 0;
+                                                           gpu_graph_f32_store_observed_any()) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -2087,15 +2087,30 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
 
                 pulsar_gpu_tensor *q_view = gpu_graph_q_row_view(g->batch_q, t, q_dim);
-                pulsar_gpu_tensor *kv_cache_view = gpu_graph_tensor_row_view(g->batch_kv, t, PULSAR_N_HEAD_DIM);
+                /* Row t of the PACKED rows the kv_path already emitted, not a
+                 * row of the f32 staging.  This site used to re-quantise
+                 * batch_kv row t into the ring -- a SECOND quantise of rows the
+                 * pack had already round-tripped, which is exactly the
+                 * not-bit-idempotent double-quantise this file's header warns
+                 * about and which the batched arms fixed by scattering bytes
+                 * (L094 item 4).  Copying the bytes makes the ring agree with
+                 * what attention read by construction. */
+                pulsar_gpu_tensor *kv_pack_view = pulsar_gpu_tensor_view(
+                        g->batch_kv_pack,
+                        (uint64_t)t * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
+                        PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
                 pulsar_gpu_tensor *heads_view = gpu_graph_tensor_row_view(g->batch_heads, t, q_dim);
-                ok = ok && q_view && kv_cache_view && heads_view;
+                ok = ok && q_view && kv_pack_view && heads_view;
                 if (ok && !zero_prefix) {
-                    ok = pulsar_gpu_store_raw_kv_tensor(g->layer_raw_cache[il],
-                                                       kv_cache_view,
+                    /* n_tokens=1 with pos0=pos puts the row at pos % raw_cap --
+                     * the same slot the f32 store targeted (attn_pack_ring_slot). */
+                    ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il],
+                                                       kv_pack_view,
                                                        g->raw_cap,
-                                                       pos % g->raw_cap,
-                                                       PULSAR_N_HEAD_DIM) != 0;
+                                                       pos,
+                                                       1u,
+                                                       PULSAR_N_HEAD_DIM,
+                                                       NULL, NULL, 1u) != 0;
                 }
                 if (ok && have_topk && n_selected != 0) {
                     ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
@@ -2138,7 +2153,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  PULSAR_N_HEAD_DIM) != 0;
                 }
                 pulsar_gpu_tensor_free(heads_view);
-                pulsar_gpu_tensor_free(kv_cache_view);
+                pulsar_gpu_tensor_free(kv_pack_view);
                 pulsar_gpu_tensor_free(q_view);
             }
         }
