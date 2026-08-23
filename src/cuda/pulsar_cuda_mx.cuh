@@ -37,6 +37,14 @@
  *     live (row, kb) pairs leaves stale swizzle slots for the GEMM to read.
  *     pulsar_gpu_mxfp8_act_cache_e4m3_slot() does that memset. */
 
+/* Round UP to a multiple of n.  Lives here rather than in one .cu because the
+ * MX scale slab's geometry (blocks-per-row padded to 4, rows padded to 128) is
+ * shared by the producers, the GEMV arms and the packers -- and a second copy
+ * of a layout constant is how the swizzle/linear mix-up nearly shipped. */
+__host__ __device__ __forceinline__ static int pulsar_mx_rup(int x, int n) {
+    return (x + n - 1) / n * n;
+}
+
 __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);

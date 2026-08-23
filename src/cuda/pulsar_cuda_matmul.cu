@@ -626,7 +626,8 @@ static int cublaslt_ensure(void) {
 }
 
 
-static inline int mx_rup(int x, int n) { return (x + n - 1) / n * n; }
+/* mx_rup moved to pulsar_cuda_mx.cuh (shared with the cutlass packers). */
+#define mx_rup pulsar_mx_rup
 /* Reservation arithmetic for the scratch arena: every cuda_arena_take here
  * 256-aligns, so the reservation has to budget the ALIGNED size of each
  * slice.  Budgeting the raw sizes is how a caller reserves less than it

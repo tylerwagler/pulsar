@@ -979,6 +979,42 @@ __global__ static void e4m3_act_pack_kernel(uint8_t *q, uint8_t *sf, const float
   }
 }
 
+/* SWIZZLE-writing twin of e4m3_act_pack_kernel.  IDENTICAL per-32 amax, se and
+ * encode -- so its values are bit-identical to both the round-trip and the
+ * linear packer -- but the scale byte lands at pulsar_mx_sfoff(row, kb, kbp)
+ * instead of at sf[b].
+ *
+ * ⚠ BOTH PACKERS EXIST BECAUSE THE TWO A8 ARMS DISAGREE ABOUT THE SCALE PLANE.
+ * expert_gemv_down_kernel reads it LINEARLY (xsf[k0>>5], offset per slot);
+ * expert_gemv_gu_swiglu_kernel reads it through the SWIZZLE, because its A8 arm
+ * was built to consume the PRODUCER's cache.  Handing a swizzled reader a
+ * linear plane compiles clean and computes a well-formed WRONG answer -- that
+ * mistake was one build away from shipping on 2026-08-23.
+ *
+ * ⚠ THE SCALE SLAB MUST BE ZEROED BEFORE THIS RUNS.  mx_sfoff leaves holes
+ * whenever rows or blocks are not multiples of 128/4, and the GEMM reads those
+ * slots; the producer-side cache zeroes for exactly this reason. */
+__global__ static void e4m3_act_pack_swizzled_kernel(uint8_t *q, uint8_t *sf,
+                                                     const float *x,
+                                                     int nblk_per_row, int kbp,
+                                                     long nblk32) {
+  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk32) return;
+  const int row = (int)(b / nblk_per_row);
+  const int kb  = (int)(b % nblk_per_row);
+  const float *src = x + b * 32;
+  uint8_t *dq = q + b * 32;
+  float mx = 0.f;
+  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
+  const int se = pulsar_mx_shared_exp(mx);
+  const float inv = exp2f((float)-se);
+  sf[pulsar_mx_sfoff(row, kb, kbp)] = pulsar_mx_scale_byte(se);
+  for (int i = 0; i < 32; i++) {
+    const cutlass::float_e4m3_t e = (cutlass::float_e4m3_t)(src[i] * inv);
+    dq[i] = *(const uint8_t *)&e;
+  }
+}
+
 /* Persistent activation round-trip buffers, grown on demand and reused across
  * layers/calls -- single GPU-submission thread, same convention as the other
  * static caches. */
@@ -1010,10 +1046,23 @@ int pulsar_cutlass_expert_ffn_gemv_small(
    * because its A8 arm exists to consume the PRODUCER's cache.  So the down
    * leg converts by mirroring pulsar_cutlass_gemv_down exactly; the gate/up
    * leg would need a swizzle-writing packer and stays on the round-trip. */
-  const size_t xq_floats = (size_t)n_tokens * in_dim;
+  /* BOTH legs are native-format now.  The gate/up leg reads its scale plane
+   * through pulsar_mx_sfoff's swizzle, so it is fed by
+   * e4m3_act_pack_swizzled_kernel; the down leg reads a linear plane and keeps
+   * e4m3_act_pack_kernel.  Sizes are in BYTES (payload + scales) expressed in
+   * the buffer's float units.
+   *
+   * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
+   * into 512-byte groups, so it needs ceil(rows/128) * (kbp/4) * 512 and must be
+   * ZEROED (the tiling leaves holes the GEMM still reads). */
+  const int   x_nblk_row = (int)(in_dim / 32u);
+  const int   x_kbp      = pulsar_mx_rup(x_nblk_row, 4);
+  const size_t xq_elems  = (size_t)n_tokens * in_dim;
+  const size_t xsf_bytes = (size_t)((n_tokens + 127u) / 128u) * (size_t)(x_kbp / 4) * 512u;
+  const size_t xq_bytes  = xq_elems + xsf_bytes;
   const size_t midq_elems = (size_t)n_slots * mid_dim;
   const size_t midq_bytes = midq_elems + midq_elems / 32u;
-  const size_t need = xq_floats + (midq_bytes + 3u) / 4u;
+  const size_t need = (xq_bytes + 3u) / 4u + (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
     if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
     g_fp4_gemv_actbuf = nullptr;
@@ -1023,19 +1072,23 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     }
     g_fp4_gemv_actbuf_floats = need;
   }
-  float *xq = g_fp4_gemv_actbuf;
-  uint8_t *midq8 = (uint8_t *)(g_fp4_gemv_actbuf + xq_floats);
+  uint8_t *xq8   = (uint8_t *)g_fp4_gemv_actbuf;
+  uint8_t *xsf   = xq8 + xq_elems;
+  uint8_t *midq8 = xq8 + ((xq_bytes + 3u) & ~(size_t)3u);
   uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   {
-    const long nb = (long)(xq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);   /* W4A8: E4M3 acts */
+    const long nb = (long)(xq_elems / 32);
+    /* Zero first: the swizzle leaves holes and the GEMM reads them. */
+    if (cudaMemsetAsync(xsf, 0, xsf_bytes) != cudaSuccess) return 1;
+    e4m3_act_pack_swizzled_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(
+        xq8, xsf, x, x_nblk_row, x_kbp, nb);   /* W4A8: E4M3 acts, swizzled SF */
   }
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
-        mid_scratch, xq, nullptr, nullptr, 0, selected, rweights,
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        mid_scratch, nullptr, (const __nv_fp8_e4m3 *)xq8, xsf, x_kbp, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }
