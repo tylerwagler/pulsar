@@ -1034,18 +1034,11 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     uint64_t gate_stride, uint64_t gate_data_bytes,
     uint64_t down_stride, uint64_t down_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
-    int in_dim, int mid_dim, int out_dim) {
+    int in_dim, int mid_dim, int out_dim,
+    const void *act_q, const void *act_sf, int act_kbp) {
   if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  /* Native-format transport (L094 item 5), DOWN LEG ONLY -- and the asymmetry
-   * is load-bearing, not laziness.  The two A8 arms disagree about the scale
-   * plane's layout: expert_gemv_down_kernel reads it LINEARLY (xsf[k0>>5]),
-   * which is exactly what e4m3_act_pack_kernel writes, while
-   * expert_gemv_gu_swiglu_kernel reads it through pulsar_mx_sfoff's SWIZZLE
-   * because its A8 arm exists to consume the PRODUCER's cache.  So the down
-   * leg converts by mirroring pulsar_cutlass_gemv_down exactly; the gate/up
-   * leg would need a swizzle-writing packer and stays on the round-trip. */
   /* BOTH legs are native-format now.  The gate/up leg reads its scale plane
    * through pulsar_mx_sfoff's swizzle, so it is fed by
    * e4m3_act_pack_swizzled_kernel; the down leg reads a linear plane and keeps
@@ -1078,7 +1071,33 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  {
+  /* HANDOVER (L089): when the producing norm already emitted this x as E4M3 +
+   * ue8m0, read THOSE bytes and do not pack.  x is then never dereferenced by
+   * this call -- which is the whole point.  This arm's read of the raw f32 was
+   * L089's "sixth reader", the lone consumer sitting outside every moe.cu
+   * guard, and the reason the ffn f32 store-skip is still cut at n<=8.
+   *
+   * ⚠ THE HIT IS ONLY VALID BECAUSE BOTH SIDES ARE THE SWIZZLE, and that was
+   * checked on both ends rather than assumed: the producer writes through
+   * pulsar_mx_emit_block -> pulsar_mx_sfoff, and expert_gemv_gu_swiglu_kernel
+   * reads through pulsar_mx_sfoff, with act_kbp = mx_rup(in_dim/32,4) = the
+   * x_kbp computed here.  Handing a swizzled reader a linear plane compiles
+   * clean and computes a well-formed WRONG answer; the reverse assumption --
+   * that nothing needed the swizzle -- is what broke the engine in 7df3b75. */
+  const bool have_handover = (act_q != nullptr && act_sf != nullptr && act_kbp == x_kbp);
+  const __nv_fp8_e4m3 *gu_q  = have_handover ? (const __nv_fp8_e4m3 *)act_q
+                                             : (const __nv_fp8_e4m3 *)xq8;
+  const uint8_t       *gu_sf = have_handover ? (const uint8_t *)act_sf : xsf;
+  if (!have_handover) {
+    /* MISS: pack from x ourselves.  Announce once -- a silently-missed
+     * handover must not be able to masquerade as a hit, the same reasoning as
+     * the sibling arms' "no re-encode" announce. */
+    static int announced_pack = 0;
+    if (!announced_pack) {
+      announced_pack = 1;
+      fprintf(stderr, "pulsar: small-batch FFN GEMV packs x itself (handover miss) "
+                      "in_dim=%d n_tokens=%d\n", in_dim, n_tokens);
+    }
     const long nb = (long)(xq_elems / 32);
     /* Zero first: the swizzle leaves holes and the GEMM reads them. */
     if (cudaMemsetAsync(xsf, 0, xsf_bytes) != cudaSuccess) return 1;
@@ -1088,7 +1107,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
     expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
-        mid_scratch, nullptr, (const __nv_fp8_e4m3 *)xq8, xsf, x_kbp, selected, rweights,
+        mid_scratch, nullptr, gu_q, gu_sf, x_kbp, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }

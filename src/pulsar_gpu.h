@@ -1373,7 +1373,19 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         unsigned        n_total_expert,
         int             in_dim,
         int             mid_dim,
-        int             out_dim);
+        int             out_dim,
+        /* Producer handover (L089): the E4M3 + ue8m0 the producing norm already
+         * emitted for x, with act_kbp blocks per row.  When supplied AND
+         * act_kbp matches this call's geometry, x is NOT READ AT ALL -- which is
+         * the point: this arm's raw-f32 read of x was L089's "sixth reader", the
+         * one consumer outside all the moe.cu guards.  Pass NULL/NULL/0 to pack
+         * from x instead (the miss path, which announces itself once).
+         * ⚠ act_sf must be in the pulsar_mx_sfoff SWIZZLE, not a linear plane:
+         * the gate/up arm indexes it that way and a linear plane would compute
+         * a well-formed wrong answer. */
+        const void     *act_q,
+        const void     *act_sf,
+        int             act_kbp);
 
 /* Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
  * blockscaled grouped GEMM launch each -- replacing the per-expert host loop + blocking offsets
