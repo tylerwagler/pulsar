@@ -14,12 +14,16 @@
  * shuffle the producer can do for free, and the standalone quantize pass that
  * would otherwise read the f32 back is not moved but DELETED.
  *
- * ⚠ MUST MATCH pulsar_cuda_matmul.cu's mx_sfoff / mxfp8_quant_act_kernel
- * EXACTLY.  These epilogues REPLACE that pass, so a divergence in the swizzle
- * or in the exponent arithmetic is a SILENT WRONG-OPERAND bug, not a rounding
- * difference -- the GEMM would read a well-formed value from the wrong slot.
- * This header exists so there is ONE definition to keep in step with the
- * quantiser instead of a copy per producer file; it was extracted from
+ * ⚠ A divergence in the swizzle or in the exponent arithmetic is a SILENT
+ * WRONG-OPERAND bug, not a rounding difference -- the GEMM reads a well-formed
+ * value from the wrong slot.  This warning used to say "MUST MATCH
+ * pulsar_cuda_matmul.cu's mx_sfoff / mxfp8_quant_act_kernel EXACTLY", which
+ * described the state BEFORE the extraction below: every TU that touches the
+ * layout now includes THIS header, and as of 2026-08-23 the quantise kernels
+ * in matmul.cu and mxfp4_cutlass.cu call pulsar_mx_shared_exp/_scale_byte
+ * instead of carrying their own copies of the formula.  There is nothing left
+ * to keep in step -- keep it that way: new producers CALL these, never
+ * re-derive them.  It was extracted from
  * pulsar_cuda_hc_router.cu (b7ba56b), verified inert by SASS compare.
  *
  * CALLER CONTRACT, and it is easy to get wrong:

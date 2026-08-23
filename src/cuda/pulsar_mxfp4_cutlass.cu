@@ -950,8 +950,7 @@ __global__ static void e4m3_act_roundtrip_kernel(float *xq, const float *x, long
   float *dst = xq + b * 32;
   float mx = 0.f;
   for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
-  int se = -127; if (mx > 0.f) { int e = (int)floorf(log2f(mx)); se = e - 7; }
-  if (se < -127) se = -127; if (se > 127) se = 127;
+  const int se = pulsar_mx_shared_exp(mx);   /* ONE definition, shared header */
   const float inv = exp2f((float)-se), s = exp2f((float)se);
   for (int i = 0; i < 32; i++) dst[i] = (float)((cutlass::float_e4m3_t)(src[i] * inv)) * s;
 }
@@ -971,10 +970,9 @@ __global__ static void e4m3_act_pack_kernel(uint8_t *q, uint8_t *sf, const float
   uint8_t *dq = q + b * 32;
   float mx = 0.f;
   for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
-  int se = -127; if (mx > 0.f) { int e = (int)floorf(log2f(mx)); se = e - 7; }
-  if (se < -127) se = -127; if (se > 127) se = 127;
+  const int se = pulsar_mx_shared_exp(mx);   /* ONE definition, shared header */
   const float inv = exp2f((float)-se);
-  sf[b] = (uint8_t)(se + 127);
+  sf[b] = pulsar_mx_scale_byte(se);
   for (int i = 0; i < 32; i++) {
     const cutlass::float_e4m3_t e = (cutlass::float_e4m3_t)(src[i] * inv);
     dq[i] = *(const uint8_t *)&e;

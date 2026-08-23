@@ -644,10 +644,9 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
     int row = warp / KB, kb = warp % KB;
     float v = X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
-    int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
-    if (se < -127) se = -127; if (se > 127) se = 127;
-    data[(size_t)(kb * 32 + lane) + (size_t)row * K] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
-    if (lane == 0) scale[pulsar_mx_sfoff(row, kb, KBp)] = (unsigned char)(se + 127);
+    const int se = pulsar_mx_shared_exp(a);
+    data[(size_t)(kb * 32 + lane) + (size_t)row * K] = pulsar_mx_encode(v, se);
+    if (lane == 0) scale[pulsar_mx_sfoff(row, kb, KBp)] = pulsar_mx_scale_byte(se);
 }
 
 
@@ -664,10 +663,9 @@ __global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_toke
     int g = row % n_groups, tok = row / n_groups;
     float v = X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
-    int se = -127; if (a > 0.f) { int e = (int)floorf(log2f(a)); se = e - 7; }
-    if (se < -127) se = -127; if (se > 127) se = 127;
-    data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = (__nv_fp8_e4m3)(v * exp2f((float)-se));
-    if (lane == 0) scale[(size_t)g * scale_slab + pulsar_mx_sfoff(tok, kb, KBp)] = (unsigned char)(se + 127);
+    const int se = pulsar_mx_shared_exp(a);
+    data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = pulsar_mx_encode(v, se);
+    if (lane == 0) scale[(size_t)g * scale_slab + pulsar_mx_sfoff(tok, kb, KBp)] = pulsar_mx_scale_byte(se);
 }
 
 
