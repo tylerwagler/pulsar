@@ -450,7 +450,6 @@ static bool gpu_graph_indexed_attention_span(
         uint32_t                    s0,
         uint32_t                    sn,
         uint32_t                    spos0,
-        uint64_t                    iq_row,
         uint64_t                    q_dim,
         uint32_t                    n_comp,
         uint32_t                    ratio,
@@ -461,9 +460,12 @@ static bool gpu_graph_indexed_attention_span(
         bool                        stage_profile,
         bool                        pre_boundary,
         double                     *stage_t0) {
-    pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_q,
-            (uint64_t)s0 * iq_row * sizeof(float),
-            (uint64_t)sn * iq_row * sizeof(float));
+    /* Q is the producer's PACKED rows now (L090.4): per-token stride is
+     * n_head packed rows, in BYTES -- the element-size trap the sq_view
+     * comment below warns about, avoided by construction. */
+    pulsar_gpu_tensor *iq_view = pulsar_gpu_tensor_view(g->batch_indexer_qp,
+            (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
+            (uint64_t)sn * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
     pulsar_gpu_tensor *iw_view = pulsar_gpu_tensor_view(g->batch_indexer_weights,
             (uint64_t)s0 * PULSAR_N_INDEXER_HEAD * sizeof(float),
             (uint64_t)sn * PULSAR_N_INDEXER_HEAD * sizeof(float));
@@ -1504,6 +1506,7 @@ bool gpu_graph_encode_layer_attention_batch(
             /* Fused rope + QAT: one launch over batch_indexer_q instead of the
              * old rope_tail + qat pair (bit-exact, see the kernel note). */
             if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->batch_indexer_q,
+                                                    g->batch_indexer_qp,
                                                     n_tokens,
                                                     PULSAR_N_INDEXER_HEAD,
                                                     PULSAR_N_INDEXER_HEAD_DIM,
@@ -1827,7 +1830,6 @@ bool gpu_graph_encode_layer_attention_batch(
                  * with pointer-identical arguments. */
                 const uint32_t slice = gpu_graph_prefill_slice();
                 const uint32_t span = (slice != 0u && slice < n_tokens) ? slice : n_tokens;
-                const uint64_t iq_row = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
                 /* Hoisted out of the span loop.  This selects the comp source and,
                  * on the non-native path, DEQUANTS all n_comp packed rows into the
                  * shared f32 shadow.  Both inputs (il, n_comp) are loop-invariant
@@ -1857,7 +1859,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                 spos0 + sn - 1u,
                                                                                 s_n_raw);
                     ok = gpu_graph_indexed_attention_span(g, model, layer, il,
-                            s0, sn, spos0, iq_row, q_dim, n_comp, ratio, index_scale,
+                            s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                             mseq ? 0u : s_n_raw, mseq ? 0u : s_raw_start,
                             &sop, index_stage_profile, true, &index_stage_t0);
                 }
@@ -1911,7 +1913,6 @@ bool gpu_graph_encode_layer_attention_batch(
              * first_raw_pos == 0 by passing n_raw = s0 + sn with raw_start 0. */
             const uint32_t zslice = gpu_graph_prefill_slice();
             const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;
-            const uint64_t ziq_row = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
             /* The packed cache straight in, like every other span site. This
              * branch built the f32 shadow unconditionally and was the ONLY
              * source of attn_pack_dequant launches in production. */
@@ -1930,7 +1931,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
                 ok = gpu_graph_indexed_attention_span(g, model, layer, il,
-                        s0, sn, spos0, ziq_row, q_dim, n_comp, ratio, index_scale,
+                        s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                         s0 + sn, 0u,
                         &zsop, index_stage_profile, false, &index_stage_t0);
             }
@@ -2044,8 +2045,10 @@ bool gpu_graph_encode_layer_attention_batch(
 
                 if (ratio == 4 && cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
-                    pulsar_gpu_tensor *indexer_q_view = gpu_graph_tensor_row_view(
-                            g->batch_indexer_q, t, (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM);
+                    pulsar_gpu_tensor *indexer_q_view = pulsar_gpu_tensor_view(
+                            g->batch_indexer_qp,
+                            (uint64_t)t * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
+                            (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
                     pulsar_gpu_tensor *indexer_w_view = gpu_graph_tensor_row_view(
                             g->batch_indexer_weights, t, PULSAR_N_INDEXER_HEAD);
                     ok = indexer_q_view && indexer_w_view &&

@@ -32,6 +32,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_heads);
     pulsar_gpu_tensor_free(g->batch_indexer_weights);
     pulsar_gpu_tensor_free(g->batch_indexer_q);
+    pulsar_gpu_tensor_free(g->batch_indexer_qp);
     pulsar_gpu_tensor_free(g->batch_comp_sc);
     pulsar_gpu_tensor_free(g->batch_comp_kv);
     pulsar_gpu_tensor_free(g->batch_kv);
@@ -105,6 +106,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->indexer_scores);
     pulsar_gpu_tensor_free(g->indexer_weights);
     pulsar_gpu_tensor_free(g->indexer_q);
+    pulsar_gpu_tensor_free(g->indexer_qp);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->layer_raw_cache[il]);
     }

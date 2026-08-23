@@ -485,6 +485,42 @@ typedef struct {
 /* One descriptor launch over `rows`, then per-row single-session reference
  * launches against bank views; byte-compare.  indexed != 0 exercises the
  * indexed (top-k) entry instead of the mixed entry. */
+/* Pack n_rows x 128 f32 values into MXKV FP4 rows (64 nibble bytes + 4 E8M0
+ * scale bytes) -- the indexer Q operand format since L090.4.  The scorer
+ * comparisons below are device-vs-device over the SAME packed tensor, so only
+ * determinism matters here, not encode tie-breaking. */
+static void mb_pack_q_rows(const float *src, uint8_t *dst, uint64_t n_rows) {
+    static const float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    for (uint64_t r = 0; r < n_rows; r++) {
+        const float *x = src + r * 128u;
+        uint8_t *out = dst + r * 68u;
+        for (uint32_t blk = 0; blk < 4u; blk++) {
+            float amax = 7.052966104933725e-38f;
+            for (uint32_t i = 0; i < 32u; i++)
+                amax = fmaxf(amax, fabsf(x[blk * 32u + i]));
+            int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
+            e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
+            const float scale = ldexpf(1.0f, e8 - 127);
+            out[64u + blk] = (uint8_t)e8;
+            for (uint32_t i = 0; i < 32u; i += 2u) {
+                uint8_t n2[2];
+                for (uint32_t k = 0; k < 2u; k++) {
+                    float v = x[blk * 32u + i + k] / scale;
+                    const uint8_t sign = v < 0.f ? 8u : 0u;
+                    v = fminf(6.0f, fabsf(v));
+                    uint8_t best = 0; float bd = 1e30f;
+                    for (uint8_t c = 0; c < 8u; c++) {
+                        const float d = fabsf(v - kE2M1[c]);
+                        if (d < bd) { bd = d; best = c; }
+                    }
+                    n2[k] = (uint8_t)(best | sign);
+                }
+                out[(blk * 32u + i) >> 1u] = (uint8_t)(n2[0] | (n2[1] << 4));
+            }
+        }
+    }
+}
+
 static int mb_run_case(const char *label,
                        const mb_row *rows, uint32_t n_rows,
                        pulsar_gpu_tensor *raw_slab, uint32_t raw_cap,
@@ -885,7 +921,9 @@ static int mb_idx_run_case(const char *label,
     uint32_t *sel_ref = (uint32_t *)malloc((uint64_t)top_k * sizeof(uint32_t));
     int32_t *pos_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
     int32_t *sid_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_rows * q_row * sizeof(float));
+    const uint64_t qp_row = (uint64_t)n_head * 68u;   /* packed rows per token-row */
+    uint8_t *qp_host = (uint8_t *)malloc((uint64_t)n_rows * qp_row);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_rows * qp_row);
     pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc((uint64_t)n_rows * n_head * sizeof(float));
     pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc((uint64_t)n_rows * n_comp_superset * sizeof(float));
     pulsar_gpu_tensor *scores_ref = pulsar_gpu_tensor_alloc((uint64_t)n_comp_superset * sizeof(float));
@@ -894,7 +932,7 @@ static int mb_idx_run_case(const char *label,
     pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     int rc = 1;
-    if (!q_host || !w_host || !out_batch || !out_ref || !sel_batch || !sel_ref ||
+    if (!q_host || !qp_host || !w_host || !out_batch || !out_ref || !sel_batch || !sel_ref ||
         !pos_host || !sid_host || !q || !w || !scores || !scores_ref || !sel ||
         !sel_ref_t || !positions || !seq_id) goto done;
     mb_rng_state = 0x1d0b5u;
@@ -904,7 +942,8 @@ static int mb_idx_run_case(const char *label,
         pos_host[r] = (int32_t)rows[r].qpos;
         sid_host[r] = (int32_t)rows[r].bank;
     }
-    if (!pulsar_gpu_tensor_write(q, 0, q_host, (uint64_t)n_rows * q_row * sizeof(float)) ||
+    mb_pack_q_rows(q_host, qp_host, (uint64_t)n_rows * n_head);
+    if (!pulsar_gpu_tensor_write(q, 0, qp_host, (uint64_t)n_rows * qp_row) ||
         !pulsar_gpu_tensor_write(w, 0, w_host, (uint64_t)n_rows * n_head * sizeof(float)) ||
         !pulsar_gpu_tensor_write(positions, 0, pos_host, n_rows * sizeof(int32_t)) ||
         !pulsar_gpu_tensor_write(seq_id, 0, sid_host, n_rows * sizeof(int32_t))) goto done;
@@ -934,8 +973,8 @@ static int mb_idx_run_case(const char *label,
         const mb_row *row = &rows[r];
         pulsar_gpu_tensor *bank_view = pulsar_gpu_tensor_view(
                 index_slab, (uint64_t)row->bank * index_bank_bytes, index_bank_bytes);
-        pulsar_gpu_tensor *q_view = pulsar_gpu_tensor_view(q, (uint64_t)r * q_row * sizeof(float),
-                                                     q_row * sizeof(float));
+        pulsar_gpu_tensor *q_view = pulsar_gpu_tensor_view(q, (uint64_t)r * qp_row,
+                                                     qp_row);
         pulsar_gpu_tensor *w_view = pulsar_gpu_tensor_view(w, (uint64_t)r * n_head * sizeof(float),
                                                      (uint64_t)n_head * sizeof(float));
         int ok = bank_view && q_view && w_view &&
@@ -994,7 +1033,7 @@ done:
     pulsar_gpu_tensor_free(scores_ref); pulsar_gpu_tensor_free(scores);
     pulsar_gpu_tensor_free(w); pulsar_gpu_tensor_free(q);
     free(sid_host); free(pos_host); free(sel_ref); free(sel_batch);
-    free(out_ref); free(out_batch); free(w_host); free(q_host);
+    free(out_ref); free(out_batch); free(w_host); free(qp_host); free(q_host);
     return rc;
 }
 
@@ -1068,7 +1107,8 @@ static int check_multibank_indexer(void) {
         const int32_t pos_host[2] = {100, 37};
         const int32_t sid_host[2] = {-1, 1};
         pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count * sizeof(float));
-        pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(2 * q_row * sizeof(float));
+        uint8_t qp_host2[2 * 64 * 68];   /* n_head<=64 packed rows x 2 tokens */
+        pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(2 * (uint64_t)n_head * 68u);
         pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc(2 * n_head * sizeof(float));
         pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc(2 * (uint64_t)n_comp_sup * sizeof(float));
         pulsar_gpu_tensor *p = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
@@ -1081,7 +1121,8 @@ static int check_multibank_indexer(void) {
             for (uint64_t i = 0; i < 2 * q_row; i++) q_host[i] = mb_rand() * 0.5f;
             for (uint64_t i = 0; i < 2 * n_head; i++) w_host[i] = 1.0f;
             if (pulsar_gpu_tensor_write(slab, 0, host, count * sizeof(float)) &&
-                pulsar_gpu_tensor_write(q, 0, q_host, 2 * q_row * sizeof(float)) &&
+                (mb_pack_q_rows(q_host, qp_host2, 2 * (uint64_t)n_head), 1) &&
+                pulsar_gpu_tensor_write(q, 0, qp_host2, 2 * (uint64_t)n_head * 68u) &&
                 pulsar_gpu_tensor_write(w, 0, w_host, 2 * n_head * sizeof(float)) &&
                 pulsar_gpu_tensor_write(p, 0, pos_host, sizeof(pos_host)) &&
                 pulsar_gpu_tensor_write(s, 0, sid_host, sizeof(sid_host)) &&

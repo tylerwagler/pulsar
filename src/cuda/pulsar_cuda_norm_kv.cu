@@ -716,8 +716,8 @@ __device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
  * so the result is bit-exact vs the two-launch sequence; the __syncthreads
  * between the phases stands in for the old kernel boundary (one block owns
  * the whole row, so a block-local barrier is equivalent). */
-__global__ static void indexer_rope_hadamard_fp4_kernel(
-        float *x, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+__global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
+        float *x, uint8_t *out, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, int inverse,
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow,
@@ -738,13 +738,27 @@ __global__ static void indexer_rope_hadamard_fp4_kernel(
     }
     __syncthreads();
 
+    /* Hadamard + QAT, identical math to indexer_hadamard_fp4_pack_kernel --
+     * but the E2M1 code + E8M0 scale ARE the output now.  The f32 dequant
+     * writeback that used to live here (the "QAT round-trip") is gone: x is
+     * producer-internal rope staging, and every consumer reads the packed
+     * row, so there is exactly one Q operand encoding (L090.4). */
     __shared__ float vals[128];
     __shared__ float absbuf[128];
+    __shared__ uint8_t nib_sh[128];
     indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
 
     float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
-    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
-    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale))) * scale;
+    int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
+    e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
+    float scale = exp2f((float)(e8 - 127));
+    uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
+    nib_sh[tid] = nib;
+    __syncthreads();
+
+    uint8_t *outr = out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u);
+    if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
+    if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
 }
 
 /* Same QAT transform as indexer_rope_hadamard_fp4_kernel minus the rope (bit-identical f32 result
@@ -1195,24 +1209,31 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
 
 
 
-/* Fused rope + QAT for the indexer q projection: one launch instead of the
- * rope_tail + qat pair over the same tensor. n_rows = n_tok * n_head. */
+/* Fused rope + QAT + PACK for the indexer q projection: rope the f32 staging
+ * in place, Hadamard + E2M1-quantize, and store MXKV FP4 packed rows into
+ * `packed`.  There is no dequantized output: the packed rows are the ONLY Q
+ * the scorers see, so the quantized values cannot fork from what a second
+ * encode would produce -- the encode happens once, here. n_rows = n_tok * n_head. */
 int pulsar_gpu_dsv4_indexer_rope_qat_tensor(pulsar_gpu_tensor *x,
+        pulsar_gpu_tensor *packed,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
     const uint32_t n_rows = n_tok * n_head;
-    if (!x || n_rows == 0 || head_dim != 128u || n_rot > head_dim || (n_rot & 1) ||
-        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
+    if (!x || !packed || n_rows == 0 || head_dim != 128u || n_rot > head_dim || (n_rot & 1) ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        packed->bytes < (uint64_t)n_rows * PULSAR_MXKV_FP4_ROWBYTES(128u)) {
         return 0;
     }
+    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;   /* staging is f32 by contract */
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
-    indexer_rope_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr,
+    indexer_rope_hadamard_fp4_pack_q_kernel<<<n_rows, 128>>>((float *)x->ptr,
+            (uint8_t *)packed->ptr,
             n_rows, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
             freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
             positions ? (const int32_t *)positions->ptr : NULL);
-    return cuda_ok(cudaGetLastError(), "indexer_rope_hadamard_fp4 launch");
+    return cuda_ok(cudaGetLastError(), "indexer rope+qat+pack launch");
 }
 
 /* QAT + pack: roundtrip n_rows f32 rows of x in place (the same QAT the fused

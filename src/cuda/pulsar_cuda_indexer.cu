@@ -37,6 +37,25 @@ __device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index
 
 
 
+/* Four consecutive Q values of one packed row as a float4, indexed in
+ * FOUR-ELEMENT units (lane covers dims 4*lane..4*lane+3, one 32-block scale).
+ * Same decode as idx_comp_load_dev; vectorized for the n=1 fast tier. */
+__device__ static inline float4 idx_q_load4(const pulsar_mxkv_pack_t *qp,
+                                            uint64_t row, uint32_t lane) {
+    const uint8_t *r = (const uint8_t *)qp + row * PULSAR_MXKV_FP4_ROWBYTES(128u);
+    const uint32_t d0 = lane * 4u;
+    const float scale = __uint_as_float((uint32_t)r[64u + (d0 >> 5u)] << 23);
+    const uint8_t b0 = r[d0 >> 1u], b1 = r[(d0 >> 1u) + 1u];
+    const uint8_t n0 = (uint8_t)(b0 & 0xfu), n1 = (uint8_t)(b0 >> 4);
+    const uint8_t n2 = (uint8_t)(b1 & 0xfu), n3 = (uint8_t)(b1 >> 4);
+    float4 v;
+    v.x = (n0 & 8u) ? -idx_e2m1_value_dev((int)(n0 & 7u)) * scale : idx_e2m1_value_dev((int)(n0 & 7u)) * scale;
+    v.y = (n1 & 8u) ? -idx_e2m1_value_dev((int)(n1 & 7u)) * scale : idx_e2m1_value_dev((int)(n1 & 7u)) * scale;
+    v.z = (n2 & 8u) ? -idx_e2m1_value_dev((int)(n2 & 7u)) * scale : idx_e2m1_value_dev((int)(n2 & 7u)) * scale;
+    v.w = (n3 & 8u) ? -idx_e2m1_value_dev((int)(n3 & 7u)) * scale : idx_e2m1_value_dev((int)(n3 & 7u)) * scale;
+    return v;
+}
+
 /* positions/seq_id/comp_cap/n_banks (descriptor-aware indexer kernels): the
  * same per-row multi-session banking as the decode attention kernels
  * (pulsar_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
@@ -56,7 +75,7 @@ __device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index
  * degenerates to the classic single-cache scalar path bit-exactly. */
 __global__ static void indexer_scores_kernel(
         float *scores,
-        const float *q,
+        const pulsar_mxkv_pack_t *q,
         const float *weights,
         const pulsar_mxkv_pack_t *index_comp,
         uint32_t n_comp,
@@ -96,10 +115,11 @@ __global__ static void indexer_scores_kernel(
                              : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
-        const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+        const uint64_t q_row = (uint64_t)t * n_head + h;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
-            dot += qh[d] * idx_comp_load_dev(index_src, comp_base + c, d, head_dim);
+            dot += idx_comp_load_dev(q, q_row, d, head_dim) *
+                   idx_comp_load_dev(index_src, comp_base + c, d, head_dim);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -127,7 +147,7 @@ __global__ static void indexer_scores_kernel(
  * indexer_scores_kernel (one row, so positions[0]/seq_id[0]). */
 __global__ static void indexer_score_one_direct_kernel(
         float *scores,
-        const float *q,
+        const pulsar_mxkv_pack_t *q,
         const float *weights,
         const pulsar_mxkv_pack_t *index_comp,
         uint32_t n_comp,
@@ -178,7 +198,7 @@ __global__ static void indexer_score_one_direct_kernel(
     float wtotal = 0.0f;
     for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
         const uint32_t h = h0 + warp;
-        const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+        const float4 qv = idx_q_load4(q, h, lane);
         const float4 kv = ((const float4 *)krow)[lane];
         float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
         dot = warp_sum_f32(dot);
@@ -807,7 +827,7 @@ static int indexer_scores_launch(
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         head_dim != 128u ||   /* packed rows are the 68-byte head_dim-128 layout */
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * PULSAR_MXKV_FP4_ROWBYTES(128u) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < comp_bytes ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
@@ -819,21 +839,14 @@ static int indexer_scores_launch(
     const void * const *index_bank_ptrs_ptr =
         (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
-    /* D5: the two f32 scorers below take Q through the MXFP4 tier's own E4M3
-     * quantisation first, so all three scorers multiply the same operand format
-     * and a token's candidate set stops depending on batch width or banking.
-     * The tier itself is skipped -- it packs Q to E4M3 as part of its own
-     * launch, and leaving it untouched keeps solo prefill bit-identical. */
-    if (head_dim == 128u && n_head == 64u && (n_tokens == 1u || descr)) {
-        if (!pulsar_gpu_indexer_q_e4m3_roundtrip((float *)q->ptr, n_tokens,
-                                                 n_head, head_dim)) {
-            fprintf(stderr, "pulsar: indexer Q E4M3 round-trip failed\n");
-            return 0;
-        }
-    }
+    /* D5's cross-tier operand unification is now structural: Q arrives as the
+     * producer's packed E2M1 rows (L090.4), every tier decodes the same bytes,
+     * and the per-entry E4M3 round-trip that used to force this -- an identity
+     * on values already crushed to the FP4 grid -- is deleted with the f32
+     * container it patched over. */
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
+                                                         (const pulsar_mxkv_pack_t *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const pulsar_mxkv_pack_t *)index_comp->ptr,
                                                          n_comp, pos0, ratio,
@@ -868,7 +881,7 @@ static int indexer_scores_launch(
                             "(Q quantised to E4M3)\n");
         }
         return pulsar_gpu_indexer_scores_mxfp4(
-                (float *)scores->ptr, (const float *)q->ptr,
+                (float *)scores->ptr, (const pulsar_mxkv_pack_t *)q->ptr,
                 (const float *)weights->ptr,
                 (const pulsar_mxkv_pack_t *)index_comp->ptr,
                 n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
@@ -879,7 +892,7 @@ static int indexer_scores_launch(
      * tier does not take -- goes to the generic per-(comp,row) kernel. */
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                         (const float *)q->ptr,
+                                         (const pulsar_mxkv_pack_t *)q->ptr,
                                          (const float *)weights->ptr,
                                          (const pulsar_mxkv_pack_t *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,

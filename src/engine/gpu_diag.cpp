@@ -448,7 +448,8 @@ uint64_t gpu_graph_session_bytes_banked(
     total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
     total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
     total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
-    total += dz.indexer_q_dim * f32;                      /* indexer_q */
+    total += dz.indexer_q_dim * f32;                      /* indexer_q (rope staging) */
+    total += (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES; /* indexer_qp (packed) */
     total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
     total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
              pc * sizeof(uint32_t);                       /* comp_selected */
@@ -490,7 +491,8 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * dz.q_dim * PULSAR_Q_ELT_SIZE;           /* batch_q */
     total += 2ull * pc * PULSAR_N_HEAD_DIM * f32;            /* batch_kv_raw/kv */
     total += 2ull * pc * dz.comp_width_max * f32;         /* batch_comp_kv/sc */
-    total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q */
+    total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q (rope staging) */
+    total += pc * (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES; /* batch_indexer_qp (packed) */
     total += pc * PULSAR_N_INDEXER_HEAD * f32;               /* batch_indexer_weights */
     total += pc * dz.q_dim * f32;                         /* batch_heads */
     total += pc * dz.low_dim * f32;                       /* batch_attn_low */
@@ -1879,6 +1881,8 @@ bool gpu_graph_alloc_raw_cap(
                                                  PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     }
     g->indexer_q = pulsar_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
+    g->indexer_qp = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD *
+                                            PULSAR_ENGINE_IDXFP4_ROWBYTES);
     g->indexer_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD * sizeof(float));
     /* PULSAR_PREFILL_SLICE: these two are the only ctx-scaling f32 work buffers
      * with a prefill_cap token dimension; under slicing they only ever hold
@@ -1954,6 +1958,8 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_comp_kv = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_comp_sc = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_indexer_q = pulsar_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
+    g->batch_indexer_qp = pulsar_gpu_tensor_alloc(pc * (uint64_t)PULSAR_N_INDEXER_HEAD *
+                                                  PULSAR_ENGINE_IDXFP4_ROWBYTES);
     g->batch_indexer_weights = pulsar_gpu_tensor_alloc(pc * PULSAR_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = pulsar_gpu_tensor_alloc(pc * q_dim * sizeof(float));
     g->batch_attn_low = pulsar_gpu_tensor_alloc(pc * low_dim * sizeof(float));
@@ -2010,7 +2016,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
                     g->attn_comp_stage &&
-                    g->indexer_q && g->indexer_weights && g->indexer_scores &&
+                    g->indexer_q && g->indexer_qp && g->indexer_weights && g->indexer_scores &&
                     g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&
                     g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
@@ -2030,7 +2036,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
-                    g->batch_indexer_q && g->batch_indexer_weights &&
+                    g->batch_indexer_q && g->batch_indexer_qp && g->batch_indexer_weights &&
                     g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
                     g->batch_after_attn_hc &&
                     g->batch_ffn_cur && g->batch_ffn_norm &&

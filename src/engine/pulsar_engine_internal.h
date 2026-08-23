@@ -929,7 +929,8 @@ typedef struct {
      * layer_index_comp_cache.  Also reused for session-save dequant and
      * session-load repack. */
     pulsar_gpu_tensor *idx_comp_stage;
-    pulsar_gpu_tensor *indexer_q;
+    pulsar_gpu_tensor *indexer_q;      /* f32 rope staging, producer-internal (L090.4) */
+    pulsar_gpu_tensor *indexer_qp;     /* packed E2M1 Q rows -- what the scorers read */
     pulsar_gpu_tensor *indexer_weights;
     pulsar_gpu_tensor *indexer_scores;
     pulsar_gpu_tensor *comp_selected;
@@ -1056,7 +1057,8 @@ typedef struct {
     pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;
     pulsar_gpu_tensor *batch_comp_sc;
-    pulsar_gpu_tensor *batch_indexer_q;
+    pulsar_gpu_tensor *batch_indexer_q;   /* f32 rope staging, producer-internal (L090.4) */
+    pulsar_gpu_tensor *batch_indexer_qp;  /* packed E2M1 Q rows -- what the scorers read */
     pulsar_gpu_tensor *batch_indexer_weights;
     pulsar_gpu_tensor *batch_heads;
     pulsar_gpu_tensor *batch_attn_low;

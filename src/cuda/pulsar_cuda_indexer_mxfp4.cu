@@ -189,19 +189,43 @@ __device__ __forceinline__ static int idx_amax_shift(float amax) {
     int e; frexpf(amax, &e); return (e - 1) - 8;   /* subnormal amax: rare */
 }
 
+/* Decode 4 consecutive values of one MXKV-FP4 packed row (68 B: 64 nibble
+ * bytes + 4 E8M0 scale bytes).  TWIN of idx_q_load4 in pulsar_cuda_indexer.cu,
+ * and deliberately a separate copy: this TU keeps its include surface to
+ * pulsar_gpu.h (see the swiglu twin note in pulsar_mxfp4_cutlass.cu).  They
+ * MUST agree on the E2M1 value table and the scale decode. */
+__device__ static inline float4 idx_qp_load4_local(const pulsar_mxkv_pack_t *qp,
+                                                   uint64_t row, uint32_t lane) {
+    static const float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const uint8_t *r = (const uint8_t *)qp + row * (IDX_HEAD_DIM / 2u + IDX_KSLABS);
+    const uint32_t d0 = lane * 4u;
+    const float scale = __uint_as_float((uint32_t)r[(IDX_HEAD_DIM / 2u) + (d0 >> 5u)] << 23);
+    const uint8_t b0 = r[d0 >> 1u], b1 = r[(d0 >> 1u) + 1u];
+    float4 v;
+    const uint8_t n0 = (uint8_t)(b0 & 0xfu), n1 = (uint8_t)(b0 >> 4);
+    const uint8_t n2 = (uint8_t)(b1 & 0xfu), n3 = (uint8_t)(b1 >> 4);
+    v.x = (n0 & 8u) ? -kE2M1[n0 & 7u] * scale : kE2M1[n0 & 7u] * scale;
+    v.y = (n1 & 8u) ? -kE2M1[n1 & 7u] * scale : kE2M1[n1 & 7u] * scale;
+    v.z = (n2 & 8u) ? -kE2M1[n2 & 7u] * scale : kE2M1[n2 & 7u] * scale;
+    v.w = (n3 & 8u) ? -kE2M1[n3 & 7u] * scale : kE2M1[n3 & 7u] * scale;
+    return v;
+}
+
 __global__ __launch_bounds__(256, 4)
 static void idx_pack_q_kernel(
         uint8_t *__restrict__ qa,            /* [n_tokens][heads][128] e4m3 */
         uint8_t *__restrict__ qsf,           /* [n_tokens][heads][4]   ue8m0 */
-        const float *__restrict__ q,
+        const pulsar_mxkv_pack_t *__restrict__ q,
         uint32_t n_rows) {                   /* n_tokens * IDX_HEADS */
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row  = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (row >= n_rows) return;
 
-    /* qa and q share the [row][128] layout, so the row index needs no decompose
-     * into (token, head) at all. */
-    const float4 v = ((const float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane];
+    /* qa and q share the [row][...] layout, so the row index needs no decompose
+     * into (token, head) at all.  q is the producer's packed E2M1 row; the
+     * decoded values are bit-identical to the f32 the old container held, so
+     * the E4M3 bytes this kernel emits are unchanged (L090.4). */
+    const float4 v = idx_qp_load4_local(q, row, lane);
 
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     /* Lanes 8b..8b+7 hold scale block b, so xor over the low three lane bits
@@ -226,65 +250,13 @@ static void idx_pack_q_kernel(
     ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = w;
 }
 
-/* D5: give the f32 scorers the SAME Q this tier multiplies.
- *
- * Three scorers exist and they were fed two different Q formats: this tier
- * quantises Q to E4M3 (measured in tests/idx_quant_fidelity.cc), while the
- * single-token decode kernel and the banked/generic kernel dot in f32.  The
- * indexer picks WHICH 512 compressed rows attention can see, so that was not a
- * precision detail -- a token's candidate set could differ between its prefill
- * and its decode, and between a solo and a banked prefill of the same prompt.
- *
- * This applies the tier's own quantisation as an in-place round-trip so the
- * other two scorers multiply the same numbers.  It lives HERE, next to
- * idx_pack_q_kernel, and shares idx_amax_shift and idx_f32_to_e4m3 with it --
- * a second copy of the scale rule in the other TU is exactly the duplication
- * that produced the defect.  The reduction ORDER still differs between the
- * three kernels; that is the acceptable kind of divergence, and the operand
- * format no longer is.
- *
- * The encode is ours and the decode is the hardware's, which is the one pairing
- * that cannot drift: a byte's meaning is fixed by the format.
- *
- * IDEMPOTENT, so the tier is free to run over an already-round-tripped Q: se is
- * derived from the block amax, round-to-nearest keeps that amax inside the same
- * binade (E4M3 at exponent 8 is 256..448, and a value rounding up to 512
- * saturates to 448 rather than carrying), so a second pass picks the same se
- * and re-encodes to the same bytes. */
-__global__ __launch_bounds__(256, 4)
-static void idx_q_e4m3_roundtrip_kernel(float *__restrict__ q, uint32_t n_rows) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t row  = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
-    if (row >= n_rows) return;
-
-    float4 v = ((const float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane];
-
-    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 4));
-
-    const int se = idx_amax_shift(amax);
-    const float inv = ldexpf(1.0f, -se);
-    const float fwd = ldexpf(1.0f, se);
-
-    #define IDX_RT(component) do { \
-        const uint8_t b = idx_f32_to_e4m3((component) * inv); \
-        (component) = (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&b)) * fwd; \
-    } while (0)
-    IDX_RT(v.x); IDX_RT(v.y); IDX_RT(v.z); IDX_RT(v.w);
-    #undef IDX_RT
-
-    ((float4 *)(q + (uint64_t)row * IDX_HEAD_DIM))[lane] = v;
-}
-
-int pulsar_gpu_indexer_q_e4m3_roundtrip(float *q, uint32_t n_tokens, uint32_t n_head,
-                                        uint32_t head_dim) {
-    if (!q || n_tokens == 0 || n_head != IDX_HEADS || head_dim != IDX_HEAD_DIM) return 0;
-    const uint32_t n_rows = n_tokens * n_head;
-    idx_q_e4m3_roundtrip_kernel<<<(n_rows + 7u) / 8u, 256>>>(q, n_rows);
-    return cudaGetLastError() == cudaSuccess;
-}
+/* The D5 E4M3 round-trip (idx_q_e4m3_roundtrip_kernel + its wrapper) lived
+ * here until L090.4.  It forced all three scorers onto one Q operand format
+ * by round-tripping the f32 container through this tier's E4M3 quantisation.
+ * The producer now emits Q as packed E2M1 rows and every scorer decodes the
+ * same bytes, so the unification is structural and the round-trip -- an
+ * identity on values already crushed to the FP4 grid -- had nothing left to
+ * do. */
 
 /* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
  * at bits [5:2], which is where the measured contract says the MMA reads them. */
@@ -537,7 +509,7 @@ static void idx_scores_mxfp4_kernel(
 /* No extern "C": pulsar_gpu.h declares the whole backend seam with plain
  * linkage, and mismatching it here is a hard error once the header is in. */
 int pulsar_gpu_indexer_scores_mxfp4(
-        float *scores, const float *q, const float *weights,
+        float *scores, const pulsar_mxkv_pack_t *q, const float *weights,
         const pulsar_mxkv_pack_t *comp,
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t n_head, uint32_t head_dim, uint32_t ratio,

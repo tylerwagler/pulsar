@@ -727,7 +727,8 @@ bool gpu_graph_encode_decode_layer(
                                                               g->qr_norm,
                                                               1);
                 /* Fused rope + QAT, mirroring the prefill site. */
-                if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->indexer_q, 1,
+                if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->indexer_q,
+                                                        g->indexer_qp, 1,
                                                         PULSAR_N_INDEXER_HEAD,
                                                         PULSAR_N_INDEXER_HEAD_DIM,
                                                         PULSAR_N_ROT,
@@ -756,7 +757,7 @@ bool gpu_graph_encode_decode_layer(
                 }
                 if (ok) {
                     ok = pulsar_gpu_indexer_score_one_tensor(g->indexer_scores,
-                                                                g->indexer_q,
+                                                                g->indexer_qp,
                                                                 g->indexer_weights,
                                                                 g->layer_index_comp_cache[il],
                                                                 g->layer_n_index_comp[il],
