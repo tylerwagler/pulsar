@@ -387,7 +387,14 @@ bool gpu_graph_encode_decode_layer(
         if (ok && !pulsar_gpu_bf16_act_slot(g->attn_norm, 1, PULSAR_N_EMBD, &an_b)) {
             an_b = NULL;
         }
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->attn_cur,
+        /* DUMP-ONLY CARRIER (L086 D2): attn_cur's only consumer is the
+         * "hc_attn_pre" dump below -- prefill has gated this exact store since
+         * the dead-store pass (gpu_prefill.cpp, same kernel, same buffer role)
+         * and decode was simply never brought in line.  The kernel takes NULL
+         * for this output, which is how prefill already calls it. */
+        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                                                         gpu_graph_f32_store_observed("hc_attn_pre", il, pos)
+                                                             ? g->attn_cur : NULL,
                                                          g->attn_norm,
                                                          an_q, an_sf, an_kbp,
                                                          an_b,
@@ -975,7 +982,11 @@ bool gpu_graph_encode_decode_layer(
         if (ok && !pulsar_gpu_bf16_act_slot(g->ffn_norm, 1, PULSAR_N_EMBD, &fn_b)) {
             fn_b = NULL;
         }
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(g->ffn_cur,
+        /* DUMP-ONLY CARRIER (L086 D2), same asymmetry as attn_cur above: the
+         * only consumer of ffn_cur is the "hc_ffn_pre" dump. */
+        ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                                                         gpu_graph_f32_store_observed("hc_ffn_pre", il, pos)
+                                                             ? g->ffn_cur : NULL,
                                                          g->ffn_norm,
                                                          fn_q, fn_sf, fn_kbp,
                                                          fn_b,
@@ -1022,7 +1033,13 @@ bool gpu_graph_encode_decode_layer(
     }
     if (ok) ok = gpu_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  PULSAR_N_EMBD, PULSAR_N_EXPERT, g->ffn_norm, 1);
-    if (ok) ok = pulsar_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
+    /* DUMP-ONLY CARRIER (L086 D2): router_probs' only consumer is the
+     * "ffn_moe_probs" dump; router_select_tensor already writes it only when
+     * non-NULL (hc_router.cu: `probs ? (float *)probs->ptr : NULL`), and the
+     * batch twin has been gated this way since the dead-store pass. */
+    if (ok) ok = pulsar_gpu_router_select_tensor(g->router_selected, g->router_weights,
+                                                gpu_graph_f32_store_observed("ffn_moe_probs", il, pos)
+                                                    ? g->router_probs : NULL,
                                                 model->map, model->size,
                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
                                                 layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
