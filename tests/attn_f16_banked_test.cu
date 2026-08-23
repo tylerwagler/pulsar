@@ -184,7 +184,8 @@ int main(int argc, char **argv) {
         cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
 
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, draw, (const float *)dpk, use_tk, n_tokens,
+        dout, ds, dq, (const pulsar_attn_pack_t *)draw,
+        (const pulsar_attn_pack_t *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
         n_head, D, dpos, dseq, dbp, comp_cap, n_banks, NULL);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }

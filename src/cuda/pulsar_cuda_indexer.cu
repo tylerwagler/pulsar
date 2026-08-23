@@ -20,7 +20,7 @@ __device__ static inline float idx_e2m1_value_dev(int i) {
     }
 }
 
-__device__ static inline float idx_comp_load_dev(const float *index_comp,
+__device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index_comp,
                                                  uint64_t row, uint32_t d,
                                                  uint32_t head_dim) {
     (void)head_dim;   /* packed rows are always the 68-byte head_dim-128 layout */
@@ -58,7 +58,7 @@ __global__ static void indexer_scores_kernel(
         float *scores,
         const float *q,
         const float *weights,
-        const float *index_comp,
+        const pulsar_mxkv_pack_t *index_comp,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -91,7 +91,7 @@ __global__ static void indexer_scores_kernel(
     /* Per-bank index base (see attention_decode_mixed_kernel): base-pointer table
      * → separate per-bank allocation at LOCAL row; NULL → classic seq_id*comp_cap. */
     const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
-    const float *index_src = index_bank_ptrs ? (const float *)index_bank_ptrs[sid_b] : index_comp;
+    const pulsar_mxkv_pack_t *index_src = index_bank_ptrs ? (const pulsar_mxkv_pack_t *)index_bank_ptrs[sid_b] : index_comp;
     const uint64_t comp_base = index_bank_ptrs ? 0u
                              : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
     float total = 0.0f;
@@ -129,7 +129,7 @@ __global__ static void indexer_score_one_direct_kernel(
         float *scores,
         const float *q,
         const float *weights,
-        const float *index_comp,
+        const pulsar_mxkv_pack_t *index_comp,
         uint32_t n_comp,
         uint32_t pos0,
         uint32_t ratio,
@@ -160,7 +160,7 @@ __global__ static void indexer_score_one_direct_kernel(
     }
     /* Per-bank index base (see indexer_scores_kernel). */
     const uint32_t sid_b = seq_id ? (uint32_t)seq_id[0] : 0u;
-    const float *index_src = index_bank_ptrs ? (const float *)index_bank_ptrs[sid_b] : index_comp;
+    const pulsar_mxkv_pack_t *index_src = index_bank_ptrs ? (const pulsar_mxkv_pack_t *)index_bank_ptrs[sid_b] : index_comp;
     const uint64_t comp_base = index_bank_ptrs ? 0u
                              : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
 
@@ -835,7 +835,7 @@ static int indexer_scores_launch(
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
+                                                         (const pulsar_mxkv_pack_t *)index_comp->ptr,
                                                          n_comp, pos0, ratio,
                                                          scale, causal ? 1 : 0,
                                                          positions_ptr, seq_id_ptr,
@@ -869,7 +869,8 @@ static int indexer_scores_launch(
         }
         return pulsar_gpu_indexer_scores_mxfp4(
                 (float *)scores->ptr, (const float *)q->ptr,
-                (const float *)weights->ptr, index_comp->ptr,
+                (const float *)weights->ptr,
+                (const pulsar_mxkv_pack_t *)index_comp->ptr,
                 n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
                 causal ? 1 : 0);
     }
@@ -880,7 +881,7 @@ static int indexer_scores_launch(
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
                                          (const float *)q->ptr,
                                          (const float *)weights->ptr,
-                                         (const float *)index_comp->ptr,
+                                         (const pulsar_mxkv_pack_t *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,
                                          head_dim, ratio, scale, causal ? 1 : 0,
                                          positions_ptr, seq_id_ptr,

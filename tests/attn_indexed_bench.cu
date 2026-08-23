@@ -167,14 +167,16 @@ int main(int argc, char **argv) {
         switch (rps_rt) {
         case 4:
             attention_indexed_mixed_heads8_online_kernel<4, 16><<<grid, 512>>>(
-                heads, sinks, q, raw_kv, comp_kv, topk,
+                heads, sinks, q, (const pulsar_attn_pack_t *)raw_kv,
+                (const pulsar_attn_pack_t *)comp_kv, topk,
                 n_tokens, 0u, n_raw_rt, raw_cap, 0u,
                 n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
                 0u, positions, nullptr, nullptr, comp_cap, 1u);
             return;
         case 16:
             attention_indexed_mixed_heads8_online_kernel<16, 16><<<grid, 512>>>(
-                heads, sinks, q, raw_kv, comp_kv, topk,
+                heads, sinks, q, (const pulsar_attn_pack_t *)raw_kv,
+                (const pulsar_attn_pack_t *)comp_kv, topk,
                 n_tokens, 0u, n_raw_rt, raw_cap, 0u,
                 n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
                 0u, positions, nullptr, nullptr, comp_cap, 1u);
@@ -182,7 +184,8 @@ int main(int argc, char **argv) {
         default: break;
         }
         attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
-            heads, sinks, q, raw_kv, comp_kv, topk,
+            heads, sinks, q, (const pulsar_attn_pack_t *)raw_kv,
+                (const pulsar_attn_pack_t *)comp_kv, topk,
             n_tokens, /*pos0=*/0u, n_raw_rt, raw_cap, /*raw_start=*/0u,
             n_comp_rt, top_k, window, ratio, n_head, head_dim, raw_f16,
             positions, /*seq_id=*/nullptr,

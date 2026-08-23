@@ -537,7 +537,8 @@ static void idx_scores_mxfp4_kernel(
 /* No extern "C": pulsar_gpu.h declares the whole backend seam with plain
  * linkage, and mismatching it here is a hard error once the header is in. */
 int pulsar_gpu_indexer_scores_mxfp4(
-        float *scores, const float *q, const float *weights, const void *comp,
+        float *scores, const float *q, const float *weights,
+        const pulsar_mxkv_pack_t *comp,
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
         uint32_t n_head, uint32_t head_dim, uint32_t ratio,
         float scale, int causal) {

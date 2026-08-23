@@ -258,12 +258,13 @@ int main(int argc, char **argv) {
         cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
     }
     const int rc = indexed
-        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, use_topk ? dtk : NULL,
+        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
+                                           (const pulsar_attn_pack_t *)dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
                                            NULL, NULL, NULL, 0u, 1u, NULL)
-        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
-                                           n_comp ? dckv : NULL,
+        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
+                                           n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,
                                            n_head, D, NULL);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
@@ -277,12 +278,12 @@ int main(int argc, char **argv) {
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
         const int iters = 20;
         for (int i = 0; i < 3; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
                                              n_tokens, n_comp, window, ratio, n_head, D, NULL);
         cudaDeviceSynchronize();
         cudaEventRecord(e0);
         for (int i = 0; i < iters; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
                                              n_tokens, n_comp, window, ratio, n_head, D, NULL);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);

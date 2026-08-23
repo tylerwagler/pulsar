@@ -54,14 +54,14 @@ int cublas_ok(cublasStatus_t, const char *what) {
 }
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) { return 0; }
 int pulsar_gpu_attention_f16_indexed(float *, const float *, const float *,
-        const float *, const float *, const int *, uint32_t, uint32_t, uint32_t,
+        const pulsar_attn_pack_t *, const pulsar_attn_pack_t *, const int *, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, int, const int *, const int *, const void * const *, uint32_t,
         uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_indexed hit\n"); exit(97);
 }
 int pulsar_gpu_attention_f16_prefill(float *, const float *, const float *,
-        const float *, const float *, uint32_t, uint32_t, uint32_t, uint32_t,
+        const pulsar_attn_pack_t *, const pulsar_attn_pack_t *, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_prefill hit\n"); exit(97);
 }
@@ -209,7 +209,7 @@ int main() {
         /* golden: single walk (z=1, no partials) */
         dim3 g1(c.n_tokens, hg, 1);
         attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0,
+                (const pulsar_attn_pack_t *)draw, (const pulsar_attn_pack_t *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,
@@ -221,7 +221,7 @@ int main() {
             return 1;
         dim3 gs(c.n_tokens, hg, PULSAR_DEC_SPLITKV_S);
         attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
-                (const float *)draw, (const float *)dcomp, 0,
+                (const pulsar_attn_pack_t *)draw, (const pulsar_attn_pack_t *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,
                 dpos, dseq, (const void * const *)dbp,

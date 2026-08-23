@@ -271,12 +271,21 @@ typedef struct {
  * defer Q norm+rope to the kernel or run the standalone kernel as before. */
 int pulsar_gpu_attn_f16_tier_on(void);
 
+/* Opaque packed-row carriers (L092).  The packed caches (584-B ATTN_PACK rows;
+ * MXKV-FP4 indexer rows) used to travel as `const float *` -- a carrier type
+ * that described nothing, so one direct raw_kv[i] anywhere was defect ten and
+ * compiled clean.  Deliberately INCOMPLETE types: indexing or arithmetic is a
+ * compile error, so every read goes through the format's accessor (or an
+ * explicit byte-level cast at a row-granular copy).  Pass tensor->ptr. */
+typedef struct pulsar_attn_pack_s pulsar_attn_pack_t;
+typedef struct pulsar_mxkv_pack_s pulsar_mxkv_pack_t;
+
 int pulsar_gpu_attention_f16_prefill_mx(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes per element.  Opaque here so the
          * public header does not pull in cuda_fp16.h; the concrete type is
          * pulsar_q_t in pulsar_cuda_internal.h.  Pass tensor->ptr. */
         float *heads, const float *sinks, const void *q,
-        const float *raw_kv, const float *comp_kv,
+        const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
@@ -290,8 +299,8 @@ int pulsar_gpu_attention_f16_prefill(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
         const void              *q,
-        const float             *raw_kv,
-        const float             *comp_kv,
+        const pulsar_attn_pack_t *raw_kv,
+        const pulsar_attn_pack_t *comp_kv,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -312,8 +321,8 @@ int pulsar_gpu_attention_f16_indexed(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
         const void              *q,
-        const float             *raw_kv,
-        const float             *comp_kv,
+        const pulsar_attn_pack_t *raw_kv,
+        const pulsar_attn_pack_t *comp_kv,
         const int               *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -342,7 +351,7 @@ int pulsar_gpu_indexer_scores_mxfp4(
         float                   *scores,
         const float             *q,
         const float             *weights,
-        const void              *comp,
+        const pulsar_mxkv_pack_t *comp,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                pos0,

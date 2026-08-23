@@ -166,20 +166,17 @@ static void attn_f16_kernel(
         float *__restrict__ heads,            /* [n_tokens][n_head][512] */
         const float *__restrict__ sinks,      /* [n_head] */
         const QT *__restrict__ q,             /* [n_tokens][n_head][512], f32 or __half */
-        const float *__restrict__ raw_kv,     /* PULSAR_ATTN_PACK rows */
-        const float *__restrict__ comp_kv,    /* PULSAR_ATTN_PACK rows; may alias raw.
-                                               * ⚠ THE POINTER TYPE LIES: these are
-                                               * 584 B byte rows behind a float*, so
-                                               * the stride is the FORMAT's, never
-                                               * sizeof(float)*head_dim.  There used
-                                               * to be a comp_pack parameter here
-                                               * choosing between packed and f32
-                                               * rows; passing it wrong read 584 B
-                                               * rows at a 2048 B stride and produced
-                                               * out-of-bounds NaNs from a clean
-                                               * compile.  It is gone -- there is one
-                                               * format, so there is nothing to get
-                                               * wrong. */
+        const pulsar_attn_pack_t *__restrict__ raw_kv,   /* PULSAR_ATTN_PACK rows */
+        const pulsar_attn_pack_t *__restrict__ comp_kv,  /* PULSAR_ATTN_PACK rows; may
+                                               * alias raw.  These carried a bare
+                                               * float* until L092 -- "THE POINTER
+                                               * TYPE LIES" was this comment's
+                                               * opening line -- and a mis-strided
+                                               * read of the 584 B rows once
+                                               * produced OOB NaNs from a clean
+                                               * compile.  The opaque type makes
+                                               * that unwritable now: only the
+                                               * pack accessors can read these. */
         const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head,
@@ -266,7 +263,7 @@ static void attn_f16_kernel(
     __shared__ uint32_t sVisComp;
     uint32_t raw_count, raw_start = 0u, comp_count = 0u;
     uint32_t comp_base = 0u;
-    const float *comp_src = comp_kv;
+    const pulsar_attn_pack_t *comp_src = comp_kv;
     if (ring) {
         /* Descriptor (banked) preamble, byte-for-byte as the f32 kernel derives
          * it; NULL descriptors collapse to the scalar pos0+t path. */
@@ -282,7 +279,7 @@ static void attn_f16_kernel(
         }
         const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
         const uint32_t raw_base = seq_id ? sid_b * raw_cap : 0u;
-        comp_src = comp_bank_ptrs ? (const float *)comp_bank_ptrs[sid_b] : comp_kv;
+        comp_src = comp_bank_ptrs ? (const pulsar_attn_pack_t *)comp_bank_ptrs[sid_b] : comp_kv;
         comp_base = comp_bank_ptrs ? 0u : (seq_id ? sid_b * comp_cap : 0u);
         if (tid == 0u) {
             uint32_t rc = 0u, rf = 0u;
@@ -808,7 +805,7 @@ int pulsar_gpu_attn_f16_tier_on(void) {
 
 int pulsar_gpu_attention_f16_prefill_mx(
         float *heads, const float *sinks, const void *q,
-        const float *raw_kv, const float *comp_kv,
+        const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
@@ -869,7 +866,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
 
 int pulsar_gpu_attention_f16_prefill(
         float *heads, const float *sinks, const void *q,
-        const float *raw_kv, const float *comp_kv,
+        const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
         const pulsar_gpu_q_prep *q_prep) {
@@ -888,7 +885,7 @@ int pulsar_gpu_attention_f16_prefill(
  * on the kernel).  A 0 here is a real failure, never a silent shape demotion. */
 int pulsar_gpu_attention_f16_indexed(
         float *heads, const float *sinks, const void *q,
-        const float *raw_kv, const float *comp_kv, const int *topk,
+        const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,

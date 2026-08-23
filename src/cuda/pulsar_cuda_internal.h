@@ -198,7 +198,10 @@ __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
     return (b & 0x80u) ? -sv : sv;
 }
 
-__device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+/* The opaque packed-row carriers (pulsar_attn_pack_t / pulsar_mxkv_pack_t)
+ * are declared in pulsar_gpu.h (L092); the accessors below are the only
+ * sanctioned element reads. */
+__device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     if (d < n_nope) {
