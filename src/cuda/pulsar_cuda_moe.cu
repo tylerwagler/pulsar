@@ -1609,6 +1609,17 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
             const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
             const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
             const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
+            /* Handover first (L089): when the producing norm already emitted
+             * this x as E4M3, gemv_small reads THOSE bytes and never
+             * dereferences the f32 -- which REMOVES the sixth reader instead of
+             * guarding it, and is what makes lifting the n<=8 ffn store-skip
+             * possible.  The guard now covers only the miss path, which packs. */
+            const void *hq = NULL, *hsf = NULL; int hkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, 1u, expert_in_dim, &hq, &hsf, &hkbp)) {
+                hq = NULL; hsf = NULL; hkbp = 0;
+            }
+            if (!hq)
+                PULSAR_MOE_F32_GUARD(x->ptr, 1u, expert_in_dim, "moe small-batch FFN GEMV (decode, handover miss)");
             if (gate_w && up_w && down_w &&
                 pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
@@ -1617,7 +1628,8 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
                         gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes,
                         clamp, 1, (int)n_expert, n_total_expert,
-                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
+                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                        hq, hsf, hkbp) == 0) {
                 moe_sum_kernel<<<(uint32_t)((out_dim + 255u) / 256u), 256>>>(
                         (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1u);
                 if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
@@ -1774,6 +1786,17 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
             const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
             const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
+            /* Handover first (L089): when the producing norm already emitted
+             * this x as E4M3, gemv_small reads THOSE bytes and never
+             * dereferences the f32 -- which REMOVES the sixth reader instead of
+             * guarding it, and is what makes lifting the n<=8 ffn store-skip
+             * possible.  The guard now covers only the miss path, which packs. */
+            const void *hq = NULL, *hsf = NULL; int hkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &hq, &hsf, &hkbp)) {
+                hq = NULL; hsf = NULL; hkbp = 0;
+            }
+            if (!hq)
+                PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe small-batch FFN GEMV (handover miss)");
             if (gate_w && up_w && down_w &&
                 pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
@@ -1782,7 +1805,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                         gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,
-                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
+                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                        hq, hsf, hkbp) == 0) {
                 const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
                 moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
                         (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
