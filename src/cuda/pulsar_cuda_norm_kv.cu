@@ -471,8 +471,10 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
  *
  * **If you ever feed already-quantized data into `fp8_kv_quantize*`,
  * `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround rate jumps from
- * 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**  `gpu_decode.cpp:498` passes
- * `quantize_fp8=false` under pack for exactly this reason.
+ * 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**  the old standalone
+ * quantizer's `quantize_fp8` flag was hardcoded false at every call site for
+ * exactly this reason -- and was deleted, with its kernel, in the L093 sweep:
+ * the pack commit is the single fp8 quantizer.
  *
  * This is MEASURED, not theoretical.  On 2026-08-18 three KV paths were found
  * quantizing the same rows twice (prefill's ring store re-quantized the buffer
@@ -546,48 +548,16 @@ __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
 
 
 
-__global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    uint32_t n_nope = head_dim - n_rot;
-    float *xr = x + (uint64_t)row * head_dim;
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < n_nope; off += 64) {
-        float v = 0.0f;
-        if (off + tid < n_nope) v = xr[off + tid];
-        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
-        if (off + tid < n_nope) {
-            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
-            xr[off + tid] = q;
-        }
-        __syncthreads();
-    }
-    /* The rope tail takes the same treatment one dtype up, exactly as
-     * attn_pack_store_kernel does it.
-     *
-     * This kernel used to leave rope alone, and every one of its three callers
-     * then PACKED the buffer into a ring -- which narrows rope to bf16. So a
-     * token attended to itself at f32 rope precision during its own chunk, and
-     * at bf16 rope precision from every later chunk: the same operand with two
-     * numerics, chosen by when you looked at it. The nope dims never had this
-     * problem because the E4M3 roundtrip here already matched what the ring
-     * stores.
-     *
-     * With this the staging buffer holds EXACTLY what the packed row decodes to
-     * for all 512 dims, so the subsequent pack is a pure re-encode. */
-    for (uint32_t d = tid; d < n_rot; d += blockDim.x)
-        xr[n_nope + d] = __bfloat162float(__float2bfloat16(xr[n_nope + d]));
-}
+/* fp8_kv_quantize_kernel (the standalone in-place quantizer) lived here until
+ * the 2026-08-22 launched-vs-defined sweep (L093): every caller passed
+ * quantize_fp8=false -- the pack-store below has been the single fp8 quantizer
+ * since the 2026-08-18 double-quantize audit -- so the kernel, its wrapper
+ * pulsar_gpu_dsv4_fp8_kv_quantize_tensor, and the flag were dead dispatch.
+ * The recipe lives on in attn_pack_store. */
 
 /* PULSAR_ATTN_PACK store: quantize the nope dims of n_rows f32 rows of x with
- * EXACTLY the fp8_kv_quantize_kernel recipe (same reduction, same scale
- * formula, same clamp/roundtrip), write the roundtripped f32 back into x (so
+ * the engine's ONE fp8 recipe (per-64 amax reduction, exp2(ceil(log2(amax/448)))
+ * scale, clamp to +-448, E4M3 roundtrip), write the roundtripped f32 back into x (so
  * the stage/dumps show the same values the f32 pipeline produces), and store
  * the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h; 584 B at
  * head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
@@ -1184,17 +1154,11 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_t
 
 
 
-int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
-    if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;   /* untemplated f32 in-place */
-    fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
-    return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
-}
 
 
 
 /* PULSAR_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
- * of x IN PLACE (identical to pulsar_gpu_dsv4_fp8_kv_quantize_tensor) and store
+ * of x IN PLACE (the single pack-store fp8 recipe) and store
  * the packed rows into `packed` at rows [out_row0, out_row0+n_rows). */
 /* Row geometry, straight from the macros the kernels index with.  Deliberately
  * NOT a re-derivation: if these ever stop being the same expression the kernels
@@ -1600,7 +1564,6 @@ int pulsar_gpu_compressor_prefill_tensor(
         uint32_t                n_tokens,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
-        bool                    quantize_fp8,
         float                   freq_base,
         float                   freq_scale,
         float                   ext_factor,
@@ -1698,7 +1661,6 @@ int pulsar_gpu_compressor_prefill_tensor(
                     NULL, NULL, 0, 0u, 0u);
             if (!cuda_ok(cudaGetLastError(), "compressor prefill rope launch")) return 0;
         }
-        if (quantize_fp8 && !pulsar_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
     }
     return 1;
 }
@@ -1721,7 +1683,6 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
         uint32_t                n_tokens,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
-        bool                    quantize_fp8,
         float                   freq_base,
         float                   freq_scale,
         float                   ext_factor,
@@ -1779,7 +1740,6 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
                 NULL, NULL, 0, 0u, 0u);
         if (!cuda_ok(cudaGetLastError(), "compressor replay rope launch")) return 0;
     }
-    if (quantize_fp8 && !pulsar_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
     if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),

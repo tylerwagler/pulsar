@@ -1750,7 +1750,6 @@ static inline uint64_t tensor_map_size(const pulsar_model *m, const pulsar_tenso
     return t->ext_map ? t->ext_size : m->size;
 }
 void f16_round_inplace_cpu(float *x, uint32_t n);
-void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
 void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim);
 void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim);
 void pulsar_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y);

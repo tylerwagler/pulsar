@@ -1183,11 +1183,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          PULSAR_N_ROT,
                                                          compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                         /* The commit's pack-store kernel is the single fp8
-                                                          * quantizer; a second quantize is NOT bit-idempotent
-                                                          * for borderline block amax (the scale can shift,
-                                                          * re-rounding small values). */
-                                                         false,
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -1306,7 +1301,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             layer->attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, pos0, n_tokens, PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            false, freq_base, freq_scale, ext_factor, attn_factor,
+                            freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
                 } else if (ok) {
@@ -1320,7 +1315,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             layer->attn_compressor_norm->type,
                             PULSAR_N_HEAD_DIM, ratio, pos0, n_tokens, PULSAR_N_ROT,
                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                            false, freq_base, freq_scale, ext_factor, attn_factor,
+                            freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
                 }
@@ -1553,7 +1548,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              n_tokens,
                                                              PULSAR_N_ROT,
                                                              compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                             false,
                                                              freq_base,
                                                              freq_scale,
                                                              ext_factor,
@@ -1669,7 +1663,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                 layer->indexer_compressor_norm->type,
                                 PULSAR_N_INDEXER_HEAD_DIM, pos0, n_tokens, PULSAR_N_ROT,
                                 compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                false, freq_base, freq_scale, ext_factor, attn_factor,
+                                freq_base, freq_scale, ext_factor, attn_factor,
                                 PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                                 PULSAR_RMS_EPS) != 0;
                     }

@@ -697,17 +697,11 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
          * the stores narrow. */
         const pulsar_gpu_tensor *positions);
 
-int pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
-        pulsar_gpu_tensor *x,
-        uint32_t          n_tok,
-        uint32_t          head_dim,
-        uint32_t          n_rot);
-
 /* PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
  * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16 rope]
  * (584 B at head_dim 512 / n_rot 64, byte-identical to vLLM's fp8_ds_mla DSv4
  * cache line).  The stored values are exactly the
- * pulsar_gpu_dsv4_fp8_kv_quantize_tensor roundtrip for the nope dims and the
+ * pack-store fp8 roundtrip for the nope dims (the single quantizer) and the
  * bf16 roundtrip for the rope tail, so read-back is bit-identical to the f32
  * cache -- quantize_store applies BOTH roundtrips to the source rows in place.
  * quantize_store additionally roundtrips the f32 source rows IN PLACE
@@ -935,7 +929,6 @@ int pulsar_gpu_compressor_prefill_tensor(
         uint32_t                n_tokens,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
-        bool                    quantize_fp8,
         float                   freq_base,
         float                   freq_scale,
         float                   ext_factor,
@@ -961,7 +954,6 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
         uint32_t                n_tokens,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
-        bool                    quantize_fp8,
         float                   freq_base,
         float                   freq_scale,
         float                   ext_factor,
