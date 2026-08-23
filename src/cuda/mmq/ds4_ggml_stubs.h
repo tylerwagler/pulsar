@@ -31,7 +31,7 @@
 //     ggml_cuda_concurrent_event::is_valid() to compile - we never call it)
 //   * int64_t ggml_nbytes(const ggml_tensor *) (stub - never called)
 //   * int64_t ggml_time_us() (used by USE_CUDA_GRAPH paths we disable)
-//   * inline ggml_type_size() / ggml_blck_size() lookups
+//   * (the inline size-trait lookups were removed in L093 -- see below)
 //
 // Things ggml-common.h (vendored) owns:
 //   * ggml_half / ggml_half2 typedefs
@@ -186,100 +186,9 @@ enum ggml_type {
  * across src/cuda/mmq finds ggml_tensor only inside two comments in ds4_mmq.cu
  * describing what we deliberately do NOT vendor. */
 
-// ----------------------------------------------------------------------------
-// Inline size traits.
-//
-// Lookup tables hand-aligned with llama.cpp's ggml_type_traits in
-// ggml/src/ggml.c. Only types referenced by the vendored switch are needed.
-// ----------------------------------------------------------------------------
-
-inline size_t ggml_type_size(enum ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_F32:     return 4;
-        case GGML_TYPE_F16:     return 2;
-        case GGML_TYPE_BF16:    return 2;
-        case GGML_TYPE_I8:      return 1;
-        case GGML_TYPE_I16:     return 2;
-        case GGML_TYPE_I32:     return 4;
-        case GGML_TYPE_I64:     return 8;
-        case GGML_TYPE_F64:     return 8;
-        case GGML_TYPE_Q4_0:    return 18;
-        case GGML_TYPE_Q4_1:    return 20;
-        case GGML_TYPE_Q5_0:    return 22;
-        case GGML_TYPE_Q5_1:    return 24;
-        case GGML_TYPE_Q8_0:    return 34;
-        case GGML_TYPE_Q8_1:    return 36;
-        case GGML_TYPE_Q2_K:    return 84;
-        case GGML_TYPE_Q3_K:    return 110;
-        case GGML_TYPE_Q4_K:    return 144;
-        case GGML_TYPE_Q5_K:    return 176;
-        case GGML_TYPE_Q6_K:    return 210;
-        case GGML_TYPE_Q8_K:    return 292;
-        case GGML_TYPE_IQ2_XXS: return 66;
-        case GGML_TYPE_IQ2_XS:  return 74;
-        case GGML_TYPE_IQ2_S:   return 82;
-        case GGML_TYPE_IQ3_XXS: return 98;
-        case GGML_TYPE_IQ3_S:   return 110;
-        case GGML_TYPE_IQ1_S:   return 50;
-        case GGML_TYPE_IQ1_M:   return 56;
-        case GGML_TYPE_IQ4_NL:  return 18;
-        case GGML_TYPE_IQ4_XS:  return 136;
-        case GGML_TYPE_MXFP4:   return 17;
-        case GGML_TYPE_NVFP4:   return 18;
-        case GGML_TYPE_Q1_0:    return 36;
-        default:                return 0;
-    }
-}
-
-// ds4 (L008): needed by mmvq.cu's ggml_cuda_should_use_mmvq after the
-// post-5c0e946 re-sync.  "Quantized" here means block-quantized, i.e. anything
-// whose block size is greater than 1 element -- which is exactly what
-// ggml_blck_size already encodes, so derive it rather than keep a second list
-// that can drift from the first.
-inline int64_t ggml_blck_size(enum ggml_type t);
-
-inline bool ggml_is_quantized(enum ggml_type t) {
-    return ggml_blck_size(t) > 1;
-}
-
-inline int64_t ggml_blck_size(enum ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_I8:
-        case GGML_TYPE_I16:
-        case GGML_TYPE_I32:
-        case GGML_TYPE_I64:
-        case GGML_TYPE_F64:
-            return 1;
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_1:
-        case GGML_TYPE_IQ4_NL:
-            return 32;
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_K:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:
-        case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q1_0:
-            return 256;
-        default:
-            return 1;
-    }
-}
+// The inline size traits (ggml_type_size / ggml_blck_size / ggml_is_quantized
+// and their q8/K-quant lookup tables) lived here until the 2026-08-22
+// launched-vs-defined sweep (L093).  Their last callers -- two dead
+// `blck = ggml_blck_size(type)` locals -- were removed in the types sweep the
+// same week, leaving the whole cluster reachable from nothing (the mmvq code
+// the L008 comment cited was itself removed in L066).
