@@ -1577,6 +1577,18 @@ static int routed_moe_launch(
 
 
 int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
+    /* Nothing below this line consults esz: every scratch/output cast in the
+     * MoE lane is (float *) over a tensor the graph allocates f32.  That was
+     * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
+     * MoE tensor is ever narrowed, ten casts become defect nine at once,
+     * silently.  So the whole lane's f32 assumption is enforced ONCE, here at
+     * its two entry points. */
+    if (pulsar_tensor_esz(out) != sizeof(float) || pulsar_tensor_esz(up) != sizeof(float) ||
+        pulsar_tensor_esz(mid) != sizeof(float) || pulsar_tensor_esz(down) != sizeof(float) ||
+        pulsar_tensor_esz(weights) != sizeof(float) || pulsar_tensor_esz(x) != sizeof(float)) {
+        fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
+        return 0;
+    }
     if (gate_type == 40u && down_type == 40u) {
         /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
          * 4 launches with no host round-trip, vs the grouped path's BLOCKING
@@ -1855,6 +1867,18 @@ static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
 }
 
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+    /* Nothing below this line consults esz: every scratch/output cast in the
+     * MoE lane is (float *) over a tensor the graph allocates f32.  That was
+     * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
+     * MoE tensor is ever narrowed, ten casts become defect nine at once,
+     * silently.  So the whole lane's f32 assumption is enforced ONCE, here at
+     * its two entry points. */
+    if (pulsar_tensor_esz(out) != sizeof(float) || pulsar_tensor_esz(up) != sizeof(float) ||
+        pulsar_tensor_esz(mid) != sizeof(float) || pulsar_tensor_esz(down) != sizeof(float) ||
+        pulsar_tensor_esz(weights) != sizeof(float) || pulsar_tensor_esz(x) != sizeof(float)) {
+        fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
+        return 0;
+    }
     static int time_moe = -1;
     if (time_moe < 0) time_moe = getenv("PULSAR_MOE_TIME") != NULL ? 1 : 0;
     if (!time_moe) {
