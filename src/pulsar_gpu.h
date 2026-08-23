@@ -1459,7 +1459,15 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
         const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
         int n_total_expert, int in_dim, int out_dim,
         const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-        uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a);
+        uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a,
+        /* Producer handover (L089), same contract as pulsar_cutlass_grouped_moe:
+         * act_q/act_sf are the E4M3 + ue8m0 the producing norm already emitted
+         * (act_sf in the pulsar_mx_sfoff SWIZZLE), and row_src_tok[R] says which
+         * token row padded row R came from, < 0 marking a padding row that gets a
+         * zero payload and scale.  When all three are supplied, the f32
+         * x_gathered is NOT READ.  Pass NULL/NULL/0/NULL to pack from it. */
+        const void *act_q, const void *act_sf, int act_kbp,
+        const int32_t *row_src_tok);
 
 /* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch

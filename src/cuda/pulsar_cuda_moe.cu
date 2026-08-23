@@ -916,6 +916,10 @@ static int routed_moe_launch_mixed40(
     const uint64_t ug_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* up_g   (A) */
     const uint64_t mg_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* mid_g  (A) */
     const uint64_t og_b   = caseB ? rows * out_dim * sizeof(float) : 0;         /* out_g  (B) */
+    /* row_src_tok: only the caseA GROUPED arm gathers x, so only it can take the
+     * producer handover.  caseB's grouped_proj consumes mid_g, which the GPU
+     * just computed and no norm ever encoded. */
+    const uint64_t rsrc_b = (use_grouped && caseA) ? rows * sizeof(int32_t) : 0;
     const uint64_t proj_b = use_grouped
         ? (caseA ? pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim)
                  : pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim))
@@ -935,7 +939,7 @@ static int routed_moe_launch_mixed40(
         cutlass_moe_align_up(wg_b, A)      + cutlass_moe_align_up(ppair_b, A) +
         cutlass_moe_align_up(gg_b, A)      + cutlass_moe_align_up(ug_b, A) +
         cutlass_moe_align_up(mg_b, A)      + cutlass_moe_align_up(og_b, A) +
-        cutlass_moe_align_up(proj_b, A);
+        cutlass_moe_align_up(rsrc_b, A)    + cutlass_moe_align_up(proj_b, A);
 
     cuda_arena ar;
     if (!cuda_arena_begin(&ar, total_scratch, "routed_moe mixed40")) return 0;
@@ -951,6 +955,7 @@ static int routed_moe_launch_mixed40(
     float    *up_g_buf     = (float *)cuda_arena_take(&ar, ug_b, A);
     float    *mid_g_buf    = (float *)cuda_arena_take(&ar, mg_b, A);
     float    *out_g_buf    = (float *)cuda_arena_take(&ar, og_b, A);
+    int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_b, A);
     uint8_t  *proj_scratch = (uint8_t *)cuda_arena_take(&ar, proj_b, A);
     if (!proj_scratch) return 0;  /* take() latches: one check covers all thirteen */
     float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
@@ -960,6 +965,9 @@ static int routed_moe_launch_mixed40(
     int ok = cuda_ok(cudaMemset(counts, 0, counts_b), "mixed40 counts clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_b), "mixed40 xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_b), "mixed40 ppair clear");
+    /* -1 everywhere: rows the gather never visits ARE the padding rows, and the
+     * E4M3 gather zero-fills exactly those (what pre-zeroed f32 rows gave). */
+    if (ok && rsrc_b) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_b), "mixed40 rsrc clear");
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
     if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
@@ -1026,24 +1034,39 @@ static int routed_moe_launch_mixed40(
         float *mid_g  = mid_g_buf;
         if (use_grouped) {
             /* grouped: padded-gather x -> grouped GEMMs -> swiglu(padded) -> padded-scatter. */
-            /* row_src_tok = NULL: the mixed-40 path goes through
-             * pulsar_cutlass_grouped_proj, which has its own packer and no
-             * pre-encoded-activation entry yet, so it still gathers f32. */
-            PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe mixed40 gather");
-            moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair, NULL,
+            /* HANDOVER (L089 item a): grouped_proj now HAS a pre-encoded entry,
+             * so the mixed-type layers stop being the one tier that gathers raw
+             * f32.  On a hit the f32 x is never gathered or read; the E4M3 is
+             * permuted straight into the CUTLASS layout, riding the row
+             * permutation that had to happen anyway.  A miss keeps the f32
+             * gather, under the guard. */
+            const void *mq = NULL, *msf = NULL; int mkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &mq, &msf, &mkbp)) {
+                mq = NULL; msf = NULL; mkbp = 0;
+            }
+            const int mixed_handover = (mq && msf && row_src_tok);
+            if (!mixed_handover)
+                PULSAR_MOE_F32_GUARD(x->ptr, n_tokens, expert_in_dim, "moe mixed40 gather (handover miss)");
+            moe_padded_gather_kernel<<<pair_count, 256>>>(
+                    mixed_handover ? NULL : x_gathered, w_gathered, padded_pair,
+                    mixed_handover ? row_src_tok : NULL,
                     NULL /* pair_slot: this path scatters, no inverse map */,
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
             if (ok && pulsar_cutlass_grouped_proj(gate_g, x_gathered, (const uint8_t *)gate_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
+                    mixed_handover ? mq : NULL, mixed_handover ? msf : NULL,
+                    mixed_handover ? mkbp : 0, mixed_handover ? row_src_tok : NULL) != 0) ok = 0;
             /* reuse_packed_a: same x_gathered, same scratch, same layout -- the
              * up leg consumes the gate leg's E4M3 encoding instead of packing
              * the identical values a second time. */
             if (ok && pulsar_cutlass_grouped_proj(up_g, x_gathered, (const uint8_t *)up_w,
                     gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 1) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 1,
+                    mixed_handover ? mq : NULL, mixed_handover ? msf : NULL,
+                    mixed_handover ? mkbp : 0, mixed_handover ? row_src_tok : NULL) != 0) ok = 0;
             if (ok) {
                 uint64_t n = padded_upper * expert_mid_dim;
                 moe_swiglu_gathered_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(
@@ -1131,9 +1154,12 @@ static int routed_moe_launch_mixed40(
             moe_padded_gather_pairflat_kernel<<<pair_count, 256>>>(mid_g, padded_pair, mid_flat,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, expert_mid_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40B mid gather");
+            /* No handover on the down leg: its input is mid_g, which the GPU
+             * just computed and no producing norm ever encoded. */
             if (ok && pulsar_cutlass_grouped_proj(out_g, mid_g, (const uint8_t *)down_w,
                     down_expert_bytes, down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0) != 0) ok = 0;
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
+                    NULL, NULL, 0, NULL) != 0) ok = 0;
             if (ok) {
                 moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
                         (uint32_t)padded_upper, out_dim);

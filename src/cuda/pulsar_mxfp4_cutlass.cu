@@ -764,7 +764,8 @@ int pulsar_cutlass_grouped_proj(
     const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-    uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a){
+    uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a,
+    const void *act_q, const void *act_sf, int act_kbp, const int32_t *row_src_tok){
   size_t xA_off,xSF_off,xSF_bytes,arr_off,ws_off,ws_bytes;
   size_t need = grouped_proj_layout(padded_total, n_total_expert, in_dim,
                                     &xA_off,&xSF_off,&xSF_bytes,&arr_off,&ws_off,&ws_bytes);
@@ -781,7 +782,17 @@ int pulsar_cutlass_grouped_proj(
    * only READS xA/xSF, so nothing between the calls can have touched them. */
   if (!reuse_packed_a) {
     cudaMemsetAsync(xSF, 0, xSF_bytes);
-    pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+    /* Producer handover (L089): when the norm already emitted these rows as
+     * E4M3, permute THOSE bytes into the CUTLASS layout instead of gathering
+     * f32 and re-encoding it.  Identical shape to pulsar_cutlass_grouped_moe's
+     * entry -- this is the one that the mixed-type (gate type != down type)
+     * layers lacked, which is why they alone kept gathering raw f32 and were
+     * the last tier holding the ffn f32 store on.  The transcode rides the row
+     * permutation that has to happen regardless, so it costs ~nothing. */
+    if (act_q && act_sf && row_src_tok)
+      gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim);
+    else
+      pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
   }
   long pmt = grouped_per_mtile_sfA(in_dim);
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
