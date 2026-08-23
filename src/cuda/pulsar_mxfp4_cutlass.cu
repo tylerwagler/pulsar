@@ -303,7 +303,7 @@ __global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
   }
   const int4 *s = reinterpret_cast<const int4*>(src_q + (size_t)src * K + (size_t)kb * 32);
   d[0] = s[0]; d[1] = s[1];
-  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[pulsar_mx_act_sfoff(src, kb, src_kbp)]);
+  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[pulsar_mx_sfoff(src, kb, src_kbp)]);
 }
 
 static void gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
@@ -869,7 +869,7 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
     const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
     const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
-    const float sa = A8 ? gemv_sf_val(xsf[pulsar_mx_act_sfoff(xrow, k0 >> 5, xkbp)]) : 0.f;
+    const float sa = A8 ? gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]) : 0.f;
     #pragma unroll
     for (int j = 0; j < 8; j++) {
       const float xv = A8 ? (__half2float((__half)xt8[k0 + j]) * sa) : xt[k0 + j];
@@ -1010,18 +1010,10 @@ int pulsar_cutlass_expert_ffn_gemv_small(
    * because its A8 arm exists to consume the PRODUCER's cache.  So the down
    * leg converts by mirroring pulsar_cutlass_gemv_down exactly; the gate/up
    * leg would need a swizzle-writing packer and stays on the round-trip. */
-  /* BOTH legs native-format, and BOTH fed by the SAME packer.  That is only
-   * possible because the activation scale plane is now row-major
-   * (pulsar_mx_act_sfoff): the gate/up arm used to read it through the weight
-   * tiling, which is what would otherwise have forced a second, swizzle-writing
-   * packer.  Sizes in BYTES (payload + one ue8m0 per 32-value block) expressed
-   * in the buffer's float units; a row-major plane has no holes, so nothing
-   * needs zeroing. */
-  const size_t xq_elems   = (size_t)n_tokens * in_dim;
-  const size_t xq_bytes   = xq_elems + xq_elems / 32u;
+  const size_t xq_floats = (size_t)n_tokens * in_dim;
   const size_t midq_elems = (size_t)n_slots * mid_dim;
   const size_t midq_bytes = midq_elems + midq_elems / 32u;
-  const size_t need = (xq_bytes + 3u) / 4u + (midq_bytes + 3u) / 4u;
+  const size_t need = xq_floats + (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
     if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
     g_fp4_gemv_actbuf = nullptr;
@@ -1031,21 +1023,19 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     }
     g_fp4_gemv_actbuf_floats = need;
   }
-  uint8_t *xq8   = (uint8_t *)g_fp4_gemv_actbuf;
-  uint8_t *xsf   = xq8 + xq_elems;
-  uint8_t *midq8 = xq8 + ((xq_bytes + 3u) & ~(size_t)3u);
+  float *xq = g_fp4_gemv_actbuf;
+  uint8_t *midq8 = (uint8_t *)(g_fp4_gemv_actbuf + xq_floats);
   uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   {
-    const long nb = (long)(xq_elems / 32);
-    e4m3_act_pack_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq8, xsf, x, nb);   /* W4A8: E4M3 acts */
+    const long nb = (long)(xq_floats / 32);
+    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);   /* W4A8: E4M3 acts */
   }
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
-        mid_scratch, nullptr, (const __nv_fp8_e4m3 *)xq8, xsf, (int)(in_dim / 32u),
-        selected, rweights,
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
+        mid_scratch, xq, nullptr, nullptr, 0, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }
