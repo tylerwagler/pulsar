@@ -7,17 +7,25 @@
  * mode only changes storage and read traffic.  head_dim must be 128. */
 
 
-__device__ static inline float idx_e2m1_value_dev(int i) {
-    switch (i & 7) {
-    case 0: return 0.0f;
-    case 1: return 0.5f;
-    case 2: return 1.0f;
-    case 3: return 1.5f;
-    case 4: return 2.0f;
-    case 5: return 3.0f;
-    case 6: return 4.0f;
-    default: return 6.0f;
-    }
+/* E2M1 nibble -> float by PURE BIT MATH (sign, 2-bit exp, 1-bit mantissa).
+ * Normals (e>=1) are exactly (1 + m/2) * 2^(e-1), which is the f32 whose
+ * exponent field is (e+126) and whose mantissa bit is m<<22; the one subnormal
+ * pair is m*0.5.  Verified equal to the 8-entry table for ALL 8 codes, and the
+ * sign fold is exact either way ((-a)*b == -(a*b) in IEEE).
+ *
+ * TWIN of attn_pack_e4m3's shape in pulsar_cuda_internal.h, and for the same
+ * reason.  This used to be an 8-way switch called PER ELEMENT from the decode
+ * scorer's inner loop -- 32 lanes x 64 heads x every compressed-row block --
+ * and it was MEASURED at ~1.9% of decode on 2026-08-23 (the FP4 Q transport
+ * reads 7.5x less memory yet ran slower, which is what pointed at instruction
+ * count rather than bandwidth). */
+__device__ __forceinline__ static float idx_e2m1_decode(uint32_t nib, float scale) {
+    const uint32_t e = (nib >> 1) & 3u;
+    const uint32_t m = nib & 1u;
+    const float v = e ? __uint_as_float(((e + 126u) << 23) | (m << 22))
+                      : (float)m * 0.5f;
+    const float sv = v * scale;
+    return (nib & 8u) ? -sv : sv;
 }
 
 __device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index_comp,
@@ -31,8 +39,7 @@ __device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index
     const float scale = __uint_as_float((uint32_t)r[64u + (d >> 5u)] << 23);
     const uint8_t byte = r[d >> 1u];
     const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-    const float mag = idx_e2m1_value_dev((int)(nib & 7u));
-    return (nib & 8u) ? -mag * scale : mag * scale;
+    return idx_e2m1_decode(nib, scale);
 }
 
 
@@ -49,10 +56,12 @@ __device__ static inline float4 idx_q_load4(const pulsar_mxkv_pack_t *qp,
     const uint8_t n0 = (uint8_t)(b0 & 0xfu), n1 = (uint8_t)(b0 >> 4);
     const uint8_t n2 = (uint8_t)(b1 & 0xfu), n3 = (uint8_t)(b1 >> 4);
     float4 v;
-    v.x = (n0 & 8u) ? -idx_e2m1_value_dev((int)(n0 & 7u)) * scale : idx_e2m1_value_dev((int)(n0 & 7u)) * scale;
-    v.y = (n1 & 8u) ? -idx_e2m1_value_dev((int)(n1 & 7u)) * scale : idx_e2m1_value_dev((int)(n1 & 7u)) * scale;
-    v.z = (n2 & 8u) ? -idx_e2m1_value_dev((int)(n2 & 7u)) * scale : idx_e2m1_value_dev((int)(n2 & 7u)) * scale;
-    v.w = (n3 & 8u) ? -idx_e2m1_value_dev((int)(n3 & 7u)) * scale : idx_e2m1_value_dev((int)(n3 & 7u)) * scale;
+    /* One decode per component -- this called the helper TWICE per component
+     * (once in each ternary arm) when it was written. */
+    v.x = idx_e2m1_decode(n0, scale);
+    v.y = idx_e2m1_decode(n1, scale);
+    v.z = idx_e2m1_decode(n2, scale);
+    v.w = idx_e2m1_decode(n3, scale);
     return v;
 }
 
