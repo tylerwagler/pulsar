@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Internal launcher for the gated D2R Q2_K MoE down-GEMM path.
+// Internal launchers for the D2R IQ2_XXS MoE GEMMs (pair gate/up + single)
+// and their E4M3 activation staging.  Ungated: the E4M3 arm is the only arm.
 
 #pragma once
 
@@ -7,12 +8,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-/* Which IQ2 dequant arm the expert GEMMs run; read once per process.
- *   0 = q8_1 int8 operands, integer MMA, scale fold (default)
- *   1 = E4M3 operands, block-scaled MXFP8 MMA, hardware ue8m0, no fold
- * ⚠ The INPUT STAGING must match: arm 1 requires ds4_quantize_mmq_e4m3_cuda.
- * They are selected off this same function in ds4_mmq.cu; keep them together. */
 
 /* Stage MMQ activations as E4M3 + ue8m0 instead of q8_1 int8.  Same
  * block_mx_act_mmq layout: qs[] holds e4m3 bit patterns, d4[i] carries the ue8m0
@@ -57,8 +52,8 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     size_t          worklist_scratch_bytes,
     cudaStream_t    stream);
 
-// Complete target-prefill gate/up path: both IQ2_XXS projections share one
-// activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
-// directly into the expert-major Q8_1 D2S6 input consumed by Q2_K down.
+// Single-tensor IQ2_XXS D2R GEMM (the routed DOWN leg): one weight, one
+// f32 output, same worklist/staging contract as the pair launch above.
+// (A comment here used to describe a deleted fused Q8_1/Q2_K epilogue.)
 
 int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *act, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, cudaStream_t stream);

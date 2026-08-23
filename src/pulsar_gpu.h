@@ -1348,8 +1348,9 @@ int pulsar_cutlass_expert_ffn_scratch(
         size_t          scratch_bytes);
 
 /* Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
- * fp4 GEMV: one gate+up+swiglu launch and one down launch over all (token,expert) slots,
- * no sort, no host readback, f32 activations. down_out gets one pre-weighted FFN result
+ * fp4-weight GEMV: one gate+up+swiglu launch and one down launch over all (token,expert)
+ * slots, no sort, no host readback.  Activations are E4M3 (producer encoding when armed,
+ * roundtripped from the f32 x otherwise) -- the same W4A8 operands as the grouped GEMM. down_out gets one pre-weighted FFN result
  * per slot at [slot*out_dim]; the caller sums the n_expert slices per token (moe_sum).
  * mid_scratch must hold n_tokens*n_expert*mid_dim floats. selected/rweights are the
  * device [n_tokens,n_expert] routing outputs. Returns 0 on success. */

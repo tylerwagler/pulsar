@@ -33,13 +33,14 @@
 
 // Upstream deleted get_mmq_x_max_host in the post-5c0e946 restructure: the tile
 // width J is now an INPUT to ggml_cuda_mmq_get_config rather than something the
-// host derives.  We only ever used it to size the q8_1 scratch, and the bound
+// host derives.  We only ever used it to size the activation-staging scratch
+// (block_mx_act_mmq since the E4M3 arm became the only arm), and the bound
 // that matters is the largest J the launcher can pick, which is the top of its
 // search loop -- `for (int J = 8; J <= 128 ...)` in mmq.cuh.  128 also matches
 // what the old helper returned on Turing-MMA hardware, so the scratch is the
 // same size as before.  Deliberately an upper bound: under-sizing this buffer
 // would be an overflow, over-sizing costs a few KiB once. (L008)
-// ⚠ 128 HERE WAS A BUG (fixed 2026-08-14): it undersized the q8_1 scratch and
+// ⚠ 128 HERE WAS A BUG (fixed 2026-08-14): it undersized the staging scratch and
 // produced 129280/129280 NON-FINITE logits at prefill depth 4102 (a 4096 chunk
 // plus a 6-token tail).  I had reasoned that 128 was "the top of the launcher's
 // J search loop" -- that is the TILING loop (`for J = 8; J <= 128`), not the
@@ -476,11 +477,10 @@ int ds4_mmq_moe_impl(
     // with M innermost and n_expert_used as the second dim that mmq writes
     // through ids_dst.  s1 = M (the column stride in the flat dst buffer
     // mmq writes into).  The output is column-major: out[col*M + row].
-    // stride_channel_y per upstream: ne11 * ne10_padded * sizeof(block_q8_1)
-    //                                     / (QK8_1 * sizeof(int))
-    // In MoE mode the kernel zeroes out the channel-stride contribution to
-    // offset_y after reading expert_bounds, so the value is permissive -
-    // but we set it consistently with upstream.
+    // stride_channel_y: in MoE mode the kernel zeroes out the channel-stride
+    // contribution to offset_y after reading expert_bounds, so the value is
+    // permissive.  (An upstream block_q8_1/QK8_1 sizing formula was quoted
+    // here for an mmq_args field that is no longer built -- L066.)
 
 
     /* pulsar (plan 41b): IQ2_XXS twin of the Q2_K block below.  Our v5mx down

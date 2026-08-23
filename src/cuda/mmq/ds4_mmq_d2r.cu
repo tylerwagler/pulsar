@@ -333,11 +333,11 @@ static_assert(sizeof(IQ2RawWarpStage) ==
               "unexpected IQ2 raw ring stage size");
 
 
-constexpr size_t kSmemQ8StageBytes = (size_t)kNFrag * 8 * sizeof(block_mx_act_mmq);
+constexpr size_t kSmemActStageBytes = (size_t)kNFrag * 8 * sizeof(block_mx_act_mmq);
 constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
 constexpr size_t kSmemIQ2RawBytes = (size_t)kWarps * kRawStages * sizeof(IQ2RawWarpStage);
 constexpr size_t kSmemIQ2GridBytes = 256u * sizeof(uint2);
-constexpr size_t kSmemIQ2StaticBytes = (size_t)kStages * kSmemQ8StageBytes +
+constexpr size_t kSmemIQ2StaticBytes = (size_t)kStages * kSmemActStageBytes +
                                        kSmemIQ2RawBytes + kSmemIQ2GridBytes + kSmemInvBytes;
 static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
               "IQ2 D2R static shared memory exceeds 48 KiB");

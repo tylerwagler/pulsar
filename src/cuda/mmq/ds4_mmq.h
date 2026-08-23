@@ -5,8 +5,13 @@
 // without C++ compilation. Functions return 0 on success and non-zero on
 // failure (with stderr error message). Device pointers are caller-owned.
 //
-// The ABI exposes raw quantized GEMM, routed MoE, aligned-SoA D2R, and fused
-// decode/prefill epilogues used by ds4_cuda.cu.
+// The live surface is four entries: init, the should-use oracle, and the two
+// aligned-SoA IQ2_XXS routed-MoE GEMMs (pair gate/up and single).  The wide
+// ABI this header used to document -- raw Q2_K/Q8_0 dense and MoE entries,
+// the whole mmvq-backed vector half, the fused Q2_K-down pipelines, the
+// aligned decode matvecs, derepack, and the pool-stream hook -- was removed
+// with its callers in L066; the 2026-08-22 types sweep removed the ~250 lines
+// of orphaned documentation that had outlived those declarations here.
 
 #pragma once
 
@@ -39,107 +44,54 @@ int ds4_mmq_init(int device);
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
 int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 
-// Dense matmul entry points. Per-type wrappers that all share the same
-// underlying mul_mat_q template, parameterised by the weight quant type.
-//
-// All three variants compute:
-//
-//   out[col, row] = sum_k W[row, k] * X[k, col]      0 <= row < M, 0 <= col < N
-//
-// Layouts (matching ggml + llama.cpp mmq conventions, all on device):
-//   W:       [M rows, K cols], row-major, packed in the type-specific block
-//            format. K must be a multiple of 256.
-//   X_f32:   [N rows, K cols] F32 row-major (logical [K, N] with K
-//            innermost - i.e. for each "column" col of the logical [K, N]
-//            matrix, K contiguous floats live at X[col*K .. col*K + K]).
-//   out_f32: caller-allocated, M*N floats. mmq writes in column-major:
-//            out[col*M + row]. Callers expecting row-major must transpose.
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-
-
-
-// MoE matmul entry points. For each (token, slot-within-token's-top-k) pair
-// the kernel computes:
+// Routed-MoE contract shared by both entries below.  For each (token,
+// slot-within-token's-top-k) pair the kernel computes:
 //
 //   out[col, row] = sum_k W[ids[token, slot], row, k] * X[token, k]
 //
-// where col = token * n_expert_used + slot, row in [0, M).  The caller is
-// responsible for any downstream sum-weighted-by-router-weights reduction
-// across the n_expert_used dimension. Fused variants declared below perform
-// the SwiGLU/router weighting and deterministic top-6 reduction directly.
+// where col = token * n_expert_used + slot, row in [0, M).  The caller owns
+// the downstream sum-weighted-by-router-weights reduction across the
+// n_expert_used dimension (moe_mmq_swiglu_fold / moe_sum in moe.cu).
 //
 // Layouts:
-//   W:       device pointer, [n_experts, M rows, K cols] in the
-//            type-specific block format.  Per-expert slab is M*K/blck
-//            blocks stored contiguously; experts are stacked.
 //   X_f32:   device pointer, [n_tokens, K] F32 row-major (K innermost).
 //   ids:     device pointer, [n_tokens, n_expert_used] int32_t row-major.
 //            ids[t*n_expert_used + s] is the expert id for token t's
 //            s-th routing slot.  Values must be in [0, n_experts).
-//   out_f32: caller-allocated, M * n_tokens * n_expert_used floats.
+//   out_*:   caller-allocated, M * n_tokens * n_expert_used floats.
 //            Column-major: out[col*M + row].
+//
+// Weights are the weight-server aligned-SoA IQ2_XXS artifact
+// (--repack-iq2-aligned; byte-neutral repack of the raw expert stream).
+// block_iq2_xxs is 66 bytes, so the raw stream is only 2-byte aligned and
+// every 32-bit code word costs two 16-bit loads; the artifact splits the
+// block scales out and 64B-aligns the code stream:
+//
+//   [ __half dq[nblk] ][ pad to 64B ][ uint2 qs[nblk * 8] ]
+//
+// where nblk = n_experts * M * (K / 256) and block linear order matches the
+// raw tensor byte order (expert-major, then row, then block).
+//
+// Activation staging is E4M3 + ue8m0 (block_mx_act_mmq; ds4_act_block.cuh),
+// built once per call -- there has been no q8_1 activation since the D2R
+// E4M3 arm became the only arm.
 //
 // K must be a multiple of 256.  n_expert_used must be one of the values
 // the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
 // (or any other value, which falls back to the generic path).  For V4
 // Flash, n_expert_used = 6.
 //
+// Output is NOT nonfinite-sanitized: the routed-MoE consumers
+// (moe_mmq_swiglu / moe_sum with guard_nonfinite=1) sanitize at read.
+// New callers must sanitize at consumption.
+//
 // Returns 0 on success, non-zero on validation or launch failure.
 
-
-
-// Same Q2_K MMQ operation, but omits the standalone nonfinite cleanup pass.
-// Every output element must be consumed immediately by a kernel that maps
-// nonfinite values to zero. This avoids a full extra read/write of the large
-// routed-down buffer during prefill.
-
-
-// ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
-// row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
-// ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
-// tile loader reads the SoA sections directly -- bit-identical output to the
-// raw path, no derepack scratch.
-// CONTRACT DIFFERENCE (P3): unlike the raw entries, the output is NOT
-// nonfinite-sanitized; the routed-MoE consumers (moe_mmq_swiglu / moe_sum
-// with guard_nonfinite=1) sanitize at read, so the standalone whole-buffer
-// pass is skipped.  New callers must sanitize at consumption.
-
-
-// Paired MoE entries. Compute gate AND up over the same activation in a
-// single call so the Q8_1 quantize of X (and the mm_ids_helper bookkeeping)
-// happens once instead of twice. Both weights must be the same quant type
-// and the same shape (M, K, n_experts); out_a / out_b have the same layout
-// as a single ds4_mmq_<type>_moe call. Saves one launch of
-// quantize_mmq_q8_1_cuda and one ggml_cuda_launch_mm_ids_helper per MoE
-// block. See ds4_mmq.cu / routed_moe_launch for the wiring.
-//
-// Returns 0 on success; on error neither output is guaranteed valid.
-
-
-// Target-prefill pipeline for the V4 Flash routed MoE. It builds the
-// expert-major assignment map once, runs the paired IQ2_XXS gate/up MMQs,
-// computes clamp + SwiGLU + router weighting in mid_f32, then gathers and
-// quantizes those rows for the Q2_K down MMQ through the same ids_dst and
-// expert_bounds. No second mm_ids_helper is launched; gate/up/mid/down keep
-// the standard pair-major output layout.
-
-/* Same fused target-prefill pipeline over byte-neutral aligned-SoA IQ2_XXS
- * and Q2_K replacement artifacts. Gate/up and down automatically dispatch
- * to the native D2R kernels on SM121. */
-
-// Aligned-artifact production fast path. Gate/up stay in registers, weighted
-// SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
-// down output is materialized. The caller-owned input/work/down scratch keeps
-// this hot path free of stream-ordered allocations; all three ranges must be
-// distinct and remain live until the function returns.
-/* ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa removed: no callers (see .cu) */
-
-// ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
-// aligned-SoA artifacts (weight server --repack-iq2-aligned); see
-// ds4_mmq_q2_K_moe_soa.
+// Paired gate/up entry: computes gate AND up over the same activation in a
+// single call, so the E4M3 activation staging (and the mm_ids_helper
+// bookkeeping) happens once instead of twice.  Both weights must be the same
+// quant type and shape (M, K, n_experts); out_a / out_b each have the single-
+// entry output layout.  On error neither output is guaranteed valid.
 int ds4_mmq_iq2_xxs_moe_pair_soa(
     const void    * Wa_soa,
     const void    * Wb_soa,
@@ -161,180 +113,10 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     const void    * act_sf,
     int             act_kbp);
 
-
-// MoE vector matmul entries (Step 6). Same signature and semantics as the
-// ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
-// kernels instead of mmq. mmvq is structurally optimised for small batch
-// counts (single-token decode, short prefill), where mmq's tile-based
-// approach wastes work on empty columns.
-//
-// Constraints:
-//   - n_tokens * something must fit under mmvq's per-arch batch cap
-//     (MMVQ_MAX_BATCH_SIZE = 8 on Blackwell). Specifically, ncols_dst as
-//     computed by the wrapper must be <= 8. The wrapper rejects with -1
-//     if the request is too large.
-//   - K must be a multiple of 256 (same as the mmq path).
-//
-// Unlike the mmq path, mmvq consumes a CANONICAL block_q8_1 buffer (not
-// the interleaved block_mx_act_mmq the mmq path uses). The wrapper builds
-// the canonical buffer internally; callers cannot reuse a Q8_1 buffer
-// previously built for the mmq path.
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-
-
-
-// Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
-//
-// block_iq2_xxs is 66 bytes, so the raw expert stream is only 2-byte aligned
-// and every 32-bit code word costs two 16-bit loads.  W_aligned is a repacked
-// copy of the SAME bytes with the block scales split out and the code stream
-// 64B-aligned:
-//
-//   [ __half dq[nblk] ][ pad to 64B ][ uint2 qs[nblk * 8] ]
-//
-// where nblk = n_experts * M * (K / 256) and block linear order matches the
-// raw tensor byte order (expert-major, then row, then block).  The weight
-// server builds this layout (--repack-iq2-aligned).  The
-// ds4_mmq_iq2_xxs_aligned_bytes sizing oracle that used to be named here was
-// removed in L066 step 2 -- it had no callers.
-//
-// Semantics and output layout are identical to ds4_mmq_iq2_xxs_moe_vec at
-// n_tokens == 1 (the only supported width; other widths return non-zero so
-// the caller can fall back).
-
-
-// M2 moe-down: aligned row-pair-SoA Q2_K routed-expert decode matvec.  Twin
-// of mul_mat_vec_q_moe<GGML_TYPE_Q2_K, 2> at the down-leg call shape
-// (n_expert_used == 1: each (token, slot) assignment is its own "token") with
-// bit-identical outputs; only the weight layout changes.  W_aligned is the
-// weight-server --repack-q2k-aligned artifact (DERIVED_Q2_K_ALIGNED_MOE,
-// REPLACES the raw range; byte-neutral):
-//
-//   npair = n_experts * (M/2) * (K/256)
-//   [ uint2 dm2[npair] ][ pad 64B ][ int4 sc4[npair*2] ][ pad 64B ]
-//   [ uint2 qs2[npair*16] ]
-//
-// keyed to the kernel's rows_per_block == 2 (see ds4_mmq.cu for the exact
-// field packing).  Use ds4_mmq_q2_k_aligned_bytes to size or validate an
-// artifact.  Unsupported shapes return non-zero so the caller can fall back.
-
-
-/* Deterministic top-6 down projection for decode/verifier rows. The six
- * assignment contributions are reduced in slot order directly into out_f32;
- * no [token,slot,out_dim] intermediate is materialized. */
-
-// Exact inverse of the weight-server repack: fills raw_out (nblk * 84 bytes,
-// raw block_q2_K stream) from an aligned artifact, device->device on
-// `stream`, for the batched/mmq raw-layout consumers (same role as
-// ds4_mmq_iq2_xxs_aligned_derepack).
-
-
-/* ds4_mmq_q8_0_aligned_dense_vec was declared here; removed in L066 step 2
- * along with the whole mmvq-backed half, which nothing referenced. */
-
-// Fused down+sum vector entries for routed MoE with top_k=6. These preserve
-// the canonical Q8_1 activation quantization used by the regular _moe_vec
-// path, but avoid materializing [token, slot, out_dim] down results and avoid
-// the separate slot-sum kernel. The caller must already have baked router
-// weights into X_f32, so the helper computes:
-//
-//   out[token, row] = sum_slot W[ids[token, slot], row, :] @ X[token, slot, :]
-//
-// Layouts:
-//   W:       [n_experts, M rows, K cols] in Q2_K or Q4_K blocks
-//   X_f32:   [n_tokens * 6, K] F32 row-major
-//   ids:     [n_tokens, 6] int32 row-major
-//   out_f32: [n_tokens, M] F32 row-major
-//
-// Constraints:
-//   - n_expert_used must be 6
-//   - K must be a multiple of 256
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-
-// Fused gate+up+SwiGLU vector entries for routed MoE with top_k=6. These use
-// canonical Q8_1 activation quantization and compute weighted mid directly:
-//
-//   mid[token, slot, row] =
-//       silu(clamp_gate(W_gate[expert,row] @ X[token]))
-//     * clamp_up(W_up[expert,row] @ X[token])
-//     * router_weight[token, slot]
-//
-// Clamp semantics match ds4_cuda.cu: gate is capped above, up is clamped to
-// [-clamp, clamp], and no clamp is applied when clamp <= 1e-6.
-//
-// Layouts:
-//   W_gate/W_up: [n_experts, M rows, K cols] in IQ2_XXS or Q4_K blocks
-//   X_f32:       [n_tokens, K] F32 row-major
-//   ids:         [n_tokens, 6] int32 row-major
-//   weights:     [n_tokens, 6] F32 row-major
-//   mid_f32:     [n_tokens * 6, M] F32 row-major
-//
-// Constraints:
-//   - n_expert_used must be 6
-//   - K must be a multiple of 256
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-
-// Pair-fused MoE vector matmul entries (Step 6). Computes
-//
-//   out[col, row] = (W_a[ids, row, :] @ X[token, :])
-//                 * silu(W_b[ids, row, :] @ X[token, :])
-//
-// in a SINGLE mmvq launch via mmvq's built-in fusion (fusion.gate = W_b,
-// fusion.glu_op = GGML_GLU_OP_SWIGLU). The kernel applies silu to the
-// fusion.gate matmul and multiplies into the main matmul: pass the
-// SwiGLU "up" weights as W_a and the SwiGLU "gate" weights as W_b to
-// match ds4's expected silu(gate)*up semantics. The DeepSeek V4 clamp
-// and router-weight multiplication are NOT applied by the kernel - the
-// caller is expected to apply them as a small post-process (or to skip
-// clamp if clamp==0).
-//
-// Constraints:
-//   - n_tokens = 1 ONLY. mmvq supports fusion only at ncols_dst = 1.
-//   - K must be a multiple of 256.
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-
-// Raw pair MoE vector entries. They quantize X to canonical Q8_1 once, then
-// run the same mmvq matvec kernel twice to produce the unfused gate and up
-// outputs. This preserves the caller's clamp-aware SwiGLU epilogue while
-// avoiding the duplicate Q8_1 quantize/scratch setup of two separate
-// ds4_mmq_*_moe_vec calls.
-//
-// Layout and constraints match ds4_mmq_*_moe_vec:
-//   out_[token * n_expert_used + slot, row]
-//   K must be a multiple of 256.
-
-
-
-// Dense vector matmul entry (Step 6). Same shape semantics as
-// ds4_mmq_q8_0_dense but routed through mmvq for batch counts that
-// favour the vec path (n_tokens <= 8 on Blackwell).
-//
-// Returns 0 on success, non-zero on validation or launch failure.
-
-
-// Set the thread-local stream that the internal cuda pool uses for
-// cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
-// Step 8 (CUDA Graphs) calls this with the capture stream so pool
-// allocations land on the captured stream and don't invalidate capture.
-// Pass NULL to reset to cudaStreamPerThread.
-/* ds4_pool_set_stream was here: the ggml pool it ordered is gone (L066). */
-
 /* pulsar (plan 41b): IQ2_XXS single-tensor MoE over the aligned-SoA artifact.
- * Upstream ships q2_K_moe_soa and iq2_xxs_moe_pair_soa but no IQ2 SINGLE soa
- * entry, which is what a routed DOWN needs when the down tensor is IQ2 rather
- * than Q2_K (our v5mx).  Same contract as ds4_mmq_iq2_xxs_moe. */
+ * Upstream shipped a pair entry but no IQ2 SINGLE soa entry, which is what a
+ * routed DOWN needs when the down tensor is IQ2 rather than Q2_K (our v5mx).
+ * Same contract as the pair entry at one weight/one output. */
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
     const float   * X_f32,
