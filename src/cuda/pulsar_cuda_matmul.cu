@@ -1705,42 +1705,6 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *
 }
 
 
-/* Fused pair of the de-interleaved mmvq: two weights (out0,out1) sharing one
- * activation x and in_dim, computed in a single launch. Each warp owns one
- * global output row -- rows [0,out0_dim) go to weight0/out0, the rest to
- * weight1/out1. Bit-identical to launching mxfp8_mmvq_deint_kernel twice (same
- * per-row math); the win is one launch instead of two on the overhead-bound
- * decode path (q_a+kv from attn_norm, shared gate+up from ffn_norm). */
-__global__ static void mxfp8_mmvq_deint_pair_kernel(
-        float *out0, float *out1,
-        const __nv_fp8_e4m3 *data0, const unsigned char *scale0, int out0_dim,
-        const __nv_fp8_e4m3 *data1, const unsigned char *scale1, int out1_dim,
-        const float *x, int in_dim, int KBp) {
-    int warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    int lane = threadIdx.x & 31;
-    const __nv_fp8_e4m3 *data;
-    const unsigned char *scale;
-    float *out;
-    int o;
-    if (warp < out0_dim) { o = warp;            data = data0; scale = scale0; out = out0; }
-    else                 { o = warp - out0_dim; if (o >= out1_dim) return;
-                           data = data1; scale = scale1; out = out1; }
-    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
-    float acc = 0.f;
-    for (int base = 0; base < in_dim; base += 128) {
-        int k = base + lane * 4;
-        uint32_t packed = *(const uint32_t *)(row + k);
-        int kb = k >> 5;
-        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
-        const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
-        const float *xk = x + k;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc += __half2float((__half)q[j]) * sc * xk[j];
-    }
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
-    if (lane == 0) out[o] = acc;   /* pair kernel: gate/up, stays f32 (L045) */
-}
-
 
 /* Small-batch (2..4 token) variant of the de-interleaved mmvq for the spec-decode
  * verify forward. One weight-row read serves all NT tokens (per-token accumulators),
@@ -2261,61 +2225,18 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
     }
-    /* Decode fast path: both weights share x and in_dim, so fuse the two
-     * de-interleaved mmvq launches into one. Only when both are registered
-     * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
-     * otherwise defer to the per-weight path below.
-     *
-     * ⚠ FORMAT BEFORE FUSION. This kernel takes x as f32 and has no A8 variant,
-     * so taking it when the producer HAS emitted an E4M3 encoding would silently
-     * run attn_q_a and attn_kv as W8A32 while every other decode GEMV ran W8A8 --
-     * which is exactly what it did: gpu_decode.cpp arms an E4M3 slot off
-     * attn_norm for these two, and nothing read it. A size- or shape-thresholded
-     * activation format is the defect this codebase refuses by name elsewhere
-     * ("one activation format, every batch size"), so when a valid encoding
-     * exists we give up the launch fusion and take the per-weight A8 path
-     * below. Fusing two launches is worth less than the operand being right. */
-    const mxfp8_act_cache_t *pair_a8 = act_slot_find_rows(x->ptr, n_tok, in_dim);
-    if (!pair_a8 && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
+    /* A fused mxfp8_mmvq_deint_pair_kernel lived here until the 2026-08-22
+     * launched-vs-defined sweep (L093).  It fired only when NO valid E4M3
+     * encoding existed for x at n_tok==1 -- and gpu_decode.cpp arms exactly
+     * that encoding off attn_norm before every call, so the fusion's only
+     * remaining trigger was a cudaMalloc failure inside the act cache.  An
+     * f32-activation kernel reachable only on an allocation-error path is a
+     * W8A32/W8A8 split waiting for an OOM to expose it ("one activation
+     * format, every batch size"); the per-weight calls below compute the same
+     * function and derive their output type from the tensor. */
+    if (act_slot_a8_declared_short(x->ptr, n_tok, in_dim) &&
+        !act_slot_find_rows(x->ptr, n_tok, in_dim))
         return act_a8_contract_fail("qkv pair GEMV", n_tok, in_dim, out0_dim);
-    const bool have_a8 = pair_a8 && pair_a8->valid;
-    if (!have_a8 && n_tok == 1 && in_dim % 128 == 0 &&
-        g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
-        const uint64_t fblocks = (in_dim + 31) / 32;
-        const uint64_t fbytes0 = out0_dim * fblocks * 33;
-        const uint64_t fbytes1 = out1_dim * fblocks * 33;
-        /* This kernel is untemplated f32-out/f32-in; the byte bounds alone
-         * would accept an oversized narrowed buffer (defect nine's shape), so
-         * the format is checked, not just the size.  A mismatch falls through
-         * to the unfused labeled calls, which derive their output type from
-         * the tensor. */
-        const bool bounds_ok =
-            weight0_offset <= model_size && fbytes0 <= model_size - weight0_offset &&
-            weight1_offset <= model_size && fbytes1 <= model_size - weight1_offset &&
-            pulsar_tensor_esz(x) == sizeof(float) &&
-            pulsar_tensor_esz(out0) == sizeof(float) &&
-            pulsar_tensor_esz(out1) == sizeof(float) &&
-            x->bytes >= in_dim * sizeof(float) &&
-            out0->bytes >= out0_dim * sizeof(float) &&
-            out1->bytes >= out1_dim * sizeof(float);
-        if (bounds_ok) {
-            const fp8_mx_weight *w0 = cuda_fp8_mx_weight(model_map, weight0_offset, fbytes0,
-                                                         in_dim, out0_dim, "mxfp8_pair0");
-            const fp8_mx_weight *w1 = cuda_fp8_mx_weight(model_map, weight1_offset, fbytes1,
-                                                         in_dim, out1_dim, "mxfp8_pair1");
-            if (w0 && w1) {
-                const int KBp = mx_rup((int)(in_dim / 32), 4);
-                const unsigned wpb = 8;  /* output rows (warps) per 256-thread block */
-                dim3 grid(((unsigned)(out0_dim + out1_dim) + wpb - 1) / wpb);
-                mxfp8_mmvq_deint_pair_kernel<<<grid, wpb * 32>>>(
-                        (float *)out0->ptr, (float *)out1->ptr,
-                        w0->data, w0->scale, (int)out0_dim,
-                        w1->data, w1->scale, (int)out1_dim,
-                        (const float *)x->ptr, (int)in_dim, KBp);
-                return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint pair");
-            }
-        }
-    }
     return cuda_matmul_mxfp8_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                            in_dim, out0_dim, x, n_tok, "mxfp8_pair0") &&
            cuda_matmul_mxfp8_tensor_labeled(out1, model_map, model_size, weight1_offset,
