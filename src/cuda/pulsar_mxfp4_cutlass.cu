@@ -1004,9 +1004,18 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
+  /* Native-format transport (L094 item 5), DOWN LEG ONLY -- and the asymmetry
+   * is load-bearing, not laziness.  The two A8 arms disagree about the scale
+   * plane's layout: expert_gemv_down_kernel reads it LINEARLY (xsf[k0>>5]),
+   * which is exactly what e4m3_act_pack_kernel writes, while
+   * expert_gemv_gu_swiglu_kernel reads it through pulsar_mx_sfoff's SWIZZLE
+   * because its A8 arm exists to consume the PRODUCER's cache.  So the down
+   * leg converts by mirroring pulsar_cutlass_gemv_down exactly; the gate/up
+   * leg would need a swizzle-writing packer and stays on the round-trip. */
   const size_t xq_floats = (size_t)n_tokens * in_dim;
-  const size_t midq_floats = (size_t)n_slots * mid_dim;
-  const size_t need = xq_floats + midq_floats;
+  const size_t midq_elems = (size_t)n_slots * mid_dim;
+  const size_t midq_bytes = midq_elems + midq_elems / 32u;
+  const size_t need = xq_floats + (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
     if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
     g_fp4_gemv_actbuf = nullptr;
@@ -1017,7 +1026,8 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     g_fp4_gemv_actbuf_floats = need;
   }
   float *xq = g_fp4_gemv_actbuf;
-  float *midq = xq + xq_floats;
+  uint8_t *midq8 = (uint8_t *)(g_fp4_gemv_actbuf + xq_floats);
+  uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   {
@@ -1032,13 +1042,13 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         n_expert, n_total_expert, in_dim, mid_dim);
   }
   {
-    const long nb = (long)(midq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid_scratch, nb);   /* W4A8: E4M3 acts */
+    const long nb = (long)(midq_elems / 32);
+    e4m3_act_pack_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq8, midsf, mid_scratch, nb);   /* W4A8: E4M3 acts */
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-    expert_gemv_down_kernel<decltype(sfl_dn), false><<<g, 256>>>(
-        down_out, midq, nullptr, nullptr, selected,
+    expert_gemv_down_kernel<decltype(sfl_dn), true><<<g, 256>>>(
+        down_out, nullptr, midq8, midsf, selected,
         down_w, down_stride, down_data_bytes, sfl_dn,
         n_total_expert, mid_dim, out_dim);
   }
