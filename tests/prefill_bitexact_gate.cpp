@@ -490,9 +490,11 @@ static void diff_row(const float *cur, const float *ref, int width, uint32_t dep
  * post-mortem: argmax stayed put while hidden states drifted 40%).  PASS iff top-1
  * holds at every depth AND KL <= tol at every depth.  Softmax/KL accumulate in
  * double so the metric itself does not round. */
+/* out_kl (optional) receives this row's KL so the caller can grade DIRECTION
+ * against a recorded budget, not just against an absolute ceiling. */
 static int fidelity_row(const float *cur, const float *ref, int width,
                         uint32_t depth, double kl_tol, int known_high,
-                        int known_flip) {
+                        int known_flip, double *out_kl) {
     double maxg = -1e300, maxc = -1e300;
     int arg_g = 0, arg_c = 0;
     for (int i = 0; i < width; i++) {
@@ -512,6 +514,7 @@ static int fidelity_row(const float *cur, const float *ref, int width,
         if (fabs(d) > maxabs) maxabs = fabs(d);
     }
     if (kl < 0.0) kl = 0.0;   /* fp noise can push a ~0 KL slightly negative */
+    if (out_kl) *out_kl = kl;
     const double rms = sqrt(sse / (double)width);
     const int top1_ok = (arg_g == arg_c);
     /* TOP-1 is enforced at EVERY depth including known-high ones: a divergence
@@ -607,6 +610,23 @@ static int fidelity_row(const float *cur, const float *ref, int width,
  * storage narrowing: L072/L045/L079), a budget anchor rather than an oracle
  * for quant-quality absolutes.  Determinism re-runs are skipped: that property
  * belongs to --check, and doubling a 30k-token prefill buys nothing here. */
+/* A KL budget file is `depth kl` per line, '#' comments ignored.  Returns the
+ * recorded KL for `depth`, or -1 if the file has no entry for it (a new depth
+ * is not a failure -- it just has nothing to be graded against yet). */
+static double kl_baseline_lookup(const char *path, uint32_t depth) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1.0;
+    char line[256];
+    double found = -1.0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        unsigned d = 0; double k = 0.0;
+        if (sscanf(line, "%u %lf", &d, &k) == 2 && d == depth) { found = k; break; }
+    }
+    fclose(f);
+    return found;
+}
+
 static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
     for (int i = 0; i < n; i++) if (list[i] == d) return 1;
     return 0;
@@ -616,7 +636,10 @@ static int run_check_reference(const char *model, const char *ref_path,
                                const char *tokens_path, double kl_tol,
                                int enforce,
                                const uint32_t *known_high, int n_known_high,
-                               const uint32_t *known_flip, int n_known_flip) {
+                               const uint32_t *known_flip, int n_known_flip,
+                               const char *kl_base_path, const char *kl_dump_path) {
+    struct { uint32_t depth; double kl; int known_high; } kl_out[64];
+    int n_kl_out = 0;
     /* Load the reference blob in full (its shape is the run's shape). */
     FILE *fp = fopen(ref_path, "rb");
     if (!fp) { fprintf(stderr, "cannot read reference blob %s\n", ref_path); return 1; }
@@ -725,7 +748,79 @@ static int run_check_reference(const char *model, const char *ref_path,
         if (!row_is_sane(row, width, rh.depths[i])) { fail = 1; continue; }
         const int kh = depth_in_list(rh.depths[i], known_high, n_known_high);
         const int kf = depth_in_list(rh.depths[i], known_flip, n_known_flip);
-        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh, kf) && enforce) fail = 1;
+        double kl_here = -1.0;
+        if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh, kf, &kl_here) && enforce) fail = 1;
+        if (kl_here >= 0.0 && n_kl_out < (int)(sizeof(kl_out)/sizeof(kl_out[0]))) {
+            kl_out[n_kl_out].depth = rh.depths[i];
+            kl_out[n_kl_out].kl = kl_here;
+            kl_out[n_kl_out].known_high = kh;
+            n_kl_out++;
+        }
+    }
+
+    /* ---- DIRECTION vs a recorded budget --------------------------------
+     * The absolute ceiling above cannot see DIRECTION: at the clean depths we
+     * sit at 1e-5..1e-7 against a 1e-4 tol, so a change could move 500x FURTHER
+     * from the source and still "pass".  And an improvement at a known-high
+     * depth earns no credit at all, because those rows are informational.
+     *
+     * With --kl-baseline the gate grades what we actually care about: did this
+     * change move us CLOSER to the source or further?  (Tyler, 2026-08-24.)
+     *
+     * ⚠ The verdict is NET, deliberately.  A per-depth "nothing may worsen"
+     * rule would have REJECTED the hc_expand tree summation, which improved 6
+     * of 9 depths including all three known-high outliers while worsening two
+     * that were already at 1e-7..1e-6.  Trading 1e-7 for 1e-6 to buy 0.25->0.17
+     * is a good trade and the gate must be able to say so.  A single depth may
+     * still fail on its own if it blows past the LARGE-regression guard. */
+    if (kl_base_path && n_kl_out > 0) {
+        double sum_cur = 0.0, sum_base = 0.0;
+        int matched = 0, worse_big = 0;
+        printf("\n  KL DIRECTION vs %s:\n", kl_base_path);
+        for (int k = 0; k < n_kl_out; k++) {
+            double b = kl_baseline_lookup(kl_base_path, kl_out[k].depth);
+            if (b < 0.0) { printf("    depth %6u: %.3e  (no baseline entry)\n",
+                                  kl_out[k].depth, kl_out[k].kl); continue; }
+            matched++;
+            sum_cur += kl_out[k].kl; sum_base += b;
+            const double rel = (b > 0.0) ? (kl_out[k].kl - b) / b : 0.0;
+            const char *tag = (kl_out[k].kl < b) ? "CLOSER" :
+                              (kl_out[k].kl > b) ? "further" : "same";
+            printf("    depth %6u: %.3e vs %.3e  %+7.1f%%  %s%s\n",
+                   kl_out[k].depth, kl_out[k].kl, b, rel * 100.0, tag,
+                   kl_out[k].known_high ? "  (known-high)" : "");
+            /* Large single-depth regression: 10x worse AND above 1e-6, so a
+             * 1e-7 -> 1e-6 wobble does not trip it but a real blow-up does. */
+            if (kl_out[k].kl > b * 10.0 && kl_out[k].kl > 1e-6) {
+                printf("      ^ LARGE single-depth regression (>10x and >1e-6)\n");
+                worse_big = 1;
+            }
+        }
+        if (matched > 0) {
+            const double net = (sum_base > 0.0) ? (sum_cur - sum_base) / sum_base : 0.0;
+            printf("  NET over %d matched depths: %.6e vs %.6e  (%+.2f%%) -> %s\n",
+                   matched, sum_cur, sum_base, net * 100.0,
+                   (sum_cur <= sum_base) ? "CLOSER TO SOURCE" : "FURTHER FROM SOURCE");
+            if (enforce && sum_cur > sum_base) {
+                fprintf(stderr, "REFERENCE GATE FAIL: net KL moved AWAY from the "
+                                "source (%.6e > %.6e)\n", sum_cur, sum_base);
+                fail = 1;
+            }
+            if (enforce && worse_big) {
+                fprintf(stderr, "REFERENCE GATE FAIL: a single depth regressed "
+                                ">10x above 1e-6\n");
+                fail = 1;
+            }
+        }
+    }
+    if (kl_dump_path && n_kl_out > 0) {
+        FILE *kf2 = fopen(kl_dump_path, "w");
+        if (!kf2) { fprintf(stderr, "cannot write %s\n", kl_dump_path); return 1; }
+        fprintf(kf2, "# depth kl   (recorded %s)\n", ref_path);
+        for (int k = 0; k < n_kl_out; k++)
+            fprintf(kf2, "%u %.17g\n", kl_out[k].depth, kl_out[k].kl);
+        fclose(kf2);
+        printf("  KL budget written to %s (%d depths)\n", kl_dump_path, n_kl_out);
     }
 
     printf("\nREFERENCE GATE: %s\n",
@@ -894,6 +989,9 @@ int main(int argc, char **argv) {
         int n_known_flip = 0;
         int enforce = 0;
         double tol = 1e30;
+        /* --kl-baseline FILE : grade DIRECTION (closer/further from source)
+         * --dump-kl FILE     : record the current per-depth KL as a budget */
+        const char *kl_base_path = NULL, *kl_dump_path = NULL;
         for (int a = 5; a < argc; a++) {
             if (strncmp(argv[a], "--known-high", 12) == 0) {
                 const char *list = strchr(argv[a], '=');
@@ -911,6 +1009,14 @@ int main(int argc, char **argv) {
                     const char *c = strchr(p, ',');
                     p = c ? c + 1 : NULL;
                 }
+            } else if (strncmp(argv[a], "--kl-baseline", 13) == 0) {
+                const char *v = strchr(argv[a], '=');
+                if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
+                kl_base_path = v;
+            } else if (strncmp(argv[a], "--dump-kl", 9) == 0) {
+                const char *v = strchr(argv[a], '=');
+                if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
+                kl_dump_path = v;
             } else {
                 tol = atof(argv[a]);
                 enforce = 1;
@@ -929,9 +1035,11 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n_known_flip; i++) printf(" %u", known_flip[i]);
             printf("\n");
         }
+        if (kl_base_path) printf("  KL budget: grading DIRECTION against %s\n", kl_base_path);
         return run_check_reference(argv[1], argv[3], argv[4], tol, enforce,
                                    known_high, n_known_high,
-                                   known_flip, n_known_flip);
+                                   known_flip, n_known_flip,
+                                   kl_base_path, kl_dump_path);
     }
     const char *model = argv[1];
     const int dumping = strcmp(argv[2], "--dump") == 0;
@@ -1096,7 +1204,7 @@ int main(int argc, char **argv) {
             const size_t off = (size_t)i * (size_t)width;
             /* --check-fidelity has no known-high concept: it compares against OUR
              * own golden, where every depth is expected to meet the tolerance. */
-            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0, 0)) fail = 1;
+            if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0, 0, NULL)) fail = 1;
         }
         printf("\nPREFILL FIDELITY GATE: %s\n", fail ? "FAIL" : "PASS");
         free(base);
