@@ -594,7 +594,22 @@ context-coherence-probe:
 # it and move this anchor deliberately; if it moves us away, reject it.  The byte
 # gate keeps its whole value -- catching UNINTENDED change -- exactly as long as
 # every move of this anchor is deliberate and says why.
-PREFILL_BASELINE_REF ?= f742688
+# MOVED f742688 -> the L074 consolidation on 2026-08-24, the second deliberate
+# move under the source standard -- and the first one that CORRECTED AN EARLIER
+# VERDICT OF MINE.
+#
+# L074 (one authority for the tail-rope math) failed this byte gate, was graded,
+# and was REJECTED on an all-depths NET of +21.4% "further".  That metric was
+# wrong: [[L080]] then measured that the three known-high depths are FLAT
+# reference positions (entropy ~1.7 nats, p(top1) 0.42-0.70) against ~0.0000 and
+# p(top1)=1.0000 everywhere else, so summing across all depths let three noisy
+# rows swamp six informative ones by five orders.  Re-graded on CONFIDENT depths
+# only it is **-15.14% CLOSER** to the source (4102 -90.2%, 6144 -75.2%).
+#
+# Controls run at the same time: the tree itself grades +0.00%, and the
+# SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
+# regression as well as accepting improvement.
+PREFILL_BASELINE_REF ?= a3b5fae
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
