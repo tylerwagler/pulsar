@@ -102,7 +102,7 @@ __device__ static inline float attn_pack_dot_lane8(const QT *qh, const pulsar_at
 
 template <typename QT>
 __global__ static void attention_prefill_raw_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -164,7 +164,7 @@ __global__ static void attention_prefill_raw_kernel(
 
 template <typename QT>
 __global__ static void attention_prefill_mixed_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -378,7 +378,7 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *tmp,
         uint32_t n_tokens,
         uint32_t n_head,
@@ -390,7 +390,7 @@ __global__ static void attention_prefill_unpack_heads_kernel(
     uint64_t q = gid / head_dim;
     uint32_t h = q % n_head;
     uint32_t t = q / n_head;
-    heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
+    heads_store(heads, gid, tmp[((uint64_t)h * n_tokens + t) * head_dim + d]);
 }
 
 /* positions/seq_id/comp_cap (all descriptor-aware decode kernels): per-row
@@ -419,7 +419,7 @@ __global__ static void attention_prefill_unpack_heads_kernel(
  * classic single-cache scalar path bit-exactly. */
 template <typename QT>
 __global__ static void attention_decode_mixed_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -620,7 +620,7 @@ __global__ static void attention_decode_mixed_kernel(
 
 template <typename QT>
 __global__ static void attention_indexed_mixed_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -856,7 +856,7 @@ __global__ static void attention_indexed_mixed_kernel(
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, typename QT>
 __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -1099,7 +1099,7 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
 template <typename QT>
 __global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
 static void attention_decode_mixed_heads8_online_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const QT *q,
         const pulsar_attn_pack_t *raw_kv,
@@ -1399,7 +1399,7 @@ static void attention_decode_mixed_heads8_online_kernel(
  * way (engine KL closed loop, see docs/engine-perf-map.md).
  * Launch: grid (n_tokens, n_head), 128 threads; each thread owns 4 dims. */
 __global__ static void attention_decode_split_merge_kernel(
-        float *heads,
+        pulsar_heads_t *heads,
         const float *sinks,
         const float * __restrict__ part_o,
         const float * __restrict__ part_ml,
@@ -1456,7 +1456,7 @@ static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *
         PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 2u];
 
 static int attention_decode_heads8_launch(
-        float *heads, const float *sinks, const pulsar_q_t *q, const pulsar_attn_pack_t *raw_kv,
+        pulsar_heads_t *heads, const float *sinks, const pulsar_q_t *q, const pulsar_attn_pack_t *raw_kv,
         const pulsar_attn_pack_t *comp_kv, uint32_t non_causal, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
         uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
