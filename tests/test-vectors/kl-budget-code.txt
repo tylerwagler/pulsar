@@ -1,0 +1,4 @@
+# depth kl   (recorded /home/claude/refcap/code.ref.bin)
+512 9.317425274108925e-06
+2048 1.9310054219718728e-06
+3840 0.18976208550413118
