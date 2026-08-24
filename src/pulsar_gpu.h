@@ -68,7 +68,7 @@
  * ~22% of memory throughput (engine-sol-sweep-2026-08-24.md), so removing store
  * bytes cannot speed it up.  The gains are fidelity and a 512 -> 256 MiB
  * allocation.  Do not sell it as throughput. */
-#define PULSAR_HEADS_ELT_SIZE 4u
+#define PULSAR_HEADS_ELT_SIZE 2u
 
 
 /* Q activation storage precision (L045).  batch_q is the largest activation in

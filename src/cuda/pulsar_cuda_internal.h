@@ -274,11 +274,12 @@ static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must 
  * PULSAR_HEADS_ELT_SIZE in pulsar_gpu.h.  Same contract as pulsar_hc_t: the
  * STORAGE narrows, every kernel still loads to f32 and accumulates in f32.
  *
- * Currently float -- the plumbing lands before the flip (see the macro's note).
- * The static_assert below is the whole point of declaring the two together: the
+ * FLIPPED to __nv_bfloat16 2026-08-24, after increments 1-7 landed the whole
+ * plumbing inert at f32 and the full suite went green on it byte-exact.  The
+ * static_assert below is the whole point of declaring the two together: the
  * Q buffer's width mismatch shipped as a real defect because changing either
  * side alone compiled clean. */
-typedef float pulsar_heads_t;
+typedef __nv_bfloat16 pulsar_heads_t;
 /* Both casts are valid for float AND __nv_bfloat16 (the bf16 type carries a
  * float conversion operator and a float constructor), so the flip really is
  * one line in pulsar_gpu.h plus one in the typedef above. */
