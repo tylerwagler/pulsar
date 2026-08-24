@@ -594,7 +594,7 @@ context-coherence-probe:
 # it and move this anchor deliberately; if it moves us away, reject it.  The byte
 # gate keeps its whole value -- catching UNINTENDED change -- exactly as long as
 # every move of this anchor is deliberate and says why.
-PREFILL_BASELINE_REF ?= d50777bd
+PREFILL_BASELINE_REF ?= f742688
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
