@@ -2098,6 +2098,17 @@ bool gpu_graph_encode_layer_attention_batch(
                         n_selected = PULSAR_N_INDEXER_TOP_K < cur_index
                             ? PULSAR_N_INDEXER_TOP_K
                             : cur_index;
+                        /* Mirror of the batch path's dump at :545.  This deep
+                         * per-token path had no selection dump, which made
+                         * "did the top-k SELECTION change?" unanswerable
+                         * exactly where it matters: the L033 flip's only
+                         * regressing depth (story@4096) is a PRUNED depth, and
+                         * every unpruned depth moved closer to source.
+                         * Discrete reselection vs continuous rounding is the
+                         * whole verdict question, and this is the instrument
+                         * that answers it. */
+                        gpu_graph_debug_dump_i32_tensor("indexer_topk",
+                                g->comp_selected, (uint64_t)n_selected, il, pos);
                     }
                 }
 
