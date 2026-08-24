@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_rope.cuh"   /* the tail-rope math: ONE authority (L074) */
 #include "pulsar_cuda_mx.cuh"
 #include <cuda_fp8.h>
 
@@ -168,7 +169,6 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
 
 
 
-__device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 
 
 
@@ -217,82 +217,49 @@ __global__ static void head_rms_norm_rope_tail_kernel(
     }
 
     float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1), corr1);
-    }
+    if (ext_factor != 0.0f)
+        rope_corr_dims_dev(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr0, &corr1);
     for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
         uint32_t i = pair * 2u;
-        float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
-        float theta_interp = freq_scale * theta_extrap;
-        float theta = theta_interp;
-        float mscale = attn_factor;
-        if (ext_factor != 0.0f) {
-            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-        }
-        float c = cosf(theta) * mscale;
-        float s = sinf(theta) * mscale;
-        if (inverse) s = -s;
         /* The rotation itself stays in f32 for both instantiations; only the
          * two stores narrow.  Rotating in f16 would compound the rounding
          * across the pair and is not what the fp16-storage change is. */
         QT *tail = xr + n_nope;
         float x0 = q_load<QT>(tail, i) * scale;
         float x1 = q_load<QT>(tail, i + 1) * scale;
-        q_store<QT>(tail, i,     x0 * c - x1 * s);
-        q_store<QT>(tail, i + 1, x0 * s + x1 * c);
+        float r0, r1;
+        rope_pair_rotate_core_dev(x0, x1, i, n_rot, rope_pos, inverse,
+                                  freq_base, freq_scale, ext_factor, attn_factor,
+                                  corr0, corr1, &r0, &r1);
+        q_store<QT>(tail, i,     r0);
+        q_store<QT>(tail, i + 1, r1);
     }
 }
 
 
 
-__device__ static float rope_yarn_ramp_dev(float low, float high, int i0) {
-    float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
-    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-}
 
-
-
-/* One rope rotation pair, in place at tail[i], tail[i+1]. The SINGLE authority
- * for the tail-rope math: rope_tail_kernel and the fused indexer rope+QAT
- * kernel both call this, so the two launch shapes cannot drift numerically.
- * Returns the rotated pair through r0/r1 for callers with an epilogue. */
+/* One rope rotation pair, in place at tail[i], tail[i+1], for the callers with
+ * a float* tail (rope_tail_kernel and the fused indexer rope+QAT kernel).
+ *
+ * ⚠ THIS IS NOT THE AUTHORITY -- it used to claim it was, while the header
+ * claimed the same thing and a third copy sat in the kernel above. All of them
+ * now call rope_pair_rotate_core_dev in pulsar_cuda_rope.cuh, which is the one
+ * place the YaRN math lives. Returns the rotated pair through r0/r1 for callers
+ * with an epilogue. */
 __device__ static void rope_tail_rotate_pair_dev(
         float *tail, uint32_t i, uint32_t n_rot, uint32_t rope_pos,
         uint32_t n_ctx_orig, int inverse,
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, float *out_r0, float *out_r1) {
     float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1), corr1);
-    }
+    if (ext_factor != 0.0f)
+        rope_corr_dims_dev(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr0, &corr1);
 
-    float theta_extrap = (float)rope_pos * powf(freq_base, -((float)i) / (float)n_rot);
-    float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
-    float mscale = attn_factor;
-    if (ext_factor != 0.0f) {
-        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    float c = cosf(theta) * mscale;
-    float s = sinf(theta) * mscale;
-    if (inverse) s = -s;
-
-    float x0 = tail[i];
-    float x1 = tail[i + 1];
-    const float r0 = x0 * c - x1 * s;
-    const float r1 = x0 * s + x1 * c;
+    float r0, r1;
+    rope_pair_rotate_core_dev(tail[i], tail[i + 1], i, n_rot, rope_pos, inverse,
+                              freq_base, freq_scale, ext_factor, attn_factor,
+                              corr0, corr1, &r0, &r1);
     tail[i] = r0;
     tail[i + 1] = r1;
     *out_r0 = r0;

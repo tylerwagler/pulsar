@@ -4,6 +4,15 @@
  * attn_f16_kernel (pulsar_cuda_attn_f16.cu). Three kernels computing this
  * independently is how bit-exactness dies; they all call these.
  *
+ * ⚠ THE "they all call these" CLAIM WAS FALSE FROM 2026-08-21 TO 2026-08-24.
+ * The header shipped and attn_f16_kernel used it, but pulsar_cuda_norm_kv.cu
+ * never included it and kept TWO transcribed copies plus its own ramp helper --
+ * and one of those copies also described itself as "the SINGLE authority".
+ * Three transcriptions, two of them claiming to be the only one. L074 closed
+ * that on 2026-08-24; the claim above is now true, and `grep -L
+ * pulsar_cuda_rope.cuh $(grep -rl rope_pair_rotate src/cuda)` is how to keep
+ * it true.
+ *
  * Every operation and its order is preserved from the original kernel bodies
  * verbatim: a prefill gate depth compares full-vocab logits byte-for-byte, so
  * even a reassociated multiply here is a red gate. */
