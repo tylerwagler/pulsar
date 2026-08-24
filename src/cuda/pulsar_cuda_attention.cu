@@ -1555,7 +1555,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_head * head_dim * PULSAR_HEADS_ELT_SIZE ||
         q->bytes < (uint64_t)n_head * head_dim * PULSAR_Q_ELT_SIZE ||
         raw_kv->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         head_dim <= PULSAR_ATTN_PACK_NROT ||
@@ -1632,7 +1632,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     if (mx_out) *mx_out = 0;
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_HEADS_ELT_SIZE ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE ||
         raw_kv->bytes < (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         window > 256) return 0;
@@ -1882,7 +1882,7 @@ static int attention_decode_batch_launch(
         (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_HEADS_ELT_SIZE ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE ||
         raw_kv->bytes < kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         head_dim <= PULSAR_ATTN_PACK_NROT ||
@@ -2100,7 +2100,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         n_comp == 0 || top_k == 0 ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_HEADS_ELT_SIZE ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE ||
         raw_kv->bytes < kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         head_dim <= PULSAR_ATTN_PACK_NROT ||
@@ -2302,7 +2302,7 @@ static int attention_prefill_mixed_launch(
         (n_comp != 0 && !comp_kv) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_HEADS_ELT_SIZE ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE ||
         raw_kv->bytes < (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         /* Pack-aware, like the three sibling launches.  A guard that hard-codes
