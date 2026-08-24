@@ -152,13 +152,13 @@ __global__ static void attention_prefill_raw_kernel(
         denom = den;
     }
     __syncthreads();
-    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) {
             acc += raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim) * scores[r];
         }
-        oh[d] = acc / denom;
+        heads_store(oh, d, acc / denom);
     }
 }
 
@@ -233,13 +233,13 @@ __global__ static void attention_prefill_mixed_kernel(
     }
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
-    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim) * scores[r];
         for (uint32_t c = 0; c < visible_comp; c++)
             acc += (attn_comp_pack_ld(comp_kv, (uint64_t)c, d, head_dim)) * scores[raw_count + c];
-        oh[d] = acc / denom;
+        heads_store(oh, d, acc / denom);
     }
 }
 
@@ -448,8 +448,8 @@ __global__ static void attention_decode_mixed_kernel(
          * a device array): fail-visible.  Zero this row's head output and
          * read nothing; an out-of-pool id would otherwise be a silent wild
          * read across the whole slab. */
-        float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
-        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) oh[d] = 0.0f;
+        pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) heads_store(oh, d, 0.0f);
         return;
     }
     const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
@@ -585,7 +585,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
-    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
         uint32_t d0 = threadIdx.x;
         uint32_t d1 = d0 + 256u;
@@ -603,8 +603,8 @@ __global__ static void attention_decode_mixed_kernel(
             acc1 += attn_comp_pack_ld(comp_src, comp_base + c, d1, head_dim) * s;
 
         }
-        oh[d0] = acc0 / denom;
-        oh[d1] = acc1 / denom;
+        heads_store(oh, d0, acc0 / denom);
+        heads_store(oh, d1, acc1 / denom);
     } else {
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
@@ -613,7 +613,7 @@ __global__ static void attention_decode_mixed_kernel(
                 acc += attn_comp_pack_ld(comp_src, comp_base + c, d, head_dim) * scores[raw_count + c];
 
             }
-            oh[d] = acc / denom;
+            heads_store(oh, d, acc / denom);
         }
     }
 }
@@ -647,8 +647,8 @@ __global__ static void attention_indexed_mixed_kernel(
     if (t >= n_tokens || h >= n_head) return;
     if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
         /* Dead/evicted row: see attention_decode_mixed_kernel. */
-        float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
-        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) oh[d] = 0.0f;
+        pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) heads_store(oh, d, 0.0f);
         return;
     }
     /* Descriptor preamble: see attention_decode_mixed_kernel.  comp_rows[]
@@ -801,7 +801,7 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
-    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
         uint32_t d0 = threadIdx.x;
         uint32_t d1 = d0 + 256u;
@@ -819,8 +819,8 @@ __global__ static void attention_indexed_mixed_kernel(
             acc1 += attn_comp_pack_ld(comp_src, comp_base + comp_rows[c], d1, head_dim) * s;
 
         }
-        oh[d0] = acc0 / denom;
-        oh[d1] = acc1 / denom;
+        heads_store(oh, d0, acc0 / denom);
+        heads_store(oh, d1, acc1 / denom);
     } else {
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
@@ -828,7 +828,7 @@ __global__ static void attention_indexed_mixed_kernel(
             for (uint32_t s = 0; s < comp_count; s++) {
                 acc += (attn_comp_pack_ld(comp_src, comp_base + comp_rows[s], d, head_dim)) * scores[raw_count + s];
             }
-            oh[d] = acc / denom;
+            heads_store(oh, d, acc / denom);
         }
     }
 }
@@ -890,8 +890,8 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
          * (no __syncthreads has run yet).  See
          * attention_decode_mixed_heads8_online_kernel. */
         if (valid_head) {
-            float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
-            for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+            pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
+            for (uint32_t d = lane; d < head_dim; d += 32u) heads_store(oh, d, 0.0f);
         }
         return;
     }
@@ -1157,8 +1157,8 @@ static void attention_decode_mixed_heads8_online_kernel(
                     part_ml[pbase * 2u + 1u] = 0.0f;
                 }
             } else {
-                float *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
-                for (uint32_t d = lane; d < head_dim; d += 32u) oh[d] = 0.0f;
+                pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
+                for (uint32_t d = lane; d < head_dim; d += 32u) heads_store(oh, d, 0.0f);
             }
         }
         return;
@@ -1580,7 +1580,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
      * carve-out) — this is a perplexity/eval-gated numerics change. */
     if (!cuda_attention_score_buffer_fits(n_comp) || head_dim == 512u) {
         if (head_dim == 512u) {
-            return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+            return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
                     (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
                     n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
                     0, 1, 0, n_raw, raw_cap,
@@ -1592,7 +1592,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
         return 0;
     }
     dim3 grid(1, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_decode_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
                                                  sinks,
                                                  (const pulsar_q_t *)q->ptr,
                                                  (const pulsar_attn_pack_t *)raw_kv->ptr,
@@ -1682,7 +1682,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
              * quantiser -- a half-written encoding would be a wrong answer,
              * not a slow one. */
             if (pulsar_gpu_attention_f16_prefill_mx(
-                    (float *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
                     (const pulsar_attn_pack_t *)raw_kv->ptr, NULL,
                     n_tokens, 0u, window, 1u, n_head, head_dim,
                     gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
@@ -1798,7 +1798,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                                        (int)n_head);
         if (!cublas_ok(st, "attention raw value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
-        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
+        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((pulsar_heads_t *)heads->ptr,
                                                                         out_tmp,
                                                                         n_tokens,
                                                                         n_head,
@@ -1806,7 +1806,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         return cuda_ok(cudaGetLastError(), "attention raw unpack launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_prefill_raw_kernel<<<grid, 128>>>((float *)heads->ptr,
+    attention_prefill_raw_kernel<<<grid, 128>>>((pulsar_heads_t *)heads->ptr,
                                                 sinks,
                                                 (const pulsar_q_t *)q->ptr,
                                                 (const pulsar_attn_pack_t *)raw_kv->ptr,
@@ -1905,7 +1905,7 @@ static int attention_decode_batch_launch(
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
         if (head_dim == 512u) {
-            return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+            return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
                     (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
                     n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
                     non_causal, n_tokens, pos0,
@@ -1933,7 +1933,7 @@ static int attention_decode_batch_launch(
                 fprintf(stderr, "pulsar: continued-prefill attention = fp16 tensor-core tier\n");
             }
             if (pulsar_gpu_attention_f16_indexed(
-                    (float *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
                     (const pulsar_attn_pack_t *)raw_kv->ptr,
                     n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
                     NULL /* no topk: visible-prefix sweep */,
@@ -1947,7 +1947,7 @@ static int attention_decode_batch_launch(
             return 0;
         }
         ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
-        return attention_decode_heads8_launch((float *)heads->ptr, sinks,
+        return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
                 (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
                 n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
                 non_causal, n_tokens, pos0,
@@ -1958,7 +1958,7 @@ static int attention_decode_batch_launch(
     }
     ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
     dim3 grid(n_tokens, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_decode_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
                                                  sinks,
                                                  (const pulsar_q_t *)q->ptr,
                                                  (const pulsar_attn_pack_t *)raw_kv->ptr,
@@ -2209,7 +2209,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
                 fprintf(stderr, "pulsar: indexed attention = fp16 tensor-core tier\n");
             }
             if (pulsar_gpu_attention_f16_indexed(
-                    (float *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
                     (const pulsar_attn_pack_t *)raw_kv->ptr, (const pulsar_attn_pack_t *)comp_kv->ptr,
                     (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
                     raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
@@ -2223,7 +2223,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
         {   /* the two-pass rb4 alternative is gone; this is the only arm */
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
+            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((pulsar_heads_t *)heads->ptr,
                                                                                sinks,
                                                                                (const pulsar_q_t *)q->ptr,
                                                                                (const pulsar_attn_pack_t *)raw_kv->ptr,
@@ -2250,7 +2250,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     }
     ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
     dim3 grid(n_tokens, n_head, 1);
-    attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_indexed_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
                                                   sinks,
                                                   (const pulsar_q_t *)q->ptr,
                                                   (const pulsar_attn_pack_t *)raw_kv->ptr,
@@ -2359,7 +2359,7 @@ static int attention_prefill_mixed_launch(
              * through with *mx_out unset so the caller's quantize pass runs
              * instead of reading a half-written slab. */
             if (pulsar_gpu_attention_f16_prefill_mx(
-                    (float *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
                     (const pulsar_attn_pack_t *)raw_kv->ptr,
                     n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : NULL,
                     n_tokens, n_comp, window, ratio, n_head, head_dim,
@@ -2478,7 +2478,7 @@ static int attention_prefill_mixed_launch(
                                        (int)n_head);
         if (!cublas_ok(st, "attention mixed value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
-        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
+        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((pulsar_heads_t *)heads->ptr,
                                                                         out_tmp,
                                                                         n_tokens,
                                                                         n_head,
@@ -2486,7 +2486,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed unpack launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_prefill_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_prefill_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
                                                   sinks,
                                                   (const pulsar_q_t *)q->ptr,
                                                   (const pulsar_attn_pack_t *)raw_kv->ptr,

@@ -570,6 +570,17 @@ double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
  * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
 
+/* Read n ELEMENTS of t to the host as f32, whatever width they are stored at.
+ *
+ * pulsar_gpu_tensor_read copies BYTES, so a caller that wants floats has to
+ * know the stored width -- and host code cannot see it (the esz field lives on
+ * the struct in pulsar_cuda_internal.h).  Every such caller therefore assumed
+ * f32, which is correct until it isn't: reinterpreting a narrowed buffer is
+ * type-legal, silent, and produces a dump that looks like data.  This is the
+ * one entry point diagnostics should use.  Returns 0 on failure. */
+int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
+                               float *out, uint64_t n_elems);
+
 /* Reserve the activation cache's E4M3 slots and hand back both device pointers
  * plus the scale pitch, so a producer can emit the MX encoding from its own
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */

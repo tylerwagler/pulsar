@@ -137,7 +137,11 @@ void gpu_graph_debug_dump_tensor(
     }
 
     float *buf = (float *)xmalloc((size_t)n_f32 * sizeof(buf[0]));
-    if (pulsar_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
+    /* Reads ELEMENTS, not bytes, and widens whatever they are stored as.  This
+     * was a raw byte read that assumed f32; heads (L033) is the first narrowed
+     * tensor on this path, and the failure mode was a dump full of plausible
+     * garbage rather than an error. */
+    if (pulsar_gpu_tensor_read_f32(t, 0, buf, n_f32) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_f32)) {

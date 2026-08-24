@@ -1846,13 +1846,20 @@ struct pulsar_range_stats_dev {
     unsigned long long n_nan;    /* NaN (a different problem entirely) */
 };
 
-__global__ static void range_stats_kernel(const float *x, uint64_t n,
+/* T is the tensor's STORED element type.  These two diagnostics used to cast
+ * every tensor to `const float *`, which silently reinterprets a narrowed
+ * buffer -- and they are the ONLY readers a narrowed activation reaches before
+ * a human looks at the numbers, so a wrong answer here is a wrong answer that
+ * looks authoritative.  (L033: heads is the first narrowed tensor that gets
+ * dumped; q and hc were narrowed earlier but are not on this path.) */
+template <typename T>
+__global__ static void range_stats_kernel(const T *x, uint64_t n,
                                           pulsar_range_stats_dev *out) {
     unsigned int lmax = 0u, lmin = 0xffffffffu;
     unsigned long long lo = 0, ls = 0, lb = 0, ln = 0;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n; i += (uint64_t)gridDim.x * blockDim.x) {
-        const float v = x[i];
+        const float v = (float)x[i];
         if (isnan(v)) { ln++; continue; }
         if (isinf(v)) { lb++; continue; }
         const float a = fabsf(v);
@@ -1896,12 +1903,13 @@ __global__ static void range_stats_kernel(const float *x, uint64_t n,
  * described below.  The E4M3 leg now goes through the engine's own
  * pulsar_mx_encode(), so the reference is the format we would actually store
  * rather than a second implementation of it that can drift. */
-__global__ static void act_int8_vs_e4m3_kernel(const float *x, uint64_t n,
+template <typename T>
+__global__ static void act_int8_vs_e4m3_kernel(const T *x, uint64_t n,
                                                double *acc_num, double *acc_den) {
     const uint64_t blk = (uint64_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     const uint32_t lane = threadIdx.x & 31;
     const uint64_t i = blk * 32 + lane;
-    const float v = (i < n) ? x[i] : 0.0f;
+    const float v = (i < n) ? (float)x[i] : 0.0f;
     float a = fabsf(v);
     if (!isfinite(a)) a = 0.0f;
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
@@ -1948,7 +1956,10 @@ double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n) {
     const unsigned wpb = 8;
     unsigned blocks = (unsigned)((warps + wpb - 1) / wpb);
     if (blocks == 0) blocks = 1;
-    act_int8_vs_e4m3_kernel<<<blocks, wpb * 32>>>((const float *)t->ptr, n, dev, dev + 1);
+    if (pulsar_tensor_esz(t) == sizeof(float))
+        act_int8_vs_e4m3_kernel<float><<<blocks, wpb * 32>>>((const float *)t->ptr, n, dev, dev + 1);
+    else
+        act_int8_vs_e4m3_kernel<__nv_bfloat16><<<blocks, wpb * 32>>>((const __nv_bfloat16 *)t->ptr, n, dev, dev + 1);
     double host[2] = { 0.0, 0.0 };
     if (cudaDeviceSynchronize() != cudaSuccess ||
         cudaMemcpy(host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -1961,6 +1972,27 @@ double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n) {
 
 
 /* Fills six doubles: max|v|, min nonzero |v|, n_over, n_subnormal, n_inf, n_nan. */
+int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
+                               float *out, uint64_t n_elems) {
+    if (!t || !t->ptr || !out || n_elems == 0) return 0;
+    const uint32_t esz = pulsar_tensor_esz(t);
+    if (t->bytes < (elem_off + n_elems) * esz) return 0;
+    if (esz == sizeof(float))
+        return pulsar_gpu_tensor_read(t, elem_off * esz, out, n_elems * sizeof(float)) != 0;
+    if (esz != sizeof(__nv_bfloat16)) return 0;
+    /* Widen on the host: this runs only behind the dump/range-sweep env gates,
+     * so a staging buffer here costs nothing anyone measures, and it keeps the
+     * conversion in the one place that knows the stored type. */
+    __nv_bfloat16 *tmp = (__nv_bfloat16 *)malloc((size_t)n_elems * sizeof(*tmp));
+    if (!tmp) return 0;
+    if (pulsar_gpu_tensor_read(t, elem_off * esz, tmp, n_elems * sizeof(*tmp)) == 0) {
+        free(tmp); return 0;
+    }
+    for (uint64_t i = 0; i < n_elems; i++) out[i] = __bfloat162float(tmp[i]);
+    free(tmp);
+    return 1;
+}
+
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5) {
     if (!t || !t->ptr || n == 0 || !out5) return 0;
     pulsar_range_stats_dev host = { 0u, 0xffffffffu, 0, 0, 0, 0 };
@@ -1970,7 +2002,10 @@ int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double
         cudaFree(dev); return 0;
     }
     const unsigned int blocks = (unsigned int)((n + 255) / 256 > 1024 ? 1024 : (n + 255) / 256);
-    range_stats_kernel<<<blocks ? blocks : 1u, 256>>>((const float *)t->ptr, n, dev);
+    if (pulsar_tensor_esz(t) == sizeof(float))
+        range_stats_kernel<float><<<blocks ? blocks : 1u, 256>>>((const float *)t->ptr, n, dev);
+    else
+        range_stats_kernel<__nv_bfloat16><<<blocks ? blocks : 1u, 256>>>((const __nv_bfloat16 *)t->ptr, n, dev);
     if (cudaDeviceSynchronize() != cudaSuccess ||
         cudaMemcpy(&host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
         cudaFree(dev); return 0;

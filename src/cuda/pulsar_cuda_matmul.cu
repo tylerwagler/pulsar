@@ -2870,7 +2870,7 @@ int pulsar_gpu_attention_output_batch_tensor(
         if (!out_a) return 0;
         if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes, out_a,
                                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
-                                    (const float *)heads->ptr, "attn_out_a")) return 0;
+                                    (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;
     }
     /* Emit `low` here too, for the same reason as the n==1 entry below: the "b"
      * GEMM consumes it next. This entry is what the SERVER actually takes --
@@ -2933,7 +2933,7 @@ int pulsar_gpu_attention_output_low_tensor(
 
     if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes, out_a,
                                 group_dim, rank, n_groups, 1, blocks_a, low_dim,
-                                (const float *)heads->ptr, "attn_out_a")) return 0;
+                                (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;
 
     /* Emit `low` so the "b" projection that consumes it next multiplies in
      * E4M3 too. Done here rather than as an epilogue on the "a" kernel: the
