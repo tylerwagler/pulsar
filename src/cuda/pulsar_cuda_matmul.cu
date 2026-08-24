@@ -239,13 +239,51 @@ __device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
 }
 
 
+/* Stage one 32-element activation block into registers from whatever width the
+ * activation is STORED at (L033).
+ *
+ * T=float keeps the exact eight-float4 sequence the two grouped-"a" GEMVs had
+ * before they were templated -- same instructions, same order -- so their f32
+ * arms stay bit-identical.  A narrowed T issues four 128-bit loads of eight
+ * elements each and widens on the way into the block; the dot helpers below
+ * still see f32, so no arithmetic depends on the storage width.
+ *
+ * Both grouped-"a" GEMVs staged this with the same copy-pasted loop.  One
+ * helper now, so a future width lands in one place instead of two that have to
+ * be kept agreeing by hand. */
+template <typename T>
+__device__ __forceinline__ static void stage_x_block32(const T *xr, float *xb);
+
+template <>
+__device__ __forceinline__ void stage_x_block32<float>(const float *xr, float *xb) {
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        *(float4 *)&xb[k * 4] = *(const float4 *)&xr[(uint32_t)k * 4u];
+}
+
+template <>
+__device__ __forceinline__ void stage_x_block32<__nv_bfloat16>(const __nv_bfloat16 *xr, float *xb) {
+    /* 8 bf16 is 16 B, the same 128-bit transaction the f32 arm issues -- four
+     * of them rather than eight, not a narrower access pattern. */
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const uint4 raw = *(const uint4 *)&xr[(uint32_t)k * 8u];
+        const __nv_bfloat16 *h = (const __nv_bfloat16 *)&raw;
+#pragma unroll
+        for (int j = 0; j < 8; j++) xb[k * 8 + j] = __bfloat162float(h[j]);
+    }
+}
+
+/* T is the activation's STORED type, deduced from the pointer.  Callers on f32
+ * buffers are unchanged; (float)x[i] is the identity for T=float. */
+template <typename T>
 __device__ __forceinline__ static float dev_dot_fp8mx_f32_block(
-        const unsigned char *wblk, const float *x, uint64_t bn) {
+        const unsigned char *wblk, const T *x, uint64_t bn) {
     const float wscale = __int_as_float((uint32_t)wblk[0] << 23);   /* E8M0 */
     float s = 0.0f;
     for (uint64_t i = 0; i < bn; i++) {
         const __half wh = (__half)(*(const __nv_fp8_e4m3 *)&wblk[1 + i]);
-        s += __half2float(wh) * x[i];
+        s += __half2float(wh) * (float)x[i];
     }
     return wscale * s;
 }
@@ -372,14 +410,16 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
 
 
 
-template<bool DEINT>
+/* XT is the activation's STORED element type (L033); f32 instantiation is the
+ * pre-template code exactly. */
+template<bool DEINT, typename XT>
 __global__ static void grouped_fp8mx_a_warp8_kernel(
         float *low,
         const unsigned char *w,
         const __nv_fp8_e4m3 *wdata,
         const unsigned char *wscale,
         int KBp,
-        const float *x,
+        const XT *x,
         uint64_t group_dim,
         uint64_t rank,
         uint32_t n_groups,
@@ -399,16 +439,13 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
     if ((row0 + nr - 1) / rank == group) {
         /* Common case (rank % PULSAR_FP8MX_ROWS == 0): all rows share the
          * group's activation row, so its blocks are loaded once per warp. */
-        const float *xr = x + (tok * (uint64_t)n_groups + group) * group_dim;
+        const XT *xr = x + (tok * (uint64_t)n_groups + group) * group_dim;
         for (uint64_t b = lane; b < blocks; b += 32u) {
             const uint64_t i0 = b * 32;
             const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
             if (bn == 32u) {
                 float xb[32];
-#pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    *(float4 *)&xb[k * 4] = *(const float4 *)&xr[i0 + (uint32_t)k * 4u];
-                }
+                stage_x_block32<XT>(xr + i0, xb);
 #pragma unroll
                 for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                     if (r >= nr) continue;
@@ -428,7 +465,7 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
         }
     } else {
         for (uint32_t r = 0; r < nr; r++) {
-            const float *xr = x + (tok * (uint64_t)n_groups + (row0 + r) / rank) * group_dim;
+            const XT *xr = x + (tok * (uint64_t)n_groups + (row0 + r) / rank) * group_dim;
             for (uint64_t b = lane; b < blocks; b += 32u) {
                 const uint64_t i0 = b * 32;
                 const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
@@ -514,13 +551,13 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
  * path exactly, so each token's output is bit-identical to the n=1 kernel.
  * Caller guarantees: deint weight available, rank % PULSAR_FP8MX_ROWS == 0 (row
  * quads never straddle a group), group_dim % 32 == 0 (whole blocks). */
-template <int NT>
+template <int NT, typename XT>
 __global__ static void grouped_fp8mx_a_nt_kernel(
         float *low,
         const __nv_fp8_e4m3 *wdata,
         const unsigned char *wscale,
         int KBp,
-        const float *x,
+        const XT *x,
         uint64_t group_dim,
         uint64_t rank,
         uint32_t n_groups,
@@ -535,18 +572,15 @@ __global__ static void grouped_fp8mx_a_nt_kernel(
     for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++)
 #pragma unroll
         for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
-    const float *xg = x + group * group_dim;
+    const XT *xg = x + group * group_dim;
     const uint64_t tok_stride = (uint64_t)n_groups * group_dim;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
 #pragma unroll
         for (int t = 0; t < NT; t++) {
             float xb[32];
-            const float *xr = xg + (uint64_t)t * tok_stride + i0;
-#pragma unroll
-            for (int k = 0; k < 8; k++) {
-                *(float4 *)&xb[k * 4] = *(const float4 *)&xr[(uint32_t)k * 4u];
-            }
+            const XT *xr = xg + (uint64_t)t * tok_stride + i0;
+            stage_x_block32<XT>(xr, xb);
 #pragma unroll
             for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
                 const uint32_t rw = (uint32_t)(row0 + r);
@@ -655,14 +689,16 @@ __global__ static void mxfp8_quant_act_kernel(const float *X, int rows, int K, i
  * heads[tok][group][K] but each group is an independent GEMM, so the E4M3 data
  * is regrouped as n_groups slabs of [K, n_tokens] col-major and the E8M0 scale
  * as n_groups independent swizzles of scale_slab bytes (token = scale row). */
-__global__ static void mxfp8_quant_act_grouped_kernel(const float *X, int n_tokens, int n_groups,
+/* T is the activation's STORED type (L033).  Both callers quantise heads. */
+template <typename T>
+__global__ static void mxfp8_quant_act_grouped_kernel(const T *X, int n_tokens, int n_groups,
                                                       int K, int KBp, __nv_fp8_e4m3 *data,
                                                       unsigned char *scale, size_t scale_slab) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     int KB = K / 32; if (warp >= n_tokens * n_groups * KB) return;
     int row = warp / KB, kb = warp % KB;        /* row = tok * n_groups + g */
     int g = row % n_groups, tok = row / n_groups;
-    float v = X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
+    float v = (float)X[(size_t)row * K + kb * 32 + lane], a = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
     const int se = pulsar_mx_shared_exp(a);
     data[((size_t)g * n_tokens + tok) * K + kb * 32 + lane] = pulsar_mx_encode(v, se);
@@ -1525,7 +1561,7 @@ static int cuda_attention_output_a_mx_gemm(
         cudaMemsetAsync(sx, 0, scale_bytes, 0);
         int warps = (int)n_tokens * (int)n_groups * (int)KB;
         mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
-                (const float *)heads->ptr, (int)n_tokens, (int)n_groups,
+                (const pulsar_heads_t *)heads->ptr, (int)n_tokens, (int)n_groups,
                 (int)group_dim, KBp, xq, sx, x_scale_slab);
         if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
     }
@@ -2652,7 +2688,7 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t out_a_offset,
         uint64_t out_a_bytes, const unsigned char *out_a, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
-        const float *heads, const char *label) {
+        const pulsar_heads_t *heads, const char *label) {
     const dim3 grid_a(((unsigned)low_dim + 31u) / 32u, (unsigned)n_tokens, 1);
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
@@ -2721,20 +2757,20 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
         const dim3 g(((unsigned)low_dim + 31u) / 32u);
         switch (n_tokens) {
-        case 2: grouped_fp8mx_a_nt_kernel<2><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+        case 2: grouped_fp8mx_a_nt_kernel<2, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, blocks_a); break;
-        case 3: grouped_fp8mx_a_nt_kernel<3><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+        case 3: grouped_fp8mx_a_nt_kernel<3, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, blocks_a); break;
-        default: grouped_fp8mx_a_nt_kernel<4><<<g, 256>>>(low, dw->data, dw->scale, KBp,
+        default: grouped_fp8mx_a_nt_kernel<4, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, blocks_a); break;
         }
         return cuda_ok(cudaGetLastError(), "attention_output_a nt launch");
     }
     if (dw) {
-        grouped_fp8mx_a_warp8_kernel<true><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
+        grouped_fp8mx_a_warp8_kernel<true, pulsar_heads_t><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, n_tokens, blocks_a);
     } else {
-        grouped_fp8mx_a_warp8_kernel<false><<<grid_a, 256>>>(low, out_a,
+        grouped_fp8mx_a_warp8_kernel<false, pulsar_heads_t><<<grid_a, 256>>>(low, out_a,
                 (const __nv_fp8_e4m3 *)NULL, (const unsigned char *)NULL, 0,
                 heads, group_dim, rank, n_groups, n_tokens, blocks_a);
     }
@@ -2768,7 +2804,7 @@ int pulsar_gpu_attention_output_batch_tensor(
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < (uint64_t)n_tokens) {
             const uint64_t low_dim = (uint64_t)n_groups * rank;
-            const uint64_t headb = (uint64_t)n_groups * group_dim * sizeof(float);
+            const uint64_t headb = (uint64_t)n_groups * group_dim * PULSAR_HEADS_ELT_SIZE;
             const uint64_t lowb  = low_dim * sizeof(float);
             const uint64_t outb  = out_dim * sizeof(float);
             pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
@@ -2800,7 +2836,7 @@ int pulsar_gpu_attention_output_batch_tensor(
     if (out_a_offset > model_size || out_b_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
         out_b_bytes > model_size - out_b_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * PULSAR_HEADS_ELT_SIZE ||
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
@@ -2887,7 +2923,7 @@ int pulsar_gpu_attention_output_low_tensor(
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 33u;
     if (out_a_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
-        heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
+        heads->bytes < (uint64_t)n_groups * group_dim * PULSAR_HEADS_ELT_SIZE ||
         low->bytes < low_dim * sizeof(float)) {
         return 0;
     }
