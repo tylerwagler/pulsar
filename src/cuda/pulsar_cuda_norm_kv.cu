@@ -239,16 +239,26 @@ __global__ static void head_rms_norm_rope_tail_kernel(
 
 
 
-/* One rope rotation pair, in place at tail[i], tail[i+1], for the callers with
- * a float* tail (rope_tail_kernel and the fused indexer rope+QAT kernel).
+/* One rope rotation pair, in place at tail[i], tail[i+1], for the callers that
+ * rotate a stored tail (rope_tail_kernel and the fused indexer rope+QAT
+ * kernel).  T is the buffer's STORED element type and is deduced from the
+ * pointer, never named at the call site.
  *
  * ⚠ THIS IS NOT THE AUTHORITY -- it used to claim it was, while the header
  * claimed the same thing and a third copy sat in the kernel above. All of them
  * now call rope_pair_rotate_core_dev in pulsar_cuda_rope.cuh, which is the one
  * place the YaRN math lives. Returns the rotated pair through r0/r1 for callers
- * with an epilogue. */
+ * with an epilogue.
+ *
+ * T changes WHERE the values live, never HOW they are rotated: the operands
+ * widen to float on the way in, the YaRN core is the same f32 code for every
+ * instantiation, and only the store narrows.  So T=float emits the identical
+ * instruction sequence this function had before it was templated -- which is
+ * the property the byte gate checks, and the reason the narrowing can land
+ * one buffer at a time instead of all at once. */
+template <typename T>
 __device__ static void rope_tail_rotate_pair_dev(
-        float *tail, uint32_t i, uint32_t n_rot, uint32_t rope_pos,
+        T *tail, uint32_t i, uint32_t n_rot, uint32_t rope_pos,
         uint32_t n_ctx_orig, int inverse,
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, float *out_r0, float *out_r1) {
@@ -257,17 +267,21 @@ __device__ static void rope_tail_rotate_pair_dev(
         rope_corr_dims_dev(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr0, &corr1);
 
     float r0, r1;
-    rope_pair_rotate_core_dev(tail[i], tail[i + 1], i, n_rot, rope_pos, inverse,
+    rope_pair_rotate_core_dev((float)tail[i], (float)tail[i + 1], i, n_rot, rope_pos, inverse,
                               freq_base, freq_scale, ext_factor, attn_factor,
                               corr0, corr1, &r0, &r1);
-    tail[i] = r0;
-    tail[i + 1] = r1;
+    tail[i] = (T)r0;
+    tail[i + 1] = (T)r1;
+    /* r0/r1 leave as f32 on purpose.  The MX epilogue below quantises from
+     * THESE registers, not from a read-back of tail[], so narrowing T does not
+     * put a second rounding in front of the E4M3 emission. */
     *out_r0 = r0;
     *out_r1 = r1;
 }
 
+template <typename T>
 __global__ static void rope_tail_kernel(
-        float *x,
+        T *x,
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
@@ -304,7 +318,7 @@ __global__ static void rope_tail_kernel(
     uint32_t i = pair * 2;
 
     const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t * pos_stride;
-    float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    T *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
     float r0, r1;
     rope_tail_rotate_pair_dev(tail, i, n_rot, rope_pos, n_ctx_orig, inverse,
                               freq_base, freq_scale, ext_factor, attn_factor,
@@ -1234,11 +1248,20 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
 
 int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {
-    if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    /* Untemplated f32 in-place kernel; the byte bound alone would accept an
-     * oversized narrowed buffer.  The f16-aware twin is head_rms_norm_rope_tail
-     * above -- keep the two from drifting. */
-    if (pulsar_tensor_esz(x) != sizeof(float)) return 0;
+    if (!x || n_rot > head_dim || (n_rot & 1)) return 0;
+    /* Derived from the buffer, never passed in -- the same rule its f16-aware
+     * twin head_rms_norm_rope_tail states above, for the same reason: passing
+     * the width is how decode came to hand an f16 Q to the f32 kernel.
+     *
+     * This used to be `esz != sizeof(float) -> refuse`, guarding an untemplated
+     * kernel against a narrowed buffer whose byte bound would still pass.  The
+     * kernel is templated now, so the width selects an instantiation instead of
+     * rejecting the call, and the bound below is computed from that same width
+     * rather than from a hardcoded sizeof(float) -- which is what made the
+     * bound too weak to stand alone in the first place. */
+    const size_t esz = pulsar_tensor_esz(x);
+    if (esz != sizeof(float) && esz != sizeof(__nv_bfloat16)) return 0;
+    if (x->bytes < (uint64_t)n_tok * n_head * head_dim * esz) return 0;
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     /* The MX epilogue owns exactly the blocks covering [head_dim - n_rot,
      * head_dim), so that range must BE whole MX blocks and a warp must map to
@@ -1252,8 +1275,12 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
         return 0;
     }
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
-            (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups);
+    if (esz == sizeof(float))
+        rope_tail_kernel<float><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
+                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups);
+    else
+        rope_tail_kernel<__nv_bfloat16><<<(pairs + 255) / 256, 256>>>((__nv_bfloat16 *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
+                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 
