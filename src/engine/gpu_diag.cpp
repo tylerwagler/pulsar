@@ -517,7 +517,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q (rope staging) */
     total += pc * (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES; /* batch_indexer_qp (packed) */
     total += pc * PULSAR_N_INDEXER_HEAD * f32;               /* batch_indexer_weights */
-    total += pc * dz.q_dim * f32;                         /* batch_heads */
+    total += pc * dz.q_dim * PULSAR_HEADS_ELT_SIZE;       /* batch_heads */
     total += pc * dz.low_dim * f32;                       /* batch_attn_low */
     total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_out */
     total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
@@ -1916,7 +1916,7 @@ bool gpu_graph_alloc_raw_cap(
     g->indexer_scores = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
-    g->heads = pulsar_gpu_tensor_alloc(q_dim * sizeof(float));
+    g->heads = pulsar_gpu_tensor_alloc_elt(q_dim, PULSAR_HEADS_ELT_SIZE);   /* same authority */
     g->attn_low = pulsar_gpu_tensor_alloc(low_dim * sizeof(float));
     g->attn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->after_attn_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
@@ -1984,7 +1984,10 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_indexer_qp = pulsar_gpu_tensor_alloc(pc * (uint64_t)PULSAR_N_INDEXER_HEAD *
                                                   PULSAR_ENGINE_IDXFP4_ROWBYTES);
     g->batch_indexer_weights = pulsar_gpu_tensor_alloc(pc * PULSAR_N_INDEXER_HEAD * sizeof(float));
-    g->batch_heads = pulsar_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    /* The stored width is PULSAR_HEADS_ELT_SIZE, not sizeof(float): the alloc,
+     * the byte budget and the kernels must agree on ONE authority or the flip
+     * to bf16 silently under-allocates. */
+    g->batch_heads = pulsar_gpu_tensor_alloc_elt(pc * q_dim, PULSAR_HEADS_ELT_SIZE);
     g->batch_attn_low = pulsar_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_after_attn_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE);   /* HC residual carrier */

@@ -2345,6 +2345,12 @@ pulsar_gpu_tensor *gpu_graph_q_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,
         uint64_t          row_values);
+/* heads buffers stride by PULSAR_HEADS_ELT_SIZE (L033) -- use this for
+ * batch_heads/heads, not the generic float-strided helper above. */
+pulsar_gpu_tensor *gpu_graph_heads_row_view(
+        pulsar_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values);
 /* Read an HC residual carrier (BF16 storage; task #62) into an f32 host buffer,
  * expanding each sample. Dev-only (parity self-test + env-gated DSpark dumps). */
 int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,

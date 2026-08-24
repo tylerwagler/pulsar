@@ -42,6 +42,34 @@
  * test. Removed 2026-08-17 with the rest of the callerless switches. */
 #define PULSAR_HC_ELT_SIZE 2u
 
+/* Stored element size of batch_heads / heads -- the attention output, and the
+ * largest UNCONDITIONAL f32 activation store in the engine (~512 MiB at 4096
+ * prefill; 21.5 GiB of writes per prefill, every layer, every arm).
+ *
+ * ⚠ STILL 4 (f32) IN THIS INCREMENT, DELIBERATELY.  The plumbing lands first
+ * and inert, exactly as the Q flip did (L045 increment 1): every producer and
+ * consumer moves onto pulsar_heads_t / heads_load / heads_store while the width
+ * is unchanged, so this increment is a provable no-op that the byte-exact gate
+ * certifies.  Flipping this to 2u is then a ONE-LINE change with the whole
+ * surface already converted.
+ *
+ * WHY BF16 AND NOT F16, when the attention tier packs Q to __half anyway:
+ * measured, not assumed.  The 2026-08-23 three-way grade re-scored under the
+ * confident/flat split (L080) gives, against the B300 source, on the depths
+ * where the model is actually certain:
+ *     f32 -> f16  : +7.23% FURTHER from source
+ *     f32 -> bf16 : -29.67% CLOSER
+ * They point in OPPOSITE directions; the old all-depths view called both
+ * "neutral" because the two flat rows masked the difference.  bf16 is the
+ * source's own residual dtype (ds4-source-numerics), f16 is a dtype the source
+ * has nowhere -- so this narrowing is a FIDELITY IMPROVEMENT, not a tradeoff.
+ *
+ * ⚠ IT IS NOT A SPEED CHANGE.  The engine is latency-bound and attn_f16 sits at
+ * ~22% of memory throughput (engine-sol-sweep-2026-08-24.md), so removing store
+ * bytes cannot speed it up.  The gains are fidelity and a 512 -> 256 MiB
+ * allocation.  Do not sell it as throughput. */
+#define PULSAR_HEADS_ELT_SIZE 4u
+
 
 /* Q activation storage precision (L045).  batch_q is the largest activation in
  * the model -- pc * n_head * head_dim, 512 MiB at a 4096-token prefill -- and

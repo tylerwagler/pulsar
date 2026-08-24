@@ -89,6 +89,21 @@ pulsar_gpu_tensor *gpu_graph_q_row_view(
 }
 
 
+/* Row view into the attention-output (heads) buffer (L033). Strides by
+ * PULSAR_HEADS_ELT_SIZE — use this, not the generic helper, for batch_heads and
+ * heads. Third instance of the same hazard after Q and HC: the generic view
+ * strides by sizeof(float) and against a narrowed buffer lands at double the
+ * intended offset, which compiles clean and computes a wrong answer. */
+pulsar_gpu_tensor *gpu_graph_heads_row_view(
+        pulsar_gpu_tensor *base,
+        uint32_t          row,
+        uint64_t          row_values) {
+    return pulsar_gpu_tensor_view(base,
+                                 (uint64_t)row * row_values * PULSAR_HEADS_ELT_SIZE,
+                                 row_values * PULSAR_HEADS_ELT_SIZE);
+}
+
+
 /* Row view into an HC residual CARRIER buffer (BF16 storage; task #62). Same as
  * gpu_graph_tensor_row_view but strides by PULSAR_HC_ELT_SIZE, not sizeof(float) —
  * use this (not the generic helper) for cur_hc/next_hc/after_*_hc bases. */
@@ -475,8 +490,8 @@ static bool gpu_graph_indexed_attention_span(
             (uint64_t)s0 * q_dim * PULSAR_Q_ELT_SIZE,
             (uint64_t)sn * q_dim * PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *sh_view = pulsar_gpu_tensor_view(g->batch_heads,
-            (uint64_t)s0 * q_dim * sizeof(float),
-            (uint64_t)sn * q_dim * sizeof(float));
+            (uint64_t)s0 * q_dim * PULSAR_HEADS_ELT_SIZE,
+            (uint64_t)sn * q_dim * PULSAR_HEADS_ELT_SIZE);
     /* Multiseq: per-span descriptor views (rows s0..s0+sn).  The scalar raw
      * span/start are ignored in banked mode -- they are derived per row. */
     pulsar_gpu_tensor *sp_view = op->mseq
@@ -2099,7 +2114,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         g->batch_kv_pack,
                         (uint64_t)t * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
                         PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
-                pulsar_gpu_tensor *heads_view = gpu_graph_tensor_row_view(g->batch_heads, t, q_dim);
+                pulsar_gpu_tensor *heads_view = gpu_graph_heads_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_pack_view && heads_view;
                 if (ok && !zero_prefix) {
                     /* n_tokens=1 with pos0=pos puts the row at pos % raw_cap --

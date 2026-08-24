@@ -270,6 +270,27 @@ __device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uin
 __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
+/* Stored attention-output (heads) element type; pairs with
+ * PULSAR_HEADS_ELT_SIZE in pulsar_gpu.h.  Same contract as pulsar_hc_t: the
+ * STORAGE narrows, every kernel still loads to f32 and accumulates in f32.
+ *
+ * Currently float -- the plumbing lands before the flip (see the macro's note).
+ * The static_assert below is the whole point of declaring the two together: the
+ * Q buffer's width mismatch shipped as a real defect because changing either
+ * side alone compiled clean. */
+typedef float pulsar_heads_t;
+/* Both casts are valid for float AND __nv_bfloat16 (the bf16 type carries a
+ * float conversion operator and a float constructor), so the flip really is
+ * one line in pulsar_gpu.h plus one in the typedef above. */
+__device__ __forceinline__ static float heads_load(const pulsar_heads_t *p, uint64_t i) {
+    return (float)p[i];
+}
+__device__ __forceinline__ static void heads_store(pulsar_heads_t *p, uint64_t i, float v) {
+    p[i] = (pulsar_heads_t)v;
+}
+static_assert(sizeof(pulsar_heads_t) == PULSAR_HEADS_ELT_SIZE,
+              "pulsar_heads_t and PULSAR_HEADS_ELT_SIZE state the same width; move both or neither");
+
 /* A weight tensor stored EITHER f32 or bf16, decided per tensor at load time
  * rather than per build (unlike pulsar_hc_t above, which is one compile-time
  * choice for the whole engine).  Several families moved to bf16 storage to stop
