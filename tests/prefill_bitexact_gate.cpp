@@ -627,6 +627,40 @@ static double kl_baseline_lookup(const char *path, uint32_t depth) {
     return found;
 }
 
+/* Shannon entropy (nats) of a logit row, and p(top1).  Used to classify a
+ * graded depth as CONFIDENT or FLAT.
+ *
+ * WHY THE GATE NEEDS THIS (L080, 2026-08-24): measured over both reference
+ * blobs, every depth is one of two populations and there is nothing in
+ * between -- the clean depths sit at entropy ~0.0000 with p(top1)=1.0000 and an
+ * effective support of ONE token, while the three "known-high" depths sit at
+ * ~1.7 nats with 5-14 tokens carrying 90% of the mass.  At a certain position
+ * there is no distribution to disagree about, so any two implementations agree
+ * at ~1e-6 trivially; at a flat one, small logit differences move REAL
+ * probability mass and KL is naturally O(0.1).
+ *
+ * That matters for the VERDICT: summing KL across all depths lets the three
+ * flat rows (0.17-0.57) swamp the six confident ones (1e-6) by five orders, so
+ * a NET over everything is decided almost entirely by the least informative
+ * rows.  The confident set carries the decision; the flat set is reported. */
+static void row_entropy(const float *row, int width, double *H_out, double *p1_out) {
+    double m = -1e300;
+    for (int i = 0; i < width; i++) if (row[i] > m) m = row[i];
+    double Z = 0.0;
+    for (int i = 0; i < width; i++) Z += exp((double)row[i] - m);
+    double H = 0.0, p1 = 0.0;
+    for (int i = 0; i < width; i++) {
+        const double p = exp((double)row[i] - m) / Z;
+        if (p > 0.0) H -= p * log(p);
+        if (p > p1) p1 = p;
+    }
+    *H_out = H; *p1_out = p1;
+}
+
+/* The two populations are ~0.0003 and ~1.7 nats, so any cut in between works;
+ * this one is two decades clear of the confident side. */
+#define GATE_FLAT_ENTROPY_NATS 0.05
+
 static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
     for (int i = 0; i < n; i++) if (list[i] == d) return 1;
     return 0;
@@ -638,7 +672,7 @@ static int run_check_reference(const char *model, const char *ref_path,
                                const uint32_t *known_high, int n_known_high,
                                const uint32_t *known_flip, int n_known_flip,
                                const char *kl_base_path, const char *kl_dump_path) {
-    struct { uint32_t depth; double kl; int known_high; } kl_out[64];
+    struct { uint32_t depth; double kl; int known_high; int flat; double H; double p1; } kl_out[64];
     int n_kl_out = 0;
     /* Load the reference blob in full (its shape is the run's shape). */
     FILE *fp = fopen(ref_path, "rb");
@@ -751,9 +785,14 @@ static int run_check_reference(const char *model, const char *ref_path,
         double kl_here = -1.0;
         if (!fidelity_row(row, ref_row, ncmp, rh.depths[i], kl_tol, kh, kf, &kl_here) && enforce) fail = 1;
         if (kl_here >= 0.0 && n_kl_out < (int)(sizeof(kl_out)/sizeof(kl_out[0]))) {
+            double H = 0.0, p1 = 0.0;
+            row_entropy(ref_row, ncmp, &H, &p1);   /* classify from the REFERENCE */
             kl_out[n_kl_out].depth = rh.depths[i];
             kl_out[n_kl_out].kl = kl_here;
             kl_out[n_kl_out].known_high = kh;
+            kl_out[n_kl_out].flat = (H >= GATE_FLAT_ENTROPY_NATS);
+            kl_out[n_kl_out].H = H;
+            kl_out[n_kl_out].p1 = p1;
             n_kl_out++;
         }
     }
@@ -774,20 +813,23 @@ static int run_check_reference(const char *model, const char *ref_path,
      * is a good trade and the gate must be able to say so.  A single depth may
      * still fail on its own if it blows past the LARGE-regression guard. */
     if (kl_base_path && n_kl_out > 0) {
-        double sum_cur = 0.0, sum_base = 0.0;
-        int matched = 0, worse_big = 0;
+        double sum_cur = 0.0, sum_base = 0.0;          /* CONFIDENT depths only */
+        double flat_cur = 0.0, flat_base = 0.0;        /* FLAT depths, reported  */
+        int matched = 0, n_flat = 0, worse_big = 0;
         printf("\n  KL DIRECTION vs %s:\n", kl_base_path);
         for (int k = 0; k < n_kl_out; k++) {
             double b = kl_baseline_lookup(kl_base_path, kl_out[k].depth);
             if (b < 0.0) { printf("    depth %6u: %.3e  (no baseline entry)\n",
                                   kl_out[k].depth, kl_out[k].kl); continue; }
-            matched++;
-            sum_cur += kl_out[k].kl; sum_base += b;
+            if (kl_out[k].flat) { n_flat++; flat_cur += kl_out[k].kl; flat_base += b; }
+            else                { matched++; sum_cur += kl_out[k].kl; sum_base += b; }
             const double rel = (b > 0.0) ? (kl_out[k].kl - b) / b : 0.0;
             const char *tag = (kl_out[k].kl < b) ? "CLOSER" :
                               (kl_out[k].kl > b) ? "further" : "same";
-            printf("    depth %6u: %.3e vs %.3e  %+7.1f%%  %s%s\n",
+            printf("    depth %6u: %.3e vs %.3e  %+7.1f%%  %s   [%s H=%.3f p1=%.3f]%s\n",
                    kl_out[k].depth, kl_out[k].kl, b, rel * 100.0, tag,
+                   kl_out[k].flat ? "FLAT     " : "confident",
+                   kl_out[k].H, kl_out[k].p1,
                    kl_out[k].known_high ? "  (known-high)" : "");
             /* Large single-depth regression: 10x worse AND above 1e-5.
              *
@@ -801,19 +843,33 @@ static int run_check_reference(const char *model, const char *ref_path,
              * guard meaningful (it is one decade under the 1e-4 tol this gate
              * already enforces per depth) without letting it veto changes on
              * noise. */
-            if (kl_out[k].kl > b * 10.0 && kl_out[k].kl > 1e-5) {
+            /* CONFIDENT depths only: a flat row swinging 10x is expected, not a
+             * blow-up, because its KL is dominated by which of several
+             * near-equal tokens each implementation happens to favour. */
+            if (!kl_out[k].flat && kl_out[k].kl > b * 10.0 && kl_out[k].kl > 1e-5) {
                 printf("      ^ LARGE single-depth regression (>10x and >1e-5)\n");
                 worse_big = 1;
             }
         }
+        /* FLAT rows are reported and NEVER decide.  Their KL is O(0.1) against
+         * O(1e-6) at confident rows, so including them in one sum means the
+         * verdict is set by the three least-informative depths (L080). */
+        if (n_flat > 0) {
+            const double fnet = (flat_base > 0.0) ? (flat_cur - flat_base) / flat_base : 0.0;
+            printf("  FLAT %d depths (entropy >= %.2f nats — the model is genuinely "
+                   "uncertain there, so KL is large for both of us):\n"
+                   "       %.6e vs %.6e  (%+.2f%%)  INFORMATIONAL, does not decide\n",
+                   n_flat, (double)GATE_FLAT_ENTROPY_NATS, flat_cur, flat_base, fnet * 100.0);
+        }
         if (matched > 0) {
             const double net = (sum_base > 0.0) ? (sum_cur - sum_base) / sum_base : 0.0;
-            printf("  NET over %d matched depths: %.6e vs %.6e  (%+.2f%%) -> %s\n",
+            printf("  NET over %d CONFIDENT depths: %.6e vs %.6e  (%+.2f%%) -> %s\n",
                    matched, sum_cur, sum_base, net * 100.0,
                    (sum_cur <= sum_base) ? "CLOSER TO SOURCE" : "FURTHER FROM SOURCE");
             if (enforce && sum_cur > sum_base) {
-                fprintf(stderr, "REFERENCE GATE FAIL: net KL moved AWAY from the "
-                                "source (%.6e > %.6e)\n", sum_cur, sum_base);
+                fprintf(stderr, "REFERENCE GATE FAIL: net KL over CONFIDENT depths "
+                                "moved AWAY from the source (%.6e > %.6e)\n",
+                        sum_cur, sum_base);
                 fail = 1;
             }
             if (enforce && worse_big) {
