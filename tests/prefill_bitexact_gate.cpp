@@ -302,7 +302,39 @@ static void scrub_one(const char *name, const char *value) {
     }
 }
 
+/* Diagnostic opt-in: PULSAR_GATE_DIAGNOSTIC_DUMPS=1 keeps the four graph-dump
+ * variables through the scrub so an instrumented run can record tensors (the
+ * L033 flip needed the top-k SELECTION at its one regressing depth, and this
+ * scrub -- correctly -- ate the request without a trace).
+ *
+ * Why this is an explicit mode and not a keep-list entry: dumps are
+ * observation, not numerics, BUT enabling them un-skips the dump-only f32
+ * stores, so the binary exercises a slightly different store path than the
+ * one certified.  A diagnostic run is therefore NOT a certification, and says
+ * so at the top of its output rather than printing a PASS someone might file. */
+static int diagnostic_dumps_on(void) {
+    const char *e = getenv("PULSAR_GATE_DIAGNOSTIC_DUMPS");
+    return e && !strcmp(e, "1");
+}
+static const char *const g_env_keep_diag[] = {
+    "PULSAR_GATE_DIAGNOSTIC_DUMPS",
+    "PULSAR_CUDA_GRAPH_DUMP_PREFIX",
+    "PULSAR_CUDA_GRAPH_DUMP_NAME",
+    "PULSAR_CUDA_GRAPH_DUMP_LAYER",
+    "PULSAR_CUDA_GRAPH_DUMP_POS",
+};
+static int env_kept_diag(const char *name) {
+    if (!diagnostic_dumps_on()) return 0;
+    for (size_t i = 0; i < sizeof(g_env_keep_diag) / sizeof(g_env_keep_diag[0]); i++)
+        if (!strcmp(name, g_env_keep_diag[i])) return 1;
+    return 0;
+}
+
 static void scrub_numerics_env(void) {
+    if (diagnostic_dumps_on())
+        fprintf(stderr,
+                "PREFILL GATE: *** DIAGNOSTIC RUN — graph dumps kept; this run "
+                "certifies NOTHING; do not record its verdict ***\n");
     /* Collect first: unsetenv() invalidates `environ` mid-iteration. */
     char *names[256];
     const size_t cap = sizeof(names) / sizeof(names[0]);
@@ -334,7 +366,7 @@ static void scrub_numerics_env(void) {
         }
         memcpy(nm, *e, len);
         nm[len] = '\0';
-        if (env_kept(nm)) { free(nm); continue; }
+        if (env_kept(nm) || env_kept_diag(nm)) { free(nm); continue; }
         names[n++] = nm;
     }
     for (size_t i = 0; i < n; i++) {
