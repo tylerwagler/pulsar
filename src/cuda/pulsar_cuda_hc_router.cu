@@ -141,13 +141,22 @@ __global__ static void hc_expand_kernel(
             comb_v[src_hc] = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             res_v[src_hc] = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
         }
+        /* ⚠ __fmaf_rn, NOT `acc += a*b`.  The first attempt (b40e03d) used the
+         * plain expression and FAILED the byte-exact prefill gate at EVERY
+         * depth: this TU is built with --use_fast_math, so once the four
+         * products are visible to the compiler it is free to REASSOCIATE them
+         * into a tree, and "same order in source" stops meaning "same order in
+         * codegen".  __fmaf_rn is a fixed round-to-nearest FMA the compiler may
+         * not reassociate, so the dependency chain through acc stays exactly
+         * the rolled loop's. */
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++) acc += comb_v[src_hc] * res_v[src_hc];
+        for (int src_hc = 0; src_hc < NHC; src_hc++)
+            acc = __fmaf_rn(comb_v[src_hc], res_v[src_hc], acc);
     } else {
         for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
             float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
-            acc += comb_v * res_v;
+            acc = __fmaf_rn(comb_v, res_v, acc);
         }
     }
     pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
