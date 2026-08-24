@@ -571,6 +571,29 @@ context-coherence-probe:
 # L064 record exactly which bytes moved and the experiment that proved it -- a
 # single-chunk prompt stayed bit-identical while a ring-reading one did not,
 # which is what established that the fast-math scale bucket is not idempotent.
+# MOVED d50777bd -> HEAD-of-this-change on 2026-08-24, and for a NEW REASON the
+# earlier moves did not have: not because the old anchor could not load the
+# artifact, but because a change that DISAGREES with the old anchor was measured
+# CLOSER TO THE SOURCE.
+#
+# Tyler, 2026-08-24: "I would love to disagree with our past if it puts us
+# closer to the original model.  In fact, we probably need to completely
+# re-evaluate all decisions we made regarding being bit-exact to ourselves and
+# start evaluating against the source logits."
+#
+# The change: hc_expand's gather lets --use_fast_math reassociate four products
+# into a tree.  Pairwise summation has O(log n) error growth vs sequential O(n),
+# so the tree is the MORE ACCURATE arithmetic, and graded against the B300
+# reference it is closer at 6 of 9 depths -- including ALL THREE known-high
+# outliers (story 512 0.643->0.569, story 30464 0.255->0.173, code 3840
+# 0.196->0.190).  See pulsar-notes/bit-exact-vs-source-2026-08-24.md.
+#
+# ⇒ THE RULE THIS ESTABLISHES, alongside "re-baseline whenever a numerics change
+# SHIPS": a byte-gate FAIL is not by itself a reason to revert.  Grade the change
+# against cuda-reference-gate first.  If it moves us CLOSER to the source, adopt
+# it and move this anchor deliberately; if it moves us away, reject it.  The byte
+# gate keeps its whole value -- catching UNINTENDED change -- exactly as long as
+# every move of this anchor is deliberate and says why.
 PREFILL_BASELINE_REF ?= d50777bd
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose

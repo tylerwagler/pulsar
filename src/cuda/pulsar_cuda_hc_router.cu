@@ -141,22 +141,30 @@ __global__ static void hc_expand_kernel(
             comb_v[src_hc] = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             res_v[src_hc] = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
         }
-        /* ⚠ __fmaf_rn, NOT `acc += a*b`.  The first attempt (b40e03d) used the
-         * plain expression and FAILED the byte-exact prefill gate at EVERY
-         * depth: this TU is built with --use_fast_math, so once the four
-         * products are visible to the compiler it is free to REASSOCIATE them
-         * into a tree, and "same order in source" stops meaning "same order in
-         * codegen".  __fmaf_rn is a fixed round-to-nearest FMA the compiler may
-         * not reassociate, so the dependency chain through acc stays exactly
-         * the rolled loop's. */
+        /* PLAIN `acc += a*b`, DELIBERATELY, and this is a numerics decision --
+         * read before "fixing" it back to __fmaf_rn.
+         *
+         * With --use_fast_math the compiler REASSOCIATES these four products
+         * into a tree once they are visible.  That is not a defect: pairwise
+         * summation has O(log n) error growth where sequential has O(n), so the
+         * tree is the more accurate arithmetic.  Graded against the B300 source
+         * logits it is CLOSER to the source at 6 of 9 depths, including all
+         * three known-high outliers (story 512 0.643->0.569, story 30464
+         * 0.255->0.173, code 3840 0.196->0.190).
+         *
+         * An earlier revision pinned this with __fmaf_rn purely to keep the
+         * byte gate green, which preserved our own historical rounding instead
+         * of reducing our distance from the source.  Tyler, 2026-08-24: "I
+         * would love to disagree with our past if it puts us closer to the
+         * original model."  The prefill baseline was re-anchored for this
+         * change; see PREFILL_BASELINE_REF in the Makefile. */
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++)
-            acc = __fmaf_rn(comb_v[src_hc], res_v[src_hc], acc);
+        for (int src_hc = 0; src_hc < NHC; src_hc++) acc += comb_v[src_hc] * res_v[src_hc];
     } else {
         for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
             float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
-            acc = __fmaf_rn(comb_v, res_v, acc);
+            acc += comb_v * res_v;   /* matches the unrolled arm above */
         }
     }
     pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
