@@ -688,6 +688,12 @@ cuda-prefill-gate:
 # enough to pass them would be ~1e4x too loose for the mid rows and would
 # protect nothing.
 PULSAR_REF_TOL ?= 1e-4
+# Per-depth KL budgets: the gate grades DIRECTION against these (closer to the
+# source = pass).  Absent, it falls back to the absolute-ceiling check only,
+# which cannot see direction -- see the 2026-08-24 note in
+# pulsar-notes/bit-exact-vs-source-2026-08-24.md.
+KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-story.txt
+KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # ⚠ ONE SHELL, DELIBERATELY.  Each make recipe LINE gets its own shell, so an
 # `exit 0` in a guard on the first line exits only that line and make runs the
 # rest anyway -- which is exactly how the first version of this target failed
@@ -703,11 +709,31 @@ cuda-reference-gate:
 		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
 		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 			$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-			$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512; \
+			$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512 \
+			$(if $(wildcard $(KL_BUDGET_STORY)),--kl-baseline $(KL_BUDGET_STORY),); \
 		./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 			$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
-			$(PULSAR_REF_TOL) --known-high 3840; \
+			$(PULSAR_REF_TOL) --known-high 3840 \
+			$(if $(wildcard $(KL_BUDGET_CODE)),--kl-baseline $(KL_BUDGET_CODE),); \
 	fi
+
+# Re-record the KL budgets from the CURRENT tree.  Same discipline as
+# PREFILL_BASELINE_REF: do this only when a change has been GRADED CLOSER to the
+# source and adopted, and say why in the commit.  Re-recording to silence a
+# regression is the one thing that makes this gate worthless.
+.PHONY: cuda-reference-gate-budget
+cuda-reference-gate-budget:
+	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
+		echo "REFUSING: set PULSAR_REF_DIR to the reference-capture dir"; exit 1; fi
+	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
+		$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512 \
+		--dump-kl $(KL_BUDGET_STORY)
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
+		$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
+		$(PULSAR_REF_TOL) --known-high 3840 --dump-kl $(KL_BUDGET_CODE)
+	@echo "KL budgets re-recorded -- COMMIT THEM with the reason"
 
 # NOTE: CUTLASS is an external header-only include path (never a submodule, and
 # never populated by `git worktree add`), so the baseline build is pointed at
