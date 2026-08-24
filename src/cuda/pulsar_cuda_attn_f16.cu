@@ -163,7 +163,8 @@ __device__ static inline uint32_t af16_pack_qraw(
 template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
-        float *__restrict__ heads,            /* [n_tokens][n_head][512] */
+        pulsar_heads_t *__restrict__ heads,   /* [n_tokens][n_head][512], STORED width
+                                               * = PULSAR_HEADS_ELT_SIZE (L033) */
         const float *__restrict__ sinks,      /* [n_head] */
         const QT *__restrict__ q,             /* [n_tokens][n_head][512], f32 or __half */
         const pulsar_attn_pack_t *__restrict__ raw_kv,   /* PULSAR_ATTN_PACK rows */
@@ -239,7 +240,7 @@ static void attn_f16_kernel(
     if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
         for (uint32_t i = tid; i < AF16_HPB * AF16_DIM; i += AF16_THREADS) {
             const uint32_t hh = hbase + i / AF16_DIM;
-            if (hh < n_head) heads[((uint64_t)t * n_head + hh) * AF16_DIM + (i % AF16_DIM)] = 0.0f;
+            if (hh < n_head) heads_store(heads, ((uint64_t)t * n_head + hh) * AF16_DIM + (i % AF16_DIM), 0.0f);
         }
         return;
     }
@@ -668,15 +669,20 @@ static void attn_f16_kernel(
             const float ib = sCorr[hb0 + g + 8u] /
                              (sL[hb0 + g + 8u] == 0.0f ? 1.0f : sL[hb0 + g + 8u]);
             const uint32_t ha = hbase + hb0 + g, hb = hbase + hb0 + g + 8u;
-            float *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
-            float *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
+            pulsar_heads_t *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
+            pulsar_heads_t *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
+            /* ⚠ The E4M3 emission below takes the SAME acc[] registers, NOT a
+             * read-back of these stores -- so narrowing this buffer does not
+             * change what the attn-output GEMM multiplies on this path.  The
+             * fidelity effect of the flip arrives through rope_tail, which DOES
+             * read heads back, rotates in place, and emits the tail's share. */
             #pragma unroll
             for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
                 const uint32_t nb = warp * AF16_DPW + n * 8u;
-                oa[nb + tg * 2u]      = acc[m][n][0] * ia;
-                oa[nb + tg * 2u + 1u] = acc[m][n][1] * ia;
-                ob[nb + tg * 2u]      = acc[m][n][2] * ib;
-                ob[nb + tg * 2u + 1u] = acc[m][n][3] * ib;
+                heads_store(oa, nb + tg * 2u,      acc[m][n][0] * ia);
+                heads_store(oa, nb + tg * 2u + 1u, acc[m][n][1] * ia);
+                heads_store(ob, nb + tg * 2u,      acc[m][n][2] * ib);
+                heads_store(ob, nb + tg * 2u + 1u, acc[m][n][3] * ib);
             }
             /* E4M3 for the attn-output "a" GEMM, straight out of the registers
              * the f32 stores above just used.
@@ -804,7 +810,7 @@ int pulsar_gpu_attn_f16_tier_on(void) {
 }
 
 int pulsar_gpu_attention_f16_prefill_mx(
-        float *heads, const float *sinks, const void *q,
+        void *heads_v, const float *sinks, const void *q,
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
@@ -812,6 +818,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok,
         const pulsar_gpu_q_prep *q_prep) {
+    pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     if (!heads || !sinks || !q || !raw_kv) return 0;
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
@@ -865,12 +872,12 @@ int pulsar_gpu_attention_f16_prefill_mx(
 }
 
 int pulsar_gpu_attention_f16_prefill(
-        float *heads, const float *sinks, const void *q,
+        void *heads_v, const float *sinks, const void *q,
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
         const pulsar_gpu_q_prep *q_prep) {
-    return pulsar_gpu_attention_f16_prefill_mx(heads, sinks, q, raw_kv, comp_kv,
+    return pulsar_gpu_attention_f16_prefill_mx(heads_v, sinks, q, raw_kv, comp_kv,
                                                n_tokens, n_comp, window, ratio,
                                                n_head, head_dim,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
@@ -884,7 +891,7 @@ int pulsar_gpu_attention_f16_prefill(
  * comp rows are ATTN_PACK, always -- the format parameter is gone (see the note
  * on the kernel).  A 0 here is a real failure, never a silent shape demotion. */
 int pulsar_gpu_attention_f16_indexed(
-        float *heads, const float *sinks, const void *q,
+        void *heads_v, const float *sinks, const void *q,
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
@@ -894,6 +901,7 @@ int pulsar_gpu_attention_f16_indexed(
         const pulsar_gpu_q_prep *q_prep) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
+    pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
     if (n_comp != 0u && !comp_kv) return 0;
     pulsar_gpu_q_prep qp;

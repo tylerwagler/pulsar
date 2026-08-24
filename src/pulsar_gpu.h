@@ -311,8 +311,13 @@ typedef struct pulsar_mxkv_pack_s pulsar_mxkv_pack_t;
 int pulsar_gpu_attention_f16_prefill_mx(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes per element.  Opaque here so the
          * public header does not pull in cuda_fp16.h; the concrete type is
-         * pulsar_q_t in pulsar_cuda_internal.h.  Pass tensor->ptr. */
-        float *heads, const float *sinks, const void *q,
+         * pulsar_q_t in pulsar_cuda_internal.h.  Pass tensor->ptr.
+         *
+         * heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes per
+         * element, opaque for the same reason (concrete type pulsar_heads_t).
+         * It was `float *` until L033; if you are adding a caller, pass
+         * tensor->ptr and do NOT assume f32. */
+        void *heads, const float *sinks, const void *q,
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
@@ -344,7 +349,9 @@ int pulsar_gpu_attention_f16_prefill(
  * are ATTN_PACK rows, always -- bank isolation gated by
  * tests/attn_f16_banked_test.cu.  Returns 0 on refusal or failure. */
 int pulsar_gpu_attention_f16_indexed(
-        float                   *heads,
+        /* heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes/element;
+         * opaque here for the same reason as q below (L033). Pass tensor->ptr. */
+        void                    *heads,
         const float             *sinks,
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
