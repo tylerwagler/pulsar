@@ -661,6 +661,19 @@ static void row_entropy(const float *row, int width, double *H_out, double *p1_o
  * this one is two decades clear of the confident side. */
 #define GATE_FLAT_ENTROPY_NATS 0.05
 
+/* The NET line prints the direction to two decimals, so a move smaller than
+ * half of the last printed digit is a move this gate cannot see.  Calling one
+ * of those "CLOSER TO SOURCE" puts a verdict next to a "+0.00%" that flatly
+ * contradicts it -- and the verdict is the half that gets quoted later, by
+ * someone who did not read the number beside it.  Below this, say UNCHANGED.
+ *
+ * This is not a tolerance on the physics; it is the display's own resolution.
+ * The positive control (grading a tree against budgets recorded from that same
+ * tree) lands on exact bitwise equality, so it reads UNCHANGED, which is the
+ * whole point: a control that cannot tell "identical" from "improved" is not
+ * a control. */
+#define GATE_NET_DEAD_BAND 5e-5   /* = 0.005%, half of the last printed digit */
+
 static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
     for (int i = 0; i < n; i++) if (list[i] == d) return 1;
     return 0;
@@ -863,10 +876,18 @@ static int run_check_reference(const char *model, const char *ref_path,
         }
         if (matched > 0) {
             const double net = (sum_base > 0.0) ? (sum_cur - sum_base) / sum_base : 0.0;
+            /* One predicate decides both the word and the verdict, so the two
+             * can never disagree.  Enforcement used to fail on `sum_cur >
+             * sum_base`, which red-gates a change whose regression is smaller
+             * than the resolution this line prints at -- a 1-ulp increase and a
+             * real 30% regression got the same treatment. */
+            const int moved_further = (net > GATE_NET_DEAD_BAND);
+            const char *dir = moved_further ? "FURTHER FROM SOURCE"
+                            : (net < -GATE_NET_DEAD_BAND) ? "CLOSER TO SOURCE"
+                            : "UNCHANGED (below this gate's display resolution)";
             printf("  NET over %d CONFIDENT depths: %.6e vs %.6e  (%+.2f%%) -> %s\n",
-                   matched, sum_cur, sum_base, net * 100.0,
-                   (sum_cur <= sum_base) ? "CLOSER TO SOURCE" : "FURTHER FROM SOURCE");
-            if (enforce && sum_cur > sum_base) {
+                   matched, sum_cur, sum_base, net * 100.0, dir);
+            if (enforce && moved_further) {
                 fprintf(stderr, "REFERENCE GATE FAIL: net KL over CONFIDENT depths "
                                 "moved AWAY from the source (%.6e > %.6e)\n",
                         sum_cur, sum_base);
