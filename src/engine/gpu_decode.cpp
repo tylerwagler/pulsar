@@ -1875,7 +1875,13 @@ bool gpu_graph_matmul_plain_tensor(
      * purpose so the gap failed at load rather than dispatching into nothing,
      * which is exactly what it did when a repacked artifact was tried. Adding the
      * arm is what makes that repack legal. */
-    if (w->type == PULSAR_TENSOR_FP8_E4M3 || w->type == PULSAR_TENSOR_MXFP8_LT) {
+    /* MXFP8_LT ONLY.  The FP8_E4M3 (type-38) disjunct that used to sit here was
+     * provably dead: gguf.cpp's loader calls pulsar_die("plain MXFP8 weight in
+     * artifact") on type 38 since L060, so no such weight can reach any
+     * dispatcher.  Its membership in the accept set is deliberate sequencing --
+     * pass validation, then die at cache time with the actionable repack
+     * message -- but the dispatch branch itself served nothing (L083 C6). */
+    if (w->type == PULSAR_TENSOR_MXFP8_LT) {
         return pulsar_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
                                             w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
     }
