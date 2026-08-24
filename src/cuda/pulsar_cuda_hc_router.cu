@@ -90,6 +90,21 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
 
 
 
+/* NHC: the hidden-carrier count as a COMPILE-TIME value, or 0 to take the
+ * runtime loop.  The point is memory-level parallelism, not instruction count.
+ *
+ * The 2026-08-24 SOL sweep found this kernel at 87.5% occupancy with ZERO
+ * barrier stalls and 31.6M long_scoreboard stalls -- i.e. plenty of warps, all
+ * of them waiting on global loads, at only 25.7% of memory throughput.  The
+ * cause is visible in the source: `n_hc` arrives as a kernel ARGUMENT, so the
+ * src_hc loop cannot be unrolled, and its `residual_hc` loads (each n_embd
+ * apart, individually coalesced) issue ONE AT A TIME, each waiting on the last.
+ * Templating on the count lets all NHC loads be in flight together.
+ *
+ * BIT-EXACT: the accumulation order is unchanged (acc += c0*r0; acc += c1*r1;
+ * ...), so this is an issue-order change only.  It is graded by the byte-exact
+ * prefill gate, not the reference gate. */
+template <int NHC>
 __global__ static void hc_expand_kernel(
         pulsar_hc_t *out_hc,
         const float *block_out,
@@ -114,14 +129,51 @@ __global__ static void hc_expand_kernel(
     float block_v = block_out[(uint64_t)t * n_embd + d];
     if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
     float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
-    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-        float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-        float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
-        acc += comb_v * res_v;
+    if (NHC > 0) {
+        /* Gather first, accumulate second: the loads have no dependence on each
+         * other, so hoisting them out of the accumulate lets the compiler keep
+         * NHC of them in flight.  The adds then run in the SAME order as the
+         * rolled loop, which is what keeps this bit-exact. */
+        float comb_v[NHC > 0 ? NHC : 1];
+        float res_v[NHC > 0 ? NHC : 1];
+#pragma unroll
+        for (int src_hc = 0; src_hc < NHC; src_hc++) {
+            comb_v[src_hc] = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
+            res_v[src_hc] = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
+        }
+#pragma unroll
+        for (int src_hc = 0; src_hc < NHC; src_hc++) acc += comb_v[src_hc] * res_v[src_hc];
+    } else {
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
+            float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
+            acc += comb_v * res_v;
+        }
     }
     pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
 }
 
+
+
+/* One dispatch point for the three hc_expand callers.  PULSAR_N_HC is 4 on the
+ * shipped artifact; anything else takes the runtime-loop instantiation, so a
+ * differently-shaped model still runs (just without the unrolled gather). */
+static void hc_expand_launch(uint32_t blocks, uint32_t threads,
+                             pulsar_hc_t *out_hc, const float *block_out,
+                             const float *block_add, const pulsar_hc_t *residual_hc,
+                             const float *post, const float *comb,
+                             uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
+                             uint32_t post_stride, uint32_t comb_stride, int has_add) {
+    if (n_hc == 4u) {
+        hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
+                                                post, comb, n_embd, n_hc, n_tokens,
+                                                post_stride, comb_stride, has_add);
+    } else {
+        hc_expand_kernel<0><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
+                                                post, comb, n_embd, n_hc, n_tokens,
+                                                post_stride, comb_stride, has_add);
+    }
+}
 
 
 __global__ static void hc_split_weighted_sum_fused_kernel(
@@ -917,7 +969,8 @@ int pulsar_gpu_hc_expand_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tens
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+                      (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const pulsar_hc_t *)residual_hc->ptr,
@@ -935,7 +988,8 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+                      (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const pulsar_hc_t *)residual_hc->ptr,
@@ -954,7 +1008,8 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+                      (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
                                                     (const pulsar_hc_t *)residual_hc->ptr,
