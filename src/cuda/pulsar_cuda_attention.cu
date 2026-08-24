@@ -1,5 +1,24 @@
 #include "pulsar_cuda_internal.h"
 
+/* Store one float4's worth of merged attention output at the STORED heads
+ * width (L033).  The split-KV merge kernels used to write their result as
+ *     ((float4 *)(heads + base))[idx] = acc;
+ * which reinterprets the buffer: with pulsar_heads_t narrowed to bf16 that
+ * stamps f32 bit patterns across EIGHT bf16 elements -- type-legal, compiles
+ * clean, and decodes as garbage ("grep the buffer, not the accessor"; this was
+ * the fourth instance the L033 flip surfaced, and the one that made decode
+ * emit an endless BOS stream).  Element indexing is preserved exactly: slot
+ * idx covers elements [idx*4, idx*4+4). */
+__device__ __forceinline__ static void heads_store4(
+        pulsar_heads_t *row, uint32_t idx, float4 v) {
+    const uint64_t b = (uint64_t)idx * 4u;
+    heads_store(row, b + 0u, v.x);
+    heads_store(row, b + 1u, v.y);
+    heads_store(row, b + 2u, v.z);
+    heads_store(row, b + 3u, v.w);
+}
+
+
 /* Every KV buffer is PULSAR_ATTN_PACK rows -- 584 B at head_dim 512, nope dims
  * E4M3 with a per-64 E8M0 scale and rope dims bf16 -- so ONE decoder serves the
  * sliding-window ring, the compressed pool, the drafter's ring and the current
@@ -101,6 +120,7 @@ __device__ static inline float attn_pack_dot_lane8(const QT *qh, const pulsar_at
 }
 
 template <typename QT>
+
 __global__ static void attention_prefill_raw_kernel(
         pulsar_heads_t *heads,
         const float *sinks,
@@ -1075,11 +1095,11 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
-        out4[lane +  0u] = o0;
-        out4[lane + 32u] = o1;
-        out4[lane + 64u] = o2;
-        out4[lane + 96u] = o3;
+        pulsar_heads_t *outr = heads + ((uint64_t)t * n_head + head) * head_dim;
+        heads_store4(outr, lane +  0u, o0);
+        heads_store4(outr, lane + 32u, o1);
+        heads_store4(outr, lane + 64u, o2);
+        heads_store4(outr, lane + 96u, o3);
     }
 }
 
@@ -1375,11 +1395,11 @@ static void attention_decode_mixed_heads8_online_kernel(
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
-        out4[lane +  0u] = o0;
-        out4[lane + 32u] = o1;
-        out4[lane + 64u] = o2;
-        out4[lane + 96u] = o3;
+        pulsar_heads_t *outr = heads + ((uint64_t)t * n_head + head) * head_dim;
+        heads_store4(outr, lane +  0u, o0);
+        heads_store4(outr, lane + 32u, o1);
+        heads_store4(outr, lane + 64u, o2);
+        heads_store4(outr, lane + 96u, o3);
     }
 }
 
@@ -1433,7 +1453,7 @@ __global__ static void attention_decode_split_merge_kernel(
         acc.w += w[i] * v.w;
     }
     acc.x *= inv; acc.y *= inv; acc.z *= inv; acc.w *= inv;
-    ((float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim))[tid] = acc;
+    heads_store4(heads + ((uint64_t)t * n_head + head) * head_dim, tid, acc);
 }
 
 /* Split-KV partial scratch: static device storage so the split launch is
