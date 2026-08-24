@@ -52,6 +52,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <type_traits>   /* the declaration-vs-definition guard below */
 #include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 
@@ -870,6 +871,35 @@ int pulsar_gpu_attention_f16_prefill_mx(
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
+
+/* Declaration-vs-definition guard for the wrapper below.
+ *
+ * pulsar_gpu.h reaches this TU through pulsar_cuda_internal.h, so a drifted
+ * declaration does NOT produce a redefinition error -- C++ just quietly adds a
+ * second overload.  No engine translation unit references this wrapper (only
+ * tests/attn_f16_kernel_test.cu does), so the stale overload stays undefined
+ * and unreferenced and the whole engine still links clean.  That is exactly
+ * how the L033 increment-2 signature change shipped a header the compiler was
+ * happy with and the attn gate was not.
+ *
+ * So this pins the declared type against the definition's signature.  Observed
+ * behaviour, not predicted: reverting the header to `float *heads` makes this
+ * fail as a plain static assertion (nvcc resolves the decltype rather than
+ * rejecting it as ambiguous), reported at this line with the message below.
+ * Either way the build stops here -- and a build error beats a link error in a
+ * gate an hour later.
+ *
+ * If you change this function's signature you must edit BOTH the header and
+ * the definition; this assert only tells you that you forgot, it cannot tell
+ * you which one is right. */
+static_assert(std::is_same<
+        decltype(pulsar_gpu_attention_f16_prefill),
+        int(void *, const float *, const void *,
+            const pulsar_attn_pack_t *, const pulsar_attn_pack_t *,
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+            const pulsar_gpu_q_prep *)>::value,
+    "pulsar_gpu.h's pulsar_gpu_attention_f16_prefill has drifted from the "
+    "definition below; update the header -- do not add an overload");
 
 int pulsar_gpu_attention_f16_prefill(
         void *heads_v, const float *sinks, const void *q,

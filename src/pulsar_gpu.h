@@ -327,7 +327,18 @@ int pulsar_gpu_attention_f16_prefill_mx(
         const pulsar_gpu_q_prep *q_prep);
 
 int pulsar_gpu_attention_f16_prefill(
-        float                   *heads,
+        /* heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes per
+         * element, opaque for the same reason as q below (concrete type
+         * pulsar_heads_t).  It was `float *` until L033.
+         *
+         * This wrapper has NO caller in the engine -- it exists so
+         * tests/attn_f16_kernel_test.cu can drive the real kernel through a
+         * narrow signature.  That is exactly why this declaration went stale
+         * when its definition changed and the engine still built clean: no
+         * production translation unit references the symbol, so nothing but
+         * the gate could catch the mismatch.  Keep it in step with the
+         * definition in pulsar_cuda_attn_f16.cu by hand. */
+        void                    *heads,
         const float             *sinks,
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
