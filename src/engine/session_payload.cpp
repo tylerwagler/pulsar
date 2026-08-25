@@ -220,13 +220,6 @@ static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
 
 
 
-/* Session files always store the indexer comp cache as f32 rows.  Under
- * PULSAR_IDX_FP4 the persistent cache is MXKV-FP4-packed, so save dequantizes
- * into the f32 staging first and load repacks from it.  The repack is
- * value-exact for all realistic rows (QAT-roundtripped fp4 values on
- * power-of-two block scales survive re-encoding); the one exception is a
- * 32-block whose amax sits below the mxkv encode floor (1e-20), which would
- * flush to zero — unreachable for RMS-normed indexer rows. */
 /* v5: the indexer comp cache is written in the format it is held in, exactly as
  * v4 did for the attention comp cache.  It used to dequantise MXKV-FP4 rows into
  * a 512 B/row f32 staging buffer, write that, and re-pack on load -- 68 B of

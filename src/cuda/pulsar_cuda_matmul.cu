@@ -829,13 +829,13 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * THREADING: per-thread state, matching the per-thread CUDA streams -- two
  * sessions prefilling concurrently must not share a quantized activation.
  *
- * TWO ENCODINGS, ONE ARMING.  The same activation also feeds F16 cuBLAS GEMMs
- * (this model stores the compressor/indexer projections as F16 while q_a/kv are
- * activation on every call for exactly the same reason.  That conversion is
- * likewise pure, so the cache carries an f16 copy alongside the MXFP8 one and
- * both are filled lazily -- a layer pays for only the encodings it actually
- * uses.  On a ratio-4 layer that is 1 quantization + 1 conversion instead of
- * 2 + 5. */
+ * TWO ENCODINGS, ONE ARMING.  The same activation also feeds BF16 GEMMs (the
+ * steering/plain matmul arm), and that conversion is likewise pure, so the
+ * slot carries a bf16 copy (valid_b / xb -- see f32_to_bf16_kernel) alongside
+ * the E4M3 one and both fill lazily: a layer pays for only the encodings it
+ * actually uses.  (This paragraph once described an F16 copy for "F16 cuBLAS
+ * GEMMs" and was truncated mid-clause; the last F16 weight left the model and
+ * the field is __nv_bfloat16 *xb -- rewritten by L106 V8.) */
 /* MULTI-SLOT.  One armed buffer sufficed while only batch_attn_norm and
  * batch_ffn_norm carried producer-emitted encodings, because those two never
  * had to be live at the same instant.  Driving every activation to E4M3 breaks

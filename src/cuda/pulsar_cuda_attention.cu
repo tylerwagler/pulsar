@@ -1669,14 +1669,20 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     static int raw_path_reported = 0;
     if (!raw_path_reported) {
         raw_path_reported = 1;
-        const int takes_window = n_tokens > 1 && head_dim == 512;
+        /* Name the arm the dispatch below ACTUALLY takes -- this string said
+         * "FUSED window kernel" for a predicate that has routed to the fp16
+         * MMA tier since it shipped, the same label-lies-about-the-arm class
+         * as the drafter launch log (L106 A3). */
+        const int batch512 = n_tokens > 1 && head_dim == 512;
+        const int f16_tier = batch512 &&
+                pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && (n_head % 16u) == 0u;
         fprintf(stderr,
                 "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> %s\n",
                 n_tokens, head_dim, window,
-                takes_window ? "FUSED window kernel (no score matrix)"
-                             : (g_cublas_ready
-                                    ? "unfused cuBLAS two-GEMM"
-                                    : "generic per-token kernel"));
+                f16_tier ? "fp16 tensor-core tier"
+                         : (batch512 && g_cublas_ready
+                                ? "unfused cuBLAS two-GEMM"
+                                : "generic per-token kernel"));
     }
     if (n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
@@ -2353,14 +2359,17 @@ static int attention_prefill_mixed_launch(
     static int mixed_path_reported = 0;
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
-        const int takes_window = allow_fused && n_tokens > 1 && head_dim == 512;
+        /* Same truth-in-labeling fix as the RAW entry above (L106 A3). */
+        const int mbatch512 = n_tokens > 1 && head_dim == 512;
+        const int mf16_tier = mbatch512 &&
+                pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && (n_head % 16u) == 0u;
         fprintf(stderr,
                 "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> %s\n",
                 n_tokens, n_comp,
-                takes_window ? "FUSED window kernel"
-                             : (g_cublas_ready
-                                    ? "unfused cuBLAS two-GEMM"
-                                    : "generic per-token kernel"));
+                mf16_tier ? "fp16 tensor-core tier"
+                          : (mbatch512 && g_cublas_ready
+                                 ? "unfused cuBLAS two-GEMM"
+                                 : "generic per-token kernel"));
     }
     if (allow_fused && n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.

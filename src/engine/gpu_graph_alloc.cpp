@@ -80,9 +80,10 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
  * GPU Decode Release Helpers and Reference Fallbacks.
  * =========================================================================
  *
- * The normal generation path uses the fused helpers below.  The older unfused
- * kernels remain available as diagnostic reference paths selected only by the
- * PULSAR_CUDA_DISABLE_*_FUSION environment switches.
+ * The generation path uses the fused helpers below.  (The unfused reference
+ * arms and their PULSAR_CUDA_DISABLE_*_FUSION switches were deleted in the
+ * 133->108 flag purge -- an opt-out with no real caller gets deleted; this
+ * header said otherwise until L106 K4.)
  */
 
 bool gpu_graph_env_flag(const char *name, int *cache) {

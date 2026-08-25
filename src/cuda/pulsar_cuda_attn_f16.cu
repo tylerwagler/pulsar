@@ -788,8 +788,10 @@ static int af16_dynsmem_ok(void) {
          * batch_q's element type (L045), and a missing grant does not fail
          * loudly at build time -- the launch gets 0 dynamic bytes and faults,
          * exactly as the comment above warns.  So BOTH instantiations are
-         * granted here even though only <float> is launched today: the f16
-         * flip must not be able to forget this. */
+         * granted: <pulsar_q_t> (= __half since the L045 flip) is what
+         * launches today, and the <float> grant is the safety net a future
+         * width change must not be able to forget.  (This sentence once said
+         * "<float> is launched today" -- it had drifted; L106 A4.) */
         cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<float>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 (int)AF16_DYNSMEM_BYTES);

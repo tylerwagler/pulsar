@@ -870,10 +870,13 @@ static int indexer_scores_launch(
      * dequantising them to fp16 first.  3.4x the WMMA tier at n_comp=512,
      * n_tokens=512 on a locked clock.
      *
-     * This path quantises Q to E4M3, so it is a fidelity change, not just a
-     * faster route to the same numbers — the suite-v1 KL run cleared it
-     * (docs/engine-perf-map.md, "fidelity ledger").
-     * tests/idx_quant_fidelity.cc's top-k overlap was the component evidence.
+     * FIDELITY: none changed on this path any more.  This paragraph used to
+     * say "quantises Q to E4M3" -- true before L090.4; today the tier consumes
+     * the producer's packed E2M1 nibbles directly (idx_spread4 re-containers
+     * bytes: no amax, no rounding, no second scale -- see
+     * pulsar_cuda_indexer_mxfp4.cu).  The suite-v1 KL run cleared the ORIGINAL
+     * flip; tests/idx_quant_fidelity.cc's top-k overlap was the component
+     * evidence.  (Stale claim found by L106 V8.)
      *
      * The shape conditions are checked HERE rather than read off the
      * launcher's return, so its 0 means a real allocation or launch failure.

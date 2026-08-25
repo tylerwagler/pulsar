@@ -46,12 +46,13 @@
  * largest UNCONDITIONAL f32 activation store in the engine (~512 MiB at 4096
  * prefill; 21.5 GiB of writes per prefill, every layer, every arm).
  *
- * ⚠ STILL 4 (f32) IN THIS INCREMENT, DELIBERATELY.  The plumbing lands first
- * and inert, exactly as the Q flip did (L045 increment 1): every producer and
- * consumer moves onto pulsar_heads_t / heads_load / heads_store while the width
- * is unchanged, so this increment is a provable no-op that the byte-exact gate
- * certifies.  Flipping this to 2u is then a ONE-LINE change with the whole
- * surface already converted.
+ * FLIPPED TO 2u (bf16) 2026-08-24, Tyler-accepted, after the plumbing landed
+ * inert (increments 1-7, SASS-proven no-ops) exactly as the Q flip did (L045).
+ * Every producer and consumer goes through pulsar_heads_t / heads_load /
+ * heads_store; the re-anchor ceremony (budgets + baseline at 5d45142) recorded
+ * the move.  This paragraph used to say "STILL 4 IN THIS INCREMENT" -- the
+ * colonoscopy found that stale claim sitting fifteen lines above the 2u it
+ * contradicted, at the single most load-bearing comment in the flip (L106 K4).
  *
  * WHY BF16 AND NOT F16, when the attention tier packs Q to __half anyway:
  * measured, not assumed.  The 2026-08-23 three-way grade re-scored under the
