@@ -65,9 +65,6 @@ __global__ static void embed_tokens_hc_kernel(
 __device__ __forceinline__ static float pulsar_at_load(const __nv_bfloat16 *x, uint64_t i) {
     return __bfloat162float(x[i]);
 }
-__device__ __forceinline__ static float pulsar_at_load(const float *x, uint64_t i) {
-    return x[i];
-}
 
 
 /* Small-batch (2..4 token) f16 GEMV: one weight-row read serves all NT tokens,
@@ -112,38 +109,6 @@ __global__ static void matmul_nt_kernel(
         __syncthreads();
     }
 }
-
-
-
-__global__ static void matmul_f32_kernel(
-        float *out,
-        const float *w,
-        const float *x,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t n_tok) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    uint64_t tok = (uint64_t)blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-
-    float sum = 0.0f;
-    const float *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        sum += wr[i] * xr[i];
-    }
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
-}
-
-
 
 
 
@@ -2379,14 +2344,20 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 
 
-int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map) return 0;
+/* L079/L087: the bf16 compute core, weight given as a resolved DEVICE pointer.
+ * Two producers feed it: pulsar_gpu_matmul_bf16_tensor (native BF16 storage,
+ * pointer straight into the mmap) and pulsar_gpu_matmul_f32_tensor (F32-source
+ * storage, pointer into the once-converted bf16 copy -- see
+ * f32_weight_bf16_resolve).  Everything numeric lives HERE, so the two weight
+ * families cannot drift: same activation cache, same NT/GemmEx/GEMV arms,
+ * same M-independence contract. */
+static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
+                            uint64_t in_dim, uint64_t out_dim,
+                            const pulsar_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !w) return 0;
     /* inc 4 prefix-split (see the f16/mxfp8 twins): decode prefix [0,n_dec)
      * M-independent, prefill suffix [n_dec,n_tok) tensor-core, via pure-regime
-     * recursion. MISSING here until 2026-08-16, which is why every weight family
-     * that moved onto this arm failed cuda-mixed-neutrality-gate while the f16
-     * and mxfp8 arms passed: a mixed batch ran as one call at the full width, so
-     * the decode rows were never computed at their own M. */
+     * recursion. */
     {
         const uint64_t n_dec = (uint64_t)g_mneutral_rows;
         if (n_dec > 0 && n_dec < n_tok) {
@@ -2399,18 +2370,13 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
                                                              x->bytes - n_dec * inb);
             const int saved = g_mneutral_rows;
             g_mneutral_rows = (int)n_dec;
-            int r1 = pulsar_gpu_matmul_bf16_tensor(&out_pre, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
+            int r1 = matmul_bf16_wptr(&out_pre, w, in_dim, out_dim, &x_pre, n_dec);
             g_mneutral_rows = 0;
-            int r2 = pulsar_gpu_matmul_bf16_tensor(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
+            int r2 = matmul_bf16_wptr(&out_suf, w, in_dim, out_dim, &x_suf, n_tok - n_dec);
             g_mneutral_rows = saved;
             return r1 && r2;
         }
     }
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
     /* Format check, not just size: these arms store f32 through an
      * untemplated float*, and an oversized narrowed batch buffer at small
      * n_tok would pass a pure byte bound (defect nine's shape). */
@@ -2418,9 +2384,6 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
         pulsar_tensor_esz(out) != sizeof(float)) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
-    if (!wptr) return 0;
-    const uint16_t *w = (const uint16_t *)wptr;
 
     /* ONE bf16 activation for the whole call, produced before the arm is
      * chosen.  Every arm below reads these exact bytes, so "which kernel ran"
@@ -2571,115 +2534,93 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
 }
 
 
+int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
+    if (!wptr) return 0;
+    return matmul_bf16_wptr(out, (const uint16_t *)wptr, in_dim, out_dim, x, n_tok);
+}
+
+
+/* L079/L087 phase 1: F32-source weights COMPUTE in bf16 on tensor cores.
+ *
+ * The source model's residual stream is BF16 -- there is no F32 compute
+ * anywhere in the checkpoint's own math ([[ds4-source-numerics]]) -- so bf16
+ * compute for the F32-stored family (hc_attn_fn/hc_ffn_fn/output_hc_fn/
+ * *_ape) is CLOSER to source than the cublasSgemm/SIMT arms it replaces,
+ * while the checkpoint storage stays exactly F32 (fidelity policy intact).
+ * Priced by the 2026-08-25 fusion survey: this family was 14.4% of decode
+ * GPU time (verify-batch NT kernels) + 6.2% of prefill (SIMT sgemm).
+ *
+ * The copy is converted ONCE per weight (immutable, keyed by offset --
+ * same pattern as g_fp8_mx_by_offset next door) and lives beside the mmap:
+ * the full F32 family is ~130 MiB of f32, so ~65 MiB of bf16 copies. */
+static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
+                                               uint64_t model_size,
+                                               uint64_t offset,
+                                               uint64_t in_dim, uint64_t out_dim) {
+    static std::unordered_map<uint64_t, uint16_t *> g_f32w_bf16;
+    static uint64_t fc_off[4] = {~0ull, ~0ull, ~0ull, ~0ull};
+    static const uint16_t *fc_ptr[4] = {};
+    const int slot = (int)(offset & 3u);
+    if (fc_off[slot] == offset) return fc_ptr[slot];
+    auto it = g_f32w_bf16.find(offset);
+    if (it != g_f32w_bf16.end()) {
+        fc_off[slot] = offset; fc_ptr[slot] = it->second;
+        return it->second;
+    }
+    const uint64_t n = in_dim * out_dim;
+    const uint64_t f32_bytes = n * sizeof(float);
+    if (offset > model_size || f32_bytes > model_size - offset) return NULL;
+    const float *src = (const float *)cuda_model_range_ptr(model_map, offset,
+                                                           f32_bytes, "f32->bf16 src");
+    if (!src) return NULL;
+    uint16_t *dst = NULL;
+    if (cudaMalloc(&dst, n * sizeof(uint16_t)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "pulsar: f32->bf16 weight copy alloc failed (%.1f MiB) -- "
+                        "REFUSING (no silent SIMT fallback)\n",
+                (double)(n * 2) / 1048576.0);
+        return NULL;
+    }
+    f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, src, n);
+    if (cudaGetLastError() != cudaSuccess) { (void)cudaFree(dst); return NULL; }
+    g_f32w_bf16[offset] = dst;
+    fc_off[slot] = offset; fc_ptr[slot] = dst;
+    static uint64_t total = 0;
+    total += n * 2;
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: F32-source matmul family computes in BF16 tensor "
+                        "cores (source residual stream is BF16; storage stays F32)\n");
+    }
+    return dst;
+}
+
+
 
 
 
 
 int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-    /* inc 4 prefix-split (see the f16/mxfp8 twins): decode prefix [0,n_dec)
-     * M-independent, prefill suffix [n_dec,n_tok) tensor-core, via pure-regime
-     * recursion. MISSING here until 2026-08-16, which is why every weight family
-     * that moved onto this arm failed cuda-mixed-neutrality-gate while the f16
-     * and mxfp8 arms passed: a mixed batch ran as one call at the full width, so
-     * the decode rows were never computed at their own M. */
-    {
-        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
-        if (n_dec > 0 && n_dec < n_tok) {
-            const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
-            pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
-            pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
-            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
-                                                             out->bytes - n_dec * outb);
-            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
-                                                             x->bytes - n_dec * inb);
-            const int saved = g_mneutral_rows;
-            g_mneutral_rows = (int)n_dec;
-            int r1 = pulsar_gpu_matmul_f32_tensor(&out_pre, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_pre, n_dec);
-            g_mneutral_rows = 0;
-            int r2 = pulsar_gpu_matmul_f32_tensor(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec);
-            g_mneutral_rows = saved;
-            return r1 && r2;
-        }
-    }
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    uint64_t weight_elems = out_dim * in_dim;
-    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
-    uint64_t weight_bytes = weight_elems * sizeof(float);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    /* Format check, not just size: these arms store f32 through an
-     * untemplated float*, and an oversized narrowed batch buffer at small
-     * n_tok would pass a pure byte bound (defect nine's shape). */
-    if (pulsar_tensor_esz(x) != sizeof(float) ||
-        pulsar_tensor_esz(out) != sizeof(float)) return 0;
-    if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
-    if (!wptr) return 0;
-    const float *w = (const float *)wptr;
-    /* M-INDEPENDENCE, same contract as the f16 arm above. cuBLAS below is
-     * batch-shape dependent: a row computed at n_tok=1 and the same row inside
-     * a wider batch do not agree bit-for-bit. That is invisible while these
-     * weights are f16 (the f16 arm has this nt kernel) and became visible the
-     * moment hc_*_fn and the *_ape families moved onto this path -- it is what
-     * cuda-mixed-neutrality-gate's GATE 2 caught, whose contract is rel-RMS 0
-     * between a fused prefill and a classic resume.
-     *
-     * The nt kernel's per-token loop and reduction match the n=1 kernel exactly,
-     * so each token's output is bit-identical to running it alone. The gate
-     * raises the cap to 8 via g_mneutral_rows, exactly as the f16 twin does. */
-    {
-        const uint64_t nt_cap = (g_mneutral_rows > 0)
-                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : 4u;
-        if (n_tok >= 2 && n_tok <= nt_cap) {
-            dim3 g((unsigned)out_dim);
-            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, float><<<g, 256>>>( \
-                    (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
-            switch (n_tok) {
-            case 2: PULSAR_NT_LAUNCH(2); break;
-            case 3: PULSAR_NT_LAUNCH(3); break;
-            case 4: PULSAR_NT_LAUNCH(4); break;
-            case 5: PULSAR_NT_LAUNCH(5); break;
-            case 6: PULSAR_NT_LAUNCH(6); break;
-            case 7: PULSAR_NT_LAUNCH(7); break;
-            case 8: PULSAR_NT_LAUNCH(8); break;
-            case 9: PULSAR_NT_LAUNCH(9); break;
-            case 10: PULSAR_NT_LAUNCH(10); break;
-            case 11: PULSAR_NT_LAUNCH(11); break;
-            case 12: PULSAR_NT_LAUNCH(12); break;
-            case 13: PULSAR_NT_LAUNCH(13); break;
-            case 14: PULSAR_NT_LAUNCH(14); break;
-            case 15: PULSAR_NT_LAUNCH(15); break;
-            default: PULSAR_NT_LAUNCH(16); break;   /* n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX */
-            }
-            #undef PULSAR_NT_LAUNCH
-            return cuda_ok(cudaGetLastError(), "matmul_f32 nt launch");
-        }
-    }
-    if (g_cublas_ready && n_tok > 1) {
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemm(g_cublas,
-                                        CUBLAS_OP_T,
-                                        CUBLAS_OP_N,
-                                        (int)out_dim,
-                                        (int)n_tok,
-                                        (int)in_dim,
-                                        &alpha,
-                                        w,
-                                        (int)in_dim,
-                                        (const float *)x->ptr,
-                                        (int)in_dim,
-                                        &beta,
-                                        (float *)out->ptr,
-                                        (int)out_dim);
-        return cublas_ok(st, "f32 matmul");
-    }
-    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
-    return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
+    if (out_dim > UINT64_MAX / in_dim) return 0;
+    /* L079/L087 phase 1: resolve the once-converted bf16 copy and run the
+     * SHARED bf16 core (see matmul_bf16_wptr).  What used to be here -- the
+     * f32 NT kernels, cublasSgemm, and the f32 GEMV -- computed in f32 for
+     * weights whose SOURCE math is bf16; the whole family now takes the
+     * tensor-core path at every n_tok, so mixed-batch M-independence and the
+     * n=1-vs-batch contract are the bf16 core's, uniformly.  Resolver failure
+     * is TERMINAL (refuse-loud): a silent SIMT fallback would split the
+     * family's numerics by allocation weather. */
+    const uint16_t *w16 = f32_weight_bf16_resolve(model_map, model_size,
+                                                  weight_offset, in_dim, out_dim);
+    if (!w16) return 0;
+    return matmul_bf16_wptr(out, w16, in_dim, out_dim, x, n_tok);
 }
 
 
