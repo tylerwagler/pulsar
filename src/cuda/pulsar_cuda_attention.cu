@@ -1695,7 +1695,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
          * here is a REAL failure, so it is reported rather than silently
          * demoted to the FMA kernel. */
         static const int use_f16_attn = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
-        if (use_f16_attn && head_dim == 512u && (n_head % 16u) == 0u) {
+        if (use_f16_attn && (n_head % 16u) == 0u)   /* head_dim==512 proven by the enclosing branch (K13) */ {
             static int announced = 0;
             if (!announced) {
                 announced = 1;
@@ -2353,7 +2353,9 @@ static int attention_prefill_mixed_launch(
      * batch max/sum), so it is NOT bit-identical to the GEMM path. */
     /* PULSAR_ATTN_FUSED_COMP is gone -- no setter anywhere, so the masked case
      * never took the fused kernel and the A/B it gated never ran. */
-    const int allow_fused = 1;
+    /* L106 K13: `allow_fused` was a constant 1 (its PULSAR_ATTN_FUSED_COMP
+     * setter is long gone); the false side of every `allow_fused &&` was
+     * dead text misleading readers about reachability.  Folded through. */
     /* One-shot: which branch actually serves this workload. Guessing at this
      * has been wrong twice; print it rather than infer it. */
     static int mixed_path_reported = 0;
@@ -2371,12 +2373,12 @@ static int attention_prefill_mixed_launch(
                                  ? "unfused cuBLAS two-GEMM"
                                  : "generic per-token kernel"));
     }
-    if (allow_fused && n_tokens > 1 && head_dim == 512) {
+    if (n_tokens > 1 && head_dim == 512) {
         /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
          * This is the site that carries the traffic: the raw-window one runs
          * twice a prefill, this one runs per layer. */
         static const int use_f16_attn_mixed = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
-        if (use_f16_attn_mixed && head_dim == 512u && (n_head % 16u) == 0u) {
+        if (use_f16_attn_mixed && (n_head % 16u) == 0u)   /* head_dim==512 proven by the enclosing branch (K13) */ {
             static int announced = 0;
             if (!announced) {
                 announced = 1;

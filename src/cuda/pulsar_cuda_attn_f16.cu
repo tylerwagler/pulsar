@@ -772,9 +772,13 @@ static int af16_device_supported(void) {
  * this function, widening the gate for the tier that reads pack natively).
  * So this answers for the tier that is actually going to run. */
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
-    static int on = -1;
-    if (on < 0) on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && af16_device_supported();
-    return on;
+    /* L106 K14: this had a body IDENTICAL to pulsar_gpu_attn_f16_tier_on and
+     * the two drifted risk was real (same predicate, two caches).  The two
+     * NAMES stay -- call sites ask two different questions ("does prefill
+     * consume packed comp rows?" vs "is the f16 tier on?") that happen to have
+     * the same answer today; if that ever stops being true, the split point is
+     * already named.  One body now. */
+    return pulsar_gpu_attn_f16_tier_on();
 }
 
 /* One-time dynamic-smem opt-in for attn_f16_kernel: static shared alone is
@@ -935,7 +939,6 @@ int pulsar_gpu_attention_f16_indexed(
      * visible comp prefix rather than a selection. */
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
-    if (n_comp != 0u && !comp_kv) return 0;
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {

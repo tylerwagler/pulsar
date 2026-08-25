@@ -288,6 +288,15 @@ static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1
  * routed_expert_gate_down_layout()'s CUTLASS_MXFP4 branch: *_stride is the full per-expert
  * [data+SF] block size, *_data_bytes is where the SF blob starts within that block (the
  * "row_bytes" parameter slot, repurposed -- see that function's comment in weights.cpp). */
+/* L106 K12 (audited, WON'T-DO): this per-expert loop gathers f32 rows and
+ * lets the cutlass pack re-derive the E4M3 the act cache already holds -- a
+ * duplicate encode its grouped sibling (:607) and the mixed-40 path avoid.
+ * Taking the handover here means threading act_q/act_sf through the whole
+ * per-expert pulsar_cutlass_expert_ffn API for a path that is an ANNOUNCED
+ * ~4x-slower fallback (fires only when the grouped GEMM fails).  Bytes are
+ * identical either way (encoders verified byte-identical); the waste is real
+ * but only on a path whose firing is itself the alarm.  Revisit only if the
+ * "per-expert loop" warning is ever observed in production. */
 static int routed_moe_launch_cutlass(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *down,

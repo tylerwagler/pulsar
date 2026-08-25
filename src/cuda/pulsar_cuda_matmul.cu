@@ -2047,8 +2047,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * PULSAR_MSEQ_MAX (it drifted once: caps stayed 8 while MSEQ went 16). */
         const uint64_t nt_cap = (g_mneutral_rows > 0)
                 ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)gemv_max_n;
-        if (n_tok >= 2 && n_tok <= nt_cap && n_tok <= PULSAR_GPU_MNEUTRAL_ROWS_MAX &&
-            in_dim % 128 == 0) {
+        /* nt_cap is 4 or MNEUTRAL_ROWS_MAX, so <= nt_cap already bounds the
+         * row count; the explicit MNEUTRAL conjunct here was provably true (K13). */
+        if (n_tok >= 2 && n_tok <= nt_cap && in_dim % 128 == 0) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
             if (bw) {
@@ -2712,7 +2713,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
      * kernel and leaving the 2..4 nt fusion on f32 would be a size-thresholded
      * activation format -- the exact defect removed from the mmvq pair path and
      * refused by name in the MoE down path. Format beats fusion. */
-    if (dw && group_dim % 32 == 0 &&
+    if (dw &&   /* dw != NULL implies group_dim%32==0 (K13) */
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
         const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
         const size_t data_n  = (size_t)n_tokens * n_groups * group_dim;
