@@ -1168,7 +1168,14 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
              * band), forgive ONE down-signal; a second consecutive one backs
              * off regardless. Prose tails run ~0.5-0.7, so its immediate
              * back-off is untouched. */
-            if (pend_conf[K - 1] >= 0.90f && !s->spec.spec_depth_down_forgiven) {
+            /* v3: the veto applies ONLY at depth 5 -- the measured
+             * structured optimum it exists to protect. Below 5 it is what
+             * regressed prose in the v2 A/B (prose has occasional >=0.90
+             * tails and each forgiven round pays a deep draft that converts
+             * nothing); at 6 it delays the return to 5, and 6 is never
+             * optimal (sweep: depth 6 lost on BOTH regimes). */
+            if (depth == 5u &&
+                pend_conf[K - 1] >= 0.90f && !s->spec.spec_depth_down_forgiven) {
                 s->spec.spec_depth_down_forgiven = true;
             } else {
                 s->spec.spec_depth_down_forgiven = false;
