@@ -2770,10 +2770,16 @@ static inline uint16_t f32_to_f16(float f) {
 }
 
 
-/* L107 adaptive draft depth bounds (controller in session_spec.cpp; the
- * sweep measured depth 6 losing on BOTH regimes, so the ceiling is 6). The
- * /metrics max_draft reports at least MAX so the per-position waterfall
- * covers every position the controller can reach. */
-enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 6 };
+/* L107 adaptive draft depth bounds (controller in session_spec.cpp). MAX is
+ * the drafter's TRAINED BLOCK (0731 DSpark metadata: stages=3 block=5):
+ * position 6 is out of distribution, and the sweep measured depth 6 DOMINATED
+ * everywhere -- accepted/step falls (3.31 -> 3.20 structured) while drafting
+ * cost jumps, so even transient controller excursions there are purchased
+ * losses (Tyler's catch, 2026-08-25 evening; the earlier ceiling of 6 was a
+ * "probe step" rationale that predates knowing the block width). Re-tune MAX
+ * only with a drafter retrained at a wider block (L092). The /metrics
+ * max_draft reports at least MAX so the per-position waterfall covers every
+ * position the controller can reach. */
+enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
 
 #endif /* PULSAR_ENGINE_INTERNAL_H */
