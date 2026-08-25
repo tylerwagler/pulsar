@@ -74,6 +74,8 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_markov_logits);
     pulsar_gpu_tensor_free(g->dspark_conf_scores);
     pulsar_gpu_tensor_free(g->dspark_conf_tokens);
+    pulsar_gpu_tensor_free(g->dspark_refined_ids);
+    pulsar_gpu_tensor_free(g->dspark_refined2_ids);
     pulsar_gpu_tensor_free(g->output_norm);
     pulsar_gpu_tensor_free(g->output_embd);
     pulsar_gpu_tensor_free(g->output_weights);

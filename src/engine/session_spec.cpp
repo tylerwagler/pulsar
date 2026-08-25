@@ -674,6 +674,36 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * markov step consumes. */
     const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
     bool draft_ok = true;
+    if (!sample_drafts) {
+        /* L108 P1: the greedy walk chains ON DEVICE.  The old loop did a
+         * blocking 8-byte read per position purely to hand the next step a
+         * token id that already lived in device memory -- ~depth syncs per
+         * round, the single largest host-serialization line in the P1 trace.
+         * Seed ids[0], launch the whole chain, read all ids back ONCE.  Same
+         * kernels, same launch order, same arithmetic: byte-exact (the only
+         * behavioural delta is that the chain clamps an out-of-vocab id
+         * in-kernel where the loop refused host-side -- unreachable either
+         * way, ids are argmaxes over the vocab).  The SAMPLED path keeps the
+         * loop below: its chain routes through a host rng draw per position. */
+        draft_ok =
+            pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, &refined[0],
+                                    sizeof(int32_t)) &&
+            pulsar_gpu_dspark_markov_chain_model(dspark_logits,
+                                              g->dspark_refined_ids,
+                                              g->dspark_refined2_ids,
+                                              g->spec_logits, spec_row_bytes,
+                                              dmap, dsize,
+                                              w->markov_w1->abs_offset,
+                                              w->markov_w2->abs_offset,
+                                              n_draft, vocab_size, embed_dim,
+                                              w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                              w->markov_w2->type == PULSAR_TENSOR_BF16) &&
+            pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t),
+                                   &refined[1], (uint64_t)n_draft * sizeof(int32_t)) &&
+            (!dtree_stats ||
+             pulsar_gpu_tensor_read(g->dspark_refined2_ids, sizeof(int32_t),
+                                    &refined2[1], (uint64_t)n_draft * sizeof(int32_t)));
+    } else
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);

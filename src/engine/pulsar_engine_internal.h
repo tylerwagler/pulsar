@@ -1007,6 +1007,11 @@ typedef struct {
      * serialization. */
     pulsar_gpu_tensor *dspark_conf_scores;  /* [16] f32 per-draft confidence */
     pulsar_gpu_tensor *dspark_conf_tokens;  /* [16] i32 refined draft ids   */
+    pulsar_gpu_tensor *dspark_refined_ids;  /* [17] i32: L108 P1 device-chained
+                                             * greedy walk -- [0] seeded with the
+                                             * base token, reduce pos p writes
+                                             * the winner to [p+1] */
+    pulsar_gpu_tensor *dspark_refined2_ids; /* [17] i32 runner-ups (DTree) */
     pulsar_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
     pulsar_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
     pulsar_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */
