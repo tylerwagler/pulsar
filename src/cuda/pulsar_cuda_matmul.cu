@@ -1842,25 +1842,17 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
     float acc[NT];
     #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = 0.f;
-    /* L109 N4: software-pipelined weight load.  ncu measured 20.7 cycles/warp
-     * stalled on the L1TEX scoreboard for exactly this load->use chain; issue
-     * the NEXT iteration's packed weight + scale while the current one is in
-     * the MACs.  Load scheduling only -- the multiply/accumulate ORDER is
-     * untouched, so this is BIT-EXACT against the unpipelined kernel (and the
-     * n=1 twin's per-token identity is preserved verbatim). */
-    int k0 = lane * 4;
-    uint32_t wpk_n = *(const uint32_t *)(row + k0);
-    float sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, k0 >> 5, KBp)] << 23);
+    /* L109 N4 verdict: the software-pipelined weight load was tried 2026-08-25
+     * and REVERTED same day -- the N-batch A/B isolated a large decode
+     * regression to this kernel's arm (occupancy loss from the pipeline
+     * registers outweighing the scoreboard win; the kernel already ran at 83%
+     * occupancy and the stall was cheaper than the registers). Bit-exact
+     * either way; kept for the record. */
     for (int base = 0; base < in_dim; base += 128) {
-        const int k = base + lane * 4;
-        const int kb = k >> 5;
-        const uint32_t wpk = wpk_n;
-        const float sw = sw_n;
-        const int kn = k + 128;
-        if (kn < in_dim) {
-            wpk_n = *(const uint32_t *)(row + kn);
-            sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kn >> 5, KBp)] << 23);
-        }
+        int k = base + lane * 4;
+        uint32_t wpk = *(const uint32_t *)(row + k);
+        int kb = k >> 5;
+        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         #pragma unroll
         for (int t = 0; t < NT; t++) {
