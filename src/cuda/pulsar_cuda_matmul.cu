@@ -2719,6 +2719,31 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         const size_t data_n  = (size_t)n_tokens * n_groups * group_dim;
         const size_t scale_n = (size_t)n_groups * slab;
         const size_t data_bytes_a8 = data_n * sizeof(__nv_fp8_e4m3);
+        /* L106 K1: consume the producer-emitted grouped encoding when it is
+         * current, exactly as the tensor-core arm does.  Before this probe,
+         * only that arm consulted the cache, so the "a" activation was
+         * f32->E4M3 above the gemv cap and f32->bf16->E4M3 at or below it --
+         * a SIZE-THRESHOLDED ACTIVATION FORMAT, the defect this file refuses
+         * by name two functions up, live on every spec verify with K <= 3.
+         * The producer encodes from the attention accumulator registers; this
+         * quantiser reads the bf16 heads store.  One probe removes the split:
+         * every n now multiplies the same bytes the producer emitted, and the
+         * quantise below remains only for buffers with no producer encoding
+         * (decode g->heads, the drafter). */
+        mxfp8_gact_cache_t *gc = gact_find(heads, n_tokens, n_groups, group_dim);
+        if (gc && gc->valid && gc->kbp == KBp && gc->scale_slab == slab) {
+            static int announced_gact_gemv = 0;
+            if (!announced_gact_gemv) {
+                announced_gact_gemv = 1;
+                fprintf(stderr, "pulsar: attn-out 'a' GEMV = producer-emitted E4M3 "
+                                "(grouped quantise pass skipped)\n");
+            }
+            grouped_fp8mx_a_warp8_a8_kernel<<<grid_a, 256>>>(
+                    low, dw->data, dw->scale, KBp,
+                    gc->xq, gc->sx, gc->kbp, (uint64_t)gc->scale_slab,
+                    group_dim, rank, n_groups, n_tokens, blocks_a);
+            return cuda_ok(cudaGetLastError(), "attention_output_a a8 launch (gact)");
+        }
         /* Soft failure on purpose: this path falls through to f32 rather than
          * failing the call, and the arena latches, so a refused reservation
          * arrives as a NULL take below and needs no separate branch. */

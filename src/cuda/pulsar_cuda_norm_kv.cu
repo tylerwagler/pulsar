@@ -478,16 +478,16 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
  * than reaching for the fresh quantizers above -- that is the whole point of
  * this comment.
  *
- * KNOWN (benign, unfixed): `indexer_hadamard_fp4*_kernel`'s amax floor
- * 7.052966104933725e-38f is bit-exactly `6.0f * 2^-126` — i.e. it sits ON a
- * misround point, so an all-zero/all-subnormal indexer block takes e8=2 here
- * where the exact path gives e8=1, 100% of the time. Value impact NIL (every
- * lane encodes to nibble 0 either way), but the stored E8M0 BYTE differs from
- * what mxkv_pack writes for the same row — a latent flake for any gate that
- * byte-compares those two paths on an empty row. Left as-is because fixing it
- * is bit-changing against current goldens for zero value gain; fold it in next
- * time goldens are re-baselined anyway. (The E4M3 floor 1.0e-4f was checked and
- * is NOT on a misround point.)
+ * RESOLVED BY DELETION (2026-08-25, L106 K11): this note used to record that
+ * the amax floor 7.052966104933725e-38f (= exactly 6.0f * 2^-126, ON a
+ * misround point) made an empty block's stored E8M0 byte differ from what the
+ * mxkv_pack RESTORE packer wrote for the same row — a latent flake for any
+ * byte-comparing gate, deferred to the next golden re-baseline.  The restore
+ * packer no longer exists: the v5 session payload moves packed bytes verbatim
+ * both directions, so there is exactly ONE packer and no second path to agree
+ * with.  The floor stays as-is — "folding" it now would change bytes for zero
+ * benefit.  Value impact was always NIL (every lane encodes nibble 0 either
+ * way).  (The E4M3 floor 1.0e-4f was checked and is NOT on a misround point.)
  * ============================================================================ */
 
 /* Exact ceil-log2 E8M0 bucket computed from float bit patterns — no log2f/ceilf,
