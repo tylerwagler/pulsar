@@ -1120,15 +1120,21 @@ static int check_multibank_indexer(void) {
     {
         const uint32_t n_head = 4;
         const uint64_t q_row = (uint64_t)n_head * head_dim;
-        const uint64_t bank_bytes = (uint64_t)comp_cap * head_dim * sizeof(float);
-        const uint64_t count = (uint64_t)n_banks * comp_cap * head_dim;
-        float *host = (float *)malloc(count * sizeof(float));
+        /* L106 K9: this slab was built as f32 rows (512 B/row) and handed to a
+         * reader that decodes 68 B MXKV-FP4 rows.  The 7.5x oversize meant
+         * nothing faulted, and the dead-row assertion (all -INF) is
+         * insensitive to garbage scores on the live row -- the case was green
+         * while measuring nothing.  Build packed rows exactly as the fp4
+         * sibling above does. */
+        const uint64_t row_bytes = 68;   /* PULSAR_MXKV_FP4_ROWBYTES(128), as the fp4 sibling above */
+        const uint64_t count = (uint64_t)n_banks * comp_cap * row_bytes;
+        uint8_t *host = (uint8_t *)malloc(count);
         float *q_host = (float *)malloc(2 * q_row * sizeof(float));
         float *w_host = (float *)malloc(2 * n_head * sizeof(float));
         float *out = (float *)malloc(2 * (uint64_t)n_comp_sup * sizeof(float));
         const int32_t pos_host[2] = {100, 37};
         const int32_t sid_host[2] = {-1, 1};
-        pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count * sizeof(float));
+        pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count);
         uint8_t qp_host2[2 * 64 * 68];   /* n_head<=64 packed rows x 2 tokens */
         pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(2 * (uint64_t)n_head * 68u);
         pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc(2 * n_head * sizeof(float));
@@ -1136,13 +1142,17 @@ static int check_multibank_indexer(void) {
         pulsar_gpu_tensor *p = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         pulsar_gpu_tensor *s = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         int dead_rc = 1;
-        (void)bank_bytes;
         if (host && q_host && w_host && out && slab && q && w && scores && p && s) {
             mb_rng_state = 0xdeadf00u;
-            for (uint64_t i = 0; i < count; i++) host[i] = mb_rand();
+            for (uint64_t i = 0; i < count; i++) {
+                const uint64_t in_row = i % row_bytes;
+                const uint32_t r8 = (uint32_t)(mb_rng_state >> 16) & 0xffu;
+                mb_rng_state = mb_rng_state * 1664525u + 1013904223u;
+                host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
+            }
             for (uint64_t i = 0; i < 2 * q_row; i++) q_host[i] = mb_rand() * 0.5f;
             for (uint64_t i = 0; i < 2 * n_head; i++) w_host[i] = 1.0f;
-            if (pulsar_gpu_tensor_write(slab, 0, host, count * sizeof(float)) &&
+            if (pulsar_gpu_tensor_write(slab, 0, host, count) &&
                 (mb_pack_q_rows(q_host, qp_host2, 2 * (uint64_t)n_head), 1) &&
                 pulsar_gpu_tensor_write(q, 0, qp_host2, 2 * (uint64_t)n_head * 68u) &&
                 pulsar_gpu_tensor_write(w, 0, w_host, 2 * n_head * sizeof(float)) &&

@@ -90,7 +90,10 @@ int main(int argc, char **argv) {
      * mode.  The argument is still accepted and ignored so old invocations do
      * not fail. */
     (void)argc; (void)argv;
-    const int packed = 1;
+    /* L106 K10: a `packed` flag pinned to 1 kept an f32 comp arm alive that
+     * built and uploaded a full slab and would MIS-STRIDE (2048 vs 584 B/row)
+     * against the packed reader if ever unpinned.  The arm is gone; this test
+     * exercises the shipped ATTN_PACK format only. */
     const uint32_t D = AF16_DIM, n_head = 32u;
     const uint32_t n_banks = 4u, raw_cap = 64u, comp_cap = 32u;
     const uint32_t n_tokens = 16u, top_k = 8u, window = 24u, ratio = 2u;
@@ -98,20 +101,16 @@ int main(int argc, char **argv) {
 
     printf("attn f16 BANK ISOLATION test: %u banks, raw_cap=%u comp_cap=%u,"
            " %u tokens x %u heads, comp=%s\n\n", n_banks, raw_cap, comp_cap,
-           n_tokens, n_head, packed ? "ATTN_PACK" : "f32");
+           n_tokens, n_head, "ATTN_PACK");
 
     /* bank b is the constant v_b, everywhere: raw ring slice AND comp slice */
     auto vb = [](uint32_t b) { return 0.25f * (float)(b + 1u); };
 
     const size_t pack_row_b = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
     std::vector<uint8_t> rawp((size_t)n_banks * raw_cap * pack_row_b);
-    std::vector<float> comp((size_t)n_banks * comp_cap * D);
     for (uint32_t b = 0; b < n_banks; b++) {
         for (uint32_t r = 0; r < raw_cap; r++)
             pack_const_row(&rawp[((size_t)b * raw_cap + r) * pack_row_b], vb(b), D);
-        for (uint32_t r = 0; r < comp_cap; r++)
-            for (uint32_t d = 0; d < D; d++)
-                comp[((size_t)b * comp_cap + r) * D + d] = vb(b);
     }
 
     std::mt19937_64 rng(20260808);
@@ -133,25 +132,22 @@ int main(int argc, char **argv) {
     /* packed comp banks: same constants, ATTN_PACK layout */
     const uint64_t prow = PULSAR_ATTN_PACK_ROWBYTES(D);
     std::vector<uint8_t> pcomp((size_t)n_banks * comp_cap * prow, 0);
-    if (packed)
         for (uint32_t b = 0; b < n_banks; b++)
             for (uint32_t r = 0; r < comp_cap; r++)
                 pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
     pulsar_q_t *dq;
-    float *draw, *dcomp, *ds; int32_t *dtk, *dpos, *dseq;
+    float *draw, *ds; int32_t *dtk, *dpos, *dseq;
     /* dout carries the STORED heads type (L033); the sentinel below must
      * round-trip through it, or a bf16 width turns every never-written slot
      * into a false "written garbage" (-12345 is not representable in bf16). */
     pulsar_heads_t *dout;
     std::vector<pulsar_heads_t> out_h(out.size());
     const float kSent = (float)(pulsar_heads_t)(-12345.f);
-    dq = fixture_upload_q(q); cudaMalloc(&draw, rawp.size());
-    cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
+    dq = fixture_upload_q(q); cudaMalloc(&draw, rawp.size()); cudaMalloc(&ds, sinks.size()*4);
     cudaMalloc(&dout, out.size()*sizeof(pulsar_heads_t)); cudaMalloc(&dtk, tk.size()*4);
     cudaMalloc(&dpos, pos.size()*4); cudaMalloc(&dseq, seq.size()*4);
     cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(dcomp, comp.data(), comp.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size()*4, cudaMemcpyHostToDevice);
     for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
     cudaMemcpy(dout, out_h.data(), out_h.size()*sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
@@ -161,14 +157,11 @@ int main(int argc, char **argv) {
 
     /* comp_bank_ptrs: one base pointer per bank, the shape the engine passes */
     uint8_t *dpk = NULL;
-    if (packed) {
-        cudaMalloc(&dpk, pcomp.size());
-        cudaMemcpy(dpk, pcomp.data(), pcomp.size(), cudaMemcpyHostToDevice);
-    }
+    cudaMalloc(&dpk, pcomp.size());
+    cudaMemcpy(dpk, pcomp.data(), pcomp.size(), cudaMemcpyHostToDevice);
     std::vector<const void *> hbp(n_banks);
     for (uint32_t b = 0; b < n_banks; b++)
-        hbp[b] = packed ? (const void *)(dpk + (size_t)b * comp_cap * prow)
-                        : (const void *)(dcomp + (size_t)b * comp_cap * D);
+        hbp[b] = (const void *)(dpk + (size_t)b * comp_cap * prow);
     const void **dbp = NULL;
     cudaMalloc(&dbp, n_banks * sizeof(void *));
     cudaMemcpy(dbp, hbp.data(), n_banks * sizeof(void *), cudaMemcpyHostToDevice);
