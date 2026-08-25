@@ -207,8 +207,18 @@ static int check_dspark_non_causal_attention(void) {
     for (uint32_t d = 0; d < n_head * head_dim; d++) {
         q_row[d] = (float)(d % 8) * 0.2f;
     }
+    /* Rows must be DISTINCT (L033): with identical rows, causal outputs are
+     * mathematically equal at every position and the old "causal outputs
+     * differ" assertion was passing on f32 accumulation NOISE alone -- a
+     * degenerate fixture, latent until bf16 rounded the noise away.  A
+     * per-row scale makes the causal prefix mean genuinely position-dependent
+     * (O(0.1) >> one bf16 ulp) while non-causal outputs stay token-invariant,
+     * since every token sees every row. */
     for (uint32_t t = 0; t < n_raw; t++) {
-        memcpy(raw_host + (uint64_t)t * head_dim, kvrow, head_dim * sizeof(float));
+        const float row_scale = 1.0f + 0.03f * (float)t;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            raw_host[(uint64_t)t * head_dim + d] = kvrow[d] * row_scale;
+        }
     }
     for (uint32_t t = 0; t < n_tokens; t++) {
         memcpy(q_host + (uint64_t)(t * n_head) * head_dim, q_row, (uint64_t)n_head * head_dim * sizeof(float));
@@ -623,7 +633,7 @@ static int mb_run_case(const char *label,
             : NULL;
         /* Attention Q, same as the batch side: element size, not f32. */
         pulsar_gpu_tensor *q_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_Q_ELT_SIZE);
-        pulsar_gpu_tensor *h_ref = pulsar_gpu_tensor_alloc((uint64_t)ref_rows * row_f32 * sizeof(float));
+        pulsar_gpu_tensor *h_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_HEADS_ELT_SIZE);
         pulsar_gpu_tensor *tk_ref = indexed
             ? pulsar_gpu_tensor_alloc((uint64_t)ref_rows * top_k * sizeof(int32_t))
             : NULL;
@@ -673,8 +683,10 @@ static int mb_run_case(const char *label,
             }
         }
         ok = ok && pulsar_gpu_synchronize() &&
-             pulsar_gpu_tensor_read(h_ref, (uint64_t)(ref_rows - 1) * row_f32 * sizeof(float),
-                                 out_ref, row_f32 * sizeof(float));
+             /* ELEMENT offset: a byte offset computed with sizeof(float) lands
+              * a narrowed buffer at DOUBLE the intended row (L033). */
+             pulsar_gpu_tensor_read_f32(h_ref, (uint64_t)(ref_rows - 1) * row_f32,
+                                 out_ref, row_f32);
         free(tk_ref_host);
         free(q_ref_host);
         pulsar_gpu_tensor_free(tk_ref);
@@ -847,15 +859,19 @@ static int check_multibank_decode_attention(void) {
         const int32_t sid_host2[2] = {-1, 1};
         float *q_host2 = (float *)malloc(2 * row_f32 * sizeof(float));
         float *out2 = (float *)malloc(2 * row_f32 * sizeof(float));
-        pulsar_gpu_tensor *q2 = pulsar_gpu_tensor_alloc(2 * row_f32 * sizeof(float));
-        pulsar_gpu_tensor *h2 = pulsar_gpu_tensor_alloc(2 * row_f32 * sizeof(float));
+        /* q2 was a LATENT bug: raw f32 written into a buffer the entry reads
+         * at PULSAR_Q_ELT_SIZE since L045 -- the dead-row check passed anyway
+         * because an out-of-pool seq_id zeroes the row regardless of what the
+         * garbage query was.  Typed properly it tests what it claims to. */
+        pulsar_gpu_tensor *q2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_Q_ELT_SIZE);
+        pulsar_gpu_tensor *h2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_HEADS_ELT_SIZE);
         pulsar_gpu_tensor *p2 = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         pulsar_gpu_tensor *s2 = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         int dead_rc = 1;
         if (q_host2 && out2 && q2 && h2 && p2 && s2) {
             mb_rng_state = 0xbeef1234u;
             for (uint64_t i = 0; i < 2 * row_f32; i++) q_host2[i] = mb_rand() * 0.25f;
-            if (pulsar_gpu_tensor_write(q2, 0, q_host2, 2 * row_f32 * sizeof(float)) &&
+            if (pulsar_gpu_tensor_write_q_f32(q2, 0, q_host2, 2 * row_f32) &&
                 pulsar_gpu_tensor_write(p2, 0, pos_host2, sizeof(pos_host2)) &&
                 pulsar_gpu_tensor_write(s2, 0, sid_host2, sizeof(sid_host2)) &&
                 pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -866,7 +882,7 @@ static int check_multibank_decode_attention(void) {
                         p2, s2, NULL, comp_cap, n_banks,
                                           NULL /* q pre-normed */) &&
                 pulsar_gpu_synchronize() &&
-                pulsar_gpu_tensor_read(h2, 0, out2, 2 * row_f32 * sizeof(float))) {
+                pulsar_gpu_tensor_read_f32(h2, 0, out2, 2 * row_f32)) {
                 dead_rc = 0;
                 for (uint64_t i = 0; i < row_f32; i++) {
                     if (out2[i] != 0.0f) {

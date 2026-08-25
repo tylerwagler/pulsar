@@ -335,8 +335,15 @@ int main(int argc, char **argv) {
     printf("max |delta|                 = %.3e\n", max_abs);
     printf("NaN = %zu, never-written = %zu\n", nan, untouched);
 
-    const int pass = (nan == 0 && untouched == 0 && worst_l2 < 1e-3 &&
-                      (sum_ref > 0 && sum_abs / sum_ref < 1e-3));
+    /* Width-aware bar (L033): the oracle narrows through pulsar_heads_t, but
+     * kernel and oracle reach the rounding boundary from DIFFERENT f32 values
+     * (fold order), so near-boundary elements legitimately land one bf16 ulp
+     * apart (~4e-3 element-wise; measured worst rel L2 1.6e-3).  5e-3 keeps a
+     * ~100x margin to the layout-bug class this test exists to catch (the
+     * phase-3 B row bug measured ~0.5). */
+    const double bar = sizeof(pulsar_heads_t) == 2 ? 5e-3 : 1e-3;
+    const int pass = (nan == 0 && untouched == 0 && worst_l2 < bar &&
+                      (sum_ref > 0 && sum_abs / sum_ref < bar));
     printf("\nATTN F16 KERNEL TEST: %s\n", pass ? "PASS" : "FAIL");
     if (!pass) {
         printf("  first few (ref vs got):\n");
