@@ -236,21 +236,34 @@ int main(int argc, char **argv) {
             for (uint32_t d = 0; d < D; d++) {
                 double o = 0.0;
                 for (uint32_t r = 0; r < tot; r++) o += h16(p[r]) * h16(kvrow(r)[d]);
-                ref[((size_t)t * n_head + h) * D + d] = o / sum;
+                /* Round through the STORED heads width (L033): the kernel's
+                 * last act is a pulsar_heads_t store, so the oracle must take
+                 * the same rounding or the compare measures storage width
+                 * instead of fragment layout and summation -- bf16 rounding is
+                 * ~4e-3 relative, an order over this test's 4.9e-4 budget. */
+                ref[((size_t)t * n_head + h) * D + d] = (float)(pulsar_heads_t)(o / sum);
             }
         }
     }
 
     /* ---- kernel ----------------------------------------------------------- */
     pulsar_q_t *dq;
-    float *dkv, *dckv, *ds, *dout;
+    float *dkv, *dckv, *ds;
+    /* dout carries the STORED heads type (L033): this test raw-byte-read the
+     * kernel's output as f32 and became one of the day's five reinterpreting
+     * readers the moment the width flipped.  Written in pulsar_heads_t it is
+     * width-agnostic instead. */
+    pulsar_heads_t *dout;
+    std::vector<pulsar_heads_t> out_h(out.size());
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
     dq = fixture_upload_q(q); cudaMalloc(&dkv, rawp.size());
     cudaMalloc(&dckv, ckvp.size());
     cudaMemcpy(dckv, ckvp.data(), ckvp.size(), cudaMemcpyHostToDevice);
-    cudaMalloc(&ds, sinks.size() * 4); cudaMalloc(&dout, out.size() * 4);
+    cudaMalloc(&ds, sinks.size() * 4);
+    cudaMalloc(&dout, out.size() * sizeof(pulsar_heads_t));
     cudaMemcpy(dkv, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
 
     int32_t *dtk = NULL;
     if (use_topk) {
@@ -271,7 +284,8 @@ int main(int argc, char **argv) {
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
     }
-    cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_h.data(), dout, out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < out.size(); i++) out[i] = (float)out_h[i];
 
     /* ---- timing, at the shape nsys measured the shipping kernel at --------- */
     {

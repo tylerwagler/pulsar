@@ -53,14 +53,14 @@ int cublas_ok(cublasStatus_t, const char *what) {
     fprintf(stderr, "stub cublas_ok hit (%s)\n", what); exit(97);
 }
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) { return 0; }
-int pulsar_gpu_attention_f16_indexed(float *, const float *, const float *,
+int pulsar_gpu_attention_f16_indexed(void *, const float *, const void *,
         const pulsar_attn_pack_t *, const pulsar_attn_pack_t *, const int *, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, int, const int *, const int *, const void * const *, uint32_t,
         uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_indexed hit\n"); exit(97);
 }
-int pulsar_gpu_attention_f16_prefill(float *, const float *, const float *,
+int pulsar_gpu_attention_f16_prefill(void *, const float *, const void *,
         const pulsar_attn_pack_t *, const pulsar_attn_pack_t *, uint32_t, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, int, const pulsar_gpu_q_prep *) {
     fprintf(stderr, "stub f16_prefill hit\n"); exit(97);
@@ -178,20 +178,22 @@ int main() {
         if (c.name[7] == 'e' && c.n_tokens >= 3) seq[2] = (int32_t)c.n_banks; /* evicted */
 
         pulsar_q_t *dq;
-        float *draw, *dcomp, *ds, *dgold, *dsplit;
+        float *draw, *dcomp, *ds;
+        /* gold/split receive the kernels' heads output: STORED width (L033). */
+        pulsar_heads_t *dgold, *dsplit;
         int32_t *dpos = NULL, *dseq = NULL;
         const void **dbp = NULL;
         cudaMalloc(&draw, rawp.size());
         cudaMalloc(&dcomp, compp.size());
         dq = fixture_upload_q(q);
         cudaMalloc(&ds, sinks.size() * 4);
-        cudaMalloc(&dgold, q.size() * 4);
-        cudaMalloc(&dsplit, q.size() * 4);
+        cudaMalloc(&dgold, q.size() * sizeof(pulsar_heads_t));
+        cudaMalloc(&dsplit, q.size() * sizeof(pulsar_heads_t));
         cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dcomp, compp.data(), compp.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemset(dgold, 0xe5, q.size() * 4);
-        cudaMemset(dsplit, 0x5e, q.size() * 4);
+        cudaMemset(dgold, 0xe5, q.size() * sizeof(pulsar_heads_t));
+        cudaMemset(dsplit, 0x5e, q.size() * sizeof(pulsar_heads_t));
         if (c.descr) {
             cudaMalloc(&dpos, pos.size() * 4);
             cudaMalloc(&dseq, seq.size() * 4);
@@ -232,8 +234,12 @@ int main() {
         if (!cuda_ok(cudaDeviceSynchronize(), c.name)) return 1;
 
         std::vector<float> gold(q.size()), split(q.size());
-        cudaMemcpy(gold.data(), dgold, gold.size() * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(split.data(), dsplit, split.size() * 4, cudaMemcpyDeviceToHost);
+        {
+            std::vector<pulsar_heads_t> gh(q.size()), sh(q.size());
+            cudaMemcpy(gh.data(), dgold, gh.size() * sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(sh.data(), dsplit, sh.size() * sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < q.size(); i++) { gold[i] = (float)gh[i]; split[i] = (float)sh[i]; }
+        }
 
         double worst = 0.0; uint32_t wt = 0, wh = 0; size_t nans = 0;
         for (uint32_t t = 0; t < c.n_tokens; t++)
@@ -249,7 +255,15 @@ int main() {
                 const double rel = std::sqrt(e2 / (n2 > 1e-30 ? n2 : 1e-30));
                 if (rel > worst) { worst = rel; wt = t; wh = h; }
             }
-        const int ok = (nans == 0 && worst < 1e-5);
+        /* Width-aware bar (L033): at f32 heads both arms narrowed identical
+         * values and 1e-5 (epsilon-class) applied.  At bf16 the two arms round
+         * DIFFERENT f32 values (the split path merges through f32 scratch and
+         * narrows once at the end), so near-tie elements legitimately differ
+         * by one bf16 ulp (~4e-3 element-wise).  1e-3 on the per-(t,h) rel L2
+         * still sits 100x under the 1e-1 indexing-bug class this test exists
+         * to catch. */
+        const double bar = sizeof(pulsar_heads_t) == 2 ? 1e-3 : 1e-5;
+        const int ok = (nans == 0 && worst < bar);
         printf("%-20s worst rel L2 %.3e (tok %u head %u) nan=%zu  %s\n",
                c.name, worst, wt, wh, nans, ok ? "ok" : "FAIL");
         if (!ok) fail = 1;

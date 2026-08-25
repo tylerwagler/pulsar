@@ -121,7 +121,9 @@ static int check_decode_attention_overflow_path(void) {
         comp_host[(uint64_t)c * head_dim] = 1.0f;
     }
 
-    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
+    /* Stored heads width, not f32 (L033) -- this test was the fifth raw-byte
+     * reader of a narrowed buffer found in one day; see heads_store4. */
+    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE);
     /* Attention Q: stored element size, not f32 (L045). */
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
@@ -154,7 +156,7 @@ static int check_decode_attention_overflow_path(void) {
                                               n_head,
                                               head_dim) &&
         pulsar_gpu_synchronize() &&
-        pulsar_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
+        pulsar_gpu_tensor_read_f32(heads, 0, heads_host, q_count)) {
         rc = 0;
         for (uint32_t h = 0; h < n_head; h++) {
             const float v = heads_host[(uint64_t)h * head_dim];
@@ -212,8 +214,8 @@ static int check_dspark_non_causal_attention(void) {
         memcpy(q_host + (uint64_t)(t * n_head) * head_dim, q_row, (uint64_t)n_head * head_dim * sizeof(float));
     }
 
-    pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
-    pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc(heads_count * sizeof(float));
+    pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE);
+    pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE);
     /* Attention Q: stored element size, not f32 (L045). */
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tokens * q_count, PULSAR_Q_ELT_SIZE);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
@@ -248,8 +250,8 @@ static int check_dspark_non_causal_attention(void) {
                                                                      NULL, NULL, 0, 1,
                                           NULL /* q pre-normed */);
         if (ok_c && ok_nc && pulsar_gpu_synchronize() &&
-            pulsar_gpu_tensor_read(heads_c, 0, heads_causal, heads_count * sizeof(float)) &&
-            pulsar_gpu_tensor_read(heads_nc, 0, heads_non_causal, heads_count * sizeof(float))) {
+            pulsar_gpu_tensor_read_f32(heads_c, 0, heads_causal, heads_count) &&
+            pulsar_gpu_tensor_read_f32(heads_nc, 0, heads_non_causal, heads_count)) {
 
             int causal_all_equal = 1;
             for (uint32_t t = 1; t < n_tokens; t++) {
@@ -550,7 +552,9 @@ static int mb_run_case(const char *label,
 
     /* Attention Q: stored element size, not f32 (L045).  heads stays f32. */
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
-    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc(q_count * sizeof(float));
+    /* Stored heads width, not f32 (L033) -- this test was the fifth raw-byte
+     * reader of a narrowed buffer found in one day; see heads_store4. */
+    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE);
     pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *topk = NULL;
@@ -586,7 +590,7 @@ static int mb_run_case(const char *label,
                                           NULL /* q pre-normed */);
         }
         if (!ok || !pulsar_gpu_synchronize() ||
-            !pulsar_gpu_tensor_read(heads, 0, out_batch, q_count * sizeof(float))) {
+            !pulsar_gpu_tensor_read_f32(heads, 0, out_batch, q_count)) {
             fprintf(stderr, "multibank %s: descriptor launch failed\n", label);
             goto done;
         }

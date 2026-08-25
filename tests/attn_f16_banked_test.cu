@@ -139,15 +139,22 @@ int main(int argc, char **argv) {
                 pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
     pulsar_q_t *dq;
-    float *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
+    float *draw, *dcomp, *ds; int32_t *dtk, *dpos, *dseq;
+    /* dout carries the STORED heads type (L033); the sentinel below must
+     * round-trip through it, or a bf16 width turns every never-written slot
+     * into a false "written garbage" (-12345 is not representable in bf16). */
+    pulsar_heads_t *dout;
+    std::vector<pulsar_heads_t> out_h(out.size());
+    const float kSent = (float)(pulsar_heads_t)(-12345.f);
     dq = fixture_upload_q(q); cudaMalloc(&draw, rawp.size());
     cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
-    cudaMalloc(&dout, out.size()*4); cudaMalloc(&dtk, tk.size()*4);
+    cudaMalloc(&dout, out.size()*sizeof(pulsar_heads_t)); cudaMalloc(&dtk, tk.size()*4);
     cudaMalloc(&dpos, pos.size()*4); cudaMalloc(&dseq, seq.size()*4);
     cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dcomp, comp.data(), comp.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dout, out.data(), out.size()*4, cudaMemcpyHostToDevice);
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+    cudaMemcpy(dout, out_h.data(), out_h.size()*sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
     cudaMemcpy(dtk, tk.data(), tk.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dpos, pos.data(), pos.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dseq, seq.data(), seq.size()*4, cudaMemcpyHostToDevice);
@@ -179,9 +186,10 @@ int main(int argc, char **argv) {
         const uint32_t use_topk = mode ? 0u : top_k;
         const char *label = mode ? "visible-prefix sweep (topk=NULL)" : "top-k selection";
         printf("---- %s ----\n", label);
-        cudaMemset(dout, 0, out.size() * 4);
-        std::fill(out.begin(), out.end(), -12345.f);
-        cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemset(dout, 0, out.size() * sizeof(pulsar_heads_t));
+        std::fill(out.begin(), out.end(), kSent);
+        for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+        cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
 
     const int rc = pulsar_gpu_attention_f16_indexed(
         dout, ds, dq, (const pulsar_attn_pack_t *)draw,
@@ -192,7 +200,8 @@ int main(int argc, char **argv) {
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
     }
-    cudaMemcpy(out.data(), dout, out.size()*4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_h.data(), dout, out_h.size()*sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < out.size(); i++) out[i] = (float)out_h[i];
 
     double worst_leak = 0.0; uint32_t leak_tok = 0, leak_head = 0;
     size_t evict_bad = 0, untouched = 0, nan = 0;
@@ -203,7 +212,7 @@ int main(int argc, char **argv) {
             for (uint32_t d = 0; d < D; d++) {
                 const float g = out[((size_t)t * n_head + h) * D + d];
                 if (std::isnan(g)) { nan++; continue; }
-                if (g == -12345.f) { untouched++; continue; }
+                if (g == kSent) { untouched++; continue; }
                 const double e = std::fabs((double)g - want);
                 if (ev) { if (e > 0.0) evict_bad++; continue; }
                 if (e > worst_leak) { worst_leak = e; leak_tok = t; leak_head = h; }
