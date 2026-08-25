@@ -18,6 +18,7 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
+#include <type_traits>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -116,6 +117,9 @@ typedef __half pulsar_q_t;
  * both authorities on the same fact.  HC already has this bridge (below); Q --
  * the buffer whose width mismatch actually shipped as defect nine -- did not:
  * changing either alone compiled clean. */
+static_assert(PULSAR_Q_ELT_FMT == PULSAR_ELT_F16 &&
+              std::is_same<pulsar_q_t, __half>::value,
+              "q format tag and pulsar_q_t state the same type; move both or neither");
 static_assert(sizeof(pulsar_q_t) == PULSAR_Q_ELT_SIZE,
               "pulsar_q_t and PULSAR_Q_ELT_SIZE state the same width; move both or neither");
 
@@ -225,11 +229,22 @@ struct pulsar_gpu_tensor {
      * restating the stride -- produced eight distinct defects in one
      * narrowing, all of them type-legal and all of them silent. */
     uint32_t esz;
+    /* Element FORMAT (L106 K15).  0 (PULSAR_ELT_F32) for every plain alloc,
+     * so pre-existing zero-initialised tensors keep meaning what they meant;
+     * set from the *_ELT_FMT authority at alloc_elt, inherited by views. */
+    uint32_t fmt;
 };
 
 /* The element size to actually use.  Never read t->esz directly. */
 static inline uint32_t pulsar_tensor_esz(const pulsar_gpu_tensor *t) {
     return (t && t->esz) ? t->esz : 4u;
+}
+
+/* The element FORMAT to actually use (L106 K15).  Never read t->fmt directly.
+ * A tensor with no stated format is f32, matching pulsar_tensor_esz's default
+ * -- the two defaults must stay in agreement. */
+static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
+    return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
 }
 
 /* Stack sub-view that INHERITS the base's element size.  The hand-rolled
@@ -241,6 +256,7 @@ static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b
     t.ptr = (char *)b->ptr + off;
     t.bytes = bytes;
     t.owner = 0;
+    t.fmt = b ? b->fmt : 0u;
     t.esz = b->esz;
     return t;
 }
@@ -268,6 +284,9 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
 typedef __nv_bfloat16 pulsar_hc_t;
 __device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
 __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
+static_assert(PULSAR_HC_ELT_FMT == PULSAR_ELT_BF16 &&
+              std::is_same<pulsar_hc_t, __nv_bfloat16>::value,
+              "hc format tag and pulsar_hc_t state the same type; move both or neither");
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
 /* Stored attention-output (heads) element type; pairs with
@@ -289,6 +308,9 @@ __device__ __forceinline__ static float heads_load(const pulsar_heads_t *p, uint
 __device__ __forceinline__ static void heads_store(pulsar_heads_t *p, uint64_t i, float v) {
     p[i] = (pulsar_heads_t)v;
 }
+static_assert(PULSAR_HEADS_ELT_FMT == PULSAR_ELT_BF16 &&
+              std::is_same<pulsar_heads_t, __nv_bfloat16>::value,
+              "heads format tag and pulsar_heads_t state the same type; move both or neither");
 static_assert(sizeof(pulsar_heads_t) == PULSAR_HEADS_ELT_SIZE,
               "pulsar_heads_t and PULSAR_HEADS_ELT_SIZE state the same width; move both or neither");
 

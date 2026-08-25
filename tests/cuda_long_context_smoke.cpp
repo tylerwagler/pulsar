@@ -123,9 +123,9 @@ static int check_decode_attention_overflow_path(void) {
 
     /* Stored heads width, not f32 (L033) -- this test was the fifth raw-byte
      * reader of a narrowed buffer found in one day; see heads_store4. */
-    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE);
+    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
     /* Attention Q: stored element size, not f32 (L045). */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
     pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
@@ -224,10 +224,10 @@ static int check_dspark_non_causal_attention(void) {
         memcpy(q_host + (uint64_t)(t * n_head) * head_dim, q_row, (uint64_t)n_head * head_dim * sizeof(float));
     }
 
-    pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE);
-    pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE);
+    pulsar_gpu_tensor *heads_c = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
+    pulsar_gpu_tensor *heads_nc = pulsar_gpu_tensor_alloc_elt(heads_count, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
     /* Attention Q: stored element size, not f32 (L045). */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tokens * q_count, PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tokens * q_count, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim));
     int rc = 1;
@@ -561,10 +561,10 @@ static int mb_run_case(const char *label,
     }
 
     /* Attention Q: stored element size, not f32 (L045).  heads stays f32. */
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE);
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     /* Stored heads width, not f32 (L033) -- this test was the fifth raw-byte
      * reader of a narrowed buffer found in one day; see heads_store4. */
-    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE);
+    pulsar_gpu_tensor *heads = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
     pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
     pulsar_gpu_tensor *topk = NULL;
@@ -632,8 +632,8 @@ static int mb_run_case(const char *label,
                                   comp_bank_bytes)
             : NULL;
         /* Attention Q, same as the batch side: element size, not f32. */
-        pulsar_gpu_tensor *q_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_Q_ELT_SIZE);
-        pulsar_gpu_tensor *h_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_HEADS_ELT_SIZE);
+        pulsar_gpu_tensor *q_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
+        pulsar_gpu_tensor *h_ref = pulsar_gpu_tensor_alloc_elt((uint64_t)ref_rows * row_f32, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
         pulsar_gpu_tensor *tk_ref = indexed
             ? pulsar_gpu_tensor_alloc((uint64_t)ref_rows * top_k * sizeof(int32_t))
             : NULL;
@@ -863,8 +863,8 @@ static int check_multibank_decode_attention(void) {
          * at PULSAR_Q_ELT_SIZE since L045 -- the dead-row check passed anyway
          * because an out-of-pool seq_id zeroes the row regardless of what the
          * garbage query was.  Typed properly it tests what it claims to. */
-        pulsar_gpu_tensor *q2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_Q_ELT_SIZE);
-        pulsar_gpu_tensor *h2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_HEADS_ELT_SIZE);
+        pulsar_gpu_tensor *q2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
+        pulsar_gpu_tensor *h2 = pulsar_gpu_tensor_alloc_elt(2 * row_f32, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
         pulsar_gpu_tensor *p2 = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         pulsar_gpu_tensor *s2 = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
         int dead_rc = 1;

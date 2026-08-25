@@ -1097,12 +1097,24 @@ uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
 }
 
-/* Allocate n_elems of esz bytes each, recording esz on the tensor so no
- * consumer has to be told the element type separately. */
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz) {
+/* Allocate n_elems of esz bytes each, recording BOTH the element size and the
+ * element FORMAT on the tensor (L106 K15) so no consumer has to be told the
+ * type separately -- and so a widening reader can refuse what it cannot widen
+ * instead of decoding f16 bits as bf16.  The fmt/esz pair is checked here:
+ * a caller stating a 2-byte f32 or a 4-byte f16 is lying to one authority. */
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
+                                               pulsar_elt_fmt fmt) {
     if (esz == 0) esz = 4u;
+    const uint32_t want = (fmt == PULSAR_ELT_F32) ? 4u
+                        : (fmt == PULSAR_ELT_F16 || fmt == PULSAR_ELT_BF16) ? 2u
+                        : esz;   /* BYTES: any size is its own truth */
+    if (esz != want) {
+        fprintf(stderr, "pulsar: alloc_elt fmt/esz mismatch (fmt=%d esz=%u) -- refusing\n",
+                (int)fmt, esz);
+        return NULL;
+    }
     pulsar_gpu_tensor *t = pulsar_gpu_tensor_alloc(n_elems * esz);
-    if (t) t->esz = esz;
+    if (t) { t->esz = esz; t->fmt = (uint32_t)fmt; }
     return t;
 }
 
@@ -1186,6 +1198,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
     t->bytes = bytes;
     t->owner = 0;
     t->esz = base->esz;   /* a view of a narrowed buffer is still narrowed */
+    t->fmt = base->fmt;   /* and still the same FORMAT (L106 K15) */
     return t;
 }
 

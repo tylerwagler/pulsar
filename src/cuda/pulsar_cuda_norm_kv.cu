@@ -1956,10 +1956,16 @@ double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n) {
     const unsigned wpb = 8;
     unsigned blocks = (unsigned)((warps + wpb - 1) / wpb);
     if (blocks == 0) blocks = 1;
-    if (pulsar_tensor_esz(t) == sizeof(float))
-        act_int8_vs_e4m3_kernel<float><<<blocks, wpb * 32>>>((const float *)t->ptr, n, dev, dev + 1);
-    else
-        act_int8_vs_e4m3_kernel<__nv_bfloat16><<<blocks, wpb * 32>>>((const __nv_bfloat16 *)t->ptr, n, dev, dev + 1);
+    switch (pulsar_tensor_fmt(t)) {   /* L106 K15: format, not size */
+    case PULSAR_ELT_F32:
+        act_int8_vs_e4m3_kernel<float><<<blocks, wpb * 32>>>((const float *)t->ptr, n, dev, dev + 1); break;
+    case PULSAR_ELT_F16:
+        act_int8_vs_e4m3_kernel<__half><<<blocks, wpb * 32>>>((const __half *)t->ptr, n, dev, dev + 1); break;
+    case PULSAR_ELT_BF16:
+        act_int8_vs_e4m3_kernel<__nv_bfloat16><<<blocks, wpb * 32>>>((const __nv_bfloat16 *)t->ptr, n, dev, dev + 1); break;
+    default:
+        cudaFree(dev); return -1.0;   /* BYTES: not a value stream */
+    }
     double host[2] = { 0.0, 0.0 };
     if (cudaDeviceSynchronize() != cudaSuccess ||
         cudaMemcpy(host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -1976,9 +1982,30 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
                                float *out, uint64_t n_elems) {
     if (!t || !t->ptr || !out || n_elems == 0) return 0;
     const uint32_t esz = pulsar_tensor_esz(t);
+    const pulsar_elt_fmt fmt = pulsar_tensor_fmt(t);
     if (t->bytes < (elem_off + n_elems) * esz) return 0;
-    if (esz == sizeof(float))
+    /* L106 K15: dispatch on the FORMAT, not the size -- esz==2 is ambiguous
+     * between __half and __nv_bfloat16, and this reader used to resolve it as
+     * bf16 unconditionally, so a routed f16 buffer would have decoded as
+     * plausible wrong numbers.  BYTES (packed rows, int payloads) is refused
+     * loudly: there is no widening that means anything. */
+    if (fmt == PULSAR_ELT_BYTES) {
+        fprintf(stderr, "pulsar: tensor_read_f32 refused: PULSAR_ELT_BYTES tensor "
+                        "(packed/opaque rows are not widenable)\n");
+        return 0;
+    }
+    if (fmt == PULSAR_ELT_F32)
         return pulsar_gpu_tensor_read(t, elem_off * esz, out, n_elems * sizeof(float)) != 0;
+    if (fmt == PULSAR_ELT_F16) {
+        __half *tmp16 = (__half *)malloc((size_t)n_elems * sizeof(*tmp16));
+        if (!tmp16) return 0;
+        if (pulsar_gpu_tensor_read(t, elem_off * esz, tmp16, n_elems * sizeof(*tmp16)) == 0) {
+            free(tmp16); return 0;
+        }
+        for (uint64_t i = 0; i < n_elems; i++) out[i] = __half2float(tmp16[i]);
+        free(tmp16);
+        return 1;
+    }
     if (esz != sizeof(__nv_bfloat16)) return 0;
     /* Widen on the host: this runs only behind the dump/range-sweep env gates,
      * so a staging buffer here costs nothing anyone measures, and it keeps the
@@ -2002,10 +2029,16 @@ int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double
         cudaFree(dev); return 0;
     }
     const unsigned int blocks = (unsigned int)((n + 255) / 256 > 1024 ? 1024 : (n + 255) / 256);
-    if (pulsar_tensor_esz(t) == sizeof(float))
-        range_stats_kernel<float><<<blocks ? blocks : 1u, 256>>>((const float *)t->ptr, n, dev);
-    else
-        range_stats_kernel<__nv_bfloat16><<<blocks ? blocks : 1u, 256>>>((const __nv_bfloat16 *)t->ptr, n, dev);
+    switch (pulsar_tensor_fmt(t)) {   /* L106 K15: format, not size */
+    case PULSAR_ELT_F32:
+        range_stats_kernel<float><<<blocks ? blocks : 1u, 256>>>((const float *)t->ptr, n, dev); break;
+    case PULSAR_ELT_F16:
+        range_stats_kernel<__half><<<blocks ? blocks : 1u, 256>>>((const __half *)t->ptr, n, dev); break;
+    case PULSAR_ELT_BF16:
+        range_stats_kernel<__nv_bfloat16><<<blocks ? blocks : 1u, 256>>>((const __nv_bfloat16 *)t->ptr, n, dev); break;
+    default:
+        cudaFree(dev); return 0;   /* BYTES: not a value stream */
+    }
     if (cudaDeviceSynchronize() != cudaSuccess ||
         cudaMemcpy(&host, dev, sizeof(host), cudaMemcpyDeviceToHost) != cudaSuccess) {
         cudaFree(dev); return 0;

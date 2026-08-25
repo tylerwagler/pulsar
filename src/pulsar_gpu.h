@@ -41,6 +41,7 @@
  * that flip shipped, and nothing has set it since -- no target, no gate, no
  * test. Removed 2026-08-17 with the rest of the callerless switches. */
 #define PULSAR_HC_ELT_SIZE 2u
+#define PULSAR_HC_ELT_FMT  PULSAR_ELT_BF16   /* pairs with pulsar_hc_t; bridge assert CUDA-side */
 
 /* Stored element size of batch_heads / heads -- the attention output, and the
  * largest UNCONDITIONAL f32 activation store in the engine (~512 MiB at 4096
@@ -70,6 +71,7 @@
  * bytes cannot speed it up.  The gains are fidelity and a 512 -> 256 MiB
  * allocation.  Do not sell it as throughput. */
 #define PULSAR_HEADS_ELT_SIZE 2u
+#define PULSAR_HEADS_ELT_FMT  PULSAR_ELT_BF16   /* pairs with pulsar_heads_t; bridge assert CUDA-side */
 
 
 /* Q activation storage precision (L045).  batch_q is the largest activation in
@@ -92,6 +94,7 @@
  * stage 1); it is cuda-reference-gate that certifies this, not the byte-exact
  * prefill gate. */
 #define PULSAR_Q_ELT_SIZE 2u
+#define PULSAR_Q_ELT_FMT  PULSAR_ELT_F16   /* pairs with pulsar_q_t; bridge assert CUDA-side */
 
 /* Shared-expert gate/up staging element size (L033 increment 2).  Same
  * contract as the two above: this is the STORED width the alloc, the byte
@@ -99,6 +102,7 @@
  * GEMM) and the consumer (the swiglu fold) both derive their kernel type from
  * the tensor's esz at runtime, never from this macro.  f16 today. */
 #define PULSAR_SHARED_ACT_ELT_SIZE 2u
+#define PULSAR_SHARED_ACT_ELT_FMT  PULSAR_ELT_F16   /* f16 staging; runtime-esz consumers */
 
 /* spec_logits row capacity.  The multi-row logits slab is sized to the
  * deepest speculative verify / multiseq head the engine ever emits
@@ -130,7 +134,28 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
 /* n_elems * esz bytes, with esz recorded on the tensor.  Use this for any
  * buffer whose elements are not f32; consumers then derive the type from
  * the tensor instead of being handed a flag that can disagree with it. */
-pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz);
+/* Element FORMAT of a tensor (L106 K15, Tyler: option A).  An element SIZE
+ * cannot distinguish __half from __nv_bfloat16 (both 2 B) nor E4M3 from int8
+ * from raw bytes (all 1 B), and this engine's dominant historical defect class
+ * is clean-compiling byte reinterpretation -- including in the widening
+ * diagnostics that fidelity decisions are read from.  The tag makes wrong
+ * dispatch IMPOSSIBLE rather than merely disciplined:
+ *   - every alloc_elt names its format from the same authority that names its
+ *     width (the *_ELT_FMT macro beside each *_ELT_SIZE);
+ *   - views/subviews inherit it;
+ *   - a widening reader dispatches on it and REFUSES what it cannot widen.
+ * PULSAR_ELT_BYTES marks packed/opaque rows and integer payloads: sized,
+ * never widenable. */
+typedef enum pulsar_elt_fmt {
+    PULSAR_ELT_F32  = 0,   /* 0 so a zeroed struct reads as the f32 default,
+                              exactly as esz==0 does */
+    PULSAR_ELT_F16  = 1,
+    PULSAR_ELT_BF16 = 2,
+    PULSAR_ELT_BYTES = 3,
+} pulsar_elt_fmt;
+
+pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
+                                               pulsar_elt_fmt fmt);
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
