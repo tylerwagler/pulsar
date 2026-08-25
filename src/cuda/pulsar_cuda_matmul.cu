@@ -113,69 +113,15 @@ __global__ static void matmul_nt_kernel(
 
 
 
-/* L109 N1: split-K for SKINNY outputs (the hc family: 16384->24, 16384->4).
- * The one-block-per-column NT kernel launches grid 24 on a ~40-SM part --
- * 2-3% utilization, 62 us for work worth ~10 (ncu, L109-BIG4 doc).  Split the
- * in_dim reduction across NT_SPLITK chunk-blocks per column; each block runs
- * the SAME strided-lane + tree-reduce order the NT kernel uses over its own
- * chunk, and a second kernel sums the chunk partials in FIXED chunk order.
- * Deterministic (no atomics, fixed order) and M-INDEPENDENT by construction:
- * every token's math is per-token and the chunking never depends on n_tok, so
- * a row at n=1 and the same row inside any batch are bit-identical.  NOT
- * bit-identical to the unsplit kernel (f32 reassociation) -- known-flip
- * class; graded by the reference gate like every numerics change. */
-#define PULSAR_NT_SPLITK 16
-template <int NT, typename WT, typename AT>
-__global__ static void matmul_nt_splitk_kernel(
-        float *partials,            /* [S][NT][out_dim] */
-        const WT *w,
-        const AT *x,
-        uint64_t in_dim,
-        uint64_t out_dim) {
-    const uint64_t row = (uint64_t)blockIdx.x;
-    const uint32_t sk = blockIdx.y;
-    if (row >= out_dim) return;
-    const uint64_t chunk = (in_dim + PULSAR_NT_SPLITK - 1) / PULSAR_NT_SPLITK;
-    const uint64_t i0 = (uint64_t)sk * chunk;
-    const uint64_t i1 = i0 + chunk < in_dim ? i0 + chunk : in_dim;
-    float sum[NT];
-    #pragma unroll
-    for (int t = 0; t < NT; t++) sum[t] = 0.0f;
-    const WT *wr = w + row * in_dim;
-    for (uint64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
-        const float wv = pulsar_wt_load(wr, i);
-        #pragma unroll
-        for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(x, t * in_dim + i);
-    }
-    __shared__ float partial[256];
-    #pragma unroll
-    for (int t = 0; t < NT; t++) {
-        partial[threadIdx.x] = sum[t];
-        __syncthreads();
-        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-            __syncthreads();
-        }
-        if (threadIdx.x == 0)
-            partials[((uint64_t)sk * NT + t) * out_dim + row] = partial[0];
-        __syncthreads();
-    }
-}
-
-__global__ static void matmul_nt_splitk_reduce_kernel(
-        float *out,                 /* [n_tok][out_dim] */
-        const float *partials,      /* [S][NT][out_dim] */
-        uint64_t out_dim,
-        uint32_t n_tok) {
-    const uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t t = blockIdx.y;
-    if (row >= out_dim || t >= n_tok) return;
-    float s = 0.0f;
-    for (uint32_t k = 0; k < PULSAR_NT_SPLITK; k++)   /* FIXED order: deterministic */
-        s += partials[((uint64_t)k * n_tok + t) * out_dim + row];
-    out[(uint64_t)t * out_dim + row] = s;
-}
-
+/* L109 N1 verdict (2026-08-25, tried and REVERTED same day): split-K for the
+ * skinny hc outputs ran at 9.7us vs the 62us one-block-per-column launches --
+ * a 6x kernel win worth ~1 ms/token -- but the f32 reassociation (known-flip
+ * class) perturbed the drafter's target-anchor conditioning and measured
+ * -8% structured tokens/step in the server decomposition A/B (prose neutral).
+ * The acceptance tax exceeds the kernel gain. A bit-exact variant does not
+ * exist at grid=24 (any repartition of the serial lane sums reassociates).
+ * Reopen only with a drafter retuned on the new numerics (L092 refit), or if
+ * the hc family stops feeding drafter anchors. */
 
 /* BF16 is the high 16 bits of f32, so conversions are pure bit ops (no header). */
 __device__ __forceinline__ static float bf16_to_f32(uint16_t b) {
@@ -1842,17 +1788,24 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
     float acc[NT];
     #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = 0.f;
-    /* L109 N4 verdict: the software-pipelined weight load was tried 2026-08-25
-     * and REVERTED same day -- the N-batch A/B isolated a large decode
-     * regression to this kernel's arm (occupancy loss from the pipeline
-     * registers outweighing the scoreboard win; the kernel already ran at 83%
-     * occupancy and the stall was cheaper than the registers). Bit-exact
-     * either way; kept for the record. */
+    /* L109 N4 RETRIAL: the first conviction (2026-08-25, 'occupancy loss')
+     * was measured with N1 aboard -- N1's acceptance regression confounded the
+     * composite A/B and N1 is now reverted. N4 is bit-exact (load scheduling
+     * only), so it gets the single-lever A/B its first trial never had. ncu:
+     * 20.7 cycles/warp stalled on this load->use chain. */
+    int k0 = lane * 4;
+    uint32_t wpk_n = *(const uint32_t *)(row + k0);
+    float sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, k0 >> 5, KBp)] << 23);
     for (int base = 0; base < in_dim; base += 128) {
-        int k = base + lane * 4;
-        uint32_t wpk = *(const uint32_t *)(row + k);
-        int kb = k >> 5;
-        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
+        const int k = base + lane * 4;
+        const int kb = k >> 5;
+        const uint32_t wpk = wpk_n;
+        const float sw = sw_n;
+        const int kn = k + 128;
+        if (kn < in_dim) {
+            wpk_n = *(const uint32_t *)(row + kn);
+            sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kn >> 5, KBp)] << 23);
+        }
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         #pragma unroll
         for (int t = 0; t < NT; t++) {
@@ -2554,53 +2507,6 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * ROUNDS the activations to bf16, so its disagreement with the n=1 kernel is
      * larger than the f32 arm's, not smaller" until 2026-08-17, which was true
      * and was the bug. */
-    /* L109 N1: skinny outputs take split-K at EVERY small n_tok (1..16).
-     * Grid out_dim x 16 fills the part; the unsplit arms below never see
-     * these shapes, so the split IS the family's numeric authority for them
-     * (n=1 included -- M-independence needs one authority, not two). */
-    if (out_dim <= 64 && in_dim >= 4096 && n_tok >= 1 && n_tok <= 16) {
-        static thread_local float *sk_partials = NULL;
-        static thread_local size_t sk_cap = 0;
-        const size_t need = (size_t)PULSAR_NT_SPLITK * 16 * out_dim * sizeof(float);
-        if (need > sk_cap) {
-            if (sk_partials) { (void)cudaFree(sk_partials); sk_partials = NULL; sk_cap = 0; }
-            if (cudaMalloc(&sk_partials, need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-            sk_cap = need;
-        }
-        static int announced_sk = 0;
-        if (!announced_sk) {
-            announced_sk = 1;
-            fprintf(stderr, "pulsar: skinny-output matmul = split-K x%d "
-                            "(out_dim<=64; one numeric authority for n_tok 1..16)\n",
-                    PULSAR_NT_SPLITK);
-        }
-        dim3 g((unsigned)out_dim, PULSAR_NT_SPLITK);
-        #define PULSAR_SK_LAUNCH(N) matmul_nt_splitk_kernel<N, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
-                sk_partials, (const __nv_bfloat16 *)w, xb16, in_dim, out_dim)
-        switch (n_tok) {
-        case 1: PULSAR_SK_LAUNCH(1); break;
-        case 2: PULSAR_SK_LAUNCH(2); break;
-        case 3: PULSAR_SK_LAUNCH(3); break;
-        case 4: PULSAR_SK_LAUNCH(4); break;
-        case 5: PULSAR_SK_LAUNCH(5); break;
-        case 6: PULSAR_SK_LAUNCH(6); break;
-        case 7: PULSAR_SK_LAUNCH(7); break;
-        case 8: PULSAR_SK_LAUNCH(8); break;
-        case 9: PULSAR_SK_LAUNCH(9); break;
-        case 10: PULSAR_SK_LAUNCH(10); break;
-        case 11: PULSAR_SK_LAUNCH(11); break;
-        case 12: PULSAR_SK_LAUNCH(12); break;
-        case 13: PULSAR_SK_LAUNCH(13); break;
-        case 14: PULSAR_SK_LAUNCH(14); break;
-        case 15: PULSAR_SK_LAUNCH(15); break;
-        default: PULSAR_SK_LAUNCH(16); break;
-        }
-        #undef PULSAR_SK_LAUNCH
-        dim3 gr(((unsigned)out_dim + 63u) / 64u, (unsigned)n_tok);
-        matmul_nt_splitk_reduce_kernel<<<gr, 64>>>((float *)out->ptr, sk_partials,
-                                                   out_dim, (uint32_t)n_tok);
-        return cuda_ok(cudaGetLastError(), "matmul skinny split-K launch");
-    }
     {
         const uint64_t nt_cap = (g_mneutral_rows > 0)
                 ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : 4u;
