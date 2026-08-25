@@ -1439,6 +1439,17 @@ typedef struct pulsar_spec_carry_state {
     bool spec_depth_down_forgiven; /* L107 v2: one down-signal was vetoed on a
                                     * still-confident tail; a second consecutive
                                     * one backs off regardless */
+    uint8_t spec_depth_climb_cooldown; /* L107 v4: rounds remaining in which UP
+                                    * is suppressed after an actual back-off.
+                                    * Raw-completion prose oscillated 2->3->4->
+                                    * crash forever (29 transitions/192 tok,
+                                    * -14%): each failed excursion burns a deep
+                                    * round, and tail conf does NOT separate
+                                    * good climbs from bad (a 0.93 tail climbed
+                                    * into commit=0). Cooldown makes excursions
+                                    * rare after they fail; structured's downs
+                                    * are rare (and v3-forgiven rounds are not
+                                    * downs), so its climb is untouched. */
     /* --- Temperature-matched draft sampling (spec-decode Item 1) ---
      * At temperature > 0 the drafts above are DRAWN from a temperature-matched
      * proposal q (the drafter's refined logits filtered at the request's
