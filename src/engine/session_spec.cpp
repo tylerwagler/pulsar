@@ -1271,6 +1271,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (K > 0) {
         const uint32_t depth = spec_cur_depth(s);
         if (s->spec.spec_depth_climb_cooldown) s->spec.spec_depth_climb_cooldown--;
+        if (s->spec.spec_depth_rounds_since_up < 255u) s->spec.spec_depth_rounds_since_up++;
         int next = (int)depth;
         if (2u * (uint32_t)commit < depth) {
             /* v2 down-veto: the A/B trajectory showed single bad rounds at
@@ -1291,7 +1292,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                 s->spec.spec_depth_down_forgiven = true;
             } else {
                 s->spec.spec_depth_down_forgiven = false;
-                s->spec.spec_depth_climb_cooldown = 8u;   /* v4 */
+                /* v5: only a FAILED EXCURSION (down within 2 rounds of the
+                 * last up) triggers the cooldown. */
+                if (s->spec.spec_depth_rounds_since_up <= 2u)
+                    s->spec.spec_depth_climb_cooldown = 8u;
                 next--;
             }
         } else if ((uint32_t)commit == depth &&
@@ -1299,6 +1303,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                    (pend_conf[depth - 1] >= SPEC_DEPTH_CONF_UP ||
                     pend_conf[depth - 1] < 0.0f)) {
             s->spec.spec_depth_down_forgiven = false;
+            s->spec.spec_depth_rounds_since_up = 0u;
             next++;
         } else {
             s->spec.spec_depth_down_forgiven = false;

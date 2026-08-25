@@ -1439,8 +1439,15 @@ typedef struct pulsar_spec_carry_state {
     bool spec_depth_down_forgiven; /* L107 v2: one down-signal was vetoed on a
                                     * still-confident tail; a second consecutive
                                     * one backs off regardless */
+    uint8_t spec_depth_rounds_since_up; /* L107 v5: rounds since the last UP,
+                                    * saturating at 255; a down within 2 of an
+                                    * up is a FAILED EXCURSION and triggers the
+                                    * cooldown; a down after a sustained ride
+                                    * carries no penalty (v4's blanket cooldown
+                                    * cost ~0.9 t/s on BOTH server workloads by
+                                    * suppressing profitable climbs). */
     uint8_t spec_depth_climb_cooldown; /* L107 v4: rounds remaining in which UP
-                                    * is suppressed after an actual back-off.
+                                    * is suppressed after a failed excursion.
                                     * Raw-completion prose oscillated 2->3->4->
                                     * crash forever (29 transitions/192 tok,
                                     * -14%): each failed excursion burns a deep
