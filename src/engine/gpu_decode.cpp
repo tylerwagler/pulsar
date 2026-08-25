@@ -1368,6 +1368,16 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor         *base_logits_out,
         const int32_t            draft_ids[],
         uint32_t                n_draft) {
+    /* L106 K2a: the drafter hand-rolls its attention half and never passes
+     * through the batch encode whose first act is the gact disarm -- so a
+     * gact entry armed and noted by a prior prefill chunk or spec verify of
+     * EQUAL WIDTH would satisfy the cache probe when a deeper draft
+     * (n_draft >= 5) takes the tensor-core "a" arm, handing the drafter the
+     * MAIN model's activation encoding: corrupted draft logits, acceptance
+     * collapse (output stays correct -- spec verify is protected).  Unreachable
+     * at today's n_draft <= 4; a PREREQUISITE for L092 deeper drafts.  Disarm
+     * here, unconditionally, exactly as the batch encode does per layer. */
+    pulsar_gpu_mxfp8_gact_disarm();
     if (!g || !base_model || !base_weights || !dspark_model || !w ||
         !base_logits_out || n_draft == 0 || n_draft > 16 ||
         n_draft > g->prefill_cap)
@@ -1452,6 +1462,14 @@ bool gpu_graph_dspark_draft_forward(
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
+        /* L106 K2b: batch_attn_norm feeds TWO MXFP8 GEMMs (attn_q_a, attn_kv).
+         * Unarmed, each independently re-quantised the same values from f32 --
+         * the duplicate encode the act-cache design note called "the sanctioned
+         * miss", per layer per draft.  Arming makes the first GEMM's quantise
+         * land in the slot and the second hit it; bit-identical either way
+         * (same encoder, same bytes), one encode instead of two. */
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_attn_norm, n_draft,
+                                               PULSAR_N_EMBD);
         /* --- Q projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_qr, dspark_model->map, dspark_model->size,
@@ -1483,6 +1501,10 @@ bool gpu_graph_dspark_draft_forward(
             layer->attn_kv->abs_offset,
             PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
             g->batch_attn_norm, n_draft) != 0;
+        /* K2b: last consumer of the armed attn_norm ran; disarm so a later
+         * width-matched buffer reuse cannot hit this entry (same rule as the
+         * head entries' redundant second lock). */
+        pulsar_gpu_mxfp8_act_cache_disarm();
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
             g->batch_kv, g->batch_kv_raw,
             dspark_model->map, dspark_model->size,
