@@ -1788,24 +1788,19 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
     float acc[NT];
     #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = 0.f;
-    /* L109 N4 RETRIAL: the first conviction (2026-08-25, 'occupancy loss')
-     * was measured with N1 aboard -- N1's acceptance regression confounded the
-     * composite A/B and N1 is now reverted. N4 is bit-exact (load scheduling
-     * only), so it gets the single-lever A/B its first trial never had. ncu:
-     * 20.7 cycles/warp stalled on this load->use chain. */
-    int k0 = lane * 4;
-    uint32_t wpk_n = *(const uint32_t *)(row + k0);
-    float sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, k0 >> 5, KBp)] << 23);
+    /* L109 N4 FINAL VERDICT (2026-08-25, two trials): a manual
+     * software-pipelined weight load (prefetch next word+scale, guarded by an
+     * in-loop bounds branch) measured -33% DECODE in a clean single-lever A/B
+     * against the true baseline -- the hand pipeline plus its branch defeats
+     * the compiler's own scheduling of this loop, which was already good.
+     * Bit-exact both ways; the stall ncu reports here (20.7 cyc/warp L1TEX)
+     * is cheaper than any register/branch price paid to hide it. Do not
+     * re-add without a branch-free formulation A/B'd solo. */
     for (int base = 0; base < in_dim; base += 128) {
-        const int k = base + lane * 4;
-        const int kb = k >> 5;
-        const uint32_t wpk = wpk_n;
-        const float sw = sw_n;
-        const int kn = k + 128;
-        if (kn < in_dim) {
-            wpk_n = *(const uint32_t *)(row + kn);
-            sw_n = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kn >> 5, KBp)] << 23);
-        }
+        int k = base + lane * 4;
+        uint32_t wpk = *(const uint32_t *)(row + k);
+        int kb = k >> 5;
+        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
         const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
         #pragma unroll
         for (int t = 0; t < NT; t++) {

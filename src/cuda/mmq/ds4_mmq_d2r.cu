@@ -924,11 +924,11 @@ void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
  * losing arm was DELETED rather than left behind as a flag -- along with
  * make_iq2_A_tile, the fold helpers, and the arm-selecting kernel argument.
  * Callers stage E4M3; nothing here can disagree with them about the format. */
-/* L109 N2 verdict: minBlocks 3 was tried 2026-08-25 and REVERTED same day --
- * the combined N-batch A/B measured -33% decode, consistent with spill cost
- * on a 128-register kernel forced to ~85. Occupancy stays 2 blocks/SM; the
- * latency-hiding for this kernel must come from spill-free register savings
- * or structural change, not launch_bounds pressure. */
+/* L109 N2 verdict (corrected 2026-08-25 late): minBlocks 3 was reverted on a
+ * COMPOSITE A/B later shown to be confounded (N1's acceptance tax + N4's
+ * pipeline regression dominated it) -- N2 was never measured solo and its
+ * true cost is UNKNOWN. The spill risk on a 128-register kernel is real, so
+ * 2 stays until someone runs the clean single-lever A/B this one never got. */
 __global__ __launch_bounds__(kThreads, 2)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,
