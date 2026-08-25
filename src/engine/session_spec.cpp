@@ -57,6 +57,18 @@ static uint32_t spec_cur_depth(const pulsar_session *s) {
     return (uint32_t)d;
 }
 
+/* L108 P2: any offline dump mode needs the refined ids on the host at draft
+ * time, which forces the immediate (non-deferred) harvest path. Read once. */
+static int spec_dump_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *a = getenv("PULSAR_DSPARK_DUMP");
+        const char *b = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
+        cached = (a && a[0]) || (b && b[0]) ? 1 : 0;
+    }
+    return cached;
+}
+
 /* --- Terminal yield-quench controller (spec-decode Item 4) ---------------
  * Controller design after the Entrpi ds4 yield quench (v0.1.1, MIT): per
  * request, every fused spec step accrues debt = breakeven yield minus
@@ -703,6 +715,42 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * markov step consumes. */
     const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
     bool draft_ok = true;
+    /* L108 P2: with no host consumer at draft time (greedy, no diagnostics),
+     * launch the chain + conf scoring and DEFER the readback to the next
+     * consumer (pulsar_session_spec_chain_harvest) -- the caller's token
+     * emission then overlaps the drafter's GPU time. */
+    const bool defer_harvest = !sample_drafts && !dtree_stats && !spec_dump_active();
+    if (!sample_drafts) {
+        /* L108 P1: the greedy walk chains ON DEVICE.  The old loop did a
+         * blocking 8-byte read per position purely to hand the next step a
+         * token id that already lived in device memory -- ~depth syncs per
+         * round, the single largest host-serialization line in the P1 trace.
+         * Seed ids[0], launch the whole chain, read all ids back ONCE.  Same
+         * kernels, same launch order, same arithmetic: byte-exact (the only
+         * behavioural delta is that the chain clamps an out-of-vocab id
+         * in-kernel where the loop refused host-side -- unreachable either
+         * way, ids are argmaxes over the vocab).  The SAMPLED path keeps the
+         * loop below: its chain routes through a host rng draw per position. */
+        draft_ok =
+            pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, &refined[0],
+                                    sizeof(int32_t)) &&
+            pulsar_gpu_dspark_markov_chain_model(dspark_logits,
+                                              g->dspark_refined_ids,
+                                              g->dspark_refined2_ids,
+                                              g->spec_logits, spec_row_bytes,
+                                              dmap, dsize,
+                                              w->markov_w1->abs_offset,
+                                              w->markov_w2->abs_offset,
+                                              n_draft, vocab_size, embed_dim,
+                                              w->markov_w1->type == PULSAR_TENSOR_BF16,
+                                              w->markov_w2->type == PULSAR_TENSOR_BF16) &&
+            (defer_harvest ||
+             (pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t),
+                                     &refined[1], (uint64_t)n_draft * sizeof(int32_t)) &&
+              (!dtree_stats ||
+               pulsar_gpu_tensor_read(g->dspark_refined2_ids, sizeof(int32_t),
+                                      &refined2[1], (uint64_t)n_draft * sizeof(int32_t)))));
+    } else
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
@@ -849,6 +897,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     uint32_t keep = n_draft;
     float conf[16];
     bool have_conf = false;
+    bool conf_deferred = false;
     {
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f || dtree_stats) {
@@ -859,7 +908,14 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
             pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
             pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
             if (conf_dev && tok_dev &&
-                pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
+                (defer_harvest
+                     /* device-to-device: the ids are already in the chain
+                      * array; a host write here would force the read this
+                      * path exists to avoid */
+                     ? pulsar_gpu_tensor_copy(tok_dev, 0, g->dspark_refined_ids, 0,
+                                              (uint64_t)n_draft * sizeof(int32_t)) != 0
+                     : pulsar_gpu_tensor_write(tok_dev, 0, refined,
+                                               (uint64_t)n_draft * sizeof(int32_t)) != 0) &&
                 pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
                                                       dmap, dsize,
                                                       w->markov_w1->abs_offset,
@@ -867,19 +923,31 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                                       n_draft, PULSAR_N_EMBD, embed_dim, vocab_size,
                                                       w->markov_w1->type == PULSAR_TENSOR_BF16,
                                                       w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
-                pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
-                have_conf = true;
-                if (tau > 0.0f) {
-                    uint32_t k = 0;
-                    while (k < n_draft && conf[k] >= tau) k++;
-                    keep = k;   /* 0 pending = next step is a plain n=1 forward */
+                (defer_harvest ||
+                 pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float)))) {
+                if (defer_harvest) {
+                    conf_deferred = true;   /* harvest reads + trims later */
+                } else {
+                    have_conf = true;
+                    if (tau > 0.0f) {
+                        uint32_t k = 0;
+                        while (k < n_draft && conf[k] >= tau) k++;
+                        keep = k;   /* 0 pending = next step is a plain n=1 forward */
+                    }
                 }
             }
         }
     }
     s->spec.dspark_pending_base = (int32_t)next_base;
-    s->spec.dspark_n_pending = keep;
-    for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
+    if (defer_harvest) {
+        s->spec.dspark_n_pending = 0;   /* harvest sets the real count */
+        s->spec.dspark_chain_unharvested = true;
+        s->spec.dspark_chain_conf = conf_deferred;
+        s->spec.dspark_chain_n = n_draft;
+    } else {
+        s->spec.dspark_n_pending = keep;
+        for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
+    }
     /* The proposal rule and the exact params these drafts were sampled under.
      * Stamped unconditionally, in the same straight-line block as
      * dspark_n_pending above — this is the only site that makes pendings
@@ -920,6 +988,48 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     }
 
     return keep;
+}
+
+/* L108 P2: lazy completion of a device-chained greedy draft. Mirrors the
+ * immediate path's semantics exactly: conf-read failure -> untrimmed keep
+ * (have_conf=false there), ids-read failure -> 0 pendings (best-effort
+ * contract, next step is a plain forward). Merge marker for L107: when the
+ * adaptive-depth controller lands, its unconditional dspark_pending_conf
+ * store must be replicated here. */
+void pulsar_session_spec_chain_harvest(pulsar_session *s) {
+    if (!s->spec.dspark_chain_unharvested) return;
+    s->spec.dspark_chain_unharvested = false;
+    pulsar_gpu_graph *g = &s->graph;
+    const uint32_t n_draft = s->spec.dspark_chain_n;
+    if (n_draft == 0 || n_draft > 16u) return;
+    int32_t ids[17];
+    if (!g->dspark_refined_ids ||
+        !pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t), ids + 1,
+                                (uint64_t)n_draft * sizeof(int32_t)))
+        return;
+    uint32_t keep = n_draft;
+    float conf[16];
+    bool have_conf = false;
+    if (s->spec.dspark_chain_conf &&
+        pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, conf,
+                               (uint64_t)n_draft * sizeof(float))) {
+        have_conf = true;
+        const float tau = dspark_conf_sched_tau();
+        if (tau > 0.0f) {
+            uint32_t k = 0;
+            while (k < n_draft && conf[k] >= tau) k++;
+            keep = k;
+        }
+    }
+    s->spec.dspark_n_pending = keep;
+    for (uint32_t i = 0; i < keep; i++) {
+        s->spec.dspark_pending[i] = ids[i + 1];
+        /* L107 merge: the adaptive-depth controller reads the verified
+         * chain's conf at round_end (pend_conf via round assembly) -- the
+         * deferred path must store it here, exactly as the immediate path's
+         * unconditional store does at draft time. */
+        s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
+    }
 }
 
 /* inc-6: one speculative ROUND's state, threaded between round_begin (rows
@@ -969,6 +1079,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     /* Pending drafts continue from the greedy base we predicted last step; if
      * the caller committed something else (tool injection, sampling change),
      * they are stale. */
+    pulsar_session_spec_chain_harvest(s);   /* L108 P2 */
     K = s->spec.dspark_n_pending;
     if (K > 16u) K = 16u;
     if (K && s->spec.dspark_pending_base != (int32_t)first_token) K = 0;
@@ -1012,7 +1123,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     for (uint32_t i = 0; i < K; i++) pend_conf[i] = s->spec.dspark_pending_conf[i];
     if (dtree_stats)
         for (uint32_t i = 0; i < K; i++) pend_alt[i] = s->spec.dspark_pending_alt[i];
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     n_batch = 1u + K;
 
@@ -1591,6 +1702,11 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
 uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
                                         float out[16]) {
+    /* L108 P2: the live session's pending count may still be an
+     * in-flight chain; complete it before peeking. Logically a lazy
+     * read-completion, not observable-state mutation. */
+    pulsar_session_spec_chain_harvest((pulsar_session *)s);
+
     if (!s || !s->bank_carry || bank >= s->bank_carry_n) return 0;
     const pulsar_bank_carry *c = &s->bank_carry[bank];
     if (!c->valid) return 0;

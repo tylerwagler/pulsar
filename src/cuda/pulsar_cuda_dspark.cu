@@ -35,9 +35,13 @@ __global__ static void dspark_markov_step_kernel(
         const float *base_logits,
         const void *markov_w1,
         const void *markov_w2,
-        int32_t prev_token,
+        const int32_t *prev_token_ptr,  /* L108 P1: device-fed so the walk
+                                         * chains without a host round-trip;
+                                         * broadcast read, cached */
         uint32_t vocab_size,
         uint32_t embed_dim) {
+    int32_t prev_token = *prev_token_ptr;
+    if (prev_token < 0 || (uint32_t)prev_token >= vocab_size) prev_token = 0;
     const uint64_t embed_base = (uint64_t)prev_token * embed_dim;
     float best_val = -INFINITY;
     int32_t best_id = 0;
@@ -114,7 +118,10 @@ __global__ static void dspark_markov_step_kernel(
  * out_ids[1] (runner-up) feeds the optional refined_id2 path.
  */
 __global__ static void dspark_markov_reduce_kernel(
-        int32_t *out_ids,           /* [2]: best id, runner-up id */
+        int32_t *dst_top1,          /* winner id (L108 P1: points into the
+                                     * chain's device id array, so the next
+                                     * step kernel reads it directly) */
+        int32_t *dst_top2,          /* runner-up id, or NULL */
         const int32_t *ids,
         const float *vals,
         const int32_t *ids2,
@@ -163,8 +170,8 @@ __global__ static void dspark_markov_reduce_kernel(
         __syncthreads();
     }
     if (tid == 0) {
-        out_ids[0] = best_ids[0];
-        out_ids[1] = sec_ids[0];
+        *dst_top1 = best_ids[0];
+        if (dst_top2) *dst_top2 = sec_ids[0];
     }
 }
 
@@ -178,6 +185,7 @@ static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
                                         int32_t *refined_id2_dst) {
     dspark_markov_reduce_kernel<<<1, 256>>>(
         (int32_t *)out_dev->ptr,
+        (int32_t *)out_dev->ptr + 1,
         (const int32_t *)id_dev->ptr,
         (const float *)val_dev->ptr,
         (const int32_t *)id2_dev->ptr,
@@ -212,6 +220,17 @@ int pulsar_gpu_dspark_markov_step_model(
     if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
     if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
     if ((uint64_t)prev_token >= vocab_size) return 0;
+
+    /* L108 P1: the kernel now takes the previous id by DEVICE pointer (so the
+     * chained greedy walk needs no host round-trip). This single-step entry
+     * (the sampled path, which routes the chain through a host rng draw)
+     * stages its host id into a persistent 1-int slot -- one 4-byte H2D per
+     * position, noise next to that path's per-position 517 KB qrow read. */
+    static thread_local pulsar_gpu_tensor *staged_id = NULL;
+    if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+    if (!staged_id) return 0;
+    if (!pulsar_gpu_tensor_write(staged_id, 0, &prev_token, sizeof(int32_t)))
+        return 0;
 
     /* Sized by the STORAGE width, not sizeof(float): a bf16 markov head is half
      * these bytes and checking it against the f32 size would reject a valid
@@ -291,7 +310,7 @@ int pulsar_gpu_dspark_markov_step_model(
         (int32_t *)rb.id2->ptr,                               \
         (float *)rb.val2->ptr,                                \
         (const float *)base_logits->ptr,                      \
-        w1, w2, prev_token, vocab_size, embed_dim)
+        w1, w2, (const int32_t *)staged_id->ptr, vocab_size, embed_dim)
     if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_LAUNCH(true, true);
     else if (w1_bf16)         PULSAR_MARKOV_LAUNCH(true, false);
     else if (w2_bf16)         PULSAR_MARKOV_LAUNCH(false, true);
@@ -304,6 +323,110 @@ int pulsar_gpu_dspark_markov_step_model(
                                          rb.out, grid_dim,
                                          refined_id_dst, refined_id2_dst);
     return rc;
+}
+
+
+struct DsparkReduceBufsChain {
+    pulsar_gpu_tensor *id, *val, *id2, *val2;
+    uint32_t cap;
+};
+
+/* L108 P1: device-chained greedy markov walk.  Launches the whole n_draft
+ * refine sequence with the token feed in device memory: step kernel pos p
+ * reads ids[p], its reduce writes the winner to ids[p+1] (and the runner-up
+ * to ids2[p+1]), which the next step kernel reads directly.  ids[0] must be
+ * pre-seeded by the caller.  NO device-to-host read happens here -- the
+ * caller reads ids/ids2 once after the chain (that read is the round's one
+ * drafter sync).  refined_logits is a single [vocab] f32 scratch row reused
+ * by every position: nothing in the greedy chain reads it back, and reuse is
+ * stream-ordered.  Same kernels, same launch order, same arithmetic as the
+ * single-step path -- byte-exact by construction (any gate red is a bug).
+ * The SAMPLED path cannot use this: its chain routes through a host rng draw
+ * per position (pulsar_sample_dist_draw), so it keeps the single-step entry
+ * above (P1b would need device-side dist build + draw with rng parity). */
+int pulsar_gpu_dspark_markov_chain_model(
+        pulsar_gpu_tensor *refined_logits,      /* [vocab] f32 scratch */
+        pulsar_gpu_tensor *ids_dev,             /* [n_draft+1] i32, [0] seeded */
+        pulsar_gpu_tensor *ids2_dev,            /* [n_draft+1] i32 runner-ups */
+        const pulsar_gpu_tensor *base_logits,   /* [n_draft, row_stride] f32 */
+        uint64_t base_row_stride_bytes,
+        const void *dspark_model_map,
+        uint64_t dspark_model_size,
+        uint64_t markov_w1_offset,
+        uint64_t markov_w2_offset,
+        uint32_t n_draft,
+        uint32_t vocab_size,
+        uint32_t embed_dim,
+        int w1_bf16,
+        int w2_bf16) {
+    if (!refined_logits || !ids_dev || !ids2_dev || !base_logits ||
+        !dspark_model_map || n_draft == 0 || n_draft > 16)
+        return 0;
+    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
+    if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
+    if (ids_dev->bytes  < ((uint64_t)n_draft + 1) * sizeof(int32_t)) return 0;
+    if (ids2_dev->bytes < ((uint64_t)n_draft + 1) * sizeof(int32_t)) return 0;
+    if (base_row_stride_bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
+    if (base_logits->bytes < (uint64_t)(n_draft - 1) * base_row_stride_bytes +
+                             (uint64_t)vocab_size * sizeof(float)) return 0;
+
+    const uint64_t w1_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t w2_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
+    if (markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset) return 0;
+    if (markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset) return 0;
+    const void *w1 = cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const void *w2 = cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
+    if (!w1 || !w2) return 0;
+
+    const uint32_t block_dim = 256;
+    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    if (grid_dim > 65535) return 0;
+    static thread_local DsparkReduceBufsChain crb = {};
+    if (grid_dim > crb.cap) {
+        pulsar_gpu_tensor_free(crb.id);
+        pulsar_gpu_tensor_free(crb.val);
+        pulsar_gpu_tensor_free(crb.id2);
+        pulsar_gpu_tensor_free(crb.val2);
+        crb.id   = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        crb.val  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        crb.id2  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        crb.val2 = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        crb.cap  = (crb.id && crb.val && crb.id2 && crb.val2) ? grid_dim : 0;
+    }
+    if (!crb.id || !crb.val || !crb.id2 || !crb.val2) return 0;
+
+    int32_t *ids = (int32_t *)ids_dev->ptr;
+    int32_t *ids2 = (int32_t *)ids2_dev->ptr;
+    for (uint32_t pos = 0; pos < n_draft; pos++) {
+        const float *base_row =
+            (const float *)((const char *)base_logits->ptr +
+                            (uint64_t)pos * base_row_stride_bytes);
+#define PULSAR_MARKOV_CHAIN_LAUNCH(A, B)                        \
+        dspark_markov_step_kernel<A, B><<<grid_dim, block_dim>>>( \
+            (float *)refined_logits->ptr,                         \
+            (int32_t *)crb.id->ptr,                               \
+            (float *)crb.val->ptr,                                \
+            (int32_t *)crb.id2->ptr,                              \
+            (float *)crb.val2->ptr,                               \
+            base_row, w1, w2, ids + pos, vocab_size, embed_dim)
+        if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_CHAIN_LAUNCH(true, true);
+        else if (w1_bf16)         PULSAR_MARKOV_CHAIN_LAUNCH(true, false);
+        else if (w2_bf16)         PULSAR_MARKOV_CHAIN_LAUNCH(false, true);
+        else                      PULSAR_MARKOV_CHAIN_LAUNCH(false, false);
+#undef PULSAR_MARKOV_CHAIN_LAUNCH
+        dspark_markov_reduce_kernel<<<1, 256>>>(
+            ids + pos + 1, ids2 + pos + 1,
+            (const int32_t *)crb.id->ptr,  (const float *)crb.val->ptr,
+            (const int32_t *)crb.id2->ptr, (const float *)crb.val2->ptr,
+            grid_dim);
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 

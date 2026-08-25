@@ -1726,6 +1726,14 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
 
 /* DSpark Markov + confidence heads */
 
+int pulsar_gpu_dspark_markov_chain_model(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
+        pulsar_gpu_tensor *ids2_dev, const pulsar_gpu_tensor *base_logits,
+        uint64_t base_row_stride_bytes,
+        const void *dspark_model_map, uint64_t dspark_model_size,
+        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
+        int w1_bf16, int w2_bf16);
 int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,

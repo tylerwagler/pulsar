@@ -830,7 +830,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
      * rebuild that lands on the same length, and a sampled draft's q belongs to
      * the previous request's distribution. Dropping them here costs one draft
      * round at the start of a request and is the only guard that covers it. */
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     /* A sync begins a new request: re-arm the terminal yield quench. */
     spec_quench_reset(s);
 
@@ -1222,7 +1222,7 @@ void pulsar_session::invalidate() {
     auto *s = this;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
     /* plan-33 inc C: an invalidated bank restarts from zero — a live keep
@@ -1254,7 +1254,7 @@ void pulsar_session::rewind(int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills

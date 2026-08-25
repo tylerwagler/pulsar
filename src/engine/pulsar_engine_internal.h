@@ -1011,6 +1011,11 @@ typedef struct {
                                              * upload (L104 fix B: was a
                                              * cudaMalloc/free PER DRAFTER
                                              * FORWARD in gpu_decode) */
+    pulsar_gpu_tensor *dspark_refined_ids;  /* [17] i32: L108 P1 device-chained
+                                             * greedy walk -- [0] seeded with the
+                                             * base token, reduce pos p writes
+                                             * the winner to [p+1] */
+    pulsar_gpu_tensor *dspark_refined2_ids; /* [17] i32 runner-ups (DTree) */
     pulsar_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
     pulsar_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
     pulsar_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */
@@ -1365,6 +1370,16 @@ typedef struct pulsar_spec_carry_state {
      * forward (EAGLE pipeline inversion). 0 pending = next step is a plain
      * n=1 forward. Invalidated on rewind/invalidate. */
     int32_t dspark_pending[16];
+    /* L108 P2: a device-chained greedy draft was LAUNCHED but its ids/conf
+     * have not been read back yet.  The read happens lazily ("harvest") at
+     * the next consumer -- round assembly, the bank conf peek, or a bank
+     * save -- so token emission/streaming overlaps the drafter's GPU time.
+     * Every site that DROPS pendings must also drop the flag (the
+     * pulsar_spec_drop_pendings helper below is the single authority), or a
+     * later harvest would resurrect pendings the reset meant to kill. */
+    bool dspark_chain_unharvested;
+    bool dspark_chain_conf;      /* conf scoring was launched for the chain */
+    uint32_t dspark_chain_n;     /* drafted depth of the in-flight chain */
     uint32_t dspark_n_pending;
     /* The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
@@ -1488,6 +1503,23 @@ typedef struct pulsar_spec_carry_state {
     uint64_t spec_num_drafts;
     uint64_t spec_gen_tokens;
 } pulsar_spec_carry_state;
+
+/* Drop pendings AND any unharvested in-flight chain (L108 P2). The single
+ * authority for every "pendings are stale" reset -- setting dspark_n_pending
+ * to 0 by hand while a chain is in flight leaves a flag that would resurrect
+ * the stale ids at the next harvest. */
+static inline void pulsar_spec_drop_pendings(pulsar_spec_carry_state *sp) {
+    sp->dspark_n_pending = 0;
+    sp->dspark_chain_unharvested = false;
+}
+
+/* L108 P2: read back an in-flight device-chained draft (ids + conf), apply
+ * the conf-sched trim, and populate the pendings. Idempotent; no-op when no
+ * chain is in flight. Must run before anything consumes dspark_n_pending /
+ * dspark_pending[], and before a bank save copies spec state (banks share
+ * the session's graph tensors, so a saved unharvested flag would harvest
+ * another bank's chain). Defined in session_spec.cpp. */
+void pulsar_session_spec_chain_harvest(pulsar_session *s);
 
 /* Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
  * pool-session's HOST per-conversation state (checkpoint token history, host
