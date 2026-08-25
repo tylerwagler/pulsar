@@ -1396,12 +1396,25 @@ int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_byt
 int pulsar_gpu_begin_commands(void) { return 1; }
 
 
-int pulsar_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+/* L104 host-sync attack, fix A: flush/end wait on the PER-THREAD stream, not
+ * the whole device.  Every launch in this engine lands on the per-thread
+ * default stream (Makefile --default-stream per-thread; cuBLAS is pinned to
+ * cudaStreamPerThread at handle init), and flush/end are called from the
+ * thread that submitted the work, so the stream wait observes everything the
+ * caller launched.  cudaDeviceSynchronize additionally interlocks with every
+ * other stream in the process and spins the whole device idle -- measured
+ * ~1.4 calls/token on the decode path (P1 trace: 3.8 s / 374 calls per 256
+ * tokens).  pulsar_gpu_synchronize below KEEPS the device-wide wait: it is
+ * the cross-thread drain (session payload save/load, error paths), where
+ * "someone else's stream" is exactly what must be waited for. */
+int pulsar_gpu_flush_commands(void) {
+    return cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "flush");
+}
 
 
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
-    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+    return cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands");
 }
 
 
