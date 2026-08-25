@@ -135,7 +135,7 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
         token_vec_set_prefix(&s->checkpoint, tokens, n_cached);
         s->checkpoint_valid = true;
         s->spec.spec_carry_valid = false;
-        s->spec.dspark_n_pending = 0;
+        pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
     }
     /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive.
@@ -253,7 +253,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
         c->spec.spec_carry_valid = false;
-        c->spec.dspark_n_pending = 0;
+        pulsar_spec_drop_pendings(&c->spec);
         c->spec.dspark_pending_sampled = false;
         /* (no carried mseq_dirty: bank_state_restore clears the live flag
          * unconditionally once this bank's frontier counters are installed) */
@@ -273,7 +273,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         token_vec_set_prefix(&s->checkpoint, tokens, (int)R);
         s->checkpoint_valid = true;
         s->spec.spec_carry_valid = false;
-        s->spec.dspark_n_pending = 0;
+        pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
     }
     g->fork_pin[src] = 0u;
@@ -501,6 +501,7 @@ void pulsar_session::bank_state_save(uint32_t bank) {
      * s->mseq_dirty is NOT saved: it describes the graph's scalar frontier
      * counters, not this bank's conversation, and _restore re-establishes
      * per-bank frontier truth and clears it unconditionally. */
+    pulsar_session_spec_chain_harvest(s);   /* L108 P2: never save an in-flight chain */
     c->spec = s->spec;
     c->valid = true;
 }

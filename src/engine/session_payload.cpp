@@ -545,7 +545,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * that fails midway may already have overwritten GPU state the carry
      * and pendings were conditioned on */
     s->spec.spec_carry_valid = false;
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     spec_quench_reset(s);
     uint64_t remaining = payload_bytes;
     uint32_t h[PULSAR_SESSION_PAYLOAD_U32_FIELDS];
@@ -752,7 +752,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * next drafts (and therefore the verify batch shapes) depend on whatever
      * ran before the restore — the source of run-to-run tie flips. */
     s->spec.spec_carry_valid = false;
-    s->spec.dspark_n_pending = 0;
+    pulsar_spec_drop_pendings(&s->spec);
     spec_quench_reset(s);
     for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = 0;
     g->dspark_prompt_n = 0;
