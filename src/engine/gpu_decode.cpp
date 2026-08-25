@@ -1386,13 +1386,13 @@ bool gpu_graph_dspark_draft_forward(
     if (!base_weights->token_embd || !base_weights->output)
         return false;
 
-    /* Embed N draft tokens via main model's F16 token_embd → HC-expand */
-    pulsar_gpu_tensor *tokens_t = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+    /* Embed N draft tokens via main model's F16 token_embd → HC-expand.
+     * L104 fix B: persistent graph-owned upload tensor (n_draft <= 16) -- this
+     * was a cudaMalloc + blocking write + cudaFree per drafter forward. */
+    pulsar_gpu_tensor *tokens_t = g->dspark_embed_tokens;
     if (!tokens_t) return false;
-    if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t))) {
-        pulsar_gpu_tensor_free(tokens_t);
+    if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t)))
         return false;
-    }
     bool ok = pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
                                               tokens_t,
                                               base_model->map,
@@ -1402,7 +1402,6 @@ bool gpu_graph_dspark_draft_forward(
                                               n_draft,
                                               PULSAR_N_EMBD,
                                               PULSAR_N_HC) != 0;
-    pulsar_gpu_tensor_free(tokens_t);
     if (!ok) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;

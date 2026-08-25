@@ -1007,6 +1007,10 @@ typedef struct {
      * serialization. */
     pulsar_gpu_tensor *dspark_conf_scores;  /* [16] f32 per-draft confidence */
     pulsar_gpu_tensor *dspark_conf_tokens;  /* [16] i32 refined draft ids   */
+    pulsar_gpu_tensor *dspark_embed_tokens; /* [16] i32 draft ids for the embed
+                                             * upload (L104 fix B: was a
+                                             * cudaMalloc/free PER DRAFTER
+                                             * FORWARD in gpu_decode) */
     pulsar_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
     pulsar_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
     pulsar_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */
