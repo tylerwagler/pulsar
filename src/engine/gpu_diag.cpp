@@ -480,7 +480,7 @@ uint64_t gpu_graph_session_bytes_banked(
     total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
     total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
              pc * sizeof(uint32_t);                       /* comp_selected */
-    total += dz.q_dim * f32;                              /* heads */
+    total += dz.q_dim * PULSAR_HEADS_ELT_SIZE;            /* heads (stored width; L106 K5) */
     total += dz.low_dim * f32;                            /* attn_low */
     total += (uint64_t)PULSAR_N_EMBD * f32;                  /* attn_out */
     total += dz.hc_dim * hc;                              /* after_attn_hc (carrier) */

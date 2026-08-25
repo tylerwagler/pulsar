@@ -1889,30 +1889,6 @@ void rope_tail_layer_batch_inplace(
         bool              inverse,
         uint32_t          n_tok);
 float sigmoid_stable(float x);
-void layer_attention_rows_one(
-        float             * out_heads,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * q,
-        const float       * kv_rows,
-        uint32_t            n_kv);
-void layer_attention_one(
-        float             * out_heads,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * q,
-        const float       * kv);
-void layer_grouped_out_one(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * heads);
-void layer_grouped_out_batch(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * heads,
-        uint32_t            n_tok);
 float silu(float x);
 float softplus_stable(float x);
 void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp);

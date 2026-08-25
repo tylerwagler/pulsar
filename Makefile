@@ -48,7 +48,8 @@ override NVCCFLAGS += $(NVCC_EXTRA)
 # HC_F32=1 (-DPULSAR_HC_F32) used to restore f32 residual carriers: the control
 # build that proved the BF16 storage narrowing was a pure no-op. That flip
 # shipped and nothing set the switch afterwards -- no target, no gate, no test,
-# only a comment in tests/attn_indexed_bench.cu -- so it went on 2026-08-17.
+# nothing at all (its last mention, a comment in the since-deleted
+# attn_indexed_bench.cu, went with that file; L106 K7) -- so it went on 2026-08-17.
 # The carriers are BF16, full stop, and pulsar_hc_t has one definition.
 
 # An object is stale when the FLAGS that produced it change, not only when a

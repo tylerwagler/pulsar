@@ -2766,14 +2766,20 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         }
         return cuda_ok(cudaGetLastError(), "attention_output_a nt launch");
     }
-    if (dw) {
-        grouped_fp8mx_a_warp8_kernel<true, pulsar_heads_t><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
-                heads, group_dim, rank, n_groups, n_tokens, blocks_a);
-    } else {
-        grouped_fp8mx_a_warp8_kernel<false, pulsar_heads_t><<<grid_a, 256>>>(low, out_a,
-                (const __nv_fp8_e4m3 *)NULL, (const unsigned char *)NULL, 0,
-                heads, group_dim, rank, n_groups, n_tokens, blocks_a);
+    if (!dw) {
+        /* L106 K3: this used to soft-fall to the raw-33B DEINT=false arm.  A
+         * NULL resolver here means the pre-stored MXFP8_LT weight failed to
+         * resolve -- a should-never-happen path whose fallback silently ran a
+         * different kernel on the same call: the dense dispatcher made the
+         * twin case TERMINAL (L083 C3, "refuse-loud"), and this entry now
+         * follows the same rule.  A loud failure beats a quiet arm change. */
+        fprintf(stderr, "pulsar: attn-out 'a' weight did not resolve (deint) -- refusing "
+                        "the raw fallback (group_dim=%llu rank=%llu)\n",
+                (unsigned long long)group_dim, (unsigned long long)rank);
+        return 0;
     }
+    grouped_fp8mx_a_warp8_kernel<true, pulsar_heads_t><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
+            heads, group_dim, rank, n_groups, n_tokens, blocks_a);
     return cuda_ok(cudaGetLastError(), "attention_output_a launch");
 }
 
