@@ -28,6 +28,35 @@ static float dspark_conf_sched_tau(void) {
     return cached;
 }
 
+/* --- L107 adaptive draft depth -------------------------------------------
+ * The 2026-08-25 depth sweep measured opposite optima per regime (prose 2,
+ * structured 5; the shipped static 3 loses ~5%/~9.5% respectively), and the
+ * conf-head calibration run measured the head monotone in both regimes with
+ * conf>=0.9 -> 1.000 realized accept. Post-draft conf-sched trimming cannot
+ * capture this (draft cost is paid before the trim; the sweep ran WITH the
+ * trimmer on), so depth itself moves: +/-1 per round in spec_round_end.
+ *   UP:   the whole drafted chain was verified AND accepted (commit == depth,
+ *         which implies the trimmer kept everything) and the tail position's
+ *         confidence clears SPEC_DEPTH_CONF_UP (calibrated >=0.82 accept) --
+ *         the drafter was not the bottleneck this round, so probe deeper.
+ *   DOWN: less than half the drafted depth converted (2*commit < depth) --
+ *         drafting work is outrunning acceptance, back off.
+ * Bounds [SPEC_DEPTH_MIN, SPEC_DEPTH_MAX] are the sweep's measured range;
+ * depth 6 lost on BOTH regimes, so probing past it is priced as pure waste.
+ * Distribution-preserving by construction (verification is exact at any
+ * depth); NOT byte-identical on greedy prose -- verify-batch width shifts
+ * accumulation ~1 ULP, the same known-flip class as conf-sched itself. */
+#define SPEC_DEPTH_MIN PULSAR_SPEC_DEPTH_MIN
+#define SPEC_DEPTH_MAX PULSAR_SPEC_DEPTH_MAX
+#define SPEC_DEPTH_CONF_UP 0.70f
+static uint32_t spec_cur_depth(const pulsar_session *s) {
+    int d = s->spec.spec_adaptive_depth;
+    if (d <= 0) d = s->engine->dspark_draft_tokens;
+    if (d < 1) d = 1;
+    if (d > 16) d = 16;
+    return (uint32_t)d;
+}
+
 /* --- Terminal yield-quench controller (spec-decode Item 4) ---------------
  * Controller design after the Entrpi ds4 yield quench (v0.1.1, MIT): per
  * request, every fused spec step accrues debt = breakeven yield minus
@@ -602,7 +631,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     static int dtree_stats_env = -1;
     const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
-    uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
+    uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
     if (n_draft == 0u) return 0;
     /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
@@ -866,11 +895,11 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     s->spec.dspark_pending_top_k = top_k;
     s->spec.dspark_pending_top_p = top_p;
     s->spec.dspark_pending_min_p = min_p;
+    for (uint32_t i = 0; i < keep; i++)   /* L107: controller reads these in round_end */
+        s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
     if (dtree_stats)
-        for (uint32_t i = 0; i < keep; i++) {
+        for (uint32_t i = 0; i < keep; i++)
             s->spec.dspark_pending_alt[i] = refined2[i + 1];
-            s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
-        }
 
     /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
      * position whose confidence lands in the ~[0.25,0.65] split band (where a
@@ -979,12 +1008,10 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
     for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.dspark_pending[i];
-    /* DTree Phase 0: carry last step's drafter #2 + conf for these pendings. */
+    /* Conf carried unconditionally (L107 controller); drafter #2 is DTree-only. */
+    for (uint32_t i = 0; i < K; i++) pend_conf[i] = s->spec.dspark_pending_conf[i];
     if (dtree_stats)
-        for (uint32_t i = 0; i < K; i++) {
-            pend_alt[i] = s->spec.dspark_pending_alt[i];
-            pend_conf[i] = s->spec.dspark_pending_conf[i];
-        }
+        for (uint32_t i = 0; i < K; i++) pend_alt[i] = s->spec.dspark_pending_alt[i];
     s->spec.dspark_n_pending = 0;
     s->spec.spec_carry_valid = false;
     n_batch = 1u + K;
@@ -1121,6 +1148,31 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         s->spec.spec_draft_tokens += K;
         s->spec.spec_accepted_tokens += (uint64_t)commit;
         s->spec.spec_num_drafts += 1u;
+    }
+
+    /* L107 adaptive draft depth (constants + rationale at spec_cur_depth).
+     * Runs BEFORE the redraft below so the next chain is drafted at the new
+     * depth. commit == depth implies the trimmer kept the whole chain AND the
+     * target accepted all of it (commit <= K <= depth always). A tail conf of
+     * -1 (head didn't run, e.g. conf-sched disabled) passes the UP check: the
+     * full-accept signal alone then drives the climb. Counts-only decision,
+     * deterministic for a fixed stream, same property as yield-quench. */
+    if (K > 0) {
+        const uint32_t depth = spec_cur_depth(s);
+        int next = (int)depth;
+        if (2u * (uint32_t)commit < depth) {
+            next--;
+        } else if ((uint32_t)commit == depth &&
+                   (pend_conf[depth - 1] >= SPEC_DEPTH_CONF_UP ||
+                    pend_conf[depth - 1] < 0.0f)) {
+            next++;
+        }
+        if (next < SPEC_DEPTH_MIN) next = SPEC_DEPTH_MIN;
+        if (next > SPEC_DEPTH_MAX) next = SPEC_DEPTH_MAX;
+        if (dspark_stats && (uint32_t)next != depth)
+            fprintf(stderr, "pulsar: adaptive-k depth %u -> %d (commit=%d K=%u tail=%.2f)\n",
+                    depth, next, commit, K, (double)pend_conf[K - 1]);
+        s->spec.spec_adaptive_depth = next;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
@@ -1273,7 +1325,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
+    uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
     if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is

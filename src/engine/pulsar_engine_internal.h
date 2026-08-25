@@ -1400,12 +1400,23 @@ typedef struct pulsar_spec_carry_state {
      * emitted or forwarded) */
     float spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
     int spec_carry_top_k;
-    /* DTree Phase 0 (PULSAR_DTREE_STATS): the drafter #2 token and confidence
-     * score for each pending draft, carried from the drafting step to the
-     * verify step so a rejection can be scored p2 = P(target correction ==
-     * drafter #2 | #1 rejected), bucketed by conf. Measurement-only. */
+    /* DTree Phase 0 (PULSAR_DTREE_STATS): the drafter #2 token for each
+     * pending draft, carried from the drafting step to the verify step so a
+     * rejection can be scored p2 = P(target correction == drafter #2 | #1
+     * rejected), bucketed by conf. Measurement-only. */
     int32_t dspark_pending_alt[16];
+    /* Confidence-head score per pending draft, carried draft->verify. Stored
+     * UNCONDITIONALLY (-1 when the head didn't run): the L107 adaptive-depth
+     * controller reads the verified chain's tail confidence in round_end, and
+     * DTREE_V reuses it under PULSAR_DTREE_STATS. */
     float   dspark_pending_conf[16];
+    /* L107 adaptive draft depth: the session's CURRENT draft depth, moved
+     * +/-1 per round by the controller in spec_round_end from the realized
+     * accept count and the verified tail confidence. 0 = uninitialized (first
+     * draft reads the engine's --dspark-draft value, which is thereby the
+     * STARTING depth, not a fixed width). Persists across requests in a
+     * session on purpose: a client's workload regime usually does too. */
+    int spec_adaptive_depth;   /* bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct */
     /* --- Temperature-matched draft sampling (spec-decode Item 1) ---
      * At temperature > 0 the drafts above are DRAWN from a temperature-matched
      * proposal q (the drafter's refined logits filtered at the request's
@@ -2701,5 +2712,11 @@ static inline uint16_t f32_to_f16(float f) {
 #endif
 }
 
+
+/* L107 adaptive draft depth bounds (controller in session_spec.cpp; the
+ * sweep measured depth 6 losing on BOTH regimes, so the ceiling is 6). The
+ * /metrics max_draft reports at least MAX so the per-position waterfall
+ * covers every position the controller can reach. */
+enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 6 };
 
 #endif /* PULSAR_ENGINE_INTERNAL_H */

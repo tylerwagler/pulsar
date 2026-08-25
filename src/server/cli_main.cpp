@@ -643,7 +643,7 @@ int main(int argc, char **argv) {
      * into the main artifact), so the state is logged here, never at parse. */
     if (pulsar_engine_has_dspark(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: speculative decoding active (merged drafter, draft depth %d)",
+                   "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
                    pulsar_engine_dspark_draft_tokens(engine));
     } else {
         server_log(PULSAR_LOG_DEFAULT,

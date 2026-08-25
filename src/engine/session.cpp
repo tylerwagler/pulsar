@@ -561,7 +561,8 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
     out->num_drafts = e->spec_num_drafts;
     out->gen_tokens = e->spec_gen_tokens;
     for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
-    out->max_draft = e->dspark_draft_tokens;
+    out->max_draft = e->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
+                         ? e->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;   /* L107: waterfall covers the adaptive range */
     out->has_dspark = e->dspark_ready;
 }
 
@@ -580,7 +581,9 @@ void pulsar_session::spec_metrics(pulsar_spec_metrics *out) const {
     out->draft_tokens = s->spec.spec_draft_tokens;
     out->num_drafts = s->spec.spec_num_drafts;
     out->gen_tokens = s->spec.spec_gen_tokens;
-    out->max_draft = s->engine ? s->engine->dspark_draft_tokens : 0;
+    out->max_draft = !s->engine ? 0
+                    : s->engine->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
+                         ? s->engine->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;
     out->has_dspark = s->engine ? s->engine->dspark_ready : false;
 }
 
