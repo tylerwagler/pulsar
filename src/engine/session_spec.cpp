@@ -1161,11 +1161,26 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         const uint32_t depth = spec_cur_depth(s);
         int next = (int)depth;
         if (2u * (uint32_t)commit < depth) {
-            next--;
+            /* v2 down-veto: the A/B trajectory showed single bad rounds at
+             * depth 5 with tail conf ~0.98 knocking depth down and costing
+             * ~2 t/s until the climb back. When the calibrated head still
+             * believed in the chain (tail >= 0.90 -> measured 1.000-accept
+             * band), forgive ONE down-signal; a second consecutive one backs
+             * off regardless. Prose tails run ~0.5-0.7, so its immediate
+             * back-off is untouched. */
+            if (pend_conf[K - 1] >= 0.90f && !s->spec.spec_depth_down_forgiven) {
+                s->spec.spec_depth_down_forgiven = true;
+            } else {
+                s->spec.spec_depth_down_forgiven = false;
+                next--;
+            }
         } else if ((uint32_t)commit == depth &&
                    (pend_conf[depth - 1] >= SPEC_DEPTH_CONF_UP ||
                     pend_conf[depth - 1] < 0.0f)) {
+            s->spec.spec_depth_down_forgiven = false;
             next++;
+        } else {
+            s->spec.spec_depth_down_forgiven = false;
         }
         if (next < SPEC_DEPTH_MIN) next = SPEC_DEPTH_MIN;
         if (next > SPEC_DEPTH_MAX) next = SPEC_DEPTH_MAX;

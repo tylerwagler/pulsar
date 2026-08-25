@@ -1417,6 +1417,9 @@ typedef struct pulsar_spec_carry_state {
      * STARTING depth, not a fixed width). Persists across requests in a
      * session on purpose: a client's workload regime usually does too. */
     int spec_adaptive_depth;   /* bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct */
+    bool spec_depth_down_forgiven; /* L107 v2: one down-signal was vetoed on a
+                                    * still-confident tail; a second consecutive
+                                    * one backs off regardless */
     /* --- Temperature-matched draft sampling (spec-decode Item 1) ---
      * At temperature > 0 the drafts above are DRAWN from a temperature-matched
      * proposal q (the drafter's refined logits filtered at the request's
