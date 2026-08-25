@@ -53,7 +53,15 @@ constexpr int kMTile      = 128;
 constexpr int kNTile      = 64;
 constexpr int kWarps      = 8;
 constexpr int kThreads    = 32 * kWarps;
-constexpr int kStages     = 2;
+constexpr int kStages     = 2;  // act PREFETCH DISTANCE (issue at k for k+2)
+/* Act ring DEPTH.  Depth must EXCEED the prefetch distance or the issue at
+ * iter k targets ((k+dist) % depth) == the very slot being read at k -- true
+ * at ANY depth when depth == distance, which is why the old 2/2 scheme needed
+ * a second full-block barrier between the MMA fold (reads) and the prefetch
+ * issue (writes).  At depth 3 / distance 2 the write slot (k+2)%3 never
+ * aliases the read slot k%3, and the remaining per-iteration barrier bounds
+ * warp spread to one iteration so no third slot is ever live (L099). */
+constexpr int kActDepth   = 3;
 constexpr int kNFrag      = kNTile / 8;
 constexpr int kRawStages  = 2;  // k256 raw slots; NT=64 stays under 48 KiB.
 constexpr int kIQ2RawRowsPerWarp = 16;
@@ -65,7 +73,8 @@ constexpr int kActPrefetchTrips = (kActPrefetchItems + kThreads - 1) / kThreads;
 
 static_assert(kNTile == 64, "D2R production path is CFG1 NT64 only");
 
-static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two act stages");
+static_assert(kStages == 2, "D2R act prefetch distance is 2");
+static_assert(kActDepth > kStages, "act ring depth must exceed the prefetch distance -- equal means the issue aliases the current read slot (L099)");
 static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
 static_assert(kActPrefetchTrips == 3, "unexpected act issue trip count");
 static_assert(kIQ2RawQCodeTrips == 4, "unexpected IQ2 raw-ring issue trip count");
@@ -208,7 +217,7 @@ __device__ __forceinline__ int d2r_tig() {
 }
 
 __device__ __forceinline__ int d2r_act_stage(int k128_iter) {
-    return k128_iter & (kStages - 1);
+    return k128_iter % kActDepth;
 }
 
 __device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
@@ -217,7 +226,7 @@ __device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
 
 template <bool FullTile>
 __device__ __forceinline__ void issue_act_prefetch_one(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const char * __restrict__ act_iter_base,
         int col_count, int stage, int t) {
     constexpr int cols = kNFrag * 8;
@@ -234,7 +243,7 @@ __device__ __forceinline__ void issue_act_prefetch_one(
 
 template <bool FullTile, int Iter>
 __device__ __forceinline__ void issue_act_prefetch_unrolled(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const char * __restrict__ act_iter_base,
         int col_count, int stage, int tid) {
     if constexpr (Iter < kActPrefetchTrips) {
@@ -253,7 +262,7 @@ __device__ __forceinline__ void issue_act_prefetch_unrolled(
 
 template <bool FullTile>
 __device__ __forceinline__ void issue_act_prefetch(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter, int tid) {
     const char *act_tile_base = s_inv.act_tile_base;
@@ -268,7 +277,7 @@ __device__ __forceinline__ void issue_act_prefetch(
 }
 
 __device__ __forceinline__ void issue_act_prefetch_one_fast(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const char * __restrict__ act_iter_base,
         int stage, int t) {
     constexpr int cols = kNFrag * 8;
@@ -284,7 +293,7 @@ __device__ __forceinline__ void issue_act_prefetch_one_fast(
 
 template <int Iter>
 __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const char * __restrict__ act_iter_base,
         int stage, int tid) {
     if constexpr (Iter < kActPrefetchTrips) {
@@ -301,7 +310,7 @@ __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
 }
 
 __device__ __forceinline__ void issue_act_prefetch_fast(
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter) {
     const char *act_iter_base =
@@ -359,7 +368,7 @@ static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
 template <int NFrag, typename TileB>
 __device__ __forceinline__ void load_B_tile(
         TileB &B,
-        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int stage, int nf, int k_in_act) {
     const int *base = reinterpret_cast<const int *>(&s_act[stage][nf][0].qs[k_in_act]);
     ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_mx_act_mmq) / sizeof(int));
@@ -626,7 +635,7 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int raw_stage, int act_stage, bool raw_row0_ok, bool raw_row1_ok,
         int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
     static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
@@ -679,7 +688,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
-        const block_mx_act_mmq (&s_act)[kStages][NFrag][8],
+        const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int k128_iter, const volatile SmemInvariants &s_inv) {
     const int warp = d2r_warp();
     const int group = d2r_group();
@@ -718,7 +727,7 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
 template <bool FullTile, typename TileA, typename TileB, typename TileC>
 __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[kNFrag][TileC::ne],
-        block_mx_act_mmq (&s_act)[kStages][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_grid,
         const volatile SmemInvariants &s_inv) {
@@ -751,13 +760,31 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
         if (k128_iter >= s_inv.k128_iters) {
             break;
         }
-        if ((k128_iter & 1) == 0) {
-            int keep_raw = 0;
-            if constexpr (kRawStages > 1) {
-                keep_raw = ((k128_iter >> 1) + 1 < s_inv.nb) ? 1 : 0;
-            }
-            cp_async_wait_keep(keep_raw);
+        /* Per-iteration wait, keep derived exactly (L099).  The commit-group
+         * timeline per thread is: prologue A0,A1,R0,R1, then each iter j
+         * commits act(j+kStages) (if in range) and, on odd j, raw((j>>1)+
+         * kRawStages) (if in range) -- act first, raw second.  The LATEST
+         * group this iteration depends on is act(k) (committed at iter k-2)
+         * for k >= kStages, else raw(k>>1) from the prologue.  keep = the
+         * number of groups committed AFTER that one:
+         *   k <  kStages: only R1 can follow R0            -> keep = (nb > 1)
+         *   k >= kStages: raw at iter k-2 (odd, in range)
+         *               + act(k+1) (if k+1 < iters)
+         *               + raw at iter k-1 (odd, in range)  -> keep in 0..2
+         * Under-waiting reads a half-filled tile; over-waiting only stalls.
+         * The tail terms shrink keep exactly when nothing newer was issued,
+         * so the needed group is always completed. */
+        int keep;
+        if (k128_iter < kStages) {
+            keep = (s_inv.nb > 1) ? 1 : 0;
+        } else {
+            keep = 0;
+            const int jm2 = k128_iter - 2, jm1 = k128_iter - 1;
+            if ((jm2 & 1) && ((jm2 >> 1) + kRawStages < s_inv.nb)) keep++;
+            if (k128_iter + 1 < s_inv.k128_iters) keep++;
+            if ((jm1 & 1) && ((jm1 >> 1) + kRawStages < s_inv.nb)) keep++;
         }
+        cp_async_wait_keep(keep);
         __syncthreads();
         if ((k128_iter & 1) == 0) {
             /* dq LDG for the raw prefetch issued at the NEXT (odd) iteration:
@@ -776,7 +803,12 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
                 acc, s_raw, s_grid, s_act, k128_iter, s_inv);
         }
 
-        __syncthreads();
+        /* No second block barrier (L099).  The act issue below writes slot
+         * (k+kStages) % kActDepth, disjoint from the slot any warp can still
+         * be reading (depth > distance); the raw issue rewrites a slot this
+         * WARP alone owns, so only intra-warp ordering is needed -- the
+         * __syncwarp() at the raw issue replaces the ordering the block
+         * barrier used to provide against independent thread scheduling. */
         const int pf_iter = k128_iter + kStages;
         if (pf_iter < s_inv.k128_iters) {
             if constexpr (FullTile) {
@@ -788,6 +820,7 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
         if ((k128_iter & 1) != 0) {
             const int raw_pf = (k128_iter >> 1) + kRawStages;
             if (raw_pf < s_inv.nb) {
+                __syncwarp();
                 if constexpr (FullTile) {
                     issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, dq_pend);
                 } else {
@@ -938,7 +971,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
      * the names still said int8, and a name that outlives its format is not
      * cosmetic -- reading `block_q8_1_mmq` as evidence the MoE still ran q8_1 is
      * exactly how L065 got written and retracted.  See ds4_act_block.cuh. */
-    __shared__ __align__(16) block_mx_act_mmq s_act[kStages][kNFrag][8];
+    __shared__ __align__(16) block_mx_act_mmq s_act[kActDepth][kNFrag][8];
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) uint2 s_grid[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
