@@ -2057,6 +2057,18 @@ int server::worker_find_fuse_prefills(session_slot **out, int max_out) {
         }
     }
     pulsar_session *pool = s->sess;
+    /* The prefill-depth term below exists to protect ACTIVE DECODERS from
+     * bandwidth displacement (the 4x8192 regime). With no decoder in flight
+     * -- the co-prefill carrier's whole case -- there is nothing to displace,
+     * and summed ABSOLUTE positions would veto every warm-restored prefill
+     * (they start at 20k+), which is exactly the workload the lane exists
+     * for. Scope the term to decoder-present quanta. */
+    int n_dec_live = 0;
+    for (int i = 0; i < s->n_slots; i++) {
+        const session_slot *dl = &s->slots[i];
+        if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING)
+            n_dec_live++;
+    }
     int npf = 0;
     long pf_depth = 0;   /* L112 inc A: summed positions of SELECTED prefills */
     for (int i = 0; i < s->n_slots && npf < max_out; i++) {
@@ -2068,13 +2080,7 @@ int server::worker_find_fuse_prefills(session_slot **out, int max_out) {
         const int P = pulsar_session_bank_pos(pool, sl->bank);
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
-        /* L112 inc A depth guard: the SECOND prefill onward joins only while the
-         * selected prefills' summed positions stay under the same threshold that
-         * bounds decode-side depth. Two deep prefill runs in one sweep read two
-         * deep KV prefixes for attention -- the displacement mechanism the
-         * 4x8192 measurement punished. The FIRST qualifier always folds (that is
-         * today's P=1 behavior, unchanged). */
-        if (npf > 0 && s->mixed_deep_guard_rows > 0 &&
+        if (n_dec_live >= 1 && npf > 0 && s->mixed_deep_guard_rows > 0 &&
             pf_depth + P > (long)s->mixed_deep_guard_rows)
             continue;
         pf_depth += P;
