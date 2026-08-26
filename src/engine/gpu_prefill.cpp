@@ -2248,6 +2248,13 @@ bool gpu_graph_encode_layer_attention_batch(
         ok = gpu_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
     if (ok) {
+        /* L112 bisect hooks: expand_split's two UN-dumped inputs — the real
+         * carrier (hc_attn_pre dumps batch_attn_cur, a different tensor) and
+         * the Sinkhorn'd split coefficients the weighted-sum wrote. */
+        gpu_graph_debug_dump_hc_tensor("hc_carrier_in", g->batch_cur_hc,
+                                      (uint64_t)n_tokens * hc_dim, il, pos0);
+        gpu_graph_debug_dump_tensor("hc_split_coefs", g->batch_hc_split,
+                                      (uint64_t)n_tokens * mix_hc, il, pos0);
         ok = pulsar_gpu_hc_expand_split_tensor(after_attn_hc_view,
                                             g->batch_attn_out,
                                             g->batch_cur_hc,
