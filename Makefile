@@ -948,6 +948,9 @@ tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/pulsar_engin
 tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.cpp
 
+tests/cobatch_bisect_probe.o: tests/cobatch_bisect_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/cobatch_bisect_probe.cpp
+
 # Public-API only (pulsar.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
 # PULSAR_GATE_BUILD_REF stamps the blob with the git HEAD that built the dumper, so
@@ -1013,6 +1016,9 @@ tests/mixed_prefill_gate: tests/mixed_prefill_gate.o src/lib/pulsar_help.o $(COR
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/mixed_neutrality_gate: tests/mixed_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/cobatch_bisect_probe: tests/cobatch_bisect_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
