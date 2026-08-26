@@ -716,6 +716,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    /* L112 bisect hook: the RAW mix GEMM output, before Sinkhorn touches it —
+     * separates cuBLAS-M-dependence from Sinkhorn-shape-dependence. */
+    if (ok) gpu_graph_debug_dump_tensor("hc_mix_raw", g->batch_hc_mix,
+                                          (uint64_t)n_tokens * mix_hc, il, pos0);
     {
         /* ...and the E4M3 encoding too: batch_attn_norm feeds seven MXFP8
          * projections, every one of which would otherwise wait on a separate
