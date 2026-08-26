@@ -54,6 +54,7 @@ static bool populate(pulsar_session *s, uint32_t bank, int off) {
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s MODEL solo|cob\n", argv[0]); return 2; }
     const bool cob = strcmp(argv[2], "cob") == 0;
+    const bool classic = strcmp(argv[2], "classic") == 0;
     pulsar_engine_options o; memset(&o, 0, sizeof o);
     o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
     if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
@@ -69,6 +70,22 @@ int main(int argc, char **argv) {
     }
     if (!populate(s, 0, 0)) return 1;
     if (cob && !populate(s, 1, OFFB)) return 1;
+
+    if (classic) {
+        /* Classic-path reference: extend [0,C0) to [0,C0+K4) via
+         * pulsar_session_sync -- the path a LONE arrival takes. Same
+         * positions, same rows, same dump stamps (pos0 = C0) as the sweep
+         * modes, so dump files compare directly. */
+        char e[256];
+        pulsar_tokens p = { .v = g_toks.v, .len = C0 + K4, .cap = C0 + K4 };
+        if (pulsar_session_sync(s, &p, e, sizeof e) != 0) {
+            fprintf(stderr, "classic resume failed: %s\n", e); return 1;
+        }
+        printf("PROBE classic: sync ok, argmax=%d\n", pulsar_session_argmax(s));
+        pulsar_session_free(s);
+        pulsar_engine_close(g_e);
+        return 0;
+    }
 
     const int vocab = (int)PULSAR_N_VOCAB;
     const int nrows = cob ? 2 * K4 : K4;
