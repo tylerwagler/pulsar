@@ -1751,18 +1751,46 @@ bool gpu_graph_encode_output_head_batch(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = output_pre && output_weights && output_embd && output_norm && logits;
 
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
-                                                 (const pulsar_model *)model,
-                                                 weights->output_hc_fn,
-                                             hc_dim,
-                                             PULSAR_N_HC,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    /* L112 inc C: the head's norm+mix runs the SAME fused kernel the classic
+     * head uses, once per row -- the unfused rms+matmul pair it replaced here
+     * diverged from the fused GEMV at ~8e-4 (the pair's core rounds the
+     * normed activations to bf16; the fused kernel computes in f32 -- the
+     * "byte-identical to the pair" claim on the fused kernel described the
+     * pre-L079 f16 pair and went stale). One kernel, one arithmetic: a lone
+     * classic arrival and a co-batched run now produce the same head bytes.
+     * head-row counts are <= 16, so the per-row launches are noise. */
+    if (ok && (weights->output_hc_fn->type == PULSAR_TENSOR_BF16 ||
+               weights->output_hc_fn->type == PULSAR_TENSOR_F32)) {
+        const uint64_t xrow = hc_dim * PULSAR_HC_ELT_SIZE;
+        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            pulsar_gpu_tensor *xr = pulsar_gpu_tensor_view(g->batch_cur_hc,
+                                                        (uint64_t)t * xrow, xrow);
+            pulsar_gpu_tensor *orow = pulsar_gpu_tensor_view(output_pre,
+                                                          (uint64_t)t * PULSAR_N_HC * sizeof(float),
+                                                          (uint64_t)PULSAR_N_HC * sizeof(float));
+            ok = xr && orow &&
+                 pulsar_gpu_hc_norm_mix_tensor(orow, model->map, model->size,
+                                            weights->output_hc_fn->abs_offset,
+                                            hc_dim, PULSAR_N_HC, xr,
+                                            PULSAR_RMS_EPS,
+                                            weights->output_hc_fn->type) != 0;
+            pulsar_gpu_tensor_free(orow);
+            pulsar_gpu_tensor_free(xr);
+        }
+    } else if (ok) {
+        ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                  g->batch_cur_hc,
+                                                  (uint32_t)hc_dim,
+                                                  n_tokens,
+                                                  PULSAR_RMS_EPS) != 0 &&
+             gpu_graph_matmul_plain_tensor(output_pre,
+                                          (const pulsar_model *)model,
+                                          weights->output_hc_fn,
+                                          hc_dim,
+                                          PULSAR_N_HC,
+                                          g->batch_flat_hc,
+                                          n_tokens) != 0;
+    }
     if (ok) gpu_graph_debug_dump_tensor("result_hc_pre", output_pre,
                                           (uint64_t)n_tokens * PULSAR_N_HC, PULSAR_N_LAYER, 0);
     if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights,
