@@ -288,7 +288,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     pulsar_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (pulsar_session_stage_payload(w->session, &staged,
+    if (pulsar_session_stage_payload(w->session, &staged, w->cache_dir,
                                   save_err, sizeof(save_err)) != 0) {
         snprintf(err, err_len, "%s",
                  save_err[0] ? save_err : "session has no valid KV payload");

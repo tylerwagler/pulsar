@@ -1708,7 +1708,8 @@ struct pulsar_session {
     uint32_t prefill_quantum_min_suffix() const;
     const pulsar_tokens *tokens();
     uint64_t payload_bytes();
-    int stage_payload(pulsar_session_payload_file *out, char *err, size_t errlen);
+    int stage_payload(pulsar_session_payload_file *out, const char *stage_dir,
+                      char *err, size_t errlen);
     int save_payload(FILE *fp, char *err, size_t errlen);
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
     int save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen);

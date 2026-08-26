@@ -353,6 +353,7 @@ void pulsar_session_payload_file_free(pulsar_session_payload_file *payload) {
 
 
 int pulsar_session::stage_payload(pulsar_session_payload_file *out,
+                              const char *stage_dir,
                               char *err, size_t errlen) {
     auto *s = this;
     if (!out) {
@@ -365,8 +366,30 @@ int pulsar_session::stage_payload(pulsar_session_payload_file *out,
         return 1;
     }
 
-    char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+    /* L110 F5: stage in the CALLER's disk directory, not /tmp. On the GB10
+     * serving box /tmp is tmpfs, and unified memory means a multi-GiB staged
+     * payload competes with GPU KV banks for the same physical pool -- worst
+     * at deep-session stores, exactly when memory is tightest. NULL falls
+     * back to /tmp for callers with no disk dir (tests). */
+    char tmpl[1024];
+    const int n = snprintf(tmpl, sizeof tmpl, "%s/ds4-session-payload.XXXXXX",
+                           stage_dir && stage_dir[0] ? stage_dir : "/tmp");
+    if (n < 0 || (size_t)n >= sizeof tmpl - 32) {
+        payload_set_err(err, errlen, "session payload staging dir path too long");
+        return 1;
+    }
     int fd = mkstemp(tmpl);
+    /* Rename onto the house "<name>.tmp.<pid>" convention so the kvstore's
+     * boot-scan orphan GC reclaims a crash-abandoned staged file (it lives in
+     * the store dir now); the live-pid check keeps in-flight saves safe when
+     * two servers share a cache dir. Best-effort: on rename failure keep the
+     * mkstemp name (worst case a crash leaks one skipped file, /tmp-era
+     * behavior). */
+    char named[1056];
+    if (fd >= 0) {
+        snprintf(named, sizeof named, "%s.tmp.%ld", tmpl, (long)getpid());
+        if (rename(tmpl, named) == 0) memcpy(tmpl, named, strlen(named) + 1);
+    }
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");
         return 1;

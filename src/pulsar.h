@@ -619,8 +619,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 15u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
+/* stage_dir: directory for the transient staged file (the caller's disk
+ * dir). NULL/"" falls back to /tmp -- avoid on tmpfs boxes, where staged
+ * bytes are RAM (L110 F5). */
 int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
-                              char *err, size_t errlen);
+                              const char *stage_dir, char *err, size_t errlen);
 int pulsar_session_write_staged_payload(const pulsar_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void pulsar_session_payload_file_free(pulsar_session_payload_file *payload);

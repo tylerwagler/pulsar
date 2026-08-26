@@ -838,7 +838,8 @@ public:
         }
 
         pulsar_session_payload_file staged = {};
-        if (pulsar_session_stage_payload(session, &staged,
+        /* Stage in the store's own dir (real disk), not /tmp (L110 F5). */
+        if (pulsar_session_stage_payload(session, &staged, kc_.dir,
                                       save_err, sizeof(save_err)) != 0) {
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
                  "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
