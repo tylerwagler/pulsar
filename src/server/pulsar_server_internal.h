@@ -866,8 +866,12 @@ typedef struct {
 #define PULSAR_SESSION_POOL_CAP 16
 /* L112 inc A: hard ceiling on prefills folded into one fused quantum (the
  * config knob mixed_max_prefills clamps to this). Bank-count math: 16 runs
- * (PULSAR_MSEQ_MAX) bound decode banks + prefill runs together. */
-#define PULSAR_SERVER_MIXED_MAX_PF 4
+ * (PULSAR_MSEQ_MAX) bound decode banks + prefill runs together, so 8 prefills
+ * still leaves 8 decode banks. Note the fused lane splits its per-step fold
+ * budget (mixed_chunk_tokens, default 8) across the prefills -- beyond ~4 the
+ * per-step sub-chunks get thin there; the co-prefill carrier (inc B) is the
+ * lane that scales to 6+ concurrent streams with chunk-sized splits. */
+#define PULSAR_SERVER_MIXED_MAX_PF 8
 /* Auto-sizing cap: the batched custom-nt matmul lane and the split-KV decode
  * gate cap their fast paths at 8 rows, and N=12 aggregate decode holds 29.2
  * tok/s at 8 banks vs 21.9 at 12 (>8-row steps fall to the slow lanes) — so

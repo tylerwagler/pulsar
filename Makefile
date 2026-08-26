@@ -391,7 +391,7 @@ cuda-algo-stability-gate: tests/algo_stability_gate
 # plan-34 phase-2 inc 3: K-row single-bank prefill through the mixed entry —
 # coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.
 cuda-mixed-prefill-gate: tests/mixed_prefill_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=6 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
 
 # Artifact-only, no GPU, seconds: does the ROUTER agree with the artifact's own
 # REAP declaration? A router left in source expert order against compacted

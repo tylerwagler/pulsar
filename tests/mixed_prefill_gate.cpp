@@ -324,6 +324,106 @@ int main(int argc,char**argv){
         }
     }
 
+
+    /* GATE 6 (L112 inc C, the 6-STREAM requirement tested AT 6): six K-row
+     * runs from six banks in ONE sweep, each bitwise identical to its own
+     * single-run reference. The determinism argument is row-local (no P
+     * dependence), but the requirement names six streams, so six streams is
+     * the shape that gates it. Offsets 600*r give distinct content per run;
+     * runs whose text would overrun the prompt are dropped (P degrades, gate
+     * still meaningful at P>=3). */
+    {
+        const int PMAX6 = 6, K6 = 257, STRIDE6 = 600;
+        pulsar_session *s6 = NULL;
+        int P = 0;
+        if (pulsar_session_create(&s6, g_e, 4096) != 0) {
+            printf("GATE 6: skipped (session)\n");
+        } else if (s6->graph.banks.n_banks < 3) {
+            printf("GATE 6: skipped (pool %u < 3 banks; run with PULSAR_MSEQ_BANKS=6)\n",
+                   s6->graph.banks.n_banks);
+            pulsar_session_free(s6); s6 = NULL;
+        } else {
+            const int maxp = (int)s6->graph.banks.n_banks < PMAX6
+                           ? (int)s6->graph.banks.n_banks : PMAX6;
+            for (int r = 0; r < maxp; r++)
+                if (STRIDE6 * r + C0 + K6 <= g_toks.len) P = r + 1;
+            if (P < 3) {
+                printf("GATE 6: skipped (prompt fits only %d runs)\n", P);
+                pulsar_session_free(s6); s6 = NULL;
+            }
+        }
+        if (s6 && P >= 3) {
+            float **refs = (float **)malloc((size_t)P * sizeof(float *));
+            float *lgP = (float *)malloc((size_t)P * vocab * sizeof(float));
+            bool ok = refs && lgP;
+            for (int r = 0; ok && r < P; r++) {
+                refs[r] = (float *)malloc((size_t)vocab * sizeof(float));
+                const int off = STRIDE6 * r;
+                pulsar_session *sr = NULL;
+                ok = refs[r] && pulsar_session_create(&sr, g_e, 4096) == 0;
+                if (ok) {
+                    pulsar_gpu_graph *gr = &sr->graph; char e6[256];
+                    if (gr->banks.n_banks && !gpu_graph_bank_repoint(gr, 0)) ok = false;
+                    if (ok) {
+                        pulsar_session_invalidate(sr);
+                        pulsar_tokens pc = {.v = g_toks.v + off, .len = C0, .cap = C0};
+                        if (pulsar_session_sync(sr, &pc, e6, sizeof e6) != 0) ok = false;
+                    }
+                    if (ok) {
+                        gpu_graph_bank_counters_capture(gr, 0);
+                        pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc((size_t)K6 * sizeof(*rq));
+                        for (int j = 0; j < K6; j++) { rq[j].bank = 0; rq[j].pos = C0 + j; rq[j].token = g_toks.v[off + C0 + j]; }
+                        uint32_t nr6 = 0;
+                        if (pulsar_session_decode_mixed(sr, rq, (uint32_t)K6, refs[r], vocab, &nr6, 0u, e6, sizeof e6) != 0 || nr6 != 1) ok = false;
+                        free(rq);
+                    }
+                }
+                if (sr) pulsar_session_free(sr);
+            }
+            if (ok) {
+                pulsar_gpu_graph *g6 = &s6->graph; char e6[256];
+                for (int r = 0; ok && r < P; r++) {
+                    const int off = STRIDE6 * r;
+                    if (!gpu_graph_bank_repoint(g6, (uint32_t)r)) { ok = false; break; }
+                    pulsar_session_invalidate(s6);
+                    pulsar_tokens pc = {.v = g_toks.v + off, .len = C0, .cap = C0};
+                    if (pulsar_session_sync(s6, &pc, e6, sizeof e6) != 0) { ok = false; break; }
+                    gpu_graph_bank_counters_capture(g6, (uint32_t)r);
+                }
+                if (ok) {
+                    pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc((size_t)P * K6 * sizeof(*rq));
+                    int wq = 0;
+                    for (int r = 0; r < P; r++)
+                        for (int j = 0; j < K6; j++, wq++) {
+                            rq[wq].bank = (uint32_t)r; rq[wq].pos = C0 + j;
+                            rq[wq].token = g_toks.v[STRIDE6 * r + C0 + j];
+                        }
+                    uint32_t nr6 = 0;
+                    if (pulsar_session_decode_mixed(s6, rq, (uint32_t)(P * K6), lgP, P * vocab, &nr6, 0u, e6, sizeof e6) != 0 ||
+                        nr6 != (uint32_t)P) ok = false;
+                    free(rq);
+                }
+            }
+            if (ok) {
+                int bad = 0;
+                for (int r = 0; r < P; r++) {
+                    long fd = -1;
+                    const float *row = lgP + (size_t)r * vocab;
+                    for (int i2 = 0; i2 < vocab; i2++) if (row[i2] != refs[r][i2]) { fd = i2; break; }
+                    if (fd >= 0) {
+                        fprintf(stderr, "GATE 6 FAIL: run %d/%d not bitwise (first diff %ld)\n", r, P, fd);
+                        bad = 1;
+                    }
+                }
+                if (!bad) printf("GATE 6: P=%d co-batched sweep BITWISE IDENTICAL to %d single runs\n", P, P);
+                else g_fail = 1;
+            } else { fprintf(stderr, "GATE 6 FAIL: setup/sweep failed\n"); g_fail = 1; }
+            for (int r = 0; r < P; r++) if (refs && refs[r]) free(refs[r]);
+            free(refs); free(lgP);
+            pulsar_session_free(s6);
+        }
+    }
+
 done:
     pulsar_engine_close(g_e);
     if(g_fail){ fprintf(stderr,"MIXED-PREFILL GATE: FAIL\n"); return 1; }
