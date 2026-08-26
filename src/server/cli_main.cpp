@@ -967,15 +967,13 @@ int main(int argc, char **argv) {
         if (s.mixed_deep_guard_rows < 0) s.mixed_deep_guard_rows = 0;
         /* L112 inc A: prefills folded per fused quantum. The step budget is
          * SPLIT across them, so this raises ingest concurrency, not row count.
-         * ⚠ DEFAULT 1 (= the proven P=1 behavior): the P=2 gates (mixed-prefill
-         * GATE 4, neutrality GATE 5, 2026-08-26) show the engine's in-sweep
-         * batched attention assumes ONE contiguous prefill run -- with two
-         * K-row runs the LATER run's rows attend across the earlier run's rows
-         * (decode rows stay byte-identical; prefill last-row logit rel-RMS
-         * 5e-2 / 2.5e-1 vs 2e-4 single-run). Do NOT raise past 1 until the
-         * per-run mask lands in the engine and both gates go green. */
+         * DEFAULT 4: the gating condition on the earlier default-1 ("until
+         * both gates go green") is met -- the co-batch gates are BITWISE
+         * (GATE 4/5/6, rel-RMS 0.0) since the M-neutral MMA core landed; the
+         * suspected cross-run contamination was disproven (twin bitwise) and
+         * the real cause (M-dependent cuBLAS reduction orders) is gone. */
         const char *mp = getenv("PULSAR_MIXED_MAX_PREFILLS");
-        s.mixed_max_prefills = mp ? atoi(mp) : 1;
+        s.mixed_max_prefills = mp ? atoi(mp) : 4;
         if (s.mixed_max_prefills < 1) s.mixed_max_prefills = 1;
         if (s.mixed_max_prefills > PULSAR_SERVER_MIXED_MAX_PF)
             s.mixed_max_prefills = PULSAR_SERVER_MIXED_MAX_PF;
