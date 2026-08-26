@@ -76,7 +76,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test
 
 all: help
 
@@ -352,6 +352,9 @@ src/engine/%.o: src/engine/%.c src/engine/pulsar_engine_internal.h src/pulsar.h 
 src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
+src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+
 src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/rax.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
@@ -484,9 +487,18 @@ pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o 
 pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
+# TP transport-core unit test (branch tensor_parallel, slice 1).  Host-only:
+# no CUDA, no sockets -- builds and runs with plain g++.  Pins the slab
+# layout + identity contract the transport lift builds on.
+tests/tp_core_test: tests/tp_core_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_core_test.cpp src/tp/pulsar_tp.cpp
+
+tp-core-test: tests/tp_core_test
+	./tests/tp_core_test
+
 test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
