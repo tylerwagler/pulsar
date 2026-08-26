@@ -2531,20 +2531,41 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
             return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
         }
     }
-    /* L112 inc C (2026-08-26): the cublasGemmEx arm that served n_tok > 16 is
-     * GONE. CUBLAS_GEMM_DEFAULT selects its algorithm per shape, so the same
-     * row computed at two batch widths accumulated in two different orders --
-     * measured M=257 vs M=514 on hc_attn_fn: 74% of output elements differ,
-     * max|d| 1.2e-4 over the 57344-deep dots, which bf16 carrier rounding and
-     * 43 layers amplified to the co-batch gate failures (rel-RMS 5e-2). It was
-     * the ONLY M-dependent arm in the layer: the five-phase bisect found every
-     * other stage bitwise M-stable. The per-row order of matmul_bf16_kernel
-     * below is IDENTICAL to the NT arm's and the n==1 path's (same 256-stride
-     * k-loop, same tree reduction), so with cuBLAS gone this core is per-row
-     * deterministic at EVERY n_tok: co-batched prefill == solo prefill ==
-     * fused-fold, byte for byte -- the "same result at 1 stream or 6"
-     * requirement. Perf: bounded by the pre-L079 SIMT era for this family
-     * (~6% of prefill, halved bytes at bf16); re-priced in the L112 A/B. */
+    /* L112 inc C (2026-08-26): SHAPE-ROUTED arms, for the "same result at 1
+     * stream or 6" requirement (co-batched == solo == fused-fold, byte for
+     * byte). CUBLAS_GEMM_DEFAULT picks per-shape algorithms, and the probe
+     * (tests/cublas_mstable_probe.cu, GB10/CUDA 13.3) measured:
+     *   - SKINNY N (hc_mix: K=28672 N=24): EVERY algo M-UNSTABLE -- split-K
+     *     is forced for occupancy and split-K reassociates per M. The same
+     *     row at M=257 vs 514 differed on 74% of elements (max|d| 1.2e-4 over
+     *     the 57344-deep dots), which bf16 carrier rounding + 43 layers
+     *     amplified into the co-batch gate failures.
+     *   - WIDE N (>= 512 across the family's shapes): every algo M-STABLE in
+     *     both the sweep (257v514) and chunk (2048v4096) regimes -- enough
+     *     output tiles that no split-K runs, so per-row results are already
+     *     M-independent.
+     * Route: wide N keeps cuBLAS (the perf-critical mass -- deleting it
+     * outright measured -60% promessi prefill); skinny N takes the SIMT
+     * kernel below, whose per-row order matches the NT arm's and the n==1
+     * path's, and whose cost at N < 256 is noise. The wide-arm M-stability
+     * is EMPIRICAL, not contractual: the bitwise gates (mixed-prefill GATE
+     * 1/4/6) run the property every ledger and fail loudly if a CUDA upgrade
+     * changes it. */
+    if (g_cublas_ready && n_tok > 1 && out_dim >= 256) {
+        const uint16_t *xb = (const uint16_t *)xb16;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(g_cublas,
+                                         CUBLAS_OP_T, CUBLAS_OP_N,
+                                         (int)out_dim, (int)n_tok, (int)in_dim,
+                                         &alpha,
+                                         w, CUDA_R_16BF, (int)in_dim,
+                                         xb, CUDA_R_16BF, (int)in_dim,
+                                         &beta,
+                                         out->ptr, CUDA_R_32F, (int)out_dim,
+                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return cublas_ok(st, "bf16 matmul");
+    }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, xb16, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
