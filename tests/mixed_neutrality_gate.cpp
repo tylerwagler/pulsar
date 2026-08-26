@@ -42,6 +42,7 @@ static int g_n_dec = 2;
 #define C0    128               /* prefill bank's classic first chunk (lifts frontier off 0) */
 #define K_PRE 64                /* prefill run length; >8 => grouped MoE suffix taken */
 #define PBASE 700               /* prefill bank token region (distinct from decode banks) */
+#define PBASE2 (PBASE + 900)     /* second co-batched prefill: distinct content */
 
 static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
@@ -163,12 +164,12 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
 
 /* classic RESUME reference for the prefill bank: fresh session, prefill [0,C0)
  * then resume to [0,C0+K), copy last-position logits + next token. */
-static bool classic_resume(int K, float *out_lg, int *next_tok) {
+static bool classic_resume_at(int base, int K, float *out_lg, int *next_tok) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
     pulsar_gpu_graph *g = &s->graph;
     char err[256]; bool ok = true;
-    const int *pptr = g_toks.v + PBASE;
+    const int *pptr = g_toks.v + base;
     if (g->banks.n_banks && !gpu_graph_bank_repoint(g, 0)) { pulsar_session_free(s); return false; }
     pulsar_session_invalidate(s);
     pulsar_tokens p0 = { .v = (int *)pptr, .len = C0, .cap = C0 };
@@ -182,6 +183,10 @@ static bool classic_resume(int K, float *out_lg, int *next_tok) {
     }
     pulsar_session_free(s);
     return ok;
+}
+
+static bool classic_resume(int K, float *out_lg, int *next_tok) {
+    return classic_resume_at(PBASE, K, out_lg, next_tok);
 }
 
 static long first_diff(const float *a, const float *b, long n) {
@@ -269,6 +274,94 @@ int main(int argc, char **argv) {
            g_n_dec, g_n_dec, K_PRE, g_n_dec, g_n_dec + K_PRE, g_n_dec,
            (g_n_dec >= 2 && K_PRE > 8) ? "OK" : "MISCONFIGURED");
     if (!(g_n_dec >= 2 && K_PRE > 8)) { fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>8)\n"); g_fail = 1; }
+
+
+    /* GATE 5 (L112 inc A): decode neutrality with TWO co-batched prefill runs.
+     * Rows = [decode banks][K run @ bank n_dec][K run @ bank n_dec+1]; the decode
+     * banks' logit rows must be BYTE-IDENTICAL to the decode-only reference
+     * (the same oracle as GATE 4/1, now with a second run in the sweep), and
+     * each prefill run's last-row logits must match its classic-resume
+     * reference. Skips when the pool cannot host n_dec+2 banks (the wide
+     * variant runs 12+1 = 13 of 13). */
+    {
+        pulsar_session *s5 = NULL;
+        bool ok = pulsar_session_create(&s5, g_e, 4096) == 0;
+        const uint32_t need = (uint32_t)g_n_dec + 2u;
+        if (ok && gpu_graph_bank_pool_count(&s5->graph) < need) {
+            printf("GATE 5: skipped (pool %u < %u banks)\n",
+                   gpu_graph_bank_pool_count(&s5->graph), need);
+            pulsar_session_free(s5); s5 = NULL;
+        } else if (ok) {
+            pulsar_gpu_graph *g5 = &s5->graph; char err5[256];
+            const int vocab = (int)PULSAR_N_VOCAB;
+            int argtok[N_DEC_MAX];
+            for (int k = 0; ok && k < g_n_dec; k++) {
+                if (!gpu_graph_bank_repoint(g5, (uint32_t)k)) { ok = false; break; }
+                pulsar_session_invalidate(s5);
+                pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
+                if (pulsar_session_sync(s5, &p, err5, sizeof err5) != 0) { ok = false; break; }
+                gpu_graph_bank_counters_capture(g5, (uint32_t)k);
+                argtok[k] = pulsar_session_argmax(s5);
+            }
+            const int bases[2] = { PBASE, PBASE2 };
+            for (int r = 0; ok && r < 2; r++) {
+                const uint32_t b = (uint32_t)(g_n_dec + r);
+                if (!gpu_graph_bank_repoint(g5, b)) { ok = false; break; }
+                pulsar_session_invalidate(s5);
+                pulsar_tokens p = { .v = g_toks.v + bases[r], .len = C0, .cap = C0 };
+                if (pulsar_session_sync(s5, &p, err5, sizeof err5) != 0) { ok = false; break; }
+                gpu_graph_bank_counters_capture(g5, b);
+            }
+            const uint32_t n_rows5 = (uint32_t)g_n_dec + 2u * (uint32_t)K_PRE;
+            pulsar_multiseq_req *rq5 = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows5 * sizeof(*rq5)) : NULL;
+            float *lg5 = ok ? (float *)malloc((size_t)((uint32_t)g_n_dec + 2u) * vocab * sizeof(float)) : NULL;
+            if (ok && (!rq5 || !lg5)) ok = false;
+            if (ok) {
+                for (int k = 0; k < g_n_dec; k++) {
+                    rq5[k].bank = (uint32_t)k; rq5[k].pos = g_len[k]; rq5[k].token = argtok[k];
+                }
+                uint32_t w = (uint32_t)g_n_dec;
+                for (int r = 0; r < 2; r++)
+                    for (int j = 0; j < K_PRE; j++, w++) {
+                        rq5[w].bank = (uint32_t)(g_n_dec + r);
+                        rq5[w].pos = C0 + j;
+                        rq5[w].token = g_toks.v[bases[r] + C0 + j];
+                    }
+                uint32_t nr5 = 0;
+                if (pulsar_session_decode_mixed(s5, rq5, n_rows5, lg5,
+                        (int)(((uint32_t)g_n_dec + 2u) * vocab), &nr5, 0u,
+                        err5, sizeof err5) != 0) {
+                    fprintf(stderr, "GATE 5 FAIL: P=2 sweep: %s\n", err5); ok = false;
+                } else if (nr5 != (uint32_t)g_n_dec + 2u) {
+                    fprintf(stderr, "GATE 5 FAIL: n_runs=%u expected %u\n", nr5, (uint32_t)g_n_dec + 2u); ok = false;
+                }
+            }
+            if (ok) {
+                int bad = 0;
+                for (int k = 0; k < g_n_dec; k++) {
+                    long d = first_diff(lg5 + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
+                    if (d >= 0) { fprintf(stderr, "GATE 5 FAIL: decode bank %d logits differ at %ld with P=2\n", k, d); bad = 1; }
+                }
+                for (int r = 0; r < 2; r++) {
+                    float *cl = (float *)malloc((size_t)vocab * sizeof(float)); int nt = -1;
+                    if (!classic_resume_at(bases[r], K_PRE, cl, &nt)) { fprintf(stderr, "GATE 5 FAIL: classic ref %d\n", r); bad = 1; free(cl); continue; }
+                    const float *row = lg5 + (size_t)(g_n_dec + r) * vocab;
+                    double se = 0, sr = 0;
+                    for (int i5 = 0; i5 < vocab; i5++) { double dd = (double)row[i5] - cl[i5]; se += dd * dd; sr += (double)cl[i5] * cl[i5]; }
+                    double rel = sr > 0 ? sqrt(se / sr) : (se > 0 ? 1e9 : 0.0);
+                    long am = 0; for (int i5 = 1; i5 < vocab; i5++) if (row[i5] > row[am]) am = i5;
+                    printf("GATE 5 prefill run %d: next=%ld classic=%d %s | rel-RMS=%.3e\n",
+                           r, am, nt, (int)am == nt ? "MATCH" : "MISMATCH", rel);
+                    if ((int)am != nt || rel >= 1e-2) { fprintf(stderr, "GATE 5 FAIL: prefill run %d diverges from classic\n", r); bad = 1; }
+                    free(cl);
+                }
+                if (!bad) printf("GATE 5: P=2 co-batched sweep NEUTRAL (decode byte-identical, both prefill runs classic-true)\n");
+                else g_fail = 1;
+            } else { g_fail = 1; }
+            free(rq5); free(lg5);
+            pulsar_session_free(s5);
+        } else { fprintf(stderr, "GATE 5 FAIL: session create\n"); g_fail = 1; }
+    }
 
 done:
     free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);

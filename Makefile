@@ -406,7 +406,7 @@ cuda-reap-router-audit:
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
 cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=4 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # Wide variant: 12 decode banks exercises the armed M-neutral kernel range past
 # 8 (the l048-ntcap-16 coverage) — NT instantiations 9..16 and the MoE

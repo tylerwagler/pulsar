@@ -177,6 +177,97 @@ int main(int argc,char**argv){
         if(K<=512 && ratio>1.5){ fprintf(stderr,"GATE 3 FAIL: K=%d mixed %.2fx slower than classic-RESUME (>1.5x)\n",K,ratio); g_fail=1; }
     }
 
+
+    /* GATE 4 (L112 inc A/B): TWO K-row prefill runs from TWO banks in ONE mixed
+     * sweep. Oracle: each run's next token matches its own SINGLE-run mixed
+     * reference exactly (gates 1-3 tie single-run to classic), and last-position
+     * logit rel-RMS < 1e-2 -- co-batching a second prompt must not perturb the
+     * first (bank isolation), in either direction. Distinct content per bank
+     * (offset 700) so cross-bank bleed cannot alias as equality. */
+    {
+        const int OFFB = 700, K4 = 256;
+        pulsar_session *s4 = NULL;
+        if (pulsar_session_create(&s4, g_e, 4096) != 0) { fprintf(stderr,"GATE 4 FAIL: session\n"); g_fail=1; goto done; }
+        if (s4->graph.banks.n_banks < 2) {
+            printf("GATE 4: skipped (pool %u < 2 banks; run with PULSAR_MSEQ_BANKS=2)\n",
+                   s4->graph.banks.n_banks);
+            pulsar_session_free(s4);
+        } else if (OFFB + C0 + K4 > g_toks.len) {
+            printf("GATE 4: skipped (prompt too short)\n");
+            pulsar_session_free(s4);
+        } else {
+            float *ref0 = (float *)malloc((size_t)vocab*sizeof(float));
+            float *ref1 = (float *)malloc((size_t)vocab*sizeof(float));
+            float *lg2  = (float *)malloc((size_t)2*vocab*sizeof(float));
+            int rnext[2] = {-1,-1};
+            bool ok = true;
+            /* single-run references, one fresh session each. */
+            for (int r = 0; ok && r < 2; r++) {
+                const int off = r ? OFFB : 0;
+                pulsar_session *sr = NULL;
+                if (pulsar_session_create(&sr, g_e, 4096) != 0) { ok=false; break; }
+                pulsar_gpu_graph *gr = &sr->graph; char e[256];
+                if (gr->banks.n_banks && !gpu_graph_bank_repoint(gr,0)) ok=false;
+                if (ok) {
+                    pulsar_session_invalidate(sr);
+                    pulsar_tokens pc = {.v=g_toks.v+off,.len=C0,.cap=C0};
+                    if (pulsar_session_sync(sr,&pc,e,sizeof e)!=0) ok=false;
+                }
+                if (ok) {
+                    gpu_graph_bank_counters_capture(gr,0);
+                    pulsar_multiseq_req *rq=(pulsar_multiseq_req*)malloc((size_t)K4*sizeof(*rq));
+                    for (int j=0;j<K4;j++){ rq[j].bank=0; rq[j].pos=C0+j; rq[j].token=g_toks.v[off+C0+j]; }
+                    uint32_t nr=0;
+                    float *dst = r ? ref1 : ref0;
+                    if (pulsar_session_decode_mixed(sr,rq,(uint32_t)K4,dst,vocab,&nr,0u,e,sizeof e)!=0 || nr!=1) ok=false;
+                    else rnext[r]=(int)argmax_f32(dst,(uint64_t)vocab);
+                    free(rq);
+                }
+                pulsar_session_free(sr);
+            }
+            /* the co-batched sweep: bank0 = offset 0, bank1 = offset OFFB. */
+            if (ok) {
+                pulsar_gpu_graph *g4=&s4->graph; char e[256];
+                for (int b=0; ok && b<2; b++) {
+                    const int off = b ? OFFB : 0;
+                    if (!gpu_graph_bank_repoint(g4,(uint32_t)b)) { ok=false; break; }
+                    pulsar_session_invalidate(s4);
+                    pulsar_tokens pc={.v=g_toks.v+off,.len=C0,.cap=C0};
+                    if (pulsar_session_sync(s4,&pc,e,sizeof e)!=0){ ok=false; break; }
+                    gpu_graph_bank_counters_capture(g4,(uint32_t)b);
+                }
+                if (ok) {
+                    pulsar_multiseq_req *rq=(pulsar_multiseq_req*)malloc((size_t)2*K4*sizeof(*rq));
+                    for (int j=0;j<K4;j++){ rq[j].bank=0;    rq[j].pos=C0+j;    rq[j].token=g_toks.v[C0+j]; }
+                    for (int j=0;j<K4;j++){ rq[K4+j].bank=1; rq[K4+j].pos=C0+j; rq[K4+j].token=g_toks.v[OFFB+C0+j]; }
+                    uint32_t nr=0;
+                    if (pulsar_session_decode_mixed(s4,rq,(uint32_t)(2*K4),lg2,2*vocab,&nr,0u,e,sizeof e)!=0){
+                        fprintf(stderr,"GATE 4 FAIL: co-batched sweep: %s\n",e); ok=false;
+                    } else if (nr!=2) {
+                        fprintf(stderr,"GATE 4 FAIL: n_runs=%u expected 2\n",nr); ok=false;
+                    }
+                    free(rq);
+                }
+            }
+            if (ok) {
+                for (int r=0; r<2; r++) {
+                    const float *ref = r ? ref1 : ref0;
+                    const float *row = lg2 + (size_t)r*vocab;
+                    const int nx = (int)argmax_f32(row,(uint64_t)vocab);
+                    double se=0, sr2=0;
+                    for (int i2=0;i2<vocab;i2++){ double d=(double)row[i2]-ref[i2]; se+=d*d; sr2+=(double)ref[i2]*ref[i2]; }
+                    double rel=sr2>0?sqrt(se/sr2):(se>0?1e9:0.0);
+                    printf("GATE 4 run %d: next co-batched=%d single-run=%d %s | rel-RMS=%.3e (<1e-2: %s)\n",
+                           r,nx,rnext[r],nx==rnext[r]?"MATCH":"MISMATCH",rel,rel<1e-2?"YES":"NO");
+                    if (nx!=rnext[r]){ fprintf(stderr,"GATE 4 FAIL: run %d next-token mismatch (co-batch perturbs the run)\n",r); g_fail=1; }
+                    if (rel>=1e-2){ fprintf(stderr,"GATE 4 FAIL: run %d rel-RMS %.3e >= 1e-2\n",r,rel); g_fail=1; }
+                }
+            } else { fprintf(stderr,"GATE 4 FAIL: setup/sweep failed\n"); g_fail=1; }
+            free(ref0); free(ref1); free(lg2);
+            pulsar_session_free(s4);
+        }
+    }
+
 done:
     pulsar_engine_close(g_e);
     if(g_fail){ fprintf(stderr,"MIXED-PREFILL GATE: FAIL\n"); return 1; }
