@@ -1763,6 +1763,8 @@ bool gpu_graph_encode_output_head_batch(
                                              PULSAR_N_HC,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    if (ok) gpu_graph_debug_dump_tensor("result_hc_pre", output_pre,
+                                          (uint64_t)n_tokens * PULSAR_N_HC, PULSAR_N_LAYER, 0);
     if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights,
                                                     output_pre,
                                                     model->map,
@@ -1771,11 +1773,15 @@ bool gpu_graph_encode_output_head_batch(
                                                     weights->output_hc_base->abs_offset,
                                                     PULSAR_N_HC,
                                                     PULSAR_HC_EPS) != 0;
+    if (ok) gpu_graph_debug_dump_tensor("result_hc_weights", output_weights,
+                                          (uint64_t)n_tokens * PULSAR_N_HC, PULSAR_N_LAYER, 0);
     if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
                                                   g->batch_cur_hc,
                                                   output_weights,
                                                   PULSAR_N_EMBD,
                                                   PULSAR_N_HC) != 0;
+    if (ok) gpu_graph_debug_dump_tensor("result_hc", output_embd,
+                                          (uint64_t)n_tokens * PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                        output_embd,
                                                        model->map,
@@ -1795,6 +1801,10 @@ bool gpu_graph_encode_output_head_batch(
                                             weights->output->abs_offset, PULSAR_N_EMBD,
                                             vocab_dim, output_norm, n_tokens) != 0;
     }
+    if (ok) gpu_graph_debug_dump_tensor("result_norm", output_norm,
+                                          (uint64_t)n_tokens * PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
+    if (ok) gpu_graph_debug_dump_tensor("result_output", logits,
+                                          (uint64_t)n_tokens * vocab_dim, PULSAR_N_LAYER, 0);
 
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
