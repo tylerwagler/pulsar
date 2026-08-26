@@ -342,9 +342,23 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     if (tool_schemas && tool_schemas[0]) {
         append_tools_prompt_text(&system, tool_schemas);
     }
+    /* L113: only the LEADING run of system messages (plus the top-level
+     * system/instructions FIELD, wherever the parser appended it) joins the
+     * system region. Mid-conversation system-role messages render IN PLACE
+     * in the history below. Consolidating them here is what broke replay
+     * prefix stability: agent clients append a new system-role nudge per
+     * turn at the array tail, and moving it into the region shifted every
+     * rendered byte after ~the scaffolding, capping warm-forks at the
+     * system prompt (root-caused 2026-08-25 from route-debug token ids). */
+    int leading_end = 0;
+    while (leading_end < msgs->len &&
+           role_is_system(msgs->v[leading_end].role) &&
+           !msgs->v[leading_end].system_field)
+        leading_end++;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
+        if (!m->system_field && i >= leading_end) continue;  /* renders in place */
         if (system.len) buf_puts(&system, "\n\n");
         buf_puts(&system, m->content ? m->content : "");
     }
@@ -363,7 +377,16 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
-            continue;
+            if (m->system_field || i < leading_end) continue;  /* in the region */
+            /* Mid-conversation system message: render in place as an
+             * environment note (the wrapper agent clients already use for
+             * injected context), so the rendered prefix stays append-only
+             * across turns. */
+            buf_puts(&out, "<｜User｜><system-reminder>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</system-reminder>");
+            pending_assistant = true;
+            pending_tool_result = false;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
             buf_puts(&out, m->content ? m->content : "");
@@ -437,7 +460,17 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
-            continue;
+            /* L113: a system message arriving mid tool-loop renders in place,
+             * exactly as the full-replay render will place it next turn --
+             * dropping it here (the old behavior) both hid it from the model
+             * and made the live KV mismatch the following replay. The
+             * system FIELD never belongs in a continuation tail. */
+            if (m->system_field) continue;
+            buf_puts(&out, "<｜User｜><system-reminder>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</system-reminder>");
+            pending_assistant = true;
+            pending_tool_result = false;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
             buf_puts(&out, m->content ? m->content : "");

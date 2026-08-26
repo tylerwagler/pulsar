@@ -271,6 +271,12 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
+    /* True when this system-role entry carries the request's top-level
+     * system/instructions FIELD (the parser appends it to the array). Field
+     * content always renders in the system region; inline role:system
+     * MESSAGES follow the leading-run rule instead (L113) — position in the
+     * array cannot distinguish the two, so this flag is the one authority. */
+    bool system_field;
 } chat_msg;
 
 typedef struct {

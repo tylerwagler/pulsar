@@ -1821,14 +1821,14 @@ static void test_render_think_max_prompt_prefix(void) {
 
 
 
-/* vLLM PR #44283's bug class, pinned as NOT-OURS (2026-08-25): newer
- * Anthropic clients (Claude Code) put role:"system" messages INSIDE the
- * messages array instead of (or alongside) the top-level system field.
- * Contract: the parser accepts them (no role whitelist), and the renderer
- * consolidates every system message from anywhere in the array into the
- * system region -- joined, in order -- and EXCLUDES them from the
- * conversation history (no user turn may carry system text). */
-static void test_inline_system_messages_consolidate(void) {
+/* vLLM PR #44283's bug class (inline role:system accepted) + L113 placement
+ * (2026-08-25): the LEADING run of system messages joins the system region;
+ * a system message arriving MID-conversation renders IN PLACE as a
+ * <system-reminder> environment note. Consolidating mid-stream system
+ * messages into the region is what capped every warm-fork at the
+ * scaffolding: agent clients append one system-role nudge per turn, and
+ * teleporting it to the top shifted the whole rendered prefix. */
+static void test_inline_system_message_placement(void) {
     const char *messages =
         "[{\"role\":\"system\",\"content\":\"You are terse.\"},"
         "{\"role\":\"user\",\"content\":\"Hello\"},"
@@ -1839,18 +1839,91 @@ static void test_inline_system_messages_consolidate(void) {
     TEST_ASSERT(msgs.len == 3);
     TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
     TEST_ASSERT(!strcmp(msgs.v[2].role, "system"));
+    TEST_ASSERT(!msgs.v[0].system_field && !msgs.v[2].system_field);
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
-    /* Both system texts land in the system region, joined in array order,
-     * BEFORE the first user turn, and never inside the history. */
-    const char *sys_joined = strstr(prompt, "You are terse.\n\nPrefer bullet lists.");
+    /* Leading system text is in the region BEFORE the first user turn; the
+     * mid-conversation one renders after that turn, in place, wrapped. */
+    const char *sys_lead = strstr(prompt, "You are terse.");
     const char *user_turn = strstr(prompt, "<｜User｜>Hello");
-    TEST_ASSERT(sys_joined != NULL);
+    const char *in_place = strstr(prompt,
+        "<｜User｜><system-reminder>\nPrefer bullet lists.\n</system-reminder>");
+    TEST_ASSERT(sys_lead != NULL);
     TEST_ASSERT(user_turn != NULL);
-    TEST_ASSERT(sys_joined < user_turn);
-    TEST_ASSERT(strstr(user_turn, "Prefer bullet lists.") == NULL);
+    TEST_ASSERT(in_place != NULL);
+    TEST_ASSERT(sys_lead < user_turn);
+    TEST_ASSERT(user_turn < in_place);
+    /* Nothing from the nudge leaks into the region. */
+    TEST_ASSERT(strstr(prompt, "Prefer bullet lists.") == in_place + strlen("<｜User｜><system-reminder>\n"));
     free(prompt);
+
+    /* The top-level system FIELD is appended to the array by the parser --
+     * trailing position, but system_field=true keeps it in the region. */
+    chat_msg field = {0};
+    field.role = xstrdup("system");
+    field.content = xstrdup("Field prompt.");
+    field.system_field = true;
+    chat_msgs_push(&msgs, field);
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_LOW);
+    TEST_ASSERT(prompt != NULL);
+    const char *field_at = strstr(prompt, "Field prompt.");
+    TEST_ASSERT(field_at != NULL);
+    TEST_ASSERT(field_at < strstr(prompt, "<｜User｜>Hello"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+
+/* L113 regression pin: appending a system-role nudge plus a new user turn
+ * must EXTEND the previous render, never rewrite it. render(N) minus its
+ * dangling assistant prefix must be a byte prefix of render(N+1). This is
+ * the property whose absence cost every warm-fork past the scaffolding. */
+static void test_appended_system_message_keeps_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("First question");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("First answer");
+    chat_msgs_push(&msgs, m1);
+
+    /* Tool context, like the agent clients this pins: without it the
+     * renderer collapses OLDER assistant think blocks relative to
+     * last_user_idx, which is its own (pre-existing, checkpoint-matched)
+     * prefix instability and not what this test is about. */
+    const char *schemas = "{\"name\":\"noop\"}";
+    char *before = render_chat_prompt_text(&msgs, schemas, NULL, PULSAR_THINK_LOW);
+    TEST_ASSERT(before != NULL);
+
+    chat_msg nudge = {0};
+    nudge.role = xstrdup("system");
+    nudge.content = xstrdup("The task tools haven't been used recently.");
+    chat_msgs_push(&msgs, nudge);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("user");
+    m2.content = xstrdup("Second question");
+    chat_msgs_push(&msgs, m2);
+
+    char *after = render_chat_prompt_text(&msgs, schemas, NULL, PULSAR_THINK_LOW);
+    TEST_ASSERT(after != NULL);
+
+    /* Strip render(N)'s dangling assistant prefix if present, then require
+     * byte-prefix containment. (This history ends in a completed assistant
+     * turn, so there is no dangling prefix -- assert containment directly,
+     * and keep the strip logic exercised via the length check.) */
+    size_t blen = strlen(before);
+    TEST_ASSERT(strlen(after) > blen);
+    TEST_ASSERT(strncmp(before, after, blen) == 0);
+    /* And the nudge itself sits in place, after the first answer. */
+    const char *in_place = strstr(after, "<｜User｜><system-reminder>\n"
+                                  "The task tools haven't been used recently.");
+    TEST_ASSERT(in_place != NULL);
+    TEST_ASSERT(in_place >= after + blen - strlen("<｜Assistant｜>"));
+    free(before);
+    free(after);
     chat_msgs_free(&msgs);
 }
 
@@ -5534,7 +5607,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
-    test_inline_system_messages_consolidate();
+    test_inline_system_message_placement();
+    test_appended_system_message_keeps_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

@@ -437,6 +437,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         chat_msg msg = {0};
         msg.role = xstrdup("system");
         msg.content = system;
+        msg.system_field = true;
         system = NULL;
         chat_msgs_push(&msgs, msg);
     }
@@ -1368,6 +1369,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
         chat_msg msg = {0};
         msg.role = xstrdup("system");
         msg.content = instructions;
+        msg.system_field = true;
         instructions = NULL;
         /* Insert at the head so it precedes the conversation. */
         chat_msgs_push(&msgs, msg);
