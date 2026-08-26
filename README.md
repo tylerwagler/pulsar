@@ -72,7 +72,27 @@ against the tests in this tree and the `tool-eval-bench` quality suite — the
 pinned TEB score is 84-85, level with the strongest competing GB10 engine, and
 the 84-scenario short set scores identically at 0 and at ~295k tokens of live
 context pressure.
-This release line moves the engine onto the tensor cores end to end: the
+This release line makes speculative decoding adaptive and moves the last
+F32 compute onto the tensor cores. **Adaptive draft depth**: the drafter's
+depth is no longer a fixed knob -- a per-session controller walks it between
+2 and 5 (5 = the drafter's trained block) from realized acceptance and the
+confidence head's per-position scores, capturing each workload's measured
+optimum (prose settles shallow, structured/tool output rides the deep end;
+`--dspark-draft` now sets the STARTING depth). **BF16 tensor-core compute for
+the F32-source weight family** (`hc_attn_fn`/`hc_ffn_fn`/`output_hc_fn`/APEs):
+storage stays checkpoint-exact F32, compute runs bf16 -- which is *closer to
+the source model's own numerics* (its residual stream is BF16), confirmed by
+the source-reference gate at every confident depth and by the disappearance
+of a long-standing top-1 disagreement with the B300 reference at depth 512.
+Net single-stream speculative decode moved ~+25% on raw-completion prose and
+~+7-10% on served structured output versus v0.4.2. Under the hood: the
+drafter's markov walk is device-chained (one readback per round instead of
+one per position), draft results harvest lazily so token emission overlaps
+drafter GPU time, per-thread-stream synchronization replaces device-wide
+syncs, and an engine-wide audit (the "colonoscopy") deleted every unjustified
+dual path it found, with element-format tags making activation formats
+type-checked rather than convention.
+Earlier: v0.4.x moved the engine onto the tensor cores end to end: the
 vendored-MMQ D2R path runs every 2-bit routed-expert GEMM on the tensor cores,
 prefill attention is fp16 tensor-core on all paths, the indexer scorer runs
 block-scaled MXFP4, and split-KV decode attention lifts shallow-context decode
@@ -257,9 +277,9 @@ the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
   indexed, banked and continued-prefill paths; reads the packed comp cache
   directly).
 - `PULSAR_CUDA_INDEXER_MXFP4` — block-scaled MXFP4 indexer scorer.
-- `PULSAR_CUDA_DECODE_SPLITKV` — split-KV decode attention with softmax
-  merge (8 row-splits; the small-batch decode walk no longer serializes on
-  8 blocks).
+- Split-KV decode attention with softmax merge (8 row-splits; the
+  small-batch decode walk no longer serializes on 8 blocks). Default-on;
+  its opt-out switch was retired in the v0.5.0 switch audit.
 
 | Context | Prefill (t/s, cold) | Decode plain (t/s) |
 | ---: | ---: | ---: |
@@ -269,8 +289,10 @@ the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
 | 16k | 932 | 17.5 |
 | 32k | 909 | 17.1 |
 
-Single-stream speculative decode (drafter on, chat-style structured output)
-averages **~24.6 t/s with bursts above 30**.  Aggregate decode under
+Single-stream speculative decode (drafter on) on the v0.5.0 build:
+raw-completion prose ~28 t/s and served structured output ~28-30 t/s at
+shallow context under adaptive depth (server wall-clock, temp 0; the v0.4.x
+figure on the same protocol was ~24.6 with bursts above 30).  Aggregate decode under
 concurrency (pp2048/tg128, llama-benchy protocol): 23.1 t/s at c2/d0 and
 26.2 at c4/d0, still 17.3-17.7 at c2-c4/d8192 — throughput *rises* with
 stream count.  Deep context is measured, not advertised: the 84-scenario
@@ -331,13 +353,18 @@ batch. (A uniform 2-bit build prefills faster but scores lower on quality — th
 measured allocation trades some prefill for the tool-use win, beating the uniform
 2-bit build on hard-mode tool-eval-bench.)
 
-Draft acceptance varies with workload and depth: measured α runs ~81-91% on
-structured/tool output and ~60-68% on general prose, so the speedup is largest on
-structured/tool workloads where acceptance is highest. The default draft depth is
-**3** (measured optimum for this build — see Speculative decoding); the
-autoregressive drafter's per-position cost means deeper chains stop paying, and
-shallower drafting especially helps at long context, where the old depth-5
-default lost the most to verify-row cost. Plain (non-speculative) decode is
+Draft acceptance varies with workload and depth: measured against this build,
+structured/tool output holds ~70% conditional acceptance per drafted position
+through depth 5, while general prose runs markedly lower (~50% first-token) --
+so the speedup is largest on structured workloads. **Draft depth is adaptive
+(v0.5.0)**: a per-session controller walks depth within [2, 5] from realized
+accepts and the drafter confidence head's per-position scores (the head is
+measured well-calibrated: scores >=0.9 corresponded to 100% realized
+acceptance). A depth sweep measured opposite per-workload optima -- prose
+fastest at depth 2, structured at depth 5 -- and the controller captures both
+in one configuration; 5 is a hard ceiling because it is the drafter's trained
+block width (position 6 is out of distribution and measurably counter-
+productive). `--dspark-draft N` sets the starting depth (default 3). Plain (non-speculative) decode is
 roughly flat and bandwidth-bound; speculation is a speedup layered on top. On
 shallow, low-acceptance requests speculation can run slightly *slower* than
 plain, so **its downside is capped to a few percent by the yield-quench safety

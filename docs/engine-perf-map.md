@@ -1,5 +1,14 @@
 # Where prefill time actually goes
 
+> **Scope note (added v0.5.0, 2026-08-25):** this document's measurements are
+> from 2026-08-08 and remain broadly valid for PREFILL shape attribution. The
+> DECODE side has since been re-attributed from scratch: decode is ~97%
+> GPU-busy (an earlier 67%-busy figure was a measurement artifact), four
+> kernels hold ~72% of decode GPU time, and the F32 hc family named below now
+> computes in BF16 on tensor cores. For current decode attribution see the
+> v0.5.0 release notes and the kernel census that ships with them.
+
+
 Measured 2026-08-08 on sparky (GB10, sm_121, 48 SMs), `pulsar-bench` at a
 4001-token pure prefill (`--gen-tokens 0`) against
 `/srv/models/v5mx4-0731-mmqaligned.gguf`, nsys `cuda_gpu_kern_sum`.
