@@ -1451,8 +1451,6 @@ static int routed_moe_launch(
         const uint32_t use_big_batch = use_sorted_pairs;
         const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
         uint32_t *sorted_pairs = NULL;
-        uint32_t *sorted_offsets = NULL;
-        uint32_t *sorted_counts = NULL;
         uint32_t *tile_total = NULL;
         uint32_t *tile_experts = NULL;
         uint32_t *tile_starts = NULL;
@@ -1497,8 +1495,6 @@ static int routed_moe_launch(
                 uint32_t *offsets = (uint32_t *)(scratch + counts_bytes);
                 uint32_t *cursors = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
                 sorted_pairs = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes);
-                sorted_offsets = offsets;
-                sorted_counts = counts;
                 uint32_t *tile_offsets = (uint32_t *)(scratch + tile_offsets_off);
                 tile_total = (uint32_t *)(scratch + tile_total_off);
                 tile_experts = (uint32_t *)(scratch + tile_experts_off);
