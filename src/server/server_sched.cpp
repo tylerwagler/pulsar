@@ -2429,6 +2429,7 @@ void *worker_main(void *arg) {
         }
         if (!sl) continue; /* unreachable: n_active > 0 */
 
+        const bool sl_was_decode = sl->gen && sl->gen->phase == GEN_DECODE;
         if (sl->gen && sl->gen->phase != GEN_DONE) {
             s->generate_job_step(sl);
             if (sl->gen) slot_writer_flush(&sl->gen->writer);
@@ -2436,6 +2437,31 @@ void *worker_main(void *arg) {
         }
         if (!sl->gen || sl->gen->phase == GEN_DONE) {
             s->worker_finish_slot(sl);
+        }
+        /* L112: paired decode quantum. In this classic branch a lone decoder
+         * (n_dec <= spec_max_live keeps it off the batched lane) got ONE
+         * quantum per full round-robin cycle -- behind three 4096-token
+         * prefill chunks that is one decode turn per ~12 s, which reads as
+         * "decode waits for all prefills" on a monitor (observed on
+         * pulsar-tui during the 2026-08-25 v0.5.0 perf pass). The batched
+         * branch already pairs its decode sweep with one prefill advance per
+         * pass; mirror it here: whenever the advanced slot was NOT decoding,
+         * also give one decode-phase slot its quantum. Identical
+         * generate_job_step the slot would get on its own turn -- scheduling
+         * order only, no numerics. */
+        if (!sl_was_decode) {
+            for (int k = 0; k < s->n_slots; k++) {
+                session_slot *c = &s->slots[k];
+                if (c != sl && c->active_job && c->gen &&
+                    c->gen->phase == GEN_DECODE) {
+                    s->generate_job_step(c);
+                    if (c->gen) slot_writer_flush(&c->gen->writer);
+                    c->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
+                    if (!c->gen || c->gen->phase == GEN_DONE)
+                        s->worker_finish_slot(c);
+                    break;
+                }
+            }
         }
         s->publish_metrics_snapshot(); /* /metrics: once per quantum */
     }
