@@ -548,8 +548,8 @@ so a request's greedy continuation can depend on what else is co-scheduled at th
 moment — the same class of numerical nondeterminism as batched inference in other
 engines. Likewise, v0.3.1's head-grouped decode-attention kernel is not
 bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
-differ from the prior release (quality-verified neutral; set
-`PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
+differ from the prior release (quality-verified neutral; the v0.2.3 kernel was
+retired in the L027 switch cleanup and is no longer restorable by env var).
 Two further guardrails keep a misbehaving client from wedging the server:
 concurrent client connections are capped (64; connections over the cap get an
 immediate 503 instead of piling up threads), and a whole-request read deadline

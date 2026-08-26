@@ -144,8 +144,7 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
 
 All runtime tuning/diagnostic gates use the `PULSAR_CUDA_*` prefix (this fork
 renamed every `PULSAR_METAL_*` gate; there are no compatibility aliases).
-Also: `PULSAR_FP8_NO_MXCORE`, `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_GGUF_DIR`
-(download script).
+Also: `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_GGUF_DIR` (download script).
 
 ## Deferred Work
 

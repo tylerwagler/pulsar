@@ -93,10 +93,6 @@ void pulsar_gpu_batched_copy_free(void *handle);
 int pulsar_gpu_begin_commands(void);
 int pulsar_gpu_flush_commands(void);
 int pulsar_gpu_end_commands(void);
-/* Decode CUDA-graph capture pair: begin returns 1 when the tape is being
- * captured (end replays it as one graph launch and syncs); 0 means graphs
- * are disabled (PULSAR_CUDA_NO_GRAPHS / unsupported) and the caller must use
- * the plain begin/end_commands pair instead. */
 int pulsar_gpu_synchronize(void);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
