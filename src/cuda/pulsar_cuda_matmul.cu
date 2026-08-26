@@ -2551,6 +2551,24 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * is EMPIRICAL, not contractual: the bitwise gates (mixed-prefill GATE
      * 1/4/6) run the property every ledger and fail loudly if a CUDA upgrade
      * changes it. */
+    /* L112 shape census (same first-8 discipline as the T3 census above):
+     * name every (in_dim, out_dim, n_tok>=17) this core serves and which arm
+     * takes it -- the -18%% promessi residue and the in-engine M-instability
+     * both hide in this list. */
+    if (n_tok >= 17) {
+        static uint64_t cen_shapes[16];
+        static int cen_n = 0;
+        const uint64_t key = (in_dim << 40) | (out_dim << 16) | (n_tok & 0xffffu);
+        int known = 0;
+        for (int i = 0; i < cen_n; i++) if (cen_shapes[i] == key) { known = 1; break; }
+        if (!known && cen_n < 16) {
+            cen_shapes[cen_n++] = key;
+            fprintf(stderr, "pulsar: bf16-core shape in=%llu out=%llu m=%llu arm=%s\n",
+                    (unsigned long long)in_dim, (unsigned long long)out_dim,
+                    (unsigned long long)n_tok,
+                    (g_cublas_ready && out_dim >= 256) ? "cublas" : "simt");
+        }
+    }
     if (g_cublas_ready && n_tok > 1 && out_dim >= 256) {
         const uint16_t *xb = (const uint16_t *)xb16;
         const float alpha = 1.0f;
