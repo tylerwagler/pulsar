@@ -2544,6 +2544,11 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      *     both the sweep (257v514) and chunk (2048v4096) regimes -- enough
      *     output tiles that no split-K runs, so per-row results are already
      *     M-independent.
+     * BOUNDARY 512, from the census-real-shape probe: K=4096 N=256 is
+     * M-UNSTABLE at sweep-size Ms (257v514) under every algo -- it split-Ks
+     * exactly where the co-batch runs live -- while N=512 and N=1024 are
+     * stable in both regimes. N >= 512 is the measured-stable set, not a
+     * guess; the first 256 boundary shipped a gate failure.
      * Route: wide N keeps cuBLAS (the perf-critical mass -- deleting it
      * outright measured -60% promessi prefill); skinny N takes the SIMT
      * kernel below, whose per-row order matches the NT arm's and the n==1
@@ -2566,10 +2571,10 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
             fprintf(stderr, "pulsar: bf16-core shape in=%llu out=%llu m=%llu arm=%s\n",
                     (unsigned long long)in_dim, (unsigned long long)out_dim,
                     (unsigned long long)n_tok,
-                    (g_cublas_ready && out_dim >= 256) ? "cublas" : "simt");
+                    (g_cublas_ready && out_dim >= 512) ? "cublas" : "simt");
         }
     }
-    if (g_cublas_ready && n_tok > 1 && out_dim >= 256) {
+    if (g_cublas_ready && n_tok > 1 && out_dim >= 512) {
         const uint16_t *xb = (const uint16_t *)xb16;
         const float alpha = 1.0f;
         const float beta = 0.0f;
