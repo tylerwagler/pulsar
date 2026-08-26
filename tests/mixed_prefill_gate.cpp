@@ -185,7 +185,13 @@ int main(int argc,char**argv){
      * first (bank isolation), in either direction. Distinct content per bank
      * (offset 700) so cross-bank bleed cannot alias as equality. */
     {
-        const int OFFB = 700, K4 = 256;
+        /* K=257: NOT a multiple of ratio, so the single-run reference and the
+         * co-batched sweep BOTH take the per-token compressor path -- the
+         * aligned-run replay kernel is numerically close but not identical to
+         * the per-token kernel, and an oracle comparing across that pair
+         * aliases path numerics as co-batch error (first observed 2026-08-26:
+         * K=256 refs on the replay path read rel-RMS 5e-2/2.5e-1). */
+        const int OFFB = 700, K4 = 257;
         pulsar_session *s4 = NULL;
         if (pulsar_session_create(&s4, g_e, 4096) != 0) { fprintf(stderr,"GATE 4 FAIL: session\n"); g_fail=1; goto done; }
         if (s4->graph.banks.n_banks < 2) {
@@ -265,6 +271,51 @@ int main(int argc,char**argv){
             } else { fprintf(stderr,"GATE 4 FAIL: setup/sweep failed\n"); g_fail=1; }
             free(ref0); free(ref1); free(lg2);
             pulsar_session_free(s4);
+
+            /* TWIN check: co-batch two banks fed IDENTICAL text (offset 0).
+             * Same positions, same tokens, independent per-bank state -- the
+             * two runs' last-row logits must be BITWISE identical; any
+             * difference is cross-run leakage, free of every path-numerics
+             * alias. */
+            pulsar_session *st = NULL;
+            if (pulsar_session_create(&st, g_e, 4096) != 0 ||
+                st->graph.banks.n_banks < 2) {
+                printf("GATE 4 TWIN: skipped (session/banks)\n");
+                if (st) pulsar_session_free(st);
+            } else {
+                float *tl = (float *)malloc((size_t)2*vocab*sizeof(float));
+                bool ok2 = true;
+                pulsar_gpu_graph *gt = &st->graph; char e2[256];
+                for (int b = 0; ok2 && b < 2; b++) {
+                    if (!gpu_graph_bank_repoint(gt,(uint32_t)b)) { ok2=false; break; }
+                    pulsar_session_invalidate(st);
+                    pulsar_tokens pc = {.v=g_toks.v,.len=C0,.cap=C0};
+                    if (pulsar_session_sync(st,&pc,e2,sizeof e2)!=0){ ok2=false; break; }
+                    gpu_graph_bank_counters_capture(gt,(uint32_t)b);
+                }
+                if (ok2) {
+                    pulsar_multiseq_req *rq=(pulsar_multiseq_req*)malloc((size_t)2*K4*sizeof(*rq));
+                    for (int j=0;j<K4;j++){ rq[j].bank=0;    rq[j].pos=C0+j; rq[j].token=g_toks.v[C0+j]; }
+                    for (int j=0;j<K4;j++){ rq[K4+j].bank=1; rq[K4+j].pos=C0+j; rq[K4+j].token=g_toks.v[C0+j]; }
+                    uint32_t nr=0;
+                    if (pulsar_session_decode_mixed(st,rq,(uint32_t)(2*K4),tl,2*vocab,&nr,0u,e2,sizeof e2)!=0 || nr!=2)
+                        ok2=false;
+                    free(rq);
+                }
+                if (ok2) {
+                    long fd=-1;
+                    for (int i2=0;i2<vocab;i2++)
+                        if (tl[i2]!=tl[(size_t)vocab+i2]) { fd=i2; break; }
+                    if (fd<0) printf("GATE 4 TWIN: identical-content runs BITWISE IDENTICAL (no cross-run leakage)\n");
+                    else {
+                        fprintf(stderr,"GATE 4 TWIN FAIL: identical-content runs differ at logit %ld (%.6e vs %.6e) -- CROSS-RUN LEAKAGE\n",
+                                fd,(double)tl[fd],(double)tl[(size_t)vocab+fd]);
+                        g_fail=1;
+                    }
+                } else { fprintf(stderr,"GATE 4 TWIN FAIL: setup/sweep failed\n"); g_fail=1; }
+                free(tl);
+                pulsar_session_free(st);
+            }
         }
     }
 
