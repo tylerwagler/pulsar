@@ -35,10 +35,11 @@ int main(void) {
     if (cublasCreate(&bl) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "cublas create failed\n"); return 1; }
 
     struct { int K, N; const char *tag; } shapes[] = {
-        { 28672,   24, "hc_mix (hc_dim x mix_hc)" },
-        {  7168,  512, "compressor-ish" },
-        {  7168, 1536, "indexer-ish" },
-        {  7168, 4096, "wide-ish" },
+        { 16384,   24, "hc_mix (census real)" },
+        {  4096,   64, "census real 64" },
+        {  4096,  256, "census real 256" },
+        {  4096,  512, "census real 512" },
+        {  4096, 1024, "census real 1024" },
     };
     const int M2 = 514, M1 = 257;
     const int MB = 4096;   /* also test 2048-vs-4096 for the big-chunk case */
