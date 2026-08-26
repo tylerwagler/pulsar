@@ -149,6 +149,14 @@ int main(int argc,char**argv){
                (allvalid&&distinct>=2)?"YES":"NO", allvalid, distinct, cd<0?NGEN:cd);
         printf("GATE 2: K=%d spans >1 ratio group; step_end frontier self-check PASSED (mixed run returned valid tokens, no rc=-1)\n",K1);
         if(mix[0]!=ref[0]){ fprintf(stderr,"GATE 1 FAIL: next-token mismatch (prefill boundary/KV wrong)\n"); g_fail=1; }
+        /* L112 inc C: the mixed and classic paths share every kernel now
+         * (bf16 core sans cuBLAS; fused head norm+mix) -- the oracle is
+         * BITWISE, not drift-bounded. A reappearing rel-RMS means a path
+         * split was reintroduced. */
+        {
+            int fdiff=-1; for(int i=0;i<vocab;i++) if(mix_lg[i]!=ref_lg[i]){ fdiff=i; break; }
+            if(fdiff>=0){ fprintf(stderr,"GATE 1 FAIL: logits not bitwise (first diff %d, rel-RMS %.3e) -- classic/mixed path split reintroduced\n",fdiff,rel_rms); g_fail=1; }
+        }
         if(rel_rms>=1e-2){ fprintf(stderr,"GATE 1 FAIL: last-pos logit rel-RMS %.3e >= 1e-2 (KV corruption, not last-ulp drift)\n",rel_rms); g_fail=1; }
         if(!(allvalid&&distinct>=2)){ fprintf(stderr,"GATE 1 FAIL: continuation degenerate/garbage\n"); g_fail=1; }
     }
