@@ -1821,6 +1821,40 @@ static void test_render_think_max_prompt_prefix(void) {
 
 
 
+/* vLLM PR #44283's bug class, pinned as NOT-OURS (2026-08-25): newer
+ * Anthropic clients (Claude Code) put role:"system" messages INSIDE the
+ * messages array instead of (or alongside) the top-level system field.
+ * Contract: the parser accepts them (no role whitelist), and the renderer
+ * consolidates every system message from anywhere in the array into the
+ * system region -- joined, in order -- and EXCLUDES them from the
+ * conversation history (no user turn may carry system text). */
+static void test_inline_system_messages_consolidate(void) {
+    const char *messages =
+        "[{\"role\":\"system\",\"content\":\"You are terse.\"},"
+        "{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"system\",\"content\":\"Prefer bullet lists.\"}]";
+    const char *p = messages;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
+    TEST_ASSERT(!strcmp(msgs.v[2].role, "system"));
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_LOW);
+    TEST_ASSERT(prompt != NULL);
+    /* Both system texts land in the system region, joined in array order,
+     * BEFORE the first user turn, and never inside the history. */
+    const char *sys_joined = strstr(prompt, "You are terse.\n\nPrefer bullet lists.");
+    const char *user_turn = strstr(prompt, "<｜User｜>Hello");
+    TEST_ASSERT(sys_joined != NULL);
+    TEST_ASSERT(user_turn != NULL);
+    TEST_ASSERT(sys_joined < user_turn);
+    TEST_ASSERT(strstr(user_turn, "Prefer bullet lists.") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+
 /* 0731 effort levels: HIGH renders its own (distinct) prefix, LOW renders
  * none — a LOW prompt is byte-identical to the pre-0731 default rendering. */
 static void test_render_think_effort_prefixes(void) {
@@ -5500,6 +5534,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
+    test_inline_system_messages_consolidate();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
