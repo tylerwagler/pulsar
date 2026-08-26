@@ -965,12 +965,20 @@ int main(int argc, char **argv) {
         const char *mg = getenv("PULSAR_MIXED_DEEP_GUARD_ROWS");
         s.mixed_deep_guard_rows = mg ? atoi(mg) : 16384;
         if (s.mixed_deep_guard_rows < 0) s.mixed_deep_guard_rows = 0;
+        /* L112 inc A: prefills folded per fused quantum. The step budget is
+         * SPLIT across them, so this raises ingest concurrency, not row count. */
+        const char *mp = getenv("PULSAR_MIXED_MAX_PREFILLS");
+        s.mixed_max_prefills = mp ? atoi(mp) : 2;
+        if (s.mixed_max_prefills < 1) s.mixed_max_prefills = 1;
+        if (s.mixed_max_prefills > PULSAR_SERVER_MIXED_MAX_PF)
+            s.mixed_max_prefills = PULSAR_SERVER_MIXED_MAX_PF;
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: fused mixed-batch lane %s (chunk=%d/step, deep guard=%d rows)",
+                   "pulsar-server: fused mixed-batch lane %s (chunk=%d/step, deep guard=%d rows, max prefills=%d)",
                    s.mixed_batch_enabled ? "ENABLED (default; opt out with PULSAR_MIXED_BATCH=0)"
                                          : "disabled (PULSAR_MIXED_BATCH)",
                    s.mixed_chunk_tokens,
-                   s.mixed_deep_guard_rows);
+                   s.mixed_deep_guard_rows,
+                   s.mixed_max_prefills);
     }
     /* plan-33 inc B: warm full-prefix fork routing kill-switch. Default ON in
      * pool mode; PULSAR_WARM_FORK=0 restores today's in-place-continuation routing

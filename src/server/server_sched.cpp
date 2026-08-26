@@ -2027,9 +2027,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
  * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
  * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
  * when the flag is off, not in pool mode, or nothing qualifies. */
-session_slot *server::worker_find_fuse_prefill() {
+int server::worker_find_fuse_prefills(session_slot **out, int max_out) {
     auto *s = this;
-    if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
+    if (!s->mixed_batch_enabled || s->pool_banks <= 0 || max_out <= 0) return 0;
     /* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
      * prefill chunk into a decode quantum whose banks already read a deep
      * aggregate KV working set displaces bandwidth-saturated decode. Refuse
@@ -2053,11 +2053,13 @@ session_slot *server::worker_find_fuse_prefill() {
                            n_dec, deep, s->mixed_deep_guard_rows);
                 last_logged = deep;
             }
-            return NULL;
+            return 0;
         }
     }
     pulsar_session *pool = s->sess;
-    for (int i = 0; i < s->n_slots; i++) {
+    int npf = 0;
+    long pf_depth = 0;   /* L112 inc A: summed positions of SELECTED prefills */
+    for (int i = 0; i < s->n_slots && npf < max_out; i++) {
         session_slot *sl = &s->slots[i];
         gen_state *g = sl->gen;
         if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
@@ -2066,31 +2068,46 @@ session_slot *server::worker_find_fuse_prefill() {
         const int P = pulsar_session_bank_pos(pool, sl->bank);
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
-        return sl;                                              /* P=1: first qualifier */
+        /* L112 inc A depth guard: the SECOND prefill onward joins only while the
+         * selected prefills' summed positions stay under the same threshold that
+         * bounds decode-side depth. Two deep prefill runs in one sweep read two
+         * deep KV prefixes for attention -- the displacement mechanism the
+         * 4x8192 measurement punished. The FIRST qualifier always folds (that is
+         * today's P=1 behavior, unchanged). */
+        if (npf > 0 && s->mixed_deep_guard_rows > 0 &&
+            pf_depth + P > (long)s->mixed_deep_guard_rows)
+            continue;
+        pf_depth += P;
+        out[npf++] = sl;
     }
-    return NULL;
+    return npf;
 }
 
-/* plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
- * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
- * pulsar_session_decode_mixed sweep as the decode banks (true continuous batching,
- * P=1). Decode banks advance exactly as worker_batched_decode_quantum — the inc-4
- * neutrality gate proves a co-scheduled prefill does not perturb them — so their
- * per-request output is unchanged in shape. The prefill advances up to
- * QUANTUM*chunk tokens, SPREAD uniformly across the steps so no single decode step
- * eats a whole chunk (the p99 lever vs the time-slice's per-interval decode stall).
- * pf's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the tail's
- * pulsar_session_sync carries the prefill->decode completion (kv-cache store,
- * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
- * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
- * note_committed_tokens). */
-void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf) {
+/* plan-34 phase-2 inc 5 + L112 inc A — FUSED mixed-batch quantum, N prefills.
+ * One decode quantum whose EVERY step folds small sub-chunks for up to
+ * mixed_max_prefills prefilling slots into the SAME pulsar_session_decode_mixed
+ * sweep as the decode banks (true continuous batching). Decode banks advance
+ * exactly as worker_batched_decode_quantum — the inc-4 neutrality gate proves a
+ * co-scheduled prefill does not perturb them. The per-step fold budget
+ * (mixed_chunk_tokens) is SPLIT across the live prefills (remainder to the
+ * earliest-admitted — FIFO bias so the oldest finishes first), so N>1 never
+ * raises the per-step row count over P=1. Row ORDER within a step is
+ * [decode rows][finishing prefill runs][intermediate prefill runs]: the engine
+ * emits head logits for a PREFIX of runs (max_head_runs), so placing finishing
+ * runs before intermediate ones lets one prefix count emit exactly the decode
+ * banks plus every prefill completing this step — no engine change. Each
+ * prefill's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the
+ * tail's pulsar_session_sync carries the prefill->decode completion (kv-cache
+ * store, gen_stream_begin), so this never reimplements that handoff.
+ * Reconciliation per prefill bank is the exact P=1 recipe, looped; every
+ * reconciled bank but the LAST is state_saved before the next restore, and the
+ * last stays live — the single-prefill invariant, preserved. */
+void server::worker_mixed_batch_quantum(session_slot **dec, int n,
+                                        session_slot **pfs, int npf) {
     auto *s = this;
-    if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
+    if (n <= 0 || npf <= 0 || npf > PULSAR_SERVER_MIXED_MAX_PF) return;
     pulsar_session *pool = s->sess;
     const int vocab = pulsar_engine_logits_width(s->engine);
-    gen_state *pg = pf->gen;
-    const pulsar_tokens *pp = pg->prompt_for_sync;
 
     s->guard_maybe_evict(dec, n);
 
@@ -2114,21 +2131,37 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         g->batch_feed_valid = true; g->batch_active = true;
     }
 
-    /* Prefill-bank ENTRY: make pf live at its committed frontier P0 and capture its
-     * per-bank counters so the mixed driver reads pf's TRUE starting frontier. */
-    if (!s->bank_switch(pf->bank)) {
-        snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
-        pg->finish = "error"; pg->phase = GEN_FINISH; return;
+    /* Prefill-bank ENTRY, per folded prefill: make it live at its committed
+     * frontier and capture its per-bank counters so the mixed driver reads its
+     * TRUE starting frontier. A failed restore errors THAT prefill only. */
+    const pulsar_tokens *pp[PULSAR_SERVER_MIXED_MAX_PF] = {NULL};
+    int P0[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+    int pf_done[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+    bool pf_giveup[PULSAR_SERVER_MIXED_MAX_PF] = {false};
+    bool reached_end[PULSAR_SERVER_MIXED_MAX_PF] = {false};
+    float *pf_last_logits[PULSAR_SERVER_MIXED_MAX_PF] = {NULL};
+    for (int i = 0; i < npf; i++) {
+        session_slot *pf = pfs[i];
+        gen_state *pg = pf ? pf->gen : NULL;
+        if (!pg || !pg->prompt_for_sync) { pf_giveup[i] = true; continue; }
+        pp[i] = pg->prompt_for_sync;
+        if (!s->bank_switch(pf->bank)) {
+            snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
+            pg->finish = "error"; pg->phase = GEN_FINISH;
+            pf_giveup[i] = true; continue;
+        }
+        P0[i] = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
+        pf_last_logits[i] = (float *)server_xmalloc((size_t)vocab * sizeof(float));
     }
-    const int P0 = pulsar_session_pos(pool);
-    pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
     {   /* one-shot observability: confirm the fused lane actually engaged. */
         static int logged = 0;
         if (logged < 3) { logged++;
             server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: FUSED mixed quantum engaged (prefill bank %u at pos %d/%d, "
-                       "%d decode banks, chunk %d/step)",
-                       (unsigned)pf->bank, P0, pp->len, n, s->mixed_chunk_tokens);
+                       "pulsar-server: FUSED mixed quantum engaged (%d prefill(s), first bank %u at pos %d/%d, "
+                       "%d decode banks, chunk %d/step split %d-way)",
+                       npf, (unsigned)pfs[0]->bank, P0[0], pp[0] ? pp[0]->len : -1, n,
+                       s->mixed_chunk_tokens, npf);
         }
     }
 
@@ -2136,18 +2169,11 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     const int cap = pulsar_session_prefill_cap(pool);   /* mixed-step row ceiling */
     if (kstep > cap - PULSAR_SESSION_POOL_CAP) kstep = cap - PULSAR_SESSION_POOL_CAP;
     if (kstep < 1) kstep = 1;
-    const int len = pp->len;
-    int pf_done = 0;
-    bool reached_end = false;                     /* prefill reached len this quantum */
-    bool pf_giveup = false;                        /* prefill rejected -> stop folding it */
 
     const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
     pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
-    float *logits = (float *)server_xmalloc((size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
-    /* last-position (len-1) logits captured from the final fused prefill run — the
-     * decode seed for the prefill->decode handoff (byte-identical to classic per
-     * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
-    float *pf_last_logits = (float *)server_xmalloc((size_t)vocab * sizeof(float));
+    float *logits = (float *)server_xmalloc(
+        (size_t)(PULSAR_SESSION_POOL_CAP + PULSAR_SERVER_MIXED_MAX_PF) * (size_t)vocab * sizeof(float));
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
     for (int step = 0; step < PULSAR_SERVER_DECODE_QUANTUM_TOKENS; step++) {
@@ -2165,47 +2191,77 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             reqs[m].bank = sl->bank; reqs[m].pos = g->batch_feed_pos;
             reqs[m].token = g->batch_feed_token; live_idx[m] = i; m++;
         }
-        /* Fold this step's ascending prefill sub-chunk from P0+pf_done, all the way
-         * to len (the FINAL sub-chunk carries the last-position logits used for the
-         * prefill->decode handoff — no non-aligned classic tail resume, so the
-         * prefill output stays byte-identical to a cold prefill). */
-        const int pos_now = P0 + pf_done;
-        int kthis = 0;
-        if (!pf_giveup && pos_now < len) {
-            kthis = kstep;
-            if (pos_now + kthis > len) kthis = len - pos_now;
+
+        /* Split this step's fold budget across the live prefills; classify each
+         * sub-chunk as FINISHING (reaches its prompt end this step — its
+         * last-row logits are the decode seed) or INTERMEDIATE. */
+        int kthis[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+        int live = 0;
+        for (int i = 0; i < npf; i++)
+            if (!pf_giveup[i] && pp[i] && P0[i] + pf_done[i] < pp[i]->len) live++;
+        int fin_list[PULSAR_SERVER_MIXED_MAX_PF], mid_list[PULSAR_SERVER_MIXED_MAX_PF];
+        int fin_n = 0, mid_n = 0;
+        if (live > 0) {
+            int base = kstep / live, rem = kstep % live;
+            for (int i = 0; i < npf; i++) {
+                if (pf_giveup[i] || !pp[i]) continue;
+                const int pos_now = P0[i] + pf_done[i];
+                const int left = pp[i]->len - pos_now;
+                if (left <= 0) continue;
+                int k = base + (rem > 0 ? 1 : 0);
+                if (rem > 0) rem--;
+                if (k > left) k = left;
+                if (k <= 0) continue;
+                kthis[i] = k;
+                if (pos_now + k == pp[i]->len) fin_list[fin_n++] = i;
+                else                            mid_list[mid_n++] = i;
+            }
         }
-        for (int j = 0; j < kthis; j++) {
-            reqs[m + j].bank = pf->bank;
-            reqs[m + j].pos = pos_now + j;
-            reqs[m + j].token = pp->v[pos_now + j];
+        /* Place rows: [decode][finishing runs][intermediate runs]. */
+        int nrows = m;
+        for (int f = 0; f < fin_n + mid_n; f++) {
+            const int i = f < fin_n ? fin_list[f] : mid_list[f - fin_n];
+            const int pos_now = P0[i] + pf_done[i];
+            for (int t = 0; t < kthis[i]; t++) {
+                reqs[nrows].bank = pfs[i]->bank;
+                reqs[nrows].pos = pos_now + t;
+                reqs[nrows].token = pp[i]->v[pos_now + t];
+                nrows++;
+            }
         }
-        const int nrows = m + kthis;
         if (nrows == 0) break;
+        const int pf_rows = nrows - m;
 
         char err[96];
         uint32_t n_runs = 0;
-        /* LEVER 1: on an INTERMEDIATE prefill sub-chunk (prefill does not reach len
-         * this step, and there are decode banks to head), emit ONLY the decode banks'
-         * logits (max_head_runs = m) — the prefill run's intermediate logits are
-         * unused, and the head takes the single-block identity path (no two-block
-         * resync, no wasted prefill head). On the FINAL sub-chunk (pos_now+kthis==len)
-         * OR a pure-decode step, pass 0 = all runs (the prefill head IS consumed). */
-        const uint32_t head_cap =
-            (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
+        /* LEVER 1 (generalized): with any INTERMEDIATE run present, emit only the
+         * decode banks + finishing runs (a run prefix, by the placement above).
+         * With no intermediates, 0 = all runs. The emitted row count is
+         * m + fin_n either way — except the corner where every decoder finished
+         * mid-quantum (m == 0) and only intermediates remain: head_cap 0 then
+         * emits the intermediate runs' logits (unconsumed, tiny waste, rare). */
+        const uint32_t head_cap = (mid_n > 0 && (m + fin_n) > 0)
+                                  ? (uint32_t)(m + fin_n) : 0u;
+        const int emit_rows = head_cap > 0 ? m + fin_n : m + fin_n + mid_n;
         int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
-                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
-        if (rc == 1 && kthis > 0) {
-            /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
-             * its bank's frontier is not position-true (a cache-warm resume). Do NOT
-             * harm the co-scheduled decode banks: stop folding this prefill (route it
-             * classic via no_fuse) and retry this step DECODE-ONLY. */
-            pf_giveup = true; pg->no_fuse = true;
+                (int)((size_t)(emit_rows > 0 ? emit_rows : 1) * (size_t)vocab),
+                &n_runs, head_cap, err, sizeof err);
+        if (rc == 1 && pf_rows > 0) {
+            /* RECOVERABLE reject (nothing committed) caused by a PREFILL run —
+             * e.g. a bank frontier that is not position-true. The driver cannot
+             * name the offender, so stop folding ALL of them (each routes classic
+             * via no_fuse) and retry this step DECODE-ONLY. Rare; correctness
+             * first, the classic path re-serves them next pass. */
+            for (int i = 0; i < npf; i++) {
+                if (pf_giveup[i] || !pfs[i] || !pfs[i]->gen) continue;
+                pf_giveup[i] = true; pfs[i]->gen->no_fuse = true;
+            }
             if (m > 0) {
                 rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
                         (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
-            } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
-            kthis = 0;                              /* prefill did not advance */
+            } else { s->live_bank = -1; break; }   /* only prefills this step: just stop */
+            for (int i = 0; i < npf; i++) kthis[i] = 0;   /* no prefill advanced */
+            fin_n = 0;
         }
         s->live_bank = -1;
         if (rc != 0) {
@@ -2217,13 +2273,15 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             }
             break;   /* real decode failure -> stop */
         }
-        pf_done += kthis;
-        if (kthis > 0 && pos_now + kthis == len) {
-            /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
-             * index m, last-of-run) as the decode seed for the handoff. */
-            memcpy(pf_last_logits, logits + (size_t)m * (size_t)vocab, (size_t)vocab * sizeof(float));
-            reached_end = true;
+        /* Finishing runs sit at emitted rows [m, m+fin_n) in placement order:
+         * capture each one's len-1 logits as its decode seed. */
+        for (int f = 0; f < fin_n; f++) {
+            const int i = fin_list[f];
+            memcpy(pf_last_logits[i], logits + (size_t)(m + f) * (size_t)vocab,
+                   (size_t)vocab * sizeof(float));
+            reached_end[i] = true;
         }
+        for (int i = 0; i < npf; i++) pf_done[i] += kthis[i];
 
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
@@ -2245,39 +2303,209 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     }
     free(reqs); free(logits);
 
-    /* Reconcile the prefill bank (same recipe as a decode bank leaving the lane):
-     * install its driver-maintained frontier (P0+pf_done) and advance the host
-     * checkpoint by exactly the committed prefill tokens, so its next chunk resumes
-     * correctly and any store sees the true frontier. */
-    if (pf_done > 0 && pg->phase == GEN_PREFILL_MAIN) {
+    /* Reconcile each folded prefill bank (the P=1 recipe, looped): install its
+     * driver-maintained frontier and advance the host checkpoint by exactly the
+     * committed tokens. Every reconciled bank but the LAST is saved back before
+     * the next restore (so its noted state survives the switch); the last stays
+     * live — the single-prefill invariant, unchanged. */
+    int last_rec = -1;
+    for (int i = 0; i < npf; i++)
+        if (pf_done[i] > 0 && pfs[i] && pfs[i]->gen &&
+            pfs[i]->gen->phase == GEN_PREFILL_MAIN) last_rec = i;
+    for (int i = 0; i < npf; i++) {
+        if (pf_done[i] <= 0) continue;
+        session_slot *pf = pfs[i];
+        gen_state *pg = pf ? pf->gen : NULL;
+        if (!pg || pg->phase != GEN_PREFILL_MAIN) continue;
         if (pulsar_session_bank_state_restore(pool, pf->bank)) {
-            pulsar_session_note_committed_tokens(pool, &pp->v[P0], pf_done);
-            pf->committed_pos = P0 + pf_done;
+            pulsar_session_note_committed_tokens(pool, &pp[i]->v[P0[i]], pf_done[i]);
+            pf->committed_pos = P0[i] + pf_done[i];
             s->live_bank = (int)pf->bank;
-            if (reached_end) {
+            if (reached_end[i]) {
                 /* Prefill complete: seed the decode with the fused last-position
                  * logits (byte-identical to classic) and run the SAME prefill->
-                 * decode handoff the classic path uses (kv-cache store, SSE start,
-                 * GEN_DECODE_INIT). No non-aligned classic tail resume => the
-                 * request's decode is byte-identical to a cold classic prefill. */
-                pulsar_session_set_logits(pool, pf_last_logits, vocab);
+                 * decode handoff the classic path uses. */
+                pulsar_session_set_logits(pool, pf_last_logits[i], vocab);
                 slot_writer_install(&pg->writer);
                 s->gen_stream_begin(pf);
                 slot_writer_flush(&pg->writer);
             }
+            if (i != last_rec)
+                pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
         } else {
             snprintf(pg->err, sizeof pg->err, "prefill bank %u reconcile failed", (unsigned)pf->bank);
             pg->finish = "error"; pg->phase = GEN_FINISH;
         }
     }
-    free(pf_last_logits);
+    for (int i = 0; i < npf; i++) free(pf_last_logits[i]);
 
     const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
     for (int i = 0; i < n; i++) {
         dec[i]->last_serviced_us = now_us;
         if (dec[i]->gen) slot_writer_flush(&dec[i]->gen->writer);
     }
-    pf->last_serviced_us = now_us;
+    for (int i = 0; i < npf; i++)
+        if (pfs[i]) pfs[i]->last_serviced_us = now_us;
+}
+
+/* L112 inc B — CO-PREFILL quantum: the zero-decoder case. The fused lane needs
+ * a decode quantum as carrier, but the measured c4 serialization (pp 572 vs
+ * 1038 t/s aggregate) happens precisely when nothing is decoding yet: N
+ * concurrent prefills advance one classic 4096-chunk per round-robin pass,
+ * serially. This quantum runs ONE decode_mixed sweep with ZERO decode rows —
+ * just P prefill runs (the driver is run-generic; runs are runs) — so one pass
+ * over the weights serves every co-batched prompt's sub-chunk. One sweep per
+ * quantum, then back to worker_main: a decode becoming ready re-evaluates the
+ * lane on the very next pass, so decode liveness is untouched. First chunks
+ * and final tails stay CLASSIC exactly as the fused lane (the tail carries the
+ * prefill->decode handoff); entry, giveup, finishing-first head emission, and
+ * reconciliation are the fused quantum's recipes.
+ * Head-emission corner: max_head_runs 0 means ALL runs, so a sweep with no
+ * finishing run pays ONE unconsumed head row (head_cap 1) rather than all —
+ * negligible against a multi-thousand-row sweep. */
+void server::worker_coprefill_quantum(session_slot **pfs, int npf) {
+    auto *s = this;
+    if (npf < 2 || npf > PULSAR_SERVER_MIXED_MAX_PF) return;
+    pulsar_session *pool = s->sess;
+    const int vocab = pulsar_engine_logits_width(s->engine);
+
+    const pulsar_tokens *pp[PULSAR_SERVER_MIXED_MAX_PF] = {NULL};
+    int P0[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+    int pf_done[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+    bool pf_giveup[PULSAR_SERVER_MIXED_MAX_PF] = {false};
+    bool reached_end[PULSAR_SERVER_MIXED_MAX_PF] = {false};
+    float *pf_last_logits[PULSAR_SERVER_MIXED_MAX_PF] = {NULL};
+    for (int i = 0; i < npf; i++) {
+        session_slot *pf = pfs[i];
+        gen_state *pg = pf ? pf->gen : NULL;
+        if (!pg || !pg->prompt_for_sync) { pf_giveup[i] = true; continue; }
+        pp[i] = pg->prompt_for_sync;
+        if (!s->bank_switch(pf->bank)) {
+            snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
+            pg->finish = "error"; pg->phase = GEN_FINISH;
+            pf_giveup[i] = true; continue;
+        }
+        P0[i] = pulsar_session_pos(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
+        pf_last_logits[i] = (float *)server_xmalloc((size_t)vocab * sizeof(float));
+    }
+    {   /* one-shot observability. */
+        static int logged = 0;
+        if (logged < 3) { logged++;
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: CO-PREFILL quantum engaged (%d prefills, first bank %u at pos %d/%d)",
+                       npf, (unsigned)pfs[0]->bank, P0[0], pp[0] ? pp[0]->len : -1);
+        }
+    }
+
+    /* Sweep budget: up to one classic chunk's worth of rows total, split across
+     * the live prefills — c2 runs 2 x ~2048-row runs through one weight pass. */
+    const int cap = pulsar_session_prefill_cap(pool);
+    int total = cap - PULSAR_SESSION_POOL_CAP;
+    if (total > 4096) total = 4096;
+    if (total < npf) total = npf;
+
+    int live = 0;
+    for (int i = 0; i < npf; i++)
+        if (!pf_giveup[i] && pp[i] && P0[i] < pp[i]->len) live++;
+    if (live >= 2) {
+        pulsar_multiseq_req *reqs =
+            (pulsar_multiseq_req *)server_xmalloc((size_t)total * sizeof(*reqs));
+        float *logits = (float *)server_xmalloc(
+            (size_t)PULSAR_SERVER_MIXED_MAX_PF * (size_t)vocab * sizeof(float));
+
+        int kthis[PULSAR_SERVER_MIXED_MAX_PF] = {0};
+        int fin_list[PULSAR_SERVER_MIXED_MAX_PF], mid_list[PULSAR_SERVER_MIXED_MAX_PF];
+        int fin_n = 0, mid_n = 0;
+        int base = total / live, rem = total % live;
+        for (int i = 0; i < npf; i++) {
+            if (pf_giveup[i] || !pp[i]) continue;
+            const int pos_now = P0[i];
+            const int left = pp[i]->len - pos_now;
+            if (left <= 0) continue;
+            int k = base + (rem > 0 ? 1 : 0);
+            if (rem > 0) rem--;
+            if (k > left) k = left;
+            if (k <= 0) continue;
+            kthis[i] = k;
+            if (pos_now + k == pp[i]->len) fin_list[fin_n++] = i;
+            else                            mid_list[mid_n++] = i;
+        }
+        int nrows = 0;
+        for (int f = 0; f < fin_n + mid_n; f++) {
+            const int i = f < fin_n ? fin_list[f] : mid_list[f - fin_n];
+            for (int t = 0; t < kthis[i]; t++) {
+                reqs[nrows].bank = pfs[i]->bank;
+                reqs[nrows].pos = P0[i] + t;
+                reqs[nrows].token = pp[i]->v[P0[i] + t];
+                nrows++;
+            }
+        }
+        if (nrows > 0) {
+            char err[96];
+            uint32_t n_runs = 0;
+            const uint32_t head_cap = fin_n > 0 ? (uint32_t)fin_n : 1u;
+            const int emit_rows = fin_n > 0 ? fin_n : 1;
+            int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
+                    (int)((size_t)emit_rows * (size_t)vocab), &n_runs, head_cap,
+                    err, sizeof err);
+            s->live_bank = -1;
+            if (rc != 0) {
+                /* Recoverable or fatal: either way, stop co-batching these — the
+                 * classic path re-serves them next pass (no_fuse routes them
+                 * around both fused lanes). */
+                for (int i = 0; i < npf; i++) {
+                    if (pf_giveup[i] || !pfs[i] || !pfs[i]->gen) continue;
+                    pf_giveup[i] = true; pfs[i]->gen->no_fuse = true;
+                    kthis[i] = 0;
+                }
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: co-prefill sweep rejected (%s); slots rerouted classic", err);
+            } else {
+                for (int f = 0; f < fin_n; f++) {
+                    const int i = fin_list[f];
+                    memcpy(pf_last_logits[i], logits + (size_t)f * (size_t)vocab,
+                           (size_t)vocab * sizeof(float));
+                    reached_end[i] = true;
+                }
+                for (int i = 0; i < npf; i++) pf_done[i] += kthis[i];
+            }
+        }
+        free(reqs); free(logits);
+    }
+
+    /* Reconcile — the fused quantum's loop, verbatim semantics. */
+    int last_rec = -1;
+    for (int i = 0; i < npf; i++)
+        if (pf_done[i] > 0 && pfs[i] && pfs[i]->gen &&
+            pfs[i]->gen->phase == GEN_PREFILL_MAIN) last_rec = i;
+    for (int i = 0; i < npf; i++) {
+        if (pf_done[i] <= 0) continue;
+        session_slot *pf = pfs[i];
+        gen_state *pg = pf ? pf->gen : NULL;
+        if (!pg || pg->phase != GEN_PREFILL_MAIN) continue;
+        if (pulsar_session_bank_state_restore(pool, pf->bank)) {
+            pulsar_session_note_committed_tokens(pool, &pp[i]->v[P0[i]], pf_done[i]);
+            pf->committed_pos = P0[i] + pf_done[i];
+            s->live_bank = (int)pf->bank;
+            if (reached_end[i]) {
+                pulsar_session_set_logits(pool, pf_last_logits[i], vocab);
+                slot_writer_install(&pg->writer);
+                s->gen_stream_begin(pf);
+                slot_writer_flush(&pg->writer);
+            }
+            if (i != last_rec)
+                pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
+        } else {
+            snprintf(pg->err, sizeof pg->err, "prefill bank %u reconcile failed", (unsigned)pf->bank);
+            pg->finish = "error"; pg->phase = GEN_FINISH;
+        }
+    }
+    for (int i = 0; i < npf; i++) free(pf_last_logits[i]);
+
+    const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+    for (int i = 0; i < npf; i++)
+        if (pfs[i]) pfs[i]->last_serviced_us = now_us;
 }
 
 void *worker_main(void *arg) {
@@ -2376,13 +2604,14 @@ void *worker_main(void *arg) {
              * the separate classic prefill advance below. Flag OFF (or nothing
              * admissible) => pf_fuse==NULL => today's exact decode-quantum +
              * separate-prefill time-slice, byte-identical. */
-            session_slot *pf_fuse = NULL;
+            session_slot *pf_fuse[PULSAR_SERVER_MIXED_MAX_PF];
+            int n_fuse = 0;
             if (use_spec_batched) {
                 s->worker_spec_batched_quantum(dec, n_dec);
             } else {
-                pf_fuse = s->worker_find_fuse_prefill();
-                if (pf_fuse) s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse);
-                else         s->worker_batched_decode_quantum(dec, n_dec);
+                n_fuse = s->worker_find_fuse_prefills(pf_fuse, s->mixed_max_prefills);
+                if (n_fuse > 0) s->worker_mixed_batch_quantum(dec, n_dec, pf_fuse, n_fuse);
+                else            s->worker_batched_decode_quantum(dec, n_dec);
             }
             /* Finish any slot the batched quantum stopped (per-slot path
              * reconciles its checkpoint). Then also advance ONE non-decode
@@ -2403,7 +2632,10 @@ void *worker_main(void *arg) {
                 session_slot *c = &s->slots[(rr + k) % s->n_slots];
                 /* inc 5: skip the slot already advanced in-band by the fused
                  * quantum (pf_fuse) so it does not also run a classic chunk. */
-                if (c->active_job && c != pf_fuse && !slot_is_batchable_decode(c) &&
+                bool fused_in_band = false;
+                for (int f = 0; f < n_fuse; f++)
+                    if (c == pf_fuse[f]) { fused_in_band = true; break; }
+                if (c->active_job && !fused_in_band && !slot_is_batchable_decode(c) &&
                     !(c->gen && c->gen->batch_active)) {
                     other = c;
                     rr = (int)(c - s->slots) + 1;
@@ -2421,16 +2653,34 @@ void *worker_main(void *arg) {
             continue;
         }
 
+        /* L112 inc B: with no decoders at all and >= 2 admissible prefills,
+         * co-batch their chunks through one sweep instead of serializing them
+         * through the classic round-robin. One sweep per pass; the classic
+         * pick below still advances one OTHER slot (first chunks, tails,
+         * non-prefill states), excluding the co-batched set this pass. */
+        session_slot *copf[PULSAR_SERVER_MIXED_MAX_PF];
+        int nco = 0;
+        if (s->pool_banks > 0 && n_dec == 0)
+            nco = s->worker_find_fuse_prefills(copf, s->mixed_max_prefills);
+        if (nco >= 2) s->worker_coprefill_quantum(copf, nco);
+        else nco = 0;
+
         session_slot *sl = NULL;
         for (int k = 0; k < s->n_slots; k++) {
             session_slot *c = &s->slots[(rr + k) % s->n_slots];
-            if (c->active_job) {
+            bool cobatched = false;
+            for (int f = 0; f < nco; f++)
+                if (c == copf[f]) { cobatched = true; break; }
+            if (c->active_job && !cobatched) {
                 sl = c;
                 rr = (int)(c - s->slots) + 1;
                 break;
             }
         }
-        if (!sl) continue; /* unreachable: n_active > 0 */
+        if (!sl) {
+            if (nco > 0) { s->publish_metrics_snapshot(); }
+            continue; /* all active slots co-batched this pass (or none active) */
+        }
 
         const bool sl_was_decode = sl->gen && sl->gen->phase == GEN_DECODE;
         if (sl->gen && sl->gen->phase != GEN_DONE) {

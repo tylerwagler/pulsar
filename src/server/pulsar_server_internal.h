@@ -864,6 +864,10 @@ typedef struct {
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
 #define PULSAR_SESSION_POOL_CAP 16
+/* L112 inc A: hard ceiling on prefills folded into one fused quantum (the
+ * config knob mixed_max_prefills clamps to this). Bank-count math: 16 runs
+ * (PULSAR_MSEQ_MAX) bound decode banks + prefill runs together. */
+#define PULSAR_SERVER_MIXED_MAX_PF 4
 /* Auto-sizing cap: the batched custom-nt matmul lane and the split-KV decode
  * gate cap their fast paths at 8 rows, and N=12 aggregate decode holds 29.2
  * tok/s at 8 banks vs 21.9 at 12 (>8-row steps fall to the slow lanes) — so
@@ -1100,6 +1104,12 @@ struct server {
      * steps (vs one big chunk on one step) is what trades the time-slice's per-
      * interval decode STALL for a small uniform per-token cost — the p99 lever. */
     int          mixed_chunk_tokens;
+    /* L112 inc A: how many prefilling slots one fused quantum may fold
+     * (PULSAR_MIXED_MAX_PREFILLS, read once; default 2, clamp 1..4). The step's
+     * fold budget (mixed_chunk_tokens) is SPLIT across them, so raising this
+     * never raises the per-step row count -- it raises concurrency of prompt
+     * ingest under decode load. */
+    int          mixed_max_prefills;
     /* plan-33 inc B: warm full-prefix FORK routing (PULSAR_WARM_FORK, default on;
      * read once at startup). When a request's prompt token-extends an idle warm
      * bank's committed history, the router forks that trunk into a FREE bank and
@@ -1328,8 +1338,10 @@ struct server {
     void worker_finish_slot(session_slot *sl);
     void worker_batched_decode_quantum(session_slot **dec, int n);
     void worker_spec_batched_quantum(session_slot **dec, int n);
-    session_slot * worker_find_fuse_prefill();
-    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
+    int worker_find_fuse_prefills(session_slot **out, int max_out);
+    void worker_mixed_batch_quantum(session_slot **dec, int n,
+                                    session_slot **pfs, int npf);
+    void worker_coprefill_quantum(session_slot **pfs, int npf);
     session_slot * provision_bank(provision_refusal *refusal);
     session_slot * provision_slot(int ctx, provision_refusal *refusal);
     session_slot * choose_slot_for_job(job *j, int *reject_ctx, bool *waiting_owner, bool *clobbers, provision_refusal *refusal);
