@@ -261,4 +261,12 @@ int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept,
 int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept,
                                  int32_t *replay_n);
 
+/* Decode gate schedule -> slab slot.  per_token 0 falls back to the identity
+ * mapping slot = (seq-1) % n_slots; otherwise slot = gate_slot_start +
+ * ((seq-1) % gates_per_token) * gate_slot_step.  Both ranks compute this
+ * from the exchanged identity so their recv placement matches exactly. */
+uint32_t pulsar_tp_gate_slot(uint32_t n_slots, uint64_t seq,
+                             uint32_t gate_slot_start, uint32_t gate_slot_step,
+                             uint32_t gates_per_token);
+
 #endif

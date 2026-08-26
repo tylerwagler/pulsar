@@ -190,6 +190,100 @@ static void lockstep_phase(pulsar_tp *tp, int rank) {
     }
 }
 
+/* Round-trip every remaining control-plane frame type over the control
+ * socket, strictly ordered so neither side blocks ahead.  Leader sends,
+ * worker recv_commands + acks, except verify_commit and logits-half which
+ * are one-way. */
+static void frames_phase(pulsar_tp *tp, int rank) {
+    char err[256];
+    const uint64_t sid = 5150u;
+    if (rank == 0) {
+        const int toks[4] = { 1, 2, 3, 4 };
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 4) == 1, "leader send_sync");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)),
+              "leader sync ack: %s", err);
+
+        pulsar_tp_batch_item items[2] = { {1001, 61, 0}, {1002, 62, 0} };
+        CHECK(pulsar_tp_send_eval_batch(tp, items, 2) == 1,
+              "leader send_eval_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "eval_batch", err, sizeof(err)),
+              "leader eval_batch ack: %s", err);
+
+        const int prompt[2] = { 11, 12 };
+        pulsar_tp_batch_item m = { 2001, 71, 0 };
+        CHECK(pulsar_tp_send_mixed_batch(tp, 9999, prompt, 2, &m, 1) == 1,
+              "leader send_mixed_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed_batch", err, sizeof(err)),
+              "leader mixed_batch ack: %s", err);
+
+        const int drafts[3] = { 7, 8, 9 };
+        CHECK(pulsar_tp_send_verify(tp, sid, drafts, 3) == 1,
+              "leader send_verify");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "verify", err, sizeof(err)),
+              "leader verify ack: %s", err);
+
+        CHECK(pulsar_tp_send_verify_commit(tp, 1, 0) == 1,
+              "leader send_verify_commit");
+
+        const float half[4] = { 0.5f, 1.5f, 2.5f, 3.5f };
+        CHECK(pulsar_tp_send_logits_half(tp, half, 4) == 1,
+              "leader send_logits_half");
+    } else {
+        pulsar_tp_command cmd;
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv sync: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SYNC, "worker sync frame type %d",
+              (int)cmd.type);
+        CHECK(cmd.session_id == sid && cmd.n_tokens == 4, "worker sync header");
+        CHECK(cmd.tokens && cmd.tokens[0] == 1 && cmd.tokens[3] == 4,
+              "worker sync tokens");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker sync ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv eval_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_EVAL_BATCH && cmd.n_items == 2,
+              "worker eval_batch type/items");
+        CHECK(cmd.items && cmd.items[0].session_id == 1001 &&
+              cmd.items[0].token == 61 && cmd.items[1].token == 62,
+              "worker eval_batch items");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
+              "worker eval_batch ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv mixed_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_MIXED_BATCH,
+              "worker mixed_batch type %d", (int)cmd.type);
+        CHECK(cmd.session_id == 9999 && cmd.n_tokens == 2 && cmd.n_items == 1,
+              "worker mixed_batch header");
+        CHECK(cmd.tokens[0] == 11 && cmd.tokens[1] == 12 &&
+              cmd.items[0].token == 71, "worker mixed_batch payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
+              "worker mixed_batch ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv verify: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_VERIFY && cmd.n_tokens == 3,
+              "worker verify type/tokens");
+        CHECK(cmd.tokens[0] == 7 && cmd.tokens[2] == 9, "worker verify drafts");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker verify ack");
+
+        int32_t full = 0, replay = -1;
+        CHECK(pulsar_tp_recv_verify_commit(tp, &full, &replay) == 1,
+              "worker recv_verify_commit");
+        CHECK(full == 1 && replay == 0, "worker verify_commit values");
+
+        float half[4];
+        CHECK(pulsar_tp_recv_logits_half(tp, half, 4) == 1,
+              "worker recv_logits_half");
+        CHECK(half[0] == 0.5f && half[3] == 3.5f, "worker logits values");
+    }
+}
+
 static int run_rank(pulsar_tp *tp, int rank) {
     static const char *rname[2] = { "leader", "worker" };
     CHECK(pulsar_tp_rank(tp) == rank, "rank %d: pulsar_tp_rank()=%d", rank,
@@ -230,6 +324,7 @@ static int run_rank(pulsar_tp *tp, int rank) {
     big_phase(tp, rank, 1, 2, 3145728ull, 1);  /* 3 MiB   W->L (2 MiB round split) */
 
     lockstep_phase(tp, rank);
+    frames_phase(tp, rank);
 
     /* Clean shutdown: leader stops, worker sees the STOP frame. */
     if (rank == 0) {
@@ -359,6 +454,7 @@ int main(void) {
         return 1;
     }
     std::printf("tp_transport_test: ok "
-                "(loopback TCP: hello, attach, gate/batch/big exchange, eval/ack lockstep)\n");
+                "(loopback TCP: hello, attach, gate/batch/big exchange, "
+                "lockstep + all control-plane frames)\n");
     return 0;
 }

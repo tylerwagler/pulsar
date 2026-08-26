@@ -708,11 +708,19 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
 /* Slab slot a given gate seq lands in.  DS4 fires every slot in order
  * (identity mapping); a projected schedule from the hello skips dense layers
  * and the ATTN slots. */
+uint32_t pulsar_tp_gate_slot(uint32_t n_slots, uint64_t seq,
+                             uint32_t gate_slot_start, uint32_t gate_slot_step,
+                             uint32_t gates_per_token) {
+    if (gates_per_token == 0)
+        return (uint32_t)((seq - 1) % n_slots);
+    return gate_slot_start +
+           (uint32_t)((seq - 1) % gates_per_token) * gate_slot_step;
+}
+
 static uint32_t tp_gate_slot(const pulsar_tp *tp, uint64_t seq) {
-    if (tp->gates_per_token == 0)
-        return (uint32_t)((seq - 1) % tp->n_slots);
-    return tp->gate_slot_start +
-           (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
+    return pulsar_tp_gate_slot(tp->n_slots, seq,
+                               tp->gate_slot_start, tp->gate_slot_step,
+                               tp->gates_per_token);
 }
 
 static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq);

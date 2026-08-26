@@ -167,14 +167,35 @@ static void test_identity_check(void) {
     CHECK(pulsar_tp_identity_check(&mine, &mine, NULL, 0) == 0, "NULL err not tolerated");
 }
 
+static void test_gate_schedule(void) {
+    /* Identity mapping: per_token 0 -> slot = (seq-1) % n_slots. */
+    for (uint64_t seq = 1; seq <= 400; seq++)
+        CHECK(pulsar_tp_gate_slot(86u, seq, 0, 0, 0) ==
+              (uint32_t)((seq - 1) % 86u),
+              "identity slot mismatch at seq %llu", (unsigned long long)seq);
+    CHECK(pulsar_tp_gate_slot(2u, 1000, 0, 0, 0) == 1u,
+          "identity wrap (1000-1)%%2 != 1");
+
+    /* Schedule: start + ((seq-1) % per_token) * step, wrapping each token. */
+    CHECK(pulsar_tp_gate_slot(86u, 1, 4, 2, 3) == 4u, "sched seq1");
+    CHECK(pulsar_tp_gate_slot(86u, 2, 4, 2, 3) == 6u, "sched seq2");
+    CHECK(pulsar_tp_gate_slot(86u, 3, 4, 2, 3) == 8u, "sched seq3");
+    CHECK(pulsar_tp_gate_slot(86u, 4, 4, 2, 3) == 4u, "sched seq4 (wrap)");
+    /* Sparse GLM-style schedule: one FFN gate on selected layers. */
+    CHECK(pulsar_tp_gate_slot(172u, 1, 2, 43, 4) == 2u, "sparse seq1");
+    CHECK(pulsar_tp_gate_slot(172u, 2, 2, 43, 4) == 45u, "sparse seq2");
+    CHECK(pulsar_tp_gate_slot(172u, 5, 2, 43, 4) == 2u, "sparse seq5 (wrap)");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
     test_identity_check();
+    test_gate_schedule();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, gate schedule)\n");
     return 0;
 }
