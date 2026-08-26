@@ -497,6 +497,10 @@ uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
  * confidences to out[] and returns the pending count (0 = no saved state or
  * no pendings; the bank still gets its base row). The allocation these feed
  * is an UPPER bound on K -- round_begin's own validity trims still apply. */
+/* L112: the adaptive draft controller's current depth for a bank (live state
+ * for the live bank, saved carry otherwise; bank 0 in bankless sessions).
+ * 0 = no drafter / nothing valid. Pure host read for metrics/monitoring. */
+int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank);
 uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
                                         float out[16]);
 /* The carry-or-sample base draw (the head of generate_speculative). Never

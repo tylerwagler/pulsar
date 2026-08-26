@@ -359,6 +359,7 @@ bool server::send_metrics(int fd) {
     int slot_pos[PULSAR_SESSION_POOL_CAP];
     int slot_ctx[PULSAR_SESSION_POOL_CAP];
     int slot_phase[PULSAR_SESSION_POOL_CAP];
+    int slot_depth[PULSAR_SESSION_POOL_CAP];
     int slot_pf_done[PULSAR_SESSION_POOL_CAP];
     int slot_pf_total[PULSAR_SESSION_POOL_CAP];
     pthread_mutex_lock(&s->mu);
@@ -372,6 +373,7 @@ bool server::send_metrics(int fd) {
         slot_pos[i] = pos > 0 ? pos : 0;
         slot_ctx[i] = ctx > 0 ? ctx : 0;
         slot_phase[i] = s->m_slot_phase[i];
+        slot_depth[i] = s->m_slot_depth[i];
         /* prefill_last_current is -1 until the first progress callback; report
          * 0 tokens done rather than leaking the sentinel. */
         slot_pf_done[i] = s->m_slot_prefill_done[i] > 0 ? s->m_slot_prefill_done[i] : 0;
@@ -480,6 +482,10 @@ bool server::send_metrics(int fd) {
         const int idx = slot_phase_index(slot_phase[i]);
         if (idx == 1 || idx == 2) prefilling++;
     }
+    buf_puts(&b, "# HELP pulsar:spec_draft_depth Adaptive draft depth per slot (0 = no drafter/idle).\n");
+    buf_puts(&b, "# TYPE pulsar:spec_draft_depth gauge\n");
+    for (int i = 0; i < n_slots; i++)
+        buf_printf(&b, "pulsar:spec_draft_depth{slot=\"%d\"} %d\n", i, slot_depth[i]);
     buf_puts(&b, "# HELP pulsar:slot_phase Generation phase per slot (state set; 1 = current).\n");
     buf_puts(&b, "# TYPE pulsar:slot_phase gauge\n");
     for (int i = 0; i < n_slots; i++) {

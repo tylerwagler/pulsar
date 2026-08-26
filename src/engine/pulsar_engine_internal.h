@@ -1692,6 +1692,7 @@ struct pulsar_session {
     void bank_state_save(uint32_t bank);
     bool bank_state_restore(uint32_t bank);
     int bank_pos(uint32_t bank);
+    int bank_spec_depth(uint32_t bank);   /* L112: adaptive depth, live-or-carry */
     const pulsar_tokens *bank_tokens(uint32_t bank);
     int bank_common_prefix(uint32_t bank, const pulsar_tokens *prompt);
     void note_committed_tokens(const int *toks, int n);

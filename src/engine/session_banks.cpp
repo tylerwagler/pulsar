@@ -568,6 +568,32 @@ static const pulsar_tokens *bank_frontier_tokens(pulsar_session *s, uint32_t ban
     return NULL;
 }
 
+/* L112 observability: the adaptive draft controller's CURRENT depth for a
+ * bank -- live spec state for the live bank, the saved carry otherwise
+ * (same live-vs-carry rule as bank_frontier_tokens above). In a bankless
+ * session, bank 0 reads the live state. 0 = no drafter or nothing valid.
+ * Pure host reads, worker-thread safe at publish time. */
+int pulsar_session::bank_spec_depth(uint32_t bank) {
+    auto *s = this;
+    if (!s->engine || !s->engine->has_dspark()) return 0;
+    const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
+    const pulsar_spec_carry_state *sp = NULL;
+    if (pool == 0) {
+        if (bank == 0) sp = &s->spec;
+    } else if (bank < pool) {
+        const uint32_t cur = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
+        if (bank == cur) sp = &s->spec;
+        else if (s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid)
+            sp = &s->bank_carry[bank].spec;
+    }
+    if (!sp) return 0;
+    int d = sp->spec_adaptive_depth;
+    if (d <= 0) d = s->engine->dspark_draft_tokens;
+    if (d < 1) d = 1;
+    if (d > 16) d = 16;
+    return d;
+}
+
 int pulsar_session::bank_pos(uint32_t bank) {
     auto *s = this;
     const pulsar_tokens *t = bank_frontier_tokens(s, bank);

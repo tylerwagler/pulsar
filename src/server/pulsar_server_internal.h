@@ -1194,6 +1194,7 @@ struct server {
      * Stored as gen_phase + 1, so 0 (a zeroed server, or a slot with no bound
      * job) reads as idle rather than as GEN_PREFILL_COLD. */
     int m_slot_phase[PULSAR_SESSION_POOL_CAP];
+    int m_slot_depth[PULSAR_SESSION_POOL_CAP]; /* L112: adaptive draft depth per slot (0 = n/a) */
     int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  /* tokens synced so far */
     int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP]; /* prefill target, 0 if not prefilling */
     pulsar_spec_metrics m_spec;               /* engine spec-decode counters */

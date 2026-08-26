@@ -243,6 +243,7 @@ int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) { return s ? s
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) { if (s) s->bank_state_save(bank); }
 bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) { return s ? s->bank_state_restore(bank) : false; }
 int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_pos(bank); }
+int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) { if (s) s->note_committed_tokens(toks, n); }

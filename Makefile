@@ -27,6 +27,15 @@ CXXFLAGS += $(PULSAR_DEPFLAGS)
 # from git so it never goes stale (e.g. "v0.2.3-8-gec51fb2", "-dirty" if the
 # tree has uncommitted changes); falls back to "unknown" outside a git checkout.
 PULSAR_VERSION_STR := $(shell git describe --tags --dirty --always 2>/dev/null || echo unknown)
+# The version string bakes into objects via -D, so an incremental build keeps
+# serving the OLD string from any unrebuilt object -- the listen banner said
+# g70141e0f through three later same-day deploys (2026-08-25). Rebuild the
+# consuming TUs whenever HEAD moves. --git-path resolves correctly in
+# worktrees, where .git is a file.
+PULSAR_GIT_HEAD := $(shell git rev-parse --git-path HEAD 2>/dev/null)
+ifneq ($(PULSAR_GIT_HEAD),)
+src/server/cli_main.o src/server/http_server.o: $(PULSAR_GIT_HEAD)
+endif
 CFLAGS += -DPULSAR_VERSION_STR='"$(PULSAR_VERSION_STR)"'
 CFLAGS += $(PULSAR_DEPFLAGS)
 

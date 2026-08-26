@@ -1289,6 +1289,9 @@ void server::publish_metrics_snapshot() {
         s->m_slot_phase[i]         = g ? (int)g->phase + 1 : 0;
         s->m_slot_prefill_done[i]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
         s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
+        /* L112: adaptive draft depth, live-or-carry (pure host read). */
+        s->m_slot_depth[i] = sl->provisioned
+                ? pulsar_session_bank_spec_depth(s->sess, sl->bank) : 0;
     }
     s->m_spec = m;
     s->m_gen_tokens = s->w_gen_tokens;

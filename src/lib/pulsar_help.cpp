@@ -157,6 +157,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool != PULSAR_HELP_BENCH) {
             opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
+            opt(fp, c, "--dspark-draft N", "STARTING draft depth for the adaptive controller (default 3). Depth then walks 2..5 per session from realized acceptance; 5 is the drafter's trained block.");
             opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
         }
     }
