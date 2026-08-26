@@ -280,9 +280,15 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
-    int interval_tokens = p->seen ? current - p->last_current : 0;
+    /* First callback fires AFTER the first chunk completes, so the chunk has
+     * a real rate: its tokens over the elapsed-since-start. The old !seen arm
+     * zeroed the interval instead, printing "chunk=0.00 t/s" on the first
+     * chunk of every prefill -- which read as a stall on any monitor
+     * (pulsar-tui showed alternating dead samples through the 08-25 perf
+     * run). Subsequent chunks are unchanged: delta tokens over delta time. */
+    int interval_tokens = p->seen ? current - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
-    double interval_s = p->seen ? now - p->last_t : 0.0;
+    double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
     p->last_t = now;
