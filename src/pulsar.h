@@ -83,6 +83,12 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    /* Two-rank tensor parallelism (branch tensor_parallel; docs/tensor-parallel-port.md).
+     * tp_role: 1 = leader (listens on tp_port), 2 = worker (dials tp_peer:tp_port);
+     * 0 = off.  Fails loudly in pulsar_engine_open until the transport (slice 3) lands. */
+    int tp_role;
+    const char *tp_peer;
+    int tp_port;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
