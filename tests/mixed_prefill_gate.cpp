@@ -227,6 +227,7 @@ int main(int argc,char**argv){
                     float *dst = r ? ref1 : ref0;
                     if (pulsar_session_decode_mixed(sr,rq,(uint32_t)K4,dst,vocab,&nr,0u,e,sizeof e)!=0 || nr!=1) ok=false;
                     else rnext[r]=(int)argmax_f32(dst,(uint64_t)vocab);
+                    (void)rnext;
                     free(rq);
                 }
                 pulsar_session_free(sr);
@@ -256,17 +257,21 @@ int main(int argc,char**argv){
                 }
             }
             if (ok) {
+                /* L112 inc C bar: co-batched output is BITWISE the single-run
+                 * output. The bf16 core is per-row deterministic at every
+                 * n_tok since the cuBLAS arm's removal; any byte difference
+                 * here is a reintroduced M-dependence. */
                 for (int r=0; r<2; r++) {
                     const float *ref = r ? ref1 : ref0;
                     const float *row = lg2 + (size_t)r*vocab;
-                    const int nx = (int)argmax_f32(row,(uint64_t)vocab);
+                    long fd=-1;
+                    for (int i2=0;i2<vocab;i2++) if (row[i2]!=ref[i2]) { fd=i2; break; }
                     double se=0, sr2=0;
                     for (int i2=0;i2<vocab;i2++){ double d=(double)row[i2]-ref[i2]; se+=d*d; sr2+=(double)ref[i2]*ref[i2]; }
                     double rel=sr2>0?sqrt(se/sr2):(se>0?1e9:0.0);
-                    printf("GATE 4 run %d: next co-batched=%d single-run=%d %s | rel-RMS=%.3e (<1e-2: %s)\n",
-                           r,nx,rnext[r],nx==rnext[r]?"MATCH":"MISMATCH",rel,rel<1e-2?"YES":"NO");
-                    if (nx!=rnext[r]){ fprintf(stderr,"GATE 4 FAIL: run %d next-token mismatch (co-batch perturbs the run)\n",r); g_fail=1; }
-                    if (rel>=1e-2){ fprintf(stderr,"GATE 4 FAIL: run %d rel-RMS %.3e >= 1e-2\n",r,rel); g_fail=1; }
+                    printf("GATE 4 run %d: %s (first diff %ld, rel-RMS=%.3e)\n",
+                           r, fd<0?"BITWISE IDENTICAL to single-run":"DIFFERS from single-run", fd, rel);
+                    if (fd>=0){ fprintf(stderr,"GATE 4 FAIL: run %d not bitwise (first diff logit %ld, rel-RMS %.3e) -- batch-shape dependence reintroduced\n",r,fd,rel); g_fail=1; }
                 }
             } else { fprintf(stderr,"GATE 4 FAIL: setup/sweep failed\n"); g_fail=1; }
             free(ref0); free(ref1); free(lg2);
