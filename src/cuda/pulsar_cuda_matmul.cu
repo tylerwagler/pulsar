@@ -2362,6 +2362,131 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
 
 
+
+/* L112 inc C: M-NEUTRAL bf16 tensor-core GEMM.
+ *
+ * out[M x N] (f32, row-major) = x[M x K] (bf16, row-major) . w[N x K]^T (bf16,
+ * row-major -- the weight layout every caller already has).
+ *
+ * WHY THIS KERNEL EXISTS: cuBLAS GemmEx picks algorithms per shape, and its
+ * split-K choices reassociate the k-reduction differently at different M --
+ * measured on GB10/CUDA 13.3: no algo is M-stable for skinny N at any M, and
+ * even "stable" wide shapes (N=512/1024 at K=4096) cross a split-K band
+ * between M=514 and M=1542 (GATE 6) and near M=130 (GATE 5). The requirement
+ * is BYTE-equal prefill at any concurrency, so the k-order must be fixed by
+ * construction, not by empirical banding.
+ *
+ * HOW IT IS M-NEUTRAL: the grid is (N/64, M/16) fixed tiles; one warp per
+ * block computes a 16x64 output tile with a SERIAL k-loop of m16n8k16 mma
+ * steps. An output row's accumulation order depends only on K -- more rows
+ * add BLOCKS, they never re-tile or split existing rows' reductions. No
+ * split-K anywhere. Rows/cols beyond M/N are zero-padded on load and guarded
+ * on store; zero contributions are exact under f32 accumulate, so edge tiles
+ * compute the same row values a full tile would.
+ *
+ * Per-row results are NOT bitwise-equal to the NT/SIMT arms (different
+ * reduction structure); the schedule-invariance rule is therefore ARM
+ * assignment by row count alone: n_tok >= 17 ALWAYS lands here, 2..16 always
+ * NT, 1 always the GEMV path -- so a given (prompt, position) takes the same
+ * arm under every scheduling, which is what the bitwise gates assert. */
+__global__ static void matmul_bf16_mma_mneutral_kernel(
+        float *out,
+        const uint16_t *w,      /* [N][K] bf16 */
+        const uint16_t *x,      /* [M][K] bf16 */
+        uint32_t K,
+        uint32_t N,
+        uint32_t M) {
+    const uint32_t ntile = blockIdx.x;   /* 64-wide N tile   */
+    const uint32_t mtile = blockIdx.y;   /* 16-high M tile   */
+    const uint32_t lane = threadIdx.x;   /* one warp/block   */
+    const uint32_t m0 = mtile * 16u;
+    const uint32_t n0 = ntile * 64u;
+
+    __shared__ __align__(16) uint16_t sA[16][16];      /* x tile: 16 rows x 16 k  */
+    __shared__ __align__(16) uint16_t sB[64][16];      /* w tile: 64 rows x 16 k  */
+
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    /* Host-side or pre-sm80 codegen: never reached at runtime on GB10
+     * (sm_120f); the dispatcher below only launches on hardware where the
+     * bf16 mma exists. Compile-time stub keeps multi-arch builds legal. */
+    (void)out; (void)w; (void)x; (void)K; (void)N; (void)M;
+    (void)ntile; (void)mtile; (void)lane; (void)m0; (void)n0;
+#else
+    float acc[8][4];
+    #pragma unroll
+    for (int t = 0; t < 8; t++)
+        #pragma unroll
+        for (int c = 0; c < 4; c++) acc[t][c] = 0.0f;
+
+    for (uint32_t k0 = 0; k0 < K; k0 += 16u) {
+        /* Stage A: 16 rows x 16 halves (8 halves per lane, 2 lanes per row). */
+        {
+            const uint32_t r = lane >> 1, h0 = (lane & 1u) * 8u;
+            const uint32_t gr = m0 + r;
+            #pragma unroll
+            for (int h = 0; h < 8; h++) {
+                const uint32_t gk = k0 + h0 + h;
+                sA[r][h0 + h] = (gr < M && gk < K) ? x[(uint64_t)gr * K + gk] : (uint16_t)0;
+            }
+        }
+        /* Stage B: 64 weight rows x 16 halves (2 rows per lane). */
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            const uint32_t r = lane * 2u + rr;
+            const uint32_t gn = n0 + r;
+            #pragma unroll
+            for (int h = 0; h < 16; h++) {
+                const uint32_t gk = k0 + h;
+                sB[r][h] = (gn < N && gk < K) ? w[(uint64_t)gn * K + gk] : (uint16_t)0;
+            }
+        }
+        __syncthreads();
+
+        /* A fragment: m16n8k16 row-major A = four 8x8 b16 matrices. */
+        uint32_t a0, a1, a2, a3;
+        {
+            const uint32_t r = lane & 15u, cg = lane >> 4u;    /* ldmatrix.x4 addressing */
+            const uint16_t *pa = &sA[r][cg * 8u];
+            uint32_t smem_a = (uint32_t)__cvta_generic_to_shared(pa);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(smem_a));
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            /* B fragment: col-major 16x8 = our w rows [t*8 .. t*8+8) x 16 k. */
+            uint32_t b0, b1;
+            {
+                const uint32_t r = lane & 7u, cg = (lane >> 3u) & 1u;
+                const uint16_t *pb = &sB[t * 8u + r][cg * 8u];
+                uint32_t smem_b = (uint32_t)__cvta_generic_to_shared(pb);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                             : "=r"(b0), "=r"(b1) : "r"(smem_b));
+            }
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(acc[t][0]), "+f"(acc[t][1]), "+f"(acc[t][2]), "+f"(acc[t][3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+        __syncthreads();
+    }
+
+    /* Store: C tile 16x64, canonical m16n8 accumulator layout per 8-wide sub. */
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        const uint32_t row_a = lane >> 2u;            /* c0,c1 */
+        const uint32_t col_a = (lane & 3u) * 2u;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const uint32_t r = (c < 2) ? row_a : row_a + 8u;
+            const uint32_t col = col_a + (c & 1u);
+            const uint32_t gr = m0 + r, gc = n0 + t * 8u + col;
+            if (gr < M && gc < N) out[(uint64_t)gr * N + gc] = acc[t][c];
+        }
+    }
+#endif
+}
+
+
 /* L079/L087: the bf16 compute core, weight given as a resolved DEVICE pointer.
  * Two producers feed it: pulsar_gpu_matmul_bf16_tensor (native BF16 storage,
  * pointer straight into the mmap) and pulsar_gpu_matmul_f32_tensor (F32-source
@@ -2574,20 +2699,15 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
                     (g_cublas_ready && out_dim >= 512) ? "cublas" : "simt");
         }
     }
-    if (g_cublas_ready && n_tok > 1 && out_dim >= 512) {
-        const uint16_t *xb = (const uint16_t *)xb16;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmEx(g_cublas,
-                                         CUBLAS_OP_T, CUBLAS_OP_N,
-                                         (int)out_dim, (int)n_tok, (int)in_dim,
-                                         &alpha,
-                                         w, CUDA_R_16BF, (int)in_dim,
-                                         xb, CUDA_R_16BF, (int)in_dim,
-                                         &beta,
-                                         out->ptr, CUDA_R_32F, (int)out_dim,
-                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-        return cublas_ok(st, "bf16 matmul");
+    if (n_tok >= 17) {
+        /* Every >=17-row call lands on the fixed-tile MMA kernel -- see its
+         * header comment for why cuBLAS cannot serve the byte-equality
+         * requirement at ANY shape class. */
+        dim3 grid((unsigned)((out_dim + 63) / 64), (unsigned)((n_tok + 15) / 16), 1);
+        matmul_bf16_mma_mneutral_kernel<<<grid, 32>>>(
+                (float *)out->ptr, w, (const uint16_t *)xb16,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        return cuda_ok(cudaGetLastError(), "bf16 mma mneutral launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, xb16, in_dim, out_dim, n_tok);
