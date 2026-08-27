@@ -67,7 +67,12 @@ bug, not a design change.
 
 ## Slice-4 sequencing (what is desk-testable vs GPU-gated)
 
-- 4a. Identity extraction from a loaded engine (host code, GPU to run).
+- 4a. **DONE 2026-08-26** — DS-default identity builder
+      `pulsar_tp_identity_init_defaults` (src/tp) + host tests. Engine open
+      still fails loudly (see the guard) until 4b, per the fail-loud rule.
+      **Binder cross-check PASSED:** `shape_profiles.cpp` Flash {43L, 4096h,
+      129280v, 512 head-dim, 64 rot, 256+1 exp, 6 used} matches the study's
+      V4-Flash constants exactly.
 - 4b. CUDA gate machinery on the engine worker thread — big_gate first
       (prefill), per-layer gates (decode). GPU-gated; the hard chunk.
 - 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the

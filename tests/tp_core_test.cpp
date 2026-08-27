@@ -187,15 +187,32 @@ static void test_gate_schedule(void) {
     CHECK(pulsar_tp_gate_slot(172u, 5, 2, 43, 4) == 2u, "sparse seq5 (wrap)");
 }
 
+static void test_identity_defaults(void) {
+    pulsar_tp_identity id;
+    pulsar_tp_identity_init_defaults(&id, 87000000000ull, 3u, 43u, 4096u,
+                                     129280u, 2u, 1048576u);
+    CHECK(id.gguf_bytes == 87000000000ull && id.model_id == 3u && id.n_layer == 43u,
+          "identity defaults: artifact shape");
+    CHECK(id.n_embd == 4096u && id.n_vocab == 129280u && id.quant_bits == 2u &&
+          id.ctx_size == 1048576u, "identity defaults: fields");
+    /* DS: every layer gates ATTN then FFN -> identity slot mapping. */
+    CHECK(id.gates_per_token == 0 && id.gate_slot_start == 0 &&
+          id.gate_slot_step == 0, "identity defaults: DS gate schedule");
+    char err[128];
+    CHECK(pulsar_tp_identity_check(&id, &id, err, sizeof(err)) == 0,
+          "identity defaults: self-compat through identity_check");
+}
+
 int main(void) {
     test_slab_layout();
     test_hello_wire();
     test_identity_check();
+    test_identity_defaults();
     test_gate_schedule();
     if (g_failures) {
         std::fprintf(stderr, "tp_core_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, gate schedule)\n");
+    std::printf("tp_core_test: ok (slab layout, hello wire, identity check, identity defaults, gate schedule)\n");
     return 0;
 }

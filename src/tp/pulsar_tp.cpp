@@ -708,6 +708,29 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
 /* Slab slot a given gate seq lands in.  DS4 fires every slot in order
  * (identity mapping); a projected schedule from the hello skips dense layers
  * and the ATTN slots. */
+void pulsar_tp_identity_init_defaults(pulsar_tp_identity *id,
+                                      uint64_t gguf_bytes,
+                                      uint32_t model_id,
+                                      uint32_t n_layer,
+                                      uint32_t n_embd,
+                                      uint32_t n_vocab,
+                                      uint32_t quant_bits,
+                                      uint32_t ctx_size) {
+    memset(id, 0, sizeof(*id));
+    id->gguf_bytes = gguf_bytes;
+    id->model_id = model_id;
+    id->n_layer = n_layer;
+    id->n_embd = n_embd;
+    id->n_vocab = n_vocab;
+    id->quant_bits = quant_bits;
+    id->ctx_size = ctx_size;
+    /* DS: every layer fires ATTN then FFN, so there is no sparse schedule —
+     * gates_per_token 0 selects the transport's identity slot mapping. */
+    id->gate_slot_start = 0;
+    id->gate_slot_step = 0;
+    id->gates_per_token = 0;
+}
+
 uint32_t pulsar_tp_gate_slot(uint32_t n_slots, uint64_t seq,
                              uint32_t gate_slot_start, uint32_t gate_slot_step,
                              uint32_t gates_per_token) {

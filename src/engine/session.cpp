@@ -334,8 +334,10 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->quality = opt->quality;
     e->prefill_chunk = opt->prefill_chunk;
     if (opt->tp_role != 0) {
-        fprintf(stderr, "pulsar: tensor parallelism is not wired yet (tp_role=%d); "
-                        "see docs/tensor-parallel-port.md (branch tensor_parallel)\n",
+        fprintf(stderr, "pulsar: tensor parallelism (tp_role=%d): identity "
+                        "groundwork (4a) is in, but the CUDA gate machinery (4b) "
+                        "is not, so the pair cannot be armed yet; see "
+                        "docs/tensor-parallel-split.md\n",
                 opt->tp_role);
         free(e);
         *out = NULL;

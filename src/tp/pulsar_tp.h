@@ -115,6 +115,21 @@ int pulsar_tp_identity_check(const pulsar_tp_identity *mine,
                              const pulsar_tp_identity *theirs,
                              char *err, size_t errlen);
 
+/* Fill the two-rank identity for this engine's artifact and set the DS
+ * gate-schedule defaults (43-layer DS fires ATTN then FFN on every layer, so
+ * gates_per_token stays 0 -> the transport's identity slot mapping).  The
+ * engine wiring (slice 4a+) supplies the exact values from g_pulsar_shape at
+ * bind time plus the GGUF file size; this is the pure filler + default keeper,
+ * unit-tested by tp_core_test. */
+void pulsar_tp_identity_init_defaults(pulsar_tp_identity *id,
+                                      uint64_t gguf_bytes,
+                                      uint32_t model_id,
+                                      uint32_t n_layer,
+                                      uint32_t n_embd,
+                                      uint32_t n_vocab,
+                                      uint32_t quant_bits,
+                                      uint32_t ctx_size);
+
 /* ------------------------------------------------------------------------
  * Transport (slice 3).  Public surface of the ported upstream ds4_tp.c: the
  * connection/lockstep transport that runs the slice-1 slab contract.  The
