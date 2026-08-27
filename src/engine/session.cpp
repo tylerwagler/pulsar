@@ -1275,9 +1275,17 @@ void pulsar_session::rewind(int pos) {
      * 2026-08-27).  Clamp DOWN only -- a counter can only be AHEAD of a
      * rewound position, and a lagging one (mid-admission prefill) must never
      * be raised here.  Cache rows beyond the clamp are invisible (readers
-     * cap at n_comp) and are re-emitted on the next boundary cross; the
-     * per-group compressor state ring re-fills from the replayed positions
-     * before the next emit reads it. */
+     * cap at n_comp) and are re-emitted on the next boundary cross.
+     * KNOWN RESIDUAL (classic parity, not introduced here):
+     * compressor_store_kernel writes each position's slot by plain
+     * assignment, so replay re-fills the CURRENT group's slots -- but
+     * ratio-4 keeps a two-group window, and a ghost group that completed
+     * pre-rewind has already SHIFTED itself into the lower half
+     * (compressor_shift_ratio4_kernel), so the first re-emit after such a
+     * rewind folds one group of ghost projections into one comp row (the
+     * window fully self-heals 8 positions on).  Classic has done exactly
+     * this since 6de76e3; the complete fix (Stage-B save restore of the
+     * lower half) is filed in rows/L120.md. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
