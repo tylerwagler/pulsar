@@ -29,6 +29,7 @@ __pycache__/
 /tests/tp_core_test
 /tests/tp_transport_test
 /tests/tp_sched_test
+/tests/tp_slab_gpu_probe
 /tests/multiseq_frontier_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate

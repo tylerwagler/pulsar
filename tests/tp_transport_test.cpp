@@ -31,6 +31,11 @@
 #include "tp/pulsar_tp.h"
 
 static int g_failures = 0;
+/* Set when run via the remote-leader/remote-worker subcommands: two processes
+ * on separate hosts (the pair) instead of the forked loopback default.  In
+ * that mode the transport may legitimately be RDMA, so the loopback-only
+ * "must be TCP" assert is relaxed. */
+static bool g_remote_mode = false;
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
         if (!(cond)) {                                                       \
@@ -288,10 +293,19 @@ static int run_rank(pulsar_tp *tp, int rank) {
     static const char *rname[2] = { "leader", "worker" };
     CHECK(pulsar_tp_rank(tp) == rank, "rank %d: pulsar_tp_rank()=%d", rank,
           pulsar_tp_rank(tp));
-    CHECK(!pulsar_tp_is_rdma(tp), "rank %d: expected TCP transport (no verbs device)",
-          rank);
-    CHECK(pulsar_tp_peer_ctx(tp) == TEST_CTX_SIZE, "rank %d: peer_ctx=%u want %u",
-          rank, pulsar_tp_peer_ctx(tp), TEST_CTX_SIZE);
+    if (g_remote_mode) {
+        std::printf("rank %d transport=%s peer_ctx=%u\n", rank,
+                    pulsar_tp_is_rdma(tp) ? "rdma" : "tcp",
+                    pulsar_tp_peer_ctx(tp));
+        const char *want = getenv("PULSAR_TP_EXPECT_RDMA");
+        if (want && want[0])
+            CHECK(pulsar_tp_is_rdma(tp), "rank %d: PULSAR_TP_EXPECT_RDMA set but transport is TCP", rank);
+    } else {
+        CHECK(!pulsar_tp_is_rdma(tp), "rank %d: expected TCP transport (no verbs device)",
+              rank);
+        CHECK(pulsar_tp_peer_ctx(tp) == TEST_CTX_SIZE, "rank %d: peer_ctx=%u want %u",
+              rank, pulsar_tp_peer_ctx(tp), TEST_CTX_SIZE);
+    }
     CHECK(!pulsar_tp_failed(tp), "rank %d: failed() set at startup", rank);
 
     const uint64_t vec = (uint64_t)N_EMBD * sizeof(float);
@@ -350,14 +364,20 @@ static int run_rank(pulsar_tp *tp, int rank) {
     return g_failures != 0;
 }
 
-static int create_rank(int rank, int port, pulsar_tp **out, char *err, size_t errlen) {
+static int create_rank_ex(int rank, const char *peer, int port, pulsar_tp **out,
+                          char *err, size_t errlen) {
     pulsar_tp_options opt;
     std::memset(&opt, 0, sizeof(opt));
     opt.role = rank == 0 ? PULSAR_TP_ROLE_LEADER : PULSAR_TP_ROLE_WORKER;
-    opt.peer = rank == 0 ? NULL : "127.0.0.1";
+    /* worker: dial `peer`; leader: bind `peer` (NULL -> 0.0.0.0). */
+    opt.peer = peer;
     opt.port = port;
     pulsar_tp_identity id = test_identity();
     return pulsar_tp_create(out, &opt, &id, err, errlen);
+}
+
+static int create_rank(int rank, int port, pulsar_tp **out, char *err, size_t errlen) {
+    return create_rank_ex(rank, rank == 0 ? NULL : "127.0.0.1", port, out, err, errlen);
 }
 
 static int free_port(void) {
@@ -407,7 +427,55 @@ static int run_leader(int port) {
     return rc;
 }
 
-int main(void) {
+/* Remote-pair entry points (see main): one process per host; both run the
+ * full phase set; the leader ends by sending STOP, the worker by receiving it. */
+static int run_remote_leader(const char *bind_host, int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank_ex(0, (bind_host && bind_host[0]) ? bind_host : NULL,
+                        port, &tp, err, sizeof(err))) {
+        std::fprintf(stderr, "tp_transport_test remote-leader: create: %s\n", err);
+        return 1;
+    }
+    std::printf("tp_transport_test remote-leader: connected (transport=%s); "
+                "run the full phase set\n", pulsar_tp_is_rdma(tp) ? "rdma" : "tcp");
+    const int rc = run_rank(tp, 0);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+static int run_remote_worker(const char *peer_host, int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank_ex(1, peer_host, port, &tp, err, sizeof(err))) {
+        std::fprintf(stderr, "tp_transport_test remote-worker: create: %s\n", err);
+        return 1;
+    }
+    std::printf("tp_transport_test remote-worker: connected (transport=%s)\n",
+                pulsar_tp_is_rdma(tp) ? "rdma" : "tcp");
+    const int rc = run_rank(tp, 1);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+int main(int argc, char **argv) {
+    /* Remote mode: `tp_transport_test remote-leader [bind-host] PORT` on one
+     * box and `tp_transport_test remote-worker PEER-HOST PORT` on the other
+     * (the pair).  g_remote_mode relaxes the loopback-only TCP assert and
+     * PULSAR_TP_EXPECT_RDMA=1 turns it into a must-RDMA check. */
+    if (argc >= 4 && !std::strcmp(argv[1], "remote-leader")) {
+        g_remote_mode = true;
+        const int rc = run_remote_leader(argv[2], atoi(argv[3]));
+        std::fflush(stdout);
+        return rc;
+    }
+    if (argc >= 4 && !std::strcmp(argv[1], "remote-worker")) {
+        g_remote_mode = true;
+        const int rc = run_remote_worker(argv[2], atoi(argv[3]));
+        std::fflush(stdout);
+        return rc;
+    }
+
     const char *role = getenv("TP_TRANSPORT_TEST_ROLE");
 
     /* Direct worker invocation (or the forked child): dial the given port. */
