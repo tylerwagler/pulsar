@@ -141,8 +141,7 @@ static int check_decode_attention_overflow_path(void) {
         pulsar_gpu_tensor_write(comp_f32, 0, comp_host, comp_count * sizeof(float)) &&
         pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp, 0, n_comp,
                                                    head_dim, SMOKE_ATTN_NROT,
-                                                   /*keep_f32=*/true,
-                                                   PULSAR_ATTN_COMP_E4M3) &&
+                                                   /*keep_f32=*/true) &&
         pulsar_gpu_attention_decode_heads_tensor(heads,
                                               sinks,
                                               n_head * sizeof(float),
@@ -757,8 +756,7 @@ static int check_multibank_decode_attention(void) {
         !pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp_slab, 0,
                                                    (uint32_t)(n_banks * comp_cap),
                                                    head_dim, SMOKE_ATTN_NROT,
-                                                   /*keep_f32=*/true,
-                                                   PULSAR_ATTN_COMP_E4M3)) goto done;
+                                                   /*keep_f32=*/true)) goto done;
     for (uint32_t b = 0; b < n_banks; b++) {
         pulsar_gpu_tensor *bv = pulsar_gpu_tensor_view(raw_slab, (uint64_t)b * raw_cap * raw_row_b,
                                                        (uint64_t)raw_cap * raw_row_b);
@@ -1269,7 +1267,6 @@ int main(void) {
     /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
      * environment would make the launch dispatch decode E4M3 rows as nibbles and
      * fail confusingly.  Pin the format rather than inherit it. */
-    setenv("PULSAR_KV4", "0", 1);
 
     if (!pulsar_gpu_init()) return 1;
     int rc = check_large_topk();

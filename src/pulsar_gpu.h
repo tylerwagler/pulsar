@@ -797,16 +797,21 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
          * the stores narrow. */
         const pulsar_gpu_tensor *positions);
 
-/* PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  One packed row is
- * [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16 rope]
- * (584 B at head_dim 512 / n_rot 64, byte-identical to vLLM's fp8_ds_mla DSv4
- * cache line).  The stored values are exactly the
- * pack-store fp8 roundtrip for the nope dims (the single quantizer) and the
- * bf16 roundtrip for the rope tail, so read-back is bit-identical to the f32
- * cache -- quantize_store applies BOTH roundtrips to the source rows in place.
- * quantize_store additionally roundtrips the f32 source rows IN PLACE
- * (identical to the plain quantize entry) so stages/dumps stay consistent.
- * Requires n_rot == 64 and (head_dim - n_rot) % 64 == 0. */
+/* PULSAR_ATTN_PACK storage -- since the L111 unification (2026-08-27), ONE
+ * row format serves EVERY KV buffer: the raw SWA ring, the compressed pool,
+ * the drafter's ring, the MTP cache and prefill's current-chunk rows are all
+ * the 384 B NVFP4 row
+ *   [n_nope/2 e2m1 nibble bytes][n_nope/16 E4M3 scale codes][f32 row scale]
+ *   [n_rot bf16 rope]
+ * (224+28+4+128 at head_dim 512 / n_rot 64).  The nope dims are a LOSSY
+ * re-quantization of the model's QAT e4m3 values, shipped on the measured
+ * L111 verdict (net KL closer to the vLLM source than the retired e4m3 row,
+ * drafter acceptance at/above it, -31%% KV reservation); the rope tail is
+ * bf16 verbatim.  The e4m3 584 B row, its quantize recipe and every
+ * backward-compat decode arm are GONE -- old session payloads and bank
+ * snapshots refuse loudly and re-prefill; there is deliberately no
+ * conversion loader (an FP4 re-encode misrounds ~33%% of blocks; bytes are
+ * the values).  Requires n_rot == 64 and (head_dim - n_rot) %% 16 == 0. */
 /* THE BACKEND'S OWN ROW GEOMETRY, so the engine can check its copy against it.
  *
  * The packed KV row is defined TWICE -- PULSAR_ATTN_PACK_ROWBYTES(HD) in
@@ -826,40 +831,6 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
 uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
 uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 
-/* L111: the COMPRESSED POOL's row format.  The raw ring, the drafter's ring,
- * the MTP cache and prefill's current-chunk rows are ALWAYS the 584 B E4M3 row
- * above; only the committed comp pool narrows its nope payload to 4 bits.
- * The choice is made ONCE per process and asked through
- * pulsar_gpu_attn_comp_fmt(); it is passed per call to the producer below
- * (RAW_F16 lesson: one entry serving tensors of different formats takes the
- * format per call, never from a file-global).
- *
- * DEFAULT = NVFP4 since 2026-08-27 (Tyler; measured verdict in
- * pulsar-notes/rows/L111.md: net KL CLOSER to the vLLM source than the E4M3
- * row on both reference prompts, drafter acceptance AT/ABOVE the e4m3
- * baseline at every depth, per-bank KV reservation -31%).  PULSAR_KV4=0/off/
- * e4m3 opts back into the E4M3 row -- the arm the BYTE-EXACT prefill gate
- * certifies, and the only arm byte-comparable to vLLM's fp8_ds_mla cache.
- * The NVFP4 default is graded by cuda-reference-gate instead: a different
- * contract, deliberately (the L045 f32/f16 split precedent).  The MXFP4
- * candidate arm was CUT the same day (further from source on every prompt,
- * no compensating win); PULSAR_KV4=mx refuses to start.
- *
- * ⚠ The NVFP4 row RE-QUANTIZES values away from the model's own QAT e4m3
- * numerics; what makes it shippable is the measured verdict above, not
- * value-preservation. */
-typedef enum {
-    PULSAR_ATTN_COMP_E4M3  = 0, /* 584 B PULSAR_ATTN_PACK row (opt-in; byte-gate arm) */
-    PULSAR_ATTN_COMP_NVFP4 = 1, /* 384 B [224 e2m1][28 e4m3/16][f32 row scale][128 bf16 rope] */
-} pulsar_attn_comp_fmt;
-
-/* The active comp-pool format, read from PULSAR_KV4 exactly once. */
-pulsar_attn_comp_fmt pulsar_gpu_attn_comp_fmt(void);
-/* Row bytes of the ACTIVE comp-pool format (equals the pack rowbytes when the
- * format is E4M3).  The engine sizes the comp pool, bank snapshots and session
- * payload comp spans from THIS; raw-ring spans keep pulsar_gpu_attn_pack_rowbytes. */
-uint64_t pulsar_gpu_attn_comp_rowbytes(uint32_t head_dim);
-
 int pulsar_gpu_attn_pack_quantize_store_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
@@ -869,15 +840,13 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          n_rot,
         /* keep_f32: write the dequantised values back into the f32 staging.
          * OBSERVER-ONLY -- consumers read the packed rows.  Pass
-         * gpu_graph_f32_store_observed_any() (L094). */
-        bool              keep_f32,
-        /* The DESTINATION's row format.  PULSAR_ATTN_COMP_E4M3 for the raw
-         * ring and prefill's current-chunk rows (always); the active
-         * pulsar_gpu_attn_comp_fmt() for comp-pool commits.  The 4-bit
-         * formats quantize EXACTLY ONCE here -- re-encoding packed FP4
-         * misrounds ~33% of blocks (norm_kv.cu), so every later move of these
-         * rows must be a byte move. */
-        pulsar_attn_comp_fmt comp_fmt);
+         * gpu_graph_f32_store_observed_any() (L094).
+         *
+         * This kernel is the SINGLE E2M1 quantize of KV.  Re-encoding packed
+         * FP4 misrounds ~33% of blocks (norm_kv.cu), so every later move of
+         * these rows -- scatter, fork, evict/restore, session save/load --
+         * is a byte move. */
+        bool              keep_f32);
 
 /* Fused rope + QAT for the indexer q projection: one launch replacing the
  * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that

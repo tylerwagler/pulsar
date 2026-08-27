@@ -113,26 +113,18 @@ typedef struct {
 } leg_stats;
 
 /* verify one row against the GPU bytes; scale bytes toleranced, decode exact */
-static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
+static void verify_row(int fmt, const float *src,
                        const uint8_t *gr, const float *gdec, leg_stats *st) {
-    const uint32_t blk = fmt == PULSAR_ATTN_COMP_NVFP4 ? 16u : 64u;
+    (void)fmt;
+    const uint32_t blk = 16u;
     const uint32_t nblk = NNOPE / blk;
     float scale[NNOPE / 16u];
-    const uint8_t *sc;
-    const uint16_t *rope;
-
-    if (fmt == PULSAR_ATTN_COMP_E4M3) {
-        sc = gr + NNOPE;
-        rope = (const uint16_t *)(gr + NNOPE + 8u);
-        if (sc[7] != 0u) st->layout_mism++;
-    } else {
-        sc = gr + NIB;
-        rope = (const uint16_t *)(gr + NIB + nblk + 4u);
-    }
+    const uint8_t *sc = gr + NIB;
+    const uint16_t *rope = (const uint16_t *)(gr + NIB + nblk + 4u);
 
     /* scales: recompute exactly, compare with the fast-math tolerance */
     float nv_rs = 0.0f;
-    if (fmt == PULSAR_ATTN_COMP_NVFP4) {
+    {
         float ra = 0.0f;
         for (uint32_t d = 0; d < NNOPE; d++) ra = fmaxf(ra, fabsf(src[d]));
         const float rs_exact = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
@@ -143,67 +135,23 @@ static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
     for (uint32_t b = 0; b < nblk; b++) {
         float amax = 0.0f;
         for (uint32_t d = b * blk; d < (b + 1u) * blk; d++) amax = fmaxf(amax, fabsf(src[d]));
-        if (fmt == PULSAR_ATTN_COMP_NVFP4) {
-            const float t = fminf(448.0f, (float)((double)amax / 6.0 / (double)nv_rs));
-            const uint8_t exact = ref_e4m3_encode_pos(t);
-            const int d = (int)sc[b] - (int)exact;
-            if (d < -1 || d > 1) st->scale_dev++;
-            scale[b] = ref_e4m3_value(sc[b]) * nv_rs;   /* GPU byte is authoritative */
-        } else {
-            const float K = 448.0f;
-            const int lo = 0;
-            int e = (int)ceil(log2(fmax((double)amax, 1.0e-4) / (double)K)) + 127;
-            if (e < lo) e = lo;
-            if (e > 254) e = 254;
-            const int d = (int)sc[b] - e;
-            if (d < -1 || d > 1) st->scale_dev++;
-            scale[b] = exp2f((float)((int)sc[b] - 127));
-        }
+        const float t = fminf(448.0f, (float)((double)amax / 6.0 / (double)nv_rs));
+        const uint8_t exact = ref_e4m3_encode_pos(t);
+        const int d = (int)sc[b] - (int)exact;
+        if (d < -1 || d > 1) st->scale_dev++;
+        scale[b] = ref_e4m3_value(sc[b]) * nv_rs;   /* GPU byte is authoritative */
     }
 
     /* data codes vs encode(src / gpu_scale); writeback EXACT vs gpu bytes */
     for (uint32_t d = 0; d < NNOPE; d++) {
         const float s = scale[d / blk];
-        uint8_t gcode, expect;
-        float wb_expect;
-        if (fmt == PULSAR_ATTN_COMP_E4M3) {
-            gcode = gr[d];
-            const float q = s > 0.0f ? (float)((double)src[d] / (double)s) : 0.0f;
-            const float c = fminf(448.0f, fmaxf(-448.0f, q));
-            /* Sign from the BIT PATTERN, not a float compare: the hardware
-             * cvt encodes -0.0f as 0x80, `-0 >= 0` is true, and signbit() on
-             * a computed value is unreliable under -ffast-math's
-             * no-signed-zeros license (both bit this gate's first two sparky
-             * runs).  The source array's stored bits are the authority; the
-             * scale is positive, so the quotient's sign is the source's.  A
-             * sign-preserved zero byte decodes to -0 and changes nothing
-             * numeric.  (The Makefile also builds this tool -fno-fast-math --
-             * a verifier must not be compiled under value-changing flags.) */
-            uint32_t src_bits; memcpy(&src_bits, &src[d], 4);
-            const uint8_t mag_code = ref_e4m3_encode_pos(fabsf(c));
-            expect = (src_bits >> 31) ? (uint8_t)(0x80u | mag_code) : mag_code;
-            const float mag = ref_e4m3_value(gcode & 0x7fu);
-            wb_expect = ((gcode & 0x80u) ? -mag : mag) * s;
-            if (gcode != expect) {
-                const int dd = (int)(gcode & 0x7f) - (int)(expect & 0x7f);
-                st->code_mism++;
-                if ((gcode & 0x80u) != (expect & 0x80u) || dd < -1 || dd > 1) {
-                    if (st->code_nonadj < 8)
-                        fprintf(stderr, "  e4m3 nonadj: d %u src %.9g (0x%08x) scale %.9g "
-                                        "q %.9g gpu %02x cpu %02x\n",
-                                d, src[d], *(const uint32_t *)&src[d], s, q, gcode, expect);
-                    st->code_nonadj++;
-                }
-            }
-        } else {
-            gcode = (gr[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
-            const float q = s > 0.0f ? (float)((double)src[d] / (double)s) : 0.0f;
-            expect = ref_e2m1_encode(q);
-            wb_expect = ref_e2m1_decode(gcode, s);
-            if (gcode != expect) {
-                st->code_mism++;
-                if (!adjacent_e2m1(gcode, expect)) st->code_nonadj++;
-            }
+        const uint8_t gcode = (gr[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
+        const float q = s > 0.0f ? (float)((double)src[d] / (double)s) : 0.0f;
+        const uint8_t expect = ref_e2m1_encode(q);
+        const float wb_expect = ref_e2m1_decode(gcode, s);
+        if (gcode != expect) {
+            st->code_mism++;
+            if (!adjacent_e2m1(gcode, expect)) st->code_nonadj++;
         }
         if (memcmp(&wb_expect, &gdec[d], 4) != 0) st->wb_mism++;
         const double e2 = (double)gdec[d] - (double)src[d];
@@ -233,18 +181,14 @@ int main(void) {
         for (uint32_t d = NNOPE; d < HD; d++) src[r * HD + d] = 4.0f * frand() - 2.0f;
     }
 
-    struct { pulsar_attn_comp_fmt fmt; const char *name; uint64_t rowb; } legs[] = {
-        { PULSAR_ATTN_COMP_E4M3,  "e4m3", 584u },
-        { PULSAR_ATTN_COMP_NVFP4, "nv",   384u },
+    struct { int fmt; const char *name; uint64_t rowb; } legs[] = {
+        { 0, "nv", 384u },
     };
     int fails = 0;
     for (size_t l = 0; l < sizeof legs / sizeof legs[0]; l++) {
         const uint64_t rowb = legs[l].rowb;
-        if (legs[l].fmt == PULSAR_ATTN_COMP_E4M3 &&
-            pulsar_gpu_attn_pack_rowbytes(HD) != rowb) {
-            /* only the E4M3 stride has a backend query to ask; the mx/nv
-             * strides are verified structurally by verify_row's offsets. */
-            fprintf(stderr, "kv4-pack-gate: e4m3 rowbytes %llu != %llu\n",
+        if (pulsar_gpu_attn_pack_rowbytes(HD) != rowb) {
+            fprintf(stderr, "kv4-pack-gate: rowbytes %llu != %llu\n",
                     (unsigned long long)pulsar_gpu_attn_pack_rowbytes(HD),
                     (unsigned long long)rowb);
             return 1;
@@ -254,7 +198,7 @@ int main(void) {
         if (!x || !packed ||
             !pulsar_gpu_tensor_write(x, 0, src, (uint64_t)ROWS * HD * sizeof(float)) ||
             !pulsar_gpu_attn_pack_quantize_store_tensor(x, packed, 0, ROWS, HD, NROT,
-                                                        /*keep_f32=*/true, legs[l].fmt) ||
+                                                        /*keep_f32=*/true) ||
             !pulsar_gpu_synchronize()) {
             fprintf(stderr, "kv4-pack-gate: %s: GPU pack FAILED to run\n", legs[l].name);
             return 1;

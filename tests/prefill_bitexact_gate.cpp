@@ -176,7 +176,7 @@
  * usage: ./tests/prefill_bitexact_gate MODEL --dump  FILE
  *        ./tests/prefill_bitexact_gate MODEL --check FILE EXPECTED_BASELINE_REF
  *        ./tests/prefill_bitexact_gate MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]
- *            [--known-high d1,d2,...] [--known-flip d1,d2,...] [--kv4 mx|nv]
+ *            [--known-high d1,d2,...] [--known-flip d1,d2,...]
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
  */
@@ -1109,17 +1109,8 @@ int main(int argc, char **argv) {
         int enforce = 0;
         double tol = 1e30;
         /* --kl-baseline FILE : grade DIRECTION (closer/further from source)
-         * --dump-kl FILE     : record the current per-depth KL as a budget
-         * --kv4 mx|nv        : L111 MEASUREMENT ARM -- re-arm PULSAR_KV4 after
-         *   the scrub.  Reference mode is the one place a numerics knob on OUR
-         *   side is not vacuous: the other side of the compare is an external
-         *   vLLM capture the knob cannot touch, and grading the 4-bit comp
-         *   cache against that source is the whole point (the scrub's
-         *   both-sides rationale applies to --dump/--check byte compares,
-         *   which still refuse every knob).  Such a run is a measurement, not
-         *   a default certification, and says so in a banner. */
+         * --dump-kl FILE     : record the current per-depth KL as a budget */
         const char *kl_base_path = NULL, *kl_dump_path = NULL;
-        const char *kv4_arm = NULL;
         for (int a = 5; a < argc; a++) {
             if (strncmp(argv[a], "--known-high", 12) == 0) {
                 const char *list = strchr(argv[a], '=');
@@ -1145,31 +1136,12 @@ int main(int argc, char **argv) {
                 const char *v = strchr(argv[a], '=');
                 if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
                 kl_dump_path = v;
-            } else if (strncmp(argv[a], "--kv4", 5) == 0) {
-                const char *v = strchr(argv[a], '=');
-                if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
-                kv4_arm = v;
             } else {
                 tol = atof(argv[a]);
                 enforce = 1;
             }
         }
         scrub_numerics_env();
-        if (kv4_arm) {
-            if (strcmp(kv4_arm, "nv") != 0 && strcmp(kv4_arm, "e4m3") != 0) {
-                fprintf(stderr, "--kv4 takes nv or e4m3, not '%s' (the mx arm "
-                                "was cut 2026-08-27)\n", kv4_arm);
-                return 2;
-            }
-            if (setenv("PULSAR_KV4", kv4_arm, 1) != 0) {
-                fprintf(stderr, "REFERENCE GATE FAIL: setenv(PULSAR_KV4) failed -- "
-                                "cannot arm the measurement configuration\n");
-                return 2;
-            }
-            printf("*** L111 MEASUREMENT ARM: PULSAR_KV4=%s (4-bit comp KV) -- this run "
-                   "grades a NON-DEFAULT configuration against the reference; do not "
-                   "file its verdict as a default certification ***\n", kv4_arm);
-        }
         printf("prefill reference gate: this binary built from ref '%s'\n",
                PULSAR_GATE_BUILD_REF);
         if (n_known_high) {
@@ -1240,11 +1212,9 @@ int main(int argc, char **argv) {
     }
 
     scrub_numerics_env();
-    /* No arm pin here: the scrub leaves the engine on its DEFAULT, which since
-     * the 2026-08-27 flip is the NVFP4 comp row -- and the byte baseline is
-     * anchored to a commit that runs the same default (Tyler: nv is the
-     * default and soon the only option, so the byte gate certifies IT).  The
-     * E4M3 opt-out remains reachable only through --kv4/--check-reference. */
+    /* One KV format since the L111 unification -- the scrub leaves nothing to
+     * pin: the baseline is anchored to a commit running the same unified
+     * NVFP4 rows this binary runs. */
     printf("prefill bit-exactness gate: this binary built from ref '%s'\n",
            PULSAR_GATE_BUILD_REF);
 

@@ -173,20 +173,18 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
     (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 1u) / 2u + \
      (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 31u) / 32u))
 
-/* Packed attention KV row (E4M3): VALUE-PRESERVING.  One row = [448 e4m3 nope
- * bytes][7 E8M0 block-64 scale bytes][1 pad][64 bf16 rope] = 584 B (vs 2048
- * f32), byte-identical to vLLM's fp8_ds_mla DSv4 cache line.  The nope dims
- * store exactly the fp8_kv_quantize roundtrip the f32 pipeline applies in
- * place, and the rope tail its bf16 roundtrip — read-back is bit-identical.
- * Must stay in sync with PULSAR_ATTN_PACK_ROWBYTES in
- * src/cuda/pulsar_cuda_internal.h.
- *
- * ⚠ Since L111 this is the RAW-side row only by definition; the COMP POOL's
- * row can be a 4-bit format under PULSAR_KV4.  Never stride the comp pool
- * with this macro — ask gpu_graph_attn_comp_cache_row_bytes(). */
+/* THE packed KV row (NVFP4, L111 unification 2026-08-27): one row format for
+ * every KV buffer -- raw ring, comp pool, drafter ring, MTP cache, current
+ * chunk.  [n_nope/2 e2m1 nibbles][n_nope/16 e4m3 scale codes][f32 row scale]
+ * [n_rot bf16 rope] = 384 B at head_dim 512 / n_rot 64.  The nope payload is
+ * a lossy re-quantization of the QAT e4m3 values (measured verdict in
+ * rows/L111.md); rope is bf16 verbatim.  The retired 584 B e4m3 row has no
+ * decode path and no conversion loader -- stale payloads refuse by stride and
+ * version.  Must stay in sync with PULSAR_ATTN_PACK_ROWBYTES in
+ * src/cuda/pulsar_cuda_internal.h (the graph-alloc seam check enforces it). */
 #define PULSAR_ENGINE_ATTN_PACK_ROWBYTES \
-    ((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) + \
-     ((((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 64u) + 3u) & ~3ull) + \
+    ((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 2u + \
+     (uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 16u + 4u + \
      (uint64_t)PULSAR_N_ROT * 2u)
 
 
@@ -848,7 +846,7 @@ typedef struct {
     pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *spec_issc[PULSAR_MAX_LAYER];
-    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * PULSAR_ATTN_PACK row (584 B) */
+    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * PULSAR_ATTN_PACK row (384 B) */
     uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
     pulsar_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
     pulsar_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
@@ -1066,7 +1064,7 @@ typedef struct {
      * too (compute wide, store narrow). What was wrong until 2026-08-17 was f32
      * as the multiply OPERAND: attention read the staging buffer directly, so
      * the chunk's own KV was attended at 4 bytes/element while every later
-     * chunk read the same rows out of the packed ring at 584 B/row. */
+     * chunk read the same rows out of the packed ring at 384 B/row. */
     pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;
     pulsar_gpu_tensor *batch_comp_sc;

@@ -540,7 +540,7 @@ __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
  * the engine's ONE fp8 recipe (per-64 amax reduction, exp2(ceil(log2(amax/448)))
  * scale, clamp to +-448, E4M3 roundtrip), write the roundtripped f32 back into x (so
  * the stage/dumps show the same values the f32 pipeline produces), and store
- * the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h; 584 B at
+ * the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h; 384 B at
  * head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
  * takes the same treatment one dtype up: bf16-roundtripped in place, then
  * stored.  Read-back is bit-identical to the f32 path. */
@@ -549,7 +549,7 @@ __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
  * read.  positions/seq_id/n_banks/raw_cap give the ring scatter the raw cache
  * needs -- destination row is bank*raw_cap + pos%raw_cap.  raw_cap == 0
  * degenerates to consecutive rows at out_row0, which is what the compressed pool
- * wants, so ONE kernel now writes both KV caches in the one 584 B format. */
+ * wants, so ONE kernel now writes both KV caches in the one 384 B format. */
 /* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately.
  *
  * attn_pack_store_kernel (quantise then store) and attn_pack_scatter_kernel
@@ -583,57 +583,78 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
                                               const int32_t * __restrict__ positions,
                                               const int32_t * __restrict__ seq_id,
                                               uint32_t n_banks, uint32_t raw_cap) {
-    uint32_t row = blockIdx.x;
-    uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;      /* 64 threads */
     if (row >= n_rows) return;
     const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
                                                 positions, seq_id);
     if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
     const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t nblk = n_nope / PULSAR_FP8_KV_BLOCK;
-    const uint32_t nblk_pad = (nblk + 3u) & ~3u;
+    const uint32_t nib_bytes = n_nope / 2u;
+    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
     const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     const float *sr = src + (uint64_t)row * head_dim;
     float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
     uint8_t *outr = out + dst_row * rowbytes;
-    uint8_t *sc = outr + n_nope;
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + n_nope + nblk_pad);
-    __shared__ float scratch[64];
-    for (uint32_t off = 0; off < n_nope; off += PULSAR_FP8_KV_BLOCK) {
-        float v = 0.0f;
-        if (off + tid < n_nope) v = sr[off + tid];
-        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-            __syncthreads();
-        }
-        const float lg = ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f));
-        const float scale = exp2f(lg);
-        if (tid == 0) {
-            int e = (int)lg + 127;
-            if (e < 0) e = 0;
-            if (e > 254) e = 254;
-            sc[off / PULSAR_FP8_KV_BLOCK] = (uint8_t)e;
-        }
-        if (off + tid < n_nope) {
-            const float c = fminf(448.0f, fmaxf(-448.0f, v / scale));
-            if (xr) xr[off + tid] = dsv4_e4m3fn_dequant_dev(c) * scale;
-            outr[off + tid] = dsv4_e4m3fn_encode_dev(c);
-        }
-        __syncthreads();
+    uint8_t *sc = outr + nib_bytes;
+    __shared__ float samax[PULSAR_KV4_NV_NBLK(512u)];   /* 28 at head_dim 512 */
+    __shared__ float sscale[PULSAR_KV4_NV_NBLK(512u)];
+    __shared__ float srow;
+
+    for (uint32_t bk = tid; bk < nblk; bk += blockDim.x) samax[bk] = 0.0f;
+    __syncthreads();
+    /* Per-16 amax.  Non-negative floats order-match their bit patterns, so
+     * atomicMax on the int view is exact -- and max is order-independent, so
+     * the result is deterministic. */
+    for (uint32_t d = tid; d < n_nope; d += blockDim.x) {
+        atomicMax((int *)&samax[d / PULSAR_KV4_NV_BLOCK], __float_as_int(fabsf(sr[d])));
     }
+    __syncthreads();
     if (tid == 0) {
-        for (uint32_t p = nblk; p < nblk_pad; p++) sc[p] = 0;
+        float ra = 0.0f;
+        for (uint32_t bk = 0; bk < nblk; bk++) ra = fmaxf(ra, samax[bk]);
+        /* Row scale keyed so every block scale block_amax/(6*row_scale) fits
+         * E4M3's [0, 448]; the 1e-4 amax floor matches the retired fp8
+         * recipe's. */
+        const float rs = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
+        srow = rs;
+        *(float *)(sc + nblk) = rs;   /* 4-aligned: nib 224 + 28 codes */
     }
-    /* Roundtrip the rope tail through bf16 IN PLACE as well, exactly as the
-     * nope dims are roundtripped above, so the f32 staging buffer keeps holding
-     * precisely what the packed row decodes to.  Without the write-back the
-     * value-preserving invariant would hold for 448 of 512 dims only. */
+    __syncthreads();
+    for (uint32_t bk = tid; bk < nblk; bk += blockDim.x) {
+        /* The DECODED scale (e4m3 roundtrip x row scale) is what both the
+         * encode below and every reader use; a round-down clips the block's
+         * extremes into the top code -- the standard NVFP4 trade, measured
+         * in the L111 verdict. */
+        const float t = fminf(448.0f, samax[bk] * (1.0f / 6.0f) / srow);
+        sc[bk] = dsv4_e4m3fn_encode_dev(t);
+        sscale[bk] = dsv4_e4m3fn_dequant_dev(t) * srow;
+    }
+    __syncthreads();
+
+    /* Nibble pairs: thread t owns packed bytes t, t+64, ... (dims 2t, 2t+1).
+     * dsv4_e2m1fn_encode_dev is the tree's ONE reference E2M1 encoder
+     * (round-to-nearest, tie to the even code).  A zero block decodes zero
+     * whatever its code; guard the quotient so it encodes code 0, not NaN. */
+    for (uint32_t i = tid; i < nib_bytes; i += blockDim.x) {
+        const uint32_t d0 = i * 2u;
+        const float s0 = sscale[d0 / PULSAR_KV4_NV_BLOCK];
+        const float s1 = sscale[(d0 + 1u) / PULSAR_KV4_NV_BLOCK];
+        const uint32_t v0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
+        const uint32_t v1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
+        outr[i] = (uint8_t)(v0 | (v1 << 4));
+        if (xr) {
+            xr[d0]      = attn_kv4_e2m1(v0, s0);
+            xr[d0 + 1u] = attn_kv4_e2m1(v1, s1);
+        }
+    }
+    /* bf16 rope tail, roundtripped in place so the f32 staging keeps holding
+     * exactly what the packed row decodes to. */
+    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + nib_bytes + nblk + 4u);
     for (uint32_t d = tid; d < n_rot; d += blockDim.x) {
-        const __nv_bfloat16 b = __float2bfloat16(sr[n_nope + d]);
-        rope[d] = b;
-        if (xr) xr[n_nope + d] = __bfloat162float(b);
+        const __nv_bfloat16 hb = __float2bfloat16(sr[n_nope + d]);
+        rope[d] = hb;
+        if (xr) xr[n_nope + d] = __bfloat162float(hb);
     }
 }
 
@@ -1170,113 +1191,6 @@ uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim) {
     return PULSAR_MXKV_FP4_ROWBYTES(head_dim);
 }
 
-/* The active comp-pool format, read from PULSAR_KV4 exactly once (L111; the
- * env parse itself is pulsar_attn_comp_fmt_env in pulsar_cuda_internal.h so
- * the standalone kernel tests resolve it too).  An unrecognised value REFUSES
- * TO START rather than silently measuring the wrong arm (the removed
- * PULSAR_ATTN_MX set the template: a dead format env fails loudly, never
- * falls back). */
-pulsar_attn_comp_fmt pulsar_gpu_attn_comp_fmt(void) {
-    return pulsar_attn_comp_fmt_env();
-}
-
-uint64_t pulsar_gpu_attn_comp_rowbytes(uint32_t head_dim) {
-    return attn_comp_fmt_rowbytes(pulsar_gpu_attn_comp_fmt(), head_dim);
-}
-
-/* L111 4-bit comp-pool store: quantize the nope dims of n_rows f32 rows of src
- * to E2M1 against per-16 E4M3 block scales over an f32 row scale (NVFP4) and
- * store KV4 rows at [out_row0, out_row0+n_rows)
- * -- consecutive rows only: the raw ring never takes this format.  The rope
- * tail is bf16-roundtripped exactly as attn_pack_store_kernel does it.  With
- * x non-NULL the f32 staging gets the DEQUANTIZED values written back, keeping
- * the value-preserving invariant of the stage ("the stage holds what the
- * packed row decodes to") -- under KV4 those are fp4 values, not fp8.
- *
- * THIS KERNEL IS THE SINGLE E2M1 QUANTIZE.  Re-encoding a decoded FP4 row
- * misrounds ~33% of blocks (the re-encode note above attn_pack_store_kernel);
- * every downstream move -- scatter, fork, evict/restore, session save/load --
- * is a byte move of these rows. */
-template <int CF>
-__global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, uint8_t *out,
-                                                  uint32_t out_row0, uint32_t n_rows,
-                                                  uint32_t head_dim) {
-    const uint32_t row = blockIdx.x;
-    const uint32_t tid = threadIdx.x;      /* 64 threads, as the fp8 store */
-    if (row >= n_rows) return;
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t blk = PULSAR_KV4_NV_BLOCK;
-    const uint32_t nblk = n_nope / blk;
-    const uint64_t rowbytes = attn_comp_fmt_rowbytes(CF, head_dim);
-    const float *sr = src + (uint64_t)row * head_dim;
-    float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
-    uint8_t *outr = out + ((uint64_t)out_row0 + row) * rowbytes;
-    uint8_t *sc = outr + nib_bytes;
-    __shared__ float samax[PULSAR_KV4_NV_NBLK(512u)];   /* 28 covers both formats */
-    __shared__ float sscale[PULSAR_KV4_NV_NBLK(512u)];
-    __shared__ float srow;
-
-    for (uint32_t b = tid; b < nblk; b += blockDim.x) samax[b] = 0.0f;
-    __syncthreads();
-    /* Per-quant-block amax.  Non-negative floats order-match their bit
-     * patterns, so atomicMax on the int view is exact -- and max is
-     * order-independent, so the result is deterministic. */
-    for (uint32_t d = tid; d < n_nope; d += blockDim.x) {
-        atomicMax((int *)&samax[d / blk], __float_as_int(fabsf(sr[d])));
-    }
-    __syncthreads();
-
-    {
-        if (tid == 0) {
-            float ra = 0.0f;
-            for (uint32_t b = 0; b < nblk; b++) ra = fmaxf(ra, samax[b]);
-            /* Row scale keyed so every block scale block_amax/(6*row_scale)
-             * fits E4M3's [0, 448]; amax floor matches the fp8 recipe. */
-            const float rs = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
-            srow = rs;
-            *(float *)(sc + nblk) = rs;   /* 4-aligned: nib 224 + 28 codes */
-        }
-        __syncthreads();
-        for (uint32_t b = tid; b < nblk; b += blockDim.x) {
-            /* The DECODED scale (e4m3 roundtrip x row scale) is what both the
-             * encode below and every reader use; a round-down clips the
-             * block's extremes into the top code, which is the standard NVFP4
-             * trade and is measured, not assumed, by the L111 gates. */
-            const float t = fminf(448.0f, samax[b] * (1.0f / 6.0f) / srow);
-            sc[b] = dsv4_e4m3fn_encode_dev(t);
-            sscale[b] = dsv4_e4m3fn_dequant_dev(t) * srow;
-        }
-    }
-    __syncthreads();
-
-    /* Nibble pairs: thread t owns packed bytes t, t+64, ... (dims 2t, 2t+1).
-     * dsv4_e2m1fn_encode_dev is the tree's ONE reference E2M1 encoder
-     * (round-to-nearest, tie to the even code) -- the same authority the
-     * indexer QAT path answers to, deliberately not a second transcription.
-     * A zero block decodes zero whatever its code; guard the quotient so it
-     * encodes code 0 rather than NaN. */
-    for (uint32_t i = tid; i < nib_bytes; i += blockDim.x) {
-        const uint32_t d0 = i * 2u;
-        const float s0 = sscale[d0 / blk];
-        const float s1 = sscale[(d0 + 1u) / blk];
-        const uint32_t n0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
-        const uint32_t n1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
-        outr[i] = (uint8_t)(n0 | (n1 << 4));
-        if (xr) {
-            xr[d0]      = attn_kv4_e2m1(n0, s0);
-            xr[d0 + 1u] = attn_kv4_e2m1(n1, s1);
-        }
-    }
-    /* bf16 rope tail, roundtripped in place exactly as the fp8 store does. */
-    const uint32_t rope_off = nib_bytes + nblk + 4u;
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + rope_off);
-    for (uint32_t d = tid; d < PULSAR_ATTN_PACK_NROT; d += blockDim.x) {
-        const __nv_bfloat16 b = __float2bfloat16(sr[n_nope + d]);
-        rope[d] = b;
-        if (xr) xr[n_nope + d] = __bfloat162float(b);
-    }
-}
 
 int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                                        pulsar_gpu_tensor *packed,
@@ -1284,27 +1198,15 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                                        uint32_t n_rows,
                                                        uint32_t head_dim,
                                                        uint32_t n_rot,
-                                                       bool keep_f32,
-                                                       pulsar_attn_comp_fmt comp_fmt) {
+                                                       bool keep_f32) {
     if (!x || !packed || n_rows == 0 ||
         n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
-        ((head_dim - n_rot) % PULSAR_FP8_KV_BLOCK) != 0 ||
+        head_dim != 512u ||   /* shared samax/sscale are sized for 28 blocks */
+        ((head_dim - n_rot) % PULSAR_KV4_NV_BLOCK) != 0 ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
         packed->bytes < ((uint64_t)out_row0 + n_rows) *
-                        attn_comp_fmt_rowbytes(comp_fmt, head_dim)) {
+                        PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
         return 0;
-    }
-    if (comp_fmt != PULSAR_ATTN_COMP_E4M3 && head_dim != 512u) {
-        /* attn_comp_kv4_store_kernel's shared samax/sscale are sized for
-         * head_dim 512 (28 blocks); a larger shape would write past them.
-         * No caller passes anything else -- refuse rather than trust that. */
-        return 0;
-    }
-    if (comp_fmt == PULSAR_ATTN_COMP_NVFP4) {
-        attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_NVFP4><<<n_rows, 64>>>(
-                keep_f32 ? (float *)x->ptr : NULL, (const float *)x->ptr,
-                (uint8_t *)packed->ptr, out_row0, n_rows, head_dim);
-        return cuda_ok(cudaGetLastError(), "attn_comp_kv4_store nv launch");
     }
     attn_pack_store_kernel<<<n_rows, 64>>>(keep_f32 ? (float *)x->ptr : NULL,
                                           (const float *)x->ptr,

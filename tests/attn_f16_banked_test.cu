@@ -67,19 +67,15 @@ int cuda_ok(cudaError_t err, const char *what) {
  * attn_comp_pack_ld the f32 kernel uses, so there is one implementation. */
 static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    uint32_t e = 0, m = 0;
-    for (uint32_t be = 1; be < 15u && !e; be++)
-        for (uint32_t mm = 0; mm < 8u; mm++) {
-            const float cand = ldexpf(1.0f + (float)mm / 8.0f, (int)be - 7);
-            if (cand == v) { e = be; m = mm; break; }
-        }
-    if (!e) { fprintf(stderr, "pack_const_row: %.4f not exact in e4m3\n", v); exit(2); }
-    for (uint32_t d = 0; d < n_nope; d++) dst[d] = (uint8_t)((e << 3) | m);
-    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_SCALES_PAD(head_dim); i++)
-        dst[n_nope + i] = 127u;                       /* scale = 2^0 */
-    /* v is exact in e4m3 (3 mantissa bits) and therefore exact in bf16 (7), so
-     * the narrowed rope tail still decodes to precisely v. */
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(dst + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
+    /* Exact NV construction: row scale = v (f32, exact), every per-16 scale
+     * code = e4m3(1.0), every nibble = e2m1(1.0) -> each nope element decodes
+     * to exactly 1.0 * 1.0 * v = v.  The rope tail narrows v to bf16, exact
+     * whenever v is exact in e4m3 (3 mantissa bits <= bf16's 7). */
+    const uint32_t nib = n_nope / 2u, nblk = n_nope / 16u;
+    for (uint32_t i = 0; i < nib; i++) dst[i] = (uint8_t)(2u | (2u << 4)); /* e2m1 1.0 pairs */
+    for (uint32_t i = 0; i < nblk; i++) dst[nib + i] = (uint8_t)(7u << 3); /* e4m3 1.0 */
+    memcpy(dst + nib + nblk, &v, sizeof v);                               /* row scale = v */
+    __nv_bfloat16 *rope = (__nv_bfloat16 *)(dst + nib + nblk + 4u);
     for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(v);
 }
 

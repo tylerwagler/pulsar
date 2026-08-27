@@ -56,7 +56,6 @@ int main(int argc, char **argv) {
     /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
      * environment would make the launch dispatch decode E4M3 rows as nibbles and
      * fail confusingly.  Pin the format rather than inherit it. */
-    setenv("PULSAR_KV4", "0", 1);
 
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
     const uint32_t window   = (argc > 2) ? (uint32_t)atoi(argv[2]) : 24u;
@@ -92,30 +91,15 @@ int main(int argc, char **argv) {
     {
         for (uint32_t r = 0; r < n_tokens; r++) {
             uint8_t *row = &rawp[(size_t)r * pack_row_h];
-            /* scales FIRST -- the payload byte is an encode against its own
-             * block scale, so the scale has to exist before the value does.
-             * Near 2^0 so decoded magnitudes match the f32 fixture this
-             * replaced, and so the tolerances below stay meaningful. */
-            for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
-                row[n_nope_h + sc] = (uint8_t)(126 + (int)((r + sc) % 3));
+            /* Draws with a per-16-block magnitude band (2^-1..2^1) so scale
+             * addressing is exercised without degenerating the softmax --
+             * same discipline as the e4m3-era fixture, scale now DERIVED
+             * from the data because NV packs whole rows. */
+            std::vector<float> vals(D);
             for (uint32_t d = 0; d < n_nope_h; d++)
-                row[d] = host_e4m3_encode((float)(nd(rng) * 0.5),
-                                          host_pack_block_scale(row, n_nope_h, d,
-                                                                PULSAR_FP8_KV_BLOCK));
-            uint16_t *rope = (uint16_t *)(row + n_nope_h + PULSAR_ATTN_PACK_SCALES_PAD(D));
-            for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) {
-                const float f = (float)(nd(rng) * 0.5);
-                uint32_t u; std::memcpy(&u, &f, sizeof u);
-                rope[d] = (uint16_t)(u >> 16);          /* truncate to bf16 */
-            }
-            for (uint32_t d = 0; d < D; d++) {
-                if (d < n_nope_h) {
-                    kv[(size_t)r * D + d] = host_e4m3_decode(row[d],
-                        host_pack_block_scale(row, n_nope_h, d, PULSAR_FP8_KV_BLOCK));
-                } else {
-                    kv[(size_t)r * D + d] = host_bf16_widen(rope[d - n_nope_h]);
-                }
-            }
+                vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
+            for (uint32_t d = n_nope_h; d < D; d++) vals[d] = (float)(nd(rng) * 0.5);
+            host_nv_pack_row(vals.data(), row, &kv[(size_t)r * D], D);
         }
     }
     /* Comp rows are PULSAR_ATTN_PACK too.  They were f32 until 2026-08-18 and the
@@ -126,23 +110,11 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> ckvp(n_ckv * pack_row_h);
     for (size_t r = 0; r < n_ckv; r++) {
         uint8_t *row = &ckvp[r * pack_row_h];
-        for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
-            row[n_nope_h + sc] = (uint8_t)(126 + (int)((r + sc) % 3));
+        std::vector<float> vals(D);
         for (uint32_t d = 0; d < n_nope_h; d++)
-            row[d] = host_e4m3_encode((float)(nd(rng) * 0.5),
-                                      host_pack_block_scale(row, n_nope_h, d,
-                                                            PULSAR_FP8_KV_BLOCK));
-        uint16_t *rope = (uint16_t *)(row + n_nope_h + PULSAR_ATTN_PACK_SCALES_PAD(D));
-        for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++) {
-            const float f = (float)(nd(rng) * 0.5);
-            uint32_t u; std::memcpy(&u, &f, sizeof u);
-            rope[d] = (uint16_t)(u >> 16);
-        }
-        for (uint32_t d = 0; d < D; d++)
-            ckv[r * D + d] = (d < n_nope_h)
-                ? host_e4m3_decode(row[d], host_pack_block_scale(row, n_nope_h, d,
-                                                                 PULSAR_FP8_KV_BLOCK))
-                : host_bf16_widen(rope[d - n_nope_h]);
+            vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
+        for (uint32_t d = n_nope_h; d < D; d++) vals[d] = (float)(nd(rng) * 0.5);
+        host_nv_pack_row(vals.data(), row, &ckv[r * D], D);
     }
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 

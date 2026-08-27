@@ -614,7 +614,7 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * a bump, and a file straddling that change would have decoded noise into a KV
  * cache rather than refusing to load.  The version still moves on format
  * changes -- this just means forgetting is no longer silent. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(6)
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(7)  /* v7: unified NVFP4 rows -- raw AND comp strides changed (L111) */
 /* 13 shape/counters + 2 row strides (attn pack, indexer fp4). */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 15u
 

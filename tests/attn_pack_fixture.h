@@ -25,8 +25,8 @@
  * noise from the wrong end.
  *
  * The cost is that the fixture no longer sweeps every byte pattern.  That
- * coverage was defending a property of the decoder's bit math -- attn_pack_e4m3
- * is total, with no NaN encodings -- which holds by inspection and does not
+ * coverage was defending a property of the decoder's bit math -- the row decode
+ * is total -- which holds by inspection and does not
  * need a random walk to assert, whereas a non-degenerate softmax cannot be
  * recovered by inspection at all.
  */
@@ -37,49 +37,84 @@
 #include <cstdint>
 #include <cstring>
 
-/* Decode only, mirroring attn_pack_e4m3 / attn_comp_pack_ld in
- * src/cuda/pulsar_cuda_internal.h; there is nothing here that can drift from
- * the device's rounding. */
-static inline float host_e4m3_decode(uint8_t b, float scale) {
-    const uint32_t e = (b >> 3) & 15u;
-    const uint32_t m = b & 7u;
-    const float v = e ? std::ldexp(1.0f + (float)m / 8.0f, (int)e - 7)
-                      : (float)m * 0.001953125f;      /* 2^-9 * m, subnormal */
-    const float sv = v * scale;
-    return (b & 0x80u) ? -sv : sv;
+/* Host NV row codec, mirroring the device row exactly:
+ *   [n_nope/2 e2m1 nibbles][n_nope/16 e4m3 scale codes][f32 row scale]
+ *   [n_rot bf16 rope]  (384 B at head_dim 512)
+ * Encoders are inverse-searches of the decode tables so the two cannot
+ * drift; this is fixture code and clarity beats speed. */
+static inline float host_e4m3_mag(uint8_t code) {
+    const uint32_t e = (code >> 3) & 15u, m = code & 7u;
+    if (e == 15u && m == 7u) return NAN;
+    if (e == 0u) return (float)m * 0.001953125f;
+    return std::ldexp(1.0f + (float)m / 8.0f, (int)e - 7);
 }
-
-/* Nearest E4M3, defined as the inverse-search of the decoder above so the two
- * cannot drift.  128 magnitudes searched per element: this is fixture code and
- * clarity beats speed. */
-static inline uint8_t host_e4m3_encode(float v, float scale) {
-    const uint8_t sign = (v < 0.0f) ? 0x80u : 0x00u;
-    const float x = std::fabs(v / scale);
-    int best = 0; float bd = INFINITY;
-    for (int b = 0; b < 128; b++) {
-        const float d = std::fabs(host_e4m3_decode((uint8_t)b, 1.0f) - x);
-        if (d < bd) { bd = d; best = b; }
+static inline uint8_t host_e4m3_encode_pos(float x) {
+    if (x >= 448.0f) return 126u;
+    uint32_t best = 0u; float bd = std::fabs(x - host_e4m3_mag(0));
+    for (uint32_t c = 1u; c <= 126u; c++) {
+        const float d = std::fabs(x - host_e4m3_mag((uint8_t)c));
+        if (d < bd || (d == bd && (c & 1u) == 0u && (best & 1u) != 0u)) { best = c; bd = d; }
     }
-    return (uint8_t)(sign | (uint8_t)best);
+    return (uint8_t)best;
 }
-
-/* The E8M0 scale byte for nope element d of a row whose scale bytes are
- * already written.  Callers write scales BEFORE the payload -- the payload
- * byte is an encode against its own block scale, so the scale has to exist
- * before the value does. */
-static inline float host_pack_block_scale(const uint8_t *row, uint32_t n_nope,
-                                          uint32_t d, uint32_t block) {
-    const uint32_t sb = (uint32_t)row[n_nope + (d / block)];
-    float scale; const uint32_t su = sb << 23;
-    std::memcpy(&scale, &su, sizeof scale);
-    return scale;
+static inline float host_e2m1_value(uint32_t c) {
+    static const float t[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    return t[c & 7u];
 }
-
+static inline uint8_t host_e2m1_encode(float x) {
+    const float ax = std::fmin(std::fabs(x), 6.0f);
+    uint32_t best = 0u; float bd = std::fabs(ax - host_e2m1_value(0));
+    for (uint32_t i = 1u; i < 8u; i++) {
+        const float d = std::fabs(ax - host_e2m1_value(i));
+        if (d < bd || (d == bd && (i & 1u) == 0u && (best & 1u) != 0u)) { best = i; bd = d; }
+    }
+    return (uint8_t)(best | (std::signbit(x) ? 0x8u : 0u));
+}
+static inline uint16_t host_bf16_rtn(float x) {
+    uint32_t u; std::memcpy(&u, &x, sizeof u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
 static inline float host_bf16_widen(uint16_t bits) {
     const uint32_t u = (uint32_t)bits << 16;
     float f; std::memcpy(&f, &u, sizeof f); return f;
 }
 
+/* Pack one head_dim-wide float row into the NV layout; when `dec` is non-NULL
+ * also write the DECODED values, so an oracle and the kernel look at the same
+ * numbers.  Recipe mirrors attn_pack_store_kernel: per-16 amax, row scale
+ * amax_row/(6*448) with the 1e-4 floor, e4m3 rtn scale codes, e2m1 rtn
+ * tie-to-even data codes, bf16 rtn rope. */
+static inline void host_nv_pack_row(const float *vals, uint8_t *row, float *dec,
+                                    uint32_t head_dim) {
+    const uint32_t n_rot = 64u, n_nope = head_dim - n_rot;
+    const uint32_t nib = n_nope / 2u, nblk = n_nope / 16u;
+    float ra = 0.0f;
+    for (uint32_t d = 0; d < n_nope; d++) ra = std::fmax(ra, std::fabs(vals[d]));
+    const float rs = std::fmax(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
+    std::memcpy(row + nib + nblk, &rs, sizeof rs);
+    for (uint32_t b = 0; b < nblk; b++) {
+        float amax = 0.0f;
+        for (uint32_t d = b * 16u; d < (b + 1u) * 16u; d++) amax = std::fmax(amax, std::fabs(vals[d]));
+        const float t = std::fmin(448.0f, amax * (1.0f / 6.0f) / rs);
+        row[nib + b] = host_e4m3_encode_pos(t);
+        const float scale = host_e4m3_mag(row[nib + b]) * rs;
+        for (uint32_t d = b * 16u; d < (b + 1u) * 16u; d += 2u) {
+            const uint8_t v0 = scale > 0.0f ? host_e2m1_encode(vals[d] / scale) : 0u;
+            const uint8_t v1 = scale > 0.0f ? host_e2m1_encode(vals[d + 1u] / scale) : 0u;
+            row[d >> 1] = (uint8_t)(v0 | (v1 << 4));
+            if (dec) {
+                dec[d]      = ((v0 & 8u) ? -1.0f : 1.0f) * host_e2m1_value(v0) * scale;
+                dec[d + 1u] = ((v1 & 8u) ? -1.0f : 1.0f) * host_e2m1_value(v1) * scale;
+            }
+        }
+    }
+    uint16_t *rope = (uint16_t *)(row + nib + nblk + 4u);
+    for (uint32_t d = 0; d < n_rot; d++) {
+        rope[d] = host_bf16_rtn(vals[n_nope + d]);
+        if (dec) dec[n_nope + d] = host_bf16_widen(rope[d]);
+    }
+}
 
 /* ---- Q upload in the engine's stored element type -------------------------
  *

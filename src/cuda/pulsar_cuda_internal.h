@@ -72,30 +72,32 @@ enum {
  * reader decodes it in place, and the f32 arm had no caller left. */
 
 /*
- * PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
- * f32 with the nope dims already fp8-roundtripped in place (fp8_kv_quantize:
- * per-64 block scale = exp2f(ceilf(log2f(fmaxf(amax,1e-4)/448))), e4m3
- * clamp-roundtrip) and the n_rot rope tail bf16-roundtripped in place.  The
- * packed row stores exactly those values:
- *   [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16]
- * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 128 = 584 B/row (vs 2048 f32).
- * The E8M0 byte is the scale exponent + 127 (power-of-two by construction),
- * so decode (e4m3 value * 2^(e8-127); rope __bfloat162float) is bit-identical
- * to the f32 cache.  Must stay in sync with PULSAR_ENGINE_ATTN_PACK_ROWBYTES.
+ * PULSAR_ATTN_PACK: THE KV row -- one format for every KV buffer since the
+ * L111 unification (raw ring, comp pool, drafter ring, MTP cache, current
+ * chunk).  NVFP4:
+ *   [n_nope/2 e2m1 nibbles, low nibble first][n_nope/16 E4M3 scale codes]
+ *   [f32 row scale][n_rot bf16 rope]
+ * head_dim 512 / n_rot 64 -> 224 + 28 + 4 + 128 = 384 B/row.  A multiple of
+ * 16: cp.async stages 8 B chunks, the rope tail is 2-aligned, the f32 row
+ * scale 4-aligned at +252.  Scale decode = e4m3(code) * row_scale via
+ * attn_pack_e4m3.  The nope payload is a lossy re-quantization of the QAT
+ * e4m3 values (L111 verdict: closer to source, accept >= the retired e4m3
+ * row); rope is bf16 verbatim -- quantized rope is what killed ATTN_MX.
  *
- * This row is BYTE-IDENTICAL to vLLM's `fp8_ds_mla` DSv4 cache line (448 e4m3 +
- * 7 ue8m0-per-64 + 1 pad + 64 bf16 = 584 B).  The rope tail was f32 (712 B/row)
- * until 2026-08-11; the source model runs a BF16 residual, so f32 there stored
- * precision the model never had.  Keep the two layouts in step: a divergence
- * costs the cross-engine KV diff that validates this cache against a stock vLLM
- * run.  Bumping this row layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION.
+ * ⚠ Quantize EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
+ * misrounds ~33%% of blocks.  Every later move is a byte move.  There is no
+ * other KV row format and no conversion path from the retired e4m3 row --
+ * stale payloads refuse.  Must stay in sync with
+ * PULSAR_ENGINE_ATTN_PACK_ROWBYTES.  Bumping this layout MUST bump
+ * PULSAR_SESSION_PAYLOAD_VERSION (done for the unification: v7).
  */
 #define PULSAR_ATTN_PACK_NROT 64u
 #define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
-#define PULSAR_ATTN_PACK_SCALES_PAD(HD) \
-    ((PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_FP8_KV_BLOCK + 3u) & ~3u)
+#define PULSAR_ATTN_PACK_NIB(HD)  (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
+#define PULSAR_KV4_NV_BLOCK      16u
+#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
 #define PULSAR_ATTN_PACK_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
+    ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
      (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 
 /* Default-ON env gate for the measured fast tiers.  Suite-v1 KL cleared the
@@ -202,93 +204,7 @@ __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
     return (b & 0x80u) ? -sv : sv;
 }
 
-/* The opaque packed-row carriers (pulsar_attn_pack_t / pulsar_mxkv_pack_t)
- * are declared in pulsar_gpu.h (L092); the accessors below are the only
- * sanctioned element reads. */
-__device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    if (d < n_nope) {
-        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
-        return attn_pack_e4m3(r[d], scale);
-    }
-    return __bfloat162float(((const __nv_bfloat16 *)(r + n_nope +
-                             PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope]);
-}
-
-/*
- * L111: the NVFP4 comp-pool row (plans/111-kv4-comp-cache.md; DEFAULT since
- * 2026-08-27).  COMP POOL ONLY -- the raw ring, drafter ring, MTP cache and
- * current-chunk rows stay PULSAR_ATTN_PACK E4M3.  The bf16 rope tail is
- * verbatim (quantized rope is what cost the removed ATTN_MX its drafter
- * acceptance); the n_nope dims pack as E2M1 nibbles, low nibble first.
- * head_dim 512 / n_rot 64:
- *   [224 nibble bytes][28 E4M3 per-16 scales][4 f32 row scale][128 bf16 rope] = 384 B
- * A multiple of 16, so cp.async row staging keeps its 8 B chunks, the rope
- * tail its 2 B alignment, and the f32 row scale sits 4-aligned at +252.
- * The per-16 scale byte is an UNSIGNED E4M3 code decoded against the row
- * scale with attn_pack_e4m3.  (An MXFP4 candidate row -- per-32 E8M0 scales,
- * 368 B -- was measured and CUT 2026-08-27: further from the vLLM source on
- * every reference prompt; rows/L111.md holds the table.)
- *
- * ⚠ This row is a lossy re-quantization of the model's QAT e4m3 values --
- * not value-preserving, not byte-comparable to vLLM fp8_ds_mla (the opt-in
- * E4M3 row keeps that role), and re-encoding a decoded FP4 row misrounds
- * ~33% of blocks: quantize exactly once (attn_comp_kv4_store_kernel), move
- * bytes ever after. */
-#define PULSAR_KV4_NIBBLES(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
-#define PULSAR_KV4_NV_BLOCK      16u
-#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
-#define PULSAR_KV4_NV_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_KV4_NIBBLES(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
-
-/* Comp-row bytes for a format, host+device (the launch wrappers stride rows
- * with it; the engine asks through pulsar_gpu_attn_comp_rowbytes). */
-__host__ __device__ static inline uint64_t attn_comp_fmt_rowbytes(int fmt, uint32_t head_dim) {
-    if (fmt == PULSAR_ATTN_COMP_NVFP4) return PULSAR_KV4_NV_ROWBYTES(head_dim);
-    return PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-}
-
-/* The PULSAR_KV4 env read, header-inline so kernel TUs and the standalone
- * kernel tests (which #include a .cu rather than link norm_kv.o) resolve it
- * without the backend object.  Per-TU statics each read the env once; the env
- * is immutable for the process, so every copy agrees.  The engine-facing
- * pulsar_gpu_attn_comp_fmt() (norm_kv.cu) wraps this. */
-static inline pulsar_attn_comp_fmt pulsar_attn_comp_fmt_env(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("PULSAR_KV4");
-        if (!e || !e[0] || !strcmp(e, "nv")) {
-            cached = PULSAR_ATTN_COMP_NVFP4;   /* the default (2026-08-27 flip) */
-        } else if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "e4m3")) {
-            cached = PULSAR_ATTN_COMP_E4M3;    /* value-aware opt-out */
-        } else if (!strcmp(e, "mx")) {
-            fprintf(stderr, "pulsar: PULSAR_KV4=mx names the REMOVED MXFP4 arm "
-                            "(cut 2026-08-27, rows/L111.md); refusing to start\n");
-            exit(1);
-        } else {
-            fprintf(stderr, "pulsar: PULSAR_KV4='%s' names no comp-KV format "
-                            "(nv/unset | 0/off/e4m3); refusing to guess\n", e);
-            exit(1);
-        }
-    }
-    return (pulsar_attn_comp_fmt)cached;
-}
-
-/* Launch-site dispatch over the comp-pool format: `launch` is a generic
- * lambda taking a std::integral_constant<int, CF> tag, so each format gets
- * its own kernel instantiation and NOTHING branches per element inside the
- * kernels.  The format is a process constant (env, read once), so the switch
- * runs once per launch, not per token. */
-#define PULSAR_ATTN_CF_LAUNCH(launch) do {                                      \
-    if (pulsar_attn_comp_fmt_env() == PULSAR_ATTN_COMP_NVFP4)                   \
-        launch(std::integral_constant<int, PULSAR_ATTN_COMP_NVFP4>{});          \
-    else                                                                        \
-        launch(std::integral_constant<int, PULSAR_ATTN_COMP_E4M3>{});           \
-    } while (0)
-
-/* E2M1 magnitude table: 3-bit code -> value.  Kept as bit math (not a memory
+/* E2M1 magnitude decode: 3-bit code -> value, kept as bit math (not a memory
  * table) so the inner attention loops pay ALU, not LDC traffic. */
 __device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
     const uint32_t c = nib & 7u;
@@ -301,33 +217,33 @@ __device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
     return (nib & 8u) ? -sv : sv;
 }
 
-/* Four consecutive comp dims (dims [c4*4, c4*4+4)) decoded from a ROW POINTER
- * -- global or the smem copy a cp.async stage filled; the byte offsets are
- * row-relative either way.  The E4M3 arm is the exact scale-hoisted uint32
- * fetch the heads8/static/f16 kernels inlined before L111. */
-template <int CF>
+/* The opaque packed-row carriers (pulsar_attn_pack_t / pulsar_mxkv_pack_t)
+ * are declared in pulsar_gpu.h (L092); the accessors below are the only
+ * sanctioned element reads of THE row (every KV buffer -- see the layout
+ * block above). */
+__device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint32_t nib_bytes = n_nope / 2u;
+    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
+    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    if (d < n_nope) {
+        const float row_scale = *(const float *)(r + nib_bytes + nblk);
+        const float scale = attn_pack_e4m3(r[nib_bytes + (d / PULSAR_KV4_NV_BLOCK)], row_scale);
+        const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
+        return attn_kv4_e2m1(nib, scale);
+    }
+    return __bfloat162float(((const __nv_bfloat16 *)(r + nib_bytes + nblk + 4u))[d - n_nope]);
+}
+
+/* Four consecutive dims (dims [c4*4, c4*4+4)) decoded from a ROW POINTER --
+ * global or the smem copy a cp.async stage filled; the byte offsets are
+ * row-relative either way.  Scale hoisted: base%16 < 16 so the four dims
+ * share one per-16 scale. */
 __device__ static inline float4 attn_comp_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint32_t nib_bytes = n_nope / 2u;
     const uint32_t base = c4 << 2;
     float4 v;
-    if (CF == PULSAR_ATTN_COMP_E4M3) {
-        if (base < n_nope) {
-            const float scale = __uint_as_float((uint32_t)pr[n_nope + (base / PULSAR_FP8_KV_BLOCK)] << 23);
-            const uint32_t w = *(const uint32_t *)(pr + base);
-            v.x = attn_pack_e4m3(w & 0xffu, scale);
-            v.y = attn_pack_e4m3((w >> 8) & 0xffu, scale);
-            v.z = attn_pack_e4m3((w >> 16) & 0xffu, scale);
-            v.w = attn_pack_e4m3(w >> 24, scale);
-        } else {
-            const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-            v.x = __bfloat162float(rope[base - n_nope + 0u]);
-            v.y = __bfloat162float(rope[base - n_nope + 1u]);
-            v.z = __bfloat162float(rope[base - n_nope + 2u]);
-            v.w = __bfloat162float(rope[base - n_nope + 3u]);
-        }
-        return v;
-    }
-    const uint32_t nib_bytes = n_nope / 2u;
     const uint8_t *psc = pr + nib_bytes;
     if (base < n_nope) {
         const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
@@ -346,27 +262,6 @@ __device__ static inline float4 attn_comp_row_ld4(const uint8_t *pr, uint32_t c4
         v.w = __bfloat162float(rope[base - n_nope + 3u]);
     }
     return v;
-}
-
-/* Sanctioned COMP-POOL element read, templated on the pool's format.  The
- * E4M3 instantiation is attn_comp_pack_ld exactly, so kernels templated on CF
- * compile to today's code on the default leg (the byte-exact gate proves it). */
-template <int CF>
-__device__ static inline float attn_comp_ld(const pulsar_attn_pack_t *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    if (CF == PULSAR_ATTN_COMP_E4M3) return attn_comp_pack_ld(comp_kv, row, d, head_dim);
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint8_t *r = (const uint8_t *)comp_kv + row * attn_comp_fmt_rowbytes(CF, head_dim);
-    /* NVFP4 */
-    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
-    if (d < n_nope) {
-        float row_scale;
-        memcpy(&row_scale, r + nib_bytes + nblk, sizeof(float));
-        const float scale = attn_pack_e4m3(r[nib_bytes + (d / PULSAR_KV4_NV_BLOCK)], row_scale);
-        const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
-        return attn_kv4_e2m1(nib, scale);
-    }
-    return __bfloat162float(((const __nv_bfloat16 *)(r + nib_bytes + nblk + 4u))[d - n_nope]);
 }
 
 struct pulsar_gpu_tensor {

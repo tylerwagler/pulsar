@@ -96,7 +96,6 @@ int main() {
     /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
      * environment would make the launch dispatch decode E4M3 rows as nibbles and
      * fail confusingly.  Pin the format rather than inherit it. */
-    setenv("PULSAR_KV4", "0", 1);
 
     const uint32_t D = 512u, n_head = 64u;
     std::mt19937_64 rng(20260809);
@@ -139,18 +138,13 @@ int main() {
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_comp_rows; r++) {
                 uint8_t *row = &compp[r * pack_row];
-                /* scales first: the payload is an encode against its own block
-                 * scale.  Band kept near 2^0 -- the encode makes magnitude
-                 * follow the draw, but a scale far from the data wastes E4M3's
-                 * range from the wrong end. */
-                for (uint32_t s = 0; s < PULSAR_ATTN_PACK_SCALES_PAD(D); s++)
-                    row[n_nope + s] = (uint8_t)(124 + (int)(r + s) % 6);
+                /* Per-16-block magnitude band (2^-2..2^3): scale addressing
+                 * exercised, softmax non-degenerate. */
+                std::vector<float> vals(D);
                 for (uint32_t d = 0; d < n_nope; d++)
-                    row[d] = host_e4m3_encode(nd(rng),
-                                 host_pack_block_scale(row, n_nope, d,
-                                                       PULSAR_FP8_KV_BLOCK));
-                __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
-                for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
+                    vals[d] = nd(rng) * std::ldexp(1.0f, (int)((r + d / 16u) % 6) - 2);
+                for (uint32_t d = n_nope; d < D; d++) vals[d] = nd(rng);
+                host_nv_pack_row(vals.data(), row, NULL, D);
             }
         }
 
@@ -164,14 +158,11 @@ int main() {
             const uint32_t n_nope = D - PULSAR_ATTN_PACK_NROT;
             for (size_t r = 0; r < total_raw_rows; r++) {
                 uint8_t *row = &rawp[r * pack_row];
-                for (uint32_t sc = 0; sc < PULSAR_ATTN_PACK_SCALES_PAD(D); sc++)
-                    row[n_nope + sc] = (uint8_t)(124 + (int)(r + sc) % 6);
+                std::vector<float> vals(D);
                 for (uint32_t d = 0; d < n_nope; d++)
-                    row[d] = host_e4m3_encode(nd(rng),
-                                 host_pack_block_scale(row, n_nope, d,
-                                                       PULSAR_FP8_KV_BLOCK));
-                __nv_bfloat16 *rope = (__nv_bfloat16 *)(row + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(D));
-                for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(nd(rng));
+                    vals[d] = nd(rng) * std::ldexp(1.0f, (int)((r + d / 16u) % 6) - 2);
+                for (uint32_t d = n_nope; d < D; d++) vals[d] = nd(rng);
+                host_nv_pack_row(vals.data(), row, NULL, D);
             }
         }
 
@@ -215,7 +206,7 @@ int main() {
         const uint32_t hg = (n_head + 7u) / 8u;
         /* golden: single walk (z=1, no partials) */
         dim3 g1(c.n_tokens, hg, 1);
-        attention_decode_mixed_heads8_online_kernel<PULSAR_ATTN_COMP_E4M3><<<g1, 256>>>(dgold, ds, dq,
+        attention_decode_mixed_heads8_online_kernel<<<g1, 256>>>(dgold, ds, dq,
                 (const pulsar_attn_pack_t *)draw, (const pulsar_attn_pack_t *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,
@@ -227,7 +218,7 @@ int main() {
             !cuda_ok(cudaGetSymbolAddress((void **)&pml, g_dec_splitkv_part_ml), "sym ml"))
             return 1;
         dim3 gs(c.n_tokens, hg, PULSAR_DEC_SPLITKV_S);
-        attention_decode_mixed_heads8_online_kernel<PULSAR_ATTN_COMP_E4M3><<<gs, 256>>>(dsplit, ds, dq,
+        attention_decode_mixed_heads8_online_kernel<<<gs, 256>>>(dsplit, ds, dq,
                 (const pulsar_attn_pack_t *)draw, (const pulsar_attn_pack_t *)dcomp, 0,
                 c.n_tokens, 0, c.n_raw, c.raw_cap, c.raw_start, c.n_comp,
                 c.window, c.ratio, n_head, D,

@@ -293,7 +293,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
  * in the format they were written in (an FP4 re-encode misrounds ~33% of
  * blocks -- there is no conversion path, only refusal).  A refused load is a
  * cache miss, not a failure: the caller re-prefills. */
-#define PULSAR_BANK_KV_VERSION 2u
+#define PULSAR_BANK_KV_VERSION 3u  /* v3: unified NVFP4 rows (raw stride changed too) */
 
 int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {

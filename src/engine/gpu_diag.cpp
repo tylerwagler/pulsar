@@ -1767,20 +1767,23 @@ bool gpu_graph_alloc_raw_cap(
         }
     }
 
-    /* L111: announce the comp-pool format ONCE at graph alloc, so a log line
-     * proves which arm a measurement actually ran (a fix that is not live is
-     * the classic way an A/B silently grades nothing). */
+    /* One KV row format since the L111 unification.  Name it once in the log
+     * (the arm a measurement ran is a fact the log must witness), and refuse
+     * a set PULSAR_KV4: the switch is DEAD -- an env that once chose formats
+     * and now silently does nothing is how an A/B grades the wrong thing
+     * (ATTN_MX removal set the pattern). */
     {
-        /* ALWAYS name the comp format -- the arm a measurement ran is a fact
-         * the log must witness (L111's first sweep graded nothing because the
-         * arm silently wasn't live). */
-        const pulsar_attn_comp_fmt cf = pulsar_gpu_attn_comp_fmt();
-        fprintf(stderr,
-                "pulsar: comp KV cache = %s (%llu B/row%s; raw ring E4M3)\n",
-                cf == PULSAR_ATTN_COMP_NVFP4 ? "NVFP4 4-bit rows" : "E4M3 rows",
-                (unsigned long long)pulsar_gpu_attn_comp_rowbytes(PULSAR_N_HEAD_DIM),
-                cf == PULSAR_ATTN_COMP_NVFP4 ? ", default"
-                                             : ", PULSAR_KV4 opt-out; byte-gate arm");
+        if (getenv("PULSAR_KV4")) {
+            fprintf(stderr,
+                    "pulsar: PULSAR_KV4 is set but the switch was REMOVED (L111 "
+                    "unification 2026-08-27: every KV buffer is the 384 B NVFP4 "
+                    "row); unset it -- refusing to start\n");
+            gpu_graph_free(g);
+            return false;
+        }
+        fprintf(stderr, "pulsar: KV rows = NVFP4 (%llu B/row, unified: raw ring + "
+                        "comp pool + drafter + chunk)\n",
+                (unsigned long long)pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM));
     }
 
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer

@@ -161,7 +161,7 @@ __device__ static inline uint32_t af16_pack_qraw(
     return af16_pack(x0, x1);
 }
 
-template <int CF, typename QT>
+template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
         pulsar_heads_t *__restrict__ heads,   /* [n_tokens][n_head][512], STORED width
@@ -433,7 +433,6 @@ static void attn_f16_kernel(
      * (ptxas 0xc540 > 0xc000). The GB10 has 101 KB per SM; the launchers
      * opt in via cudaFuncAttributeMaxDynamicSharedMemorySize and pass
      * AF16_DYNSMEM_BYTES at launch. */
-    const uint32_t AF16_CROWB = (uint32_t)attn_comp_fmt_rowbytes(CF, AF16_DIM);
     extern __shared__ __align__(16) uint8_t af16_dynsmem[];
     uint8_t (*sRawB)[AF16_ROWS][AF16_ROWB] =
         (uint8_t (*)[AF16_ROWS][AF16_ROWB])af16_dynsmem;
@@ -461,7 +460,7 @@ static void attn_f16_kernel(
                         _ci = _bad ? 0u : (uint32_t)_c;                       \
                     }                                                         \
                     _p = (const uint8_t *)comp_src +                          \
-                         ((uint64_t)comp_base + _ci) * AF16_CROWB;            \
+                         ((uint64_t)comp_base + _ci) * AF16_ROWB;             \
                 }                                                             \
             }                                                                 \
             sSrc[BUF][_r] = _p;                                               \
@@ -472,13 +471,7 @@ static void attn_f16_kernel(
              _c += AF16_THREADS) {                                            \
             const uint32_t _r = _c / (AF16_ROWB / 8u);                        \
             const uint32_t _off = (_c % (AF16_ROWB / 8u)) * 8u;               \
-            /* comp rows are AF16_CROWB (<= AF16_ROWB) bytes under KV4; the   \
-             * guard stops the stage at the row's own end so the last comp    \
-             * row of the pool cannot be over-read.  E4M3: CROWB == ROWB and  \
-             * the guard is always true. */                                   \
-            const uint32_t _rb = ((ROW0) + _r >= raw_count)                   \
-                ? AF16_CROWB : AF16_ROWB;                                     \
-            if (sSrc[BUF][_r] && _off < _rb)                                  \
+            if (sSrc[BUF][_r])                                                \
                 __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
                                         sSrc[BUF][_r] + _off, 8);             \
         }                                                                     \
@@ -517,17 +510,10 @@ static void attn_f16_kernel(
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
             if (r < nr && sSrc[buf][r]) {
                 const uint8_t *pr = sRawB[buf][r];
-                /* Raw rows are always E4M3; comp rows follow CF.  The
-                 * row-relative decode (attn_comp_row_ld4) is the one the f32
-                 * kernels use, reading the smem copy the stage filled; its
-                 * E4M3 arm is the exact block that was inlined here. */
-                const bool is_comp = (row0 + r) >= raw_count;
-                float4 v;
-                if (CF == PULSAR_ATTN_COMP_E4M3 || !is_comp) {
-                    v = attn_comp_row_ld4<PULSAR_ATTN_COMP_E4M3>(pr, d4 >> 2, AF16_DIM);
-                } else {
-                    v = attn_comp_row_ld4<CF>(pr, d4 >> 2, AF16_DIM);
-                }
+                /* One row format for raw and comp alike (L111 unification):
+                 * the row-relative decode is the same attn_comp_row_ld4 the
+                 * f32 kernels use, reading the smem copy the stage filled. */
+                const float4 v = attn_comp_row_ld4(pr, d4 >> 2, AF16_DIM);
                 f0 = v.x; f1 = v.y; f2 = v.z; f3 = v.w;
             }
             if (d4 == 0u) sRowBad[r] = (r < nr) ? sBadStage[buf][r] : 0u;
@@ -797,19 +783,13 @@ static int af16_dynsmem_ok(void) {
          * launches today, and the <float> grant is the safety net a future
          * width change must not be able to forget.  (This sentence once said
          * "<float> is launched today" -- it had drifted; L106 A4.) */
-        cudaError_t e = cudaSuccess;
-        const void *fns[] = {
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_E4M3,  float>,
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_E4M3,  __half>,
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_NVFP4, float>,
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_NVFP4, __half>,
-        };
-        for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++) {
-            cudaError_t ei = cudaFuncSetAttribute(fns[i],
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)AF16_DYNSMEM_BYTES);
-            if (e == cudaSuccess && ei != cudaSuccess) e = ei;
-        }
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<float>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        cudaError_t e16 = cudaFuncSetAttribute(attn_f16_kernel<__half>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        if (e == cudaSuccess && e16 != cudaSuccess) e = e16;
         state = (e == cudaSuccess) ? 1 : -1;
         if (state < 0)
             fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
@@ -857,7 +837,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
      * must fit and the nope span must divide the scale block, or attn_pack_ld
      * walks rows that are not there. */
     if (head_dim <= PULSAR_ATTN_PACK_NROT ||
-        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0) return 0;
+        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0) return 0;
     /* The epilogue's grouped index math assumes whole heads per group and that
      * the nope/rope split falls on an MX block boundary (so rope_tail can own
      * the tail blocks without either side touching the other's).  Refuse the
@@ -871,8 +851,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
     if (!af16_dynsmem_ok()) return 0;
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    const auto launch_pf = [&](auto cf) {
-    attn_f16_kernel<cf.value, pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv,
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
@@ -882,8 +861,6 @@ int pulsar_gpu_attention_f16_prefill_mx(
                                             gact_kbp, gact_slab, n_groups, n_nope,
                                             gact_tok0, gact_ntok,
                                             qp, q_prep != NULL);
-    };
-    PULSAR_ATTN_CF_LAUNCH(launch_pf);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
@@ -984,8 +961,7 @@ int pulsar_gpu_attention_f16_indexed(
     if (!af16_device_supported()) return 0;
     if (!af16_dynsmem_ok()) return 0;
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    const auto launch_ix = [&](auto cf) {
-    attn_f16_kernel<cf.value, pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, pos0, n_raw, raw_cap,
@@ -996,7 +972,5 @@ int pulsar_gpu_attention_f16_indexed(
                                             positions ? n_banks : 1u, 1,
                                             NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                             qp, q_prep != NULL);
-    };
-    PULSAR_ATTN_CF_LAUNCH(launch_ix);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
 }
