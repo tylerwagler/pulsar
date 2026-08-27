@@ -925,7 +925,7 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gp
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.cpp
 
 tests/kv4_pack_gate.o: tests/kv4_pack_gate.cpp src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ tests/kv4_pack_gate.cpp
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/kv4_pack_gate.cpp
 
 tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.cpp
