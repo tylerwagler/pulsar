@@ -1411,13 +1411,13 @@ int pulsar_gpu_begin_commands(void) { return 1; }
  * spec-batched lane measures 92% busy unprofiled (L119), and these segments
  * target exactly its inter-launch fragmentation.
  *
- * PULSAR_CUDA_GRAPH_SEG=1 arms it (read once; development gate — the default
- * flips only with probe-hash bit-exactness + gates + a measured win, and the
- * losing arm is then DELETED per the no-hot-path-flags rule). */
+ * Always on (L119 verdict): the OUTPUT HEAD is the one segment whose shape
+ * pays on GB10 — one dense graph per round (+1-2% solo, bitwise-proven).
+ * Per-layer FFN segments measured -13% (cudaGraphLaunch is expensive on
+ * integrated Blackwell; 43 small graphs/round lose) and are deleted. */
 typedef struct { uint64_t key; cudaGraphExec_t exec; uint32_t uses; int dead; } pulsar_seg_ent;
 #define PULSAR_SEG_SLOTS 1024u
 static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
-static int g_seg_on = -1;
 static int g_seg_capturing = 0;
 
 static uint64_t g_seg_n_replay, g_seg_n_capture, g_seg_n_eager;
@@ -1437,17 +1437,10 @@ static pulsar_seg_ent *seg_find(uint64_t key) {
 /* 0 = run the body eagerly; 1 = capture armed (run the body, then seg_exit);
  * 2 = replayed a cached graph (skip the body entirely). */
 int pulsar_gpu_seg_enter(uint64_t key) {
-    if (g_seg_on < 0) {
-        const char *v = getenv("PULSAR_CUDA_GRAPH_SEG");
-        /* 1 = all segments; 2 = head only; 3 = ffn only (dev bisect knob —
-         * dies with the env once the default is decided). */
-        g_seg_on = v ? atoi(v) : 0;
-        if (v && g_seg_on == 0) g_seg_on = 1;
-    }
-    if (!g_seg_on || g_seg_capturing || key == 0) return 0;
-    const uint64_t phase = (key >> 8) & 0xFF;
-    if (g_seg_on == 2 && phase != 2) return 0;
-    if (g_seg_on == 3 && phase != 1) return 0;
+    /* L119: always on (the PULSAR_CUDA_GRAPH_SEG dev gate and its bisect
+     * values died with the FFN segments — the losing variant is deleted,
+     * the head segment ships default-on). */
+    if (g_seg_capturing || key == 0) return 0;
     pulsar_seg_ent *e = seg_find(key);
     if (!e || e->dead) return 0;
     if (e->exec) {
@@ -1531,8 +1524,7 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     static int announced = 0;
     if (!announced) {
         announced = 1;
-        fprintf(stderr, "pulsar: L119 decode segment capture ACTIVE "
-                        "(PULSAR_CUDA_GRAPH_SEG)\n");
+        fprintf(stderr, "pulsar: L119 head-segment graph capture ACTIVE\n");
     }
     return 1;
 }

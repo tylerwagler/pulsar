@@ -213,8 +213,9 @@ int pulsar_gpu_synchronize(void);
  * unprofiled, and these reclaim its inter-launch gaps). seg_enter: 0 = run
  * the body eagerly, 1 = capture armed (run body, then seg_exit), 2 = cached
  * graph replayed (skip the body). seg_exit returning 0 means the captured
- * work NEVER RAN — re-run the body eagerly. Armed by PULSAR_CUDA_GRAPH_SEG=1
- * (read once at first use; development gate). Worker thread only. */
+ * work NEVER RAN — re-run the body eagerly. Always on (L119 verdict: the
+ * head segment ships default-on; the per-layer FFN segments measured a net
+ * loss on GB10 and are deleted). Worker thread only. */
 int pulsar_gpu_seg_enter(uint64_t key);
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
 

@@ -2276,57 +2276,13 @@ bool gpu_graph_encode_layer_attention_batch(
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
-static bool gpu_graph_encode_layer_ffn_batch_impl(
-        pulsar_gpu_graph  *g,
-        const pulsar_model        *model,
-        const pulsar_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos0,
-        uint32_t                n_tokens);
-
-/* L119 segment bracket: the FFN half is round-invariant at fixed n_tokens
- * (2026-08-27 audit, plan 119 — every launch is n_tokens-parameterized or
- * reads device descriptors; no syncs, no readbacks, scratch quiescent after
- * warm-up), so at decode widths it is captured once per (layer, n_tokens)
- * and replayed thereafter. Wider shapes (prefill chunks) stay eager: prefill
- * is at sweep-rate saturation (L112/L114) and big-shape graphs buy nothing. */
+/* L119 verdict: per-layer FFN graph segments were built, made bitwise
+ * (parity-keyed), and MEASURED A NET LOSS on GB10 (-13% solo at 87% replay
+ * rate): cudaGraphLaunch is expensive on integrated Blackwell, and 43 small
+ * graph launches per round lose to eager launches the host already hides at
+ * 92% busy. Deleted; the output head keeps capture (1 dense graph/round,
+ * +1-2% measured). Full chain: pulsar-notes rows/L119.md. */
 bool gpu_graph_encode_layer_ffn_batch(
-        pulsar_gpu_graph  *g,
-        const pulsar_model        *model,
-        const pulsar_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos0,
-        uint32_t                n_tokens) {
-    if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
-        /* L119: the hidden-state double buffer POINTER-SWAPS per layer, and
-         * with an odd layer count the sweep-final identity alternates per
-         * sweep — a captured graph is only valid for the parity it baked
-         * (root-caused 2026-08-27: odd replays read the swapped-away buffer,
-         * all rows wrong by up to ~33 logits). Key the parity: each
-         * (layer, phase, rows, parity) owns its own graph. */
-        const uint64_t hc_parity =
-            (uintptr_t)(const void *)g->batch_cur_hc >
-            (uintptr_t)(const void *)g->batch_next_hc ? 1ull : 0ull;
-        const uint64_t key = (hc_parity << 40) |
-                             ((uint64_t)il << 16) | (1ull << 8) | n_tokens;
-        const int st = pulsar_gpu_seg_enter(key);
-        if (st == 2) return true;
-        if (st == 1) {
-            const bool ok = gpu_graph_encode_layer_ffn_batch_impl(
-                    g, model, layer, il, pos0, n_tokens);
-            if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
-            /* Capture failed (key now poisoned): the recorded work never ran,
-             * and a mid-capture violation can fail an otherwise-good body —
-             * run the body for real regardless of ok; a REAL body failure
-             * simply fails again here and propagates. */
-            return gpu_graph_encode_layer_ffn_batch_impl(
-                    g, model, layer, il, pos0, n_tokens);
-        }
-    }
-    return gpu_graph_encode_layer_ffn_batch_impl(g, model, layer, il, pos0, n_tokens);
-}
-
-static bool gpu_graph_encode_layer_ffn_batch_impl(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
         const pulsar_layer_weights *layer,
