@@ -1433,8 +1433,17 @@ static pulsar_seg_ent *seg_find(uint64_t key) {
 /* 0 = run the body eagerly; 1 = capture armed (run the body, then seg_exit);
  * 2 = replayed a cached graph (skip the body entirely). */
 int pulsar_gpu_seg_enter(uint64_t key) {
-    if (g_seg_on < 0) g_seg_on = getenv("PULSAR_CUDA_GRAPH_SEG") != NULL ? 1 : 0;
+    if (g_seg_on < 0) {
+        const char *v = getenv("PULSAR_CUDA_GRAPH_SEG");
+        /* 1 = all segments; 2 = head only; 3 = ffn only (dev bisect knob —
+         * dies with the env once the default is decided). */
+        g_seg_on = v ? atoi(v) : 0;
+        if (v && g_seg_on == 0) g_seg_on = 1;
+    }
     if (!g_seg_on || g_seg_capturing || key == 0) return 0;
+    const uint64_t phase = (key >> 8) & 0xFF;
+    if (g_seg_on == 2 && phase != 2) return 0;
+    if (g_seg_on == 3 && phase != 1) return 0;
     pulsar_seg_ent *e = seg_find(key);
     if (!e) return 0;
     if (e->exec) {
