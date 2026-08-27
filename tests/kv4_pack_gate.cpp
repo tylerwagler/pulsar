@@ -182,7 +182,13 @@ static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
             if (gcode != expect) {
                 const int dd = (int)(gcode & 0x7f) - (int)(expect & 0x7f);
                 st->code_mism++;
-                if ((gcode & 0x80u) != (expect & 0x80u) || dd < -1 || dd > 1) st->code_nonadj++;
+                if ((gcode & 0x80u) != (expect & 0x80u) || dd < -1 || dd > 1) {
+                    if (st->code_nonadj < 8)
+                        fprintf(stderr, "  e4m3 nonadj: d %u src %.9g (0x%08x) scale %.9g "
+                                        "q %.9g gpu %02x cpu %02x\n",
+                                d, src[d], *(const uint32_t *)&src[d], s, q, gcode, expect);
+                    st->code_nonadj++;
+                }
             }
         } else {
             gcode = (gr[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
