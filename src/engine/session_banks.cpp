@@ -288,7 +288,12 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
  * holding KV in host RAM reclaims nothing (unified pool). Precondition: `bank`
  * is the installed (cur) bank so its live frontier is captured. */
 #define PULSAR_BANK_KV_MAGIC   0x4B564232u   /* "KVB2" */
-#define PULSAR_BANK_KV_VERSION 1u
+/* v2 (L111): header word 4 records the comp pool's row stride, because the
+ * stride now follows PULSAR_KV4 and a snapshot's packed bytes are only valid
+ * in the format they were written in (an FP4 re-encode misrounds ~33% of
+ * blocks -- there is no conversion path, only refusal).  A refused load is a
+ * cache miss, not a failure: the caller re-prefills. */
+#define PULSAR_BANK_KV_VERSION 2u
 
 int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
@@ -301,7 +306,8 @@ int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
     gpu_graph_bank_counters_capture(g, bank);   /* ms_n_*[bank] <- live layer_n_* */
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
-    uint32_t hdr[4] = { PULSAR_BANK_KV_MAGIC, PULSAR_BANK_KV_VERSION, bank, (uint32_t)PULSAR_N_LAYER };
+    uint32_t hdr[5] = { PULSAR_BANK_KV_MAGIC, PULSAR_BANK_KV_VERSION, bank,
+                        (uint32_t)PULSAR_N_LAYER, (uint32_t)attn_row };
     if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t cnt[2] = { g->ms_n_comp[bank][il], g->ms_n_index_comp[bank][il] };
@@ -348,10 +354,16 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
     }
-    uint32_t hdr[4];
+    uint32_t hdr[5];
     if (fread(hdr, sizeof hdr, 1, fp) != 1 || hdr[0] != PULSAR_BANK_KV_MAGIC ||
         hdr[1] != PULSAR_BANK_KV_VERSION || hdr[3] != (uint32_t)PULSAR_N_LAYER) {
         payload_set_err(err, errlen, "bank kv load: bad header"); return 1;
+    }
+    if (hdr[4] != (uint32_t)gpu_graph_attn_comp_cache_row_bytes()) {
+        payload_set_err(err, errlen,
+                        "bank kv load: snapshot comp-row stride differs from the "
+                        "active PULSAR_KV4 format; refusing (re-prefill)");
+        return 1;
     }
     uint32_t comp_cnt[PULSAR_MAX_LAYER] = {0}, idx_cnt[PULSAR_MAX_LAYER] = {0};
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

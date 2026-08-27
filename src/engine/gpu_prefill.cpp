@@ -1035,7 +1035,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                            n_tokens,
                                                            PULSAR_N_HEAD_DIM,
                                                            PULSAR_N_ROT,
-                                                           gpu_graph_f32_store_observed_any()) != 0;
+                                                           gpu_graph_f32_store_observed_any(),
+                                                           /* current-chunk rows: ALWAYS the
+                                                            * 584 B E4M3 row, never KV4 */
+                                                           PULSAR_ATTN_COMP_E4M3) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);

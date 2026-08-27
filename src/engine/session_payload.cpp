@@ -149,7 +149,9 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
      * both are PULSAR_ATTN_PACK rows.  This sized them at the f32 stride --
      * 2048 B against the real 584 B -- which over-reserved the disk cache by
      * 3.5x on the KV bulk of every payload. */
-    const uint64_t comp_row = (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    /* L111: the comp pool's row size follows the active PULSAR_KV4 format;
+     * raw rows stay E4M3. */
+    const uint64_t comp_row = gpu_graph_attn_comp_cache_row_bytes();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -264,7 +266,7 @@ static int payload_write_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t 
                                         uint32_t n_rows, uint8_t *buf, size_t cap,
                                         char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    const uint64_t bytes = (uint64_t)n_rows * gpu_graph_attn_comp_cache_row_bytes();
     return payload_write_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
                                      buf, cap, err, errlen);
 }
@@ -273,9 +275,13 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
                                        uint32_t n_rows, uint8_t *buf, size_t cap,
                                        uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    const uint64_t bytes = (uint64_t)n_rows * gpu_graph_attn_comp_cache_row_bytes();
     /* Straight into the packed cache: the file holds exactly what it holds, so
-     * there is no staging buffer and no re-encode on either side. */
+     * there is no staging buffer and no re-encode on either side.  Under KV4
+     * this is what makes save/load safe at all -- an FP4 re-encode misrounds
+     * ~33% of blocks, so the bytes ARE the values.  The header's rowbytes
+     * field (h[13]) refuses a file whose comp format differs from the
+     * process's active PULSAR_KV4. */
     return payload_read_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
 }
@@ -471,7 +477,9 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         PULSAR_N_INDEXER_HEAD_DIM,
         PULSAR_N_VOCAB,
         raw_live,
-        (uint32_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
+        /* the COMP pool's row stride (raw rows are E4M3 584 B by definition);
+         * under PULSAR_KV4 this is 368/384 and discriminates the format */
+        (uint32_t)gpu_graph_attn_comp_cache_row_bytes(),
         (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -601,7 +609,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * head_dim and moves the row STRIDE, so the checks above would pass it.
      * Every row span below is addressed with these strides, so a mismatch here
      * is the difference between refusing a file and decoding noise into a cache. */
-    if (h[13] != (uint32_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES ||
+    if (h[13] != (uint32_t)gpu_graph_attn_comp_cache_row_bytes() ||
         h[14] != (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES)
     {
         payload_set_err(err, errlen,

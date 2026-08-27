@@ -1170,19 +1170,159 @@ uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim) {
     return PULSAR_MXKV_FP4_ROWBYTES(head_dim);
 }
 
+/* The active comp-pool format, read from PULSAR_KV4 exactly once (L111; the
+ * env parse itself is pulsar_attn_comp_fmt_env in pulsar_cuda_internal.h so
+ * the standalone kernel tests resolve it too).  An unrecognised value REFUSES
+ * TO START rather than silently measuring the wrong arm (the removed
+ * PULSAR_ATTN_MX set the template: a dead format env fails loudly, never
+ * falls back). */
+pulsar_attn_comp_fmt pulsar_gpu_attn_comp_fmt(void) {
+    return pulsar_attn_comp_fmt_env();
+}
+
+uint64_t pulsar_gpu_attn_comp_rowbytes(uint32_t head_dim) {
+    return attn_comp_fmt_rowbytes(pulsar_gpu_attn_comp_fmt(), head_dim);
+}
+
+/* L111 4-bit comp-pool store: quantize the nope dims of n_rows f32 rows of src
+ * to E2M1 against per-block scales (MXFP4: per-32 E8M0; NVFP4: per-16 E4M3
+ * against an f32 row scale) and store KV4 rows at [out_row0, out_row0+n_rows)
+ * -- consecutive rows only: the raw ring never takes this format.  The rope
+ * tail is bf16-roundtripped exactly as attn_pack_store_kernel does it.  With
+ * x non-NULL the f32 staging gets the DEQUANTIZED values written back, keeping
+ * the value-preserving invariant of the stage ("the stage holds what the
+ * packed row decodes to") -- under KV4 those are fp4 values, not fp8.
+ *
+ * THIS KERNEL IS THE SINGLE E2M1 QUANTIZE.  Re-encoding a decoded FP4 row
+ * misrounds ~33% of blocks (the re-encode note above attn_pack_store_kernel);
+ * every downstream move -- scatter, fork, evict/restore, session save/load --
+ * is a byte move of these rows. */
+template <int CF>
+__global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, uint8_t *out,
+                                                  uint32_t out_row0, uint32_t n_rows,
+                                                  uint32_t head_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;      /* 64 threads, as the fp8 store */
+    if (row >= n_rows) return;
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint32_t nib_bytes = n_nope / 2u;
+    const uint32_t blk = (CF == PULSAR_ATTN_COMP_MXFP4) ? PULSAR_KV4_MX_BLOCK
+                                                        : PULSAR_KV4_NV_BLOCK;
+    const uint32_t nblk = n_nope / blk;
+    const uint64_t rowbytes = attn_comp_fmt_rowbytes(CF, head_dim);
+    const float *sr = src + (uint64_t)row * head_dim;
+    float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
+    uint8_t *outr = out + ((uint64_t)out_row0 + row) * rowbytes;
+    uint8_t *sc = outr + nib_bytes;
+    __shared__ float samax[PULSAR_KV4_NV_NBLK(512u)];   /* 28 covers both formats */
+    __shared__ float sscale[PULSAR_KV4_NV_NBLK(512u)];
+    __shared__ float srow;
+
+    for (uint32_t b = tid; b < nblk; b += blockDim.x) samax[b] = 0.0f;
+    __syncthreads();
+    /* Per-quant-block amax.  Non-negative floats order-match their bit
+     * patterns, so atomicMax on the int view is exact -- and max is
+     * order-independent, so the result is deterministic. */
+    for (uint32_t d = tid; d < n_nope; d += blockDim.x) {
+        atomicMax((int *)&samax[d / blk], __float_as_int(fabsf(sr[d])));
+    }
+    __syncthreads();
+
+    if (CF == PULSAR_ATTN_COMP_NVFP4) {
+        if (tid == 0) {
+            float ra = 0.0f;
+            for (uint32_t b = 0; b < nblk; b++) ra = fmaxf(ra, samax[b]);
+            /* Row scale keyed so every block scale block_amax/(6*row_scale)
+             * fits E4M3's [0, 448]; amax floor matches the fp8 recipe. */
+            const float rs = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
+            srow = rs;
+            *(float *)(sc + nblk) = rs;   /* 4-aligned: nib 224 + 28 codes */
+        }
+        __syncthreads();
+        for (uint32_t b = tid; b < nblk; b += blockDim.x) {
+            /* The DECODED scale (e4m3 roundtrip x row scale) is what both the
+             * encode below and every reader use; a round-down clips the
+             * block's extremes into the top code, which is the standard NVFP4
+             * trade and is measured, not assumed, by the L111 gates. */
+            const float t = fminf(448.0f, samax[b] * (1.0f / 6.0f) / srow);
+            sc[b] = dsv4_e4m3fn_encode_dev(t);
+            sscale[b] = dsv4_e4m3fn_dequant_dev(t) * srow;
+        }
+    } else {
+        for (uint32_t b = tid; b < nblk; b += blockDim.x) {
+            /* exp2(ceil(log2(amax/6))): scale >= amax/6, so no value clips.
+             * The 1e-4 floor keeps e >= 112 -- byte 0 is unreachable, exactly
+             * as in the fp8 row. */
+            const float lg = ceilf(log2f(fmaxf(samax[b], 1.0e-4f) / 6.0f));
+            int e = (int)lg + 127;
+            if (e < 1) e = 1;
+            if (e > 254) e = 254;
+            sc[b] = (uint8_t)e;
+            sscale[b] = __uint_as_float((uint32_t)e << 23);
+        }
+        if (tid == 0) {
+            for (uint32_t p = nblk; p < PULSAR_KV4_MX_SCPAD(head_dim); p++) sc[p] = 0;
+        }
+    }
+    __syncthreads();
+
+    /* Nibble pairs: thread t owns packed bytes t, t+64, ... (dims 2t, 2t+1).
+     * dsv4_e2m1fn_encode_dev is the tree's ONE reference E2M1 encoder
+     * (round-to-nearest, tie to the even code) -- the same authority the
+     * indexer QAT path answers to, deliberately not a second transcription.
+     * A zero block decodes zero whatever its code; guard the quotient so it
+     * encodes code 0 rather than NaN. */
+    for (uint32_t i = tid; i < nib_bytes; i += blockDim.x) {
+        const uint32_t d0 = i * 2u;
+        const float s0 = sscale[d0 / blk];
+        const float s1 = sscale[(d0 + 1u) / blk];
+        const uint32_t n0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
+        const uint32_t n1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
+        outr[i] = (uint8_t)(n0 | (n1 << 4));
+        if (xr) {
+            xr[d0]      = attn_kv4_e2m1(n0, s0);
+            xr[d0 + 1u] = attn_kv4_e2m1(n1, s1);
+        }
+    }
+    /* bf16 rope tail, roundtripped in place exactly as the fp8 store does. */
+    const uint32_t rope_off = (CF == PULSAR_ATTN_COMP_MXFP4)
+        ? nib_bytes + PULSAR_KV4_MX_SCPAD(head_dim)
+        : nib_bytes + nblk + 4u;
+    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + rope_off);
+    for (uint32_t d = tid; d < PULSAR_ATTN_PACK_NROT; d += blockDim.x) {
+        const __nv_bfloat16 b = __float2bfloat16(sr[n_nope + d]);
+        rope[d] = b;
+        if (xr) xr[n_nope + d] = __bfloat162float(b);
+    }
+}
+
 int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                                                        pulsar_gpu_tensor *packed,
                                                        uint32_t out_row0,
                                                        uint32_t n_rows,
                                                        uint32_t head_dim,
                                                        uint32_t n_rot,
-                                                       bool keep_f32) {
+                                                       bool keep_f32,
+                                                       pulsar_attn_comp_fmt comp_fmt) {
     if (!x || !packed || n_rows == 0 ||
         n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
         ((head_dim - n_rot) % PULSAR_FP8_KV_BLOCK) != 0 ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
-        packed->bytes < ((uint64_t)out_row0 + n_rows) * PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
+        packed->bytes < ((uint64_t)out_row0 + n_rows) *
+                        attn_comp_fmt_rowbytes(comp_fmt, head_dim)) {
         return 0;
+    }
+    if (comp_fmt == PULSAR_ATTN_COMP_MXFP4) {
+        attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_MXFP4><<<n_rows, 64>>>(
+                keep_f32 ? (float *)x->ptr : NULL, (const float *)x->ptr,
+                (uint8_t *)packed->ptr, out_row0, n_rows, head_dim);
+        return cuda_ok(cudaGetLastError(), "attn_comp_kv4_store mx launch");
+    }
+    if (comp_fmt == PULSAR_ATTN_COMP_NVFP4) {
+        attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_NVFP4><<<n_rows, 64>>>(
+                keep_f32 ? (float *)x->ptr : NULL, (const float *)x->ptr,
+                (uint8_t *)packed->ptr, out_row0, n_rows, head_dim);
+        return cuda_ok(cudaGetLastError(), "attn_comp_kv4_store nv launch");
     }
     attn_pack_store_kernel<<<n_rows, 64>>>(keep_f32 ? (float *)x->ptr : NULL,
                                           (const float *)x->ptr,

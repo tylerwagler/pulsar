@@ -826,6 +826,32 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
 uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
 uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 
+/* L111: the COMPRESSED POOL's row format.  The raw ring, the drafter's ring,
+ * the MTP cache and prefill's current-chunk rows are ALWAYS the 584 B E4M3 row
+ * above; only the committed comp pool may narrow its nope payload to 4 bits.
+ * The choice is made ONCE per process (PULSAR_KV4=mx|nv, default off) and
+ * asked through pulsar_gpu_attn_comp_fmt(); it is passed per call to the
+ * producer below (RAW_F16 lesson: one entry serving tensors of different
+ * formats takes the format per call, never from a file-global).
+ *
+ * ⚠ Unlike E4M3, both 4-bit rows RE-QUANTIZE values away from the model's own
+ * QAT numerics (the e4m3 roundtrip IS the source value; e2m1 is not).  They
+ * are measurement candidates behind the reference gate + accept decomposition
+ * (plans/111-kv4-comp-cache.md), not value-preserving formats, and a 4-bit
+ * comp pool is NOT byte-comparable to vLLM's fp8_ds_mla cache. */
+typedef enum {
+    PULSAR_ATTN_COMP_E4M3  = 0, /* 584 B PULSAR_ATTN_PACK row (default) */
+    PULSAR_ATTN_COMP_MXFP4 = 1, /* 368 B [224 e2m1][14 e8m0/32 + 2 pad][128 bf16 rope] */
+    PULSAR_ATTN_COMP_NVFP4 = 2, /* 384 B [224 e2m1][28 e4m3/16][f32 row scale][128 bf16 rope] */
+} pulsar_attn_comp_fmt;
+
+/* The active comp-pool format, read from PULSAR_KV4 exactly once. */
+pulsar_attn_comp_fmt pulsar_gpu_attn_comp_fmt(void);
+/* Row bytes of the ACTIVE comp-pool format (equals the pack rowbytes when the
+ * format is E4M3).  The engine sizes the comp pool, bank snapshots and session
+ * payload comp spans from THIS; raw-ring spans keep pulsar_gpu_attn_pack_rowbytes. */
+uint64_t pulsar_gpu_attn_comp_rowbytes(uint32_t head_dim);
+
 int pulsar_gpu_attn_pack_quantize_store_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
@@ -836,7 +862,14 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         /* keep_f32: write the dequantised values back into the f32 staging.
          * OBSERVER-ONLY -- consumers read the packed rows.  Pass
          * gpu_graph_f32_store_observed_any() (L094). */
-        bool              keep_f32);
+        bool              keep_f32,
+        /* The DESTINATION's row format.  PULSAR_ATTN_COMP_E4M3 for the raw
+         * ring and prefill's current-chunk rows (always); the active
+         * pulsar_gpu_attn_comp_fmt() for comp-pool commits.  The 4-bit
+         * formats quantize EXACTLY ONCE here -- re-encoding packed FP4
+         * misrounds ~33% of blocks (norm_kv.cu), so every later move of these
+         * rows must be a byte move. */
+        pulsar_attn_comp_fmt comp_fmt);
 
 /* Fused rope + QAT for the indexer q projection: one launch replacing the
  * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that

@@ -134,7 +134,12 @@ uint32_t gpu_graph_prefill_slice(void) {
 }
 
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
-    return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+    /* L111: the comp POOL's row size follows the active PULSAR_KV4 format, so
+     * this asks the backend rather than restating the macro.  Everything that
+     * strides the comp pool -- alloc, fork, evict/restore, session payload,
+     * accounting -- must come through here; raw-ring spans keep
+     * PULSAR_ENGINE_ATTN_PACK_ROWBYTES, which is E4M3 by definition. */
+    return pulsar_gpu_attn_comp_rowbytes(PULSAR_N_HEAD_DIM);
 }
 
 /* The comment that stood here described gpu_graph_attn_comp_read_cache: a
@@ -196,7 +201,8 @@ bool gpu_graph_commit_attn_comp_stage(
                                                     g->layer_attn_comp_cache[il],
                                                     first_row, rows,
                                                     PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
-                                                    gpu_graph_f32_store_observed_any()) == 0) {
+                                                    gpu_graph_f32_store_observed_any(),
+                                                    pulsar_gpu_attn_comp_fmt()) == 0) {
             return false;
         }
         /* plan-33 inc C: byte-replace the ratio-4 boundary row after any commit
@@ -224,7 +230,8 @@ bool gpu_graph_commit_attn_comp_stage_bank(
     const bool ok = pulsar_gpu_attn_pack_quantize_store_tensor(
             g->attn_comp_stage, cache, first_row, rows,
             PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
-            gpu_graph_f32_store_observed_any()) != 0;
+            gpu_graph_f32_store_observed_any(),
+            pulsar_gpu_attn_comp_fmt()) != 0;
     pulsar_gpu_tensor_free(cache);
     /* plan-33 inc C: boundary-row restore for the explicit-bank commit path. */
     return ok && gpu_graph_emit_keep_restore(g, il, bank, first_row, rows, false);

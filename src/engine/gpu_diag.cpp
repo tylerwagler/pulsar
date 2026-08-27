@@ -1767,6 +1767,21 @@ bool gpu_graph_alloc_raw_cap(
         }
     }
 
+    /* L111: announce the comp-pool format ONCE at graph alloc, so a log line
+     * proves which arm a measurement actually ran (a fix that is not live is
+     * the classic way an A/B silently grades nothing). */
+    {
+        const pulsar_attn_comp_fmt cf = pulsar_gpu_attn_comp_fmt();
+        if (cf != PULSAR_ATTN_COMP_E4M3) {
+            fprintf(stderr,
+                    "pulsar: comp KV cache = %s 4-bit rows (%llu B/row, PULSAR_KV4; "
+                    "L111 measurement arm -- LOSSY re-quantization of the QAT e4m3 "
+                    "values; raw ring stays E4M3)\n",
+                    cf == PULSAR_ATTN_COMP_MXFP4 ? "MXFP4" : "NVFP4",
+                    (unsigned long long)pulsar_gpu_attn_comp_rowbytes(PULSAR_N_HEAD_DIM));
+        }
+    }
+
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer
      * cache pointers below then become bank-0 views instead of owning
      * allocations, and all single-session code runs unmodified. */
