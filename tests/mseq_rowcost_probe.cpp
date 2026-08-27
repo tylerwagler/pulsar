@@ -51,6 +51,13 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
+static unsigned long long fnv1a(const void *buf, size_t n) {
+    const unsigned char *p2 = (const unsigned char *)buf;
+    unsigned long long h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= p2[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 static int cmp_dbl(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y ? 1 : 0;
@@ -159,6 +166,7 @@ int main(int argc, char **argv) {
                 const uint32_t rows = (uint32_t)(B * R);
                 pulsar_multiseq_req reqs[PROBE_MAX_B * PROBE_MAX_R];
                 double ms[PROBE_ITERS];
+                unsigned long long cell_hash = 0;
                 bool cell_ok = true;
                 for (int it = 0; it < PROBE_ITERS && cell_ok; it++) {
                     /* Chains advance: iteration it starts every bank at its
@@ -187,6 +195,11 @@ int main(int argc, char **argv) {
                         break;
                     }
                     ms[it] = (t1 - t0) * 1e3;
+                    /* Differential witness: hash the FIRST iteration's logits
+                     * (base depth, deterministic teacher-forced feed) so an
+                     * arm swap can be proven byte-exact across builds. */
+                    if (it == 0)
+                        cell_hash = fnv1a(logits, (size_t)rows * (size_t)vocab * sizeof(float));
                 }
                 /* Reset the touched banks for the next cell: repoint +
                  * re-prefill from scratch keeps every cell's starting frontier
@@ -212,8 +225,8 @@ int main(int argc, char **argv) {
                 if (!cell_ok) continue;
                 qsort(ms, PROBE_ITERS, sizeof(double), cmp_dbl);
                 const double med = ms[PROBE_ITERS / 2], mn = ms[0];
-                printf("ROWCOST depth=%d B=%d R=%d rows=%u med_ms=%.3f min_ms=%.3f rows_per_ms=%.2f\n",
-                       depth, B, R, rows, med, mn, (double)rows / med);
+                printf("ROWCOST depth=%d B=%d R=%d rows=%u med_ms=%.3f min_ms=%.3f rows_per_ms=%.2f hash=%016llx\n",
+                       depth, B, R, rows, med, mn, (double)rows / med, cell_hash);
                 fflush(stdout);
             }
         }
