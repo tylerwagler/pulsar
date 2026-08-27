@@ -1730,7 +1730,14 @@ bool gpu_graph_encode_output_head_batch(
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
     if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
-        const uint64_t key = (0xFFull << 16) | (2ull << 8) | n_tokens;
+        /* L119: parity-keyed like the FFN bracket — the head reads the
+         * sweep-final hidden buffer, whose identity alternates per sweep
+         * (odd layer count x per-layer pointer swap). */
+        const uint64_t hc_parity =
+            (uintptr_t)(const void *)g->batch_cur_hc >
+            (uintptr_t)(const void *)g->batch_next_hc ? 1ull : 0ull;
+        const uint64_t key = (hc_parity << 40) |
+                             (0xFFull << 16) | (2ull << 8) | n_tokens;
         const int st = pulsar_gpu_seg_enter(key);
         if (st == 2) return true;
         if (st == 1) {

@@ -2298,7 +2298,17 @@ bool gpu_graph_encode_layer_ffn_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
-        const uint64_t key = ((uint64_t)il << 16) | (1ull << 8) | n_tokens;
+        /* L119: the hidden-state double buffer POINTER-SWAPS per layer, and
+         * with an odd layer count the sweep-final identity alternates per
+         * sweep — a captured graph is only valid for the parity it baked
+         * (root-caused 2026-08-27: odd replays read the swapped-away buffer,
+         * all rows wrong by up to ~33 logits). Key the parity: each
+         * (layer, phase, rows, parity) owns its own graph. */
+        const uint64_t hc_parity =
+            (uintptr_t)(const void *)g->batch_cur_hc >
+            (uintptr_t)(const void *)g->batch_next_hc ? 1ull : 0ull;
+        const uint64_t key = (hc_parity << 40) |
+                             ((uint64_t)il << 16) | (1ull << 8) | n_tokens;
         const int st = pulsar_gpu_seg_enter(key);
         if (st == 2) return true;
         if (st == 1) {
