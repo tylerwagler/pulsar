@@ -617,6 +617,24 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
         if (devs) r->api.free_device_list(devs);
         return 0;
     }
+    /* Auto-pick deterministically: both ranks sort by name so an unpinned
+     * selection at least chooses the same ordinal on both hosts.  True link
+     * correctness on the two-cable pair still needs PULSAR_TP_RDMA_DEV to
+     * name the same physical cable on BOTH ranks. */
+    for (int i = 1; i < num; i++)
+        for (int j = i; j > 0; j--)
+            if (strcmp(r->api.get_device_name(devs[j - 1]),
+                       r->api.get_device_name(devs[j])) <= 0)
+                break;
+            else {
+                tp_ibv_device t = devs[j - 1];
+                devs[j - 1] = devs[j];
+                devs[j] = t;
+            }
+    if (num > 1 && !getenv("PULSAR_TP_RDMA_DEV"))
+        fprintf(stderr,
+                "pulsar-tp: %d verbs devices; auto-picked by name — pin the "
+                "SAME cable on both ranks with PULSAR_TP_RDMA_DEV=<hca>\n", num);
     /* One verbs device per link.  The pair is wired by two QSFP cables, so
      * PULSAR_TP_RDMA_DEV pins the device per rank (later two-link bench);
      * the default auto-picks the first ACTIVE port. */
@@ -651,28 +669,46 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
                    "up and the link enabled on both machines?", states);
         return 0;
     }
-    /* The Thunderbolt driver only connects through the IPv4-mapped GID
-     * (::ffff:a.b.c.d); Linux RoCE GID selection is a bring-up-slice
-     * refinement.  Otherwise scan the port's GIDs for that pattern. */
+    /* GID selection.  Upstream (two-Mac/TB) wants the IPv4-mapped GID, which
+     * is a Thunderbolt-ism.  Linux RoCEv2 commonly exposes the usable GID at
+     * a non-zero index, so: honor PULSAR_TP_RDMA_GID_INDEX, else prefer the
+     * IPv4-mapped GID, else the first non-link-local (routable) GID. */
+    const char *gid_env = getenv("PULSAR_TP_RDMA_GID_INDEX");
     r->gid_index = -1;
-    for (uint32_t j = 0; j < r->port.gid_tbl_len; j++) {
-        union tp_ibv_gid tmp;
-        const int i = (int)j;
-        if (r->api.query_gid(r->ctx, 1, i, &tmp) != 0) continue;
-        uint64_t hi;
-        uint16_t mid, v4tag;
-        memcpy(&hi, &tmp.raw[0], 8);
-        memcpy(&mid, &tmp.raw[8], 2);
-        memcpy(&v4tag, &tmp.raw[10], 2);
-        if (hi == 0 && mid == 0 && v4tag == 0xffff) {
-            r->gid = tmp;
-            r->gid_index = i;
-            break;
+    if (gid_env) {
+        const int gi = atoi(gid_env);
+        if (gi >= 0 && (uint32_t)gi < r->port.gid_tbl_len &&
+            r->api.query_gid(r->ctx, 1, gi, &r->gid) == 0) {
+            r->gid_index = gi;
+        } else {
+            tp_set_err(err, errlen,
+                       "tp rdma: bad PULSAR_TP_RDMA_GID_INDEX %d (table %u)",
+                       gi, r->port.gid_tbl_len);
+            return 0;
+        }
+    } else {
+        for (uint32_t j = 0; j < r->port.gid_tbl_len; j++) {
+            union tp_ibv_gid tmp;
+            if (r->api.query_gid(r->ctx, 1, (int)j, &tmp) != 0) continue;
+            uint64_t hi;
+            uint16_t mid, v4tag, top;
+            memcpy(&hi, &tmp.raw[0], 8);
+            memcpy(&mid, &tmp.raw[8], 2);
+            memcpy(&v4tag, &tmp.raw[10], 2);
+            memcpy(&top, &tmp.raw[0], 2);
+            const bool ipv4_mapped = (hi == 0 && mid == 0 && v4tag == 0xffff);
+            const bool link_local = (top == 0xfe80);
+            if (ipv4_mapped || !link_local) {
+                r->gid = tmp;
+                r->gid_index = (int)j;
+                if (ipv4_mapped) break;   /* prefer it; else keep first routable */
+            }
         }
     }
     if (r->gid_index < 0) {
         tp_set_err(err, errlen,
-                   "tp rdma: no IPv4-mapped GID on the active port");
+                   "tp rdma: no usable GID on the active port "
+                   "(try PULSAR_TP_RDMA_GID_INDEX)");
         return 0;
     }
     r->pd = r->api.alloc_pd(r->ctx);
