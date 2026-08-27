@@ -2293,6 +2293,13 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             break;   /* real decode failure -> stop */
         }
         pf_done += kthis;
+        /* NOTE (L114 counter): fused sub-chunks bypass server_progress_cb, so
+         * pulsar:prefill_chunk_tokens_total does not tick here — the NEXT
+         * classic chunk event's interval spans the fused stretch, so totals
+         * stay exact and ticking here too would double-count. Cost: the rate
+         * curve's resolution coarsens to the fused-stretch length while
+         * decode+prefill fusion is active. A per-slot counted-watermark shared
+         * by both sites is the fix if fused-granularity ever matters. */
         if (kthis > 0 && pos_now + kthis == len) {
             /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
              * index m, last-of-run) as the decode seed for the handoff. */
