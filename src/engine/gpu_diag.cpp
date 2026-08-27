@@ -1771,15 +1771,16 @@ bool gpu_graph_alloc_raw_cap(
      * proves which arm a measurement actually ran (a fix that is not live is
      * the classic way an A/B silently grades nothing). */
     {
+        /* ALWAYS name the comp format -- the arm a measurement ran is a fact
+         * the log must witness (L111's first sweep graded nothing because the
+         * arm silently wasn't live). */
         const pulsar_attn_comp_fmt cf = pulsar_gpu_attn_comp_fmt();
-        if (cf != PULSAR_ATTN_COMP_E4M3) {
-            fprintf(stderr,
-                    "pulsar: comp KV cache = %s 4-bit rows (%llu B/row, PULSAR_KV4; "
-                    "L111 measurement arm -- LOSSY re-quantization of the QAT e4m3 "
-                    "values; raw ring stays E4M3)\n",
-                    cf == PULSAR_ATTN_COMP_MXFP4 ? "MXFP4" : "NVFP4",
-                    (unsigned long long)pulsar_gpu_attn_comp_rowbytes(PULSAR_N_HEAD_DIM));
-        }
+        fprintf(stderr,
+                "pulsar: comp KV cache = %s (%llu B/row%s; raw ring E4M3)\n",
+                cf == PULSAR_ATTN_COMP_NVFP4 ? "NVFP4 4-bit rows" : "E4M3 rows",
+                (unsigned long long)pulsar_gpu_attn_comp_rowbytes(PULSAR_N_HEAD_DIM),
+                cf == PULSAR_ATTN_COMP_NVFP4 ? ", default"
+                                             : ", PULSAR_KV4 opt-out; byte-gate arm");
     }
 
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer

@@ -828,21 +828,29 @@ uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 
 /* L111: the COMPRESSED POOL's row format.  The raw ring, the drafter's ring,
  * the MTP cache and prefill's current-chunk rows are ALWAYS the 584 B E4M3 row
- * above; only the committed comp pool may narrow its nope payload to 4 bits.
- * The choice is made ONCE per process (PULSAR_KV4=mx|nv, default off) and
- * asked through pulsar_gpu_attn_comp_fmt(); it is passed per call to the
- * producer below (RAW_F16 lesson: one entry serving tensors of different
- * formats takes the format per call, never from a file-global).
+ * above; only the committed comp pool narrows its nope payload to 4 bits.
+ * The choice is made ONCE per process and asked through
+ * pulsar_gpu_attn_comp_fmt(); it is passed per call to the producer below
+ * (RAW_F16 lesson: one entry serving tensors of different formats takes the
+ * format per call, never from a file-global).
  *
- * ⚠ Unlike E4M3, both 4-bit rows RE-QUANTIZE values away from the model's own
- * QAT numerics (the e4m3 roundtrip IS the source value; e2m1 is not).  They
- * are measurement candidates behind the reference gate + accept decomposition
- * (plans/111-kv4-comp-cache.md), not value-preserving formats, and a 4-bit
- * comp pool is NOT byte-comparable to vLLM's fp8_ds_mla cache. */
+ * DEFAULT = NVFP4 since 2026-08-27 (Tyler; measured verdict in
+ * pulsar-notes/rows/L111.md: net KL CLOSER to the vLLM source than the E4M3
+ * row on both reference prompts, drafter acceptance AT/ABOVE the e4m3
+ * baseline at every depth, per-bank KV reservation -31%).  PULSAR_KV4=0/off/
+ * e4m3 opts back into the E4M3 row -- the arm the BYTE-EXACT prefill gate
+ * certifies, and the only arm byte-comparable to vLLM's fp8_ds_mla cache.
+ * The NVFP4 default is graded by cuda-reference-gate instead: a different
+ * contract, deliberately (the L045 f32/f16 split precedent).  The MXFP4
+ * candidate arm was CUT the same day (further from source on every prompt,
+ * no compensating win); PULSAR_KV4=mx refuses to start.
+ *
+ * ⚠ The NVFP4 row RE-QUANTIZES values away from the model's own QAT e4m3
+ * numerics; what makes it shippable is the measured verdict above, not
+ * value-preservation. */
 typedef enum {
-    PULSAR_ATTN_COMP_E4M3  = 0, /* 584 B PULSAR_ATTN_PACK row (default) */
-    PULSAR_ATTN_COMP_MXFP4 = 1, /* 368 B [224 e2m1][14 e8m0/32 + 2 pad][128 bf16 rope] */
-    PULSAR_ATTN_COMP_NVFP4 = 2, /* 384 B [224 e2m1][28 e4m3/16][f32 row scale][128 bf16 rope] */
+    PULSAR_ATTN_COMP_E4M3  = 0, /* 584 B PULSAR_ATTN_PACK row (opt-in; byte-gate arm) */
+    PULSAR_ATTN_COMP_NVFP4 = 1, /* 384 B [224 e2m1][28 e4m3/16][f32 row scale][128 bf16 rope] */
 } pulsar_attn_comp_fmt;
 
 /* The active comp-pool format, read from PULSAR_KV4 exactly once. */

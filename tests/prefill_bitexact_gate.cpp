@@ -1156,8 +1156,9 @@ int main(int argc, char **argv) {
         }
         scrub_numerics_env();
         if (kv4_arm) {
-            if (strcmp(kv4_arm, "mx") != 0 && strcmp(kv4_arm, "nv") != 0) {
-                fprintf(stderr, "--kv4 takes mx or nv, not '%s'\n", kv4_arm);
+            if (strcmp(kv4_arm, "nv") != 0 && strcmp(kv4_arm, "e4m3") != 0) {
+                fprintf(stderr, "--kv4 takes nv or e4m3, not '%s' (the mx arm "
+                                "was cut 2026-08-27)\n", kv4_arm);
                 return 2;
             }
             if (setenv("PULSAR_KV4", kv4_arm, 1) != 0) {
@@ -1239,6 +1240,18 @@ int main(int argc, char **argv) {
     }
 
     scrub_numerics_env();
+    /* The byte-exact and self-fidelity modes certify the E4M3-provable arm:
+     * their baselines are e4m3 bytes, and since the 2026-08-27 default flip
+     * the engine default is NVFP4 -- graded by --check-reference instead (the
+     * L045 f32/f16 split precedent: the provable arm keeps the byte gate, the
+     * default is graded against the source, and those are different
+     * contracts).  Pin, loudly. */
+    if (setenv("PULSAR_KV4", "e4m3", 1) != 0) {
+        fprintf(stderr, "PREFILL GATE FAIL: setenv(PULSAR_KV4=e4m3) failed\n");
+        return 2;
+    }
+    printf("PREFILL GATE: byte modes certify the E4M3 arm (PULSAR_KV4=e4m3 pinned; "
+           "the NVFP4 default is graded by cuda-reference-gate)\n");
     printf("prefill bit-exactness gate: this binary built from ref '%s'\n",
            PULSAR_GATE_BUILD_REF);
 

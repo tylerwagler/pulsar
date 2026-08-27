@@ -115,8 +115,7 @@ typedef struct {
 /* verify one row against the GPU bytes; scale bytes toleranced, decode exact */
 static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
                        const uint8_t *gr, const float *gdec, leg_stats *st) {
-    const uint32_t blk = fmt == PULSAR_ATTN_COMP_MXFP4 ? 32u :
-                         fmt == PULSAR_ATTN_COMP_NVFP4 ? 16u : 64u;
+    const uint32_t blk = fmt == PULSAR_ATTN_COMP_NVFP4 ? 16u : 64u;
     const uint32_t nblk = NNOPE / blk;
     float scale[NNOPE / 16u];
     const uint8_t *sc;
@@ -126,10 +125,6 @@ static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
         sc = gr + NNOPE;
         rope = (const uint16_t *)(gr + NNOPE + 8u);
         if (sc[7] != 0u) st->layout_mism++;
-    } else if (fmt == PULSAR_ATTN_COMP_MXFP4) {
-        sc = gr + NIB;
-        rope = (const uint16_t *)(gr + NIB + 16u);
-        if (sc[14] != 0u || sc[15] != 0u) st->layout_mism++;
     } else {
         sc = gr + NIB;
         rope = (const uint16_t *)(gr + NIB + nblk + 4u);
@@ -155,8 +150,8 @@ static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
             if (d < -1 || d > 1) st->scale_dev++;
             scale[b] = ref_e4m3_value(sc[b]) * nv_rs;   /* GPU byte is authoritative */
         } else {
-            const float K = fmt == PULSAR_ATTN_COMP_MXFP4 ? 6.0f : 448.0f;
-            const int lo = fmt == PULSAR_ATTN_COMP_MXFP4 ? 1 : 0;
+            const float K = 448.0f;
+            const int lo = 0;
             int e = (int)ceil(log2(fmax((double)amax, 1.0e-4) / (double)K)) + 127;
             if (e < lo) e = lo;
             if (e > 254) e = 254;
@@ -240,7 +235,6 @@ int main(void) {
 
     struct { pulsar_attn_comp_fmt fmt; const char *name; uint64_t rowb; } legs[] = {
         { PULSAR_ATTN_COMP_E4M3,  "e4m3", 584u },
-        { PULSAR_ATTN_COMP_MXFP4, "mx",   368u },
         { PULSAR_ATTN_COMP_NVFP4, "nv",   384u },
     };
     int fails = 0;

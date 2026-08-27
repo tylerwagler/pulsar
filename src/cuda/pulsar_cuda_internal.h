@@ -217,32 +217,26 @@ __device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *comp_
 }
 
 /*
- * L111: 4-bit comp-pool row formats (plans/111-kv4-comp-cache.md).  COMP POOL
- * ONLY -- the raw ring, drafter ring, MTP cache and current-chunk rows stay
- * PULSAR_ATTN_PACK E4M3.  Both formats keep the bf16 rope tail verbatim
- * (quantized rope is what cost the removed ATTN_MX its drafter acceptance)
- * and pack the n_nope dims as E2M1 nibbles, low nibble first (MXKV
- * convention).  head_dim 512 / n_rot 64:
- *   MXFP4: [224 nibble bytes][14 E8M0 per-32 scales][2 pad][128 bf16 rope] = 368 B
- *   NVFP4: [224 nibble bytes][28 E4M3 per-16 scales][4 f32 row scale][128 bf16 rope] = 384 B
- * Both are multiples of 16 so cp.async row staging keeps its 8 B chunks and
- * the rope tail its 2 B alignment; the NVFP4 f32 row scale sits 4-aligned.
- * The E8M0 byte keeps the ATTN_PACK convention (exponent + 127, decoded
- * __uint_as_float(b << 23)) -- NOT the indexer MMA path's hardware ue8m0 bias
- * of 128.  The NVFP4 per-16 scale byte is an UNSIGNED E4M3 code decoded
- * against the row scale with attn_pack_e4m3.
+ * L111: the NVFP4 comp-pool row (plans/111-kv4-comp-cache.md; DEFAULT since
+ * 2026-08-27).  COMP POOL ONLY -- the raw ring, drafter ring, MTP cache and
+ * current-chunk rows stay PULSAR_ATTN_PACK E4M3.  The bf16 rope tail is
+ * verbatim (quantized rope is what cost the removed ATTN_MX its drafter
+ * acceptance); the n_nope dims pack as E2M1 nibbles, low nibble first.
+ * head_dim 512 / n_rot 64:
+ *   [224 nibble bytes][28 E4M3 per-16 scales][4 f32 row scale][128 bf16 rope] = 384 B
+ * A multiple of 16, so cp.async row staging keeps its 8 B chunks, the rope
+ * tail its 2 B alignment, and the f32 row scale sits 4-aligned at +252.
+ * The per-16 scale byte is an UNSIGNED E4M3 code decoded against the row
+ * scale with attn_pack_e4m3.  (An MXFP4 candidate row -- per-32 E8M0 scales,
+ * 368 B -- was measured and CUT 2026-08-27: further from the vLLM source on
+ * every reference prompt; rows/L111.md holds the table.)
  *
- * ⚠ These rows are a lossy re-quantization of the model's QAT e4m3 values --
- * nothing here is value-preserving or byte-comparable to vLLM fp8_ds_mla, and
- * re-encoding a decoded FP4 row misrounds ~33% of blocks: quantize exactly
- * once (attn_comp_kv4_store_kernel), move bytes ever after. */
+ * ⚠ This row is a lossy re-quantization of the model's QAT e4m3 values --
+ * not value-preserving, not byte-comparable to vLLM fp8_ds_mla (the opt-in
+ * E4M3 row keeps that role), and re-encoding a decoded FP4 row misrounds
+ * ~33% of blocks: quantize exactly once (attn_comp_kv4_store_kernel), move
+ * bytes ever after. */
 #define PULSAR_KV4_NIBBLES(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
-#define PULSAR_KV4_MX_BLOCK      32u
-#define PULSAR_KV4_MX_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_MX_BLOCK)
-#define PULSAR_KV4_MX_SCPAD(HD)  ((PULSAR_KV4_MX_NBLK(HD) + 3u) & ~3u)
-#define PULSAR_KV4_MX_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_KV4_NIBBLES(HD) + PULSAR_KV4_MX_SCPAD(HD) + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 #define PULSAR_KV4_NV_BLOCK      16u
 #define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
 #define PULSAR_KV4_NV_ROWBYTES(HD) \
@@ -252,7 +246,6 @@ __device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *comp_
 /* Comp-row bytes for a format, host+device (the launch wrappers stride rows
  * with it; the engine asks through pulsar_gpu_attn_comp_rowbytes). */
 __host__ __device__ static inline uint64_t attn_comp_fmt_rowbytes(int fmt, uint32_t head_dim) {
-    if (fmt == PULSAR_ATTN_COMP_MXFP4) return PULSAR_KV4_MX_ROWBYTES(head_dim);
     if (fmt == PULSAR_ATTN_COMP_NVFP4) return PULSAR_KV4_NV_ROWBYTES(head_dim);
     return PULSAR_ATTN_PACK_ROWBYTES(head_dim);
 }
@@ -266,15 +259,17 @@ static inline pulsar_attn_comp_fmt pulsar_attn_comp_fmt_env(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("PULSAR_KV4");
-        if (!e || !e[0] || !strcmp(e, "0") || !strcmp(e, "off")) {
-            cached = PULSAR_ATTN_COMP_E4M3;
+        if (!e || !e[0] || !strcmp(e, "nv")) {
+            cached = PULSAR_ATTN_COMP_NVFP4;   /* the default (2026-08-27 flip) */
+        } else if (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "e4m3")) {
+            cached = PULSAR_ATTN_COMP_E4M3;    /* value-aware opt-out */
         } else if (!strcmp(e, "mx")) {
-            cached = PULSAR_ATTN_COMP_MXFP4;
-        } else if (!strcmp(e, "nv")) {
-            cached = PULSAR_ATTN_COMP_NVFP4;
+            fprintf(stderr, "pulsar: PULSAR_KV4=mx names the REMOVED MXFP4 arm "
+                            "(cut 2026-08-27, rows/L111.md); refusing to start\n");
+            exit(1);
         } else {
             fprintf(stderr, "pulsar: PULSAR_KV4='%s' names no comp-KV format "
-                            "(mx | nv | 0/off/unset); refusing to guess\n", e);
+                            "(nv/unset | 0/off/e4m3); refusing to guess\n", e);
             exit(1);
         }
     }
@@ -287,14 +282,11 @@ static inline pulsar_attn_comp_fmt pulsar_attn_comp_fmt_env(void) {
  * kernels.  The format is a process constant (env, read once), so the switch
  * runs once per launch, not per token. */
 #define PULSAR_ATTN_CF_LAUNCH(launch) do {                                      \
-    switch (pulsar_attn_comp_fmt_env()) {                                       \
-    case PULSAR_ATTN_COMP_MXFP4:                                                \
-        launch(std::integral_constant<int, PULSAR_ATTN_COMP_MXFP4>{}); break;   \
-    case PULSAR_ATTN_COMP_NVFP4:                                                \
-        launch(std::integral_constant<int, PULSAR_ATTN_COMP_NVFP4>{}); break;   \
-    default:                                                                    \
-        launch(std::integral_constant<int, PULSAR_ATTN_COMP_E4M3>{});  break;   \
-    } } while (0)
+    if (pulsar_attn_comp_fmt_env() == PULSAR_ATTN_COMP_NVFP4)                   \
+        launch(std::integral_constant<int, PULSAR_ATTN_COMP_NVFP4>{});          \
+    else                                                                        \
+        launch(std::integral_constant<int, PULSAR_ATTN_COMP_E4M3>{});           \
+    } while (0)
 
 /* E2M1 magnitude table: 3-bit code -> value.  Kept as bit math (not a memory
  * table) so the inner attention loops pay ALU, not LDC traffic. */
@@ -338,22 +330,15 @@ __device__ static inline float4 attn_comp_row_ld4(const uint8_t *pr, uint32_t c4
     const uint32_t nib_bytes = n_nope / 2u;
     const uint8_t *psc = pr + nib_bytes;
     if (base < n_nope) {
-        float scale;
-        if (CF == PULSAR_ATTN_COMP_MXFP4) {
-            scale = __uint_as_float((uint32_t)psc[base / PULSAR_KV4_MX_BLOCK] << 23);
-        } else {
-            const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
-            scale = attn_pack_e4m3(psc[base / PULSAR_KV4_NV_BLOCK], row_scale);
-        }
+        const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
+        const float scale = attn_pack_e4m3(psc[base / PULSAR_KV4_NV_BLOCK], row_scale);
         const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
         v.x = attn_kv4_e2m1(b0 & 0xFu, scale);
         v.y = attn_kv4_e2m1(b0 >> 4, scale);
         v.z = attn_kv4_e2m1(b1 & 0xFu, scale);
         v.w = attn_kv4_e2m1(b1 >> 4, scale);
     } else {
-        const uint32_t rope_off = (CF == PULSAR_ATTN_COMP_MXFP4)
-            ? nib_bytes + PULSAR_KV4_MX_SCPAD(head_dim)
-            : nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
+        const uint32_t rope_off = nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
         const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + rope_off);
         v.x = __bfloat162float(rope[base - n_nope + 0u]);
         v.y = __bfloat162float(rope[base - n_nope + 1u]);
@@ -372,15 +357,6 @@ __device__ static inline float attn_comp_ld(const pulsar_attn_pack_t *comp_kv, u
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint32_t nib_bytes = n_nope / 2u;
     const uint8_t *r = (const uint8_t *)comp_kv + row * attn_comp_fmt_rowbytes(CF, head_dim);
-    if (CF == PULSAR_ATTN_COMP_MXFP4) {
-        if (d < n_nope) {
-            const float scale = __uint_as_float((uint32_t)r[nib_bytes + (d / PULSAR_KV4_MX_BLOCK)] << 23);
-            const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
-            return attn_kv4_e2m1(nib, scale);
-        }
-        return __bfloat162float(((const __nv_bfloat16 *)(r + nib_bytes +
-                                 PULSAR_KV4_MX_SCPAD(head_dim)))[d - n_nope]);
-    }
     /* NVFP4 */
     const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
     if (d < n_nope) {

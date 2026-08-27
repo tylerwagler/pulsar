@@ -136,17 +136,14 @@ __device__ static inline float attn_comp_dot_full(const QT *qh, const pulsar_att
     if (CF == PULSAR_ATTN_COMP_E4M3) return attn_pack_dot_full<QT>(qh, comp_kv, row, head_dim, dot);
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t blk = (CF == PULSAR_ATTN_COMP_MXFP4) ? PULSAR_KV4_MX_BLOCK
-                                                        : PULSAR_KV4_NV_BLOCK;
+    const uint32_t blk = PULSAR_KV4_NV_BLOCK;
     const uint8_t *pr = (const uint8_t *)comp_kv + row * attn_comp_fmt_rowbytes(CF, head_dim);
     const uint8_t *psc = pr + nib_bytes;
     float row_scale = 0.0f;
     if (CF == PULSAR_ATTN_COMP_NVFP4)
         row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
     for (uint32_t off = 0; off < n_nope; off += blk) {
-        const float scale = (CF == PULSAR_ATTN_COMP_MXFP4)
-            ? __uint_as_float((uint32_t)psc[off / PULSAR_KV4_MX_BLOCK] << 23)
-            : attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
+        const float scale = attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
         const uint32_t *pw = (const uint32_t *)(pr + off / 2u);
         for (uint32_t i = 0; i < blk / 8u; i++) {
             const uint32_t w = pw[i];
@@ -157,9 +154,7 @@ __device__ static inline float attn_comp_dot_full(const QT *qh, const pulsar_att
             }
         }
     }
-    const uint32_t rope_off = (CF == PULSAR_ATTN_COMP_MXFP4)
-        ? nib_bytes + PULSAR_KV4_MX_SCPAD(head_dim)
-        : nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
+    const uint32_t rope_off = nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
     const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + rope_off);
     for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++)
         dot += q_load<QT>(qh, n_nope + d) * __bfloat162float(rope[d]);
@@ -180,25 +175,20 @@ __device__ static inline float attn_comp_dot_lane8(const QT *qh, const pulsar_at
     if (CF == PULSAR_ATTN_COMP_E4M3) return attn_pack_dot_lane8<QT>(qh, comp_kv, row, lane, head_dim, dot);
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t blk = (CF == PULSAR_ATTN_COMP_MXFP4) ? PULSAR_KV4_MX_BLOCK
-                                                        : PULSAR_KV4_NV_BLOCK;
+    const uint32_t blk = PULSAR_KV4_NV_BLOCK;
     const uint8_t *pr = (const uint8_t *)comp_kv + row * attn_comp_fmt_rowbytes(CF, head_dim);
     const uint8_t *psc = pr + nib_bytes;
     float row_scale = 0.0f;
     if (CF == PULSAR_ATTN_COMP_NVFP4)
         row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
     for (uint32_t off = 0; off < n_nope; off += blk) {
-        const float scale = (CF == PULSAR_ATTN_COMP_MXFP4)
-            ? __uint_as_float((uint32_t)psc[off / PULSAR_KV4_MX_BLOCK] << 23)
-            : attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
+        const float scale = attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
         for (uint32_t d = off + lane; d < off + blk; d += 8u) {
             const uint32_t nib = (pr[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
             dot += q_load<QT>(qh, d) * attn_kv4_e2m1(nib, scale);
         }
     }
-    const uint32_t rope_off = (CF == PULSAR_ATTN_COMP_MXFP4)
-        ? nib_bytes + PULSAR_KV4_MX_SCPAD(head_dim)
-        : nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
+    const uint32_t rope_off = nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
     const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + rope_off);
     for (uint32_t d = n_nope + lane; d < head_dim; d += 8u)
         dot += q_load<QT>(qh, d) * __bfloat162float(rope[d - n_nope]);

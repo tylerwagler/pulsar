@@ -801,8 +801,6 @@ static int af16_dynsmem_ok(void) {
         const void *fns[] = {
             (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_E4M3,  float>,
             (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_E4M3,  __half>,
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_MXFP4, float>,
-            (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_MXFP4, __half>,
             (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_NVFP4, float>,
             (const void *)attn_f16_kernel<PULSAR_ATTN_COMP_NVFP4, __half>,
         };

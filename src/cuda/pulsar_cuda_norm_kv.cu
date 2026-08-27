@@ -1185,8 +1185,8 @@ uint64_t pulsar_gpu_attn_comp_rowbytes(uint32_t head_dim) {
 }
 
 /* L111 4-bit comp-pool store: quantize the nope dims of n_rows f32 rows of src
- * to E2M1 against per-block scales (MXFP4: per-32 E8M0; NVFP4: per-16 E4M3
- * against an f32 row scale) and store KV4 rows at [out_row0, out_row0+n_rows)
+ * to E2M1 against per-16 E4M3 block scales over an f32 row scale (NVFP4) and
+ * store KV4 rows at [out_row0, out_row0+n_rows)
  * -- consecutive rows only: the raw ring never takes this format.  The rope
  * tail is bf16-roundtripped exactly as attn_pack_store_kernel does it.  With
  * x non-NULL the f32 staging gets the DEQUANTIZED values written back, keeping
@@ -1206,8 +1206,7 @@ __global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, ui
     if (row >= n_rows) return;
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t blk = (CF == PULSAR_ATTN_COMP_MXFP4) ? PULSAR_KV4_MX_BLOCK
-                                                        : PULSAR_KV4_NV_BLOCK;
+    const uint32_t blk = PULSAR_KV4_NV_BLOCK;
     const uint32_t nblk = n_nope / blk;
     const uint64_t rowbytes = attn_comp_fmt_rowbytes(CF, head_dim);
     const float *sr = src + (uint64_t)row * head_dim;
@@ -1228,7 +1227,7 @@ __global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, ui
     }
     __syncthreads();
 
-    if (CF == PULSAR_ATTN_COMP_NVFP4) {
+    {
         if (tid == 0) {
             float ra = 0.0f;
             for (uint32_t b = 0; b < nblk; b++) ra = fmaxf(ra, samax[b]);
@@ -1247,21 +1246,6 @@ __global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, ui
             const float t = fminf(448.0f, samax[b] * (1.0f / 6.0f) / srow);
             sc[b] = dsv4_e4m3fn_encode_dev(t);
             sscale[b] = dsv4_e4m3fn_dequant_dev(t) * srow;
-        }
-    } else {
-        for (uint32_t b = tid; b < nblk; b += blockDim.x) {
-            /* exp2(ceil(log2(amax/6))): scale >= amax/6, so no value clips.
-             * The 1e-4 floor keeps e >= 112 -- byte 0 is unreachable, exactly
-             * as in the fp8 row. */
-            const float lg = ceilf(log2f(fmaxf(samax[b], 1.0e-4f) / 6.0f));
-            int e = (int)lg + 127;
-            if (e < 1) e = 1;
-            if (e > 254) e = 254;
-            sc[b] = (uint8_t)e;
-            sscale[b] = __uint_as_float((uint32_t)e << 23);
-        }
-        if (tid == 0) {
-            for (uint32_t p = nblk; p < PULSAR_KV4_MX_SCPAD(head_dim); p++) sc[p] = 0;
         }
     }
     __syncthreads();
@@ -1285,9 +1269,7 @@ __global__ static void attn_comp_kv4_store_kernel(float *x, const float *src, ui
         }
     }
     /* bf16 rope tail, roundtripped in place exactly as the fp8 store does. */
-    const uint32_t rope_off = (CF == PULSAR_ATTN_COMP_MXFP4)
-        ? nib_bytes + PULSAR_KV4_MX_SCPAD(head_dim)
-        : nib_bytes + nblk + 4u;
+    const uint32_t rope_off = nib_bytes + nblk + 4u;
     __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + rope_off);
     for (uint32_t d = tid; d < PULSAR_ATTN_PACK_NROT; d += blockDim.x) {
         const __nv_bfloat16 b = __float2bfloat16(sr[n_nope + d]);
@@ -1317,12 +1299,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
          * head_dim 512 (28 blocks); a larger shape would write past them.
          * No caller passes anything else -- refuse rather than trust that. */
         return 0;
-    }
-    if (comp_fmt == PULSAR_ATTN_COMP_MXFP4) {
-        attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_MXFP4><<<n_rows, 64>>>(
-                keep_f32 ? (float *)x->ptr : NULL, (const float *)x->ptr,
-                (uint8_t *)packed->ptr, out_row0, n_rows, head_dim);
-        return cuda_ok(cudaGetLastError(), "attn_comp_kv4_store mx launch");
     }
     if (comp_fmt == PULSAR_ATTN_COMP_NVFP4) {
         attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_NVFP4><<<n_rows, 64>>>(
