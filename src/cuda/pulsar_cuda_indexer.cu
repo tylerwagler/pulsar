@@ -960,6 +960,44 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
 
 
 
+int pulsar_gpu_indexer_scores_decode_run_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *bank_index_comp,
+        uint32_t                n_comp,
+        uint32_t                run_n,
+        uint32_t                run_pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    /* One same-bank consecutive-position run through the block-scaled MXFP4
+     * tier (L121).  The tier's causal mask is position-derived, so the bank's
+     * comp operand only ever reads rows below (run_pos0+run_n)/ratio -- the
+     * bank frontier under the L120 position-truth invariant -- and every
+     * masked score in the n_comp-stride row is written -INF without a read.
+     * n_comp here is the scores stride / scan bound (the step-top superset),
+     * NOT this bank's frontier. */
+    const uint32_t vis_max = (run_pos0 + run_n) / ratio;
+    if (!scores || !q || !weights || !bank_index_comp ||
+        n_comp == 0 || run_n == 0 || ratio == 0 ||
+        n_head != 64u || head_dim != 128u ||
+        q->bytes < (uint64_t)run_n * n_head * PULSAR_MXKV_FP4_ROWBYTES(128u) ||
+        weights->bytes < (uint64_t)run_n * n_head * sizeof(float) ||
+        scores->bytes < (uint64_t)run_n * n_comp * sizeof(float) ||
+        bank_index_comp->bytes < (uint64_t)vis_max * PULSAR_MXKV_FP4_ROWBYTES(128u)) {
+        return 0;
+    }
+    return pulsar_gpu_indexer_scores_mxfp4(
+            (float *)scores->ptr, (const pulsar_mxkv_pack_t *)q->ptr,
+            (const float *)weights->ptr,
+            (const pulsar_mxkv_pack_t *)bank_index_comp->ptr,
+            n_comp, run_n, run_pos0, n_head, head_dim, ratio, scale, 1);
+}
+
+
+
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
         const pulsar_gpu_tensor *scores,

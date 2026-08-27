@@ -289,7 +289,11 @@ int pulsar_gpu_indexer_score_one_tensor(
  * stride only).  NULL/NULL/0/1 = classic single-cache behavior bit-exactly.
  * Banked multi-token rows run the generic kernel (the WMMA tier stays
  * single-bank); banked n_tokens==1 keeps the direct-one fast tier so the
- * scan is bit-identical to classic single-token decode. */
+ * scan is bit-identical to classic single-token decode.
+ * L121: the engine now splits banked multi-token spans into same-bank
+ * consecutive-position runs and feeds each through the run entry below
+ * (block-scaled MXFP4 tier); this generic path remains the fallback for
+ * non-conforming spans. */
 int pulsar_gpu_indexer_scores_decode_batch_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -307,6 +311,29 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         const pulsar_gpu_tensor *index_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks);
+
+/* L121: score ONE same-bank consecutive-position run of a banked decode span
+ * through the block-scaled MXFP4 tier.  All tensor views are positioned at
+ * the run's first row; bank_index_comp is that bank's own comp slab view.
+ * n_comp is the scores stride / scan bound (step-top superset), not the
+ * bank's frontier -- the tier's position-derived causal mask bounds every
+ * comp read at (run_pos0+run_n)/ratio and writes -INF into the masked tail
+ * of each scores row.  Reassociation-class vs the generic kernel (MMA
+ * accumulation): NOT bit-identical, same fidelity class the non-banked
+ * prefill spans already ship (suite-v1 KL + top-k overlap evidence).
+ * Requires n_head == 64, head_dim == 128.  Returns 0 on refusal/failure. */
+int pulsar_gpu_indexer_scores_decode_run_tensor(
+        pulsar_gpu_tensor       *scores,
+        const pulsar_gpu_tensor *q,
+        const pulsar_gpu_tensor *weights,
+        const pulsar_gpu_tensor *bank_index_comp,
+        uint32_t                n_comp,
+        uint32_t                run_n,
+        uint32_t                run_pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
 
 /* Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
  * natively?  When it does, the engine hands it the packed cache directly and

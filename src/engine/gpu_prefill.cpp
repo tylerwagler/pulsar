@@ -510,21 +510,69 @@ static bool gpu_graph_indexed_attention_span(
     if (ok && stage_profile && pre_boundary) {
         ok = gpu_graph_indexer_stage_profile_boundary(NULL, il, spos0, sn, n_comp, stage_t0);
     }
-    if (ok) ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                              iq_view,
-                                                              iw_view,
-                                                              op->index_src,
-                                                              n_comp,
-                                                              sn,
-                                                              spos0,
-                                                              PULSAR_N_INDEXER_HEAD,
-                                                              PULSAR_N_INDEXER_HEAD_DIM,
-                                                              ratio,
-                                                              index_scale,
-                                                              sp_view, ss_view,
-                                                              op->index_bases,
-                                                              op->comp_cap,
-                                                              op->n_banks) != 0;
+    /* L121: banked multi-row spans used to run the generic per-(comp,row)
+     * score kernel -- rows x depth-linear, 26 ms/layer at depth 24.5k vs the
+     * 0.2 ms indexed attention it feeds, the 6x deep-decode regression of the
+     * unified lane.  A serving span is per-bank contiguous runs of
+     * consecutive positions (step_begin's contiguity guarantee), so each run
+     * is shape-identical to the classic non-banked case: score it through the
+     * block-scaled MXFP4 tier against the bank's own comp slab.  Any span
+     * that violates the run shape falls back to the generic descriptor
+     * launcher wholesale; single-row spans keep the direct-one tier
+     * (bit-identical to classic single-token decode). */
+    bool span_runs_conform = op->mseq && sn > 1u;
+    for (uint32_t t = 1; span_runs_conform && t < sn; t++) {
+        const uint32_t a = s0 + t;
+        if (g->ms_seq_id[a] == g->ms_seq_id[a - 1u] &&
+            g->ms_positions[a] != g->ms_positions[a - 1u] + 1)
+            span_runs_conform = false;
+    }
+    if (ok && span_runs_conform) {
+        for (uint32_t r0 = 0; ok && r0 < sn; ) {
+            uint32_t rn = 1;
+            while (r0 + rn < sn &&
+                   g->ms_seq_id[s0 + r0 + rn] == g->ms_seq_id[s0 + r0]) rn++;
+            const uint32_t bank  = (uint32_t)g->ms_seq_id[s0 + r0];
+            const uint32_t rpos0 = (uint32_t)g->ms_positions[s0 + r0];
+            pulsar_gpu_tensor *rq = pulsar_gpu_tensor_view(g->batch_indexer_qp,
+                    (uint64_t)(s0 + r0) * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES,
+                    (uint64_t)rn * PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES);
+            pulsar_gpu_tensor *rw = pulsar_gpu_tensor_view(g->batch_indexer_weights,
+                    (uint64_t)(s0 + r0) * PULSAR_N_INDEXER_HEAD * sizeof(float),
+                    (uint64_t)rn * PULSAR_N_INDEXER_HEAD * sizeof(float));
+            pulsar_gpu_tensor *rs = pulsar_gpu_tensor_view(g->indexer_scores,
+                    (uint64_t)r0 * n_comp * sizeof(float),
+                    (uint64_t)rn * n_comp * sizeof(float));
+            pulsar_gpu_tensor *rb = gpu_graph_bank_index_comp_view(g, il, bank);
+            ok = rq && rw && rs && rb &&
+                 pulsar_gpu_indexer_scores_decode_run_tensor(rs, rq, rw, rb,
+                        n_comp, rn, rpos0,
+                        PULSAR_N_INDEXER_HEAD,
+                        PULSAR_N_INDEXER_HEAD_DIM,
+                        ratio, index_scale) != 0;
+            pulsar_gpu_tensor_free(rb);
+            pulsar_gpu_tensor_free(rs);
+            pulsar_gpu_tensor_free(rw);
+            pulsar_gpu_tensor_free(rq);
+            r0 += rn;
+        }
+    } else if (ok) {
+        ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
+                                                          iq_view,
+                                                          iw_view,
+                                                          op->index_src,
+                                                          n_comp,
+                                                          sn,
+                                                          spos0,
+                                                          PULSAR_N_INDEXER_HEAD,
+                                                          PULSAR_N_INDEXER_HEAD_DIM,
+                                                          ratio,
+                                                          index_scale,
+                                                          sp_view, ss_view,
+                                                          op->index_bases,
+                                                          op->comp_cap,
+                                                          op->n_banks) != 0;
+    }
     if (ok && stage_profile) {
         ok = gpu_graph_indexer_stage_profile_boundary("score", il, spos0, sn, n_comp, stage_t0);
     }
