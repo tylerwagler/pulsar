@@ -175,8 +175,12 @@ static void verify_row(pulsar_attn_comp_fmt fmt, const float *src,
             gcode = gr[d];
             const float q = s > 0.0f ? (float)((double)src[d] / (double)s) : 0.0f;
             const float c = fminf(448.0f, fmaxf(-448.0f, q));
-            expect = c >= 0.0f ? ref_e4m3_encode_pos(c)
-                               : (uint8_t)(0x80u | ref_e4m3_encode_pos(-c));
+            /* signbit, not c >= 0: the hardware cvt encodes -0.0f as 0x80
+             * (negative zero) and `-0 >= 0` is true -- first run of this gate
+             * flagged exactly that as 16 "nonadjacent" mismatches.  A sign-
+             * preserved zero byte decodes to -0 and changes nothing numeric. */
+            expect = signbit(c) ? (uint8_t)(0x80u | ref_e4m3_encode_pos(fabsf(c)))
+                                : ref_e4m3_encode_pos(c);
             const float mag = ref_e4m3_value(gcode & 0x7fu);
             wb_expect = ((gcode & 0x80u) ? -mag : mag) * s;
             if (gcode != expect) {
