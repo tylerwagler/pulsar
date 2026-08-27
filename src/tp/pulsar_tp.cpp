@@ -340,6 +340,11 @@ typedef struct {
 #define PULSAR_TP_RDMA_RECV_WINDOW 16
 #define PULSAR_TP_RDMA_BULK_SLOTS 64
 #define PULSAR_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+/* TCP fallback write/read round: small enough that two simultaneous rounds can
+ * never fill both send buffers under ANY kernel socket-buffer clamp (the pair
+ * hosts clamp SO_SNDBUF to net.core.wmem_max ~212K; a 2 MiB round there meant
+ * both sides blocked writing with full recv-queues). */
+#define PULSAR_TP_TCP_ROUND (64ull * 1024ull)
 
 typedef struct {
     pulsar_tp_verbs_api api;
@@ -443,8 +448,12 @@ static void tp_socket_tune(int fd) {
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     /* Gate exchanges are latency-critical 16KB messages; large socket
-     * buffers only matter for the TCP fallback's pipelining. */
+     * buffers only matter for the TCP fallback's pipelining.  The kernel
+     * clamps these to net.core.wmem_max anyway.  PULSAR_TP_TEST_TINY_BUFFERS
+     * hammers the fallback's write/read-round protocol against the smallest
+     * practical buffers (test-only; validates the no-symmetric-write rule). */
     int sz = 4 * 1024 * 1024;
+    if (getenv("PULSAR_TP_TEST_TINY_BUFFERS")) sz = 32 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
@@ -1626,27 +1635,12 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
                 tp->slab + batch_in,
                 bytes);
     }
-    struct iovec iov[2] = {
-        { &h, sizeof(h) },
-        { tp->slab + batch_out, bytes },
-    };
-    size_t want = sizeof(h) + bytes;
-    ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0) return 0;
-    if ((size_t)w != want) {
-        size_t done = (size_t)w;
-        if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, reinterpret_cast<char *>(&h) + done,
-                               sizeof(h) - done))
-                return 0;
-            done = sizeof(h);
-        }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + batch_out + payload_done,
-                           bytes - payload_done))
-            return 0;
-    }
+    /* TCP fallback: header first, then alternate small write/read rounds.  A
+     * single 2 MiB writev round deadlocked on the pair hosts: the kernel clamps
+     * SO_SNDBUF to net.core.wmem_max (~212K there), so both sides filled their
+     * send buffers before either side drained (recv-queue ~457K stuck both
+     * ways).  Rounds of PULSAR_TP_TCP_ROUND are safe under any sane clamp. */
+    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
@@ -1658,14 +1652,22 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
                 layer, rows, (unsigned long long)seq);
         return 0;
     }
-    return tp_read_full(tp->data_fd, tp->slab + batch_in, bytes);
+    uint64_t off = 0;
+    while (off < bytes) {
+        const uint64_t n = bytes - off > PULSAR_TP_TCP_ROUND ?
+                           PULSAR_TP_TCP_ROUND : bytes - off;
+        if (!tp_write_full(tp->data_fd, tp->slab + batch_out + off, n)) return 0;
+        if (!tp_read_full(tp->data_fd, tp->slab + batch_in + off, n)) return 0;
+        off += n;
+    }
+    return 1;
 }
 
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
- * The fallback alternates 2MB TCP write/read rounds in the same order, so
- * neither side can fill its send buffer while the peer is also only writing
- * (the 4MB socket buffers absorb one round). */
-#define PULSAR_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
+ * The TCP fallback alternates small write/read rounds so neither side can fill
+ * its send buffer while the peer is also only writing, under ANY kernel
+ * socket-buffer clamp (the former 2 MiB rounds deadlocked on the pair hosts
+ * where net.core.wmem_max ~212K; see pulsar_tp_batch_gate_exchange). */
 
 int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
                                 const void *out, void *in, uint64_t bytes) {
@@ -1688,8 +1690,8 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     }
     uint64_t off = 0;
     while (off < bytes) {
-        const uint64_t n = bytes - off > PULSAR_TP_BIG_CHUNK ?
-                           PULSAR_TP_BIG_CHUNK : bytes - off;
+        const uint64_t n = bytes - off > PULSAR_TP_TCP_ROUND ?
+                           PULSAR_TP_TCP_ROUND : bytes - off;
         if (!tp_write_full(tp->data_fd, static_cast<const char *>(out) + off, n)) return 0;
         if (!tp_read_full(tp->data_fd, static_cast<char *>(in) + off, n)) return 0;
         off += n;

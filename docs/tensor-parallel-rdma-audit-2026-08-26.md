@@ -70,7 +70,19 @@ The recv watermark + in-slot reuse across tokens assumes in-order QP
 completions (sound for RC/UC). The pair stress pass should run the remote
 harness at a high gate count and confirm the watermark never regresses.
 
+### F9 — [HIGH, FOUND + FIXED during the Spark compile check] symmetric-write deadlock
+The 3 MiB big-gate (and the 8-row batch) used 2 MiB write-then-read rounds on
+the TCP fallback. On the pair hosts, `net.core.wmem_max` clamps our 4 MB
+`SO_SNDBUF` request to ~212 KB (effective ~425 KB), so both ends filled their
+send buffers while each was also writing — recv-queue stuck at ~457 KB both
+ways, both ranks blocked in `write`. Deadlock reproduced on the Spark (the
+dev box's large buffers masked it; transport test hung at "connected").
+**Fix:** the TCP fallback now does header-first + alternating `PULSAR_TP_TCP_ROUND`
+(64 KiB) write/read rounds for both batch and big gates — safe under any sane
+buffer clamp — plus a test-only `PULSAR_TP_TEST_TINY_BUFFERS` knob that
+reproduces the clamped condition. Verified on the Spark: all three host tests
+green, tiny-buffer runs green. (The gate path was already 16 KiB — unaffected.)
+
 ## Disposition
-FIXED: F1, F2 (host-compiled; runtime to confirm on the pair).
-RUNBOOK: F3 (+ runbook step 3 pinning).
-NOTE/LATER: F4, F5, F6. VERIFIED: F7. CONFIRM-ON-PAIR: F8.
+FIXED: F1, F2, F9. RUNBOOK: F3. NOTE/LATER: F4, F5, F6. VERIFIED: F7.
+CONFIRM-ON-PAIR: F8.
