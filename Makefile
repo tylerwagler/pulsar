@@ -625,7 +625,7 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
-PREFILL_BASELINE_REF ?= dd5c97c
+PREFILL_BASELINE_REF ?= 50cf215
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
