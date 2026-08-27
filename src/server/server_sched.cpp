@@ -2398,14 +2398,12 @@ void *worker_main(void *arg) {
             continue;
         }
 
-        /* Tier-2 three-way lane (§5). Gather steady-state batchable decode slots.
-         * n_batched > 0 means a batch is already in flight — those slots stay
-         * batched until they finish (no mid-conversation batched->classic switch,
-         * which would need stale-logits reconciliation). The batched lane engages
-         * when the batchable decode count exceeds spec_max_live, OR whenever a
-         * batch is already active. Otherwise the classic per-slot round-robin
-         * runs unchanged: n_active==1 -> spec (N=1 byte-identical), n<=spec_max_live
-         * -> spec time-slice. Env PULSAR_SERVER_SPEC_MAX_LIVE tunes the crossover. */
+        /* Gather steady-state batchable decode slots. n_batched > 0 means a
+         * plain batch is already in flight — those slots stay on the plain
+         * lane until they finish (no mid-conversation lane switch, which
+         * would need stale-logits reconciliation). L118: every decode slot is
+         * batchable and every n >= 1 arms a batched quantum; the Tier-2
+         * three-way lane that lived here is deleted. */
         session_slot *dec[PULSAR_SESSION_POOL_CAP];
         int n_dec = 0, n_batched = 0;
         if (s->pool_banks > 0) {
@@ -2426,13 +2424,12 @@ void *worker_main(void *arg) {
          * redraft respects the latch, so its pendings stay empty -- correct
          * output, base-token rounds, only the per-row capture as overhead. */
         /* L118 (everything is a batch): the batched quanta run at EVERY
-         * n_dec >= 1 — a solo session is a batch of one. The old three-way
-         * arming (classic per-slot decode below the spec_max_live crossover)
-         * survives only behind the PULSAR_CLASSIC_DECODE diagnostic hatch for
-         * A/B, and dies with the classic lane in P4 (plan 118). */
-        const int spec_arm_min = s->classic_decode_lane ? 2 : 1;
+         * n_dec >= 1 — a solo session is a batch of one. The classic per-slot
+         * decode lane, its A/B hatch, and the spec_max_live crossover are
+         * DELETED (P4; parity evidence in rows/L118.md). Spec-batched when
+         * every decoder can speculate, plain-batched otherwise. */
         bool all_spec = pulsar_engine_has_dspark(s->engine) &&
-                        n_dec >= spec_arm_min && n_batched == 0;
+                        n_dec >= 1 && n_batched == 0;
         for (int i = 0; all_spec && i < n_dec; i++) {
             gen_state *dg = dec[i]->gen;
             if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
@@ -2440,8 +2437,7 @@ void *worker_main(void *arg) {
         }
         const bool use_spec_batched = s->pool_banks > 0 && all_spec;
         const bool use_batched = use_spec_batched ||
-            (s->pool_banks > 0 && n_dec >= 1 &&
-             (!s->classic_decode_lane || n_dec > s->spec_max_live || n_batched > 0));
+            (s->pool_banks > 0 && n_dec >= 1);
 
         /* Record the lane for /metrics. Only the spec lane runs the fused verify
          * loop, so this is what tells a scraper whether the spec_decode_*
@@ -2513,7 +2509,10 @@ void *worker_main(void *arg) {
         }
         if (!sl) continue; /* unreachable: n_active > 0 */
 
-        const bool sl_was_decode = sl->gen && sl->gen->phase == GEN_DECODE;
+        /* L118: this fall-through only runs when NO decode slot exists
+         * (any GEN_DECODE slot arms use_batched above), so it services
+         * prefill/init/finish slots only. The L112 paired-decode mirror
+         * that lived here is deleted with the classic lane. */
         if (sl->gen && sl->gen->phase != GEN_DONE) {
             s->generate_job_step(sl);
             if (sl->gen) slot_writer_flush(&sl->gen->writer);
@@ -2521,31 +2520,6 @@ void *worker_main(void *arg) {
         }
         if (!sl->gen || sl->gen->phase == GEN_DONE) {
             s->worker_finish_slot(sl);
-        }
-        /* L112: paired decode quantum. In this classic branch a lone decoder
-         * (n_dec <= spec_max_live keeps it off the batched lane) got ONE
-         * quantum per full round-robin cycle -- behind three 4096-token
-         * prefill chunks that is one decode turn per ~12 s, which reads as
-         * "decode waits for all prefills" on a monitor (observed on
-         * pulsar-tui during the 2026-08-25 v0.5.0 perf pass). The batched
-         * branch already pairs its decode sweep with one prefill advance per
-         * pass; mirror it here: whenever the advanced slot was NOT decoding,
-         * also give one decode-phase slot its quantum. Identical
-         * generate_job_step the slot would get on its own turn -- scheduling
-         * order only, no numerics. */
-        if (!sl_was_decode) {
-            for (int k = 0; k < s->n_slots; k++) {
-                session_slot *c = &s->slots[k];
-                if (c != sl && c->active_job && c->gen &&
-                    c->gen->phase == GEN_DECODE) {
-                    s->generate_job_step(c);
-                    if (c->gen) slot_writer_flush(&c->gen->writer);
-                    c->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
-                    if (!c->gen || c->gen->phase == GEN_DONE)
-                        s->worker_finish_slot(c);
-                    break;
-                }
-            }
         }
         s->publish_metrics_snapshot(); /* /metrics: once per quantum */
     }

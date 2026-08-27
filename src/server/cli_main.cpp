@@ -908,31 +908,11 @@ int main(int argc, char **argv) {
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
     s.live_bank = 0;
-    /* Three-way scheduler knob (worker_main): decode banks <= spec_max_live run
-     * the per-bank spec/plain time-slice lane; more than that batch. DATA-SET
-     * from the multiseq gate on THIS v5mx build (2026-07-18, PULSAR_MSEQ_BANKS=3,
-     * 512 tok/session, engine-level): batched N=1/2/3 = 16.2/22.85/27.92 t/s
-     * aggregate vs spec-time-slice 16.88/16.86/16.65. v5mx's ~55-62% spec accept
-     * means time-slicing yields no aggregate gain past N=1, so batching wins from
-     * N=2 (+36% at N=2). The crossover is therefore at 1, NOT the plan's stale
-     * §2.2 "3" (that was the 86%-accept compact model). Default 1 = spec only
-     * when alone (N=1 byte-identical), batch at N>=2. Env PULSAR_SERVER_SPEC_MAX_LIVE
-     * retunes without a rebuild (e.g. =2 to force spec through N=2). */
-    {
-        const char *sm = getenv("PULSAR_SERVER_SPEC_MAX_LIVE");
-        int v = sm ? atoi(sm) : 1;
-        if (v < 1) v = 1;
-        if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
-        s.spec_max_live = v;
-    }
-    /* L118: everything is a batch — decode runs through the batched quanta at
-     * every n >= 1 by default. PULSAR_CLASSIC_DECODE=1 restores the old
-     * three-way arming for A/B (diagnostic escape hatch; removed with the
-     * classic lane once the unified scheduler's parity evidence is complete). */
-    s.classic_decode_lane = getenv("PULSAR_CLASSIC_DECODE") != NULL;
-    if (s.classic_decode_lane)
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: CLASSIC decode lane forced (PULSAR_CLASSIC_DECODE; diagnostic)");
+    /* L118 (everything is a batch): the three-way scheduler, its
+     * spec_max_live crossover knob (PULSAR_SERVER_SPEC_MAX_LIVE), and the
+     * PULSAR_CLASSIC_DECODE A/B hatch are DELETED — decode runs through the
+     * batched quanta at every n >= 1, a solo session being a batch of one.
+     * Parity evidence: pulsar-notes rows/L118.md. */
     /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF (OPT-IN via
      * PULSAR_MIXED_BATCH=1). It is a workload-dependent TRADE, not a safe blanket
      * default — three measured regimes:
@@ -1027,9 +1007,9 @@ int main(int argc, char **argv) {
         s.kv_committed_bytes = 0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 shared pool ACTIVE: %d banks, "
-                   "spec_max_live=%d, per-bank marginal %.2f GiB "
+                   "unified batch decode (L118), per-bank marginal %.2f GiB "
                    "(pool resident actual %.2f GiB)",
-                   pool_banks, s.spec_max_live,
+                   pool_banks,
                    (double)s.bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
                    (double)session_actual / (1024.0 * 1024.0 * 1024.0));
     } else {

@@ -1296,7 +1296,7 @@ void server::gen_decode_init(session_slot *sl) {
  * client sent explicitly is respected as-is. That includes an explicit
  * temperature==0, which selects greedy decode so DSpark speculative decode
  * (greedy-only) can engage. Tool-call payload forcing (temperature=0 while
- * decoding structured tool output, in gen_step_decode) is a separate,
+ * decoding structured tool output, in gen_resolve_sampling_decode) is a separate,
  * deliberate override applied on top of this. */
 void gen_resolve_sampling(const request *req, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
@@ -1342,7 +1342,7 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
  * loop must STOP after this token (EOS, a stop string, a completed tool_calls
  * block, or a client write error), with g->finish (and g->err on error) set.
  *
- * Factored out of gen_step_decode's per-token inner loop (plan Tier-2 Step 5)
+ * Factored out of the classic decode loop's per-token inner loop (Tier-2 Step 5)
  * so every driver shares ONE emit path: the classic spec/plain decode loop
  * below AND the batched multi-session lanes (which sample each live bank's
  * row on the host, then call this to stream that bank's slot). It touches
@@ -1550,121 +1550,16 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 
 
-/* One decode quantum: run the sampling loop for at most
- * PULSAR_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
- * state parked in gen_state. The session is untouched between quanta, so
- * resuming is exactly the next iteration of the old run-to-completion loop. */
-void server::gen_step_decode(session_slot *sl) {
-    auto *s = this;
-    gen_state *g = sl->gen;
-    job *j = g->j;
-    const int quantum_start = g->completion;
-    bool stop_decode = false;
-
-    /* Once per quantum (~1/s): stop generating for a client that has gone away.
-     * Falls through the normal GEN_FINISH epilogue so the slot, KV checkpoint and
-     * metrics are released exactly as on a natural stop; the final write simply
-     * fails harmlessly on the dead fd. */
-    if (gen_client_disconnected(j->fd)) {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: client disconnected, abandoning generation after %d tokens",
-                   g->completion);
-        g->phase = GEN_FINISH;
-        return;
-    }
-
-    while (!g_stop_requested && g->completion < g->max_tokens &&
-           pulsar_session_pos(s->sess) < pulsar_session_ctx(s->sess)) {
-        if (g->completion - quantum_start >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
-            sl->tokens_emitted += (uint64_t)(g->completion - quantum_start);
-            return; /* quantum exhausted; phase stays GEN_DECODE */
-        }
-        dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
-            g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
-        const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (g->saw_tool_start || in_tool_call))) {
-            s->kv_cache_maybe_store_continued(sl);
-        }
-        float temperature, top_p, min_p;
-        int top_k;
-        gen_resolve_sampling_decode(g, &temperature, &top_k, &top_p, &min_p);
-        int token;
-        int toks[17];
-        int ntok = 0;
-        if (pulsar_engine_has_dspark(s->engine) && g->dspark_spec_enabled) {
-            /* the speculative block owns sampling (exact sampled acceptance at
-             * any temperature; greedy degenerates to the argmax rule) */
-            ntok = pulsar_session_generate_speculative(s->sess,
-                                                    temperature, top_k, top_p, min_p,
-                                                    &g->rng,
-                                                    g->max_tokens - g->completion,
-                                                    pulsar_token_eos(s->engine),
-                                                    toks,
-                                                    (int)(sizeof(toks) / sizeof(toks[0])),
-                                                    g->err,
-                                                    sizeof(g->err));
-            if (ntok < 0) {
-                g->finish = "error";
-                break;
-            }
-        } else {
-            token = pulsar_session_sample(s->sess, temperature, top_k, top_p, min_p, &g->rng);
-            if (token == pulsar_token_eos(s->engine)) {
-                g->finish = "stop";
-                break;
-            }
-            /* Before the eval: pulsar_session_eval advances the session and
-             * overwrites the very logits this token was drawn from. */
-            logprob_capture_session(&g->logprobs, s->sess, token);
-            if (pulsar_session_eval(s->sess, token, g->err, sizeof(g->err)) != 0) {
-                g->finish = "error";
-                break;
-            }
-            toks[0] = token;
-            ntok = 1;
-        }
-
-        /* TTFT: stamp the moment the first output token is available. One guarded
-         * clock read for the whole request (branch is predictably not-taken after
-         * the first token), so no meaningful decode-loop overhead. */
-        if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
-
-        int emitted = 0;
-        for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            const bool stop = s->gen_emit_token(sl, toks[ti]);
-            emitted = ti + 1;
-            if (stop) {
-                stop_decode = true;
-                break;
-            }
-        }
-        /* A speculative block can end mid-block two ways — a stop inside the
-         * block (tool-call end, stop string) or the length cap exhausting
-         * g->max_tokens partway through — and both leave toks[emitted..ntok)
-         * committed to the bank's history but never emitted. Leaving them
-         * makes the live KV frontier disagree with every client-visible
-         * byte: the thinking-tool checkpoint binds on exactly that identity
-         * and the next turn would continue over ghost tokens. REWIND exactly
-         * the ghost tail, keeping the live KV for everything the client saw.
-         * The stop case used to invalidate the WHOLE session (a near-coin-
-         * flip full re-prefill per agentic turn; root-caused 2026-08-19 from
-         * the live trace: remember live=0 -> no-live-checkpoint ->
-         * 19,886-token rebuild), and the length case had NO handling at all. */
-        if (emitted < ntok) {
-            const int ghost = ntok - emitted;
-            const int target = pulsar_session_pos(s->sess) - ghost;
-            pulsar_session_rewind(s->sess, target);
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: spec block ended mid-block (%s): "
-                       "rewound %d ghost tokens to pos %d",
-                       stop_decode ? "stop" : "length cap", ghost, target);
-        }
-        if (stop_decode) break;
-    }
-
-    sl->tokens_emitted += (uint64_t)(g->completion - quantum_start);
-    g->phase = GEN_FINISH;
-}
+/* L118 tombstone (2026-08-26): the classic per-slot decode loop
+ * (gen_step_decode) lived here. Deleted: every GEN_DECODE slot is serviced
+ * by the batched quanta at n >= 1 (worker_spec_batched_quantum /
+ * worker_batched_decode_quantum / worker_mixed_batch_quantum), a solo
+ * session being a batch of one. Parity evidence: rows/L118.md (solo 6x6
+ * A/B unified median 19.32 vs classic 18.95 t/s; decode-floor/sse/coherence
+ * green on the unified lane; disconnect + continued-store + accounting
+ * ported). The engine-level classic API (pulsar_session_eval /
+ * generate_speculative) is unaffected — pulsar-bench/eval/agent and the
+ * gate fixtures still drive it. */
 
 
 
@@ -2279,13 +2174,13 @@ void server::generate_job_step(session_slot *sl) {
     case GEN_DECODE_INIT:
         sl->state = SLOT_DECODING;
         s->gen_decode_init(sl);
-        if (g->phase != GEN_DECODE) break;
-        /* fall through into the first decode quantum */
-        s->gen_step_decode(sl);
+        /* L118: GEN_DECODE is serviced exclusively by the batched quanta —
+         * the worker's next pass gathers this slot into the batch (a solo
+         * session is a batch of one). The classic per-slot decode loop and
+         * its first-quantum fall-through are deleted; plan 118. */
         break;
     case GEN_DECODE:
         sl->state = SLOT_DECODING;
-        s->gen_step_decode(sl);
         break;
     case GEN_FINISH:
         s->gen_step_finish(sl);

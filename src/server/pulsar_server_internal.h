@@ -1074,19 +1074,11 @@ struct server {
      * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
      * currently installed on that session (server_bank_switch lazily saves the
-     * old and restores the new). `spec_max_live` is the three-way scheduler knob
-     * (generate.cpp worker_main): n_active decode banks <= spec_max_live take the
-     * per-bank spec/plain time-slice lane, n_active > spec_max_live take the
-     * batched multiseq lane. 0 in classic mode. */
+     * old and restores the new). L118: the three-way scheduler's spec_max_live
+     * knob and the classic decode lane are deleted — decode runs through the
+     * batched quanta at every n >= 1. */
     int          pool_banks;
     int          live_bank;
-    int          spec_max_live;
-    /* L118 escape hatch (DIAGNOSTIC, dies with the classic lane in P4): when
-     * true, restore the pre-unification three-way arming (classic per-slot
-     * decode below the spec_max_live crossover) for A/B against the unified
-     * everything-is-a-batch scheduler. Env PULSAR_CLASSIC_DECODE=1, read once
-     * at startup. */
-    bool         classic_decode_lane;
     /* plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step
@@ -1282,7 +1274,6 @@ struct server {
     void gen_stream_begin(session_slot *sl);
     void gen_decode_init(session_slot *sl);
     bool gen_emit_token(session_slot *sl, int token);
-    void gen_step_decode(session_slot *sl);
     void gen_step_finish(session_slot *sl);
     void gen_state_free(session_slot *sl);
     void generate_job_begin(session_slot *sl, job *j);
