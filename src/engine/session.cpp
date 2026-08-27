@@ -1261,6 +1261,31 @@ void pulsar_session::rewind(int pos) {
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
+    /* L120: reconcile the compressor frontiers with the rewound position.
+     * Stage B's rollforward assigns layer_n_comp/layer_n_index_comp
+     * ABSOLUTELY at the round's committed frontier (gpu_prefill.cpp,
+     * gpu_graph_dspark_compressor_rollforward), and 6de76e3 replaced the
+     * full-session invalidate -- which rebuilt these -- with this rewind,
+     * which left them untouched.  Classic decode self-heals: the next
+     * boundary emit reassigns the counters before anything validates.  The
+     * batched lane does not: it captures the bank frontier (bank_state_save)
+     * and position-true-checks it at the next admission INSIDE the stale
+     * window, so a ghost tail that crossed a ratio boundary left n_comp one
+     * ahead -> hard bank reject (L120, first fired on production
+     * 2026-08-27).  Clamp DOWN only -- a counter can only be AHEAD of a
+     * rewound position, and a lagging one (mid-admission prefill) must never
+     * be raised here.  Cache rows beyond the clamp are invisible (readers
+     * cap at n_comp) and are re-emitted on the next boundary cross; the
+     * per-group compressor state ring re-fills from the replayed positions
+     * before the next emit reads it. */
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t want = (uint32_t)pos / ratio;
+        if (s->graph.layer_n_comp[il] > want) s->graph.layer_n_comp[il] = want;
+        if (ratio == 4 && s->graph.layer_n_index_comp[il] > want)
+            s->graph.layer_n_index_comp[il] = want;
+    }
 }
 
 
