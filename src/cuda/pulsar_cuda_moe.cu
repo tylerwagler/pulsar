@@ -1807,9 +1807,19 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
          * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
          * sibling caps in pulsar_cuda_matmul.cu were tried alongside this and are NOT
-         * bit-exact -- they stay at 4; do not re-couple them to this one. */
+         * bit-exact -- they stay at 4; do not re-couple them to this one.
+         * L117 2026-08-26: floor lowered 2 -> 1. The >=2 floor predated any
+         * M=1 caller (classic decode owns single-token MoE elsewhere), but the
+         * batched lanes DO reach here with one row — a lane-2 group that
+         * shrinks to one slot, a 1-bank quenched spec round, and the row-cost
+         * probe — and fell onto the grouped-CUTLASS prefill machinery
+         * (pack + 3 grouped GEMMs + gather + f32 swiglu per type-40 layer,
+         * ~25-30 ms/sweep of fixed cost for one token; nsys diff in
+         * pulsar-notes rows/L117.md). GEMV vs grouped was byte-identical at
+         * widths 6/8 (above); M=1 verified the same way (probe logits hash,
+         * see the row). */
         const uint32_t moe_gemv_cap = 8u;
-        if (n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
+        if (n_tokens >= 1u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
             mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
@@ -1864,7 +1874,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * fallback, so it is deliberately NOT flagged here. */
         {
             static int gemv_batch_logged = 0;
-            if (n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
+            if (n_tokens >= 1u && n_tokens <= 4u && !gemv_batch_logged) {
                 gemv_batch_logged = 1;
                 fprintf(stderr,
                         "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
