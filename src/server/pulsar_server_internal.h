@@ -1518,9 +1518,17 @@ struct gen_state {
     int next_tool_progress;
     int next_decode_log;
     double decode_t0;
-    pulsar_spec_metrics spec_start; /* per-session DSpark counters snapshotted at
-                                  * decode start; diffed at finish for this
-                                  * request's accept-rate/tokens-per-step */
+    /* L119: request-scoped DSpark counters, accumulated by the spec-batched
+     * lane per round (the ONLY decode lane that speculates post-L118). The
+     * old design diffed the SHARED pool session's cumulative counters, which
+     * per-round bank save/restore rolls and concurrent banks mix — the
+     * response reported impossible values (tokens/step 27.4). Filled where
+     * the truth lives: the lane knows each round's drafted rows and
+     * committed tokens for exactly this slot. */
+    uint64_t req_spec_draft;    /* draft tokens proposed+verified, this request */
+    uint64_t req_spec_accepted; /* draft tokens accepted, this request */
+    uint64_t req_spec_rounds;   /* spec rounds (incl. base-only quenched), this request */
+    uint64_t req_spec_gen;      /* tokens emitted by spec rounds, this request */
     double last_decode_log_t;
     int last_decode_log_completion;
     thinking_state thinking;

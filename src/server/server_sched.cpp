@@ -1822,6 +1822,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
     int first_tok[PULSAR_SESSION_POOL_CAP];
     uint32_t row0s[PULSAR_SESSION_POOL_CAP];
+    int row_nb[PULSAR_SESSION_POOL_CAP];   /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
     pulsar_multiseq_req reqs[16];
     int accepted[17];
@@ -1976,6 +1977,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             const uint32_t nb = pulsar_spec_round_fill_reqs(rounds[i], sl->bank,
                                                          first, reqs + rows);
             row0s[m] = rows;
+            row_nb[m] = (int)nb;
             first_tok[m] = first;
             live_idx[m] = i;
             rows += nb;
@@ -2057,6 +2059,13 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             if (stopped) g->phase = GEN_FINISH;
             sl->committed_pos = pulsar_session_pos(pool);
             sl->tokens_emitted += (uint64_t)done;
+            /* L119: request-scoped DSpark accounting — the round's truth,
+             * accumulated here where it is unambiguous (row_nb = base+K rows
+             * this bank contributed; na = base + accepted drafts). */
+            g->req_spec_rounds++;
+            if (row_nb[q] > 1) g->req_spec_draft += (uint64_t)(row_nb[q] - 1);
+            if (na > 1) g->req_spec_accepted += (uint64_t)(na - 1);
+            g->req_spec_gen += (uint64_t)done;
             /* L118: continued disk-KV store — the classic loop's cadence,
              * ported to the one point where it is valid in this lane: the
              * bank is live (round-end bank_switch) and round_end + the ghost

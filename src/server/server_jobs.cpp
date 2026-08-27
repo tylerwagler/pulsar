@@ -1251,11 +1251,14 @@ void server::gen_decode_init(session_slot *sl) {
     if (g->max_tokens > room) g->max_tokens = room;
     s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
     g->decode_t0 = server_now_sec();
-    /* Snapshot the session's cumulative DSpark counters so gen_step_finish can
-     * diff them into this request's accept-rate/tokens-per-step. Re-snapshotting
-     * here (decode_again also lands here) keeps the diff consistent with the
-     * reset completion/decode_t0 for the attempt that actually finishes. */
-    pulsar_session_spec_metrics(s->sess, &g->spec_start);
+    /* L119: reset the request-scoped DSpark accumulators (decode_again also
+     * lands here, keeping them consistent with the reset completion/decode_t0
+     * for the attempt that actually finishes). The spec-batched lane fills
+     * them per round. */
+    g->req_spec_draft = 0;
+    g->req_spec_accepted = 0;
+    g->req_spec_rounds = 0;
+    g->req_spec_gen = 0;
     g->last_decode_log_t = g->decode_t0;
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
@@ -1837,13 +1840,14 @@ void server::gen_step_finish(session_slot *sl) {
         t->prompt_n = g->prompt_tokens;
         t->cached_n = j->req.cache_read_tokens;
         t->decode_n = g->completion_total + g->completion;
-        pulsar_spec_metrics spec_end;
-        pulsar_session_spec_metrics(s->sess, &spec_end);
-        t->spec_gen = spec_end.gen_tokens - g->spec_start.gen_tokens;
-        t->spec_accepted = spec_end.accepted_tokens - g->spec_start.accepted_tokens;
-        t->spec_draft = spec_end.draft_tokens - g->spec_start.draft_tokens;
-        t->spec_drafts = spec_end.num_drafts - g->spec_start.num_drafts;
-        t->spec_active = t->spec_gen > 0; /* the fused spec loop ran this request */
+        /* L119: request-scoped accumulators from the spec-batched lane — NOT
+         * shared-session counter deltas, which bank save/restore rolls and
+         * concurrent banks mix (the response reported impossible values). */
+        t->spec_gen = g->req_spec_gen;
+        t->spec_accepted = g->req_spec_accepted;
+        t->spec_draft = g->req_spec_draft;
+        t->spec_drafts = g->req_spec_rounds;
+        t->spec_active = t->spec_gen > 0; /* the spec lane ran this request */
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
