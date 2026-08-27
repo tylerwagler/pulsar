@@ -1240,18 +1240,11 @@ int main(int argc, char **argv) {
     }
 
     scrub_numerics_env();
-    /* The byte-exact and self-fidelity modes certify the E4M3-provable arm:
-     * their baselines are e4m3 bytes, and since the 2026-08-27 default flip
-     * the engine default is NVFP4 -- graded by --check-reference instead (the
-     * L045 f32/f16 split precedent: the provable arm keeps the byte gate, the
-     * default is graded against the source, and those are different
-     * contracts).  Pin, loudly. */
-    if (setenv("PULSAR_KV4", "e4m3", 1) != 0) {
-        fprintf(stderr, "PREFILL GATE FAIL: setenv(PULSAR_KV4=e4m3) failed\n");
-        return 2;
-    }
-    printf("PREFILL GATE: byte modes certify the E4M3 arm (PULSAR_KV4=e4m3 pinned; "
-           "the NVFP4 default is graded by cuda-reference-gate)\n");
+    /* No arm pin here: the scrub leaves the engine on its DEFAULT, which since
+     * the 2026-08-27 flip is the NVFP4 comp row -- and the byte baseline is
+     * anchored to a commit that runs the same default (Tyler: nv is the
+     * default and soon the only option, so the byte gate certifies IT).  The
+     * E4M3 opt-out remains reachable only through --kv4/--check-reference. */
     printf("prefill bit-exactness gate: this binary built from ref '%s'\n",
            PULSAR_GATE_BUILD_REF);
 
