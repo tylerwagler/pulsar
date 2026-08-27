@@ -1982,6 +1982,27 @@ static int attention_decode_batch_launch(
                 comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
                 "attention decode window launch");
     }
+    if (head_dim == 512u) {
+        /* L117 2026-08-26: n_tokens == 1 here (the n>1 branch above returned).
+         * The generic per-(row,head) kernel below re-walks every raw+comp row
+         * once PER HEAD (~27x byte roofline; measured 13.7 ms/sweep in the
+         * M=1 batch cell vs 3.2 ms at M=2 — nsys diff in pulsar-notes
+         * rows/L117.md). Classic solo decode has routed head_dim==512 to the
+         * heads8-online kernel BY DEFAULT since 2026-08-02
+         * (pulsar_gpu_attention_decode_heads_tensor above) — give the batched
+         * M=1 tail the same tier. Same reassociation class as that default
+         * (NOT bit-exact vs the generic kernel); M=1 batch output is excluded
+         * from the multiseq neutrality comparisons by construction. */
+        ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
+        return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
+                (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
+                n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
+                non_causal, n_tokens, pos0,
+                n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+                head_dim, positions_ptr, seq_id_ptr,
+                comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
+                "attention decode batch-1 online launch");
+    }
     ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
