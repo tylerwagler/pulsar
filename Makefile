@@ -186,7 +186,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
 
 all: help
 
@@ -340,6 +340,13 @@ seam-check:
 FRONTIER_MODEL ?= ./ds4flash.gguf
 cuda-frontier-gate: tests/multiseq_frontier_gate
 	PULSAR_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
+
+# L120 rewind position-truth gate: compressor frontier pair == pos/ratio
+# across ghost-tail rewinds and incremental continuations (see the header of
+# tests/rewind_frontier_gate.cpp).  MODEL-DEPENDENT — same discipline as the
+# frontier gate.
+cuda-rewind-gate: tests/rewind_frontier_gate
+	./tests/rewind_frontier_gate $(FRONTIER_MODEL)
 
 # Multiseq-vs-solo token-stream gate + first aggregate-throughput measurement
 # (see the header of tests/multiseq_decode_gate.c).  MODEL-DEPENDENT — run
@@ -815,7 +822,7 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-prefill-gate \
 	cuda-reference-gate \
-               cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
+               cuda-frontier-gate cuda-rewind-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
                cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide \
@@ -930,6 +937,9 @@ tests/kv4_pack_gate.o: tests/kv4_pack_gate.cpp src/pulsar_gpu.h
 tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.cpp
 
+tests/rewind_frontier_gate.o: tests/rewind_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/rewind_frontier_gate.cpp
+
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
@@ -1001,6 +1011,9 @@ tests/kv4_pack_gate: tests/kv4_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(M
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/rewind_frontier_gate: tests/rewind_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
