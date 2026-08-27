@@ -214,6 +214,20 @@ int main(int argc, char **argv) {
                         if (iter_hash)
                             printf("ITERHASH depth=%d B=%d R=%d it=%d h=%016llx\n",
                                    depth, B, R, it, ih);
+                        /* PROBE_DUMP_DIR: write each iteration's logits for
+                         * offline diffing between arms (dev diagnostic). */
+                        static const char *dump_dir = getenv("PROBE_DUMP_DIR");
+                        if (dump_dir) {
+                            char fp[512];
+                            snprintf(fp, sizeof fp, "%s/l_%d_%d_%d_%02d.bin",
+                                     dump_dir, depth, B, R, it);
+                            FILE *df = fopen(fp, "wb");
+                            if (df) {
+                                fwrite(logits, sizeof(float),
+                                       (size_t)rows * (size_t)vocab, df);
+                                fclose(df);
+                            }
+                        }
                     }
                 }
                 /* Reset the touched banks for the next cell: repoint +

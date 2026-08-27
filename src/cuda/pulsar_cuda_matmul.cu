@@ -845,7 +845,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  * buffers and from the output head's own scratch, so no later consumer can
  * present a matching key.  That is an aliasing accident, not an invariant --
  * see the decode audit's D3. */
-#define PULSAR_ACT_SLOTS 12   /* L119 diagnostic bump: 6 thrashed at decode (period-2 eviction) */
+#define PULSAR_ACT_SLOTS 6
 
 struct mxfp8_act_cache_t {
     const void    *key_ptr;      /* armed activation buffer (NULL = disarmed) */
