@@ -361,8 +361,8 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     }
     if (hdr[4] != (uint32_t)gpu_graph_attn_comp_cache_row_bytes()) {
         payload_set_err(err, errlen,
-                        "bank kv load: snapshot comp-row stride differs from the "
-                        "active PULSAR_KV4 format; refusing (re-prefill)");
+                        "bank kv load: snapshot row stride differs from this "
+                        "build's unified NVFP4 row; refusing (re-prefill)");
         return 1;
     }
     uint32_t comp_cnt[PULSAR_MAX_LAYER] = {0}, idx_cnt[PULSAR_MAX_LAYER] = {0};

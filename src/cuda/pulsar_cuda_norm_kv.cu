@@ -1326,6 +1326,20 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         bool              keep_f32) {
+    if (head_dim != 512u) {
+        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
+         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
+         * no caller passes anything else -- refuse rather than trust that
+         * (the standard the quantize_store entry already applies). */
+        return 0;
+    }
+    if (head_dim != 512u || n_rot != PULSAR_ATTN_PACK_NROT) {
+        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
+         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
+         * no caller passes anything else -- refuse rather than trust that
+         * (the standard the quantize_store entry already applies). */
+        return 0;
+    }
     if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
         raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -1407,7 +1421,7 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, co
     const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
     if (!raw_cache || !packed || raw_cap == 0 ||
         head_dim <= PULSAR_ATTN_PACK_NROT ||
-        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_FP8_KV_BLOCK) != 0 ||
+        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0 ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
         packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
     if (n_tokens == 0) return 1;
@@ -1422,6 +1436,13 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, co
 
 int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
+    if (head_dim != 512u) {
+        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
+         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
+         * no caller passes anything else -- refuse rather than trust that
+         * (the standard the quantize_store entry already applies). */
+        return 0;
+    }
     /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
      * is the whole bank pool (byte bound scales by n_banks) and the uint32
      * row ABI (seq*raw_cap + slot) must not overflow.  pos0 is ignored when

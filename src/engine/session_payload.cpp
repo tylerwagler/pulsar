@@ -279,9 +279,8 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
     /* Straight into the packed cache: the file holds exactly what it holds, so
      * there is no staging buffer and no re-encode on either side.  Under KV4
      * this is what makes save/load safe at all -- an FP4 re-encode misrounds
-     * ~33% of blocks, so the bytes ARE the values.  The header's rowbytes
-     * field (h[13]) refuses a file whose comp format differs from the
-     * process's active PULSAR_KV4. */
+     * ~33% of blocks, so the bytes ARE the values.  The version (v7) plus the
+     * h[13] stride refuse files from any earlier row format. */
     return payload_read_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
 }
@@ -477,8 +476,8 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         PULSAR_N_INDEXER_HEAD_DIM,
         PULSAR_N_VOCAB,
         raw_live,
-        /* the COMP pool's row stride (raw rows are E4M3 584 B by definition);
-         * under PULSAR_KV4 this is 368/384 and discriminates the format */
+        /* the row stride (one unified format; 384) -- with the payload
+         * version, refuses any earlier-format file */
         (uint32_t)gpu_graph_attn_comp_cache_row_bytes(),
         (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
     };

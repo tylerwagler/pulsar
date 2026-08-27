@@ -1,6 +1,6 @@
 /* L111 KV4 pack gate: the 4-bit comp-pool pack entry
- * (pulsar_gpu_attn_pack_quantize_store_tensor with comp_fmt mx/nv) against a
- * CPU transcription of the row contract.
+ * (pulsar_gpu_attn_pack_quantize_store_tensor; one unified NVFP4 row) against
+ * a CPU transcription of the row contract.
  *
  * WHAT IS EXACT AND WHAT IS TOLERANCED -- read this before trusting a run.
  * The engine builds with --use_fast_math, so the device's log2f and '/' are

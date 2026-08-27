@@ -820,9 +820,10 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
  * behind this seam, so neither side can name the other's constant.  They were
  * kept in step by a comment saying "must stay in sync", which is the same
  * enforcement mechanism that has failed twice in one day elsewhere in this tree.
- * The engine copies also hardcode the block sizes (64 for the attn row's E8M0
- * scales, 32 for the indexer's) where the backend uses PULSAR_FP8_KV_BLOCK and
- * PULSAR_MXKV_BLOCK, so changing a block size diverges them silently.
+ * The engine copies also hardcode the block sizes (16 for the attn row's E4M3
+ * scale codes, 32 for the indexer's) where the backend uses
+ * PULSAR_KV4_NV_BLOCK and PULSAR_MXKV_BLOCK, so changing a block size
+ * diverges them silently.
  *
  * These two entries let the engine ASK rather than assume; it does so once at
  * graph alloc and refuses to start on a mismatch.  A wrong row size is not a

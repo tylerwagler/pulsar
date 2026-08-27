@@ -37,8 +37,7 @@ __device__ static inline float raw_kv_ld(const pulsar_attn_pack_t *raw_kv, uint6
     return attn_comp_pack_ld(raw_kv, row, d, head_dim);
 }
 
-/* The c4-th group of four dims of `row`; packed rows are byte-addressed with a
- * per-64 scale, so the four come scalar. */
+/* The c4-th group of four dims of `row` (per-16 scale shared by the four). */
 __device__ static inline float4 raw_kv_ld4(const pulsar_attn_pack_t *raw_kv, uint64_t row,
                                            uint32_t c4, uint32_t head_dim) {
     const uint32_t d0 = c4 << 2;
@@ -50,26 +49,17 @@ __device__ static inline float4 raw_kv_ld4(const pulsar_attn_pack_t *raw_kv, uin
     return v;
 }
 
-/* THE COMP CACHE OPERAND IS PULSAR_ATTN_PACK ROWS.  Always -- there is no
- * format parameter any more.
+/* THE COMP CACHE OPERAND IS PULSAR_ATTN_PACK ROWS -- the same 384 B NVFP4
+ * row as every other KV buffer (layout in pulsar_cuda_internal.h).  The row
+ * is LOSSY vs the f32 pipeline (e2m1 nope under per-16 e4m3 scales; rope
+ * bf16 verbatim); what makes it shippable is the measured L111 verdict, not
+ * value preservation.
  *
- * A per-call comp_kv_pack flag chose between packed and f32 comp rows here,
- * threaded through every kernel and seam entry.  Its f32 arm became unreachable
- * when the last f32 shadow pool went (2026-08-17); it was removed 2026-08-18.
- * Worth recording why such a flag is not free: both formats are `const float *`,
- * so passing it wrong reads 384 B rows at a 2048 B stride -- out of bounds, NaN,
- * and a clean compile.  That already happened once, on the f16 prefill entry
- * that hard-coded 0.
- *
- * The row is
- * (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h): [n_nope e4m3][n_nope/64 E8M0]
- * [pad][n_rot bf16 rope].  Nope dims decode e4m3_value * 2^(e8-127) — exactly
- * the fp8_kv_quantize roundtrip value the f32 cache holds — and rope dims widen
- * from bf16, which is likewise exactly what the f32 cache holds since the pack
- * store roundtrips the rope tail in place, so scores/outputs are bit-identical
- * to the f32 comp cache.
- * The 2^(e8-127) scale is built as a float exponent; the pack amax floor
- * (1e-4 -> e8 >= 105) rules out byte 0. */
+ * A per-call comp_kv_pack flag once chose between packed and f32 comp rows
+ * here, and a CF template briefly chose between e4m3 and nv rows; both are
+ * gone -- one format, so one code path.  Worth recording why such a flag is
+ * not free: all these formats are pointer-compatible, so passing one wrong
+ * reads rows at the wrong stride -- out of bounds, NaN, and a clean compile. */
 /* attn_pack_e4m3 / attn_comp_pack_ld now live in pulsar_cuda_internal.h so the
  * fp16 tensor-core kernel decodes ATTN_PACK rows with the SAME code rather
  * than a transcription of it -- there is then no second copy of the contract
@@ -1028,10 +1018,8 @@ __global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kern
             if (sr < raw_count) {
                 kv_shared[off] = raw_kv_ld4(raw_kv, (uint64_t)raw_rows[sr], c4, head_dim);
             } else {
-                /* comp row -> f32 float4 in smem via the format-templated
-                 * loader (the CF == E4M3 arm is the block that was inlined
-                 * here); the indexed row id is the top-k comp_idx, not
-                 * sr-raw_count. */
+                /* comp row -> f32 float4 via the shared row loader; the
+                 * indexed row id is the top-k comp_idx, not sr-raw_count. */
                 kv_shared[off] = attn_comp_ld4(comp_src,
                         comp_base + (uint64_t)comp_idx, c4, head_dim);
             }
@@ -1295,9 +1283,7 @@ static void attention_decode_mixed_heads8_online_kernel(
             if (sr < raw_count) {
                 kv_shared[off] = raw_kv_ld4(raw_kv, (uint64_t)raw_rows[sr], c4, head_dim);
             } else {
-                /* comp-pool row via the format-templated float4 loader; the
-                 * CF == E4M3 arm is the exact scale-hoisted uint32 fetch that
-                 * was inlined here. */
+                /* comp row via the shared float4 row loader. */
                 kv_shared[off] = attn_comp_ld4(comp_src,
                         comp_base + (sr - raw_count), c4, head_dim);
             }
