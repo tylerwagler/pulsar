@@ -1081,6 +1081,12 @@ struct server {
     int          pool_banks;
     int          live_bank;
     int          spec_max_live;
+    /* L118 escape hatch (DIAGNOSTIC, dies with the classic lane in P4): when
+     * true, restore the pre-unification three-way arming (classic per-slot
+     * decode below the spec_max_live crossover) for A/B against the unified
+     * everything-is-a-batch scheduler. Env PULSAR_CLASSIC_DECODE=1, read once
+     * at startup. */
+    bool         classic_decode_lane;
     /* plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step

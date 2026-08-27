@@ -925,6 +925,14 @@ int main(int argc, char **argv) {
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
         s.spec_max_live = v;
     }
+    /* L118: everything is a batch — decode runs through the batched quanta at
+     * every n >= 1 by default. PULSAR_CLASSIC_DECODE=1 restores the old
+     * three-way arming for A/B (diagnostic escape hatch; removed with the
+     * classic lane once the unified scheduler's parity evidence is complete). */
+    s.classic_decode_lane = getenv("PULSAR_CLASSIC_DECODE") != NULL;
+    if (s.classic_decode_lane)
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: CLASSIC decode lane forced (PULSAR_CLASSIC_DECODE; diagnostic)");
     /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF (OPT-IN via
      * PULSAR_MIXED_BATCH=1). It is a workload-dependent TRADE, not a safe blanket
      * default — three measured regimes:

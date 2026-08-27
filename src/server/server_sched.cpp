@@ -1640,6 +1640,25 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
      * transparently by server_bank_switch in the ENTRY loop below. */
     s->guard_maybe_evict(dec, n);
 
+    /* L118: per-quantum client-liveness poll (classic-loop parity). NOTE:
+     * mid-flight continued disk-KV stores are NOT ported to this plain lane —
+     * batch_feed/batch_pending tokens reconcile into the session history only
+     * at per-slot finish, so there is no point in the quantum where
+     * s->checkpoint is token-true for a bank. Finish-time stores are
+     * unchanged; the spec lane (the default path) carries the mid-flight
+     * cadence. */
+    for (int i = 0; i < n; i++) {
+        gen_state *pg = dec[i]->gen;
+        if (pg && pg->phase == GEN_DECODE && pg->batch_feed_valid &&
+            gen_client_disconnected(pg->j->fd)) {
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
+                       pg->completion);
+            pg->batch_feed_valid = false;
+            pg->phase = GEN_FINISH;
+        }
+    }
+
     /* ENTRY: a slot not yet in the batch samples its first feed token from its
      * bank's current classic logits while that bank is briefly live, then
      * CAPTURES its per-bank frontier counters (ms_n_comp[bank]) that the
@@ -1729,6 +1748,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
             g->batch_feed_pos++;
             sl->committed_pos = g->batch_feed_pos;
+            sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
             pulsar_tokens_push(&g->batch_pending, committed);
             if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
             /* Route THIS slot's stream writes through its own deferral queue
@@ -1782,6 +1802,19 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     const int eos_token = pulsar_token_eos(s->engine);
 
     s->guard_maybe_evict(dec, n);
+
+    /* L118: the per-quantum client-liveness poll the classic loop always had.
+     * A dead client's slot finishes through the normal per-slot epilogue (the
+     * final write fails harmlessly on the dead fd). */
+    for (int i = 0; i < n; i++) {
+        gen_state *pg = dec[i]->gen;
+        if (pg && pg->phase == GEN_DECODE && gen_client_disconnected(pg->j->fd)) {
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
+                       pg->completion);
+            pg->phase = GEN_FINISH;
+        }
+    }
 
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
     int first_tok[PULSAR_SESSION_POOL_CAP];
@@ -2020,6 +2053,21 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             }
             if (stopped) g->phase = GEN_FINISH;
             sl->committed_pos = pulsar_session_pos(pool);
+            sl->tokens_emitted += (uint64_t)done;
+            /* L118: continued disk-KV store — the classic loop's cadence,
+             * ported to the one point where it is valid in this lane: the
+             * bank is live (round-end bank_switch) and round_end + the ghost
+             * rewind left s->checkpoint token-true for it. Same tool-span
+             * suppression as the classic loop. */
+            if (!stopped && g->phase == GEN_DECODE) {
+                const request *rq = &g->j->req;
+                const dsml_decode_state ds =
+                    rq->kind == REQ_CHAT && rq->has_tools ?
+                        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+                if (!(rq->kind == REQ_CHAT && rq->has_tools &&
+                      (g->saw_tool_start || dsml_decode_state_is_tool(ds))))
+                    s->kv_cache_maybe_store_continued(sl);
+            }
             pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
             emitted_total += done;
         }
@@ -2105,6 +2153,20 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     const pulsar_tokens *pp = pg->prompt_for_sync;
 
     s->guard_maybe_evict(dec, n);
+
+    /* L118: per-quantum client-liveness poll (classic-loop parity; same
+     * continued-store caveat as the plain lane). */
+    for (int i = 0; i < n; i++) {
+        gen_state *lg = dec[i]->gen;
+        if (lg && lg->phase == GEN_DECODE && lg->batch_feed_valid &&
+            gen_client_disconnected(lg->j->fd)) {
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
+                       lg->completion);
+            lg->batch_feed_valid = false;
+            lg->phase = GEN_FINISH;
+        }
+    }
 
     /* Decode-bank ENTRY — identical to worker_batched_decode_quantum. */
     for (int i = 0; i < n; i++) {
@@ -2242,6 +2304,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             gen_state *g = sl->gen;
             const int committed = g->batch_feed_token;
             g->batch_feed_pos++; sl->committed_pos = g->batch_feed_pos;
+            sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
             pulsar_tokens_push(&g->batch_pending, committed);
             if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
             slot_writer_install(&g->writer);
@@ -2362,8 +2425,14 @@ void *worker_main(void *arg) {
          * this lane but degrades naturally to 1-row rounds: round_end's
          * redraft respects the latch, so its pendings stay empty -- correct
          * output, base-token rounds, only the per-row capture as overhead. */
-        bool all_spec = pulsar_engine_has_dspark(s->engine) && n_dec >= 2 &&
-                        n_batched == 0;
+        /* L118 (everything is a batch): the batched quanta run at EVERY
+         * n_dec >= 1 — a solo session is a batch of one. The old three-way
+         * arming (classic per-slot decode below the spec_max_live crossover)
+         * survives only behind the PULSAR_CLASSIC_DECODE diagnostic hatch for
+         * A/B, and dies with the classic lane in P4 (plan 118). */
+        const int spec_arm_min = s->classic_decode_lane ? 2 : 1;
+        bool all_spec = pulsar_engine_has_dspark(s->engine) &&
+                        n_dec >= spec_arm_min && n_batched == 0;
         for (int i = 0; all_spec && i < n_dec; i++) {
             gen_state *dg = dec[i]->gen;
             if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
@@ -2372,7 +2441,7 @@ void *worker_main(void *arg) {
         const bool use_spec_batched = s->pool_banks > 0 && all_spec;
         const bool use_batched = use_spec_batched ||
             (s->pool_banks > 0 && n_dec >= 1 &&
-             (n_dec > s->spec_max_live || n_batched > 0));
+             (!s->classic_decode_lane || n_dec > s->spec_max_live || n_batched > 0));
 
         /* Record the lane for /metrics. Only the spec lane runs the fused verify
          * loop, so this is what tells a scraper whether the spec_decode_*
