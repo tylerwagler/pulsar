@@ -392,7 +392,10 @@ static int routed_moe_launch_cutlass(
     if (!ffn_scratch) return 0;
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe_cutlass counts clear");
+    /* L119: Async (capture-legal); this per-expert path is a fallback but must
+     * not break a capture that reaches it. Its D2H offsets readback below
+     * remains capture-illegal by design — grouped is the captured path. */
+    int ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes), "routed_moe_cutlass counts clear");
     if (ok) {
         moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
         ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass count launch");
@@ -671,7 +674,10 @@ static int routed_moe_launch_cutlass_grouped(
     else            row_src_tok = NULL;
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "moe_grouped counts clear");
+    /* L119: Async — the sync form is a stream-capture violation and this path
+     * is reached by captured decode segments at rows > 8 (same stream, same
+     * ordering; behavior unchanged). */
+    int ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes), "moe_grouped counts clear");
     /* padding rows must be zeroed (pack sees clean data) and unmapped (padded_pair = -1). */
     if (ok && x_gathered) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_bytes), "moe_grouped wg clear");
