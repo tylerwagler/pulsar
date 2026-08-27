@@ -400,6 +400,8 @@ bool server::send_metrics(int fd) {
     const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes;
     const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes;
     const unsigned long long gen_tokens = (unsigned long long)s->m_gen_tokens;
+    const unsigned long long prefill_chunk_tokens =
+        (unsigned long long)s->m_prefill_chunk_tokens;
     const int decode_lane = s->m_decode_lane;
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
@@ -446,6 +448,12 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP vllm:generation_tokens_total Cumulative tokens emitted, all decode lanes.\n");
     buf_puts(&b, "# TYPE vllm:generation_tokens_total counter\n");
     buf_printf(&b, "vllm:generation_tokens_total %llu\n", gen_tokens);
+    /* L114: chunk-granular prefill counter — advances per ~4s prefill chunk
+     * (computed rows only), unlike vllm:prompt_tokens_total which advances at
+     * request finish. Sample this to build prefill rate curves. */
+    buf_puts(&b, "# HELP pulsar:prefill_chunk_tokens_total Computed prefill rows, accumulated per chunk.\n");
+    buf_puts(&b, "# TYPE pulsar:prefill_chunk_tokens_total counter\n");
+    buf_printf(&b, "pulsar:prefill_chunk_tokens_total %llu\n", prefill_chunk_tokens);
     buf_puts(&b, "# HELP pulsar:spec_decode_gen_tokens_total Tokens emitted by the fused spec loop only.\n");
     buf_puts(&b, "# TYPE pulsar:spec_decode_gen_tokens_total counter\n");
     buf_printf(&b, "pulsar:spec_decode_gen_tokens_total %llu\n", (unsigned long long)m.gen_tokens);

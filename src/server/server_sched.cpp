@@ -1295,6 +1295,7 @@ void server::publish_metrics_snapshot() {
     }
     s->m_spec = m;
     s->m_gen_tokens = s->w_gen_tokens;
+    s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_decode_lane = s->w_decode_lane;
     pthread_mutex_unlock(&s->mu);
 }

@@ -1175,6 +1175,14 @@ struct server {
      * copies it under mu. */
     uint64_t w_gen_tokens;        /* worker-owned, no lock */
     uint64_t m_gen_tokens;        /* published copy, read by send_metrics */
+    /* L114: chunk-granular prefill counter (computed rows only, accumulated in
+     * server_progress_cb per prefill_chunk event). vllm:prompt_tokens_total
+     * stays request-granular (finish-time, cache-exact); this one advances
+     * every ~4s chunk so a scraper can build prefill rate CURVES — flat spots
+     * = scheduler/store overhead, lower slope = per-chunk slowdown (the L114
+     * attribution instrument). */
+    uint64_t w_prefill_chunk_tokens;
+    uint64_t m_prefill_chunk_tokens;
     /* Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
