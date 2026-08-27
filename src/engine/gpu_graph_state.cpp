@@ -4,6 +4,10 @@
 
 /* Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(pulsar_gpu_graph *g) {
+    /* L119: cached segment graphs bake THIS graph's device allocations —
+     * they must not survive it (a later session reusing the addresses would
+     * replay against freed state; the multiseq gates caught this). */
+    pulsar_gpu_seg_reset();
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);

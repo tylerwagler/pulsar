@@ -1476,6 +1476,22 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     return 1;
 }
 
+/* L119: drop every cached exec graph. MUST be called when a gpu graph is
+ * torn down: the cached graphs bake that graph's device allocations, and a
+ * later session reusing (or re-receiving) those addresses would replay
+ * against freed state — the multiseq/bank gates create sessions repeatedly
+ * and caught exactly this (4 gate FAILs, 2026-08-27). Worker thread only. */
+void pulsar_gpu_seg_reset(void) {
+    for (uint32_t i = 0; i < PULSAR_SEG_SLOTS; i++) {
+        if (g_seg[i].exec) (void)cudaGraphExecDestroy(g_seg[i].exec);
+        g_seg[i].key = 0;
+        g_seg[i].exec = NULL;
+        g_seg[i].uses = 0;
+        g_seg[i].dead = 0;
+    }
+}
+
+
 /* End a capture opened by seg_enter()==1. Returns 1 when the captured graph
  * was instantiated, stored, and LAUNCHED (the body's work has now run).
  * Returns 0 when capture failed — the recorded work NEVER EXECUTED and the
