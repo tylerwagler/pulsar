@@ -2511,9 +2511,11 @@ static int attention_prefill_mixed_launch(
         /* The score GEMM's operands must agree in type, so a narrowed Q needs an
          * f16 KV operand.  Staging KV (n_keys*head_dim, stride 0 across heads)
          * rather than widening Q (n_tok*n_head*head_dim) is ~128x less work:
-         * 4 MiB against 512 MiB at a 4096-token prefill.  It is also EXACT --
-         * the packed KV is E4M3 with a power-of-two block scale, so every value
-         * fits f16's mantissa and range with nothing to round.
+         * 4 MiB against 512 MiB at a 4096-token prefill.  On the E4M3 and MXFP4
+         * legs it is also EXACT (pow2 block scales -- every decoded value
+         * fits f16 with nothing to round); the NVFP4 leg's scale is e4m3*f32,
+         * not pow2, so its f16 staging CAN round -- an accepted fidelity
+         * nuance of that measurement arm.
          * The value GEMM below keeps the f32 copy: its B operand is post-softmax
          * P, and narrowing THAT would be a real precision change. */
         const uint64_t kv16_bytes = (sizeof(pulsar_q_t) == sizeof(float))

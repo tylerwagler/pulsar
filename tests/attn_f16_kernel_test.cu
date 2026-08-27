@@ -53,6 +53,11 @@ static double h16(double v) { return (double)__half2float(__float2half((float)v)
  * on why the fixture ENCODES a draw instead of drawing random bytes */
 
 int main(int argc, char **argv) {
+    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
+     * environment would make the launch dispatch decode E4M3 rows as nibbles and
+     * fail confusingly.  Pin the format rather than inherit it. */
+    setenv("PULSAR_KV4", "0", 1);
+
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
     const uint32_t window   = (argc > 2) ? (uint32_t)atoi(argv[2]) : 24u;
     const uint32_t n_head   = (argc > 3) ? (uint32_t)atoi(argv[3]) : 32u;

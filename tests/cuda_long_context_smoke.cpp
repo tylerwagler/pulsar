@@ -1266,6 +1266,11 @@ static int check_multibank_raw_store(void) {
 }
 
 int main(void) {
+    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
+     * environment would make the launch dispatch decode E4M3 rows as nibbles and
+     * fail confusingly.  Pin the format rather than inherit it. */
+    setenv("PULSAR_KV4", "0", 1);
+
     if (!pulsar_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_dspark_markov_head() != 0) rc = 1;

@@ -230,14 +230,14 @@ int main(void) {
     int fails = 0;
     for (size_t l = 0; l < sizeof legs / sizeof legs[0]; l++) {
         const uint64_t rowb = legs[l].rowb;
-        {   /* the layout contract itself, before any kernel runs */
-            const uint64_t want = legs[l].fmt == PULSAR_ATTN_COMP_E4M3
-                ? pulsar_gpu_attn_pack_rowbytes(HD) : rowb;
-            if (want != rowb) {
-                fprintf(stderr, "kv4-pack-gate: %s rowbytes %llu != %llu\n", legs[l].name,
-                        (unsigned long long)want, (unsigned long long)rowb);
-                return 1;
-            }
+        if (legs[l].fmt == PULSAR_ATTN_COMP_E4M3 &&
+            pulsar_gpu_attn_pack_rowbytes(HD) != rowb) {
+            /* only the E4M3 stride has a backend query to ask; the mx/nv
+             * strides are verified structurally by verify_row's offsets. */
+            fprintf(stderr, "kv4-pack-gate: e4m3 rowbytes %llu != %llu\n",
+                    (unsigned long long)pulsar_gpu_attn_pack_rowbytes(HD),
+                    (unsigned long long)rowb);
+            return 1;
         }
         pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)ROWS * HD * sizeof(float));
         pulsar_gpu_tensor *packed = pulsar_gpu_tensor_alloc((uint64_t)ROWS * rowb);

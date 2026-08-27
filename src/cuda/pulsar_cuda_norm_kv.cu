@@ -1312,6 +1312,12 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
                         attn_comp_fmt_rowbytes(comp_fmt, head_dim)) {
         return 0;
     }
+    if (comp_fmt != PULSAR_ATTN_COMP_E4M3 && head_dim != 512u) {
+        /* attn_comp_kv4_store_kernel's shared samax/sscale are sized for
+         * head_dim 512 (28 blocks); a larger shape would write past them.
+         * No caller passes anything else -- refuse rather than trust that. */
+        return 0;
+    }
     if (comp_fmt == PULSAR_ATTN_COMP_MXFP4) {
         attn_comp_kv4_store_kernel<PULSAR_ATTN_COMP_MXFP4><<<n_rows, 64>>>(
                 keep_f32 ? (float *)x->ptr : NULL, (const float *)x->ptr,

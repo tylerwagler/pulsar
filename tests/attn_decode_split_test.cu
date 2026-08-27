@@ -93,6 +93,11 @@ struct Case {
 };
 
 int main() {
+    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
+     * environment would make the launch dispatch decode E4M3 rows as nibbles and
+     * fail confusingly.  Pin the format rather than inherit it. */
+    setenv("PULSAR_KV4", "0", 1);
+
     const uint32_t D = 512u, n_head = 64u;
     std::mt19937_64 rng(20260809);
     std::normal_distribution<float> nd(0.f, 0.8f);

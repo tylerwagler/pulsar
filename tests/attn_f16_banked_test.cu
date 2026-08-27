@@ -84,6 +84,11 @@ static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
 }
 
 int main(int argc, char **argv) {
+    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
+     * environment would make the launch dispatch decode E4M3 rows as nibbles and
+     * fail confusingly.  Pin the format rather than inherit it. */
+    setenv("PULSAR_KV4", "0", 1);
+
     /* Comp banks are ATTN_PACK, full stop.  This took a 'p' argument selecting
      * between packed and f32 banks until 2026-08-18, when the format parameter
      * was removed from the kernels -- there is one comp format, so there is one

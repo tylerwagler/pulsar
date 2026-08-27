@@ -173,13 +173,17 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
     (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 1u) / 2u + \
      (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 31u) / 32u))
 
-/* Packed attention comp-cache row (the only comp-cache format): VALUE-
- * PRESERVING packed attn comp cache.  One row = [448 e4m3 nope bytes][7 E8M0
- * block-64 scale bytes][1 pad][64 bf16 rope] = 584 B (vs 2048 f32), which is
- * byte-identical to vLLM's fp8_ds_mla DSv4 cache line.  The nope dims store
- * exactly the fp8_kv_quantize roundtrip the f32 pipeline applies in place, and
- * the rope tail its bf16 roundtrip — read-back is bit-identical.  Must stay
- * in sync with PULSAR_ATTN_PACK_ROWBYTES in src/cuda/pulsar_cuda_internal.h. */
+/* Packed attention KV row (E4M3): VALUE-PRESERVING.  One row = [448 e4m3 nope
+ * bytes][7 E8M0 block-64 scale bytes][1 pad][64 bf16 rope] = 584 B (vs 2048
+ * f32), byte-identical to vLLM's fp8_ds_mla DSv4 cache line.  The nope dims
+ * store exactly the fp8_kv_quantize roundtrip the f32 pipeline applies in
+ * place, and the rope tail its bf16 roundtrip — read-back is bit-identical.
+ * Must stay in sync with PULSAR_ATTN_PACK_ROWBYTES in
+ * src/cuda/pulsar_cuda_internal.h.
+ *
+ * ⚠ Since L111 this is the RAW-side row only by definition; the COMP POOL's
+ * row can be a 4-bit format under PULSAR_KV4.  Never stride the comp pool
+ * with this macro — ask gpu_graph_attn_comp_cache_row_bytes(). */
 #define PULSAR_ENGINE_ATTN_PACK_ROWBYTES \
     ((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) + \
      ((((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 64u) + 3u) & ~3ull) + \
