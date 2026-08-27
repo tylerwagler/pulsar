@@ -89,8 +89,28 @@ int main(int argc, char **argv) {
     free(text);
     const int vocab = (int)PULSAR_N_VOCAB;
 
-    const int Bs[] = {1, 2, 4};
-    const int Rs[] = {1, 2, 4, 8, 16};
+    /* PROBE_BS / PROBE_RS: comma-separated grid restriction, for profiling a
+     * single cell under nsys (e.g. PROBE_BS=1 PROBE_RS=1). Default = full grid. */
+    int Bs[8] = {1, 2, 4}, n_bs = 3;
+    int Rs[8] = {1, 2, 4, 8, 16}, n_rs = 5;
+    const char *bs_env = getenv("PROBE_BS");
+    if (bs_env && *bs_env) {
+        n_bs = 0;
+        for (const char *p2 = bs_env; *p2 && n_bs < 8;) {
+            Bs[n_bs++] = atoi(p2);
+            while (*p2 && *p2 != ',') p2++;
+            if (*p2 == ',') p2++;
+        }
+    }
+    const char *rs_env = getenv("PROBE_RS");
+    if (rs_env && *rs_env) {
+        n_rs = 0;
+        for (const char *p2 = rs_env; *p2 && n_rs < 8;) {
+            Rs[n_rs++] = atoi(p2);
+            while (*p2 && *p2 != ',') p2++;
+            if (*p2 == ',') p2++;
+        }
+    }
 
     for (int di = 0; di < n_depths; di++) {
         const int depth = depths[di];
@@ -133,8 +153,8 @@ int main(int argc, char **argv) {
         float *logits = (float *)malloc((size_t)PROBE_MAX_B * PROBE_MAX_R * (size_t)vocab * sizeof(float));
         if (!logits) { fprintf(stderr, "oom\n"); return 1; }
 
-        for (size_t bi = 0; bi < sizeof(Bs) / sizeof(Bs[0]); bi++) {
-            for (size_t ri = 0; ri < sizeof(Rs) / sizeof(Rs[0]); ri++) {
+        for (int bi = 0; bi < n_bs; bi++) {
+            for (int ri = 0; ri < n_rs; ri++) {
                 const int B = Bs[bi], R = Rs[ri];
                 const uint32_t rows = (uint32_t)(B * R);
                 pulsar_multiseq_req reqs[PROBE_MAX_B * PROBE_MAX_R];
