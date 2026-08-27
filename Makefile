@@ -924,6 +924,9 @@ tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/puls
 tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
+tests/mseq_rowcost_probe.o: tests/mseq_rowcost_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mseq_rowcost_probe.cpp
+
 tests/bank_spec_gate.o: tests/bank_spec_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.cpp
 
@@ -989,6 +992,9 @@ tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/pulsar_help
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/mseq_rowcost_probe: tests/mseq_rowcost_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
