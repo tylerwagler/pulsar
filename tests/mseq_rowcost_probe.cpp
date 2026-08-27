@@ -205,6 +205,15 @@ int main(int argc, char **argv) {
                         unsigned long long ih = fnv1a(logits,
                                 (size_t)rows * (size_t)vocab * sizeof(float));
                         cell_hash = fnv1a(&ih, sizeof ih) ^ (cell_hash * 1099511628211ull);
+                        /* PROBE_ITER_HASH=1: per-iteration hashes, to see at
+                         * which iteration a capture/replay arm first diverges
+                         * from the eager arm (dev diagnostic). */
+                        static int iter_hash = -1;
+                        if (iter_hash < 0)
+                            iter_hash = getenv("PROBE_ITER_HASH") != NULL;
+                        if (iter_hash)
+                            printf("ITERHASH depth=%d B=%d R=%d it=%d h=%016llx\n",
+                                   depth, B, R, it, ih);
                     }
                 }
                 /* Reset the touched banks for the next cell: repoint +
