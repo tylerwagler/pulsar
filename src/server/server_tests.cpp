@@ -1605,6 +1605,44 @@ static void test_think_sampling_respects_explicit_params(void) {
 
 
 
+/* L116: gen_resolve_sampling_decode is the ONE sampling authority for every
+ * decode lane (classic, plain-batched, spec-batched, mixed), and the tool
+ * admission to the batched lanes rests on it forcing temperature=0 exactly in
+ * tool-call structural regions — and nowhere else. Mutation check: dropping
+ * the override in the helper fails the STRUCTURAL/JSON_STRUCTURAL rows;
+ * over-forcing fails the payload-sampling and no-tools rows. */
+static void test_decode_sampling_tool_payload_forcing(void) {
+    job j;
+    memset(&j, 0, sizeof j);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.think_mode = PULSAR_THINK_NONE;
+    j.req.temperature = 0.8f;
+    j.req.has_temperature = true;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    dsml_decode_tracker_init(&g.dsml_tracker);
+    static const struct { dsml_decode_state st; bool tools; float want; } cases[] = {
+        {DSML_DECODE_OUTSIDE,         true,  0.8f},
+        {DSML_DECODE_STRUCTURAL,      true,  0.0f},
+        {DSML_DECODE_JSON_STRUCTURAL, true,  0.0f},
+        {DSML_DECODE_STRING_BODY,     true,  0.8f}, /* payload sampling */
+        {DSML_DECODE_JSON_STRING,     true,  0.8f}, /* payload sampling */
+        {DSML_DECODE_STRUCTURAL,      false, 0.8f}, /* no tools: tracker ignored */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        j.req.has_tools = cases[i].tools;
+        g.dsml_tracker.decode = cases[i].st;
+        float temperature = -1.0f, top_p = -1.0f, min_p = -1.0f;
+        int top_k = -1;
+        gen_resolve_sampling_decode(&g, &temperature, &top_k, &top_p, &min_p);
+        TEST_ASSERT(temperature == cases[i].want);
+    }
+    request_free(&j.req);
+}
+
+
+
 static void test_web_search_tool_recognition(void) {
     int uses = 0;
     TEST_ASSERT(web_search_tool_entry(
@@ -5600,6 +5638,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();
     test_think_sampling_respects_explicit_params();
+    test_decode_sampling_tool_payload_forcing();
     test_web_search_tool_recognition();
     test_web_search_result_replay_rebuild();
     test_web_search_replay_message_split();

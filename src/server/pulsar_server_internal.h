@@ -2015,6 +2015,8 @@ void *worker_main(void *arg);
  * worker (server_sched.cpp): bind/step/unbind plus the three per-token
  * helpers the batched and fused mixed-batch quanta share with the classic
  * decode loop. */
+void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
+                                 int *top_k, float *top_p, float *min_p);
 void gen_resolve_sampling(const request *req, float *temperature,
                           int *top_k, float *top_p, float *min_p);
 /* OpenAI logprobs ledger (generate.cpp).  capture_* records the distribution a

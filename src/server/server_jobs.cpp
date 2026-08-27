@@ -1314,6 +1314,27 @@ void gen_resolve_sampling(const request *req, float *temperature,
 
 
 
+/* Decode-lane sampling resolution: gen_resolve_sampling plus the tool-payload
+ * greedy override (temperature=0 while the DSML tracker sits inside a tool
+ * call outside a payload-sampling region). L116: ONE authority for every
+ * decode lane — classic, plain-batched, spec-batched, mixed — so a tool
+ * request samples the same wherever the scheduler routes it. Granularity is
+ * one resolution per spec block / batched round in every lane (the classic
+ * lane always worked this way: the override can lag a mid-block tool-marker
+ * crossing by up to one block). */
+void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
+                                 int *top_k, float *top_p, float *min_p) {
+    const request *req = &g->j->req;
+    gen_resolve_sampling(req, temperature, top_k, top_p, min_p);
+    const dsml_decode_state st = req->kind == REQ_CHAT && req->has_tools ?
+        g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+    if (dsml_decode_state_is_tool(st) &&
+        !dsml_decode_state_uses_payload_sampling(st))
+        *temperature = 0.0f;
+}
+
+
+
 /* Emit one already-decoded token into the response stream: append it to the
  * accumulated text, feed the thinking/DSML trackers, run stop-string and
  * tool-marker detection, and drive every active protocol stream projection
@@ -1322,14 +1343,15 @@ void gen_resolve_sampling(const request *req, float *temperature,
  * block, or a client write error), with g->finish (and g->err on error) set.
  *
  * Factored out of gen_step_decode's per-token inner loop (plan Tier-2 Step 5)
- * so both drivers share ONE emit path: the classic spec/plain decode loop
- * below AND the batched multi-session scatter (which samples each live bank's
- * row on the host, then calls this to stream that bank's slot). It touches
+ * so every driver shares ONE emit path: the classic spec/plain decode loop
+ * below AND the batched multi-session lanes (which sample each live bank's
+ * row on the host, then call this to stream that bank's slot). It touches
  * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
- * call except pulsar_token_text and the tool-recovery sync (chat_think_tool_
- * recovery, which the batched path never reaches because n>=2 is plain,
- * tool-gated decode by contract). Behavior for the single-session path is
- * byte-identical to the pre-factoring inner loop. */
+ * call except pulsar_token_text. That host-only property is what makes the
+ * L116 tool admission to the batched lanes sound: all tool-marker tracking,
+ * thinking-recovery, and stop handling here runs identically in every lane.
+ * Behavior for the single-session path is byte-identical to the
+ * pre-factoring inner loop. */
 bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -1565,10 +1587,7 @@ void server::gen_step_decode(session_slot *sl) {
         }
         float temperature, top_p, min_p;
         int top_k;
-        gen_resolve_sampling(&j->req, &temperature, &top_k, &top_p, &min_p);
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = 0.0f;
-        }
+        gen_resolve_sampling_decode(g, &temperature, &top_k, &top_p, &min_p);
         int token;
         int toks[17];
         int ntok = 0;

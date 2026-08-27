@@ -1395,15 +1395,24 @@ void server::worker_finish_slot(session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (pulsar_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
-/* A slot is eligible for the batched (plain multiseq) decode lane when it is in
- * steady-state decode and is NOT a tool-call request. Tool requests keep the
- * classic lane: their structured payload uses temperature-0 gating and the
- * think/tool recovery paths, which are plain-decode-by-contract absent from the
- * batched path. Prefill/init/finish slots are serviced per-slot as usual. */
+/* A slot is eligible for the batched decode lanes when it is in steady-state
+ * decode. L116: tool-call requests are admitted — measured 2026-08-26, the old
+ * has_tools exclusion forced ALL agent traffic onto the classic per-slot RR,
+ * which is aggregate-CONSERVED (c1/c2/c4 = 17.8/18.5/17.6 t/s) while the
+ * spec-batched lane scales (19.2/22.7/26.4). The machinery the exclusion
+ * comment cited is lane-shared today: the temp-0 tool-payload gating lives in
+ * gen_resolve_sampling_decode (every lane's sampling authority), and the
+ * think/tool recovery paths are host-side in gen_emit_token + gen_step_finish,
+ * both of which the batched lanes already drive. CONTRACT CAVEAT the admission
+ * inherits: the M>=2 batched forward is ~1 ULP off the M=1 path, so a
+ * forced-greedy tool-payload span's near-tie argmax can depend on what else is
+ * co-scheduled — same accepted property the plain batched lane has always had
+ * for explicit temp-0 requests (characterized 2026-07-22); output remains
+ * valid and self-consistent with the bank's KV.
+ * Prefill/init/finish slots are serviced per-slot as usual. */
 static bool slot_is_batchable_decode(const session_slot *sl) {
     const gen_state *g = sl->gen;
-    return sl->active_job && g && g->phase == GEN_DECODE &&
-           !(g->j->req.kind == REQ_CHAT && g->j->req.has_tools);
+    return sl->active_job && g && g->phase == GEN_DECODE;
 }
 
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
@@ -1420,8 +1429,11 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * batched inference elsewhere (vLLM et al.) — but it is a real greedy-determinism
  * property, characterized 2026-07-22. The multiseq gate proves N=2-vs-N=3
  * neutrality (bank output invariant to OTHER banks), which is a WEAKER invariant
- * than batched==solo and does NOT cover this ULP. Plain decode
- * only. Slots that stop are set to GEN_FINISH and dropped; the worker finishes
+ * than batched==solo and does NOT cover this ULP. L116: tool-call requests
+ * ride this lane too — their forced-greedy payload spans inherit exactly this
+ * property (see slot_is_batchable_decode), and their temp-0 gating comes from
+ * gen_resolve_sampling_decode like every other lane.
+ * Slots that stop are set to GEN_FINISH and dropped; the worker finishes
  * them via the per-slot path, which reconciles their host checkpoint against the
  * tokens committed here. Leaves the pool multiseq-poisoned with live_bank = -1
  * so the next server_bank_switch does a real bank restore. */
@@ -1653,7 +1665,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             continue;
         }
         float temp, top_p, min_p; int top_k;
-        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token =
             pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
         /* The bank is live and its classic logits are what this token was drawn
@@ -1729,7 +1741,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             }
             const float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
             g->batch_feed_token =
                 pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
             /* This bank's row IS the target distribution at batch_feed_pos, and
@@ -1886,7 +1898,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 continue;
             }
             float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
             const int first = pulsar_session_spec_next_base(pool, temp, top_k,
                                                          top_p, min_p, &g->rng);
             if (first == eos_token) {
@@ -1973,7 +1985,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 continue;
             }
             float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
             const int na = pulsar_session_spec_round_end(pool, rounds[live_idx[q]],
                                                       first_tok[q], eos_token,
                                                       temp, top_k, top_p, min_p,
@@ -2106,7 +2118,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             continue;
         }
         float temp, top_p, min_p; int top_k;
-        gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+        gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
         logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
         g->batch_feed_pos = pulsar_session_pos(pool);
@@ -2238,7 +2250,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             }
             const float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling(&g->j->req, &temp, &top_k, &top_p, &min_p);
+            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
             g->batch_feed_token = pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
