@@ -162,6 +162,8 @@ bool pulsar_tp_is_rdma(const pulsar_tp *tp);
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp);
 bool pulsar_tp_failed(const pulsar_tp *tp);
 void pulsar_tp_mark_failed(pulsar_tp *tp);
+uint32_t pulsar_tp_n_layer(const pulsar_tp *tp);     /* decoded from the hello */
+uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials) */
 
 /* GPU-written gate-ready flags region of the slab (u32 per slot). */
 uint64_t pulsar_tp_slab_gpu_flags_offset(const pulsar_tp_slab *s);

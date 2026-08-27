@@ -28,6 +28,7 @@ __pycache__/
 /tests/cuda_long_context_smoke
 /tests/tp_core_test
 /tests/tp_transport_test
+/tests/tp_sched_test
 /tests/multiseq_frontier_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate

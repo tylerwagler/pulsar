@@ -73,6 +73,14 @@ bug, not a design change.
       **Binder cross-check PASSED:** `shape_profiles.cpp` Flash {43L, 4096h,
       129280v, 512 head-dim, 64 rot, 256+1 exp, 6 used} matches the study's
       V4-Flash constants exactly.
+- 4b. **DONE 2026-08-26 (host half only, by design)** — gate scheduler
+      `pulsar_tp_sched.{h,cpp}`: drives the transport per-exchange over the
+      DS per-layer ATTN→FFN order and the prefill big-gate-per-layer path,
+      with the two CUDA-touching steps (.cu write/read partial) funneled
+      through hook pointers → every scheduling/lockstep rule is host-tested
+      (tp_sched_test: 2 decode tokens x 86 gates + prefill chunk, symmetric
+      on both ranks over the TCP loopback).  The `.cu` wrapper implementations
+      deliberately ship in 4c WITH their engine callers (no dead code).
 - 4b. CUDA gate machinery on the engine worker thread — big_gate first
       (prefill), per-layer gates (decode). GPU-gated; the hard chunk.
 - 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the

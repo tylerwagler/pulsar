@@ -1498,6 +1498,8 @@ void pulsar_tp_free(pulsar_tp *tp) {
 int pulsar_tp_rank(const pulsar_tp *tp) { return tp->rank; }
 bool pulsar_tp_is_rdma(const pulsar_tp *tp) { return tp->rdma_active; }
 uint32_t pulsar_tp_peer_ctx(const pulsar_tp *tp) { return tp->peer_ctx; }
+uint32_t pulsar_tp_n_layer(const pulsar_tp *tp) { return tp->n_layer; }
+uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp) { return tp->vec_bytes; }
 bool pulsar_tp_failed(const pulsar_tp *tp) {
     return tp && tp->failed.load(std::memory_order_acquire);
 }
