@@ -2086,10 +2086,11 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
         g->dspark_target_h[i] = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-        /* Fused-loop batch capture: one anchor hidden per verify-batch position
-         * (17 = the spec block clamp of 16 drafts + first_token). */
+        /* Fused-loop batch capture: one anchor hidden per verify-batch position.
+         * Sized from the slab authority (L117: a 32-row sweep reduces up to
+         * n_tokens rows into this; the old literal 17 would overflow). */
         g->dspark_target_h_batch[i] = pulsar_gpu_tensor_alloc(
-            (uint64_t)17 * PULSAR_N_EMBD * sizeof(float));
+            (uint64_t)(PULSAR_SPEC_LOGITS_ROWS + 1u) * PULSAR_N_EMBD * sizeof(float));
         /* Option F: bank the drafter ring when the pool is enabled — one
          * bank-major slab, dspark_raw_cache[i] becomes bank 0's view (repoint
          * swaps it). */

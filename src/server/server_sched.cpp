@@ -1824,12 +1824,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     uint32_t row0s[PULSAR_SESSION_POOL_CAP];
     int row_nb[PULSAR_SESSION_POOL_CAP];   /* rows this bank contributed (base+K) */
     int live_idx[PULSAR_SESSION_POOL_CAP];
-    pulsar_multiseq_req reqs[16];
-    int accepted[17];
+    pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
+    int accepted[PULSAR_SPEC_LOGITS_ROWS + 1];
     /* ALL_ROWS caps the shared forward at 16 rows (the spec-logits ceiling). */
-    float *logits = (float *)server_xmalloc((size_t)16 * (size_t)vocab * sizeof(float));
+    float *logits = (float *)server_xmalloc(
+            (size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)vocab * sizeof(float));
 
     int emitted_total = 0;
+    const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
     while (emitted_total < PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
         /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
          * At <=16 total rows the shared forward's marginal row cost is
@@ -1878,9 +1880,32 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * pre-allocator lane; the ranked allocation engages ONLY on
              * overflow, where the old behavior (arbitrary whole-bank
              * sit-out) was itself partner-coupled and strictly worse. */
-            k_overflow = demand > 16u;
+            k_overflow = demand > PULSAR_SPEC_LOGITS_ROWS;
             if (k_overflow) {
-                int budget = 16 - n_live;   /* base rows are owed unconditionally */
+                /* L117 (L049 inc 2): under overflow the ranked admission also
+                 * consults the COST TABLE — stop admitting once the next
+                 * candidate's survival is worth less than a marginal row
+                 * costs (ROWCOST 2026-08-26: marginal ~8.4 ms/row @512-depth
+                 * rising to ~11 by 2048, saturating with the indexer window;
+                 * value denominator = live EMA of ms per emitted token).
+                 * Binds ONLY under overflow — when everything fits the old
+                 * unconditional cap is byte-identical (isolation invariant,
+                 * see the lane-gate note above). vLLM #47808 is the same
+                 * design upstream. */
+                int max_depth = 0;
+                for (int i = 0; i < n; i++)
+                    if (dec[i]->gen && dec[i]->gen->phase == GEN_DECODE &&
+                        (int)dec[i]->committed_pos > max_depth)
+                        max_depth = (int)dec[i]->committed_pos;
+                float marginal_ms = 8.4f;
+                if (max_depth > 512) {
+                    const int d = max_depth < 2048 ? max_depth : 2048;
+                    marginal_ms += 2.6f * (float)(d - 512) / 1536.0f;
+                }
+                const float ema = s->spec_ms_per_tok_ema > 1.0f ?
+                                  s->spec_ms_per_tok_ema : 45.0f;
+                const float thr = marginal_ms / ema;
+                int budget = (int)PULSAR_SPEC_LOGITS_ROWS - n_live;
                 while (budget > 0) {
                     int bi = -1;
                     float bv = -1.0f;
@@ -1890,7 +1915,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                             bi = i;
                         }
                     }
-                    if (bi < 0) break;
+                    if (bi < 0 || bv < thr) break;
                     k_alloc[bi]++;
                     budget--;
                 }
@@ -1924,7 +1949,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             const uint32_t k_cap_rows = k_overflow
                 ? 1u + (uint32_t)k_alloc[i]
                 : pulsar_session_spec_next_rows_max(pool);
-            if (rows + k_cap_rows > 16u) {
+            if (rows + k_cap_rows > PULSAR_SPEC_LOGITS_ROWS) {
                 /* Over the shared-forward row budget even at the allocated
                  * K (can only happen when an earlier bank EOS'd/errored and
                  * the sweep shape shifted): sit this sweep out BEFORE the
@@ -1965,7 +1990,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (rows + pulsar_spec_round_n_rows(rounds[i]) > 16u) {
+            if (rows + pulsar_spec_round_n_rows(rounds[i]) > PULSAR_SPEC_LOGITS_ROWS) {
                 /* Unreachable: the pre-begin budget check bounds n_batch from
                  * above (begin only trims). Defensive backstop, checked
                  * BEFORE fill_reqs writes, so a future change to begin's row
@@ -2085,6 +2110,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
         }
     }
     free(logits);
+    if (emitted_total > 0) {
+        const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
+                                         (double)emitted_total);
+        s->spec_ms_per_tok_ema = s->spec_ms_per_tok_ema <= 0.0f ?
+                ms_per_tok : 0.9f * s->spec_ms_per_tok_ema + 0.1f * ms_per_tok;
+    }
     for (int i = 0; i < n; i++) {
         if (rounds[i]) pulsar_spec_round_free(rounds[i]);
         dec[i]->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);

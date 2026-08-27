@@ -120,12 +120,13 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     for (uint32_t k = 0; k < n_rows; k++)
         if (k + 1 == n_rows || reqs[k + 1].bank != reqs[k].bank) n_runs++;
     /* Inc 6 (ALL_ROWS): one logit row PER BATCH ROW, for the batched spec
-     * verify's accept walk. The head writes spec_logits, which holds 16 rows
-     * (the draft-depth ceiling) -- refuse louder rather than truncate. */
+     * verify's accept walk. The head writes spec_logits, which holds
+     * PULSAR_SPEC_LOGITS_ROWS rows -- refuse louder rather than truncate. */
     const uint32_t head_rows =
         (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) ? n_rows : n_runs;
-    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS && n_rows > 16u) {
-        PULSAR_MIXED_ERR("mixed decode: ALL_ROWS caps at 16 rows (n_rows=%u)", n_rows);
+    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS && n_rows > PULSAR_SPEC_LOGITS_ROWS) {
+        PULSAR_MIXED_ERR("mixed decode: ALL_ROWS caps at %u rows (n_rows=%u)",
+                      (unsigned)PULSAR_SPEC_LOGITS_ROWS, n_rows);
         return 1;
     }
     if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)head_rows * PULSAR_N_VOCAB) {

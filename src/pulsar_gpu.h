@@ -108,7 +108,13 @@
  * deepest speculative verify / multiseq head the engine ever emits
  * (PULSAR_MSEQ_MAX), NOT to prefill_cap -- guards on row indices must check
  * against THIS, or the 16 lives only in a comment. */
-#define PULSAR_SPEC_LOGITS_ROWS 16u
+#define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
+ * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
+ * measured sublinear c4 scaling); the ROWCOST table says marginal row cost
+ * is ~8-11 ms with no cliff, so a 32-row slab (+8.3 MB logits) lets the
+ * ranked allocator keep K near its survival optimum at c4. Every consumer
+ * derives from THIS constant (slab alloc, driver reject, lane arrays,
+ * dspark batch-capture buffer) -- audited 2026-08-27, rows/L117.md. */
 
 
 

@@ -5,6 +5,11 @@
 #define PULSAR_SERVER_INTERNAL_H
 
 #include "pulsar.h"
+/* L117: the spec-batched lane sizes its row arrays and admission budget from
+ * the engine's slab authority (PULSAR_SPEC_LOGITS_ROWS) instead of a mirrored
+ * literal -- one constant, no comment-enforced sync. The header is the
+ * self-contained backend seam (stdlib includes only). */
+#include "pulsar_gpu.h"
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
 #include "rax.h"
@@ -1191,6 +1196,11 @@ struct server {
      * attribution instrument). */
     uint64_t w_prefill_chunk_tokens;
     uint64_t m_prefill_chunk_tokens;
+    /* L117: live EMA of ms per emitted token in the spec-batched lane
+     * (worker-owned). Denominator of the overflow argmax's cost threshold:
+     * a marginal draft row is admitted while survival >= marginal_ms / this.
+     * 0 until the first quantum; the argmax uses a 45 ms prior until then. */
+    float    spec_ms_per_tok_ema;
     /* Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
