@@ -195,11 +195,17 @@ int main(int argc, char **argv) {
                         break;
                     }
                     ms[it] = (t1 - t0) * 1e3;
-                    /* Differential witness: hash the FIRST iteration's logits
-                     * (base depth, deterministic teacher-forced feed) so an
-                     * arm swap can be proven byte-exact across builds. */
-                    if (it == 0)
-                        cell_hash = fnv1a(logits, (size_t)rows * (size_t)vocab * sizeof(float));
+                    /* Differential witness: fold EVERY iteration's logits into
+                     * one running hash (teacher-forced feed is deterministic,
+                     * so iteration i's inputs are identical across runs). Two
+                     * runs of the same cell must agree bitwise — including
+                     * runs where later iterations take a replayed CUDA graph
+                     * (L119 segments) while early ones ran eager. */
+                    {
+                        unsigned long long ih = fnv1a(logits,
+                                (size_t)rows * (size_t)vocab * sizeof(float));
+                        cell_hash = fnv1a(&ih, sizeof ih) ^ (cell_hash * 1099511628211ull);
+                    }
                 }
                 /* Reset the touched banks for the next cell: repoint +
                  * re-prefill from scratch keeps every cell's starting frontier

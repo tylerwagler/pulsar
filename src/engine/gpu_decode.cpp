@@ -1711,7 +1711,40 @@ bool gpu_graph_encode_output_head(
  * tiny speculative suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
+static bool gpu_graph_encode_output_head_batch_impl(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               n_tokens,
+        uint64_t               vocab_dim);
+
+/* L119 segment bracket: the output head is round-invariant at fixed n_tokens
+ * (2026-08-27 audit — norm/mix/weights/vocab GEMM take only n_tokens and
+ * vocab_dim; no position, no frontier, no readback), so at decode widths it
+ * is captured once per n_tokens and replayed. Distinct head row counts
+ * (mixed-lane head_cap modes) key separately. */
 bool gpu_graph_encode_output_head_batch(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               n_tokens,
+        uint64_t               vocab_dim) {
+    if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+        const uint64_t key = (0xFFull << 16) | (2ull << 8) | n_tokens;
+        const int st = pulsar_gpu_seg_enter(key);
+        if (st == 2) return true;
+        if (st == 1) {
+            const bool ok = gpu_graph_encode_output_head_batch_impl(
+                    g, model, weights, n_tokens, vocab_dim);
+            if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
+            return ok ? gpu_graph_encode_output_head_batch_impl(
+                    g, model, weights, n_tokens, vocab_dim) : false;
+        }
+    }
+    return gpu_graph_encode_output_head_batch_impl(g, model, weights, n_tokens, vocab_dim);
+}
+
+static bool gpu_graph_encode_output_head_batch_impl(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,

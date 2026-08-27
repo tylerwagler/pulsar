@@ -2276,7 +2276,44 @@ bool gpu_graph_encode_layer_attention_batch(
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
+static bool gpu_graph_encode_layer_ffn_batch_impl(
+        pulsar_gpu_graph  *g,
+        const pulsar_model        *model,
+        const pulsar_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens);
+
+/* L119 segment bracket: the FFN half is round-invariant at fixed n_tokens
+ * (2026-08-27 audit, plan 119 — every launch is n_tokens-parameterized or
+ * reads device descriptors; no syncs, no readbacks, scratch quiescent after
+ * warm-up), so at decode widths it is captured once per (layer, n_tokens)
+ * and replayed thereafter. Wider shapes (prefill chunks) stay eager: prefill
+ * is at sweep-rate saturation (L112/L114) and big-shape graphs buy nothing. */
 bool gpu_graph_encode_layer_ffn_batch(
+        pulsar_gpu_graph  *g,
+        const pulsar_model        *model,
+        const pulsar_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens) {
+    if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+        const uint64_t key = ((uint64_t)il << 16) | (1ull << 8) | n_tokens;
+        const int st = pulsar_gpu_seg_enter(key);
+        if (st == 2) return true;
+        if (st == 1) {
+            const bool ok = gpu_graph_encode_layer_ffn_batch_impl(
+                    g, model, layer, il, pos0, n_tokens);
+            if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
+            /* capture failed: the recorded work never ran — run it live. */
+            return ok ? gpu_graph_encode_layer_ffn_batch_impl(
+                    g, model, layer, il, pos0, n_tokens) : false;
+        }
+    }
+    return gpu_graph_encode_layer_ffn_batch_impl(g, model, layer, il, pos0, n_tokens);
+}
+
+static bool gpu_graph_encode_layer_ffn_batch_impl(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
         const pulsar_layer_weights *layer,

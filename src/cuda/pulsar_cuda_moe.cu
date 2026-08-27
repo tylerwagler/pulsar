@@ -970,8 +970,11 @@ static int routed_moe_launch_mixed40(
     float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
     float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
 
-    /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1). */
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_b), "mixed40 counts clear");
+    /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1).
+     * L119: Async like its four siblings — the synchronous form is a CUDA
+     * stream-capture violation and this clear runs on every decode round's
+     * mixed-type layers (same stream, same ordering; behavior unchanged). */
+    int ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_b), "mixed40 counts clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_b), "mixed40 xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_b), "mixed40 ppair clear");
     /* -1 everywhere: rows the gather never visits ARE the padding rows, and the

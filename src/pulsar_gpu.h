@@ -207,6 +207,17 @@ int pulsar_gpu_flush_commands(void);
 int pulsar_gpu_end_commands(void);
 int pulsar_gpu_synchronize(void);
 
+/* L119 segment capture-or-replay for round-invariant decode-sweep stretches
+ * (plan 119 in pulsar-notes; supersedes the removed whole-sweep tape the
+ * comment above describes — the unified batch lane measures 92% GPU-busy
+ * unprofiled, and these reclaim its inter-launch gaps). seg_enter: 0 = run
+ * the body eagerly, 1 = capture armed (run body, then seg_exit), 2 = cached
+ * graph replayed (skip the body). seg_exit returning 0 means the captured
+ * work NEVER RAN — re-run the body eagerly. Armed by PULSAR_CUDA_GRAPH_SEG=1
+ * (read once at first use; development gate). Worker thread only. */
+int pulsar_gpu_seg_enter(uint64_t key);
+int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
+
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int pulsar_gpu_set_model_fd(int fd);
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);

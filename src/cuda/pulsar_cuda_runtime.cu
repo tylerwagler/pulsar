@@ -1396,6 +1396,108 @@ int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_byt
 int pulsar_gpu_begin_commands(void) { return 1; }
 
 
+/* ==== L119 segment capture-or-replay ========================================
+ *
+ * Small CUDA-graph cache for ROUND-INVARIANT stretches of the batched decode
+ * sweep (plan 119; the 2026-08-27 audit's verdict table says which stretches
+ * qualify). Keyed by (layer, phase, n_tokens); a key's first two uses run
+ * eager (scratch slots warm up — cudaMalloc during capture is illegal), the
+ * third is captured + instantiated + launched, later uses replay with one
+ * cudaGraphLaunch. Worker-thread only (like every sweep entry); ThreadLocal
+ * capture mode so other threads' CUDA ops are unaffected.
+ *
+ * This is NOT the old whole-sweep "graph tape" (removed at a +0.6% ceiling
+ * when classic decode was 98.9% GPU-busy — see pulsar_gpu.h): the unified
+ * spec-batched lane measures 92% busy unprofiled (L119), and these segments
+ * target exactly its inter-launch fragmentation.
+ *
+ * PULSAR_CUDA_GRAPH_SEG=1 arms it (read once; development gate — the default
+ * flips only with probe-hash bit-exactness + gates + a measured win, and the
+ * losing arm is then DELETED per the no-hot-path-flags rule). */
+typedef struct { uint64_t key; cudaGraphExec_t exec; uint32_t uses; } pulsar_seg_ent;
+#define PULSAR_SEG_SLOTS 1024u
+static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
+static int g_seg_on = -1;
+static int g_seg_capturing = 0;
+
+static pulsar_seg_ent *seg_find(uint64_t key) {
+    uint32_t h = (uint32_t)((key * 1099511628211ull) >> 33) % PULSAR_SEG_SLOTS;
+    for (uint32_t i = 0; i < PULSAR_SEG_SLOTS; i++) {
+        pulsar_seg_ent *e = &g_seg[(h + i) % PULSAR_SEG_SLOTS];
+        if (e->key == key) return e;
+        if (e->key == 0) { e->key = key; return e; }
+    }
+    return NULL;
+}
+
+/* 0 = run the body eagerly; 1 = capture armed (run the body, then seg_exit);
+ * 2 = replayed a cached graph (skip the body entirely). */
+int pulsar_gpu_seg_enter(uint64_t key) {
+    if (g_seg_on < 0) g_seg_on = getenv("PULSAR_CUDA_GRAPH_SEG") != NULL ? 1 : 0;
+    if (!g_seg_on || g_seg_capturing || key == 0) return 0;
+    pulsar_seg_ent *e = seg_find(key);
+    if (!e) return 0;
+    if (e->exec) {
+        if (cudaGraphLaunch(e->exec, cudaStreamPerThread) == cudaSuccess) return 2;
+        /* A failed replay poisons the entry: fall back to eager forever. */
+        (void)cudaGraphExecDestroy(e->exec);
+        e->exec = NULL;
+        e->uses = 0;
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (++e->uses < 3u) return 0;   /* two warm eager rounds per key */
+    if (cudaStreamBeginCapture(cudaStreamPerThread,
+                               cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_seg_capturing = 1;
+    return 1;
+}
+
+/* End a capture opened by seg_enter()==1. Returns 1 when the captured graph
+ * was instantiated, stored, and LAUNCHED (the body's work has now run).
+ * Returns 0 when capture failed — the recorded work NEVER EXECUTED and the
+ * caller must re-run the body eagerly. body_ok=0 aborts the capture. */
+int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
+    cudaGraph_t gr = NULL;
+    g_seg_capturing = 0;
+    const cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
+    if (!body_ok || rc != cudaSuccess || !gr) {
+        if (gr) (void)cudaGraphDestroy(gr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cudaGraphExec_t ex = NULL;
+    if (cudaGraphInstantiate(&ex, gr, NULL, NULL, 0) != cudaSuccess) {
+        (void)cudaGraphDestroy(gr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    (void)cudaGraphDestroy(gr);
+    if (cudaGraphLaunch(ex, cudaStreamPerThread) != cudaSuccess) {
+        (void)cudaGraphExecDestroy(ex);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    pulsar_seg_ent *e = seg_find(key);
+    if (e && !e->exec) {
+        e->exec = ex;
+    } else {
+        /* Table anomaly: keep correctness, drop the cache entry. */
+        (void)cudaGraphExecDestroy(ex);
+    }
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: L119 decode segment capture ACTIVE "
+                        "(PULSAR_CUDA_GRAPH_SEG)\n");
+    }
+    return 1;
+}
+
+
 /* L104 host-sync attack, fix A: flush/end wait on the PER-THREAD stream, not
  * the whole device.  Every launch in this engine lands on the per-thread
  * default stream (Makefile --default-stream per-thread; cuBLAS is pinned to
