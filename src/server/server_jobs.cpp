@@ -288,10 +288,15 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
      * run). Subsequent chunks are unchanged: delta tokens over delta time. */
     int interval_tokens = p->seen ? current - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
-    /* L114: chunk-granular prefill accounting (computed rows only — cached
-     * rows never reach a chunk event). Published per worker pass. */
-    if (p->srv && interval_tokens > 0)
-        p->srv->w_prefill_chunk_tokens += (uint64_t)interval_tokens;
+    /* L114: chunk-granular prefill accounting via the per-slot watermark
+     * (see session_slot.prefill_counted) — NOT interval_tokens, because the
+     * mixed lane's fused sub-chunks also advance the watermark and an
+     * interval here would recount them. Computed rows only. */
+    if (p->srv && p->slot && current > p->slot->prefill_counted) {
+        p->srv->w_prefill_chunk_tokens +=
+            (uint64_t)(current - p->slot->prefill_counted);
+        p->slot->prefill_counted = current;
+    }
     double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
@@ -916,6 +921,7 @@ void server::gen_begin(session_slot *sl) {
     g->trace_id = s->trace_begin(j, cached, prompt_tokens, &cache_diag,
                               cache_source, disk_cached, g->disk_cache_path);
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
+    sl->prefill_counted = cached;   /* L114 counter watermark: computed rows start here */
     g->progress = (server_prefill_progress){
         .srv = s,
         .slot = sl,

@@ -280,6 +280,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     sl->ctx_size = s->pool_ctx_size;              /* every bank shares pool ctx */
     sl->est_cost_bytes = s->bank_marginal_bytes;
     sl->tokens_emitted = 0;
+    sl->prefill_counted = 0;
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     sl->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->mu);
@@ -1014,6 +1015,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     sl->ctx_size = 0;
     sl->est_cost_bytes = 0;
     sl->tokens_emitted = 0;
+    sl->prefill_counted = 0;
     sl->last_serviced_us = 0;
     sl->continued_last_store_tokens = 0;
     /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
@@ -2293,13 +2295,16 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             break;   /* real decode failure -> stop */
         }
         pf_done += kthis;
-        /* NOTE (L114 counter): fused sub-chunks bypass server_progress_cb, so
-         * pulsar:prefill_chunk_tokens_total does not tick here — the NEXT
-         * classic chunk event's interval spans the fused stretch, so totals
-         * stay exact and ticking here too would double-count. Cost: the rate
-         * curve's resolution coarsens to the fused-stretch length while
-         * decode+prefill fusion is active. A per-slot counted-watermark shared
-         * by both sites is the fix if fused-granularity ever matters. */
+        /* L114 counter: fused sub-chunks bypass server_progress_cb — tick the
+         * chunk-granular counter through the per-slot watermark instead (the
+         * classic callback uses the same watermark, so the two sites compose
+         * without double-counting; pos_now + kthis is the same position
+         * coordinate the callback's chunk_end reports). */
+        if (kthis > 0 && pos_now + kthis > pf->prefill_counted) {
+            s->w_prefill_chunk_tokens +=
+                (uint64_t)(pos_now + kthis - pf->prefill_counted);
+            pf->prefill_counted = pos_now + kthis;
+        }
         if (kthis > 0 && pos_now + kthis == len) {
             /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
              * index m, last-of-run) as the decode seed for the handoff. */

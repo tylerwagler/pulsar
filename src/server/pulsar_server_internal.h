@@ -1017,6 +1017,14 @@ typedef struct {
                                              the true-cost estimate only gates
                                              admission before the create) */
     uint64_t     tokens_emitted;          /* decode bookkeeping for the scheduler */
+    /* L114 counter watermark: session position up to which computed prefill
+     * rows have been ticked into w_prefill_chunk_tokens. Advanced by BOTH the
+     * classic progress callback and the mixed lane's fused sub-chunk commit
+     * (same position coordinate), so their overlap can never double-count.
+     * Reset to the resume/cached position at each prefill start. Monotone
+     * per prefill: a rebuild that recomputes below the mark deliberately does
+     * not re-tick (position-progress semantics, not GPU-work accounting). */
+    int          prefill_counted;
     uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler) */
     /* Per-conversation continued-store frontier (see kv_cache_tracker_bind):
      * the shared pulsar_kvstore keeps one continued_last_store_tokens field, but
