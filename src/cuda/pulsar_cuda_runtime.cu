@@ -1414,7 +1414,7 @@ int pulsar_gpu_begin_commands(void) { return 1; }
  * PULSAR_CUDA_GRAPH_SEG=1 arms it (read once; development gate — the default
  * flips only with probe-hash bit-exactness + gates + a measured win, and the
  * losing arm is then DELETED per the no-hot-path-flags rule). */
-typedef struct { uint64_t key; cudaGraphExec_t exec; uint32_t uses; } pulsar_seg_ent;
+typedef struct { uint64_t key; cudaGraphExec_t exec; uint32_t uses; int dead; } pulsar_seg_ent;
 #define PULSAR_SEG_SLOTS 1024u
 static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
 static int g_seg_on = -1;
@@ -1445,7 +1445,7 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     if (g_seg_on == 2 && phase != 2) return 0;
     if (g_seg_on == 3 && phase != 1) return 0;
     pulsar_seg_ent *e = seg_find(key);
-    if (!e) return 0;
+    if (!e || e->dead) return 0;
     if (e->exec) {
         if (cudaGraphLaunch(e->exec, cudaStreamPerThread) == cudaSuccess) return 2;
         /* A failed replay poisons the entry: fall back to eager forever. */
@@ -1474,6 +1474,19 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     g_seg_capturing = 0;
     const cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
     if (!body_ok || rc != cudaSuccess || !gr) {
+        /* A capture that failed (or a body that failed UNDER capture — a
+         * mid-capture violation can fail an otherwise-good body) poisons the
+         * key: this segment stays eager forever. One-shot diagnosis line so
+         * the violating call names itself instead of cascading silently. */
+        static int announced_fail = 0;
+        if (!announced_fail) {
+            announced_fail = 1;
+            fprintf(stderr, "pulsar: L119 segment capture FAILED for key %llx "
+                            "(body_ok=%d, end=%s) -> key poisoned, eager\n",
+                    (unsigned long long)key, body_ok, cudaGetErrorString(rc));
+        }
+        pulsar_seg_ent *pe = seg_find(key);
+        if (pe) pe->dead = 1;
         if (gr) (void)cudaGraphDestroy(gr);
         (void)cudaGetLastError();
         return 0;

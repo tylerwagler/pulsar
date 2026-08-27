@@ -1744,8 +1744,12 @@ bool gpu_graph_encode_output_head_batch(
             const bool ok = gpu_graph_encode_output_head_batch_impl(
                     g, model, weights, n_tokens, vocab_dim);
             if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
-            return ok ? gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, n_tokens, vocab_dim) : false;
+            /* Capture failed (key now poisoned): the recorded work never ran,
+             * and a mid-capture violation can fail an otherwise-good body —
+             * run the body for real regardless of ok; a REAL body failure
+             * simply fails again here and propagates. */
+            return gpu_graph_encode_output_head_batch_impl(
+                    g, model, weights, n_tokens, vocab_dim);
         }
     }
     return gpu_graph_encode_output_head_batch_impl(g, model, weights, n_tokens, vocab_dim);
