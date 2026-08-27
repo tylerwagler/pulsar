@@ -42,6 +42,8 @@ __pycache__/
 /temp/
 /tests/bank_evict_restore_gate
 /tests/bank_fork_gate
+/tests/session_payload_gate
+/tests/kv4_pack_gate
 /tests/algo_stability_gate
 /tests/mixed_prefill_gate
 /tests/mixed_neutrality_gate
