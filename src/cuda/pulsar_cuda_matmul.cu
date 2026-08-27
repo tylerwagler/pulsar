@@ -1097,7 +1097,8 @@ void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
 static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const char *what) {
     if (*cap >= need) return 1;
     void *p = NULL;
-    if (*buf) { (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
+    if (*buf) { pulsar_gpu_seg_note_device_free();   /* stale baked pointers */
+                (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
     if (cudaMalloc(&p, need) != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr, "pulsar: MXFP8 activation cache alloc failed for %s (%.2f MiB)\n",

@@ -1068,7 +1068,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   const size_t midq_bytes = midq_elems + midq_elems / 32u;
   const size_t need = (xq_bytes + 3u) / 4u + (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
-    if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
+    if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free(); cudaFree(g_fp4_gemv_actbuf); }
     g_fp4_gemv_actbuf = nullptr;
     if (cudaMalloc(&g_fp4_gemv_actbuf, need * sizeof(float)) != cudaSuccess) {
       g_fp4_gemv_actbuf_floats = 0;
@@ -1145,7 +1145,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
  * f32 accumulators the caller composes with the dp4a side. Persistent actbuf grown on demand. */
 static int gemv_actbuf_ensure(size_t need_floats) {
   if (need_floats <= g_fp4_gemv_actbuf_floats) return 1;
-  if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
+  if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free(); cudaFree(g_fp4_gemv_actbuf); }
   g_fp4_gemv_actbuf = nullptr;
   if (cudaMalloc(&g_fp4_gemv_actbuf, need_floats * sizeof(float)) != cudaSuccess) { g_fp4_gemv_actbuf_floats = 0; return 0; }
   g_fp4_gemv_actbuf_floats = need_floats;

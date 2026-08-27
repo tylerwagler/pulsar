@@ -218,6 +218,7 @@ static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
      * cudaFree below is what makes it worse.  One live arena per slot. */
     if (g_cuda_tmp_bytes[slot] >= bytes) return g_cuda_tmp[slot];
     if (g_cuda_tmp[slot]) {
+        pulsar_gpu_seg_note_device_free();   /* baked scratch pointers die */
         (void)cudaFree(g_cuda_tmp[slot]);
         g_cuda_tmp[slot] = NULL;
         g_cuda_tmp_bytes[slot] = 0;
@@ -1481,7 +1482,13 @@ int pulsar_gpu_seg_enter(uint64_t key) {
  * later session reusing (or re-receiving) those addresses would replay
  * against freed state — the multiseq/bank gates create sessions repeatedly
  * and caught exactly this (4 gate FAILs, 2026-08-27). Worker thread only. */
+static int g_seg_reset_pending = 0;
+
 void pulsar_gpu_seg_reset(void) {
+    if (g_seg_capturing) {           /* mid-capture: defer to seg_exit */
+        g_seg_reset_pending = 1;
+        return;
+    }
     for (uint32_t i = 0; i < PULSAR_SEG_SLOTS; i++) {
         if (g_seg[i].exec) (void)cudaGraphExecDestroy(g_seg[i].exec);
         g_seg[i].key = 0;
@@ -1489,6 +1496,20 @@ void pulsar_gpu_seg_reset(void) {
         g_seg[i].uses = 0;
         g_seg[i].dead = 0;
     }
+    g_seg_reset_pending = 0;
+}
+
+
+/* L119/L117 root-cause hook: captured segment graphs bake pointers into
+ * grow-realloc device scratch (tmp slots, arenas, act buffers). ANY
+ * free-then-realloc growth makes every cached exec stale — the sanitizer
+ * caught a replayed head writing 970 MB past a freed tmp slot after a
+ * later request's prefill regrew it (f32_to_bf16_kernel, 2026-08-27,
+ * rows/L119.md). Growth sites call this; captures rebuild in a few rounds.
+ * A sync at the free site prevents the race but NOT the staleness — only
+ * invalidation does. */
+void pulsar_gpu_seg_note_device_free(void) {
+    pulsar_gpu_seg_reset();
 }
 
 
@@ -1529,6 +1550,14 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         (void)cudaGraphExecDestroy(ex);
         (void)cudaGetLastError();
         return 0;
+    }
+    if (g_seg_reset_pending) {
+        /* A scratch regrow happened DURING this capture: the freshly
+         * instantiated graph already ran (work is done) but its baked
+         * pointers may be stale for future replays — drop everything. */
+        (void)cudaGraphExecDestroy(ex);
+        pulsar_gpu_seg_reset();
+        return 1;
     }
     pulsar_seg_ent *e = seg_find(key);
     if (e && !e->exec) {

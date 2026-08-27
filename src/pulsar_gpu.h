@@ -226,6 +226,8 @@ int pulsar_gpu_seg_enter(uint64_t key);
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
+void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
+                                    * scratch free: baked pointers go stale */
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int pulsar_gpu_set_model_fd(int fd);
