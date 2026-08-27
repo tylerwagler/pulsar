@@ -1420,9 +1420,13 @@ static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
 static int g_seg_on = -1;
 static int g_seg_capturing = 0;
 
+static uint64_t g_seg_n_replay, g_seg_n_capture, g_seg_n_eager;
+
 static pulsar_seg_ent *seg_find(uint64_t key) {
     uint32_t h = (uint32_t)((key * 1099511628211ull) >> 33) % PULSAR_SEG_SLOTS;
-    for (uint32_t i = 0; i < PULSAR_SEG_SLOTS; i++) {
+    /* Bounded probe: a full/degenerate table must cost O(64), not O(slots),
+     * per segment call — misses fall back to eager. */
+    for (uint32_t i = 0; i < 64u; i++) {
         pulsar_seg_ent *e = &g_seg[(h + i) % PULSAR_SEG_SLOTS];
         if (e->key == key) return e;
         if (e->key == 0) { e->key = key; return e; }
@@ -1447,7 +1451,14 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     pulsar_seg_ent *e = seg_find(key);
     if (!e || e->dead) return 0;
     if (e->exec) {
-        if (cudaGraphLaunch(e->exec, cudaStreamPerThread) == cudaSuccess) return 2;
+        if (cudaGraphLaunch(e->exec, cudaStreamPerThread) == cudaSuccess) {
+            if ((++g_seg_n_replay % 4096u) == 0u)
+                fprintf(stderr, "pulsar: L119 seg stats: %llu replays, %llu captures, %llu eager\n",
+                        (unsigned long long)g_seg_n_replay,
+                        (unsigned long long)g_seg_n_capture,
+                        (unsigned long long)g_seg_n_eager);
+            return 2;
+        }
         /* A failed replay poisons the entry: fall back to eager forever. */
         (void)cudaGraphExecDestroy(e->exec);
         e->exec = NULL;
@@ -1455,13 +1466,20 @@ int pulsar_gpu_seg_enter(uint64_t key) {
         (void)cudaGetLastError();
         return 0;
     }
-    if (++e->uses < 3u) return 0;   /* two warm eager rounds per key */
+    /* Capture only genuinely HOT shapes: adaptive-K makes rows wobble, and
+     * capturing every transient (layer, rows, parity) combo is an
+     * instantiate storm that measured SLOWER than eager (16.2 vs 18.6 t/s
+     * solo). Transient shapes stay eager; the hot steady-state set (a few
+     * rows values) crosses the threshold quickly. */
+    e->uses++;
+    if (e->uses < 12u) { g_seg_n_eager++; return 0; }
     if (cudaStreamBeginCapture(cudaStreamPerThread,
                                cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
     g_seg_capturing = 1;
+    g_seg_n_capture++;
     return 1;
 }
 
