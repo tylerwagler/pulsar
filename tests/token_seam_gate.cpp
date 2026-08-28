@@ -18,9 +18,17 @@
  *      hold the canonical fused id instead).
  *   3. SHORTER ECHO (the production shape): live additionally carries a
  *      tail the echo does not — the client strips generated reasoning — so
- *      the echo both re-tokenizes AND ends before the live frontier. Same
- *      retention discriminator; this is the shape the resolver's old
- *      `common == old_pos` gate could never serve warm.
+ *      the echo both re-tokenizes AND ends before the live frontier.
+ *      SCOPE, measured 2026-08-28: this leg is a BEHAVIOUR PIN, not a
+ *      discriminator for the increment-2 sync generalization — it passes
+ *      with the old seam-only rescue condition too, because its shared
+ *      prefix contains a seam and that alone fires the old rescue.  It
+ *      cannot be made discriminating at this level: with no seam, a
+ *      rewind-and-stitch and a rebuild produce identical ids, identical
+ *      length and identical KV, so they differ only in COST.  The change
+ *      that altered production outcomes is the server resolver gate, and
+ *      its witness is the e2e shorter-echo probe (in-place extension vs
+ *      `live kv cache miss` + disk load), not this gate.
  *
  * The seam pair is discovered from the model's own vocabulary at runtime: a
  * multi-byte token whose text re-tokenizes as 2+ non-empty-text tokens with
