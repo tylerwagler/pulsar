@@ -64,8 +64,9 @@ This fork also stands on:
 ## Status
 
 This is **beta quality**, but releases ship regularly. The current release
-serves the **v4 (0731) artifact** — DeepSeek-V4-Flash-0731 weights, the full
-256-expert set, the matching 0731 DSpark drafter merged in-file, and the
+serves the **v5 (0731, srcfmt) artifact** — DeepSeek-V4-Flash-0731 weights
+carrying the checkpoint's native numerics, the REAP-25 per-layer expert trim,
+the matching 0731 DSpark drafter merged in-file, and the
 type-43 `IQ2_XXS_MMQ` aligned pre-store (see Model Weights). The inference
 path, the MXFP4/MXFP8/IQ2 quantization, and speculative decoding are validated
 against the tests in this tree and the `tool-eval-bench` quality suite — the
@@ -200,10 +201,13 @@ A few things this fork's GGUFs do beyond upstream:
   the REAP-25 (LiveCodeBench-50-calibrated) prune published by
   [eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4),
   vendored and applied by the quantizer's `--reap-survivors` (full build in
-  [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md)).  **The v4 (0731) line is NOT pruned** — the
-  MLA KV ledger leaves ~20 GiB of headroom on the GB10 even with the full
-  256-expert set resident (measured: twelve 32k sessions plus a 384k-context
-  window fit comfortably), so v4 keeps every expert.
+  [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md)).  **Every shipped release is REAP-25 trimmed
+  with a per-layer keep policy**: layers 3–42 keep 192 of 256 routed
+  experts, the first three layers keep the full 256.  The keep counts ship
+  in the GGUF header (`reap.layer.keep_count`) — verifiable from the file
+  itself.  (Earlier revisions of this README claimed the v4 line was
+  unpruned; the shipped v4 file's header says otherwise, and the claim was
+  an error.)
 - **Merged DSpark drafter.** The speculative drafter's tensors ship inside
   the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
   speculative decoding section below.
@@ -211,19 +215,19 @@ A few things this fork's GGUFs do beyond upstream:
 `download_model.sh` fetches this fork's shipped GGUF from our release repo:
 
 ```sh
-./download_model.sh v4          # current release: 0731 weights, full 256 experts, type-43 pre-store
+./download_model.sh v5          # current release: 0731 weights, srcfmt numerics, type-43 pre-store
 ```
 
-This release ships **one artifact**.  `v4` downloads `ds4flash-v4.gguf`
-(92,495,809,696 bytes, sha256
-`2e9879170bb1f98f9091e74bf519e3cea5f0310dda8a41a59b3c4e9d1c7214c2`):
-DeepSeek-V4-Flash-**0731** weights, the full 256-expert
-set (this line is not REAP-pruned), the 0731 DSpark drafter merged in-file,
+`v5` downloads `ds4flash-v5.gguf` (92,769,087,904 bytes, sha256
+`997098411c5082934c6f69bc05e22d16720e5eca4aeebeda1805a8274f5f2e8f`):
+DeepSeek-V4-Flash-**0731** weights on the srcfmt lineage (BF16 source
+tensors end to end, byte-lossless MXFP8/MXFP4 re-encodes, NVFP4 runtime
+KV), the REAP-25 per-layer expert trim, the 0731 DSpark drafter merged in-file,
 2-bit experts in the type-43 `IQ2_XXS_MMQ` aligned pre-store with 16 layers
 promoted to CUTLASS `MXFP4`, and MXFP8 attention/shared/head.  **Requires an
 engine with type-43 support** (this release); older engines reject it at
-load.  Older artifact lines are no longer published — the release repo hosts
-the latest only.
+load.  The release repo also hosts the previous line's `ds4flash-v4.gguf`
+(pre-srcfmt) for rollback; older lines are no longer published.
 
 It comes from
 <https://huggingface.co/twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF>,
@@ -266,8 +270,8 @@ full flag list, and start serving with:
 
 ### Current branch (2026-08-09, GB10, locked clocks)
 
-Measured with `pulsar-bench` at `sudo nvidia-smi -lgc 2600` on the full
-256-expert (un-pruned) `v5mx4-0731-mmqaligned` artifact — IQ2_XXS_MMQ
+Measured with `pulsar-bench` at `sudo nvidia-smi -lgc 2600` on the
+`v5mx4-0731-mmqaligned` artifact — IQ2_XXS_MMQ
 (type 43) routed experts with 16 layers at CUTLASS MXFP4 (type 40).  Three
 numeric tiers are **on by default** on this branch, each behind an `=0`
 opt-out and each gated by measured fidelity (suite-v1 teacher-forced KL and

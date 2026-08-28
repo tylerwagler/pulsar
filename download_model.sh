@@ -6,13 +6,20 @@ set -e
 # the DSpark drafter merged in-file (auto-enabled on load).  The repo is
 # public; no token is required for the download.
 REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
-# v4: DeepSeek-V4-Flash-0731 weights, FULL 256-expert set (this line is not
-# REAP-pruned; the repo name is a holdover from the v3 line), 0731 DSpark
-# drafter merged in-file, 2-bit routed experts in the type-43 IQ2_XXS_MMQ
-# aligned-SoA pre-store (tensor-core layout baked at quantize time -- no
-# boot-time repack), 16 quality-sensitive expert layers at CUTLASS MXFP4,
-# MXFP8 attention/shared/head.  Requires an engine with type-43 support;
-# older engines reject it at load.
+# Every release in this line is REAP-25 trimmed with a per-layer keep
+# policy: layers 3-42 keep 192 of 256 routed experts, the first three
+# layers keep the full 256 (the keep counts ship in the GGUF header,
+# reap.layer.keep_count).  Earlier docs claimed the v4 line was unpruned;
+# that was an error -- the shipped file's header says otherwise.
+#
+# v5 (current): the srcfmt line.  DeepSeek-V4-Flash-0731 weights carrying
+# the checkpoint's native numerics end to end (BF16 source tensors, MXFP8
+# E4M3 byte-lossless re-encode, MXFP4 byte-lossless experts on the
+# quality-sensitive layers, 2-bit IQ2_XXS_MMQ aligned pre-store on the
+# rest), 0731 DSpark drafter merged in-file, NVFP4 runtime KV.  Fidelity
+# gated against unquantized B300 reference logits.
+# v4 (previous): the pre-srcfmt build, same expert allocation shape.
+V5_FILE="ds4flash-v5.gguf"
 V4_FILE="ds4flash-v4.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -28,21 +35,24 @@ usage() {
 DeepSeek V4 Flash GGUF downloader (ds4 / DwarfStar)
 
 Usage:
-  ./download_model.sh v4 [--token TOKEN]
+  ./download_model.sh v5 [--token TOKEN]
 
-Target:
+Targets:
 
-  v4     Current release build, about 92 GB on disk: DeepSeek-V4-Flash-0731
-         weights with the FULL 256-expert set, the 0731 DSpark drafter
-         merged in-file, and the measured precision allocation -- 2-bit
-         routed experts in the type-43 IQ2_XXS_MMQ aligned-SoA pre-store
-         (tensor-core layout baked at quantize time: no boot-time repack,
-         the engine starts serving in ~21 s), 16 quality-sensitive expert
-         layers at CUTLASS MXFP4, MXFP8 attention/shared/head.  Targets a
-         single NVIDIA GB10 (~121 GB usable) with room for very deep
-         context (measured: full tool-calling coherence at ~295k live
-         tokens).  Requires a pulsar engine with type-43 support, built
-         with CUDA_ARCH=sm_120f.
+  v5     Current release build (srcfmt line), about 93 GB on disk:
+         DeepSeek-V4-Flash-0731 weights carrying the checkpoint's native
+         numerics end to end (BF16 source tensors, byte-lossless MXFP8/
+         MXFP4 re-encodes), the 0731 DSpark drafter merged in-file, and
+         the measured precision allocation -- 2-bit routed experts in the
+         type-43 IQ2_XXS_MMQ aligned-SoA pre-store (tensor-core layout
+         baked at quantize time: no boot-time repack), 16 quality-
+         sensitive expert layers at CUTLASS MXFP4, MXFP8 attention/
+         shared/head, REAP-25 per-layer expert trim.  Fidelity gated
+         against unquantized B300 reference logits.  Targets a single
+         NVIDIA GB10 (~121 GB usable) with room for very deep context.
+         Requires a pulsar engine built with CUDA_ARCH=sm_120f.
+
+  v4     Previous release (pre-srcfmt), about 92 GB on disk.
 
 Options:
   --token TOKEN  Hugging Face token (optional; the repo is public). Otherwise
@@ -69,6 +79,7 @@ MODEL=$1
 shift
 
 case "$MODEL" in
+    v5) MODEL_FILE=$V5_FILE ;;
     v4) MODEL_FILE=$V4_FILE ;;
     -h|--help|help)
         usage
@@ -76,7 +87,7 @@ case "$MODEL" in
         ;;
     *)
         echo "Unknown model: $MODEL" >&2
-        echo "This release ships one artifact; use: ./download_model.sh v4" >&2
+        echo "Use: ./download_model.sh v5   (or v4 for the previous release)" >&2
         exit 1
         ;;
 esac
