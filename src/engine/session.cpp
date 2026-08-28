@@ -911,8 +911,15 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
     if (s->checkpoint_valid) {
         int live_n = 0, prompt_n = 0;
         s->common_prefix_bytes(prompt, &live_n, &prompt_n);
-        const int id_common = s->common_prefix(prompt);
-        if (live_n > 0 && live_n > id_common) {
+        /* Fires for every shape that reaches here with reusable live bytes:
+         *   - SEAM: live_n > id-common (sampled vs canonical boundaries);
+         *   - SHORTER ECHO: the client strips generated reasoning, so live
+         *     carries a tail the prompt does not (live_n < checkpoint.len)
+         *     -- measured 2026-08-28, live 390,258 vs echo 390,018;
+         *   - ROLLBACK/COMPACTION: the prompt is a strict prefix of live.
+         * All three are the same conversation, so the rewind+stitch below
+         * beats a rebuild; stitching is never worse (prompt_n >= 0). */
+        if (live_n > 0) {
             s->rewind(live_n);
             pulsar_tokens stitched;
             memset(&stitched, 0, sizeof(stitched));

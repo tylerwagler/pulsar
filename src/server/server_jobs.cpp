@@ -772,13 +772,13 @@ void server::gen_begin(session_slot *sl) {
      * from position 0 regardless of what this bank served before.  The
      * choke-point twins live in slot_common_prefix (routing) and the live
      * resolvers below. */
-    int common = 0;
+    int common = 0;          /* LIVE-side byte-common (bank KV currency) */
+    int common_prompt = 0;   /* PROMPT-side byte-common (accounting currency) */
     if (!s->eval_pin) {
         /* L115: byte-equal live common (see slot_common_prefix) — seams in
-         * generated history keep the live KV; sync's seam-rescue stitches. */
-        int live_n = 0, prompt_n = 0;
-        pulsar_session_common_prefix_bytes(s->sess, &j->req.prompt, &live_n, &prompt_n);
-        common = live_n;
+         * generated history keep the live KV; sync's seam-rescue stitches.
+         * The two counts differ exactly by the seam deltas. */
+        pulsar_session_common_prefix_bytes(s->sess, &j->req.prompt, &common, &common_prompt);
     }
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
@@ -850,7 +850,27 @@ void server::gen_begin(session_slot *sl) {
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0) {
-        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+        /* L115 increment 2: the live KV serves any prompt whose BYTES are a
+         * prefix of the live history — not only an exact extension.  The
+         * shape that kept recurring is a SHORTER echo: the client strips
+         * generated reasoning, so live carries a tail the prompt does not
+         * (measured 2026-08-28: live 390,258 vs echo 390,018, plus seams),
+         * and the old `common == old_pos` gate could never pass it.
+         * Falling through is expensive, not merely slower: the disk path
+         * below REPLACES the live session with a snapshot — that day a 390k
+         * live history was discarded for a 281k one and 108,360 tokens were
+         * re-prefilled.  Serving it is safe because sync rewinds to the
+         * byte-matched live token and stitches, and rewind is position-true
+         * and value-true since L120/L124.
+         * The half-of-prompt guard keeps a genuinely different conversation
+         * (sharing only a system preamble) on its own disk snapshot. */
+        const bool pure_extension =
+            common == old_pos && j->req.prompt.len >= old_pos;
+        const bool byte_prefix_reuse =
+            common_prompt > 0 && common_prompt * 2 >= j->req.prompt.len;
+        cached = pure_extension ? common
+               : byte_prefix_reuse ? common_prompt
+               : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
     if (cached == 0) {

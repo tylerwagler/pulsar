@@ -16,6 +16,11 @@
  *      (b) end at the stitched length, and (c) RETAIN the live split ids at
  *      the seam — retention proves the live KV survived (a rebuild would
  *      hold the canonical fused id instead).
+ *   3. SHORTER ECHO (the production shape): live additionally carries a
+ *      tail the echo does not — the client strips generated reasoning — so
+ *      the echo both re-tokenizes AND ends before the live frontier. Same
+ *      retention discriminator; this is the shape the resolver's old
+ *      `common == old_pos` gate could never serve warm.
  *
  * The seam pair is discovered from the model's own vocabulary at runtime: a
  * multi-byte token whose text re-tokenizes as 2+ non-empty-text tokens with
@@ -80,7 +85,7 @@ int main(int argc, char **argv) {
     memset(&canon, 0, sizeof(canon));
     pulsar_tokenize_text(e, text, &canon);
     free(text);
-    if (canon.len < 200) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (canon.len < 800) { fprintf(stderr, "prompt too short\n"); return 1; }
 
     /* ---- discover a seam pair: canon[k] whose text re-tokenizes split ---- */
     int k = -1;
@@ -176,6 +181,71 @@ int main(int argc, char **argv) {
             CHECK(toks->v[want_len - 1] == canon.v[c2 - 1],
                   "suffix tail %d want %d", toks->v[want_len - 1], canon.v[c2 - 1]);
         }
+        pulsar_session_free(s);
+    }
+
+    /* ---- leg 3: SHORTER echo (the production shape) ----------------------
+     * Live carries a tail the client's echo does not — it strips generated
+     * reasoning, so the echo both re-tokenizes across the seam AND ends
+     * before the live frontier (measured 2026-08-28: live 390,258 vs echo
+     * 390,018).  The old resolver gate demanded the echo consume the whole
+     * live history, so this shape could never be served warm and fell to a
+     * disk snapshot that REPLACED the live session.  Same retention
+     * discriminator as leg 2: split ids surviving proves the live KV was
+     * rewound and stitched rather than rebuilt. */
+    {
+        pulsar_session *s = NULL;
+        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+        char err[256];
+        const int l1 = k + split.len + 8;      /* shared region, live boundaries */
+        const int tail = 30;                   /* "generated reasoning", stripped */
+        pulsar_tokens plive;
+        memset(&plive, 0, sizeof(plive));
+        plive.v = (int *)malloc(sizeof(int) * (size_t)(l1 + tail));
+        plive.cap = l1 + tail;
+        memcpy(plive.v, live, sizeof(int) * (size_t)l1);
+        memcpy(plive.v + l1, canon.v + 400, sizeof(int) * (size_t)tail);
+        plive.len = l1 + tail;
+        CHECK(pulsar_session_sync(s, &plive, err, sizeof(err)) == 0,
+              "leg3 live sync failed: %s", err);
+
+        /* Echo: canonical render of the SHARED bytes only, plus a new turn. */
+        const int c1 = k + 1 + 8;
+        const int newn = 12;
+        pulsar_tokens pecho;
+        memset(&pecho, 0, sizeof(pecho));
+        pecho.v = (int *)malloc(sizeof(int) * (size_t)(c1 + newn));
+        pecho.cap = c1 + newn;
+        memcpy(pecho.v, canon.v, sizeof(int) * (size_t)c1);
+        memcpy(pecho.v + c1, canon.v + 700, sizeof(int) * (size_t)newn);
+        pecho.len = c1 + newn;
+
+        /* The walk must stop at the shared boundary, not inside either tail —
+         * assert it so the leg cannot silently test a different shape. */
+        int a_n = 0, b_n = 0;
+        pulsar_engine_token_common_bytes(e, plive.v, plive.len, pecho.v, pecho.len,
+                                         &a_n, &b_n);
+        CHECK(a_n == l1 && b_n == c1,
+              "leg3 walk (%d,%d) want (%d,%d) — tails may share a leading byte",
+              a_n, b_n, l1, c1);
+
+        CHECK(pulsar_session_sync(s, &pecho, err, sizeof(err)) == 0,
+              "leg3 echo sync failed: %s", err);
+        const int want_len = l1 + newn;
+        CHECK(pulsar_session_pos(s) == want_len,
+              "leg3 stitched length %d want %d (rebuild would give %d)",
+              pulsar_session_pos(s), want_len, c1 + newn);
+        const pulsar_tokens *toks = pulsar_session_tokens(s);
+        if (toks && toks->len == want_len) {
+            CHECK(toks->v[k] == split.v[0] && toks->v[k + 1] == split.v[1],
+                  "leg3 seam ids replaced (%d,%d) want (%d,%d) — live KV was rebuilt",
+                  toks->v[k], toks->v[k + 1], split.v[0], split.v[1]);
+            CHECK(toks->v[want_len - 1] == canon.v[700 + newn - 1],
+                  "leg3 suffix tail %d want %d",
+                  toks->v[want_len - 1], canon.v[700 + newn - 1]);
+        }
+        free(pecho.v);
+        free(plive.v);
         pulsar_session_free(s);
     }
 
