@@ -79,6 +79,95 @@ static bool sync_prefix(pulsar_session *s, pulsar_tokens *toks, int len) {
     return rc == 0;
 }
 
+/* Extend the session by exactly one token via sync — pos0 is unaligned so
+ * this takes the per-row store/shift path, never the aligned prefill (whose
+ * ratio-4 window refresh would heal the contamination this leg exists to
+ * detect). */
+static bool extend_one(pulsar_session *s, pulsar_tokens *toks, int upto) {
+    pulsar_tokens p;
+    memset(&p, 0, sizeof(p));
+    p.v = toks->v;
+    p.len = p.cap = upto;
+    char err[256];
+    const int rc = pulsar_session_sync(s, &p, err, sizeof(err));
+    if (rc != 0) fprintf(stderr, "extend to %d failed: %s\n", upto, err);
+    return rc == 0;
+}
+
+/* FNV-1a over attn comp rows 30..32 and (ratio 4) index comp rows 30..32
+ * of every compressing layer, read raw D2H off the classic single-session
+ * caches. */
+static uint64_t comp_rows_hash(pulsar_session *s) {
+    pulsar_gpu_graph *g = &s->graph;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    uint64_t h = 1469598103934665603ull;
+    uint8_t buf[8192];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio != 4) continue;
+        for (uint32_t row = 30; row <= 32; row++) {
+            if (row >= g->layer_n_comp[il]) continue;
+            if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
+                                      (uint64_t)row * attn_row, buf, attn_row) == 0)
+                return 0;
+            for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+            if (row >= g->layer_n_index_comp[il]) continue;
+            if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il],
+                                      (uint64_t)row * idx_row, buf, idx_row) == 0)
+                return 0;
+            for (uint64_t i = 0; i < idx_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+        }
+    }
+    return h;
+}
+
+/* One value-leg session: prefill 0..126; if ghost_branch is set, extend
+ * one-at-a-time through the DIVERGENT tokens to 130 and rewind to 126;
+ * then extend one-at-a-time through the true tokens to 134; hash the
+ * re-emitted comp rows. */
+static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
+                               const pulsar_tokens *ghost_branch) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "value leg: session create failed\n"); return 0; }
+    uint64_t h = 0;
+    pulsar_tokens work;
+    memset(&work, 0, sizeof(work));
+    work.v = (int *)malloc(sizeof(int) * 256);
+    work.cap = 256;
+    memcpy(work.v, toks->v, sizeof(int) * 134);
+    work.len = 134;
+    bool ok = true;
+    {
+        pulsar_tokens p;
+        memset(&p, 0, sizeof(p));
+        p.v = work.v;
+        p.len = p.cap = 126;
+        char err[256];
+        ok = pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
+        if (!ok) fprintf(stderr, "value leg: base prefill failed: %s\n", err);
+    }
+    if (ok && ghost_branch) {
+        int saved[4];
+        memcpy(saved, work.v + 126, sizeof(saved));
+        memcpy(work.v + 126, ghost_branch->v, sizeof(int) * 4);
+        for (int upto = 127; ok && upto <= 130; upto++)
+            ok = extend_one(s, &work, upto);
+        if (ok) {
+            pulsar_session_rewind(s, 126);
+            ok = pulsar_session_pos(s) == 126;
+            if (!ok) fprintf(stderr, "value leg: rewind landed at %d\n", pulsar_session_pos(s));
+        }
+        memcpy(work.v + 126, saved, sizeof(saved));
+    }
+    for (int upto = 127; ok && upto <= 134; upto++)
+        ok = extend_one(s, &work, upto);
+    if (ok) h = comp_rows_hash(s);
+    free(work.v);
+    pulsar_session_free(s);
+    return h;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
@@ -136,6 +225,34 @@ int main(int argc, char **argv) {
     check_frontiers(s, 260, "second continuation");
 
     pulsar_session_free(s);
+
+    /* ---- 4. VALUE leg (L120 value-half): the comp rows a ghost rewind
+     * re-emits must be byte-identical to a session that never saw the
+     * ghosts.  Ghosts are decoded via single-token syncs (the per-row
+     * store/shift path — aligned prefill would heal the window via its
+     * refresh and mask the bug), with a DIVERGENT ghost branch (identical
+     * tokens would re-store identical projections and hide it).
+     * Control:  prefill 0..126, then true tokens one at a time to 134.
+     * Victim:   prefill 0..126, DIVERGENT tokens one at a time to 130
+     *           (ghost branch), rewind to 126, true tokens to 134.
+     * Compare attn + index comp rows 30..32 across every ratio-4 layer:
+     * row 30 is a pre-rewind sanity row, row 31 is the re-emitted group
+     * [124..127] (the window-contamination target), row 32 is the first
+     * post-heal group. */
+    const uint64_t ctl = value_leg_hash(e, &toks, NULL);
+    pulsar_tokens ghost_branch;
+    memset(&ghost_branch, 0, sizeof(ghost_branch));
+    ghost_branch.v = (int *)malloc(sizeof(int) * 4);
+    ghost_branch.len = ghost_branch.cap = 4;
+    for (int i = 0; i < 4; i++) ghost_branch.v[i] = toks.v[500 + i];
+    const uint64_t vic = value_leg_hash(e, &toks, &ghost_branch);
+    free(ghost_branch.v);
+    CHECK(ctl != 0 && vic != 0, "value leg: a session failed (ctl=%llx vic=%llx)",
+          (unsigned long long)ctl, (unsigned long long)vic);
+    CHECK(ctl == vic,
+          "value leg: ghost rewind contaminated re-emitted comp rows "
+          "(ctl=%llx vic=%llx)", (unsigned long long)ctl, (unsigned long long)vic);
+
     pulsar_engine_close(e);
 
     if (g_fail) { fprintf(stderr, "REWIND GATE: FAIL\n"); return 1; }
