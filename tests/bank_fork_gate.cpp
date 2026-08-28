@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
          * and this pins that they can never drift apart. bank 2 holds
          * toks[0..8192): n_cached 3900 cuts at R=3840 (scrolled, == P4's),
          * n_cached 8000 cuts at R=7936 (inside the ring). */
-        const int wrc = pulsar_session_bank_fork_partial(s, 2, 1, toks, 3900);
+        const int wrc = pulsar_session_bank_fork_partial(s, 2, 1, toks, 3900, 3900);
         CHECK(wrc == PULSAR_FORK_RING_SCROLLED,
               "P4b fork rc %d != PULSAR_FORK_RING_SCROLLED", wrc);
         const int frc = pulsar_session_bank_fork_partial_feasible(s, 2, 3900);
@@ -421,7 +421,7 @@ int main(int argc, char **argv) {
         pulsar_session_bank_state_save(s, 0);
 
         /* partial fork 0->1 at NC5 (cut R5), replay the divergent suffix to L5. */
-        const int prc5 = pulsar_session_bank_fork_partial(s, 0, 1, toks5, NC5);
+        const int prc5 = pulsar_session_bank_fork_partial(s, 0, 1, toks5, NC5, NC5);
         CHECK(prc5 == 0, "P5 partial fork refused rc=%d", prc5);
         CHECK(!pulsar_session_bank_fork_pinned(s, 0), "P5 src left pinned");
         CHECK(pulsar_session_bank_state_restore(s, 1), "P5 install fork dst");
@@ -485,7 +485,7 @@ int main(int argc, char **argv) {
         CHECK(pulsar_session_bank_state_restore(s, 1), "P6 install dst(1) as cur");
         pulsar_session_invalidate(s);                    /* mimic provision: cur len -> 0 */
         CHECK(pulsar_session_pos(s) == 0, "P6 precondition: dst==cur must start at 0");
-        CHECK(pulsar_session_bank_fork(s, 0, 1, toks, FLEN) == 0, "P6 full fork (dst==cur) refused");
+        CHECK(pulsar_session_bank_fork(s, 0, 1, toks, FLEN, FLEN) == 0, "P6 full fork (dst==cur) refused");
         CHECK(pulsar_session_bank_pos(s, 1) == FLEN,
               "P6 FULL dst==cur bank_pos %d != %d (WORK-SKIPPED REGRESSION: "
               "server would re-prefill from 0)", pulsar_session_bank_pos(s, 1), FLEN);
@@ -503,7 +503,7 @@ int main(int argc, char **argv) {
         pulsar_session_bank_state_save(s, 0);
         CHECK(pulsar_session_bank_state_restore(s, 1), "P6 install dst(1) as cur (partial)");
         pulsar_session_invalidate(s);
-        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks6, NC6) == 0,
+        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks6, NC6, NC6) == 0,
               "P6 partial fork (dst==cur) refused");
         CHECK(pulsar_session_bank_pos(s, 1) == R6,
               "P6 PARTIAL dst==cur bank_pos %d != R %d (WORK-SKIPPED REGRESSION)",
