@@ -430,6 +430,11 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * positions (no payload format change). */
     g->ms_proj_ring_lo[bank] = 0u;
     g->ms_proj_ring_hi[bank] = 0u;
+    /* L124: same reasoning, one line at the load site so the invariant is
+     * local rather than transitively true through free_physical (reviewer
+     * finding 5). */
+    g->ms_r128_undo_head[bank] = 0u;
+    g->ms_r128_undo_n[bank] = 0u;
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
     /* plan-33 inc C: a disk-restored bank carries full committed state — any
      * stale fork boundary threshold must not fire on it. */

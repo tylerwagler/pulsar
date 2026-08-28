@@ -2794,6 +2794,12 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    /* L124: the per-row-capture flag is per CHUNK; clear it on entry to the
+     * first layer so a failed chunk cannot leak it into a later aligned
+     * chunk's note block (reviewer finding 3 -- a note without a capture
+     * restores stale lane bytes). */
+    if (il == 0u) g->r128_perrow_chunk = false;
+
     bool ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
         fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);

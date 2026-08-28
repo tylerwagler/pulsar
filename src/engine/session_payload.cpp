@@ -775,6 +775,12 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
+    /* L124: a loaded payload replaces the conversation; the undo ring's
+     * entries describe the previous one's stores.  Zero it (the L120
+     * projection span restarts itself on the first gap; this ring cannot). */
+    s->graph.r128_undo_head = 0u;
+    s->graph.r128_undo_n = 0u;
+    s->graph.r128_perrow_chunk = false;
     s->checkpoint_valid = true;
     /* a restored state invalidates any in-flight speculative lookahead: the
      * carry token, pre-drafted pendings, AND the drafter's context-KV ring

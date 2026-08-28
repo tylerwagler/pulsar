@@ -1225,6 +1225,14 @@ void pulsar_session::invalidate() {
     pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
+    /* L124: the undo ring describes the DEAD conversation's stores; a rewind
+     * in the next one must never restore its lane bytes (unlike the L120
+     * projection span, the ring has no gap-restart to save it -- reviewer
+     * finding 2: a stale entry with pos >= a later rewind target copies a
+     * foreign row into a live state slot). */
+    s->graph.r128_undo_head = 0u;
+    s->graph.r128_undo_n = 0u;
+    s->graph.r128_perrow_chunk = false;
     /* plan-33 inc C: an invalidated bank restarts from zero — a live keep
      * threshold would make the fresh prefill's early emits restore a STALE
      * boundary row over the new conversation's KV. Disarm it. */
@@ -1374,8 +1382,10 @@ void pulsar_session::rewind(int pos) {
     /* L124: undo the ratio-128 ghost stores byte-exactly.  The 128-slot ring
      * has no shift, so each ghost store's inverse is simply the slot's saved
      * pre-store rows; walk the host ring newest-first restoring every entry
-     * with pos >= target (a doubly-stored slot unwinds to its oldest saved
-     * state), stop at the first older entry (per-bank store order is
+     * with pos >= target (each lane row holds the NEWEST pre-store bytes for
+     * its position; a rewind pops entries before any position re-stores, so
+     * duplicates cannot coexist), stop at the first older entry (per-bank
+     * store order is
      * monotone between rewinds).  Runs for crossing AND non-crossing ghost
      * spans -- the non-crossing restore is redundant (continuation re-stores
      * those slots before the next 128-emit) but harmless and uniform. */
