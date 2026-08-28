@@ -1369,7 +1369,10 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
     pulsar_gpu_tensor *dk = indexer ? g->layer_index_proj_kv[il] : g->layer_attn_proj_kv[il];
     pulsar_gpu_tensor *ds = indexer ? g->layer_index_proj_sc[il] : g->layer_attn_proj_sc[il];
     if (!dk || !ds) return true;   /* no ring on this layer (ratio != 4) */
-    const uint64_t row_bytes = 256ull * sizeof(float);
+    /* Ratio-4 widths: attn = 2*head_dim (512) = 4 KiB rows; indexer =
+     * 2*indexer_head_dim (128) = 1 KiB rows.  Lanes are attn-sized. */
+    const uint64_t row_bytes = (indexer ? 2ull * PULSAR_N_INDEXER_HEAD_DIM
+                                        : 2ull * PULSAR_N_HEAD_DIM) * sizeof(float);
     const uint64_t off = (uint64_t)(pos % 32u) * row_bytes;
     return pulsar_gpu_tensor_copy_async(dk, off, kv_row, 0, row_bytes) != 0 &&
            pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;

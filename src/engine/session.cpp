@@ -1313,12 +1313,14 @@ void pulsar_session::rewind(int pos) {
                 if (!g->layer_attn_proj_kv[il] || !g->layer_index_proj_kv[il]) continue;
                 bool ok = true;
                 for (uint32_t p = start; ok && p < (uint32_t)pos; p++) {
-                    const uint64_t row_bytes = 256ull * sizeof(float);
-                    const uint64_t off = (uint64_t)(p % 32u) * row_bytes;
-                    pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], off, row_bytes);
-                    pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], off, row_bytes);
-                    pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], off, row_bytes);
-                    pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], off, row_bytes);
+                    const uint64_t attn_row_bytes = 2ull * PULSAR_N_HEAD_DIM * sizeof(float);
+                    const uint64_t idx_row_bytes = 2ull * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+                    const uint64_t aoff = (uint64_t)(p % 32u) * attn_row_bytes;
+                    const uint64_t ioff = (uint64_t)(p % 32u) * idx_row_bytes;
+                    pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], aoff, attn_row_bytes);
+                    pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], aoff, attn_row_bytes);
+                    pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], ioff, idx_row_bytes);
+                    pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], ioff, idx_row_bytes);
                     ok = akv && asc && ikv && isc;
                     if (!ok) fprintf(stderr, "pulsar: L120 replay: view fail (p=%u)\n", p);
                     if (ok) {
