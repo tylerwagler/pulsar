@@ -553,8 +553,8 @@ uint64_t gpu_graph_session_bytes_banked(
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            total += 2ull * 17 * attn_w * f32;            /* spec_comp_kv/sc_save */
-            if (ratio == 4) total += 2ull * 17 * idx_w * f32; /* spec_icomp_kv/sc_save */
+            total += 2ull * (PULSAR_SPEC_LOGITS_ROWS + 1u) * attn_w * f32;            /* spec_comp_kv/sc_save */
+            if (ratio == 4) total += 2ull * (PULSAR_SPEC_LOGITS_ROWS + 1u) * idx_w * f32; /* spec_icomp_kv/sc_save */
         }
         total += (uint64_t)PULSAR_N_HEAD_DIM * f32;          /* spec_comp_scratch_row */
         total += 3ull * PULSAR_N_EMBD * f32;                 /* dspark_concat */
@@ -2335,12 +2335,12 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
             g->spec_icomp_kv_save[il] = NULL;
             g->spec_icomp_sc_save[il] = NULL;
             if (ratio == 0) continue;
-            g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
-            g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
+            g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
+            g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
             if (ratio == 4) {
-                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
-                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
+                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
+                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
                 ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
             }
         }

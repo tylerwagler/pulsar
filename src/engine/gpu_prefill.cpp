@@ -1238,7 +1238,7 @@ bool gpu_graph_encode_layer_attention_batch(
         if (ok && g->spec_comp_save_n && g->spec_comp_kv_save[il]) {
             uint32_t sn = g->spec_comp_save_n;
             if (sn > n_tokens) sn = n_tokens;
-            if (sn > 17u) sn = 17u;
+            if (sn > PULSAR_SPEC_LOGITS_ROWS + 1u) sn = PULSAR_SPEC_LOGITS_ROWS + 1u;
             const uint64_t sb = (uint64_t)sn * comp_width * sizeof(float);
             /* ASYNC: nothing on the host reads these. They are written here and
              * consumed only by gpu_graph_dspark_compressor_rollforward, which
@@ -1613,7 +1613,7 @@ bool gpu_graph_encode_layer_attention_batch(
             if (ok && g->spec_comp_save_n && g->spec_icomp_kv_save[il]) {
                 uint32_t sn = g->spec_comp_save_n;
                 if (sn > n_tokens) sn = n_tokens;
-                if (sn > 17u) sn = 17u;
+                if (sn > PULSAR_SPEC_LOGITS_ROWS + 1u) sn = PULSAR_SPEC_LOGITS_ROWS + 1u;
                 const uint64_t sb = (uint64_t)sn * index_width * sizeof(float);
                 /* ASYNC for the same reason as the attn compressor save above:
                  * read only by the rollforward's update kernels, same stream. */
@@ -2948,7 +2948,7 @@ bool gpu_graph_dspark_compressor_rollforward(
         uint32_t          save_row0) {
     if (!g || !model || !weights) return false;
     if (n_positions == 0) return true;
-    if (save_row0 + n_positions > 17u || !g->spec_comp_scratch_row) return false;
+    if (save_row0 + n_positions > PULSAR_SPEC_LOGITS_ROWS + 1u || !g->spec_comp_scratch_row) return false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
