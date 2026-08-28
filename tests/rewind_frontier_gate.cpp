@@ -111,12 +111,22 @@ static uint64_t comp_rows_hash(pulsar_session *s) {
             if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
                                       (uint64_t)row * attn_row, buf, attn_row) == 0)
                 return 0;
-            for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+            uint64_t rh = 1469598103934665603ull;
+            for (uint64_t i = 0; i < attn_row; i++) { rh ^= buf[i]; rh *= 1099511628211ull; }
+            h ^= rh; h *= 1099511628211ull;
+            if (il == 2)
+                fprintf(stderr, "value-leg DIAG: L2 attn row %u hash %llx\n",
+                        row, (unsigned long long)rh);
             if (row >= g->layer_n_index_comp[il]) continue;
             if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il],
                                       (uint64_t)row * idx_row, buf, idx_row) == 0)
                 return 0;
-            for (uint64_t i = 0; i < idx_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+            rh = 1469598103934665603ull;
+            for (uint64_t i = 0; i < idx_row; i++) { rh ^= buf[i]; rh *= 1099511628211ull; }
+            h ^= rh; h *= 1099511628211ull;
+            if (il == 2)
+                fprintf(stderr, "value-leg DIAG: L2 idx  row %u hash %llx\n",
+                        row, (unsigned long long)rh);
         }
     }
     return h;
