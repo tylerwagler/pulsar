@@ -106,7 +106,7 @@ static uint64_t comp_rows_hash(pulsar_session *s) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 4) continue;
-        for (uint32_t row = 30; row <= 32; row++) {
+        for (uint32_t row = 34; row <= 36; row++) {
             if (row >= g->layer_n_comp[il]) continue;
             if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
                                       (uint64_t)row * attn_row, buf, attn_row) == 0)
@@ -143,8 +143,8 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
     memset(&work, 0, sizeof(work));
     work.v = (int *)malloc(sizeof(int) * 256);
     work.cap = 256;
-    memcpy(work.v, toks->v, sizeof(int) * 134);
-    work.len = 134;
+    memcpy(work.v, toks->v, sizeof(int) * 150);
+    work.len = 150;
     bool ok = true;
     {
         /* Base prefill stops at 112 and the last 14 positions are decoded
@@ -158,27 +158,27 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
         pulsar_tokens p;
         memset(&p, 0, sizeof(p));
         p.v = work.v;
-        p.len = p.cap = 112;
+        p.len = p.cap = 128;
         char err[256];
         ok = pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
         if (!ok) fprintf(stderr, "value leg: base prefill failed: %s\n", err);
     }
-    for (int upto = 113; ok && upto <= 126; upto++)
+    for (int upto = 129; ok && upto <= 142; upto++)
         ok = extend_one(s, &work, upto);
     if (ok && ghost_branch) {
         int saved[4];
-        memcpy(saved, work.v + 126, sizeof(saved));
-        memcpy(work.v + 126, ghost_branch->v, sizeof(int) * 4);
-        for (int upto = 127; ok && upto <= 130; upto++)
+        memcpy(saved, work.v + 142, sizeof(saved));
+        memcpy(work.v + 142, ghost_branch->v, sizeof(int) * 4);
+        for (int upto = 143; ok && upto <= 146; upto++)
             ok = extend_one(s, &work, upto);
         if (ok) {
-            pulsar_session_rewind(s, 126);
-            ok = pulsar_session_pos(s) == 126;
+            pulsar_session_rewind(s, 142);
+            ok = pulsar_session_pos(s) == 142;
             if (!ok) fprintf(stderr, "value leg: rewind landed at %d\n", pulsar_session_pos(s));
         }
-        memcpy(work.v + 126, saved, sizeof(saved));
+        memcpy(work.v + 142, saved, sizeof(saved));
     }
-    for (int upto = 127; ok && upto <= 134; upto++)
+    for (int upto = 143; ok && upto <= 150; upto++)
         ok = extend_one(s, &work, upto);
     if (ok) h = comp_rows_hash(s);
     free(work.v);
