@@ -1841,6 +1841,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
         lane_profile = e && e[0] && e[0] != '0';
     }
     double prof_pre = 0.0, prof_sweep = 0.0, prof_post = 0.0;
+    double prof_rend = 0.0, prof_save = 0.0;
     int prof_rounds = 0;
     double prof_t = 0.0;
     while (emitted_total < PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
@@ -2066,6 +2067,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             }
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
+            const double prof_re0 = lane_profile ? server_now_sec() : 0.0;
             const int na = pulsar_session_spec_round_end(pool, rounds[live_idx[q]],
                                                       first_tok[q], eos_token,
                                                       temp, top_k, top_p, min_p,
@@ -2073,6 +2075,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                                                       accepted,
                                                       (int)(sizeof(accepted) / sizeof(accepted[0])),
                                                       err, sizeof err);
+            if (lane_profile) prof_rend += server_now_sec() - prof_re0;
             if (na < 0) {
                 g->finish = "error";
                 snprintf(g->err, sizeof g->err, "spec round end failed: %s", err);
@@ -2122,7 +2125,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                       (g->saw_tool_start || dsml_decode_state_is_tool(ds))))
                     s->kv_cache_maybe_store_continued(sl);
             }
+            const double prof_sv0 = lane_profile ? server_now_sec() : 0.0;
             pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
+            if (lane_profile) prof_save += server_now_sec() - prof_sv0;
             emitted_total += done;
         }
         if (lane_profile) {
@@ -2132,10 +2137,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     }
     if (lane_profile && prof_rounds > 0) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: lane-profile rounds=%d pre=%.1fms sweep=%.1fms post=%.1fms per-round pre=%.2f sweep=%.2f post=%.2f",
-                   prof_rounds, prof_pre * 1e3, prof_sweep * 1e3, prof_post * 1e3,
+                   "pulsar-server: lane-profile rounds=%d per-round pre=%.2f sweep=%.2f post=%.2f (rend=%.2f save=%.2f other=%.2f)",
+                   prof_rounds,
                    prof_pre * 1e3 / prof_rounds, prof_sweep * 1e3 / prof_rounds,
-                   prof_post * 1e3 / prof_rounds);
+                   prof_post * 1e3 / prof_rounds,
+                   prof_rend * 1e3 / prof_rounds, prof_save * 1e3 / prof_rounds,
+                   (prof_post - prof_rend - prof_save) * 1e3 / prof_rounds);
     }
     free(logits);
     if (emitted_total > 0) {
