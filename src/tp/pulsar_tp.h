@@ -240,6 +240,11 @@ typedef enum {
     PULSAR_TP_FRAME_EVAL_BATCH = 15,
     PULSAR_TP_FRAME_MIXED_BATCH = 16,
     PULSAR_TP_FRAME_COMMAND_ACK = 17,
+    /* RDMA gate-window armed ack: the first gate exchange uses this to make
+     * both ranks arm their receive window before either SENDS (a rank that
+     * sends before the peer's window is armed silently loses the first N
+     * messages under UC, shifting the whole pairing by +1). */
+    PULSAR_TP_FRAME_RDMA_GATE_ARMED = 18,
 } pulsar_tp_frame_type;
 
 typedef struct {

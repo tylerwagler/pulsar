@@ -1118,6 +1118,10 @@ static int tp_rdma_drain_cq(pulsar_tp *tp) {
     int n = r->api.poll_cq(r->cq, 16, wc);
     if (n < 0) return 0;
     for (int i = 0; i < n; i++) {
+        if (getenv("PULSAR_TP_GATE_TRACE"))
+            fprintf(stderr, "pulsar-tp: CQ wr_id=%llu status=%d opcode=%d len=%u\n",
+                    (unsigned long long)wc[i].wr_id, (int)wc[i].status,
+                    (int)wc[i].opcode, wc[i].byte_len);
         if (wc[i].status != TP_IBV_WC_SUCCESS) {
             fprintf(stderr, "pulsar-tp: rdma completion error: %s (wr_id %llu)\n",
                     tp_wc_status_str(wc[i].status),
@@ -1142,6 +1146,11 @@ static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq) {
     const uintptr_t base =
         (uintptr_t)(tp->slab + tp->layout.in_off +
                     (uint64_t)slot * tp->vec_bytes);
+    if (getenv("PULSAR_TP_GATE_TRACE"))
+        fprintf(stderr, "pulsar-tp: recv seq=%llu slot=%u addr=%llx\n",
+                (unsigned long long)seq, slot,
+                (unsigned long long)(tp->layout.in_off +
+                                     (uint64_t)slot * tp->vec_bytes));
     /* Vectors above the driver's 16KB message cap ride as two chunks landing
      * contiguously in the slot.  Both sides post/send strictly in seq order,
      * so the k'th send always matches the k'th recv; only the FINAL chunk
@@ -1191,11 +1200,29 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->layout.out_off +
                     (uint64_t)slot * tp->vec_bytes);
+    if (getenv("PULSAR_TP_GATE_TRACE"))
+        fprintf(stderr, "pulsar-tp: send seq=%llu slot=%u addr=%llx\n",
+                (unsigned long long)seq, slot,
+                (unsigned long long)(tp->layout.out_off +
+                                     (uint64_t)slot * tp->vec_bytes));
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + PULSAR_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
+        /* A rank that SENDS before the peer's window is armed silently loses
+         * its first N messages under UC (no error, no completion), shifting
+         * every later pairing by one.  That happens on the pair because the
+         * leader runs ahead of the worker while it is still in create/the
+         * control handshake.  The control socket is full-duplex, so: after
+         * arming, both sides exchange RDMA_GATE_ARMED and only then send. */
+        if (ok) ok = tp_send_frame(tp->control_fd,
+                                   PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
+        if (ok) {
+            uint32_t rtype = 0, rbytes = 0;
+            ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
+                 rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
+        }
         if (ok) r->recv_window_active = true;
     }
     for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
@@ -1208,6 +1235,12 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
         sge.addr = send_base + off;
         sge.length = (uint32_t)len;
         sge.lkey = TP_LKEY(r->mr);
+        if (getenv("PULSAR_TP_GATE_TRACE") && off == 0) {
+            const float *p0 = (const float *)(uintptr_t)(send_base + off);
+            fprintf(stderr, "pulsar-tp: TX seq=%llu addr=%llx f0=%g f1=%g\n",
+                    (unsigned long long)seq,
+                    (unsigned long long)(send_base + off), p0[0], p0[1]);
+        }
         wr.wr_id = seq;
         wr.sg_list = &sge;
         wr.num_sge = 1;
