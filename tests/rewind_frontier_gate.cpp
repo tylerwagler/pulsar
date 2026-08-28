@@ -21,9 +21,17 @@
  *   4. VALUE leg (L120 value-half): a ghost rewind with a DIVERGENT ghost
  *      branch, then byte-compare the re-emitted attn+index comp rows of
  *      every ratio-4 layer against a never-ghosted control.  The scenario
- *      deliberately avoids crossing a 128-emit boundary — ratio-128 ghost
- *      slot aliasing across such a boundary is a separate defect
- *      (rows/L124.md), not this leg's claim.
+ *      deliberately avoids crossing a 128-emit boundary so it asserts the
+ *      ratio-4 claim in isolation;
+ *   5. RATIO-128 leg (L124): the same divergent-ghost shape SHIFTED so the
+ *      ghost span crosses the first 128-emit boundary (ghosts 126..129,
+ *      rewind to 126).  Ghost stores past the boundary alias the slots of
+ *      committed positions g-128, and the re-emit of comp row 0 fires at
+ *      re-decode of position 127 -- BEFORE re-decode reaches the aliased
+ *      owners -- pooling wrong-POSITION values.  The undo log restores the
+ *      aliased slots byte-exactly on rewind; this leg byte-compares the
+ *      re-emitted ratio-128 comp row 0 across every ratio-128 layer against
+ *      a never-ghosted control.
  *
  * MODEL-DEPENDENT, GPU-resident.  Run under the memory discipline.  NOT part
  * of `make test`.
@@ -185,6 +193,72 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
     return h;
 }
 
+/* FNV-1a over ratio-128 comp row 0 of every ratio-128 layer -- the row the
+ * L124 aliasing contaminates. */
+static uint64_t r128_row0_hash(pulsar_session *s) {
+    pulsar_gpu_graph *g = &s->graph;
+    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    uint64_t h = 1469598103934665603ull;
+    uint8_t buf[8192];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (pulsar_layer_compress_ratio(il) != 128u) continue;
+        if (g->layer_n_comp[il] < 1u) continue;
+        if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, buf, attn_row) == 0)
+            return 0;
+        for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+    }
+    return h;
+}
+
+/* One ratio-128-leg session: sync 0..112, singles to 126; if ghost_branch,
+ * DIVERGENT singles 126..129 (crossing the b=128 emit boundary: ghosts 128
+ * and 129 alias the slots of committed positions 0 and 1), rewind to 126;
+ * then true singles to 134 -- the 128-emit at position 127 re-pools the
+ * full window, aliased slots included.  Hash ratio-128 comp row 0. */
+static uint64_t r128_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
+                              const pulsar_tokens *ghost_branch) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "r128 leg: session create failed\n"); return 0; }
+    uint64_t h = 0;
+    pulsar_tokens work;
+    memset(&work, 0, sizeof(work));
+    work.v = (int *)malloc(sizeof(int) * 256);
+    work.cap = 256;
+    memcpy(work.v, toks->v, sizeof(int) * 200);
+    work.len = 200;
+    bool ok = true;
+    {
+        pulsar_tokens p;
+        memset(&p, 0, sizeof(p));
+        p.v = work.v;
+        p.len = p.cap = 112;
+        char err[256];
+        ok = pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
+        if (!ok) fprintf(stderr, "r128 leg: base prefill failed: %s\n", err);
+    }
+    for (int upto = 113; ok && upto <= 126; upto++)
+        ok = extend_one(s, &work, upto);
+    if (ok && ghost_branch) {
+        int saved[4];
+        memcpy(saved, work.v + 126, sizeof(saved));
+        memcpy(work.v + 126, ghost_branch->v, sizeof(int) * 4);
+        for (int upto = 127; ok && upto <= 130; upto++)
+            ok = extend_one(s, &work, upto);
+        if (ok) {
+            pulsar_session_rewind(s, 126);
+            ok = pulsar_session_pos(s) == 126;
+            if (!ok) fprintf(stderr, "r128 leg: rewind landed at %d\n", pulsar_session_pos(s));
+        }
+        memcpy(work.v + 126, saved, sizeof(saved));
+    }
+    for (int upto = 127; ok && upto <= 134; upto++)
+        ok = extend_one(s, &work, upto);
+    if (ok) h = r128_row0_hash(s);
+    free(work.v);
+    pulsar_session_free(s);
+    return h;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
@@ -269,6 +343,26 @@ int main(int argc, char **argv) {
     CHECK(ctl == vic,
           "value leg: ghost rewind contaminated re-emitted comp rows "
           "(ctl=%llx vic=%llx)", (unsigned long long)ctl, (unsigned long long)vic);
+
+    /* ---- 5. RATIO-128 leg (L124): the crossing shape the value leg
+     * deliberately avoided.  Divergent ghosts 126..129 cross the b=128
+     * boundary; ghost stores at 128/129 alias committed slots 0/1; the
+     * re-emit of ratio-128 comp row 0 at position 127 pools them.  With the
+     * undo log the rewind restores the aliased slots byte-exactly. */
+    const uint64_t rctl = r128_leg_hash(e, &toks, NULL);
+    pulsar_tokens rghost;
+    memset(&rghost, 0, sizeof(rghost));
+    rghost.v = (int *)malloc(sizeof(int) * 4);
+    rghost.len = rghost.cap = 4;
+    for (int i = 0; i < 4; i++) rghost.v[i] = toks.v[600 + i];
+    const uint64_t rvic = r128_leg_hash(e, &toks, &rghost);
+    free(rghost.v);
+    CHECK(rctl != 0 && rvic != 0, "r128 leg: a session failed (ctl=%llx vic=%llx)",
+          (unsigned long long)rctl, (unsigned long long)rvic);
+    CHECK(rctl == rvic,
+          "r128 leg: boundary-crossing ghost rewind aliased committed slots "
+          "into comp row 0 (ctl=%llx vic=%llx)",
+          (unsigned long long)rctl, (unsigned long long)rvic);
 
     pulsar_engine_close(e);
 

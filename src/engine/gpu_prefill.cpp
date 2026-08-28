@@ -59,6 +59,8 @@ static bool gpu_graph_encode_token_raw_swa(
     /* L120 value-half: every layer banked this committed position's
      * projections above — advance the deposited span once. */
     if (ok) gpu_graph_proj_ring_note_pos(g, pos);
+    /* L124: every ratio-128 layer captured its pre-store slot above. */
+    if (ok) gpu_graph_r128_undo_note_pos(g, pos);
 
     if (ok && need_logits) {
         ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -1489,6 +1491,18 @@ bool gpu_graph_encode_layer_attention_batch(
                     pulsar_gpu_tensor *ms_target = NULL;
                     ok = kv_view && sc_view &&
                          (!mseq || (ms_st_kv && ms_st_sc));
+                    /* L124: pre-store slot capture on ratio-128 layers.  The
+                     * classic (non-mseq, non-spec-armed) per-row extension is
+                     * a per-position store like decode's; mseq goes through
+                     * bank state views the lane machinery doesn't cover
+                     * (undo log is zeroed across bank hand-offs anyway).
+                     * note_pos for this path rides the same per-position
+                     * hook decode uses (encode_token_raw_swa) when the row
+                     * is the token eval; the chunked sync path notes below. */
+                    if (ok && !mseq && !g->spec_comp_save_n && ratio == 128u) {
+                        ok = gpu_graph_r128_undo_capture(g, il, pos);
+                        g->r128_perrow_chunk = true;
+                    }
                     if (ok) {
                         ok = pulsar_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -2803,6 +2817,17 @@ bool gpu_graph_encode_layer_batch(
         const uint32_t tail = n_tokens < 8u ? n_tokens : 8u;
         for (uint32_t k = 0; k < tail; k++)
             gpu_graph_proj_ring_note_pos(g, pos0 + n_tokens - tail + k);
+        /* L124: note ONLY when the per-row arm captured this chunk's
+         * ratio-128 slots (a note without a capture would restore stale
+         * lane bytes).  The aligned batch arm doesn't capture -- and doesn't
+         * need to: a rewind can never target into an aligned chunk, and the
+         * newest-first walk stops before any pre-chunk entry. */
+        if (g->r128_perrow_chunk) {
+            const uint32_t utail = n_tokens < 32u ? n_tokens : 32u;
+            for (uint32_t k = 0; k < utail; k++)
+                gpu_graph_r128_undo_note_pos(g, pos0 + n_tokens - utail + k);
+        }
+        g->r128_perrow_chunk = false;
     }
     /* Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
      * every batch position at the anchor layers, so the last-accepted position's
@@ -2937,6 +2962,12 @@ bool gpu_graph_dspark_compressor_rollforward(
             const uint32_t pos = pos0 + t;
             pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
             pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, comp_width);
+            /* L124: pre-store slot capture (ratio-128 layers). */
+            if (ratio == 128u && !gpu_graph_r128_undo_capture(g, il, pos)) {
+                pulsar_gpu_tensor_free(sc_view);
+                pulsar_gpu_tensor_free(kv_view);
+                return false;
+            }
             bool ok = kv_view && sc_view &&
                 pulsar_gpu_compressor_update_tensor(kv_view, sc_view,
                         g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
@@ -2989,5 +3020,7 @@ bool gpu_graph_dspark_compressor_rollforward(
     /* L120 value-half: the span is committed across every layer now. */
     for (uint32_t t = 0; t < n_positions; t++)
         gpu_graph_proj_ring_note_pos(g, pos0 + t);
+    for (uint32_t t2 = 0; t2 < n_positions; t2++)
+        gpu_graph_r128_undo_note_pos(g, pos0 + t2);
     return true;
 }

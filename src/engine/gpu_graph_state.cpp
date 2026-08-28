@@ -146,6 +146,8 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->layer_attn_proj_sc[il]);
         pulsar_gpu_tensor_free(g->layer_index_proj_kv[il]);
         pulsar_gpu_tensor_free(g->layer_index_proj_sc[il]);
+        pulsar_gpu_tensor_free(g->layer_r128_undo_kv[il]);
+        pulsar_gpu_tensor_free(g->layer_r128_undo_sc[il]);
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */

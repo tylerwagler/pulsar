@@ -1371,6 +1371,37 @@ void pulsar_session::rewind(int pos) {
         if (g->proj_ring_hi > (uint32_t)pos) g->proj_ring_hi = (uint32_t)pos;
         if (g->proj_ring_lo > g->proj_ring_hi) g->proj_ring_lo = g->proj_ring_hi;
     }
+    /* L124: undo the ratio-128 ghost stores byte-exactly.  The 128-slot ring
+     * has no shift, so each ghost store's inverse is simply the slot's saved
+     * pre-store rows; walk the host ring newest-first restoring every entry
+     * with pos >= target (a doubly-stored slot unwinds to its oldest saved
+     * state), stop at the first older entry (per-bank store order is
+     * monotone between rewinds).  Runs for crossing AND non-crossing ghost
+     * spans -- the non-crossing restore is redundant (continuation re-stores
+     * those slots before the next 128-emit) but harmless and uniform. */
+    {
+        pulsar_gpu_graph *g2 = &s->graph;
+        while (g2->r128_undo_n > 0u) {
+            const uint32_t idx = (g2->r128_undo_head + 31u) % 32u;
+            const uint32_t p = g2->r128_undo_pos[idx];
+            if (p < (uint32_t)pos) break;
+            const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
+            const uint64_t state_off = (uint64_t)(p % 128u) * row_bytes;
+            const uint64_t lane_off = (uint64_t)(p % 32u) * row_bytes;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                if (pulsar_layer_compress_ratio(il) != 128u) continue;
+                if (!g2->layer_r128_undo_kv[il] || !g2->layer_r128_undo_sc[il]) continue;
+                if (pulsar_gpu_tensor_copy_async(g2->layer_attn_state_kv[il], state_off,
+                                                 g2->layer_r128_undo_kv[il], lane_off, row_bytes) == 0 ||
+                    pulsar_gpu_tensor_copy_async(g2->layer_attn_state_score[il], state_off,
+                                                 g2->layer_r128_undo_sc[il], lane_off, row_bytes) == 0) {
+                    fprintf(stderr, "pulsar: L124 undo restore FAILED (pos %u layer %u)\n", p, il);
+                }
+            }
+            g2->r128_undo_head = idx;
+            g2->r128_undo_n--;
+        }
+    }
 }
 
 

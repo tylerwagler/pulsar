@@ -602,6 +602,11 @@ bool gpu_graph_encode_decode_layer(
                                                 g->attn_norm, 1);
         }
         const uint32_t comp_row = g->layer_n_comp[il];
+        /* L124: the store below overwrites state slot pos %% 128 on ratio-128
+         * layers -- save its current contents first so a ghost rewind can
+         * restore the aliased committed value byte-exactly. */
+        if (ok && ratio == 128u)
+            ok = gpu_graph_r128_undo_capture(g, il, pos);
         if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                         g->comp_sc_cur,
                                                         g->layer_attn_state_kv[il],

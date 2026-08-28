@@ -837,6 +837,12 @@ typedef struct {
     pulsar_gpu_tensor *ipkv[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *ipsc[PULSAR_MAX_LAYER];
     uint64_t pring_bank_bytes;
+    /* L124: per-bank ratio-128 undo lanes (32 slots x head_dim f32, kv +
+     * score) -- the pre-store value of the state slot each ratio-128 store
+     * overwrites, so a ghost rewind can restore byte-exactly. */
+    pulsar_gpu_tensor *rukv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *rusc[PULSAR_MAX_LAYER];
+    uint64_t rulane_bank_bytes;
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -912,6 +918,32 @@ typedef struct {
     pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];
     uint32_t proj_ring_lo;
     uint32_t proj_ring_hi;
+
+    /* L124: ratio-128 UNDO LOG.  The ratio-128 compressor ring (128 slots,
+     * pos %% 128, no shift) lets a ghost span that crosses a 128-emit
+     * boundary alias committed slots (position g overwrites the slot of
+     * g-128), and the re-emit fires BEFORE re-decode reaches the aliased
+     * owners -- one wrong-POSITION comp row per such rewind (rows/L124.md).
+     * Before every per-position ratio-128 store, the target slot's current
+     * kv+score rows are saved into per-layer undo lanes addressed pos %% 32
+     * (unique within any restorable window: ghost overshoot <= 16), and the
+     * host ring below records the store order.  rewind() walks it
+     * newest-first restoring every entry with pos >= target -- a byte-exact
+     * inverse; no projection recompute, no shift to unwind at ratio 128.
+     * Aligned batch prefill does not capture (a rewind can never target
+     * into it) and fork/spill zero the ring (degraded = pre-fix).  Lanes:
+     * layer_r128_undo_* below; banked lanes ride the state-view repoint. */
+    pulsar_gpu_tensor *layer_r128_undo_kv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *layer_r128_undo_sc[PULSAR_MAX_LAYER];
+    uint32_t r128_undo_pos[32];
+    uint32_t r128_undo_head;   /* next push slot in the HOST ring */
+    uint32_t r128_undo_n;      /* live entries (<= 32) */
+    /* Scratch, per chunk: the per-row extension arm captured this chunk's
+     * ratio-128 slots (the aligned batch arm does not capture, and must not
+     * push notes -- a note without a capture would restore stale lane
+     * bytes).  Set by the per-row capture, consumed by the chunk-tail note
+     * block.  Not persisted, not banked. */
+    bool r128_perrow_chunk;
 
     /* Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
@@ -1161,6 +1193,11 @@ typedef struct {
      * and spill-restore: an uncovered rewind skips the value restore. */
     uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];
     uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];
+    /* L124: per-bank undo-log host state, captured/installed with ms_n_comp;
+     * zeroed on fork and spill-restore. */
+    uint32_t ms_r128_undo_pos[PULSAR_MSEQ_MAX][32];
+    uint32_t ms_r128_undo_head[PULSAR_MSEQ_MAX];
+    uint32_t ms_r128_undo_n[PULSAR_MSEQ_MAX];
     /* Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
      * device rings themselves are banked slabs, pulsar_bank_slabs.dspark_*).
      * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
@@ -2232,6 +2269,13 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
                                  const pulsar_gpu_tensor *sc_row,
                                  bool indexer);
 void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos);
+
+/* L124: save the CURRENT contents of layer il's ratio-128 state slot
+ * (pos %% 128) into the undo lane row pos %% 32 -- call BEFORE the store.
+ * note_pos records the store order in the host ring, once per position
+ * (after every ratio-128 layer captured). */
+bool gpu_graph_r128_undo_capture(pulsar_gpu_graph *g, uint32_t il, uint32_t pos);
+void gpu_graph_r128_undo_note_pos(pulsar_gpu_graph *g, uint32_t pos);
 /* Tier-2 PATH A host-carry primitive (see pulsar_bank_carry).  save copies the
  * session's live HOST per-conversation state into bank's shadow AND captures
  * the graph frontier counters (gpu_graph_bank_counters_capture).  restore
