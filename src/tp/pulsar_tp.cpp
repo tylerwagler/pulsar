@@ -1032,7 +1032,15 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     }
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTR;
-    a.path_mtu = r->port.active_mtu;   /* the port MTU, as perftest uses */
+    /* path_mtu must AGREE between the two QPs.  The pair's second link
+     * reports active_mtu 1024 on one rank and 4096 on the other; each rank
+     * using its own makes the faster side emit frames the narrower port
+     * silently drops (bisected with a probe: >1024 fails with per-port
+     * path_mtu, delivers with a uniform 1024 on both).  Use the lower of the
+     * two ports' MTUs, on both ranks. */
+    a.path_mtu = r->port.active_mtu;
+    if (r->peer.mtu != 0 && (int)r->peer.mtu < (int)a.path_mtu)
+        a.path_mtu = (decltype(a.path_mtu))(int)r->peer.mtu;
     a.dest_qp_num = r->peer.qpn;
     a.rq_psn = r->peer.psn;
     a.ah_attr.dlid = (uint16_t)r->peer.lid;
