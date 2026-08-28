@@ -1201,6 +1201,12 @@ struct server {
      * a marginal draft row is admitted while survival >= marginal_ms / this.
      * 0 until the first quantum; the argmax uses a 45 ms prior until then. */
     float    spec_ms_per_tok_ema;
+    /* L123: the batched lane's shared ALL_ROWS logits landing buffer
+     * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
+     * first quantum. It was a per-quantum malloc/free — 16.5 MB of
+     * demand-zero pages faulted back in on every touch cycle, a measured
+     * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
+    float   *spec_lane_logits;
     /* Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
