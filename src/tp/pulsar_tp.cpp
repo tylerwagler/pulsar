@@ -177,6 +177,7 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 #define TP_IBV_QP_RNR_RETRY     IBV_QP_RNR_RETRY
 #define TP_IBV_QP_MAX_QP_RD_ATOMIC   IBV_QP_MAX_QP_RD_ATOMIC
 #define TP_IBV_QP_MAX_DEST_RD_ATOMIC IBV_QP_MAX_DEST_RD_ATOMIC
+#define TP_IBV_QP_MIN_RNR_TIMER      IBV_QP_MIN_RNR_TIMER
 #define TP_IBV_GID_TYPE_IB        IBV_GID_TYPE_IB
 #define TP_IBV_GID_TYPE_ROCE_V1   IBV_GID_TYPE_ROCE_V1
 #define TP_IBV_GID_TYPE_ROCE_V2   IBV_GID_TYPE_ROCE_V2
@@ -226,6 +227,7 @@ enum { TP_IBV_QP_ACCESS_FLAGS = 1 << 3, TP_IBV_QP_PKEY_INDEX = 1 << 4,
        TP_IBV_QP_PATH_MTU = 1 << 8, TP_IBV_QP_TIMEOUT = 1 << 9,
        TP_IBV_QP_RETRY_CNT = 1 << 10, TP_IBV_QP_RNR_RETRY = 1 << 11,
        TP_IBV_QP_RQ_PSN = 1 << 12, TP_IBV_QP_MAX_QP_RD_ATOMIC = 1 << 13,
+       TP_IBV_QP_MIN_RNR_TIMER = 1 << 15,
        TP_IBV_QP_SQ_PSN = 1 << 16, TP_IBV_QP_MAX_DEST_RD_ATOMIC = 1 << 17,
        TP_IBV_QP_DEST_QPN = 1 << 20, TP_IBV_QP_STATE = 1 };
 /* enum ibv_gid_type */
@@ -803,20 +805,33 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
                    "tp rdma: no device with an active port (%s); is the peer "
                    "up and the link enabled on both machines?", states);
         return 0;
-    }    /* post_send/post_recv/poll_cq are header inlines -> resolve them from
-     * ibv_context->ops (poll=11, send=25, recv=26 on rdma-core v50; verified
-     * against the installed header).  If a future rdma-core reorders, open
-     * fails loudly here. */
+    }    /* post_send/post_recv/poll_cq are header inlines, NOT exported:
+     * resolve them from the ibv_context ops table.  With the real header in
+     * scope, read the typed members directly so the layout can never drift.
+     * The no-header fallback hard-codes the rdma-core ordering (poll=12,
+     * send=26, recv=27, 1-based): the earlier 11/25/26 hit _compat_* stubs —
+     * poll_cq became a no-op and our post_recv actually called post_send,
+     * so the receive queue was NEVER armed and the peer's messages were
+     * dropped without error (the pair's symmetric silent non-delivery). */
+#ifdef PULSAR_TP_VERBS_HDR
+    {
+        struct ibv_context *c = (struct ibv_context *)r->ctx;
+        r->api.poll_cq = (__typeof__(r->api.poll_cq))c->ops.poll_cq;
+        r->api.post_send = (__typeof__(r->api.post_send))c->ops.post_send;
+        r->api.post_recv = (__typeof__(r->api.post_recv))c->ops.post_recv;
+    }
+#else
     {
         typedef void *const *tramp;
         tramp ops = (tramp)((uint8_t *)r->ctx + sizeof(void *));
-        r->api.poll_cq = (__typeof__(r->api.poll_cq))ops[11];
-        r->api.post_send = (__typeof__(r->api.post_send))ops[25];
-        r->api.post_recv = (__typeof__(r->api.post_recv))ops[26];
-        if (!r->api.poll_cq || !r->api.post_send || !r->api.post_recv) {
-            tp_set_err(err, errlen, "tp rdma: verbs ops table null pointers");
-            return 0;
-        }
+        r->api.poll_cq = (__typeof__(r->api.poll_cq))ops[12];
+        r->api.post_send = (__typeof__(r->api.post_send))ops[26];
+        r->api.post_recv = (__typeof__(r->api.post_recv))ops[27];
+    }
+#endif
+    if (!r->api.poll_cq || !r->api.post_send || !r->api.post_recv) {
+        tp_set_err(err, errlen, "tp rdma: verbs ops table null pointers");
+        return 0;
     }
 
     /* GID selection.  Upstream (two-Mac/TB) wants the IPv4-mapped GID, which
@@ -1026,12 +1041,15 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (r->rc_mode)
-        a.max_dest_rd_atomic = 1;   /* RC reaches RTR only with this set */
+    if (r->rc_mode) {
+        a.max_dest_rd_atomic = 1;   /* RC reaches RTR only with these set */
+        a.min_rnr_timer = 12;       /* (bisected on the pair with rtr_probe) */
+    }
     if (r->api.modify_qp(r->qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
             TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN |
-            (r->rc_mode ? TP_IBV_QP_MAX_DEST_RD_ATOMIC : 0)) != 0) {
+            (r->rc_mode ? TP_IBV_QP_MAX_DEST_RD_ATOMIC |
+                         TP_IBV_QP_MIN_RNR_TIMER : 0)) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
