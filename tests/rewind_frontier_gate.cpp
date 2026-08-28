@@ -139,14 +139,24 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
     work.len = 134;
     bool ok = true;
     {
+        /* Base prefill stops at 112 and the last 14 positions are decoded
+         * as singles: the ring at the rewind point is then built by pure
+         * store/shift evolution in BOTH sessions, the same mechanism the
+         * replay reproduces.  (A prefill boundary inside the replay span
+         * would compare store-path bytes against the aligned path's
+         * refresh-seeded ring — a low-bit projection-path duality the
+         * codebase documents separately; the replay's contract is
+         * store-path value truth.) */
         pulsar_tokens p;
         memset(&p, 0, sizeof(p));
         p.v = work.v;
-        p.len = p.cap = 126;
+        p.len = p.cap = 112;
         char err[256];
         ok = pulsar_session_sync(s, &p, err, sizeof(err)) == 0;
         if (!ok) fprintf(stderr, "value leg: base prefill failed: %s\n", err);
     }
+    for (int upto = 113; ok && upto <= 126; upto++)
+        ok = extend_one(s, &work, upto);
     if (ok && ghost_branch) {
         int saved[4];
         memcpy(saved, work.v + 126, sizeof(saved));
