@@ -1826,9 +1826,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     int live_idx[PULSAR_SESSION_POOL_CAP];
     pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
     int accepted[PULSAR_SPEC_LOGITS_ROWS + 1];
-    /* ALL_ROWS caps the shared forward at 16 rows (the spec-logits ceiling). */
-    float *logits = (float *)server_xmalloc(
-            (size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)vocab * sizeof(float));
+    /* ALL_ROWS caps the shared forward at 16 rows (the spec-logits ceiling).
+     * L123: the landing buffer lives on the server (allocated once) — the
+     * per-quantum malloc re-faulted 16.5 MB of demand-zero pages every
+     * quantum. */
+    if (!s->spec_lane_logits)
+        s->spec_lane_logits = (float *)server_xmalloc(
+                (size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)vocab * sizeof(float));
+    float *logits = s->spec_lane_logits;
 
     int emitted_total = 0;
     const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
@@ -2144,7 +2149,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                    prof_rend * 1e3 / prof_rounds, prof_save * 1e3 / prof_rounds,
                    (prof_post - prof_rend - prof_save) * 1e3 / prof_rounds);
     }
-    free(logits);
     if (emitted_total > 0) {
         const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
                                          (double)emitted_total);
