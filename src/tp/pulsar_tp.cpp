@@ -1341,6 +1341,10 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
             return 0;
         }
         for (int i = 0; i < n; i++) {
+            if (getenv("PULSAR_TP_BULK_TRACE"))
+                fprintf(stderr, "pulsar-tp: drain CQ wr_id=%llu status=%d opcode=%d recv_done=%u\n",
+                        (unsigned long long)wc[i].wr_id, (int)wc[i].status,
+                        (int)wc[i].opcode, recv_done);
             if (wc[i].status != TP_IBV_WC_SUCCESS) {
                 fprintf(stderr, "pulsar-tp: rdma receive-window drain: %s\n",
                         tp_wc_status_str(wc[i].status));
@@ -1382,6 +1386,10 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
 static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
                                      uint64_t bytes) {
     pulsar_tp_rdma *r = &tp->rdma;
+    if (getenv("PULSAR_TP_BULK_TRACE"))
+        fprintf(stderr, "pulsar-tp: bulk entry bytes=%llu capable=%d "
+                "window_active=%d\n", (unsigned long long)bytes,
+                tp_rdma_big_gate_capable(tp), (int)r->recv_window_active);
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
 
     /* Payloads already inside the registered slab (verify batches) can ride
@@ -1435,10 +1443,29 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
             recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
         }
         struct tp_ibv_recv_wr *bad_recv = NULL;
+        if (getenv("PULSAR_TP_BULK_TRACE"))
+            fprintf(stderr, "pulsar-tp: bulk round off=%llu chunks=%u posting\n",
+                    (unsigned long long)off, chunks);
         if (r->api.post_recv(r->qp, recv_wr, &bad_recv) != 0) {
             fprintf(stderr, "pulsar-tp: bulk rdma post_recv: %s\n",
                     strerror(errno));
             return 0;
+        }
+        /* Same arming race as the first gate: if our sends leave before the
+         * peer has posted this round's recv window, UC drops the tail of the
+         * batch and the round wait hangs forever (bisected with a settle: a
+         * 2 ms pause before sending makes the whole transport test pass).
+         * Deterministic fix: exchange an armed ack over the control socket
+         * (quiescent here after the batch header handshake) before sending —
+         * both sides have the round's recvs posted once both acks crossed. */
+        if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED,
+                           NULL, 0))
+            return 0;
+        {
+            uint32_t rtype = 0, rbytes = 0;
+            if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
+                rtype != PULSAR_TP_FRAME_RDMA_GATE_ARMED || rbytes != 0)
+                return 0;
         }
         std::atomic_thread_fence(std::memory_order_release);
         struct tp_ibv_sge send_sge[PULSAR_TP_RDMA_BULK_SLOTS];
@@ -1473,6 +1500,10 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
                                    (int)(PULSAR_TP_RDMA_BULK_SLOTS + 1u), wc);
             if (n < 0) return 0;
             for (int i = 0; i < n; i++) {
+                if (getenv("PULSAR_TP_BULK_TRACE"))
+                    fprintf(stderr, "pulsar-tp: bulk CQ wr_id=%llu status=%d opcode=%d len=%u\n",
+                            (unsigned long long)wc[i].wr_id, (int)wc[i].status,
+                            (int)wc[i].opcode, wc[i].byte_len);
                 if (wc[i].status != TP_IBV_WC_SUCCESS) {
                     fprintf(stderr,
                             "pulsar-tp: bulk rdma completion error: %s\n",
@@ -1854,9 +1885,20 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer,
                                 (uint16_t)rows, seq };
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+        if (getenv("PULSAR_TP_BULK_TRACE"))
+            fprintf(stderr, "pulsar-tp: batch rma: header hdr l=%u rows=%u seq=%llu bytes=%llu\n",
+                    layer, rows, (unsigned long long)seq, (unsigned long long)bytes);
+        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) {
+            if (getenv("PULSAR_TP_BULK_TRACE"))
+                fprintf(stderr, "pulsar-tp: batch rma: header WRITE failed\n");
+            return 0;
+        }
         pulsar_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) {
+            if (getenv("PULSAR_TP_BULK_TRACE"))
+                fprintf(stderr, "pulsar-tp: batch rma: header READ failed\n");
+            return 0;
+        }
         if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
             ph.gate != rows || ph.seq != seq) {
             fprintf(stderr,
