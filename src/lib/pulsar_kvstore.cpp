@@ -611,9 +611,19 @@ public:
         const int step = continued_step();
         if (step <= 0) return 0;
         if (live_tokens < kc_.opt.min_tokens) return 0;
-        if (live_tokens % step != 0) return 0;
-        if (live_tokens <= kc_.continued_last_store_tokens) return 0;
-        return live_tokens;
+        /* Fire once per CROSSED boundary: the target is the highest aligned
+         * step multiple <= live, stored as a prefix (the serializer has
+         * always taken a prefix length -- cold stores cut the same way).
+         * The old test demanded live % step == 0 exactly, which only chunk-
+         * aligned prefill ever hit -- decode advances in multi-token spec
+         * rounds and skipped every boundary, so the decode-side continued
+         * checkpoint effectively never fired (L122).  For aligned inputs
+         * (every suppression caller) target == live, so the suppress/
+         * restore contract is unchanged. */
+        const int target = live_tokens - live_tokens % step;
+        if (target < kc_.opt.min_tokens) return 0;
+        if (target <= kc_.continued_last_store_tokens) return 0;
+        return target;
     }
 
     void note_store(int tokens) {

@@ -3915,6 +3915,16 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+
+    /* L122: decode advances in multi-token spec rounds and lands PAST the
+     * boundary, almost never on it.  A crossed boundary fires once, as an
+     * aligned prefix target, and does not refire until the next crossing. */
+    kc.opt = kv_cache_default_options();
+    kc.continued_last_store_tokens = 10240;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20483) == 20480);
+    kc.continued_last_store_tokens = 20480;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20487) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30723) == 30720);
 }
 
 
