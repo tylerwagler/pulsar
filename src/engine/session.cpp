@@ -1319,19 +1319,30 @@ void pulsar_session::rewind(int pos) {
                     pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], off, row_bytes);
                     pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], off, row_bytes);
                     pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], off, row_bytes);
-                    ok = akv && asc && ikv && isc &&
-                         pulsar_gpu_compressor_store_batch_tensor(akv, asc,
+                    ok = akv && asc && ikv && isc;
+                    if (!ok) fprintf(stderr, "pulsar: L120 replay: view fail (p=%u)\n", p);
+                    if (ok) {
+                        ok = pulsar_gpu_compressor_store_batch_tensor(akv, asc,
                                 g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
                                 model->map, model->size,
                                 layer->attn_compressor_ape->abs_offset,
                                 layer->attn_compressor_ape->type,
-                                PULSAR_N_HEAD_DIM, 4u, p, 1u) != 0 &&
-                         pulsar_gpu_compressor_store_batch_tensor(ikv, isc,
+                                PULSAR_N_HEAD_DIM, 4u, p, 1u) != 0;
+                        if (!ok) fprintf(stderr, "pulsar: L120 replay: attn store fail (p=%u state=%llu ape_t=%u)\n",
+                                         p, (unsigned long long)g->layer_attn_state_kv[il]->bytes,
+                                         layer->attn_compressor_ape->type);
+                    }
+                    if (ok) {
+                        ok = pulsar_gpu_compressor_store_batch_tensor(ikv, isc,
                                 g->layer_index_state_kv[il], g->layer_index_state_score[il],
                                 model->map, model->size,
                                 layer->indexer_compressor_ape->abs_offset,
                                 layer->indexer_compressor_ape->type,
                                 PULSAR_N_INDEXER_HEAD_DIM, 4u, p, 1u) != 0;
+                        if (!ok) fprintf(stderr, "pulsar: L120 replay: idx store fail (p=%u state=%llu ape_t=%u)\n",
+                                         p, (unsigned long long)g->layer_index_state_kv[il]->bytes,
+                                         layer->indexer_compressor_ape->type);
+                    }
                     if (ok && (p + 1u) % 4u == 0u) {
                         ok = pulsar_gpu_compressor_shift_ratio4_tensor(
                                     g->layer_attn_state_kv[il],
