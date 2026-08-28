@@ -772,14 +772,10 @@ void server::gen_begin(session_slot *sl) {
      * from position 0 regardless of what this bank served before.  The
      * choke-point twins live in slot_common_prefix (routing) and the live
      * resolvers below. */
-    int common = 0;          /* LIVE-side byte-common (bank KV currency) */
-    int common_prompt = 0;   /* PROMPT-side byte-common (accounting currency) */
-    if (!s->eval_pin) {
-        /* L115: byte-equal live common (see slot_common_prefix) — seams in
-         * generated history keep the live KV; sync's seam-rescue stitches.
-         * The two counts differ exactly by the seam deltas. */
-        pulsar_session_common_prefix_bytes(s->sess, &j->req.prompt, &common, &common_prompt);
-    }
+    /* L115: one authority, both currencies (see pulsar_prefix_match). */
+    pulsar_prefix_match pm;
+    s->slot_prefix_match(sl, &j->req.prompt, &pm);
+    const int common = pm.live_cut;          /* live/bank side: KV rows */
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
@@ -864,13 +860,20 @@ void server::gen_begin(session_slot *sl) {
          * and value-true since L120/L124.
          * The half-of-prompt guard keeps a genuinely different conversation
          * (sharing only a system preamble) on its own disk snapshot. */
-        const bool pure_extension =
-            common == old_pos && j->req.prompt.len >= old_pos;
-        const bool byte_prefix_reuse =
-            common_prompt > 0 && common_prompt * 2 >= j->req.prompt.len;
-        cached = pure_extension ? common
-               : byte_prefix_reuse ? common_prompt
-               : 0;
+        /* Reuse the live KV whenever the prompt's BYTES are a prefix of it —
+         * exact extension, seam-shifted echo, shorter echo (stripped
+         * reasoning), or a client rollback.  The one case to decline is a
+         * match so shallow it is just the shared header, where a fresh
+         * slot or a disk snapshot serves better: that is exactly
+         * server_slot_match_is_trivial, the SAME predicate routing uses to
+         * protect warm state.  Reusing it rather than inventing a second
+         * threshold keeps one authority for "is this match worth keeping".
+         * Accounting takes the PROMPT-side count. */
+        const bool trivial =
+            server_slot_match_is_trivial(common, old_pos,
+                                         s->slot_trivial_common_tokens,
+                                         s->slot_trivial_common_tokens);
+        cached = (pm.prompt_cut > 0 && !trivial) ? pm.prompt_cut : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
     if (cached == 0) {

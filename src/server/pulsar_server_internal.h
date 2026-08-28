@@ -1365,6 +1365,8 @@ struct server {
     /* const readers (take a const server *s in the C predecessor). */
     bool should_canonicalize_tool_checkpoint(const tool_calls *calls) const;
     int slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    void slot_prefix_match(const session_slot *sl, const pulsar_tokens *prompt,
+                           pulsar_prefix_match *out) const;
     int job_needed_ctx(const job *j) const;
     int slot_frontier_pos(const session_slot *sl) const;
     int provision_ctx_for_job(const job *j) const;

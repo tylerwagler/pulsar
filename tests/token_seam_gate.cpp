@@ -9,7 +9,7 @@
  * ~200k colds in one morning, rows/L115.md).
  *
  * Legs:
- *   1. WALK: pulsar_engine_token_common_bytes crosses a synthetic seam and
+ *   1. WALK: pulsar_tokens_prefix_match crosses a synthetic seam and
  *      matches to the shared boundary on both sides (id-common stops at it).
  *   2. RESCUE: a session built with the sampled (split) boundaries, synced
  *      against the canonical (fused) render plus a suffix, must (a) succeed,
@@ -143,9 +143,10 @@ int main(int argc, char **argv) {
 
     /* ---- leg 1: the byte walk crosses the seam ---- */
     {
-        int a_n = 0, b_n = 0;
-        pulsar_engine_token_common_bytes(e, live, live_len, canon.v, canon.len,
-                                         &a_n, &b_n);
+        pulsar_prefix_match m;
+        pulsar_tokens_prefix_match(e, live, live_len, canon.v, canon.len, &m);
+        const int a_n = m.live_cut, b_n = m.prompt_cut;
+        CHECK(m.seamed, "walk did not report the synthetic seam");
         CHECK(a_n == live_len && b_n == canon.len,
               "walk stopped at (%d,%d), want (%d,%d) [seam at %d]",
               a_n, b_n, live_len, canon.len, k);
@@ -230,9 +231,9 @@ int main(int argc, char **argv) {
 
         /* The walk must stop at the shared boundary, not inside either tail —
          * assert it so the leg cannot silently test a different shape. */
-        int a_n = 0, b_n = 0;
-        pulsar_engine_token_common_bytes(e, plive.v, plive.len, pecho.v, pecho.len,
-                                         &a_n, &b_n);
+        pulsar_prefix_match m3;
+        pulsar_tokens_prefix_match(e, plive.v, plive.len, pecho.v, pecho.len, &m3);
+        const int a_n = m3.live_cut, b_n = m3.prompt_cut;
         CHECK(a_n == l1 && b_n == c1,
               "leg3 walk (%d,%d) want (%d,%d) — tails may share a leading byte",
               a_n, b_n, l1, c1);

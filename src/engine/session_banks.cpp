@@ -120,10 +120,10 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
      * keeps the anti-contamination guarantee exactly as strong: identical
      * text is the same conversation, whatever the boundaries. */
     {
-        int live_n = 0, prompt_n = 0;
-        pulsar_engine_token_common_bytes(s->engine, hist->v, hist->len,
-                                         tokens, n_tokens, &live_n, &prompt_n);
-        if (live_n != hist->len) return 1;                  /* mismatch -> cold */
+        pulsar_prefix_match m;
+        pulsar_tokens_prefix_match(s->engine, hist->v, hist->len,
+                                   tokens, n_tokens, &m);
+        if (m.live_cut != hist->len) return 1;              /* mismatch -> cold */
     }
     /* 2. Eviction pin src (the guard's victim picker must not free it mid-clone). */
     g->fork_pin[src] = 1u;
@@ -246,10 +246,10 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
     const uint32_t cur = g->banks.cur_bank;
     {
         /* L115: byte validation (see bank_fork above). */
-        int live_n = 0, prompt_n = 0;
-        pulsar_engine_token_common_bytes(s->engine, hist->v, (int)(R + 4u),
-                                         tokens, n_tokens, &live_n, &prompt_n);
-        if (live_n != (int)(R + 4u)) return PULSAR_FORK_MISMATCH;
+        pulsar_prefix_match m;
+        pulsar_tokens_prefix_match(s->engine, hist->v, (int)(R + 4u),
+                                   tokens, n_tokens, &m);
+        if (m.live_cut != (int)(R + 4u)) return PULSAR_FORK_MISMATCH;
     }
     /* 2. Pin src; re-check evicted under the pin. Snapshot src's host carry
      * FIRST: state_save re-captures the live frontier counters, which MUST
@@ -664,16 +664,14 @@ int pulsar_session::bank_common_prefix(uint32_t bank,
     return i;
 }
 
-/* L115: byte-equal variant across sampled-vs-canonical boundary drift; the
- * live-side count is the routing currency (bank KV tokens reusable). */
-int pulsar_session::bank_common_prefix_bytes(uint32_t bank,
-                                             const pulsar_tokens *prompt) {
+/* L115: the prefix-reuse authority against one bank's committed history. */
+void pulsar_session::bank_prefix_match(uint32_t bank, const pulsar_tokens *prompt,
+                                       pulsar_prefix_match *out) {
     auto *s = this;
+    out->live_cut = 0;
+    out->prompt_cut = 0;
+    out->seamed = false;
     const pulsar_tokens *t = bank_frontier_tokens(s, bank);
-    if (!t || !prompt) return 0;
-    int live_n = 0, prompt_n = 0;
-    pulsar_engine_token_common_bytes(s->engine, t->v, t->len,
-                                     prompt->v, prompt->len,
-                                     &live_n, &prompt_n);
-    return live_n;
+    if (!t || !prompt) return;
+    pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, out);
 }

@@ -909,8 +909,9 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
      * takes the extend path.  One recursion level by construction (the
      * stitched prompt starts_with the rewound checkpoint). */
     if (s->checkpoint_valid) {
-        int live_n = 0, prompt_n = 0;
-        s->common_prefix_bytes(prompt, &live_n, &prompt_n);
+        pulsar_prefix_match m;
+        s->prefix_match(prompt, &m);
+        const int live_n = m.live_cut, prompt_n = m.prompt_cut;
         /* Fires for every shape that reaches here with reusable live bytes:
          *   - SEAM: live_n > id-common (sampled vs canonical boundaries);
          *   - SHORTER ECHO: the client strips generated reasoning, so live
@@ -1080,10 +1081,15 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
  * ending on a shared boundary.  Zero-length token texts (control/special
  * ids) only match by ID: a boundary mismatch involving one stops the walk
  * conservatively — role markers must never byte-alias into content. */
-void pulsar_engine_token_common_bytes(pulsar_engine *e,
-                                      const int32_t *a, int a_len,
-                                      const int32_t *b, int b_len,
-                                      int *a_n, int *b_n) {
+void pulsar_tokens_prefix_match(pulsar_engine *e,
+                                const int *a, int a_len,
+                                const int *b, int b_len,
+                                pulsar_prefix_match *out) {
+    out->live_cut = 0;
+    out->prompt_cut = 0;
+    out->seamed = false;
+    if (!e || !a || !b) return;
+    bool seamed = false;
     int i = 0, j = 0;          /* token cursors */
     size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
     int best_i = 0, best_j = 0;
@@ -1094,6 +1100,7 @@ void pulsar_engine_token_common_bytes(pulsar_engine *e,
             best_i = i;
             best_j = j;
             if (a[i] == b[j]) { i++; j++; continue; }   /* aligned fast path */
+            seamed = true;   /* same bytes ahead, different boundaries */
         }
         if (oa == 0) {
             ta = pulsar_token_text(e, a[i], &la);
@@ -1112,20 +1119,21 @@ void pulsar_engine_token_common_bytes(pulsar_engine *e,
     }
     if (oa == 0 && ob == 0) { best_i = i; best_j = j; }
 done:
-    *a_n = best_i;
-    *b_n = best_j;
+    out->live_cut = best_i;
+    out->prompt_cut = best_j;
+    out->seamed = seamed;
 }
 
-void pulsar_session::common_prefix_bytes(const pulsar_tokens *prompt,
-                                         int *live_n, int *prompt_n) {
+void pulsar_session::prefix_match(const pulsar_tokens *prompt,
+                                 pulsar_prefix_match *out) {
     auto *s = this;
-    *live_n = 0;
-    *prompt_n = 0;
-    if (!s->checkpoint_valid) return;
-    pulsar_engine_token_common_bytes(s->engine,
-                                     s->checkpoint.v, s->checkpoint.len,
-                                     prompt->v, prompt->len,
-                                     live_n, prompt_n);
+    out->live_cut = 0;
+    out->prompt_cut = 0;
+    out->seamed = false;
+    if (!s->checkpoint_valid || !prompt) return;
+    pulsar_tokens_prefix_match(s->engine,
+                               s->checkpoint.v, s->checkpoint.len,
+                               prompt->v, prompt->len, out);
 }
 
 

@@ -210,20 +210,28 @@ static const char *server_fork_rc_name(int rc) {
 int server::slot_common_prefix(const session_slot *sl,
                                const pulsar_tokens *prompt) const {
     const auto *s = this;
-    if (s->eval_pin) return 0;   /* choke point: no prefix reuse, ever */
-    if (!sl || !sl->provisioned) return 0;
-    /* L115: byte-equal common, so sampled-vs-canonical token-boundary seams
-     * in generated history do not read as divergence.  Routing then keeps
-     * seam-carrying banks in place, and the engine's sync seam-rescue
-     * stitches the live boundaries to the canonical suffix.  The returned
-     * count is LIVE-side tokens (the bank KV currency); prompt-side may
-     * differ by the seam deltas, which only ripples into capacity
-     * heuristics and reported cached_tokens. */
+    pulsar_prefix_match m;
+    s->slot_prefix_match(sl, prompt, &m);
+    return m.live_cut;
+}
+
+/* L115: the one prefix-reuse question, asked of a slot.  Callers that need
+ * the request-side count (accounting, prefill bounds) read `prompt_cut`;
+ * callers that need KV rows or a cut point read `live_cut`.  Across a seam
+ * these differ, and keeping them in one struct is what stops a live-side
+ * count from being used to index the request array. */
+void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prompt,
+                               pulsar_prefix_match *out) const {
+    const auto *s = this;
+    out->live_cut = 0;
+    out->prompt_cut = 0;
+    out->seamed = false;
+    if (s->eval_pin) return;     /* choke point: no prefix reuse, ever */
+    if (!sl || !sl->provisioned) return;
     if (s->pool_banks > 0)
-        return pulsar_session_bank_common_prefix_bytes(s->sess, sl->bank, prompt);
-    int live_n = 0, prompt_n = 0;
-    pulsar_session_common_prefix_bytes(s->sess, prompt, &live_n, &prompt_n);
-    return live_n;
+        pulsar_session_bank_prefix_match(s->sess, sl->bank, prompt, out);
+    else
+        pulsar_session_prefix_match(s->sess, prompt, out);
 }
 
 /* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:

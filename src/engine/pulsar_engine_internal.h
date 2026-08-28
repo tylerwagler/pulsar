@@ -1755,9 +1755,8 @@ struct pulsar_session {
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
                                                       char *err, size_t errlen);
     int common_prefix(const pulsar_tokens *prompt);
-    /* L115: byte-equal common prefix across token-boundary drift; returns
-     * the largest (live_n, prompt_n) with equal bytes on a shared boundary. */
-    void common_prefix_bytes(const pulsar_tokens *prompt, int *live_n, int *prompt_n);
+    /* L115: the prefix-reuse authority (see pulsar.h). */
+    void prefix_match(const pulsar_tokens *prompt, pulsar_prefix_match *out);
     int argmax();
     int argmax_excluding(int excluded_id);
     int sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
@@ -1780,7 +1779,7 @@ struct pulsar_session {
     int bank_spec_depth(uint32_t bank);   /* L112: adaptive depth, live-or-carry */
     const pulsar_tokens *bank_tokens(uint32_t bank);
     int bank_common_prefix(uint32_t bank, const pulsar_tokens *prompt);
-    int bank_common_prefix_bytes(uint32_t bank, const pulsar_tokens *prompt);
+    void bank_prefix_match(uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out);
     void note_committed_tokens(const int *toks, int n);
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng, int max_tokens, int eos_token,

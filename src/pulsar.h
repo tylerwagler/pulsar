@@ -335,18 +335,40 @@ pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
         pulsar_session *s, const pulsar_tokens *prompt, int common,
         char *err, size_t errlen);
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
-/* L115: byte-equal common prefix across sampled-vs-canonical token-boundary
- * drift.  Returns the largest (live_n, prompt_n) with
- * bytes(live[0..live_n)) == bytes(prompt[0..prompt_n)) ending on a shared
- * boundary; ids may differ inside.  live_n >= the id-exact common.  Control
- * tokens (empty text) match by id only.  The raw-array variant serves bank
- * carries. */
-void pulsar_session_common_prefix_bytes(pulsar_session *s, const pulsar_tokens *prompt,
-                                        int *live_n, int *prompt_n);
-void pulsar_engine_token_common_bytes(pulsar_engine *e,
-                                      const int32_t *a, int a_len,
-                                      const int32_t *b, int b_len,
-                                      int *a_n, int *b_n);
+
+/* L115 — THE prefix-reuse authority.  Every "can this state serve this
+ * prompt, and from which cut?" decision (routing, the worker's cache
+ * resolver, session sync, and the bank fork validators) asks this and
+ * nothing else.
+ *
+ * The comparison is over BYTES, not token ids: generated text freezes the
+ * boundaries the model SAMPLED into the live history, while the client's
+ * echo re-tokenizes the same bytes CANONICALLY (live `))`+`**` vs echoed
+ * `))**`).  Ids are one rendering of the history; the bytes are the
+ * history.  Control/special tokens (empty text) match by id only, so role
+ * markers can never byte-alias into content.
+ *
+ * TWO CURRENCIES, deliberately both returned: across a seam the two sides
+ * spend a different NUMBER of tokens on the same bytes.  `live_cut` is the
+ * live/bank side (KV rows, cut points, rewind targets); `prompt_cut` is the
+ * request side (accounting, cache_read_tokens, prefill bounds).  Mixing
+ * them is the hazard this struct exists to make impossible — a live-side
+ * count used to index the request array can run past its end. */
+typedef struct {
+    int  live_cut;    /* live tokens whose bytes the prompt covers */
+    int  prompt_cut;  /* prompt tokens covering those same bytes */
+    bool seamed;      /* ids disagreed inside the covered region */
+} pulsar_prefix_match;
+
+void pulsar_tokens_prefix_match(pulsar_engine *e,
+                                const int *live, int live_len,
+                                const int *prompt, int prompt_len,
+                                pulsar_prefix_match *out);
+void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
+                                 pulsar_prefix_match *out);
+void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
+                                      const pulsar_tokens *prompt,
+                                      pulsar_prefix_match *out);
 int pulsar_session_argmax(pulsar_session *s);
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
@@ -562,8 +584,6 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
  * 0 / NULL for an out-of-range or never-populated bank. */
 int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
-int  pulsar_session_bank_common_prefix_bytes(pulsar_session *s, uint32_t bank,
-                                             const pulsar_tokens *prompt);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);
 /* Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
