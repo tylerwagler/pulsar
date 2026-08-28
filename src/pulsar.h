@@ -225,7 +225,7 @@ uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_
  * eviction guard for the clone. Returns 0 on success. fork_pinned: whether a bank
  * is currently mid-fork (the guard's victim picker must skip it). */
 int  pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
-                           const int *tokens, int n_cached);
+                           const int *tokens, int n_tokens, int n_cached);
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank);
 /* plan-33 increment C — PARTIAL-prefix fork: the request shares only
  * tokens[0..n_cached) with src's history. Cuts at R = ((n_cached-4)/128)*128,
@@ -239,7 +239,7 @@ enum {
     PULSAR_FORK_EINVAL        = 1, /* bad args / bank out of range / cut beyond history */
     PULSAR_FORK_SHALLOW       = 2, /* R < align: cut too close to the origin */
     PULSAR_FORK_NOHIST        = 3, /* src has no valid committed-history carry */
-    PULSAR_FORK_MISMATCH      = 4, /* tokens[0..R+4) != src committed history */
+    PULSAR_FORK_MISMATCH      = 4, /* src history not a BYTE-prefix of tokens (L115) */
     PULSAR_FORK_EVICTED       = 5, /* src bank has no physical KV */
     PULSAR_FORK_RING_SCROLLED = 6, /* raw ring wrapped past the cut: the replay's
                                     * attention window [R-raw_window, R) is gone.
@@ -248,7 +248,7 @@ enum {
     PULSAR_FORK_COPY_FAIL     = 7, /* device clone-with-cut failed */
 };
 int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
-                                   const int *tokens, int n_cached);
+                                   const int *tokens, int n_tokens, int n_cached);
 /* Host-only feasibility probe for the partial fork: every check above EXCEPT the
  * token compare (the caller already knows its common prefix) and the device copy.
  * Lets a scheduler route an infeasible cut (typically PULSAR_FORK_RING_SCROLLED

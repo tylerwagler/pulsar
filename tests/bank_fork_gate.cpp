@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
         int *wrong = (int *)malloc((size_t)n_cached * sizeof(int));
         for (int i = 0; i < n_cached; i++) wrong[i] = toks[i];
         wrong[n_cached / 2] ^= 0x1;   /* one token differs */
-        const int rc = pulsar_session_bank_fork(s, 0, 2, wrong, n_cached);
+        const int rc = pulsar_session_bank_fork(s, 0, 2, wrong, n_cached, n_cached);
         CHECK(rc != 0, "fork ACCEPTED a mismatched prefix (anti-contamination broken)");
         CHECK(!pulsar_session_bank_fork_pinned(s, 0), "src left fork-pinned after refusal");
         fprintf(stderr, "fork_gate: mismatch-prefix fork refused rc=%d : %s\n", rc, rc != 0 ? "OK" : "FAIL");
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
     /* 3. FORK src(0) -> dst(1). Must validate + clone + mirror counters. */
     {
         /* src is cur (bank 0 installed); its committed history is s->checkpoint. */
-        const int rc = pulsar_session_bank_fork(s, 0, 1, toks, n_cached);
+        const int rc = pulsar_session_bank_fork(s, 0, 1, toks, n_cached, n_cached);
         CHECK(rc == 0, "full-prefix fork refused rc=%d", rc);
         CHECK(!pulsar_session_bank_fork_pinned(s, 0), "src still pinned after fork");
         /* immediate fork bit-identity: dst frontier == src frontier. */
@@ -237,11 +237,11 @@ int main(int argc, char **argv) {
         pulsar_session_bank_state_save(s, 0);
 
         /* shallow-cut refusal (R would be 0) */
-        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks2, 100) != 0,
+        CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks2, 100, 100) != 0,
               "P2 shallow cut not refused");
 
         /* partial fork 0->1 and replay toks2 to L2 */
-        const int prc = pulsar_session_bank_fork_partial(s, 0, 1, toks2, NC);
+        const int prc = pulsar_session_bank_fork_partial(s, 0, 1, toks2, NC, NC);
         CHECK(prc == 0, "P2 partial fork refused rc=%d", prc);
         /* TRIAGE memcmp: stash slot vs SRC row 1024 (capture correctness). */
         {
@@ -351,7 +351,7 @@ int main(int argc, char **argv) {
         /* P3: src==dst TRUNCATE-reuse — rewind bank 1 (@L2) to R and replay the
          * SAME tokens; must again be byte-identical to the cold control. */
         CHECK(pulsar_session_bank_state_restore(s, 1), "P3 install bank1");
-        const int trc = pulsar_session_bank_fork_partial(s, 1, 1, toks2, NC);
+        const int trc = pulsar_session_bank_fork_partial(s, 1, 1, toks2, NC, NC);
         CHECK(trc == 0, "P3 truncate refused rc=%d", trc);
         CHECK(pulsar_session_pos(s) == RCUT, "P3 truncated pos %d != %d", pulsar_session_pos(s), RCUT);
         {

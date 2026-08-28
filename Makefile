@@ -351,7 +351,7 @@ cuda-rewind-gate: tests/rewind_frontier_gate
 # L115 token-seam gate: sampled-vs-canonical boundary drift keeps the live
 # KV (see the header of tests/token_seam_gate.cpp).  MODEL-DEPENDENT.
 cuda-seam-gate: tests/token_seam_gate
-	./tests/token_seam_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 ./tests/token_seam_gate $(FRONTIER_MODEL)
 
 # Multiseq-vs-solo token-stream gate + first aggregate-throughput measurement
 # (see the header of tests/multiseq_decode_gate.c).  MODEL-DEPENDENT — run

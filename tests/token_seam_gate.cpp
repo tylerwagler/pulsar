@@ -257,6 +257,50 @@ int main(int argc, char **argv) {
         pulsar_session_free(s);
     }
 
+    /* ---- leg 4: a FORK across seams (the routing-side holdout) -----------
+     * Routing validated forks by token id, so a bank whose history carries
+     * sampled boundaries could not be forked onto its own canonical echo:
+     * `warm-advance-in-place refused (token-mismatch)`, measured in
+     * production 2026-08-28 at 328k and 390k.  Unlike leg 3 this leg IS a
+     * discriminator — the id compare fails outright on the old code.  The
+     * destination's stamped history must also carry the LIVE (split) ids,
+     * because the checkpoint labels the KV that was cloned. */
+    {
+        pulsar_session *s = NULL;
+        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+        if (pulsar_session_bank_count(s) < 2) {
+            fprintf(stderr, "leg4 SKIPPED: needs PULSAR_MSEQ_BANKS>=2\n");
+        } else {
+            char err[256];
+            const int l1 = k + split.len + 8;
+            pulsar_tokens plive;
+            memset(&plive, 0, sizeof(plive));
+            plive.v = live;
+            plive.len = plive.cap = l1;
+            CHECK(pulsar_session_sync(s, &plive, err, sizeof(err)) == 0,
+                  "leg4 live sync failed: %s", err);
+            /* The echo: canonical ids for the same bytes, one turn longer. */
+            const int c1 = k + 1 + 8;
+            const int c2 = c1 + 16;
+            const int rc = pulsar_session_bank_fork(s, 0, 1, canon.v, c2, l1);
+            CHECK(rc == 0, "leg4 fork refused (rc=%d) — id-exact validation", rc);
+            if (rc == 0) {
+                CHECK(pulsar_session_bank_state_restore(s, 1),
+                      "leg4 restore of forked bank failed");
+                const pulsar_tokens *dt = pulsar_session_tokens(s);
+                CHECK(dt && dt->len == l1,
+                      "leg4 forked frontier %d want %d", dt ? dt->len : -1, l1);
+                if (dt && dt->len == l1) {
+                    CHECK(dt->v[k] == split.v[0] && dt->v[k + 1] == split.v[1],
+                          "leg4 forked history stamped with CANONICAL ids (%d,%d) "
+                          "want live (%d,%d) — the label would misdescribe the KV",
+                          dt->v[k], dt->v[k + 1], split.v[0], split.v[1]);
+                }
+            }
+        }
+        pulsar_session_free(s);
+    }
+
     free(live);
     free(split.v);
     pulsar_tokens_free(&canon);

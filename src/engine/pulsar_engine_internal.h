@@ -1747,9 +1747,9 @@ struct pulsar_session {
     int bank_kv_save(uint32_t bank, FILE *fp, char *err, size_t errlen);
     int bank_kv_load(uint32_t bank, FILE *fp, char *err, size_t errlen);
     uint64_t quantum_growth_bytes_per_bank(uint32_t q);
-    int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_cached);
+    int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
     bool bank_fork_pinned(uint32_t bank) const;
-    int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_cached);
+    int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
     int bank_fork_partial_feasible(uint32_t src, int n_cached);
     int sync(const pulsar_tokens *prompt, char *err, size_t errlen);
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,

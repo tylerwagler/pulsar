@@ -47,6 +47,17 @@ static void token_vec_set_prefix(token_vec *d, const int *toks, int n) {
     for (int i = 0; i < n; i++) token_vec_push(d, toks[i]);
 }
 
+/* L115: stamp a fork destination's checkpoint from the LIVE history rather
+ * than from the request's tokens.  With token-boundary seams the two agree
+ * byte-for-byte while disagreeing in ids, and the checkpoint must describe
+ * the KV that was actually cloned — which carries the boundaries the model
+ * sampled.  Stamping from the request would label live KV with canonical
+ * ids it was not built from.  Handles `d` aliasing `src`. */
+static void token_vec_set_prefix_from(token_vec *d, const token_vec *src, int n) {
+    if (d == src) { if (d->len > n) d->len = n; return; }
+    token_vec_set_prefix(d, src->v, n);
+}
+
 /* Tier-2 PATH-A (plan-33 inc A) — deep-copy one bank carry into another (src's
  * conversation continues on dst). Reuses d's owned heap buffers; no alias/leak. */
 void pulsar_bank_carry::copy(const pulsar_bank_carry *sc) {
@@ -84,7 +95,7 @@ void pulsar_bank_carry::copy(const pulsar_bank_carry *sc) {
  * Pins src against the eviction guard for the duration of the clone. Returns 0 on
  * success, non-zero on refusal/failure (caller falls back to cold prefill). */
 int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
-                          const int *tokens, int n_cached) {
+                          const int *tokens, int n_tokens, int n_cached) {
     auto *s = this;
     if (!s || !tokens || n_cached < 0) return 1;
     pulsar_gpu_graph *g = &s->graph;
@@ -100,8 +111,19 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
         hist = &s->bank_carry[src].checkpoint;
     }
     if (!hist || (int)hist->len != n_cached) return 1;      /* full-prefix only */
-    for (int i = 0; i < n_cached; i++) {
-        if (hist->v[i] != tokens[i]) return 1;              /* mismatch -> cold */
+    /* L115: validate by BYTES, not ids.  Generated text freezes the token
+     * boundaries the model sampled into the live history; the client's echo
+     * re-tokenizes the same bytes canonically, so an id-exact compare
+     * refuses to fork a conversation onto ITS OWN history — measured
+     * 2026-08-28 as `warm-advance-in-place refused (token-mismatch)` at 328k
+     * and 390k, one of which cost a 108,360-token re-prefill.  Byte equality
+     * keeps the anti-contamination guarantee exactly as strong: identical
+     * text is the same conversation, whatever the boundaries. */
+    {
+        int live_n = 0, prompt_n = 0;
+        pulsar_engine_token_common_bytes(s->engine, hist->v, hist->len,
+                                         tokens, n_tokens, &live_n, &prompt_n);
+        if (live_n != hist->len) return 1;                  /* mismatch -> cold */
     }
     /* 2. Eviction pin src (the guard's victim picker must not free it mid-clone). */
     g->fork_pin[src] = 1u;
@@ -120,7 +142,7 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
      * from the validated request prefix (do not trust the copied carry alone). */
     if (dst < s->bank_carry_n) {
         pulsar_bank_carry *c = &s->bank_carry[dst];
-        token_vec_set_prefix(&c->checkpoint, tokens, n_cached);
+        token_vec_set_prefix_from(&c->checkpoint, hist, n_cached);
         c->checkpoint_valid = true;
         c->valid = true;
     }
@@ -132,7 +154,7 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
      * stamp s->checkpoint to tokens[0..n_cached). */
     if (dst == cur) {
         gpu_graph_bank_counters_install(g, dst);
-        token_vec_set_prefix(&s->checkpoint, tokens, n_cached);
+        token_vec_set_prefix_from(&s->checkpoint, hist, n_cached);
         s->checkpoint_valid = true;
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);
@@ -211,7 +233,7 @@ int pulsar_session::bank_fork_partial_feasible(uint32_t src, int n_cached) {
 }
 
 int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
-                                  const int *tokens, int n_cached) {
+                                  const int *tokens, int n_tokens, int n_cached) {
     auto *s = this;
     if (!s || !tokens) return PULSAR_FORK_EINVAL;
     pulsar_gpu_graph *g = &s->graph;
@@ -222,8 +244,12 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
     if (host_rc != PULSAR_FORK_OK) return host_rc;
     /* 1. VALIDATE tokens[0..R+4) vs src's committed history BEFORE any write. */
     const uint32_t cur = g->banks.cur_bank;
-    for (uint32_t i = 0; i < R + 4u; i++) {
-        if (hist->v[i] != tokens[i]) return PULSAR_FORK_MISMATCH;
+    {
+        /* L115: byte validation (see bank_fork above). */
+        int live_n = 0, prompt_n = 0;
+        pulsar_engine_token_common_bytes(s->engine, hist->v, (int)(R + 4u),
+                                         tokens, n_tokens, &live_n, &prompt_n);
+        if (live_n != (int)(R + 4u)) return PULSAR_FORK_MISMATCH;
     }
     /* 2. Pin src; re-check evicted under the pin. Snapshot src's host carry
      * FIRST: state_save re-captures the live frontier counters, which MUST
@@ -248,7 +274,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
     }
     if (dst < s->bank_carry_n) {
         pulsar_bank_carry *c = &s->bank_carry[dst];
-        token_vec_set_prefix(&c->checkpoint, tokens, (int)R);
+        token_vec_set_prefix_from(&c->checkpoint, hist, (int)R);
         c->checkpoint_valid = true;
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
@@ -270,7 +296,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
      * fired, zero work skipped, no TTFT gain). Stamp it to R explicitly. */
     if (dst == cur) {
         gpu_graph_bank_counters_install(g, dst);
-        token_vec_set_prefix(&s->checkpoint, tokens, (int)R);
+        token_vec_set_prefix_from(&s->checkpoint, hist, (int)R);
         s->checkpoint_valid = true;
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);

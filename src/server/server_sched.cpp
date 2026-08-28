@@ -639,7 +639,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
              * conversation its warmth. */
             const int rc = pulsar_session_bank_fork_partial(
                     s->sess, best->bank, best->bank,
-                    j->req.prompt.v, best_common);
+                    j->req.prompt.v, j->req.prompt.len, best_common);
             if (rc == 0) {
                 best->committed_pos = pulsar_session_bank_pos(s->sess, best->bank);
                 /* The cut moved the frontier BACKWARD; the pre-truncation
@@ -664,9 +664,10 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             pulsar_session *pool = s->sess;
             const int rc = full
                 ? pulsar_session_bank_fork(pool, best->bank, dst->bank,
-                                        j->req.prompt.v, best_common)
+                                        j->req.prompt.v, j->req.prompt.len, best_common)
                 : pulsar_session_bank_fork_partial(pool, best->bank, dst->bank,
-                                                j->req.prompt.v, best_common);
+                                                j->req.prompt.v, j->req.prompt.len,
+                                                best_common);
             if (rc == 0) {
                 /* FULL resumes at best_common; PARTIAL resumes at the engine's
                  * R-aligned cut (read it back rather than recompute the align). */
