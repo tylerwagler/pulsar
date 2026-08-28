@@ -335,6 +335,18 @@ pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
         pulsar_session *s, const pulsar_tokens *prompt, int common,
         char *err, size_t errlen);
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
+/* L115: byte-equal common prefix across sampled-vs-canonical token-boundary
+ * drift.  Returns the largest (live_n, prompt_n) with
+ * bytes(live[0..live_n)) == bytes(prompt[0..prompt_n)) ending on a shared
+ * boundary; ids may differ inside.  live_n >= the id-exact common.  Control
+ * tokens (empty text) match by id only.  The raw-array variant serves bank
+ * carries. */
+void pulsar_session_common_prefix_bytes(pulsar_session *s, const pulsar_tokens *prompt,
+                                        int *live_n, int *prompt_n);
+void pulsar_engine_token_common_bytes(pulsar_engine *e,
+                                      const int32_t *a, int a_len,
+                                      const int32_t *b, int b_len,
+                                      int *a_n, int *b_n);
 int pulsar_session_argmax(pulsar_session *s);
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
@@ -550,6 +562,8 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
  * 0 / NULL for an out-of-range or never-populated bank. */
 int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
+int  pulsar_session_bank_common_prefix_bytes(pulsar_session *s, uint32_t bank,
+                                             const pulsar_tokens *prompt);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);
 /* Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq

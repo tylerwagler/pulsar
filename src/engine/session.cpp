@@ -899,6 +899,36 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
         return 0;
     }
 
+    /* L115 seam rescue: before surrendering to a full rebuild, check whether
+     * the id mismatch is only sampled-vs-canonical TOKEN BOUNDARY drift.
+     * If the prompt's bytes match the live history's bytes up to a shared
+     * boundary past the id divergence, the live KV IS this conversation's
+     * true history (it carries the boundaries the model actually sampled) —
+     * keep it: rewind to the matched live token, stitch
+     * live[0..live_n) + prompt[prompt_n..], and re-enter sync, which now
+     * takes the extend path.  One recursion level by construction (the
+     * stitched prompt starts_with the rewound checkpoint). */
+    if (s->checkpoint_valid) {
+        int live_n = 0, prompt_n = 0;
+        s->common_prefix_bytes(prompt, &live_n, &prompt_n);
+        const int id_common = s->common_prefix(prompt);
+        if (live_n > 0 && live_n > id_common) {
+            s->rewind(live_n);
+            pulsar_tokens stitched;
+            memset(&stitched, 0, sizeof(stitched));
+            stitched.v = (int *)xmalloc(
+                    (size_t)(live_n + (prompt->len - prompt_n)) * sizeof(int));
+            stitched.cap = live_n + (prompt->len - prompt_n);
+            memcpy(stitched.v, s->checkpoint.v, (size_t)live_n * sizeof(int));
+            memcpy(stitched.v + live_n, prompt->v + prompt_n,
+                   (size_t)(prompt->len - prompt_n) * sizeof(int));
+            stitched.len = stitched.cap;
+            const int rc = s->sync(&stitched, err, errlen);
+            free(stitched.v);
+            return rc;
+        }
+    }
+
     bool ok;
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
@@ -1028,6 +1058,67 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+/* L115: token-boundary-insensitive common prefix.  Generated text freezes
+ * SAMPLED token boundaries into the live checkpoint; a client echo of the
+ * same bytes re-tokenizes CANONICALLY, so consecutive turns disagree on ids
+ * while agreeing on every byte (live `))`+`**` vs echoed `))**`).  An
+ * id-exact compare declares divergence at the earliest such seam and a
+ * conversation re-pays its whole history forever.  This walk advances two
+ * (token, byte-offset) cursors: equal ids on a shared boundary take the
+ * fast path; on mismatch it compares bytes until the boundaries realign
+ * (another shared boundary — a seam crossed) or a byte truly differs.
+ * Returns the LARGEST (a_n, b_n) with bytes(a[0..a_n)) == bytes(b[0..b_n))
+ * ending on a shared boundary.  Zero-length token texts (control/special
+ * ids) only match by ID: a boundary mismatch involving one stops the walk
+ * conservatively — role markers must never byte-alias into content. */
+void pulsar_engine_token_common_bytes(pulsar_engine *e,
+                                      const int32_t *a, int a_len,
+                                      const int32_t *b, int b_len,
+                                      int *a_n, int *b_n) {
+    int i = 0, j = 0;          /* token cursors */
+    size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
+    int best_i = 0, best_j = 0;
+    const char *ta = NULL, *tb = NULL;
+    size_t la = 0, lb = 0;
+    while (i < a_len && j < b_len) {
+        if (oa == 0 && ob == 0) {
+            best_i = i;
+            best_j = j;
+            if (a[i] == b[j]) { i++; j++; continue; }   /* aligned fast path */
+        }
+        if (oa == 0) {
+            ta = pulsar_token_text(e, a[i], &la);
+            if (!ta || la == 0) break;   /* control/special: id-only match */
+        }
+        if (ob == 0) {
+            tb = pulsar_token_text(e, b[j], &lb);
+            if (!tb || lb == 0) break;
+        }
+        while (oa < la && ob < lb) {
+            if (ta[oa] != tb[ob]) goto done;   /* true byte divergence */
+            oa++; ob++;
+        }
+        if (oa == la) { i++; oa = 0; }
+        if (ob == lb) { j++; ob = 0; }
+    }
+    if (oa == 0 && ob == 0) { best_i = i; best_j = j; }
+done:
+    *a_n = best_i;
+    *b_n = best_j;
+}
+
+void pulsar_session::common_prefix_bytes(const pulsar_tokens *prompt,
+                                         int *live_n, int *prompt_n) {
+    auto *s = this;
+    *live_n = 0;
+    *prompt_n = 0;
+    if (!s->checkpoint_valid) return;
+    pulsar_engine_token_common_bytes(s->engine,
+                                     s->checkpoint.v, s->checkpoint.len,
+                                     prompt->v, prompt->len,
+                                     live_n, prompt_n);
 }
 
 

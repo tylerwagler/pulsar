@@ -637,3 +637,17 @@ int pulsar_session::bank_common_prefix(uint32_t bank,
     while (i < n && t->v[i] == prompt->v[i]) i++;
     return i;
 }
+
+/* L115: byte-equal variant across sampled-vs-canonical boundary drift; the
+ * live-side count is the routing currency (bank KV tokens reusable). */
+int pulsar_session::bank_common_prefix_bytes(uint32_t bank,
+                                             const pulsar_tokens *prompt) {
+    auto *s = this;
+    const pulsar_tokens *t = bank_frontier_tokens(s, bank);
+    if (!t || !prompt) return 0;
+    int live_n = 0, prompt_n = 0;
+    pulsar_engine_token_common_bytes(s->engine, t->v, t->len,
+                                     prompt->v, prompt->len,
+                                     &live_n, &prompt_n);
+    return live_n;
+}

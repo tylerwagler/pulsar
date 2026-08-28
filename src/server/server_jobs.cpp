@@ -772,8 +772,14 @@ void server::gen_begin(session_slot *sl) {
      * from position 0 regardless of what this bank served before.  The
      * choke-point twins live in slot_common_prefix (routing) and the live
      * resolvers below. */
-    const int common = s->eval_pin ? 0
-                     : pulsar_session_common_prefix(s->sess, &j->req.prompt);
+    int common = 0;
+    if (!s->eval_pin) {
+        /* L115: byte-equal live common (see slot_common_prefix) — seams in
+         * generated history keep the live KV; sync's seam-rescue stitches. */
+        int live_n = 0, prompt_n = 0;
+        pulsar_session_common_prefix_bytes(s->sess, &j->req.prompt, &live_n, &prompt_n);
+        common = live_n;
+    }
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);

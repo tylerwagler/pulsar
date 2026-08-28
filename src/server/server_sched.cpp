@@ -212,9 +212,18 @@ int server::slot_common_prefix(const session_slot *sl,
     const auto *s = this;
     if (s->eval_pin) return 0;   /* choke point: no prefix reuse, ever */
     if (!sl || !sl->provisioned) return 0;
+    /* L115: byte-equal common, so sampled-vs-canonical token-boundary seams
+     * in generated history do not read as divergence.  Routing then keeps
+     * seam-carrying banks in place, and the engine's sync seam-rescue
+     * stitches the live boundaries to the canonical suffix.  The returned
+     * count is LIVE-side tokens (the bank KV currency); prompt-side may
+     * differ by the seam deltas, which only ripples into capacity
+     * heuristics and reported cached_tokens. */
     if (s->pool_banks > 0)
-        return pulsar_session_bank_common_prefix(s->sess, sl->bank, prompt);
-    return pulsar_session_common_prefix(s->sess, prompt);
+        return pulsar_session_bank_common_prefix_bytes(s->sess, sl->bank, prompt);
+    int live_n = 0, prompt_n = 0;
+    pulsar_session_common_prefix_bytes(s->sess, prompt, &live_n, &prompt_n);
+    return live_n;
 }
 
 /* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:

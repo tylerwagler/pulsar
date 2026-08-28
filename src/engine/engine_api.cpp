@@ -228,6 +228,7 @@ int pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src, i
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) { return s ? s->sync(prompt, err, errlen) : 1; }
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(pulsar_session *s, const pulsar_tokens *prompt, int common, char *err, size_t errlen) { return s ? s->rewrite_from_common(prompt, common, err, errlen) : PULSAR_SESSION_REWRITE_ERROR; }
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return s->common_prefix(prompt); }
+void pulsar_session_common_prefix_bytes(pulsar_session *s, const pulsar_tokens *prompt, int *live_n, int *prompt_n) { if (s) s->common_prefix_bytes(prompt, live_n, prompt_n); else { *live_n = 0; *prompt_n = 0; } }
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) { return s->sample(temperature, top_k, top_p, min_p, rng); }
@@ -246,6 +247,7 @@ int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { return s->bank_p
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { return s->bank_spec_depth(bank); }
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { return s->bank_tokens(bank); }
 int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s->bank_common_prefix(bank, prompt); }
+int pulsar_session_bank_common_prefix_bytes(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { return s ? s->bank_common_prefix_bytes(bank, prompt) : 0; }
 void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, int n) { if (s) s->note_committed_tokens(toks, n); }
 int pulsar_session_generate_speculative(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->generate_speculative(temperature, top_k, top_p, min_p, rng, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int eos_token, int *accepted, int accepted_cap, char *err, size_t errlen) { return s ? s->eval_speculative_block(first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen) : 0; }
