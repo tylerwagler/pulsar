@@ -1885,23 +1885,18 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 /* L117 (L049 inc 2): under overflow the ranked admission also
                  * consults the COST TABLE — stop admitting once the next
                  * candidate's survival is worth less than a marginal row
-                 * costs (ROWCOST 2026-08-26: marginal ~8.4 ms/row @512-depth
-                 * rising to ~11 by 2048, saturating with the indexer window;
-                 * value denominator = live EMA of ms per emitted token).
-                 * Binds ONLY under overflow — when everything fits the old
-                 * unconditional cap is byte-identical (isolation invariant,
-                 * see the lane-gate note above). vLLM #47808 is the same
-                 * design upstream. */
-                int max_depth = 0;
-                for (int i = 0; i < n; i++)
-                    if (dec[i]->gen && dec[i]->gen->phase == GEN_DECODE &&
-                        (int)dec[i]->committed_pos > max_depth)
-                        max_depth = (int)dec[i]->committed_pos;
-                float marginal_ms = 8.4f;
-                if (max_depth > 512) {
-                    const int d = max_depth < 2048 ? max_depth : 2048;
-                    marginal_ms += 2.6f * (float)(d - 512) / 1536.0f;
-                }
+                 * costs (value denominator = live EMA of ms per emitted
+                 * token).  Binds ONLY under overflow — when everything fits
+                 * the old unconditional cap is byte-identical (isolation
+                 * invariant, see the lane-gate note above). vLLM #47808 is
+                 * the same design upstream.
+                 * L111/L121 refresh (ROWCOST 2026-08-27, post score-tier
+                 * fix): the marginal row cost is DEPTH-FLAT — ~8 ms/row at
+                 * 2048, 8192, and 24576 alike, identical on e4m3 and NVFP4
+                 * KV.  The old 8.4→11 depth ramp was the naive score
+                 * kernel's rows x depth term (L121), not a property of the
+                 * engine; the depth scan it required is gone with it. */
+                const float marginal_ms = 8.0f;
                 const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                                   s->spec_ms_per_tok_ema : 45.0f;
                 const float thr = marginal_ms / ema;
