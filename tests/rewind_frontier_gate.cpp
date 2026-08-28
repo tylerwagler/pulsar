@@ -100,9 +100,10 @@ static bool extend_one(pulsar_session *s, pulsar_tokens *toks, int upto) {
     return rc == 0;
 }
 
-/* FNV-1a over attn comp rows 30..32 and (ratio 4) index comp rows 30..32
+/* FNV-1a over attn comp rows 34..36 and (ratio 4) index comp rows 34..36
  * of every compressing layer, read raw D2H off the classic single-session
- * caches. */
+ * caches (row 34 = pre-rewind sanity, 35 = the re-emitted group, 36 = the
+ * first post-heal group). */
 static uint64_t comp_rows_hash(pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();

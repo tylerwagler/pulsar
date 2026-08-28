@@ -1379,7 +1379,10 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
 }
 
 void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
-    if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;   /* gap: span restarts */
+    /* Gap => span restarts.  Deliberately conservative: after a rewind the
+     * next deposit lands below the stale hi and restarts the span, so slots
+     * claimed under the stale hi (ghost deposits) can never be read. */
+    if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;
     g->proj_ring_hi = pos + 1u;
     if (g->proj_ring_lo + 32u < g->proj_ring_hi)
         g->proj_ring_lo = g->proj_ring_hi - 32u;
