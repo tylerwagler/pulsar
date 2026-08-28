@@ -113,18 +113,17 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 /* ------------------------------------------------------------------------
  * Struct selection gate: <infiniband/verbs.h> presence at build time.
  *
- * The pair reaches transport=rdma but the first gate exchange never delivers:
- * UC silently tolerated our mirrored ibv_qp_attr/ibv_ah_attr into a
- * dead-but-"connected" QP, while RC rejected that exact RTR with EINVAL — the
- * signature of a subtly-wrong mirrored attribute layout.  Diffing the thunk
- * against the installed rdma-core found two concrete divergences: the mirror's
- * tp_ibv_port_attr put link_layer at offset 39 where the real struct has it at
- * 46 (the mirror was reading whatever followed — max_vl_num/sm_sl bytes), and
- * gid_tbl_len is signed int in the real struct.  When libibverbs-dev is
- * installed (dev + both Sparks), the REAL rdma-core structs are used for every
- * value handed to the verbs stack, and the TP_IBV_* names below become aliases
- * to the real enumerations; the self-contained ABI thunk is only the
- * no-header fallback.
+ * The pair reached transport=rdma but the first gate exchange never delivered.
+ * Root cause (confirmed on the box's GID table): the scan picked the FIRST
+ * IPv4-mapped GID, which on the pair is the RoCEv1 entry — the RoCEv2 gid
+ * carries IDENTICAL bytes at a later index, only distinguishable by gid_type.
+ * RC rejected that AV with EINVAL at RTR; UC swallowed it into a dead QP.
+ * Secondary finding: the mirrored tp_ibv_port_attr put link_layer at offset
+ * 39 where the real struct has it at 46.  Both argue for the same discipline —
+ * when libibverbs-dev is installed (dev + both Sparks) use the REAL rdma-core
+ * structs for every value handed to the verbs stack, and query the per-entry
+ * gid_type via _ibv_query_gid_ex.  The TP_IBV_* names below alias to the real
+ * enumerations; the self-contained ABI thunk is the no-header fallback.
  * --------------------------------------------------------------------- */
 #if defined(__has_include)
 #  if __has_include(<infiniband/verbs.h>)
@@ -178,7 +177,11 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 #define TP_IBV_QP_RNR_RETRY     IBV_QP_RNR_RETRY
 #define TP_IBV_QP_MAX_QP_RD_ATOMIC   IBV_QP_MAX_QP_RD_ATOMIC
 #define TP_IBV_QP_MAX_DEST_RD_ATOMIC IBV_QP_MAX_DEST_RD_ATOMIC
+#define TP_IBV_GID_TYPE_IB        IBV_GID_TYPE_IB
+#define TP_IBV_GID_TYPE_ROCE_V1   IBV_GID_TYPE_ROCE_V1
+#define TP_IBV_GID_TYPE_ROCE_V2   IBV_GID_TYPE_ROCE_V2
 /* struct/union aliases to the real layouts handed to the verbs stack. */
+#define tp_ibv_gid_entry          ibv_gid_entry
 #define tp_ibv_gid              ibv_gid
 #define tp_ibv_sge              ibv_sge
 #define tp_ibv_send_wr          ibv_send_wr
@@ -225,10 +228,25 @@ enum { TP_IBV_QP_ACCESS_FLAGS = 1 << 3, TP_IBV_QP_PKEY_INDEX = 1 << 4,
        TP_IBV_QP_RQ_PSN = 1 << 12, TP_IBV_QP_MAX_QP_RD_ATOMIC = 1 << 13,
        TP_IBV_QP_SQ_PSN = 1 << 16, TP_IBV_QP_MAX_DEST_RD_ATOMIC = 1 << 17,
        TP_IBV_QP_DEST_QPN = 1 << 20, TP_IBV_QP_STATE = 1 };
+/* enum ibv_gid_type */
+enum { TP_IBV_GID_TYPE_IB = 0, TP_IBV_GID_TYPE_ROCE_V1 = 1,
+       TP_IBV_GID_TYPE_ROCE_V2 = 2 };
 
 union tp_ibv_gid {
     uint8_t raw[16];
     struct { uint64_t subnet_prefix; uint64_t interface_id; } global;
+};
+
+/* struct ibv_gid_entry (gid_type at @24): returned by _ibv_query_gid_ex.
+ * RoCEv1 and RoCEv2 GIDs carry the SAME 16 bytes — only this per-entry type
+ * tells them apart; the pair's table has ::ffff:192.168.9.x as v1 (idx 2)
+ * AND v2 (idx 3), and the v1 index is an invalid AV under RoCEv2. */
+struct tp_ibv_gid_entry {
+    union tp_ibv_gid gid;         /* @0  */
+    uint32_t gid_index;           /* @16 */
+    uint32_t port_num;            /* @20 */
+    uint32_t gid_type;            /* @24 */
+    uint32_t ndev_ifindex;        /* @28 */
 };
 
 struct tp_ibv_sge { uint64_t addr; uint32_t length; uint32_t lkey; };
@@ -414,6 +432,11 @@ typedef struct {
     int (*close_device)(tp_ibv_ctx);
     int (*query_port)(tp_ibv_ctx, uint8_t, struct tp_ibv_port_attr *);
     int (*query_gid)(tp_ibv_ctx, uint8_t, int, union tp_ibv_gid *);
+    /* _ibv_query_gid_ex: optional (may be NULL on older rdma-core).  Gives the
+     * per-entry gid_type so selection can pick RoCEv2 over a byte-identical
+     * RoCEv1 GID. */
+    int (*query_gid_ex)(tp_ibv_ctx, uint32_t, uint32_t,
+                        struct tp_ibv_gid_entry *, uint32_t, size_t);
     tp_ibv_pd (*alloc_pd)(tp_ibv_ctx);
     int (*dealloc_pd)(tp_ibv_pd);
     tp_ibv_mr (*reg_mr)(tp_ibv_pd, void *, size_t, int);
@@ -675,6 +698,11 @@ static int tp_rdma_load_api(pulsar_tp_verbs_api *api) {
     TP_SYM(close_device, "ibv_close_device");
     TP_SYM(query_port, "ibv_query_port");
     TP_SYM(query_gid, "ibv_query_gid");
+    /* ibv_query_gid_ex is a header-inline wrapper over the EXPORTED
+     * _ibv_query_gid_ex (same pattern as post/recv/poll).  Optional: the GID
+     * scan prefers RoCEv2 per-entry but falls back to the raw-byte scan. */
+    api->query_gid_ex = reinterpret_cast<__typeof__(api->query_gid_ex)>(
+        dlsym(h, "_ibv_query_gid_ex"));
     TP_SYM(alloc_pd, "ibv_alloc_pd");
     TP_SYM(dealloc_pd, "ibv_dealloc_pd");
     TP_SYM(reg_mr, "ibv_reg_mr");
@@ -794,7 +822,8 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
     /* GID selection.  Upstream (two-Mac/TB) wants the IPv4-mapped GID, which
      * is a Thunderbolt-ism.  Linux RoCEv2 commonly exposes the usable GID at
      * a non-zero index, so: honor PULSAR_TP_RDMA_GID_INDEX, else prefer the
-     * IPv4-mapped GID, else the first non-link-local (routable) GID. */
+     * RoCEv2 IPv4-mapped GID (per gid_type), else a RoCEv2 routable GID, else
+     * the first non-link-local (routable) GID on the legacy path. */
     const char *gid_env = getenv("PULSAR_TP_RDMA_GID_INDEX");
     r->gid_index = -1;
     if (gid_env) {
@@ -809,9 +838,31 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
             return 0;
         }
     } else {
+        /* Prefer a RoCEv2 GID, keyed by its per-entry gid_type.  RoCEv1 and
+         * RoCEv2 GIDs share IDENTICAL 16 bytes on an IP'd port (the pair's
+         * ::ffff:192.168.9.x is both v1@index2 and v2@index3; only the type
+         * tells them apart).  Under RoCEv2 the v1 index is not a valid AV:
+         * RC rejects it at RTR with EINVAL, UC silently dead-connects — the
+         * pair's original hang class.  pick1 = first RoCEv2 IPv4-mapped
+         * (break immediately); pick2 = first RoCEv2 non-link-local; pick3 =
+         * any other usable GID (legacy readers / non-RoCE fabrics). */
+        int pick1 = -1, pick2 = -1, pick3 = -1;
         for (int j = 0; j < (int)r->port.gid_tbl_len; j++) {
             union tp_ibv_gid tmp;
-            if (r->api.query_gid(r->ctx, 1, j, &tmp) != 0) continue;
+            uint32_t gtype = TP_IBV_GID_TYPE_IB;   /* unknown with old reader */
+            if (r->api.query_gid_ex) {
+                struct tp_ibv_gid_entry e;
+                (void)memset(&e, 0, sizeof(e));
+                if (r->api.query_gid_ex(r->ctx, 1, (uint32_t)j, &e, 0,
+                                        sizeof(e)) == 0) {
+                    tmp = e.gid;
+                    gtype = e.gid_type;
+                } else if (r->api.query_gid(r->ctx, 1, j, &tmp) != 0) {
+                    continue;
+                }
+            } else if (r->api.query_gid(r->ctx, 1, j, &tmp) != 0) {
+                continue;
+            }
             uint64_t hi;
             uint16_t mid, v4tag, top;
             memcpy(&hi, &tmp.raw[0], 8);
@@ -820,12 +871,17 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
             memcpy(&top, &tmp.raw[0], 2);
             const bool ipv4_mapped = (hi == 0 && mid == 0 && v4tag == 0xffff);
             const bool link_local = (top == 0xfe80);
-            if (ipv4_mapped || !link_local) {
-                r->gid = tmp;
-                r->gid_index = (int)j;
-                if (ipv4_mapped) break;   /* prefer it; else keep first routable */
+            if (link_local) continue;
+            if (gtype == TP_IBV_GID_TYPE_ROCE_V2) {
+                if (ipv4_mapped) { pick1 = j; break; }
+                if (pick2 < 0) pick2 = j;
+            } else if (pick3 < 0) {
+                pick3 = j;
             }
         }
+        r->gid_index = (pick1 >= 0) ? pick1 : (pick2 >= 0) ? pick2 : pick3;
+        if (r->gid_index >= 0)
+            r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid);
     }
     if (r->gid_index < 0) {
         tp_set_err(err, errlen,
@@ -833,6 +889,10 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
                    "(try PULSAR_TP_RDMA_GID_INDEX)");
         return 0;
     }
+    fprintf(stderr,
+            "pulsar-tp: gid index %d (%02x:%02x:%02x:%02x:...)\n",
+            r->gid_index, r->gid.raw[0], r->gid.raw[1], r->gid.raw[2],
+            r->gid.raw[3]);
     r->pd = r->api.alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
