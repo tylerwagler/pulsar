@@ -2108,6 +2108,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
             emitted_total += done;
         }
+        /* /metrics granularity: publish per ROUND, not per quantum.  A
+         * quantum (16 tokens) takes ~1 s at deep-context rates, and a
+         * scraper polling faster than the publish cadence sees its deltas
+         * beat into 0 / 2x-rate flapping (the pulsar-tui square wave).
+         * One mutex+copy per round (~0.35 s) is host noise. */
+        s->publish_metrics_snapshot();
     }
     if (emitted_total > 0) {
         const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
