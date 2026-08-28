@@ -1832,7 +1832,19 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
 
     int emitted_total = 0;
     const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
+    /* L123 TEMPORARY instrumentation (env read once; stripped before land):
+     * attribute quantum wall time to pre-sweep host+draft, the shared
+     * forward, and post-sweep host (round_end + emit + persist). */
+    static int lane_profile = -1;
+    if (lane_profile < 0) {
+        const char *e = getenv("PULSAR_LANE_PROFILE");
+        lane_profile = e && e[0] && e[0] != '0';
+    }
+    double prof_pre = 0.0, prof_sweep = 0.0, prof_post = 0.0;
+    int prof_rounds = 0;
+    double prof_t = 0.0;
     while (emitted_total < PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
+        if (lane_profile) prof_t = server_now_sec();
         /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
          * At <=16 total rows the shared forward's marginal row cost is
          * near-flat, so the win is ALLOCATION under the cap, not budget
@@ -2007,6 +2019,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
         if (m == 0) break;
 
         /* ---- ONE shared forward over every bank's rows ------------------- */
+        if (lane_profile) {
+            const double now = server_now_sec();
+            prof_pre += now - prof_t;
+            prof_t = now;
+        }
         char err[160];
         pulsar_session_spec_arm_capture(pool, rows);
         uint32_t got = 0;
@@ -2015,6 +2032,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                                                  &got, PULSAR_MSEQ_HEAD_ALL_ROWS,
                                                  err, sizeof err);
         pulsar_session_spec_arm_capture(pool, 0u);
+        if (lane_profile) {
+            const double now = server_now_sec();
+            prof_sweep += now - prof_t;
+            prof_t = now;
+        }
         s->live_bank = -1;   /* pool is multiseq-poisoned until a bank_switch */
         if (rc != 0 || got != rows) {
             for (int q = 0; q < m; q++) {
@@ -2103,6 +2125,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
             emitted_total += done;
         }
+        if (lane_profile) {
+            prof_post += server_now_sec() - prof_t;
+            prof_rounds++;
+        }
+    }
+    if (lane_profile && prof_rounds > 0) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: lane-profile rounds=%d pre=%.1fms sweep=%.1fms post=%.1fms per-round pre=%.2f sweep=%.2f post=%.2f",
+                   prof_rounds, prof_pre * 1e3, prof_sweep * 1e3, prof_post * 1e3,
+                   prof_pre * 1e3 / prof_rounds, prof_sweep * 1e3 / prof_rounds,
+                   prof_post * 1e3 / prof_rounds);
     }
     free(logits);
     if (emitted_total > 0) {
