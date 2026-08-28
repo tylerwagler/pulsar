@@ -626,6 +626,11 @@ bool gpu_graph_encode_decode_layer(
                                                         PULSAR_ROPE_YARN_BETA_FAST,
                                                         PULSAR_ROPE_YARN_BETA_SLOW,
                                                         PULSAR_RMS_EPS) != 0;
+        /* L120 value-half: classic decode commits as it stores — bank the
+         * projection row BEFORE the indexer matmuls below reuse comp_*_cur. */
+        if (ok && ratio == 4)
+            ok = gpu_graph_proj_ring_deposit(g, il, pos, g->comp_kv_cur,
+                                             g->comp_sc_cur, false);
         if (ok && emit) {
             pulsar_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
             /* comp_row_view aliases the f32 stage; the commit below quantizes,
@@ -715,6 +720,11 @@ bool gpu_graph_encode_decode_layer(
                         g->banks.n_banks ? g->banks.cur_bank : 0u, index_row, 1, true);
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
+            /* L120 value-half: indexer projection row banked after its
+             * update (comp_*_cur hold the indexer rows here). */
+            if (ok)
+                ok = gpu_graph_proj_ring_deposit(g, il, pos, g->comp_kv_cur,
+                                                 g->comp_sc_cur, true);
             const uint32_t decode_sparse_threshold =
                 gpu_graph_decode_indexer_sparse_threshold(g);
             if (ok &&

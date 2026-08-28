@@ -1276,23 +1276,89 @@ void pulsar_session::rewind(int pos) {
      * rewound position, and a lagging one (mid-admission prefill) must never
      * be raised here.  Cache rows beyond the clamp are invisible (readers
      * cap at n_comp) and are re-emitted on the next boundary cross.
-     * KNOWN RESIDUAL (classic parity, not introduced here):
-     * compressor_store_kernel writes each position's slot by plain
-     * assignment, so replay re-fills the CURRENT group's slots -- but
-     * ratio-4 keeps a two-group window, and a ghost group that completed
-     * pre-rewind has already SHIFTED itself into the lower half
-     * (compressor_shift_ratio4_kernel), so the first re-emit after such a
-     * rewind folds one group of ghost projections into one comp row (the
-     * window fully self-heals 8 positions on).  Classic has done exactly
-     * this since 6de76e3; the complete fix (Stage-B save restore of the
-     * lower half) is filed in rows/L120.md. */
+     * VALUE HALF (the residual the clamp left, now fixed below): ratio-4
+     * keeps a two-group window, and a ghost group that completed pre-rewind
+     * has already SHIFTED itself into the lower half
+     * (compressor_shift_ratio4_kernel); ghost stores may also have
+     * overwritten committed slots of the upper half across the boundary.
+     * The window replay below rebuilds both halves from the committed-
+     * projection ring: re-run store+shift over [4*(pos/4 - 1), pos) --
+     * at most 7 positions, always inside the 32-deep ring when the span is
+     * covered (depth 32 also keeps ghost-position deposits from clobbering
+     * the needed slots: ghost minus needed position is always under 32).  An uncovered span (fresh bank, spill-restore, fork, mseq
+     * candidate-only stretches) skips the replay: degraded = the exact
+     * pre-fix classic-parity behavior, counters still clamped. */
+    bool any_ratio4_crossed = false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t want = (uint32_t)pos / ratio;
-        if (s->graph.layer_n_comp[il] > want) s->graph.layer_n_comp[il] = want;
+        if (s->graph.layer_n_comp[il] > want) {
+            if (ratio == 4) any_ratio4_crossed = true;
+            s->graph.layer_n_comp[il] = want;
+        }
         if (ratio == 4 && s->graph.layer_n_index_comp[il] > want)
             s->graph.layer_n_index_comp[il] = want;
+    }
+    if (any_ratio4_crossed && pos >= 4) {
+        pulsar_gpu_graph *g = &s->graph;
+        const uint32_t want = (uint32_t)pos / 4u;
+        const uint32_t start = 4u * (want - 1u);
+        if (start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi) {
+            pulsar_engine *e = s->engine;
+            const pulsar_model *model = &e->model;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+                if (pulsar_layer_compress_ratio(il) != 4u) continue;
+                const pulsar_layer_weights *layer = &e->weights.layer[il];
+                if (!g->layer_attn_proj_kv[il] || !g->layer_index_proj_kv[il]) continue;
+                bool ok = true;
+                for (uint32_t p = start; ok && p < (uint32_t)pos; p++) {
+                    const uint64_t row_bytes = 256ull * sizeof(float);
+                    const uint64_t off = (uint64_t)(p % 32u) * row_bytes;
+                    pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], off, row_bytes);
+                    pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], off, row_bytes);
+                    pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], off, row_bytes);
+                    pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], off, row_bytes);
+                    ok = akv && asc && ikv && isc &&
+                         pulsar_gpu_compressor_store_batch_tensor(akv, asc,
+                                g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                                model->map, model->size,
+                                layer->attn_compressor_ape->abs_offset,
+                                layer->attn_compressor_ape->type,
+                                PULSAR_N_HEAD_DIM, 4u, p, 1u) != 0 &&
+                         pulsar_gpu_compressor_store_batch_tensor(ikv, isc,
+                                g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                                model->map, model->size,
+                                layer->indexer_compressor_ape->abs_offset,
+                                layer->indexer_compressor_ape->type,
+                                PULSAR_N_INDEXER_HEAD_DIM, 4u, p, 1u) != 0;
+                    if (ok && (p + 1u) % 4u == 0u) {
+                        ok = pulsar_gpu_compressor_shift_ratio4_tensor(
+                                    g->layer_attn_state_kv[il],
+                                    g->layer_attn_state_score[il],
+                                    PULSAR_N_HEAD_DIM) != 0 &&
+                             pulsar_gpu_compressor_shift_ratio4_tensor(
+                                    g->layer_index_state_kv[il],
+                                    g->layer_index_state_score[il],
+                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
+                    }
+                    pulsar_gpu_tensor_free(isc);
+                    pulsar_gpu_tensor_free(ikv);
+                    pulsar_gpu_tensor_free(asc);
+                    pulsar_gpu_tensor_free(akv);
+                }
+                if (!ok) {
+                    fprintf(stderr,
+                            "pulsar: rewind window replay failed at layer %u "
+                            "(state degrades to pre-restore behavior)\n", il);
+                    break;
+                }
+            }
+        }
+        /* The ring itself still holds ghost-position rows above pos; the
+         * span must not cover them for a future replay. */
+        if (g->proj_ring_hi > (uint32_t)pos) g->proj_ring_hi = (uint32_t)pos;
+        if (g->proj_ring_lo > g->proj_ring_hi) g->proj_ring_lo = g->proj_ring_hi;
     }
 }
 

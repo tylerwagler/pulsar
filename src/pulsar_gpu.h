@@ -1062,6 +1062,14 @@ int pulsar_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens);
 
+/* L120 value-half: the ratio-4 two-group window shift as a standalone entry
+ * (the emit path runs it inside compressor_update).  The rewind-time window
+ * replay re-runs store+shift over committed projections. */
+int pulsar_gpu_compressor_shift_ratio4_tensor(
+        pulsar_gpu_tensor *state_kv,
+        pulsar_gpu_tensor *state_score,
+        uint32_t           head_dim);
+
 int pulsar_gpu_compressor_prefill_tensor(
         pulsar_gpu_tensor       *comp_cache,
         pulsar_gpu_tensor       *state_kv,

@@ -425,6 +425,11 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
         g->ms_n_comp[bank][il] = comp_cnt[il];
         g->ms_n_index_comp[bank][il] = idx_cnt[il];
     }
+    /* L120 value-half: the spill payload does not carry the projection
+     * ring; a restored bank runs degraded until it deposits fresh
+     * positions (no payload format change). */
+    g->ms_proj_ring_lo[bank] = 0u;
+    g->ms_proj_ring_hi[bank] = 0u;
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
     /* plan-33 inc C: a disk-restored bank carries full committed state — any
      * stale fork boundary threshold must not fire on it. */

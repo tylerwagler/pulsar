@@ -56,6 +56,10 @@ static bool gpu_graph_encode_token_raw_swa(
         }
     }
 
+    /* L120 value-half: every layer banked this committed position's
+     * projections above — advance the deposited span once. */
+    if (ok) gpu_graph_proj_ring_note_pos(g, pos);
+
     if (ok && need_logits) {
         ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
@@ -71,6 +75,27 @@ pulsar_gpu_tensor *gpu_graph_tensor_row_view(
     return pulsar_gpu_tensor_view(base,
                                  (uint64_t)row * row_values * sizeof(float),
                                  row_values * sizeof(float));
+}
+
+/* L120 value-half: bank the tail (up to 8 positions) of a chunk's staged
+ * projections into the ratio-4 ring — the aligned prefill paths' equivalent
+ * of the per-row deposit, so a rewind shortly after a continuation still
+ * finds its replay span covered. */
+static bool gpu_graph_proj_ring_deposit_tail(pulsar_gpu_graph *g, uint32_t il,
+                                             uint32_t pos0, uint32_t n_tokens,
+                                             uint32_t width, bool indexer) {
+    const uint32_t tail = n_tokens < 8u ? n_tokens : 8u;
+    bool ok = true;
+    for (uint32_t k = 0; ok && k < tail; k++) {
+        const uint32_t t = n_tokens - tail + k;
+        pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->batch_comp_kv, t, width);
+        pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->batch_comp_sc, t, width);
+        ok = kv && sc &&
+             gpu_graph_proj_ring_deposit(g, il, pos0 + t, kv, sc, indexer);
+        pulsar_gpu_tensor_free(sc);
+        pulsar_gpu_tensor_free(kv);
+    }
+    return ok;
 }
 
 
@@ -1282,6 +1307,9 @@ bool gpu_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 g->layer_n_comp[il] = n_comp;
+                if (!mseq && !g->spec_comp_save_n && ratio == 4)
+                    ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
+                                                          comp_width, false);
                 for (uint32_t t = 0; t < n_tokens; t++) {
                     comp_counts[t] = (pos0 + t + 1u) / ratio;
                 }
@@ -1407,6 +1435,9 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok) {
                     if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
                     else        g->layer_n_comp[il]    = comp_before + comp_chunk;
+                    if (!banked && !g->spec_comp_save_n && ratio == 4)
+                        ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
+                                                              comp_width, false);
                     if (comp_counts) {
                         for (uint32_t t = 0; t < n_tokens; t++) {
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
@@ -1485,6 +1516,14 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             PULSAR_ROPE_YARN_BETA_SLOW,
                                                             PULSAR_RMS_EPS) != 0;
                     }
+                    /* L120 value-half: classic sync extensions commit as they
+                     * store; deposit the projection row.  Spec-armed passes
+                     * (classic block eval) and mseq candidate rows never
+                     * deposit — their committed positions are banked by the
+                     * Stage A replay / Stage B rollforward instead. */
+                    if (ok && !mseq && !g->spec_comp_save_n && ratio == 4)
+                        ok = gpu_graph_proj_ring_deposit(g, il, pos, kv_view,
+                                                         sc_view, false);
                     if (ok && emit) {
                         pulsar_gpu_tensor *comp_row_view = ms_target
                             ? pulsar_gpu_tensor_view(ms_target,
@@ -1656,6 +1695,9 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
                 if (ok) {
                     g->layer_n_index_comp[il] = n_comp;
+                    if (!mseq && !g->spec_comp_save_n)
+                        ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
+                                                              index_width, true);
                     for (uint32_t t = 0; t < n_tokens; t++) {
                         index_counts[t] = (pos0 + t + 1u) / ratio;
                     }
@@ -1764,6 +1806,9 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) {
                         if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
                         else        g->layer_n_index_comp[il]    = index_before + index_chunk;
+                        if (!banked && !g->spec_comp_save_n)
+                            ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
+                                                                  index_width, true);
                         if (index_counts) {
                             for (uint32_t t = 0; t < n_tokens; t++) {
                                 index_counts[t] = (pos0 + t + 1u) / ratio;
@@ -1803,6 +1848,16 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
+                        /* L120 value-half: same commit-time deposit rule as
+                         * the attn per-row loop above. */
+                        if (!mseq && !g->spec_comp_save_n &&
+                            !gpu_graph_proj_ring_deposit(g, il, pos, kv_view,
+                                                         sc_view, true)) {
+                            pulsar_gpu_tensor_free(sc_view);
+                            pulsar_gpu_tensor_free(kv_view);
+                            ok = false;
+                            break;
+                        }
                         const uint32_t index_row = *n_index_slot;
                         pulsar_gpu_tensor *ms_st_kv = mseq
                             ? gpu_graph_bank_index_state_kv_view(g, il, bank) : NULL;
@@ -2740,6 +2795,15 @@ bool gpu_graph_encode_layer_batch(
         g->batch_cur_hc = g->batch_next_hc;
         g->batch_next_hc = tmp;
     }
+    /* L120 value-half: after the LAST layer of a committed (non-mseq,
+     * non-spec-armed) chunk, every ratio-4 layer has banked the chunk's
+     * tail-8 projections — advance the deposited span once per position. */
+    if (ok && il + 1u == PULSAR_N_LAYER &&
+        !g->batch_multiseq && !g->spec_comp_save_n) {
+        const uint32_t tail = n_tokens < 8u ? n_tokens : 8u;
+        for (uint32_t k = 0; k < tail; k++)
+            gpu_graph_proj_ring_note_pos(g, pos0 + n_tokens - tail + k);
+    }
     /* Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
      * every batch position at the anchor layers, so the last-accepted position's
      * hidden is available without a replay decode. Off (0) during prefill and
@@ -2887,6 +2951,11 @@ bool gpu_graph_dspark_compressor_rollforward(
                         freq_base, freq_scale, ext_factor, attn_factor,
                         PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                         PULSAR_RMS_EPS) != 0;
+            /* L120 value-half: rollforward positions are the round's
+             * COMMITTED prefix -- the canonical deposit point for the
+             * batched lane. */
+            if (ok && ratio == 4)
+                ok = gpu_graph_proj_ring_deposit(g, il, pos, kv_view, sc_view, false);
             pulsar_gpu_tensor_free(sc_view);
             pulsar_gpu_tensor_free(kv_view);
             if (!ok) return false;
@@ -2907,6 +2976,8 @@ bool gpu_graph_dspark_compressor_rollforward(
                             freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
+                if (ok)
+                    ok = gpu_graph_proj_ring_deposit(g, il, pos, ikv, isc, true);
                 pulsar_gpu_tensor_free(isc);
                 pulsar_gpu_tensor_free(ikv);
                 if (!ok) return false;
@@ -2915,5 +2986,8 @@ bool gpu_graph_dspark_compressor_rollforward(
         g->layer_n_comp[il] = (pos0 + n_positions) / ratio;
         if (ratio == 4) g->layer_n_index_comp[il] = (pos0 + n_positions) / ratio;
     }
+    /* L120 value-half: the span is committed across every layer now. */
+    for (uint32_t t = 0; t < n_positions; t++)
+        gpu_graph_proj_ring_note_pos(g, pos0 + t);
     return true;
 }

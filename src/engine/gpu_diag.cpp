@@ -767,6 +767,16 @@ static bool gpu_graph_bank_slabs_alloc(
                                      (uint64_t)n_banks * index_width * index_rows) &&
                  gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
                                      (uint64_t)n_banks * index_width * index_rows);
+            /* L120 value-half: committed-projection ring lanes (32 slots x
+             * width-256 rows; attn and indexer widths are both 256 at
+             * ratio 4).  No fill: a rewind replay only reads slots inside
+             * the deposited [lo, hi) span. */
+            b->pring_bank_bytes = 32ull * attn_width * sizeof(float);
+            b->apkv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
+            b->apsc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
+            b->ipkv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
+            b->ipsc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
+            ok = ok && b->apkv[il] && b->apsc[il] && b->ipkv[il] && b->ipsc[il];
         }
     }
     /* plan-33 inc C: the partial-fork boundary-row stash (one packed comp row +
@@ -839,6 +849,8 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = 0;
         g->ms_n_index_comp[bank][il] = 0;
     }
+    g->ms_proj_ring_lo[bank] = 0u;
+    g->ms_proj_ring_hi[bank] = 0u;
     /* plan-33: an evicted bank's boundary stash is meaningless — disarm the
      * emit-restore hook so a later cold refill cannot restore stale bytes. */
     g->ms_emit_keep[bank] = 0u;
@@ -1042,6 +1054,11 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
             g->ms_n_index_comp[dst][il] = 0u;
         }
     }
+    /* L120 value-half: a partial fork's cut invalidates the projection ring
+     * span (ring rows above R are the trunk's future); degraded until dst
+     * decodes/prefills 8 fresh positions. */
+    g->ms_proj_ring_lo[dst] = 0u;
+    g->ms_proj_ring_hi[dst] = 0u;
     if (ok) g->ms_emit_keep[dst] = keep4 + 1u;
     return ok;
 }
@@ -1095,6 +1112,11 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
                                              b->istate_bank_bytes[il]) != 0;
         }
     }
+    /* L120 value-half: the fork does not carry the projection ring; the
+     * forked bank runs degraded (no rewind window replay) until it deposits
+     * 8 fresh positions.  Safe: degraded == pre-fix behavior. */
+    g->ms_proj_ring_lo[dst] = 0u;
+    g->ms_proj_ring_hi[dst] = 0u;
     return ok;
 }
 
@@ -1166,8 +1188,23 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
                         b->spec_issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
                         b->istate_bank_bytes[il]);
             }
+            /* L120 value-half: the projection rings follow the live views. */
+            pulsar_gpu_tensor_free(g->layer_attn_proj_kv[il]);
+            pulsar_gpu_tensor_free(g->layer_attn_proj_sc[il]);
+            pulsar_gpu_tensor_free(g->layer_index_proj_kv[il]);
+            pulsar_gpu_tensor_free(g->layer_index_proj_sc[il]);
+            g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_view(
+                    b->apkv[il], (uint64_t)bank * b->pring_bank_bytes, b->pring_bank_bytes);
+            g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_view(
+                    b->apsc[il], (uint64_t)bank * b->pring_bank_bytes, b->pring_bank_bytes);
+            g->layer_index_proj_kv[il] = pulsar_gpu_tensor_view(
+                    b->ipkv[il], (uint64_t)bank * b->pring_bank_bytes, b->pring_bank_bytes);
+            g->layer_index_proj_sc[il] = pulsar_gpu_tensor_view(
+                    b->ipsc[il], (uint64_t)bank * b->pring_bank_bytes, b->pring_bank_bytes);
             ok = g->layer_index_comp_cache[il] && g->layer_index_state_kv[il] &&
-                 g->layer_index_state_score[il];
+                 g->layer_index_state_score[il] &&
+                 g->layer_attn_proj_kv[il] && g->layer_attn_proj_sc[il] &&
+                 g->layer_index_proj_kv[il] && g->layer_index_proj_sc[il];
         }
     }
     /* Option F: swap the per-bank DSpark drafter ring views (present only when
@@ -1315,11 +1352,34 @@ void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
         g->ms_n_comp[bank][il] = g->layer_n_comp[il];
         g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
     }
+    /* L120 value-half: the projection-ring span rides the same hand-off. */
+    g->ms_proj_ring_lo[bank] = g->proj_ring_lo;
+    g->ms_proj_ring_hi[bank] = g->proj_ring_hi;
     /* Option F: the drafter-ring frontier is per-bank too (device rings live in
      * banks.dspark_*), so it rides the same capture/install hand-off. */
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[bank][i] = g->dspark_n_raw[i];
     g->ms_dspark_prompt_n[bank] = g->dspark_prompt_n;
     g->ms_dspark_prompt_lo[bank] = g->dspark_prompt_lo;
+}
+
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
+                                 const pulsar_gpu_tensor *kv_row,
+                                 const pulsar_gpu_tensor *sc_row,
+                                 bool indexer) {
+    pulsar_gpu_tensor *dk = indexer ? g->layer_index_proj_kv[il] : g->layer_attn_proj_kv[il];
+    pulsar_gpu_tensor *ds = indexer ? g->layer_index_proj_sc[il] : g->layer_attn_proj_sc[il];
+    if (!dk || !ds) return true;   /* no ring on this layer (ratio != 4) */
+    const uint64_t row_bytes = 256ull * sizeof(float);
+    const uint64_t off = (uint64_t)(pos % 32u) * row_bytes;
+    return pulsar_gpu_tensor_copy_async(dk, off, kv_row, 0, row_bytes) != 0 &&
+           pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;
+}
+
+void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
+    if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;   /* gap: span restarts */
+    g->proj_ring_hi = pos + 1u;
+    if (g->proj_ring_lo + 32u < g->proj_ring_hi)
+        g->proj_ring_lo = g->proj_ring_hi - 32u;
 }
 
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
@@ -1331,6 +1391,8 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
     g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
+    g->proj_ring_lo = g->ms_proj_ring_lo[bank];
+    g->proj_ring_hi = g->ms_proj_ring_hi[bank];
 }
 
 /* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
@@ -1902,6 +1964,28 @@ bool gpu_graph_alloc_raw_cap(
                     state_init_ok = state_init_ok &&
                                     gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, index_width * index_rows);
                 }
+                /* L120 value-half: committed-projection rings (32 x width-256
+                 * rows), attn + indexer.  Banked: bank-0 views, repointed
+                 * with the state views. */
+                const uint64_t pring_bytes = 32ull * attn_width * sizeof(float);
+                if (banked) {
+                    g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.apkv[il], 0, g->banks.pring_bank_bytes);
+                    g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_view(
+                            g->banks.apsc[il], 0, g->banks.pring_bank_bytes);
+                    g->layer_index_proj_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.ipkv[il], 0, g->banks.pring_bank_bytes);
+                    g->layer_index_proj_sc[il] = pulsar_gpu_tensor_view(
+                            g->banks.ipsc[il], 0, g->banks.pring_bank_bytes);
+                } else {
+                    g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_alloc(pring_bytes);
+                    g->layer_attn_proj_sc[il] = pulsar_gpu_tensor_alloc(pring_bytes);
+                    g->layer_index_proj_kv[il] = pulsar_gpu_tensor_alloc(pring_bytes);
+                    g->layer_index_proj_sc[il] = pulsar_gpu_tensor_alloc(pring_bytes);
+                }
+                state_init_ok = state_init_ok &&
+                                g->layer_attn_proj_kv[il] && g->layer_attn_proj_sc[il] &&
+                                g->layer_index_proj_kv[il] && g->layer_index_proj_sc[il];
             }
         }
     }

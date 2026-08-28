@@ -828,6 +828,15 @@ typedef struct {
     pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];
+    /* L120 value-half: per-bank committed-projection ring lanes (ratio-4
+     * layers only; 32 slots x width-256 f32 rows = 32 KiB/lane), attention +
+     * indexer, kv + score.  Graph proj views repoint into these like the
+     * state views above. */
+    pulsar_gpu_tensor *apkv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *apsc[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *ipkv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *ipsc[PULSAR_MAX_LAYER];
+    uint64_t pring_bank_bytes;
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -883,6 +892,26 @@ typedef struct {
     pulsar_gpu_tensor *layer_index_comp_cache[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *layer_index_state_kv[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *layer_index_state_score[PULSAR_MAX_LAYER];
+
+    /* L120 value-half: rolling COMMITTED-projection rings, ratio-4 layers
+     * only — 32 slots (pos %% 32) of one width-256 f32 row each, kv + score,
+     * attention and indexer compressors.  A boundary-crossing ghost rewind
+     * replays store+shift over [4*(pos/4 - 1), pos) from these to rebuild
+     * the two-group window the ghost shift destroyed; the worst-case span
+     * is 7 positions and the deepest ghost overshoot 16 rows, so depth 32
+     * keeps every needed slot collision-free.  Deposits
+     * happen at COMMIT points only (classic decode stores, non-mseq per-row
+     * stores, Stage B rollforward) — never from speculative candidate rows.
+     * Banked mode: views into per-bank lanes, repointed with the state
+     * views.  proj_ring_lo/hi bound the contiguously-deposited span
+     * ([hi-8, hi) capped by lo); a rewind outside the span skips the value
+     * restore (degraded = pre-fix behavior, counters still clamped). */
+    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];
+    uint32_t proj_ring_lo;
+    uint32_t proj_ring_hi;
 
     /* Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
@@ -1127,6 +1156,11 @@ typedef struct {
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
     uint32_t ms_n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
+    /* L120 value-half: per-bank projection-ring span bounds (see
+     * proj_ring_lo/hi), captured/installed with ms_n_comp.  Zeroed on fork
+     * and spill-restore: an uncovered rewind skips the value restore. */
+    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];
+    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];
     /* Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
      * device rings themselves are banked slabs, pulsar_bank_slabs.dspark_*).
      * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
@@ -2189,6 +2223,15 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, ui
  * work so the scalars are that bank's counts again. */
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
+
+/* L120 value-half: deposit one COMMITTED position's compressor projection
+ * row (width-256 f32) into the ratio-4 projection ring; note_pos advances
+ * the deposited span once per position (after every layer deposited). */
+bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
+                                 const pulsar_gpu_tensor *kv_row,
+                                 const pulsar_gpu_tensor *sc_row,
+                                 bool indexer);
+void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos);
 /* Tier-2 PATH A host-carry primitive (see pulsar_bank_carry).  save copies the
  * session's live HOST per-conversation state into bank's shadow AND captures
  * the graph frontier counters (gpu_graph_bank_counters_capture).  restore

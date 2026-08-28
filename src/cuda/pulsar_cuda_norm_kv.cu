@@ -1528,6 +1528,25 @@ int pulsar_gpu_compressor_store_batch_tensor(
 
 
 
+/* L120 value-half: the ratio-4 window shift as its own entry, for the
+ * rewind-time window replay (session.cpp).  Same kernel the emit path
+ * runs; the replay re-runs store+shift over committed projections only. */
+int pulsar_gpu_compressor_shift_ratio4_tensor(
+        pulsar_gpu_tensor *state_kv,
+        pulsar_gpu_tensor *state_score,
+        uint32_t           head_dim) {
+    if (!state_kv || !state_score || head_dim == 0) return 0;
+    const uint32_t width = 2u * head_dim;   /* ratio-4 coff = 2 */
+    const uint64_t state_bytes = 8ull * width * sizeof(float);
+    if (state_kv->bytes < state_bytes || state_score->bytes < state_bytes) return 0;
+    const uint64_t half = 4ull * width;
+    compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256>>>(
+            (float *)state_kv->ptr, (float *)state_score->ptr, width);
+    return cuda_ok(cudaGetLastError(), "compressor ratio4 shift (replay) launch");
+}
+
+
+
 int pulsar_gpu_compressor_update_tensor(
         const pulsar_gpu_tensor *kv_cur,
         const pulsar_gpu_tensor *sc_cur,
