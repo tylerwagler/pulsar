@@ -1506,13 +1506,12 @@ int pulsar_gpu_compressor_store_batch_tensor(
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
-        fprintf(stderr, "pulsar: DEBUG store_batch reject: ape_off=%llu sz=%llu ape_b=%llu kv=%llu/%llu sc=%llu skv=%llu/%llu ssc=%llu\n",
-                (unsigned long long)ape_offset, (unsigned long long)model_size,
-                (unsigned long long)ape_bytes,
+        /* Fail loud: this reject was silent and cost an L120 debugging cycle
+         * (a caller passing the wrong width reads as a generic failure). */
+        fprintf(stderr, "pulsar: compressor store rejected: kv=%llu/%llu state=%llu/%llu (head_dim=%u ratio=%u)\n",
                 (unsigned long long)kv->bytes, (unsigned long long)kv_bytes,
-                (unsigned long long)sc->bytes,
                 (unsigned long long)state_kv->bytes, (unsigned long long)state_bytes,
-                (unsigned long long)state_score->bytes);
+                head_dim, ratio);
         return 0;
     }
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");

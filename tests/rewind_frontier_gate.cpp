@@ -17,7 +17,13 @@
  *      (ratio-128 layers get clamped across their own boundary too);
  *   3. the incident anatomy in miniature: after a boundary-crossing rewind,
  *      sync a continuation (the incremental prefill path — the one that
- *      preserved the skew in production) and re-assert at the new frontier.
+ *      preserved the skew in production) and re-assert at the new frontier;
+ *   4. VALUE leg (L120 value-half): a ghost rewind with a DIVERGENT ghost
+ *      branch, then byte-compare the re-emitted attn+index comp rows of
+ *      every ratio-4 layer against a never-ghosted control.  The scenario
+ *      deliberately avoids crossing a 128-emit boundary — ratio-128 ghost
+ *      slot aliasing across such a boundary is a separate defect
+ *      (rows/L124.md), not this leg's claim.
  *
  * MODEL-DEPENDENT, GPU-resident.  Run under the memory discipline.  NOT part
  * of `make test`.
@@ -111,20 +117,12 @@ static uint64_t comp_rows_hash(pulsar_session *s) {
             if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
                                       (uint64_t)row * attn_row, buf, attn_row) == 0)
                 return 0;
-            uint64_t rh = 1469598103934665603ull;
-            for (uint64_t i = 0; i < attn_row; i++) { rh ^= buf[i]; rh *= 1099511628211ull; }
-            h ^= rh; h *= 1099511628211ull;
-            fprintf(stderr, "value-leg DIAG: L%u attn row %u hash %llx\n",
-                    il, row, (unsigned long long)rh);
+            for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
             if (row >= g->layer_n_index_comp[il]) continue;
             if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il],
                                       (uint64_t)row * idx_row, buf, idx_row) == 0)
                 return 0;
-            rh = 1469598103934665603ull;
-            for (uint64_t i = 0; i < idx_row; i++) { rh ^= buf[i]; rh *= 1099511628211ull; }
-            h ^= rh; h *= 1099511628211ull;
-            fprintf(stderr, "value-leg DIAG: L%u idx  row %u hash %llx\n",
-                    il, row, (unsigned long long)rh);
+            for (uint64_t i = 0; i < idx_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
     }
     return h;
