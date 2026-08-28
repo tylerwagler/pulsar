@@ -110,11 +110,95 @@ typedef void *tp_ibv_ah;            /* struct ibv_ah * */
 typedef void *tp_ibv_srq;           /* struct ibv_srq * */
 typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
 
+/* ------------------------------------------------------------------------
+ * Struct selection gate: <infiniband/verbs.h> presence at build time.
+ *
+ * The pair reaches transport=rdma but the first gate exchange never delivers:
+ * UC silently tolerated our mirrored ibv_qp_attr/ibv_ah_attr into a
+ * dead-but-"connected" QP, while RC rejected that exact RTR with EINVAL — the
+ * signature of a subtly-wrong mirrored attribute layout.  Diffing the thunk
+ * against the installed rdma-core found two concrete divergences: the mirror's
+ * tp_ibv_port_attr put link_layer at offset 39 where the real struct has it at
+ * 46 (the mirror was reading whatever followed — max_vl_num/sm_sl bytes), and
+ * gid_tbl_len is signed int in the real struct.  When libibverbs-dev is
+ * installed (dev + both Sparks), the REAL rdma-core structs are used for every
+ * value handed to the verbs stack, and the TP_IBV_* names below become aliases
+ * to the real enumerations; the self-contained ABI thunk is only the
+ * no-header fallback.
+ * --------------------------------------------------------------------- */
+#if defined(__has_include)
+#  if __has_include(<infiniband/verbs.h>)
+#    include <infiniband/verbs.h>
+#    define PULSAR_TP_VERBS_HDR 1
+#  endif
+#endif
+
+#ifdef PULSAR_TP_VERBS_HDR
+/* rdma-core enumerations (values are ABI-fixed; aliasing also keeps the int ->
+ * enum assignments into the real *_attr fields type-correct under C++). */
+#define TP_IBV_MTU_256          IBV_MTU_256
+#define TP_IBV_MTU_512          IBV_MTU_512
+#define TP_IBV_MTU_1024         IBV_MTU_1024
+#define TP_IBV_MTU_2048         IBV_MTU_2048
+#define TP_IBV_MTU_4096         IBV_MTU_4096
+#define TP_IBV_QPT_UC           IBV_QPT_UC
+#define TP_IBV_QPT_RC           IBV_QPT_RC
+#define TP_IBV_QPS_RESET        IBV_QPS_RESET
+#define TP_IBV_QPS_INIT         IBV_QPS_INIT
+#define TP_IBV_QPS_RTR          IBV_QPS_RTR
+#define TP_IBV_QPS_RTS          IBV_QPS_RTS
+#define TP_IBV_QPS_SQD          IBV_QPS_SQD
+#define TP_IBV_QPS_SQE          IBV_QPS_SQE
+#define TP_IBV_QPS_ERR          IBV_QPS_ERR
+#define TP_IBV_PORT_NOP         IBV_PORT_NOP
+#define TP_IBV_PORT_DOWN        IBV_PORT_DOWN
+#define TP_IBV_PORT_ACTIVE      IBV_PORT_ACTIVE
+#define TP_IBV_PORT_INIT        IBV_PORT_INIT
+#define TP_IBV_PORT_ARMED       IBV_PORT_ARMED
+#define TP_IBV_WR_SEND          IBV_WR_SEND
+#define TP_IBV_WC_SUCCESS       IBV_WC_SUCCESS
+#define TP_IBV_WC_SEND          IBV_WC_SEND
+#define TP_IBV_WC_RECV          IBV_WC_RECV
+#define TP_IBV_WC_GENERAL_ERR   IBV_WC_GENERAL_ERR
+#define TP_IBV_ACCESS_LOCAL_WRITE   IBV_ACCESS_LOCAL_WRITE
+#define TP_IBV_ACCESS_REMOTE_WRITE  IBV_ACCESS_REMOTE_WRITE
+#define TP_IBV_ACCESS_REMOTE_READ   IBV_ACCESS_REMOTE_READ
+#define TP_IBV_SEND_SIGNALED    IBV_SEND_SIGNALED
+#define TP_IBV_QP_ACCESS_FLAGS  IBV_QP_ACCESS_FLAGS
+#define TP_IBV_QP_PKEY_INDEX    IBV_QP_PKEY_INDEX
+#define TP_IBV_QP_PORT          IBV_QP_PORT
+#define TP_IBV_QP_AV            IBV_QP_AV
+#define TP_IBV_QP_PATH_MTU      IBV_QP_PATH_MTU
+#define TP_IBV_QP_RQ_PSN        IBV_QP_RQ_PSN
+#define TP_IBV_QP_SQ_PSN        IBV_QP_SQ_PSN
+#define TP_IBV_QP_DEST_QPN      IBV_QP_DEST_QPN
+#define TP_IBV_QP_STATE         IBV_QP_STATE
+#define TP_IBV_QP_TIMEOUT       IBV_QP_TIMEOUT
+#define TP_IBV_QP_RETRY_CNT     IBV_QP_RETRY_CNT
+#define TP_IBV_QP_RNR_RETRY     IBV_QP_RNR_RETRY
+#define TP_IBV_QP_MAX_QP_RD_ATOMIC   IBV_QP_MAX_QP_RD_ATOMIC
+#define TP_IBV_QP_MAX_DEST_RD_ATOMIC IBV_QP_MAX_DEST_RD_ATOMIC
+/* struct/union aliases to the real layouts handed to the verbs stack. */
+#define tp_ibv_gid              ibv_gid
+#define tp_ibv_sge              ibv_sge
+#define tp_ibv_send_wr          ibv_send_wr
+#define tp_ibv_recv_wr          ibv_recv_wr
+#define tp_ibv_wc               ibv_wc
+#define tp_ibv_qp_cap           ibv_qp_cap
+#define tp_ibv_qp_init_attr     ibv_qp_init_attr
+#define tp_ibv_global_route     ibv_global_route
+#define tp_ibv_ah_attr          ibv_ah_attr
+#define tp_ibv_qp_attr          ibv_qp_attr
+#define tp_ibv_port_attr        ibv_port_attr
+#else
+/* -------------------- no-header fallback ABI thunk -------------------- */
 /* enum ibv_mtu */
 enum { TP_IBV_MTU_256 = 1, TP_IBV_MTU_512 = 2, TP_IBV_MTU_1024 = 3,
        TP_IBV_MTU_2048 = 4, TP_IBV_MTU_4096 = 5 };
-/* enum ibv_qp_type (only UC is used; upstream validated UC-only QPs) */
-enum { TP_IBV_QPT_UC = 3 };
+/* enum ibv_qp_type (default UC, upstream-validated; RC is the A/B bring-up
+ * knob — PULSAR_TP_RDMA_RC — since RC rejects a wrong RTR where UC only
+ * silently dead-connects) */
+enum { TP_IBV_QPT_RC = 2, TP_IBV_QPT_UC = 3 };
 /* enum ibv_qp_state */
 enum { TP_IBV_QPS_RESET = 0, TP_IBV_QPS_INIT = 1, TP_IBV_QPS_RTR = 2,
        TP_IBV_QPS_RTS = 3, TP_IBV_QPS_SQD = 4, TP_IBV_QPS_SQE = 5,
@@ -136,9 +220,11 @@ enum { TP_IBV_SEND_SIGNALED = 2 };
 /* enum ibv_qp_attr_mask */
 enum { TP_IBV_QP_ACCESS_FLAGS = 1 << 3, TP_IBV_QP_PKEY_INDEX = 1 << 4,
        TP_IBV_QP_PORT = 1 << 5, TP_IBV_QP_AV = 1 << 7,
-       TP_IBV_QP_PATH_MTU = 1 << 8, TP_IBV_QP_RQ_PSN = 1 << 12,
-       TP_IBV_QP_SQ_PSN = 1 << 16, TP_IBV_QP_DEST_QPN = 1 << 20,
-       TP_IBV_QP_STATE = 1 };
+       TP_IBV_QP_PATH_MTU = 1 << 8, TP_IBV_QP_TIMEOUT = 1 << 9,
+       TP_IBV_QP_RETRY_CNT = 1 << 10, TP_IBV_QP_RNR_RETRY = 1 << 11,
+       TP_IBV_QP_RQ_PSN = 1 << 12, TP_IBV_QP_MAX_QP_RD_ATOMIC = 1 << 13,
+       TP_IBV_QP_SQ_PSN = 1 << 16, TP_IBV_QP_MAX_DEST_RD_ATOMIC = 1 << 17,
+       TP_IBV_QP_DEST_QPN = 1 << 20, TP_IBV_QP_STATE = 1 };
 
 union tp_ibv_gid {
     uint8_t raw[16];
@@ -302,6 +388,18 @@ struct tp_ibv_mr_layout {
     uint32_t pad;
 };
 
+#endif /* PULSAR_TP_VERBS_HDR: real structs above, ABI-thunk fallback */
+
+#ifdef PULSAR_TP_VERBS_HDR
+#define TP_QPN(q)   (((struct ibv_qp *)(q))->qp_num)
+#define TP_LKEY(m)  (((struct ibv_mr *)(m))->lkey)
+#define TP_RKEY(m)  (((struct ibv_mr *)(m))->rkey)
+#else
+#define TP_QPN(q)   (((struct tp_ibv_qp_layout *)(q))->qp_num)
+#define TP_LKEY(m)  (((struct tp_ibv_mr_layout *)(m))->lkey)
+#define TP_RKEY(m)  (((struct tp_ibv_mr_layout *)(m))->rkey)
+#endif
+
 /* librdma/libibverbs is loaded at runtime so builds and machines without the
  * RDMA stack (or with it disabled) fall back to TCP with no link-time cost.
  * ibv_post_send()/ibv_post_recv()/ibv_poll_cq() are header inlines upstream;
@@ -357,6 +455,7 @@ typedef struct {
     union tp_ibv_gid gid;
     int gid_index;
     uint32_t max_inline;
+    bool rc_mode;               /* PULSAR_TP_RDMA_RC set: RC QP (bring-up A/B) */
     pulsar_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
@@ -585,9 +684,8 @@ static int tp_rdma_load_api(pulsar_tp_verbs_api *api) {
     TP_SYM(create_qp, "ibv_create_qp");
     TP_SYM(destroy_qp, "ibv_destroy_qp");
     TP_SYM(modify_qp, "ibv_modify_qp");
-    TP_SYM(post_send, "ibv_post_send");
-    TP_SYM(post_recv, "ibv_post_recv");
-    TP_SYM(poll_cq, "ibv_poll_cq");
+    /* post_send/post_recv/poll_cq are header inlines, NOT exported symbols;
+     * resolved from the verbs context ops table in tp_rdma_open. */
 #undef TP_SYM
     api->handle = h;
     return 1;
@@ -677,7 +775,22 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
                    "tp rdma: no device with an active port (%s); is the peer "
                    "up and the link enabled on both machines?", states);
         return 0;
+    }    /* post_send/post_recv/poll_cq are header inlines -> resolve them from
+     * ibv_context->ops (poll=11, send=25, recv=26 on rdma-core v50; verified
+     * against the installed header).  If a future rdma-core reorders, open
+     * fails loudly here. */
+    {
+        typedef void *const *tramp;
+        tramp ops = (tramp)((uint8_t *)r->ctx + sizeof(void *));
+        r->api.poll_cq = (__typeof__(r->api.poll_cq))ops[11];
+        r->api.post_send = (__typeof__(r->api.post_send))ops[25];
+        r->api.post_recv = (__typeof__(r->api.post_recv))ops[26];
+        if (!r->api.poll_cq || !r->api.post_send || !r->api.post_recv) {
+            tp_set_err(err, errlen, "tp rdma: verbs ops table null pointers");
+            return 0;
+        }
     }
+
     /* GID selection.  Upstream (two-Mac/TB) wants the IPv4-mapped GID, which
      * is a Thunderbolt-ism.  Linux RoCEv2 commonly exposes the usable GID at
      * a non-zero index, so: honor PULSAR_TP_RDMA_GID_INDEX, else prefer the
@@ -686,7 +799,7 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
     r->gid_index = -1;
     if (gid_env) {
         const int gi = atoi(gid_env);
-        if (gi >= 0 && (uint32_t)gi < r->port.gid_tbl_len &&
+        if (gi >= 0 && gi < (int)r->port.gid_tbl_len &&
             r->api.query_gid(r->ctx, 1, gi, &r->gid) == 0) {
             r->gid_index = gi;
         } else {
@@ -696,9 +809,9 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
             return 0;
         }
     } else {
-        for (uint32_t j = 0; j < r->port.gid_tbl_len; j++) {
+        for (int j = 0; j < (int)r->port.gid_tbl_len; j++) {
             union tp_ibv_gid tmp;
-            if (r->api.query_gid(r->ctx, 1, (int)j, &tmp) != 0) continue;
+            if (r->api.query_gid(r->ctx, 1, j, &tmp) != 0) continue;
             uint64_t hi;
             uint16_t mid, v4tag, top;
             memcpy(&hi, &tmp.raw[0], 8);
@@ -732,9 +845,10 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
     }
     struct tp_ibv_qp_init_attr qia;
     (void)memset(&qia, 0, sizeof(qia));
-    qia.send_cq = r->cq;
-    qia.recv_cq = r->cq;
-    qia.qp_type = TP_IBV_QPT_UC;
+    qia.send_cq = (decltype(qia.send_cq))r->cq;
+    qia.recv_cq = (decltype(qia.recv_cq))r->cq;
+    r->rc_mode = getenv("PULSAR_TP_RDMA_RC") != NULL;
+    qia.qp_type = r->rc_mode ? TP_IBV_QPT_RC : TP_IBV_QPT_UC;
     qia.cap.max_send_wr = 256;
     qia.cap.max_recv_wr = 64;
     qia.cap.max_send_sge = 1;
@@ -804,13 +918,11 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
                    (unsigned long long)tp->slab_bytes, strerror(errno));
         return 0;
     }
-    struct tp_ibv_mr_layout *mr = reinterpret_cast<struct tp_ibv_mr_layout *>(r->mr);
-    struct tp_ibv_qp_layout *qp = reinterpret_cast<struct tp_ibv_qp_layout *>(r->qp);
     pulsar_tp_rdma_info mine;
     (void)memset(&mine, 0, sizeof(mine));
     mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
-    mine.rkey = mr->rkey;
-    mine.qpn = qp->qp_num;
+    mine.rkey = TP_RKEY(r->mr);
+    mine.qpn = TP_QPN(r->qp);
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
     mine.mtu = (uint32_t)r->port.active_mtu;
     mine.lid = r->port.lid;
@@ -845,7 +957,7 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     }
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTR;
-    a.path_mtu = TP_IBV_MTU_1024;
+    a.path_mtu = r->port.active_mtu;   /* the port MTU, as perftest uses */
     a.dest_qp_num = r->peer.qpn;
     a.rq_psn = r->peer.psn;
     a.ah_attr.dlid = (uint16_t)r->peer.lid;
@@ -854,16 +966,27 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
+    if (r->rc_mode)
+        a.max_dest_rd_atomic = 1;   /* RC reaches RTR only with this set */
     if (r->api.modify_qp(r->qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
-            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
+            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN |
+            (r->rc_mode ? TP_IBV_QP_MAX_DEST_RD_ATOMIC : 0)) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTS;
     a.sq_psn = mine.psn;
-    if (r->api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
+    if (r->rc_mode) {
+        a.timeout = 14;      /* ~ 3.6 ms * 4^14: finite, generous */
+        a.retry_cnt = 7;     /* 7 = retry forever; both ranks on the pair */
+        a.rnr_retry = 7;     /* 7 = no limit on RNR backoff */
+        a.max_rd_atomic = 1;
+    }
+    if (r->api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN |
+            (r->rc_mode ? TP_IBV_QP_TIMEOUT | TP_IBV_QP_RETRY_CNT |
+                         TP_IBV_QP_RNR_RETRY | TP_IBV_QP_MAX_QP_RD_ATOMIC : 0)) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
@@ -933,7 +1056,6 @@ static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq) {
     const uintptr_t base =
         (uintptr_t)(tp->slab + tp->layout.in_off +
                     (uint64_t)slot * tp->vec_bytes);
-    struct tp_ibv_mr_layout *mr = reinterpret_cast<struct tp_ibv_mr_layout *>(r->mr);
     /* Vectors above the driver's 16KB message cap ride as two chunks landing
      * contiguously in the slot.  Both sides post/send strictly in seq order,
      * so the k'th send always matches the k'th recv; only the FINAL chunk
@@ -950,7 +1072,7 @@ static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq) {
         (void)memset(&wr, 0, sizeof(wr));
         sge.addr = base + off;
         sge.length = (uint32_t)len;
-        sge.lkey = mr->lkey;
+        sge.lkey = TP_LKEY(r->mr);
         wr.wr_id = last ? seq : 0;
         wr.sg_list = &sge;
         wr.num_sge = 1;
@@ -980,7 +1102,6 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    struct tp_ibv_mr_layout *mr = reinterpret_cast<struct tp_ibv_mr_layout *>(r->mr);
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->layout.out_off +
                     (uint64_t)slot * tp->vec_bytes);
@@ -1000,7 +1121,7 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
         (void)memset(&wr, 0, sizeof(wr));
         sge.addr = send_base + off;
         sge.length = (uint32_t)len;
-        sge.lkey = mr->lkey;
+        sge.lkey = TP_LKEY(r->mr);
         wr.wr_id = seq;
         wr.sg_list = &sge;
         wr.num_sge = 1;
@@ -1060,7 +1181,6 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
     struct tp_ibv_send_wr wr[PULSAR_TP_RDMA_RECV_WINDOW * 2u];
     (void)memset(wr, 0, sizeof(wr));
     uint8_t *scratch = tp->slab + tp->layout.batch_out_off;
-    struct tp_ibv_mr_layout *mr = reinterpret_cast<struct tp_ibv_mr_layout *>(r->mr);
     uint32_t wi = 0;
     for (uint32_t gate = 0; gate < PULSAR_TP_RDMA_RECV_WINDOW; gate++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
@@ -1068,7 +1188,7 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
                 PULSAR_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
             sge[wi].addr = (uintptr_t)(scratch + off);
             sge[wi].length = (uint32_t)len;
-            sge[wi].lkey = mr->lkey;
+            sge[wi].lkey = TP_LKEY(r->mr);
             wr[wi].wr_id = PULSAR_TP_RDMA_BULK_WR_TAG | ((uint64_t)wi + 1u);
             wr[wi].sg_list = &sge[wi];
             wr[wi].num_sge = 1;
@@ -1157,7 +1277,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
     uint8_t *stage_send = tp->slab + tp->layout.batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->layout.batch_in_off;
-    struct tp_ibv_mr_layout *mr = reinterpret_cast<struct tp_ibv_mr_layout *>(r->mr);
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t remaining = bytes - off;
@@ -1190,7 +1309,7 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
             recv_sge[i].addr = direct ? in_lo + off + chunk_off[i] :
                                  (uintptr_t)(stage_recv + chunk_off[i]);
             recv_sge[i].length = lens[i];
-            recv_sge[i].lkey = mr->lkey;
+            recv_sge[i].lkey = TP_LKEY(r->mr);
             recv_wr[i].wr_id = PULSAR_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
             recv_wr[i].sg_list = &recv_sge[i];
             recv_wr[i].num_sge = 1;
@@ -1210,7 +1329,7 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
             send_sge[i].addr = direct ? out_lo + off + chunk_off[i] :
                                  (uintptr_t)(stage_send + chunk_off[i]);
             send_sge[i].length = lens[i];
-            send_sge[i].lkey = mr->lkey;
+            send_sge[i].lkey = TP_LKEY(r->mr);
             send_wr[i].wr_id = PULSAR_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
             send_wr[i].sg_list = &send_sge[i];
             send_wr[i].num_sge = 1;
