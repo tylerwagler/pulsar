@@ -1323,8 +1323,8 @@ void pulsar_session::rewind(int pos) {
                 for (uint32_t p = start; ok && p < (uint32_t)pos; p++) {
                     const uint64_t attn_row_bytes = 2ull * PULSAR_N_HEAD_DIM * sizeof(float);
                     const uint64_t idx_row_bytes = 2ull * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-                    const uint64_t aoff = (uint64_t)(p % 32u) * attn_row_bytes;
-                    const uint64_t ioff = (uint64_t)(p % 32u) * idx_row_bytes;
+                    const uint64_t aoff = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * attn_row_bytes;
+                    const uint64_t ioff = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * idx_row_bytes;
                     pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], aoff, attn_row_bytes);
                     pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], aoff, attn_row_bytes);
                     pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], ioff, idx_row_bytes);
@@ -1392,12 +1392,12 @@ void pulsar_session::rewind(int pos) {
     {
         pulsar_gpu_graph *g2 = &s->graph;
         while (g2->r128_undo_n > 0u) {
-            const uint32_t idx = (g2->r128_undo_head + 31u) % 32u;
+            const uint32_t idx = (g2->r128_undo_head + PULSAR_REWIND_RING_DEPTH - 1u) % PULSAR_REWIND_RING_DEPTH;
             const uint32_t p = g2->r128_undo_pos[idx];
             if (p < (uint32_t)pos) break;
             const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
             const uint64_t state_off = (uint64_t)(p % 128u) * row_bytes;
-            const uint64_t lane_off = (uint64_t)(p % 32u) * row_bytes;
+            const uint64_t lane_off = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * row_bytes;
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
                 if (pulsar_layer_compress_ratio(il) != 128u) continue;
                 if (!g2->layer_r128_undo_kv[il] || !g2->layer_r128_undo_sc[il]) continue;

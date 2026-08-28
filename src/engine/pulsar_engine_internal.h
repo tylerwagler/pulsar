@@ -918,6 +918,15 @@ typedef struct {
     pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];
     uint32_t proj_ring_lo;
     uint32_t proj_ring_hi;
+/* Depth of BOTH rewind-restore rings (the L120 projection ring above and the
+ * L124 ratio-128 undo lanes): must exceed worst replay span (7) + deepest
+ * per-round ghost overshoot, or ghost-position writes alias the slots a
+ * rewind restore reads — CORRUPTION, not degradation (rows/L124.md).  The
+ * overshoot is bounded by the per-bank draft depth; this is the L125
+ * five-sites constant family, asserted here so raising either constant
+ * cannot silently break the rings.  (The projection ring's lo/hi span check
+ * is additionally structural: an aliased slot forces the span past it.) */
+#define PULSAR_REWIND_RING_DEPTH 32u
 
     /* L124: ratio-128 UNDO LOG.  The ratio-128 compressor ring (128 slots,
      * pos %% 128, no shift) lets a ghost span that crosses a 128-emit
@@ -2872,5 +2881,12 @@ static inline uint16_t f32_to_f16(float f) {
  * max_draft reports at least MAX so the per-position waterfall covers every
  * position the controller can reach. */
 enum { PULSAR_SPEC_DEPTH_MIN = 2, PULSAR_SPEC_DEPTH_MAX = 5 };
+/* L124/L125 coupling: the rewind-restore rings assume ghost overshoot stays
+ * comfortably inside their depth (see PULSAR_REWIND_RING_DEPTH).  8 covers
+ * the worst replay span (7) plus one; 16 is the driver's historical per-bank
+ * row ceiling, kept as margin. */
+static_assert(PULSAR_SPEC_DEPTH_MAX + 1 + 16 + 8 <= (int)PULSAR_REWIND_RING_DEPTH,
+              "rewind-restore ring depth no longer covers draft overshoot + replay span "
+              "(raising a draft/slab constant? rows/L124.md and rows/L125.md first)");
 
 #endif /* PULSAR_ENGINE_INTERNAL_H */

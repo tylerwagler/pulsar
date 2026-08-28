@@ -771,7 +771,7 @@ static bool gpu_graph_bank_slabs_alloc(
              * width-256 rows; attn and indexer widths are both 256 at
              * ratio 4).  No fill: a rewind replay only reads slots inside
              * the deposited [lo, hi) span. */
-            b->pring_bank_bytes = 32ull * attn_width * sizeof(float);
+            b->pring_bank_bytes = (uint64_t)PULSAR_REWIND_RING_DEPTH * attn_width * sizeof(float);
             b->apkv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
             b->apsc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
             b->ipkv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * b->pring_bank_bytes);
@@ -1400,7 +1400,7 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
      * 2*indexer_head_dim (128) = 1 KiB rows.  Lanes are attn-sized. */
     const uint64_t row_bytes = (indexer ? 2ull * PULSAR_N_INDEXER_HEAD_DIM
                                         : 2ull * PULSAR_N_HEAD_DIM) * sizeof(float);
-    const uint64_t off = (uint64_t)(pos % 32u) * row_bytes;
+    const uint64_t off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * row_bytes;
     return pulsar_gpu_tensor_copy_async(dk, off, kv_row, 0, row_bytes) != 0 &&
            pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;
 }
@@ -1415,7 +1415,7 @@ bool gpu_graph_r128_undo_capture(pulsar_gpu_graph *g, uint32_t il, uint32_t pos)
      * overshoot <= 16 < 32, same argument as the L120 projection ring). */
     const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
     const uint64_t state_off = (uint64_t)(pos % 128u) * row_bytes;
-    const uint64_t lane_off = (uint64_t)(pos % 32u) * row_bytes;
+    const uint64_t lane_off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * row_bytes;
     return pulsar_gpu_tensor_copy_async(uk, lane_off, g->layer_attn_state_kv[il],
                                         state_off, row_bytes) != 0 &&
            pulsar_gpu_tensor_copy_async(us, lane_off, g->layer_attn_state_score[il],
@@ -1427,7 +1427,7 @@ void gpu_graph_r128_undo_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
      * duplicate pushes (a position re-stored after a same-target rewind)
      * are fine: restore is idempotent per lane row. */
     g->r128_undo_pos[g->r128_undo_head] = pos;
-    g->r128_undo_head = (g->r128_undo_head + 1u) % 32u;
+    g->r128_undo_head = (g->r128_undo_head + 1u) % PULSAR_REWIND_RING_DEPTH;
     if (g->r128_undo_n < 32u) g->r128_undo_n++;
 }
 
@@ -1437,8 +1437,8 @@ void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
      * claimed under the stale hi (ghost deposits) can never be read. */
     if (g->proj_ring_hi != pos) g->proj_ring_lo = pos;
     g->proj_ring_hi = pos + 1u;
-    if (g->proj_ring_lo + 32u < g->proj_ring_hi)
-        g->proj_ring_lo = g->proj_ring_hi - 32u;
+    if (g->proj_ring_lo + PULSAR_REWIND_RING_DEPTH < g->proj_ring_hi)
+        g->proj_ring_lo = g->proj_ring_hi - PULSAR_REWIND_RING_DEPTH;
 }
 
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
@@ -2029,7 +2029,7 @@ bool gpu_graph_alloc_raw_cap(
                 /* L120 value-half: committed-projection rings (32 x width-256
                  * rows), attn + indexer.  Banked: bank-0 views, repointed
                  * with the state views. */
-                const uint64_t pring_bytes = 32ull * attn_width * sizeof(float);
+                const uint64_t pring_bytes = (uint64_t)PULSAR_REWIND_RING_DEPTH * attn_width * sizeof(float);
                 if (banked) {
                     g->layer_attn_proj_kv[il] = pulsar_gpu_tensor_view(
                             g->banks.apkv[il], 0, g->banks.pring_bank_bytes);
