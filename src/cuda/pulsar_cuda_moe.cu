@@ -1232,6 +1232,18 @@ static int routed_moe_launch_mixed40(
  * existed purely to satisfy the link.  That path went with the mmvq half in
  * ledger L066 step 2, so the stub has no caller and no reason to exist. */
 
+/* ONE definition of the per-element math, shared by the scalar and vector
+ * kernels so they cannot drift.  clamp semantics match the swiglu gate/up
+ * path above. */
+__device__ __forceinline__ static float moe_fold_elem(float g, float u, float wv, float clamp) {
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    return (g / (1.0f + expf(-g))) * u * wv;
+}
+
 __global__ static void moe_mmq_swiglu_fold_kernel(
         float *mid_out,
         const float *gate_raw,
@@ -1242,16 +1254,35 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
         float clamp) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    float g = gate_raw[idx];
-    float u = up_raw[idx];
-    /* clamp semantics match the swiglu gate/up path above */
-    if (clamp > 1.0e-6f) {
-        if (g > clamp) g = clamp;
-        if (u > clamp) u = clamp;
-        if (u < -clamp) u = -clamp;
-    }
-    const uint64_t pair = idx / (uint64_t)expert_mid_dim;
-    mid_out[idx] = (g / (1.0f + expf(-g))) * u * weights[pair];
+    mid_out[idx] = moe_fold_elem(gate_raw[idx], up_raw[idx],
+                                 weights[idx / (uint64_t)expert_mid_dim], clamp);
+}
+
+/* Vector-4 twin (L128).  ncu on the decode path measured this kernel at 9.7%
+ * SM throughput with 93% occupancy and a long-scoreboard stall ratio of
+ * 111.9 -- fully resident and doing almost nothing but waiting on memory.
+ * It is a pure streaming op (two loads, one store per output), so one
+ * element per thread wastes three quarters of every transaction and pays a
+ * 64-bit divide per element.  BIT-EXACT: identical per-element math, no
+ * reduction, only the access granularity and thread mapping change. */
+__global__ static void moe_mmq_swiglu_fold_v4_kernel(
+        float4 *mid_out,
+        const float4 *gate_raw,
+        const float4 *up_raw,
+        const float *weights,
+        uint64_t quads,
+        uint32_t expert_mid_dim_q,
+        float clamp) {
+    const uint64_t q = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= quads) return;
+    const float4 g = gate_raw[q], u = up_raw[q];
+    const float wv = weights[q / (uint64_t)expert_mid_dim_q];
+    float4 o;
+    o.x = moe_fold_elem(g.x, u.x, wv, clamp);
+    o.y = moe_fold_elem(g.y, u.y, wv, clamp);
+    o.z = moe_fold_elem(g.z, u.z, wv, clamp);
+    o.w = moe_fold_elem(g.w, u.w, wv, clamp);
+    mid_out[q] = o;
 }
 
 /* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
@@ -1326,9 +1357,25 @@ static int routed_moe_try_mmq_gate_up(
     if (rc != 0) return 0;
     const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
     const uint32_t threads = 256u;
-    const uint64_t blocks = (total + threads - 1u) / threads;
-    moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
-        mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+    /* L128: four elements per thread when the shape and alignment allow --
+     * see the v4 kernel's note.  mid_out and gate_scratch are whole
+     * allocations here (256 B aligned), but the check is cheap and keeps the
+     * fast path honest if a caller ever hands in an offset view. */
+    const bool v4 = (expert_mid_dim % 4u) == 0u && (total % 4u) == 0u &&
+                    ((uintptr_t)mid_out % 16u) == 0u &&
+                    ((uintptr_t)gate_raw % 16u) == 0u &&
+                    ((uintptr_t)up_raw % 16u) == 0u;
+    if (v4) {
+        const uint64_t quads = total / 4u;
+        const uint64_t blocks = (quads + threads - 1u) / threads;
+        moe_mmq_swiglu_fold_v4_kernel<<<(unsigned)blocks, threads>>>(
+            (float4 *)mid_out, (const float4 *)gate_raw, (const float4 *)up_raw,
+            weights_ptr, quads, expert_mid_dim / 4u, clamp);
+    } else {
+        const uint64_t blocks = (total + threads - 1u) / threads;
+        moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
+            mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+    }
     return 1;
 }
 /* Routed DOWN through MMQ.  Upstream's down rode inside a Q2_K-specific fused

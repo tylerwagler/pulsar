@@ -233,15 +233,58 @@ __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t
 // agreement. That file does not exist -- the engine was split up long ago --
 // so the reference had been unfollowable, and the invariant uncheckable,
 // for however long it took anyone to look.
+/* ONE definition of the per-element math, shared by the scalar and vector
+ * kernels below so the two can never drift.  fminf/fmaxf form, matching the
+ * hc_router twin EXACTLY: identical to the if-chain on finite inputs, but
+ * agrees on NaN too (fminf(NaN,c)=c, where the if-chain left NaN) -- the
+ * twins must not diverge on any input. */
+__device__ __forceinline__ static float swiglu_elem(float g, float u, float wv, float clamp){
+  if(clamp>1.0e-6f){ g=fminf(g,clamp); u=fminf(fmaxf(u,-clamp),clamp); }
+  const float s=g/(1.f+expf(-g));
+  return s*u*wv;
+}
+
 __global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
   long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
-  float g=gate[i], u=up[i];
-  /* fminf/fmaxf form, matching the hc_router twin EXACTLY: identical to the
-   * if-chain on finite inputs, but agrees on NaN too (fminf(NaN,c)=c, where
-   * the if-chain left NaN) -- the twins must not diverge on any input. */
-  if(clamp>1.0e-6f){ g=fminf(g,clamp); u=fminf(fmaxf(u,-clamp),clamp); }
-  float s=g/(1.f+expf(-g));
-  mid[i]=s*u*w[i/mid_dim];
+  mid[i]=swiglu_elem(gate[i], up[i], w[i/mid_dim], clamp);
+}
+
+/* Vector-4 twin (L128).  ncu on the decode path measured this kernel at
+ * 47.3% SM with a long-scoreboard stall ratio of 13.1 -- occupancy was fine
+ * (80%), it was simply waiting on memory: one element per thread means three
+ * 4-byte global accesses and a 64-bit divide per output float.  Four elements
+ * per thread turns those into 16-byte transactions and amortises the divide.
+ * BIT-EXACT by construction: same swiglu_elem per element, elementwise with
+ * no reduction, so nothing reassociates -- only the access granularity and
+ * the thread mapping change.  Taken only when mid_dim and n are multiples of
+ * 4 and all three pointers are 16-byte aligned; otherwise the scalar kernel
+ * runs unchanged. */
+__global__ void swiglu_v4_kernel(float4 *mid, const float4 *gate, const float4 *up, const float *w, float clamp, int mid_dim_q, long quads){
+  long q=(long)blockIdx.x*blockDim.x+threadIdx.x; if(q>=quads) return;
+  const float4 g=gate[q], u=up[q];
+  const float wv=w[q/mid_dim_q];   /* all four share a pair when mid_dim%4==0 */
+  float4 o;
+  o.x=swiglu_elem(g.x,u.x,wv,clamp);
+  o.y=swiglu_elem(g.y,u.y,wv,clamp);
+  o.z=swiglu_elem(g.z,u.z,wv,clamp);
+  o.w=swiglu_elem(g.w,u.w,wv,clamp);
+  mid[q]=o;
+}
+
+/* Dispatch: vector when the shape and alignment allow, scalar otherwise. */
+static inline bool swiglu_v4_ok(const void *a, const void *b, const void *c, int mid_dim, long n){
+  return (mid_dim % 4)==0 && (n % 4)==0 &&
+         ((uintptr_t)a % 16)==0 && ((uintptr_t)b % 16)==0 && ((uintptr_t)c % 16)==0;
+}
+static inline void swiglu_launch(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
+  const int t=256;
+  if(swiglu_v4_ok(mid,gate,up,mid_dim,n)){
+    const long quads=n/4; const long b=(quads+t-1)/t;
+    swiglu_v4_kernel<<<(unsigned)b,t>>>((float4*)mid,(const float4*)gate,(const float4*)up,w,clamp,mid_dim/4,quads);
+  } else {
+    const long b=(n+t-1)/t;
+    swiglu_kernel<<<(unsigned)b,t>>>(mid,gate,up,w,clamp,mid_dim,n);
+  }
 }
 
 // A_data is E4M3: M*K bytes (1 byte/elem), NOT M*K/2. SFA via the CUTLASS tile-atom layout.
@@ -455,7 +498,7 @@ int pulsar_cutlass_expert_ffn_scratch(
   pack_activation(xA,xSF,x,T,in_dim);
   rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf_e,T,mid_dim,in_dim,ws_gate);
   rc|=run_gemm(up,  xA,xSF,Wu_d,Wu_sf_e,T,mid_dim,in_dim,ws_up);
-  { long n=(long)T*mid_dim; int t=256,b=(int)((n+t-1)/t); swiglu_kernel<<<b,t>>>(mid,gate,up,weights,clamp,mid_dim,n); }
+  { long n=(long)T*mid_dim; swiglu_launch(mid,gate,up,weights,clamp,mid_dim,n); }
   pack_activation(midA,midSF,mid,T,mid_dim);
   rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf_e,T,out_dim,mid_dim,ws_down);
   return rc;
@@ -724,7 +767,7 @@ int pulsar_cutlass_grouped_moe(
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   { long n = (long)padded_total*mid_dim; int t = 256, b = (int)((n+t-1)/t);
-    swiglu_kernel<<<b,t>>>(mid, gate, up, w_gathered, clamp, mid_dim, n); }
+    swiglu_launch(mid, gate, up, w_gathered, clamp, mid_dim, n); }
 
   pack_activation(midA, midSF, mid, padded_total, mid_dim);
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
