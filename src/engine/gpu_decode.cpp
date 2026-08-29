@@ -1498,15 +1498,13 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_draft * PULSAR_N_EMBD * sizeof(float));
         ok = hc_mix_view && hc_split_view && ffn_cur_view;
-        /* RMS norm: flat HC from batch_cur_hc */
-        if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
-            g->batch_flat_hc, g->batch_cur_hc,
-            (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS) != 0;
-        /* HC → mix projection */
-        if (ok) ok = gpu_graph_matmul_plain_tensor(
-            hc_mix_view, dspark_model,
-            layer->hc_attn_fn,
-            hc_dim, mix_hc, g->batch_flat_hc, n_draft);
+        /* RMS norm + HC -> mix projection, fused at decode widths.  This is the
+         * per-layer site: it, not the once-per-round output head, is where the
+         * unfused norm's instance count actually comes from. */
+        if (ok) ok = gpu_graph_norm_mix_plain_rows(
+            dspark_model, layer->hc_attn_fn,
+            hc_dim, mix_hc, g->batch_cur_hc, hc_mix_view,
+            n_draft, g->batch_flat_hc);
         /* HC split + weighted sum → attn_cur (E-dim) */
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(
             ffn_cur_view, hc_split_view, hc_mix_view,
@@ -1940,10 +1938,10 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = output_pre && output_weights && output_embd && output_norm && logits;
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
-                                                     (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
-                                               hc_dim, PULSAR_N_HC, g->batch_flat_hc, n_tokens) != 0;
+    if (ok) ok = gpu_graph_norm_mix_plain_rows(dspark_model, dw->hc_head_fn,
+                                               hc_dim, PULSAR_N_HC, g->batch_cur_hc,
+                                               output_pre, (uint32_t)n_tokens,
+                                               g->batch_flat_hc);
     if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights, output_pre,
                                                   dspark_model->map, dspark_model->size,
                                                   dw->hc_head_scale->abs_offset,
