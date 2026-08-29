@@ -1727,6 +1727,30 @@ int pulsar_gpu_hc_norm_mix_tensor(
          * scratch round trip, not about the weight being 2 bytes. */
         uint32_t                w_type);
 
+/* Batched twin of the above: `rows` tokens, each contiguous at in_dim samples
+ * in `x` and out_dim floats in `out`.  Same kernel, gridDim.y == rows.
+ *
+ * This exists because L118 routed ALL decode through the batch lane, which had
+ * only the UNFUSED rms_norm_plain_rows + matmul pair -- so the fusion above,
+ * written to delete a 64 KB f32 scratch round trip, stopped running in
+ * production: 5 instances against 1474 for the unfused norm in a 512-depth
+ * decode profile (2026-08-29).  Bit-exactness here is against the BATCHED
+ * pair, which is a different claim than the single-row one this file's older
+ * comments make -- the batched matmul picks arms by regime
+ * (see g_mneutral_rows in pulsar_cuda_matmul.cu), so callers must stay inside
+ * the M-independent decode regime and gate on measured hash equality. */
+int pulsar_gpu_hc_norm_mix_rows_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const pulsar_gpu_tensor *x,
+        float                   eps,
+        uint32_t                w_type,
+        uint32_t                rows);
+
 int pulsar_gpu_output_hc_weights_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *pre,

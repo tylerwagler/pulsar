@@ -1139,6 +1139,15 @@ __global__ static void hc_norm_mix_kernel(
         float eps) {
     const uint32_t row = blockIdx.x;
     if (row >= out_dim) return;
+    /* blockIdx.y is the batch row.  The RMSNorm below is ALREADY recomputed
+     * redundantly in every one of the out_dim blocks -- that redundancy is the
+     * whole point of the fusion -- so a second grid dimension adds no new
+     * reduction and no new scratch: each block simply norms its own token's
+     * slice.  gridDim.y == 1 reproduces the original single-row launch
+     * bit-for-bit, because the offsets below are then zero. */
+    const uint32_t tok = blockIdx.y;
+    x   += (uint64_t)tok * n;
+    out += (uint64_t)tok * out_dim;
     const uint32_t tid = threadIdx.x;
     __shared__ float partial[BLK];
 
@@ -1205,7 +1214,7 @@ __global__ static void hc_norm_mix_kernel(
  * them, the very cost this kernel exists to remove (~5.4% of decode by its own
  * measurement). The fusion has nothing to do with the weight's width, so it is
  * templated on storage rather than gated on one type. */
-int pulsar_gpu_hc_norm_mix_tensor(
+int pulsar_gpu_hc_norm_mix_rows_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1214,19 +1223,24 @@ int pulsar_gpu_hc_norm_mix_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         float                   eps,
-        uint32_t                w_type) {
-    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
+        uint32_t                w_type,
+        uint32_t                rows) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || rows == 0) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     const uint64_t elt = (w_type == 0u) ? 4u : 2u;      /* F32 : F16/BF16 */
     const uint64_t weight_bytes = out_dim * in_dim * elt;
     if (weight_bytes > model_size - weight_offset) return 0;
-    /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
-    if (x->bytes < in_dim * PULSAR_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
+    /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample.  Bound
+     * on ROWS x dim, not one row: an under-sized batch buffer would otherwise
+     * pass a single-row check and let the kernel walk off the end at
+     * blockIdx.y > 0. */
+    if (x->bytes < (uint64_t)rows * in_dim * PULSAR_HC_ELT_SIZE ||
+        out->bytes < (uint64_t)rows * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "hc_mix");
     if (!wptr) return 0;
 #define PULSAR_HCMIX(WT, CAST)                                          \
-    hc_norm_mix_kernel<256, 8, WT><<<(uint32_t)out_dim, 256>>>(          \
+    hc_norm_mix_kernel<256, 8, WT><<<dim3((uint32_t)out_dim, rows), 256>>>( \
             (float *)out->ptr, (const CAST)wptr, (const pulsar_hc_t *)x->ptr, \
             (uint32_t)in_dim, (uint32_t)out_dim, eps)
     /* Fail closed on an unexpected type.  This used to fall through to a
@@ -1244,4 +1258,22 @@ int pulsar_gpu_hc_norm_mix_tensor(
     }
 #undef PULSAR_HCMIX
     return cuda_ok(cudaGetLastError(), "hc norm mix launch");
+}
+
+/* The original single-row entry, now one authority thinner: rows=1 makes
+ * gridDim.y == 1, the blockIdx.y offsets are zero, and the launch is the same
+ * kernel with the same arguments it always had.  Kept as a named entry because
+ * three call sites in gpu_decode.cpp read better without a literal 1. */
+int pulsar_gpu_hc_norm_mix_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const pulsar_gpu_tensor *x,
+        float                   eps,
+        uint32_t                w_type) {
+    return pulsar_gpu_hc_norm_mix_rows_tensor(out, model_map, model_size, weight_offset,
+                                              in_dim, out_dim, x, eps, w_type, 1u);
 }

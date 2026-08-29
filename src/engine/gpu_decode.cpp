@@ -300,6 +300,16 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 
+/* What counts as a decode-shaped batch, in one place.
+ *
+ * Two things need this bound and both used to spell it `16` inline: the L119
+ * output-head segment bracket (below) and the fused norm+mix rows dispatch.
+ * They are the same claim -- "this batch is decode-width, so the M-independent
+ * regime holds" -- so they get the same name.  Widening it changes which
+ * matmul arm the fallback would have used, which is a numerics decision, not a
+ * tuning one: re-run the mixed-neutrality gate if you touch it. */
+#define PULSAR_DECODE_BATCH_ROWS_MAX 16u
+
 /* Decode-only fused RMSNorm + HC-mix GEMV.  Byte-identical to the
  * rms_norm_plain -> matmul_f16 pair it replaces (see pulsar_cuda_hc_router.cu);
  * it exists because that pair ran a 1-block kernel and then a 24-block kernel
@@ -327,6 +337,44 @@ static bool gpu_graph_norm_mix_plain(
     }
     if (!pulsar_gpu_rms_norm_plain_tensor(g->flat_hc, src_hc, (uint32_t)hc_dim, PULSAR_RMS_EPS)) return false;
     return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, g->flat_hc, 1);
+}
+
+/* Batched twin.  L118 moved every decode token onto the batch lane, and the
+ * batch lane never had the fusion -- it ran rms_norm_plain_rows into a scratch
+ * buffer and then re-read that scratch from the mix GEMV, which is the exact
+ * round trip gpu_graph_norm_mix_plain exists to delete.  A 512-depth decode
+ * profile put the unfused norm at 1474 instances (1.6% of decode) against 5
+ * for the fused kernel: the July fusion had stopped running in production.
+ *
+ * The fallback is not dead weight.  The fused kernel's arithmetic was pinned
+ * to the single-row GEMV, while the batched matmul chooses arms by regime
+ * (g_mneutral_rows); outside the M-independent decode regime the two need not
+ * agree bit-for-bit, and [[plain-matmul-arm-parity-2026-08-16]] is explicit
+ * that the F32/BF16 plain arms are not neutrality-safe.  So `rows` is bounded
+ * to the decode widths where the regime holds, and everything else keeps the
+ * pair it already had. */
+/* Takes its scratch explicitly rather than reaching into the graph like its
+ * single-row sibling: the batched callers do not all stage through the same
+ * buffer, and the fused arm does not touch scratch at all. */
+static bool gpu_graph_norm_mix_plain_rows(
+        const pulsar_model      *model,
+        const pulsar_tensor     *w,
+        uint64_t              hc_dim,
+        uint64_t              out_dim,
+        const pulsar_gpu_tensor *src_hc,
+        pulsar_gpu_tensor       *out,
+        uint32_t              rows,
+        pulsar_gpu_tensor       *scratch) {
+    if (rows >= 1u && rows <= PULSAR_DECODE_BATCH_ROWS_MAX &&
+        (w->type == PULSAR_TENSOR_BF16 || w->type == PULSAR_TENSOR_F32)) {
+        return pulsar_gpu_hc_norm_mix_rows_tensor(out, model->map, model->size,
+                                                  w->abs_offset, hc_dim, out_dim,
+                                                  src_hc, PULSAR_RMS_EPS,
+                                                  w->type, rows) != 0;
+    }
+    if (!pulsar_gpu_rms_norm_plain_rows_tensor(scratch, src_hc, (uint32_t)hc_dim,
+                                               rows, PULSAR_RMS_EPS)) return false;
+    return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, scratch, rows);
 }
 
 
@@ -1746,7 +1794,7 @@ bool gpu_graph_encode_output_head_batch(
         const pulsar_weights     *weights,
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
-    if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+    if (n_tokens >= 1 && n_tokens <= PULSAR_DECODE_BATCH_ROWS_MAX && g->banks.n_banks) {
         /* L119: parity-keyed like the FFN bracket — the head reads the
          * sweep-final hidden buffer, whose identity alternates per sweep
          * (odd layer count x per-layer pointer swap). */
@@ -1812,18 +1860,16 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = output_pre && output_weights && output_embd && output_norm && logits;
 
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
-                                                 (const pulsar_model *)model,
-                                                 weights->output_hc_fn,
-                                             hc_dim,
-                                             PULSAR_N_HC,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    /* Fused when the batch is decode-width; the pair below the dispatch is the
+     * same two calls this used to make inline. */
+    if (ok) ok = gpu_graph_norm_mix_plain_rows((const pulsar_model *)model,
+                                               weights->output_hc_fn,
+                                               hc_dim,
+                                               PULSAR_N_HC,
+                                               g->batch_cur_hc,
+                                               output_pre,
+                                               (uint32_t)n_tokens,
+                                               g->batch_flat_hc);
     if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights,
                                                     output_pre,
                                                     model->map,
