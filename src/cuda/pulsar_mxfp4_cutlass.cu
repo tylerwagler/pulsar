@@ -383,7 +383,21 @@ static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A
   const int t = 128;
   const long groups = (long)M*(K/32)/4;
   const long thr = groups*32, bw = (thr+t-1)/t;
-  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(mid_f32, A_data, tSFA, gate, up, w, clamp, M, K);
+  /* The f32 mid store is DEAD on this path and is skipped.  Both callers
+   * consume only (A_data, A_sf) after this returns -- the down GEMM reads the
+   * E4M3 staging -- and `mid` is CUTLASS-local scratch, never registered in
+   * the activation cache, so no consumer can look it up and no
+   * act_f32_absent_hazard applies.  Same move the hc_router twin and qr_norm
+   * already make, with the same announce discipline.  The unfused fallback
+   * above still writes it, because pack_activation reads it back. */
+  static int announced = 0;
+  if (!announced) {
+    announced = 1;
+    fprintf(stderr, "pulsar: swiglu->E4M3 fused; mid f32 store SKIPPED "
+                    "(%.1f MiB/call at M=%d K=%d)\n",
+            (double)((size_t)M * K * sizeof(float)) / 1048576.0, M, K);
+  }
+  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(nullptr, A_data, tSFA, gate, up, w, clamp, M, K);
 }
 
 /* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
