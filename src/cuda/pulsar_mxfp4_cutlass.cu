@@ -287,6 +287,65 @@ static inline void swiglu_launch(float *mid, const float *gate, const float *up,
   }
 }
 
+/* L129 lever 1 — SwiGLU WITH the E4M3+E8M0 epilogue its hc_router twin has.
+ *
+ * The comment below this kernel has named the gap for months: the CUTLASS
+ * down path re-quantises `mid` precisely because this TU's swiglu lacked the
+ * epilogue.  The profile priced it: pack_act_e4m3_rowmajor_warp is 3.5% of
+ * decode at an 85 long-scoreboard stall ratio, and it exists only to read
+ * back f32 values this kernel just wrote.  Fusing removes the whole
+ * round-trip -- one launch and one full pass over `mid` per FFN.
+ *
+ * Structure is pack_act_e4m3_rowmajor_warp's exactly (one warp = four
+ * consecutive 32-blocks of one row, xor-shuffle amax within each block), with
+ * the loads replaced by gate/up and swiglu_elem applied first.  BIT-EXACT vs
+ * swiglu-then-pack: the packer re-read f32 values that were stored exactly,
+ * so the in-register values are the same floats, the same per-block amax over
+ * the same set, and the same cutlass::float_e4m3_t(v*inv) encode.
+ *
+ * `mid_f32` is still written (NULL to skip) because dumps and the non-fused
+ * fallback read it; the epilogue is additive. */
+template<class TSFA>
+__global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TSFA tSFA,
+                                             const float *gate, const float *up,
+                                             const float *w, float clamp, int M, int K){
+  const int nblk = K/32;
+  const long total_blk = (long)M*nblk;
+  const int lane = threadIdx.x & 31;
+  const long grp = ((long)blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+  const long blk0 = grp*4;
+  if (blk0 >= total_blk) return;
+  const int m = (int)(blk0 / nblk), kb0 = (int)(blk0 % nblk);
+  const size_t base = (size_t)m*K + (size_t)kb0*32;
+
+  const float4 g = reinterpret_cast<const float4*>(gate+base)[lane];
+  const float4 u = reinterpret_cast<const float4*>(up+base)[lane];
+  const float wv = w[m];              /* row weight: i/mid_dim == m when K==mid_dim */
+  float4 v;
+  v.x = swiglu_elem(g.x,u.x,wv,clamp);
+  v.y = swiglu_elem(g.y,u.y,wv,clamp);
+  v.z = swiglu_elem(g.z,u.z,wv,clamp);
+  v.w = swiglu_elem(g.w,u.w,wv,clamp);
+  if (mid_f32) reinterpret_cast<float4*>(mid_f32+base)[lane] = v;
+
+  float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+
+  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
+  if(se<-127)se=-127; if(se>127)se=127;
+  const float inv=exp2f((float)-se);
+
+  cutlass::float_e4m3_t ob[4];
+  ob[0]=cutlass::float_e4m3_t(v.x*inv); ob[1]=cutlass::float_e4m3_t(v.y*inv);
+  ob[2]=cutlass::float_e4m3_t(v.z*inv); ob[3]=cutlass::float_e4m3_t(v.w*inv);
+  reinterpret_cast<uint32_t*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+base)[lane]
+      = *reinterpret_cast<const uint32_t*>(ob);
+  if((lane & 7)==0) tSFA(m, (kb0+(lane>>3))*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
+}
+
+
 // A_data is E4M3: M*K bytes (1 byte/elem), NOT M*K/2. SFA via the CUTLASS tile-atom layout.
 static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, int M, int K){
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
@@ -302,6 +361,29 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
     const long thr = groups*32, bw = (thr+t-1)/t;
     pack_act_e4m3_rowmajor_warp<<<(unsigned)bw,t>>>(A_data, tSFA, x, M, K);
   }
+}
+
+/* L129 lever 1: swiglu straight into the E4M3 staging the down GEMM reads.
+ * Falls back to the unfused pair whenever the warp packer's own shape rule
+ * (K a 128-multiple) or 16-byte alignment does not hold, so the fast path
+ * adds no constraint the old pair did not already have. */
+static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A_sf,
+                                   const float *gate, const float *up, const float *w,
+                                   float clamp, int M, int K){
+  const bool shape_ok = ((K/32) % 4) == 0;
+  const bool align_ok = ((uintptr_t)gate % 16)==0 && ((uintptr_t)up % 16)==0 &&
+                        ((uintptr_t)mid_f32 % 16)==0;
+  if (!shape_ok || !align_ok) {
+    swiglu_launch(mid_f32, gate, up, w, clamp, K, (long)M*K);
+    pack_activation(A_data, A_sf, mid_f32, M, K);
+    return;
+  }
+  auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
+  auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
+  const int t = 128;
+  const long groups = (long)M*(K/32)/4;
+  const long thr = groups*32, bw = (thr+t-1)/t;
+  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(mid_f32, A_data, tSFA, gate, up, w, clamp, M, K);
 }
 
 /* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
@@ -498,8 +580,7 @@ int pulsar_cutlass_expert_ffn_scratch(
   pack_activation(xA,xSF,x,T,in_dim);
   rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf_e,T,mid_dim,in_dim,ws_gate);
   rc|=run_gemm(up,  xA,xSF,Wu_d,Wu_sf_e,T,mid_dim,in_dim,ws_up);
-  { long n=(long)T*mid_dim; swiglu_launch(mid,gate,up,weights,clamp,mid_dim,n); }
-  pack_activation(midA,midSF,mid,T,mid_dim);
+  swiglu_pack_activation(mid,midA,midSF,gate,up,weights,clamp,T,mid_dim);
   rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf_e,T,out_dim,mid_dim,ws_down);
   return rc;
 }
@@ -766,10 +847,7 @@ int pulsar_cutlass_grouped_moe(
       up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
-  { long n = (long)padded_total*mid_dim; int t = 256, b = (int)((n+t-1)/t);
-    swiglu_launch(mid, gate, up, w_gathered, clamp, mid_dim, n); }
-
-  pack_activation(midA, midSF, mid, padded_total, mid_dim);
+  swiglu_pack_activation(mid, midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim);
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
       down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
