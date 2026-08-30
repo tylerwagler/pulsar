@@ -287,7 +287,22 @@ __device__ __forceinline__ static float dev_dot_fp8mx_xreg_block(
  * so per-row activation traffic drops to int8-path parity (per-row f32 reads
  * straight from global measured ~13% slower end-to-end at decode; a shared-
  * memory staging variant measured worse still). */
-enum { PULSAR_FP8MX_ROWS = 4 };
+/* Sweep knob (2026-08-30).  The 4 above amortises one activation-block load
+ * across 4 output rows, and the comment records that 1 row/warp measured ~13%
+ * SLOWER end-to-end -- but that was the f32-activation era.  Activations are
+ * E4M3 now (1 byte, not 4), so the traffic this amortisation saves is worth 4x
+ * less than when it was measured, while ncu (2026-08-30) puts the a8 kernel at
+ * 1.33 waves/SM with long_scoreboard 41 and memory only 24% busy: starved of
+ * parallelism with bandwidth to spare.  Fewer rows per warp trades activation
+ * traffic for waves, and is BIT-EXACT (a row's lane-strided accumulation over K
+ * does not depend on how many other rows its warp also carries).
+ * Override: -DPULSAR_FP8MX_ROWS=2 */
+#ifndef PULSAR_FP8MX_ROWS
+#define PULSAR_FP8MX_ROWS 4
+#endif
+/* Output rows a whole 8-warp block covers -- every grid below derives from this
+ * rather than spelling 32, which silently meant "8 warps x 4 rows". */
+#define PULSAR_FP8MX_ROWS_PER_BLOCK (8u * (unsigned)PULSAR_FP8MX_ROWS)
 
 
 
@@ -326,7 +341,7 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
     const uint32_t nr = out_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(out_dim - row0)
                                                         : (uint32_t)PULSAR_FP8MX_ROWS;
     const unsigned char *wr = w + row0 * blocks * 33u;
-    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[PULSAR_FP8MX_ROWS] = {};
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
@@ -409,7 +424,7 @@ __global__ static void grouped_fp8mx_a_warp8_kernel(
                                                         : (uint32_t)PULSAR_FP8MX_ROWS;
     const unsigned char *wr = w + row0 * blocks * 33u;
     const uint64_t group = row0 / rank;
-    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[PULSAR_FP8MX_ROWS] = {};
 
     if ((row0 + nr - 1) / rank == group) {
         /* Common case (rank % PULSAR_FP8MX_ROWS == 0): all rows share the
@@ -494,7 +509,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
     const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
                                                         : (uint32_t)PULSAR_FP8MX_ROWS;
     const uint64_t group = row0 / rank;
-    float acc[PULSAR_FP8MX_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[PULSAR_FP8MX_ROWS] = {};
 
     const __nv_fp8_e4m3 *xr = xdata + (group * (uint64_t)n_tokens + tok) * group_dim;
     const unsigned char *xs = xscale + group * scale_slab;
@@ -2311,7 +2326,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
                                  label ? label : "fp8_hc_expand")
             : NULL;
     const int KBp = mx_rup((int)(in_dim / 32), 4);
-    const dim3 hg(((unsigned)out_dim + 31u) / 32u);
+    const dim3 hg(((unsigned)out_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK);
     const float *ba = block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr;
     /* A8: the "b" projection reads attn_low, which the "a" projection produced
      * one call earlier and encoded into the per-slot activation cache. If that
@@ -2650,7 +2665,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         uint64_t out_a_bytes, const unsigned char *out_a, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
         const pulsar_heads_t *heads, const char *label) {
-    const dim3 grid_a(((unsigned)low_dim + 31u) / 32u, (unsigned)n_tokens, 1);
+    const dim3 grid_a(((unsigned)low_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK, (unsigned)n_tokens, 1);
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
@@ -2741,7 +2756,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
      * per-token bit-identical to the n=1 DEINT kernel below. */
     if (dw && n_tokens >= 2u && n_tokens <= 4u &&
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
-        const dim3 g(((unsigned)low_dim + 31u) / 32u);
+        const dim3 g(((unsigned)low_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK);
         switch (n_tokens) {
         case 2: grouped_fp8mx_a_nt_kernel<2, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
                 heads, group_dim, rank, n_groups, blocks_a); break;
