@@ -394,6 +394,17 @@ int main(int argc, char **argv) {
             char err[256];
             /* prefill to a frontier well past several ratio-4 boundaries */
             if (sync_prefix(ms, &toks, 600)) {
+                /* A classically-prefilled session has never populated
+                 * ms_n_comp[0]: the scalars hold the truth, the per-bank slots
+                 * are zero. decode_mixed validates against the per-bank slots
+                 * (it passes capture_cur=false, correctly -- a genuine
+                 * multi-bank step's scalars are a cross-bank superset), so
+                 * without this the step is rejected with
+                 * "bank 0 frontier not position-true ... n_comp 0 want 150".
+                 * Publishing the scalars into bank 0 is exactly what the server
+                 * does on a bank hand-off, and is the dual-state bridge that
+                 * plans/ONE-STATE-MODEL.md exists to delete. */
+                pulsar_session_bank_state_save(ms, 0u);
                 /* decode through the SERVED entry: 1 row on bank 0. This sets
                  * batch_multiseq even with no pool allocated (bank 0 aliases
                  * the classic tensors), which is exactly the production shape. */
@@ -408,13 +419,16 @@ int main(int argc, char **argv) {
                     const int rc = pulsar_session_decode_mixed(
                             ms, &req, 1u, ms_logits, (int)PULSAR_N_VOCAB,
                             &out_rows, 0u, err, sizeof(err));
-                    if (rc != 0) {
-                        fprintf(stderr, "served leg: decode_mixed rc=%d %s\n", rc, err);
-                        ok = false;
-                        break;
-                    }
+                    /* CHECK, not a silent skip: the first cut of this leg
+                     * logged the rejection, set ok=false and let the gate
+                     * report PASS having tested nothing. A leg that can opt out
+                     * of its own assertion is not a gate. */
+                    CHECK(rc == 0, "served leg: decode_mixed rc=%d at pos %d: %s",
+                          rc, (int)req.pos, err);
+                    if (rc != 0) { ok = false; break; }
                     pulsar_session_note_committed_tokens(ms, &toks.v[600 + k], 1);
                 }
+                CHECK(ok, "served leg: never reached the rewind (decode failed)");
                 if (ok) {
                     /* ghost rewind across a ratio-4 boundary, exactly as the
                      * server does when emission stops mid accepted-batch */
