@@ -1044,7 +1044,16 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t               n_active,
         float                 *logits,
         uint32_t              *out_n_rows,
-        uint32_t               max_head_runs) {
+        uint32_t               max_head_runs,
+        /* capture_cur: trust the classic scalar frontier counters as the CURRENT
+         * bank's truth (and publish them into its per-bank slots on success).
+         * FALSE for genuine multi-bank stepping, where the scalars hold a
+         * cross-bank superset. TRUE only for a 1-row step on the session's own
+         * bank whose caller has already established that the scalars are that
+         * bank's truth -- pulsar_session::eval, via its mseq_dirty guard. Without
+         * this the per-bank slots are consulted, and a classically-prefilled
+         * bank has never populated them (n_comp 0), so the step is rejected. */
+        bool                   capture_cur) {
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
      * prefill chunk rides this entry); PULSAR_MSEQ_MAX bounds only the BANK count,
      * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
@@ -1089,7 +1098,7 @@ int gpu_graph_decode_multiseq_batch(
 
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
-    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, false)) return 0;
+    if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur)) return 0;
 
     /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
      * A K-row prefill run advances the KV by K but only its last row's logits

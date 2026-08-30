@@ -1324,7 +1324,8 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep. */
     const int ms_rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights,
                                                       ms_tok, ms_pos, ms_bank, 1u,
-                                                      s->logits, NULL, 0u);
+                                                      s->logits, NULL, 0u,
+                                                      /*capture_cur=*/true);
     const bool decode_ok = (ms_rc == 1);
     pulsar_alloc_guard_end();
     if (!decode_ok) {
