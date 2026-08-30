@@ -1438,6 +1438,29 @@ void pulsar_session::rewind(int pos) {
         if (ratio == 4 && s->graph.layer_n_index_comp[il] > want)
             s->graph.layer_n_index_comp[il] = want;
     }
+    /* ⚠ MEASURED LIMIT (2026-08-30): the replay below does NOT fire on the
+     * served path, and that is structural rather than incidental.
+     *
+     * The ring is deposited only for committed non-mseq, non-spec chunks
+     * (gpu_prefill.cpp:1312 deposit, :2818 note -- same guard), and
+     * gpu_graph_multiseq_step_begin sets batch_multiseq=true for EVERY
+     * multiseq step, 1 row or 16. The server decodes only that way, so between
+     * prefill chunks nothing is deposited, and a ghost rewind targeting the
+     * decode frontier lands outside the last chunk's tail-8 span. Traced on a
+     * real served workload: 0 replay TAKEN / 2 skipped, spans [18,22) and
+     * [39,43) against a rewind needing 12..17.
+     *
+     * So in production the counter clamp ABOVE is the live half of L120 (it is
+     * unconditional, and it is what fixed the observed
+     * "frontier not position-true" errors); the value restoration below runs
+     * only for classic/prefill-shaped callers. The consequence on the served
+     * path is silent, not an error: counters are correct, the step is
+     * accepted, and re-emitted comp rows keep ghost values.
+     *
+     * Covering decode would mean depositing under mseq and widening past
+     * tail-8 -- a fidelity improvement to be priced, not a bug fix. See
+     * pulsar-notes/plans/ONE-STATE-MODEL-STAGE0B.md, and the SERVED-SHAPE leg
+     * in tests/rewind_frontier_gate.cpp which pins the clamp on this path. */
     if (any_ratio4_crossed && pos >= 4) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t want = (uint32_t)pos / 4u;
