@@ -885,16 +885,19 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
                 s->checkpoint_valid = true;
                 return PULSAR_SESSION_SYNC_INTERRUPTED;
             }
-            if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                (uint32_t)prompt->v[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                s->logits))
-            {
+            /* L131: this loop used to open-code eval -- same call, same
+             * checkpoint push -- against the single-token encoder. eval now
+             * routes through the 1-row batch step, so calling it directly keeps
+             * this path on the one lane and drops the duplication (it pushes
+             * the token and clears the spec carry itself). Its mseq_dirty guard
+             * is a strict improvement here: this branch already requires
+             * checkpoint_valid, which a multiseq step clears, so the guard can
+             * only fire on a state this loop had no business decoding from. */
+            if (s->eval(prompt->v[i], err, errlen) != 0) {
                 snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
                 s->checkpoint_valid = false;
                 return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
         }
         return 0;
     }

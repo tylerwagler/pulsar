@@ -1843,12 +1843,19 @@ int generate_gpu_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = gpu_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
+        /* L131: one lane. This is a bare graph rather than a session, so it
+         * cannot go through pulsar_session::eval, but it takes the same 1-row
+         * batch step that eval now does. capture_cur is TRUE for the same
+         * reason it is there: a single row on bank 0 of a graph whose scalar
+         * frontier counters are that bank's truth -- which holds here because
+         * nothing else ever steps this graph. */
+        int     ms_tok[1]  = { token };
+        int32_t ms_pos[1]  = { (int32_t)pos };
+        int32_t ms_bank[1] = { (int32_t)(g.banks.n_banks ? g.banks.cur_bank : 0u) };
+        ok = gpu_graph_decode_multiseq_batch(&g, model, weights,
+                                             ms_tok, ms_pos, ms_bank, 1u,
+                                             logits, NULL, 0u,
+                                             /*capture_cur=*/true) == 1;
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();
