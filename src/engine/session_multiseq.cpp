@@ -61,7 +61,8 @@ int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
      * out-param needed (the caller reads n logit rows). max_head_runs = 0 (all). */
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
-                                                   bank, n, logits, NULL, 0u);
+                                                   bank, n, logits, NULL, 0u,
+                                                   /*capture_cur=*/false);
     if (rc == 0) {
         /* Recoverable: the driver rejected before arming the step, so nothing
          * was mutated — the upload writes ahead of it touch scratch only, and
@@ -148,7 +149,8 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     const int rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model,
                                                    &e->weights, tokens, pos,
                                                    bank, n_rows, logits, out_n_rows,
-                                                   max_head_runs);
+                                                   max_head_runs,
+                                                   /*capture_cur=*/false);
     /* The batch call consumed the descriptor synchronously (tokens copied to a
      * stack row, pos/seq uploaded to device in step_begin); the host scratch is
      * dead now regardless of rc. */

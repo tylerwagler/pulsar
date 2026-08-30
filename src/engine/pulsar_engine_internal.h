@@ -2338,7 +2338,8 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t               n_active,
         float                 *logits,
         uint32_t              *out_n_rows,
-        uint32_t               max_head_runs);
+        uint32_t               max_head_runs,
+        bool                   capture_cur);
 /* TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
  * graph state when enable_spec); the sizing side of the admission-control
  * single source of truth (see gpu_diag.cpp).  Includes the whole bank pool
