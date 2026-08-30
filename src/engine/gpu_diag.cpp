@@ -1777,7 +1777,6 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                prefill_cap,
         bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
-    g->comp_ratio_override = -1;
     gpu_graph_dims dz;
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
     raw_cap = dz.raw_cap;

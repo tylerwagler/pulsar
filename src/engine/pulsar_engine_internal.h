@@ -1097,10 +1097,6 @@ typedef struct {
     pulsar_gpu_tensor *dspark_raw_cache[3];
     uint32_t dspark_n_raw[3];
 
-    /* Override compression ratio for DSpark draft layers (set to 0 before
-     * calling gpu_graph_encode_decode_layer for draft model forwarding). */
-    int comp_ratio_override;
-
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -2410,17 +2406,7 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       first_row,
         uint32_t       rows);
 void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t);
-bool gpu_graph_encode_decode_layer(
-        pulsar_gpu_graph  *g,
-        const pulsar_model        *model,
-        const pulsar_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos,
-        pulsar_gpu_tensor       *raw_cache,
-        uint32_t                raw_cap,
-        uint32_t                raw_row,
-        uint32_t                n_raw,
-        int                     token);
+
 void gpu_graph_capture_dspark_target_hc(pulsar_gpu_graph *g, uint32_t il);
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
@@ -2561,13 +2547,7 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens);
-bool gpu_graph_eval_token_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits);
+
 /* save_row0 (inc 6, W2): the first row of THIS session's positions within
  * the verify forward's comp-save buffers. Classic single-bank rounds pass 0;
  * the batched lane passes the bank's row offset in the shared batch. */

@@ -2,71 +2,6 @@
 
 
 
-/* Encode a full single-token decode step on GPU.  This is the generation
- * hot path: update caches, run all layers, then produce logits. */
-static bool gpu_graph_encode_token_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        bool                   need_logits,
-        bool                   allow_split_flush) {
-    if (g->raw_cap == 0) {
-        fprintf(stderr, "pulsar: GPU graph raw KV cache is not allocated\n");
-        return false;
-    }
-    const uint32_t raw_row = pos % g->raw_cap;
-    const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos, 1);
-
-    bool ok = pulsar_gpu_embed_token_hc_tensor(g->cur_hc,
-                                              model->map,
-                                              model->size,
-                                              weights->token_embd->abs_offset,
-                                              (uint32_t)weights->token_embd->dim[1],
-                                              (uint32_t)token,
-                                              PULSAR_N_EMBD,
-                                              PULSAR_N_HC) != 0;
-
-    /*
-     * Start executing the prefix of the decode graph while the CPU is still
-     * encoding the rest. The split point is layer-based because this executor is
-     * a fixed DS4 tape, not a dynamic node graph; four layers is the measured
-     * point where the prefix is large enough to hide useful work without
-     * starving the second command buffer.
-     */
-    const uint32_t split_after_layers = gpu_graph_token_split_after_layers();
-
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-        ok = gpu_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token);
-        pulsar_gpu_tensor *tmp = g->cur_hc;
-        g->cur_hc = g->after_ffn_hc;
-        g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
-            ok = pulsar_gpu_flush_commands() != 0;
-        }
-    }
-
-    /* L120 value-half: every layer banked this committed position's
-     * projections above — advance the deposited span once. */
-    if (ok) gpu_graph_proj_ring_note_pos(g, pos);
-    /* L124: every ratio-128 layer captured its pre-store slot above. */
-    if (ok) gpu_graph_r128_undo_note_pos(g, pos);
-
-    if (ok && need_logits) {
-        ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    }
-    return ok;
-}
 
 
 
@@ -2875,54 +2810,6 @@ bool gpu_graph_encode_layer_batch(
 
 
 
-/* Execute one GPU decode token and read back logits. */
-bool gpu_graph_eval_token_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits) {
-
-    /* Diagnostics read the environment ONCE (no-hot-path-flags): this runs per
-     * decoded token, so a getenv here is a per-token libc call and lookup for a
-     * switch that cannot change after start. */
-    static int profile_env = -1;
-    const bool profile = gpu_graph_env_flag("PULSAR_CUDA_GRAPH_TOKEN_PROFILE", &profile_env);
-    const double t0 = profile ? now_sec() : 0.0;
-
-    bool ok = pulsar_gpu_begin_commands() != 0;
-    /* The last argument enables the split-flush prefix overlap, a
-     * direct-submission latency trick.  It used to be suppressed under decode
-     * CUDA-graph capture (a mid-tape device sync is illegal while capturing);
-     * that capture path was deleted in L027, so the overlap is always on. */
-    if (ok) ok = gpu_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL,
-                                                true);
-    const double t_encoded = profile ? now_sec() : 0.0;
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    const double t_done = profile ? now_sec() : 0.0;
-
-    if (ok && logits) {
-        ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
-    const double t_read = profile ? now_sec() : 0.0;
-    if (profile) {
-        fprintf(stderr,
-                "pulsar: GPU graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
-                pos,
-                (t_encoded - t0) * 1000.0,
-                (t_done - t_encoded) * 1000.0,
-                (t_read - t_done) * 1000.0,
-                (t_read - t0) * 1000.0,
-                logits != NULL);
-    }
-    if (!ok) {
-        if (pulsar_gpu_synchronize() == 0) {
-            fprintf(stderr, "pulsar: GPU synchronize after graph eval failure also failed\n");
-        }
-    }
-    return ok;
-}
 
 
 
