@@ -1857,6 +1857,10 @@ int generate_gpu_graph_raw_swa(
                                              logits, NULL, 0u,
                                              /*capture_cur=*/true) == 1;
         if (!ok) break;
+        /* Same rewind bookkeeping the deleted single-token encoder did after
+         * its layer sweep; the batch step does not do it for itself. */
+        gpu_graph_proj_ring_note_pos(&g, (uint32_t)pos);
+        gpu_graph_r128_undo_note_pos(&g, (uint32_t)pos);
         if (token_timing) {
             const double t_eval1 = now_sec();
             fprintf(stderr, "pulsar: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);

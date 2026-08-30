@@ -1336,6 +1336,15 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
         s->checkpoint_valid = false;
         return 1;
     }
+    /* L131: the deleted single-token encoder advanced these two after its layer
+     * sweep, and they are NOT bookkeeping the batch step does for itself -- the
+     * multiseq path carries per-bank ms_proj_ring_lo/hi and installs them from
+     * these SCALARS via gpu_graph_bank_counters_capture, so a scalar that never
+     * advances is captured stale and a later rewind restores contaminated comp
+     * rows. That is precisely how the rewind gate's value and r128 legs failed
+     * when this call site moved onto the batch step. */
+    gpu_graph_proj_ring_note_pos(&s->graph, (uint32_t)s->checkpoint.len);
+    gpu_graph_r128_undo_note_pos(&s->graph, (uint32_t)s->checkpoint.len);
     token_vec_push(&s->checkpoint, token);
     /* a token evaluated outside the speculative path (tool injection, plain
      * fallback loops) advances the state past any in-flight carry */
