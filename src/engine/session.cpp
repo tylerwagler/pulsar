@@ -1426,6 +1426,22 @@ void pulsar_session::rewind(int pos) {
      * the needed slots: ghost minus needed position is always under 32).  An uncovered span (fresh bank, spill-restore, fork, mseq
      * candidate-only stretches) skips the replay: degraded = the exact
      * pre-fix classic-parity behavior, counters still clamped. */
+    /* Clamp BOTH representations. The scalars alone are not enough: the served
+     * path validates the next multiseq step against the PER-BANK slots
+     * (gpu_graph_multiseq_step_begin reads ms_n_comp[bank] whenever capture_cur
+     * is false, which is every genuine multiseq step), and nothing else lowers
+     * them on a rewind -- bank_state_save only publishes the scalars on a
+     * hand-off, which does not happen when the rewound bank is decoded again
+     * with no switch-away in between (a single live slot).
+     *
+     * Reproduced deterministically by tests/mseq_rewind_probe:
+     *   after rewind   scalar_n_comp=150  ms_n_comp[0]=151   <-- diverged
+     *   next step      REJECTED: "bank 0 frontier not position-true at layer 2
+     *                  (pos 603 ratio 4: n_comp 151 want 150, n_index_comp 151)"
+     * which is L120's production signature -- same layer, same shape, same
+     * message as the 2026-08-27 incident (bank 3, n_comp 10995 want 10994).
+     * L120 clamped the scalars and closed; the per-bank half was never done. */
+    const uint32_t rw_bank = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
     bool any_ratio4_crossed = false;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1437,6 +1453,14 @@ void pulsar_session::rewind(int pos) {
         }
         if (ratio == 4 && s->graph.layer_n_index_comp[il] > want)
             s->graph.layer_n_index_comp[il] = want;
+        /* Only the bank this session's checkpoint describes: other banks hold
+         * their own positions and a rewind here says nothing about them. */
+        if (rw_bank < PULSAR_MSEQ_MAX) {
+            if (s->graph.ms_n_comp[rw_bank][il] > want)
+                s->graph.ms_n_comp[rw_bank][il] = want;
+            if (ratio == 4 && s->graph.ms_n_index_comp[rw_bank][il] > want)
+                s->graph.ms_n_index_comp[rw_bank][il] = want;
+        }
     }
     /* ⚠ MEASURED LIMIT (2026-08-30): the replay below does NOT fire on the
      * served path, and that is structural rather than incidental.
