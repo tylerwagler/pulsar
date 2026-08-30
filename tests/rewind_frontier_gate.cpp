@@ -364,6 +364,69 @@ int main(int argc, char **argv) {
           "into comp row 0 (ctl=%llx vic=%llx)",
           (unsigned long long)rctl, (unsigned long long)rvic);
 
+    /* ---- 6. SERVED-SHAPE leg (2026-08-30): the shape production actually
+     * takes, which legs 4 and 5 do NOT.
+     *
+     * Legs 4/5 build their ghosts through sync/classic decode. Those paths
+     * DEPOSIT into the projection ring (gpu_prefill.cpp:1312 and the note at
+     * :2818, both guarded `!mseq && !spec_comp_save_n`), so the rewind replay
+     * is covered and restores values. The server never decodes that way:
+     * gpu_graph_multiseq_step_begin sets batch_multiseq=true for EVERY
+     * multiseq step, so no deposit happens and the replay's coverage test
+     * fails by construction. Measured on a served workload 2026-08-30:
+     * 0 replay TAKEN / 2 skipped, spans [18,22) and [39,43) against a rewind
+     * needing 12..17 (plans/ONE-STATE-MODEL-STAGE0B.md).
+     *
+     * So this leg pins what IS live on that path and what production depends
+     * on: the counter clamp. It deliberately does NOT assert value
+     * restoration, because on this path there is none -- that is a documented
+     * limit, not a bug, and legs 4/5 already pin the value claim for the
+     * paths that do deposit.
+     *
+     * If someone later extends the ring to cover decode (option (b) in
+     * plans/ONE-STATE-MODEL.md), this leg keeps passing and a NEW value
+     * assertion belongs here beside it. */
+    {
+        pulsar_session *ms = NULL;
+        const int ms_rc = pulsar_session_create(&ms, e, 4096);
+        CHECK(ms_rc == 0 && ms != NULL, "served leg: session create failed (rc=%d)", ms_rc);
+        if (ms_rc == 0 && ms) {
+            char err[256];
+            /* prefill to a frontier well past several ratio-4 boundaries */
+            if (sync_prefix(ms, &toks, 600)) {
+                /* decode through the SERVED entry: 1 row on bank 0. This sets
+                 * batch_multiseq even with no pool allocated (bank 0 aliases
+                 * the classic tensors), which is exactly the production shape. */
+                static float *ms_logits = (float *)malloc(sizeof(float) * (size_t)PULSAR_N_VOCAB);
+                bool ok = true;
+                for (int k = 0; ok && k < 6; k++) {
+                    pulsar_multiseq_req req;
+                    req.bank  = 0u;
+                    req.pos   = (int32_t)pulsar_session_pos(ms);
+                    req.token = toks.v[600 + k];
+                    uint32_t out_rows = 0;
+                    const int rc = pulsar_session_decode_mixed(
+                            ms, &req, 1u, ms_logits, (int)PULSAR_N_VOCAB,
+                            &out_rows, 0u, err, sizeof(err));
+                    if (rc != 0) {
+                        fprintf(stderr, "served leg: decode_mixed rc=%d %s\n", rc, err);
+                        ok = false;
+                        break;
+                    }
+                    pulsar_session_note_committed_tokens(ms, &toks.v[600 + k], 1);
+                }
+                if (ok) {
+                    /* ghost rewind across a ratio-4 boundary, exactly as the
+                     * server does when emission stops mid accepted-batch */
+                    const int target = pulsar_session_pos(ms) - 3;
+                    pulsar_session_rewind(ms, target);
+                    check_frontiers(ms, target, "served leg (mseq ghost rewind)");
+                }
+            }
+            pulsar_session_free(ms);
+        }
+    }
+
     pulsar_engine_close(e);
 
     if (g_fail) { fprintf(stderr, "REWIND GATE: FAIL\n"); return 1; }
