@@ -1,4 +1,18 @@
-/* Task #32 probe — does an mseq rewind leave ms_n_comp[bank] stale?
+/* MSEQ-REWIND GATE — a rewind must clamp BOTH frontier representations.
+ *
+ * Regression test for L120's other half. L120 was filed from live production
+ * (bank 3: n_comp 10995 want 10994) and closed by clamping the SCALAR counters
+ * in pulsar_session::rewind -- but gpu_graph_multiseq_step_begin validates the
+ * next step against the PER-BANK slots (ms_n_comp[bank], whenever capture_cur
+ * is false, i.e. every genuine multiseq step), and rewind did not touch those.
+ * The only thing that lowered them was bank_state_save republishing the clamped
+ * scalars on a hand-off -- which does not happen when a rewound bank is decoded
+ * again with no switch-away between it (a single live slot).
+ *
+ * Before the fix this gate FAILED with production's exact message:
+ *   bank 0 frontier not position-true at layer 2
+ *   (pos 603 ratio 4: n_comp 151 want 150, n_index_comp 151)
+ * so it is mutation-proven by construction.
  *
  * pulsar_session::rewind clamps ONLY the scalar frontier counters
  * (grep -c ms_n_comp src/engine/session.cpp == 0). The served path validates
@@ -28,6 +42,9 @@
 
 /* Report layer 2 (ratio 4 in this artifact -- the layer L120's production
  * signature named) in both representations. */
+static int g_fail;
+#define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "MSEQ-REWIND FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); g_fail = 1; } } while (0)
+
 static void show(pulsar_session *s, const char *when, int pos) {
     pulsar_gpu_graph *g = &s->graph;
     const uint32_t il = 2;
@@ -85,6 +102,26 @@ int main(int argc, char **argv) {
     const int target = pulsar_session_pos(s) - 3;
     pulsar_session_rewind(s, target);
     show(s, "after rewind (single live slot)", target);
+    /* THE ASSERTION: both representations clamped, for every compressing layer. */
+    {
+        pulsar_gpu_graph *g = &s->graph;
+        const uint32_t b = g->banks.n_banks ? g->banks.cur_bank : 0u;
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint32_t want = (uint32_t)target / ratio;
+            CHECK(g->layer_n_comp[il] == want,
+                  "layer %u scalar n_comp %u want %u", il, g->layer_n_comp[il], want);
+            CHECK(g->ms_n_comp[b][il] == want,
+                  "layer %u PER-BANK ms_n_comp[%u] %u want %u (L120's other half)",
+                  il, b, g->ms_n_comp[b][il], want);
+            if (ratio == 4) {
+                CHECK(g->ms_n_index_comp[b][il] == want,
+                      "layer %u PER-BANK ms_n_index_comp[%u] %u want %u",
+                      il, b, g->ms_n_index_comp[b][il], want);
+            }
+        }
+    }
 
     /* round 2 on the SAME bank with no intervening switch-away -- the shape
      * that has no publisher for the clamp. Does step_begin reject? */
@@ -96,9 +133,12 @@ int main(int argc, char **argv) {
                                                 err, sizeof err);
     printf("\nround 2 on same bank after rewind: rc=%d%s\n", rc2,
            rc2 == 0 ? "  (ACCEPTED)" : "  <-- REJECTED, L120's shape");
-    if (rc2 != 0) printf("   %s\n", err);
+    CHECK(rc2 == 0, "step on a rewound bank rejected (L120's production shape): %s",
+          rc2 != 0 ? err : "");
 
     pulsar_session_free(s);
     pulsar_engine_close(e);
+    if (g_fail) { fprintf(stderr, "MSEQ-REWIND GATE: FAIL\n"); return 1; }
+    printf("MSEQ-REWIND GATE: PASS\n");
     return 0;
 }

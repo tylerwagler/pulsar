@@ -348,6 +348,12 @@ cuda-frontier-gate: tests/multiseq_frontier_gate
 cuda-rewind-gate: tests/rewind_frontier_gate
 	./tests/rewind_frontier_gate $(FRONTIER_MODEL)
 
+# L120's other half: a rewind must clamp the PER-BANK frontier as well as the
+# scalars, or the next multiseq step on that bank is rejected with production's
+# "frontier not position-true".  MODEL-DEPENDENT.
+cuda-mseq-rewind-gate: tests/mseq_rewind_probe
+	./tests/mseq_rewind_probe $(FRONTIER_MODEL)
+
 # L115 token-seam gate: sampled-vs-canonical boundary drift keeps the live
 # KV (see the header of tests/token_seam_gate.cpp).  MODEL-DEPENDENT.
 cuda-seam-gate: tests/token_seam_gate
@@ -827,7 +833,7 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-prefill-gate \
 	cuda-reference-gate \
-               cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
+               cuda-frontier-gate cuda-rewind-gate cuda-mseq-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
                cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
                cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide \

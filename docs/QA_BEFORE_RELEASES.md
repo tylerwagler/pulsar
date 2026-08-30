@@ -86,6 +86,12 @@ model.  Record pass/fail against the release commit:
   rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
   ratio-128 boundary, plus the value leg (a ghost rewind must not contaminate
   re-emitted comp rows) and the ratio-128 undo walk (L124).
+- `make cuda-mseq-rewind-gate` — a rewind must clamp BOTH frontier
+  representations. L120 clamped the scalars; the served path validates the next
+  multiseq step against the PER-BANK slots (ms_n_comp[bank]), which rewind did
+  not touch, so a rewound bank decoded again with no bank switch-away between
+  was rejected with production's own "frontier not position-true". Reproduces
+  that deterministically and asserts both copies agree.
 - `make cuda-seam-gate` — token-boundary seams keep the live KV (L115).
   Discovers a seam pair from the model's own vocabulary, then pins the byte
   walk, the sync rescue, the shorter-echo shape, and a fork across seams.
