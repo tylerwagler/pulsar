@@ -1298,11 +1298,34 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
      * free in production; armed, it makes any xmalloc/xrealloc inside the decode
      * fatal. Only the eval is guarded -- token_vec_push below legitimately grows
      * the checkpoint. */
+    /* ONE LANE.  This used to call gpu_graph_eval_token_raw_swa -- a whole
+     * parallel single-token graph encoder -- while the server decoded through
+     * gpu_graph_decode_multiseq_batch.  Two lanes meant every tool built on the
+     * classic API (pulsar-bench, pulsar-eval, pulsar-cli, several gates) measured
+     * code production never executes, which is how a dead fusion survived and
+     * how five instruments in a row measured nothing (L129).
+     *
+     * A 1-row batch on this session's own bank is the same work: bank 0 maps to
+     * the classic tensors when no pool is allocated (gpu_graph_bank_raw_pool
+     * falls back to layer_raw_cache, gpu_graph_bank_pool_count reports 1), so
+     * this costs no extra slab and no extra memory.
+     *
+     * The classic flags stay untouched deliberately, and that is SOUND rather
+     * than convenient: decode_multiseq must invalidate because its scalar
+     * frontier counters end up holding a cross-bank superset. A superset over
+     * exactly one touched bank IS that bank's truth -- and the mseq_dirty guard
+     * above already establishes that the counters were this bank's truth on
+     * entry. Both conditions are required; neither alone is enough. Nothing
+     * here weakens pulsar_session_decode_mixed's contract for its own callers. */
     pulsar_alloc_guard_begin("decode");
-    const bool decode_ok = gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                        (uint32_t)token,
-                                        (uint32_t)s->checkpoint.len,
-                                        s->logits);
+    int     ms_tok[1]  = { token };
+    int32_t ms_pos[1]  = { (int32_t)s->checkpoint.len };
+    int32_t ms_bank[1] = { (int32_t)(s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u) };
+    /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep. */
+    const int ms_rc = gpu_graph_decode_multiseq_batch(&s->graph, &e->model, &e->weights,
+                                                      ms_tok, ms_pos, ms_bank, 1u,
+                                                      s->logits, NULL, 0u);
+    const bool decode_ok = (ms_rc == 1);
     pulsar_alloc_guard_end();
     if (!decode_ok) {
         snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
