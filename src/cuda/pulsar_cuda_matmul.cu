@@ -304,6 +304,31 @@ __device__ __forceinline__ static float dev_dot_fp8mx_xreg_block(
  * rather than spelling 32, which silently meant "8 warps x 4 rows". */
 #define PULSAR_FP8MX_ROWS_PER_BLOCK (8u * (unsigned)PULSAR_FP8MX_ROWS)
 
+/* The A8 twin gets its OWN rows-per-warp, and the split is physical rather than
+ * a tuning whim: it reads E4M3 activations (1 byte/element) where the f32 twin
+ * reads 4, so the activation traffic that 4-rows-per-warp amortises costs a
+ * quarter as much here -- and that amortisation is the only thing 4 buys.
+ *
+ * Measured 2026-08-30 (nsys, pulsar-bench, 3 alternating reps, kernel GPU time):
+ *   ROWS_A8=4   848.11 ms median (spread 4.9)
+ *   ROWS_A8=1   814.42 ms median (spread 0.3)   -4.0%, arms do not overlap
+ * total GPU 8042 -> 8022 ms. BIT-EXACT: probe hash 7d6ef2dfd081fca4 unchanged
+ * across every arm, because a row's lane-strided accumulation over K does not
+ * depend on how many other rows its warp carries.
+ *
+ * ncu said why: at 4 rows this kernel ran 1.33 waves/SM with long_scoreboard 41
+ * and memory only 24% busy -- stalled on loads, bandwidth to spare, too few
+ * blocks to hide the latency. Fewer rows per warp buys waves.
+ *
+ * The f32 twin and the _nt_ variant deliberately KEEP 4: the header's "~13%
+ * slower for 1 row/warp" was measured in the f32-activation era and still
+ * applies to them, and _nt_ also serves the server's 2..4-row speculative
+ * verify batches, which this sweep did not measure. */
+#ifndef PULSAR_FP8MX_ROWS_A8
+#define PULSAR_FP8MX_ROWS_A8 1
+#endif
+#define PULSAR_FP8MX_ROWS_A8_PER_BLOCK (8u * (unsigned)PULSAR_FP8MX_ROWS_A8)
+
 
 
 /* A8 adds the activation as E4M3 + its own ue8m0 scale, so the attn-output "b"
@@ -501,15 +526,15 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         uint32_t n_groups,
         uint32_t n_tokens,
         uint64_t blocks) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
+    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS_A8;
     const uint64_t tok = (uint64_t)blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (row0 >= low_dim || tok >= n_tokens) return;
-    const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
-                                                        : (uint32_t)PULSAR_FP8MX_ROWS;
+    const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS_A8 ? (uint32_t)(low_dim - row0)
+                                                        : (uint32_t)PULSAR_FP8MX_ROWS_A8;
     const uint64_t group = row0 / rank;
-    float acc[PULSAR_FP8MX_ROWS] = {};
+    float acc[PULSAR_FP8MX_ROWS_A8] = {};
 
     const __nv_fp8_e4m3 *xr = xdata + (group * (uint64_t)n_tokens + tok) * group_dim;
     const unsigned char *xs = xscale + group * scale_slab;
@@ -517,7 +542,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         const uint64_t i0 = b * 32;
         const unsigned char xsb = xs[pulsar_mx_sfoff((int)tok, (int)b, xKBp)];
 #pragma unroll
-        for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
+        for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS_A8; r++) {
             if (r >= nr) continue;
             const uint32_t rw = (uint32_t)(row0 + r);
             acc[r] += dev_dot_fp8mx_deint_block_a8(
@@ -539,7 +564,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
  * spec-verify launch storm (8 GEMMs/layer at 2-4 rows each). Per-(row,token)
  * block order and dot helper match grouped_fp8mx_a_warp8_kernel's DEINT fast
  * path exactly, so each token's output is bit-identical to the n=1 kernel.
- * Caller guarantees: deint weight available, rank % PULSAR_FP8MX_ROWS == 0 (row
+ * Caller guarantees: deint weight available, rank % PULSAR_FP8MX_ROWS_A8 == 0 (row
  * quads never straddle a group), group_dim % 32 == 0 (whole blocks). */
 template <int NT, typename XT>
 __global__ static void grouped_fp8mx_a_nt_kernel(
@@ -2666,6 +2691,11 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
         const pulsar_heads_t *heads, const char *label) {
     const dim3 grid_a(((unsigned)low_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK, (unsigned)n_tokens, 1);
+    /* The A8 kernel carries PULSAR_FP8MX_ROWS_A8 rows per warp, not
+     * PULSAR_FP8MX_ROWS, so it needs its own grid -- grid_a still serves the f32
+     * twin below and must keep the 4-row geometry. Sharing one grid across two
+     * different rows-per-warp silently under- or over-launches. */
+    const dim3 grid_a8(((unsigned)low_dim + PULSAR_FP8MX_ROWS_A8_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_A8_PER_BLOCK, (unsigned)n_tokens, 1);
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
@@ -2713,7 +2743,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
                 fprintf(stderr, "pulsar: attn-out 'a' GEMV = producer-emitted E4M3 "
                                 "(grouped quantise pass skipped)\n");
             }
-            grouped_fp8mx_a_warp8_a8_kernel<<<grid_a, 256>>>(
+            grouped_fp8mx_a_warp8_a8_kernel<<<grid_a8, 256>>>(
                     low, dw->data, dw->scale, KBp,
                     gc->xq, gc->sx, gc->kbp, (uint64_t)gc->scale_slab,
                     group_dim, rank, n_groups, n_tokens, blocks_a);
@@ -2743,7 +2773,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
                                     "group_dim=%llu rank=%llu\n",
                             (unsigned long long)group_dim, (unsigned long long)rank);
                 }
-                grouped_fp8mx_a_warp8_a8_kernel<<<grid_a, 256>>>(
+                grouped_fp8mx_a_warp8_a8_kernel<<<grid_a8, 256>>>(
                         low, dw->data, dw->scale, KBp, xq, sx, KBp, (uint64_t)slab,
                         group_dim, rank, n_groups, n_tokens, blocks_a);
                 return cuda_ok(cudaGetLastError(), "attention_output_a a8 launch");
