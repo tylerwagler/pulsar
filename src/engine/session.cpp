@@ -1442,6 +1442,22 @@ void pulsar_session::rewind(int pos) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t want = (uint32_t)pos / 4u;
         const uint32_t start = 4u * (want - 1u);
+        /* MEASUREMENT ONLY (task #31, not for landing): is the L120 replay ever
+         * actually taken in a served workload?  The ring is maintained only for
+         * committed non-mseq, non-spec chunks, and the server's decode is always
+         * multiseq -- so this branch may never fire in production, which would
+         * mean L120's fix is not live for decode-era positions.  env read ONCE;
+         * rewind is a per-event path, not per token/layer. */
+        {
+            static int rw_diag = -1;
+            if (gpu_graph_env_flag("PULSAR_REWIND_TRACE", &rw_diag)) {
+                const bool covered = start >= g->proj_ring_lo &&
+                                     (uint32_t)pos <= g->proj_ring_hi;
+                fprintf(stderr, "REWINDTRACE pos=%d start=%u span=[%u,%u) replay=%s\n",
+                        pos, start, g->proj_ring_lo, g->proj_ring_hi,
+                        covered ? "TAKEN" : "skipped");
+            }
+        }
         if (start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi) {
             pulsar_engine *e = s->engine;
             const pulsar_model *model = &e->model;
