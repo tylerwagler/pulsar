@@ -1389,6 +1389,17 @@ void pulsar_session::invalidate() {
  * which threw away the whole live KV on every mid-block tool-call stop). */
 void pulsar_session::rewind(int pos) {
     auto *s = this;
+    /* MEASUREMENT ONLY (task #31, not for landing): count EVERY rewind at the
+     * entry. The first cut traced only inside `any_ratio4_crossed && pos >= 4`
+     * and printed nothing, which cannot distinguish "never rewound" from
+     * "rewound without crossing a ratio-4 boundary". The server's own
+     * "rewound N ghost tokens" line is gated on PULSAR_LOG_KVCACHE, so its
+     * absence proves nothing either. */
+    {
+        static int rw_entry = -1;
+        if (gpu_graph_env_flag("PULSAR_REWIND_TRACE", &rw_entry))
+            fprintf(stderr, "REWINDENTRY pos=%d checkpoint=%d\n", pos, s->checkpoint.len);
+    }
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
