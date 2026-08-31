@@ -297,11 +297,17 @@ typedef struct {
     uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
+/** Q2_K weight block: 2-bit quants with a two-level scale.
+ *
+ * `d` and `dmin` are the block-level scale and minimum; `scales` carries a
+ * packed per-sub-block pair that those two rescale. The minimum is why a Q8_K
+ * activation has to precompute group sums -- applying it needs sum(a) over
+ * each group. */
 typedef struct {
-    uint8_t  scales[QK_K / 16];
-    uint8_t  qs[QK_K / 4];
-    uint16_t d;
-    uint16_t dmin;
+    uint8_t  scales[QK_K / 16];  ///< packed per-sub-block scale and min selectors
+    uint8_t  qs[QK_K / 4];       ///< packed 2-bit quants, 4 per byte
+    uint16_t d;                  ///< block scale, f16
+    uint16_t dmin;               ///< block minimum, f16
 } block_q2_K;
 
 /** Q8_K activation block: int8 quants with one f32 scale.
@@ -378,10 +384,13 @@ enum {
     GGUF_VALUE_FLOAT64 = 12,
 };
 
+/** One row of the GGUF tensor-type table: how a type is named and how its
+ * bytes divide into blocks. Everything that sizes or strides a tensor goes
+ * through this rather than restating the arithmetic. */
 typedef struct {
-    const char *name;
-    uint32_t block_elems;
-    uint32_t block_bytes;
+    const char *name;      ///< type name as written in the file
+    uint32_t block_elems;  ///< elements per quantisation block
+    uint32_t block_bytes;  ///< bytes per block; the two give bytes-per-element
 } gguf_type_info;
 
 enum {
@@ -518,10 +527,13 @@ typedef struct {
     pulsar_tensor *tensors;    ///< parsed tensor directory, n_tensors entries
 } pulsar_model;
 
+/** A GGUF metadata array left UNPARSED: its type, length, and where its
+ * elements start. Reading an array means walking the file from `data_pos`, and
+ * most arrays are never read at all. */
 typedef struct {
-    uint32_t type;
-    uint64_t len;
-    uint64_t data_pos;
+    uint32_t type;      ///< GGUF type code of the elements
+    uint64_t len;       ///< element count
+    uint64_t data_pos;  ///< byte offset of the first element
 } pulsar_array_ref;
 
 /** Half-open byte range [off, end) of the model mapping that an accelerator
@@ -616,6 +628,14 @@ typedef struct {
     uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
 } pulsar_dspark_weights;
 
+/** Argument bundle for a thread-pool matvec worker.
+ *
+ * The pool dispatches a ::pulsar_parallel_fn over a row range, so everything a
+ * worker needs beyond (row0, row1) arrives through one void*. That is the only
+ * reason these structs exist -- they are call frames, not state.
+ *
+ * THIS one: f16 weights against an f32 activation row.
+ */
 typedef struct {
     float *out;                                         ///< destination row(s), f32
     const uint16_t *data;
@@ -648,6 +668,7 @@ typedef struct {
     uint64_t blocks;                                    ///< quantisation blocks spanning in_dim
 } quantize_q8_0_batch_ctx;
 
+/** f32 weights against an f32 activation row. */
 typedef struct {
     float *out;                                         ///< destination row(s), f32
     const float *data;                                  ///< weight rows, f32
@@ -655,6 +676,8 @@ typedef struct {
     uint64_t in_dim;                                    ///< input width (K)
 } matvec_f32_ctx;
 
+/** IQ2_XXS gate+up PAIR: two weight rows sharing one quantised
+ * activation, so the activation is loaded once for both. */
 typedef struct {
     float *out0;                                        ///< destination row for the first of the pair, f32
     float *out1;                                        ///< destination row for the second of the pair, f32
@@ -666,6 +689,8 @@ typedef struct {
     uint64_t row_bytes1;                                ///< row stride for base1, quantisation included
 } matvec_iq2_xxs_pair_ctx;
 
+/** IQ2_XXS routed experts, gate+up through SwiGLU: produces the `mid`
+ * product for up to PULSAR_MAX_EXPERT_USED experts in one call. */
 typedef struct {
     float *mid;                                         ///< destination: the SwiGLU product
     const uint8_t *gate_base[PULSAR_MAX_EXPERT_USED];   ///< weight bytes of each expert's gate projection
@@ -680,6 +705,7 @@ typedef struct {
     int n_expert;                                       ///< number of experts addressed by this call
 } matvec_iq2_xxs_mid_ctx;
 
+/** Q2_K weights against one quantised activation row. */
 typedef struct {
     float *out;                                         ///< destination row(s), f32
     const uint8_t *base;                                ///< weight bytes for this expert/row block, inside the model mapping
@@ -688,6 +714,8 @@ typedef struct {
     uint64_t row_bytes;                                 ///< stride between weight rows, quantisation included
 } matvec_q2_k_ctx;
 
+/** Q2_K down projection ACCUMULATING across experts: each expert's
+ * contribution is summed into the same output row. */
 typedef struct {
     float *out;                                         ///< destination row(s), f32
     const uint8_t *base[PULSAR_MAX_EXPERT_USED];        ///< weight bytes for this expert/row block, inside the model mapping
@@ -702,6 +730,8 @@ typedef struct {
     uint32_t slot;                                      ///< which of the token's chosen experts this is
 } pulsar_expert_pair;
 
+/** Batched IQ2_XXS gate+up: walks a (token, expert) pair list rather
+ * than a fixed per-token expert set, so one call covers a whole chunk. */
 typedef struct {
     float *mid;                                         ///< destination: the SwiGLU product
     const uint8_t *gate_base[PULSAR_MAX_EXPERT];        ///< weight bytes of each expert's gate projection
@@ -720,6 +750,8 @@ typedef struct {
     uint64_t xq_blocks;                                 ///< quantisation blocks per activation row
 } matvec_iq2_xxs_batch_mid_ctx;
 
+/** Batched Q2_K down projection, producing one output row per
+ * (token, expert) pair before pooling. */
 typedef struct {
     float *down_pair;                                   ///< destination: per-pair down-projection output
     const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
@@ -733,6 +765,8 @@ typedef struct {
     uint64_t midq_blocks;
 } matvec_q2_k_batch_down_ctx;
 
+/** Pools the batched down-projection's per-pair rows into per-token
+ * outputs, weighted by the router. */
 typedef struct {
     float *moe;                                         ///< MoE output accumulator this call adds into
     const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
@@ -1408,16 +1442,22 @@ typedef struct pulsar_vocab pulsar_vocab;
  * ID; user text goes through BPE.
  */
 
+/** One slot in a ::str_i32_table. */
 typedef struct {
-    pulsar_str key;
-    int value;
-    bool used;
+    pulsar_str key;  ///< the key, borrowed from the mapping; valid only while `used`
+    int value;       ///< the mapped value
+    bool used;       ///< the slot is occupied (open addressing needs this, not a NULL key)
 } str_i32_entry;
 
+/** Open-addressed string to int32 map, used for the vocabulary lookup.
+ *
+ * Keys are borrowed ::pulsar_str slices into the model mapping rather than
+ * copies, so building the table over a 100k-entry vocabulary costs no string
+ * allocation at all. */
 typedef struct {
-    str_i32_entry *entry;
-    uint64_t cap;
-    uint64_t used;
+    str_i32_entry *entry;  ///< the slot array
+    uint64_t cap;          ///< slots allocated; always a power of two
+    uint64_t used;         ///< slots occupied; the load factor numerator
 } str_i32_table;
 
 struct owned_str;  ///< forward decl: bpe_rank() param; full def appears later
@@ -1559,9 +1599,11 @@ struct pulsar_engine {
     bool has_dspark();
 };
 
+/** A string this struct OWNS, as opposed to ::pulsar_str which borrows.
+ * Not NUL-terminated either -- the length is authoritative. */
 typedef struct owned_str {
-    char *ptr;
-    uint64_t len;
+    char *ptr;     ///< the bytes, owned
+    uint64_t len;  ///< length in bytes
 } owned_str;
 
 /** One token under consideration by the sampler. Carries both the raw logit
@@ -3036,10 +3078,11 @@ void cpu_directional_steering_project_rows(
         float        scale);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);
+/** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
-    int *ids;
+    int *ids;      ///< candidate token ids
     float *probs;  ///< renormalized over the filtered nucleus
-    uint32_t n;
+    uint32_t n;    ///< candidates present in both arrays
 } pulsar_sample_dist;
 
 /** `scratch` is required (non-NULL) and must outlive nothing: it is pure
