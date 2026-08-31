@@ -25,21 +25,23 @@
 #include <time.h>
 #include <unistd.h>
 
+/** What the CLI was asked to do: generate, or run one of the diagnostic modes
+ * (logit dump, perplexity, KL divergence, importance matrix). */
 typedef struct {
-    const char *prompt;
-    const char *system;
-    int n_predict;
-    int ctx_size;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    bool dump_tokens;
-    const char *dump_logits_path;
-    const char *dump_logprobs_path;
-    int dump_logprobs_top_k;
-    const char *perplexity_file_path;
-    const char *kl_file_path;
+    const char *prompt;       ///< the prompt text, or NULL for stdin/interactive
+    const char *system;       ///< system prompt
+    int n_predict;            ///< generation cap in tokens
+    int ctx_size;             ///< session context size
+    float temperature;        ///< sampling temperature; 0 selects argmax
+    float top_p;              ///< nucleus cutoff
+    float min_p;              ///< relative probability floor
+    uint64_t seed;            ///< RNG seed
+    bool dump_tokens;         ///< print the tokenization and exit
+    const char *dump_logits_path;    ///< write raw logits here
+    const char *dump_logprobs_path;  ///< write per-position logprobs here
+    int dump_logprobs_top_k;         ///< alternatives to record per position
+    const char *perplexity_file_path;///< corpus to measure perplexity over
+    const char *kl_file_path;        ///< corpus for the KL-divergence walk
     /* Pre-tokenized ids for the KL walk. Cross-rig KL pairs position p on both
      * sides, so the two engines must score the SAME id sequence -- and they do
      * not agree on text: measured 2026-08-05, pulsar and vLLM produced
@@ -47,23 +49,27 @@ typedef struct {
      * pulsar_tokenize_rendered_chat folds <think>/DSML markers into single
      * special ids the way the served model does. Feeding ids bypasses both
      * tokenizers so the comparison is exact by construction. */
-    const char *kl_tokens_path;
-    const char *kl_ref_dump_path;
-    const char *kl_score_path;
-    int kl_stride;
-    int kl_prefix;
-    const char *imatrix_dataset_path;
-    const char *imatrix_output_path;
-    int imatrix_max_prompts;
-    int imatrix_max_tokens;
-    pulsar_think_mode think_mode;
+    const char *kl_tokens_path;      ///< pre-tokenized ids for the KL walk (see the note above)
+    const char *kl_ref_dump_path;    ///< reference distributions to compare against
+    const char *kl_score_path;       ///< write per-position KL scores here
+    int kl_stride;                   ///< score every Nth position
+    int kl_prefix;                   ///< positions to prefill before scoring begins
+    const char *imatrix_dataset_path;///< corpus for importance-matrix collection
+    const char *imatrix_output_path; ///< write the importance matrix here
+    int imatrix_max_prompts;         ///< cap on prompts consumed
+    int imatrix_max_tokens;          ///< cap on tokens consumed
+    pulsar_think_mode think_mode;    ///< reasoning mode for generation
 } cli_generation_options;
 
+/** The fully-resolved CLI configuration. */
 typedef struct {
-    pulsar_engine_options engine;
-    cli_generation_options gen;
+    pulsar_engine_options engine;  ///< model/runtime options
+    cli_generation_options gen;    ///< what to generate or measure
+    /** Prompt text the CLI allocated itself (read from a file or stdin), which
+     * `gen.prompt` then points into. Held separately because gen.prompt may
+     * instead point at an argv string the CLI does not own. */
     char *prompt_owned;
-    bool inspect;
+    bool inspect;                  ///< print model/tensor information and exit
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -133,11 +139,15 @@ static double cli_now_sec(void) {
 
 static char *read_prompt_file(const char *path, bool fatal);
 
+/** Userdata for the CLI's prefill progress line. */
 typedef struct {
+    /** Engine position where this prefill began. Progress is reported as
+     * `current - base_tokens`, subtracting any reused prefix so the percentage
+     * measures new work. */
     int base_tokens;
-    int input_tokens;
-    bool use_color;
-    bool finished;
+    int input_tokens;  ///< tokens this prefill will process; the denominator
+    bool use_color;    ///< redraw in place with ANSI, instead of one line per update
+    bool finished;     ///< the 100% line has been printed; suppresses a duplicate
 } cli_prefill_progress;
 
 static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
@@ -185,16 +195,22 @@ static bool is_rendered_chat_prompt(const char *prompt) {
     return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
 }
 
+/** Streams generated tokens to a FILE, optionally styling reasoning blocks.
+ *
+ * The CLI's much smaller cousin of the agent's renderer: it still needs the
+ * hold-back buffer, because a `<think>` tag can arrive split across token
+ * boundaries and must not be printed as literal text.
+ */
 typedef struct {
-    pulsar_engine *engine;
-    FILE *fp;
-    bool format_thinking;
-    bool in_think;
-    bool color_open;
-    bool use_color;
-    bool last_output_newline;
-    char pending[16];
-    size_t pending_len;
+    pulsar_engine *engine;      ///< for detokenising
+    FILE *fp;                   ///< output sink
+    bool format_thinking;       ///< style reasoning blocks distinctly
+    bool in_think;              ///< currently inside a reasoning block
+    bool color_open;            ///< an SGR sequence is open and must be closed
+    bool use_color;             ///< the sink accepts ANSI colour
+    bool last_output_newline;   ///< last byte written was '\n'
+    char pending[16];           ///< bytes withheld while a tag may be forming
+    size_t pending_len;         ///< bytes held in `pending`
 } token_printer;
 
 static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
@@ -1128,12 +1144,16 @@ static void history_file_path(char *buf, size_t len) {
     snprintf(buf, len, "%s/.ds4_history", home);
 }
 
+/** State of an interactive REPL conversation. */
 typedef struct {
-    pulsar_session *session;
-    pulsar_tokens transcript;
-    int ctx_size;
+    pulsar_session *session;    ///< KV session backing the transcript
+    pulsar_tokens transcript;   ///< the conversation so far, as tokens
+    int ctx_size;               ///< context positions available
+    /** Tokens of think-mode prefix currently sitting in the transcript. Tracked
+     * so a mode change can remove exactly the old prefix instead of rebuilding
+     * the whole transcript. */
     int effort_prefix_tokens;
-    pulsar_think_mode effort_prefix_mode; /* mode whose prefix is in the transcript */
+    pulsar_think_mode effort_prefix_mode;  ///< mode whose prefix is in the transcript
 } repl_chat;
 
 static void tokens_insert(pulsar_tokens *dst, int pos, const pulsar_tokens *src) {
