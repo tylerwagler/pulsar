@@ -122,95 +122,152 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
  * used to render sampled assistant text and DSML tool calls as they arrive.
  */
 
+/** What to generate and how to sample it: the agent's half of the engine
+ * configuration (::pulsar_engine_options carries the model's half). */
 typedef struct {
-    const char *prompt;
-    const char *system;
-    const char *trace_path;
-    int n_predict;
-    int ctx_size;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    pulsar_think_mode think_mode;
+    const char *prompt;             ///< initial user prompt, or NULL to start interactive
+    const char *system;             ///< system prompt prepended to the transcript
+    const char *trace_path;         ///< file to write a generation trace to; NULL = no trace
+    int n_predict;                  ///< generation cap in tokens per assistant turn
+    int ctx_size;                   ///< session context size in tokens
+    float temperature;              ///< sampling temperature; 0 selects argmax
+    float top_p;                    ///< nucleus-sampling mass cutoff
+    float min_p;                    ///< floor on candidate probability, relative to the top token
+    uint64_t seed;                  ///< RNG seed for reproducible sampling
+    pulsar_think_mode think_mode;   ///< whether the model may emit a reasoning block, and if so how it is shown
 } agent_generation_options;
 
+/** The fully-resolved agent configuration, assembled once from CLI flags. */
 typedef struct {
-    pulsar_engine_options engine;
-    agent_generation_options gen;
-    const char *chdir_path;
-    bool non_interactive;
+    pulsar_engine_options engine;   ///< model/runtime options handed to the engine
+    agent_generation_options gen;   ///< prompt + sampling options for each turn
+    const char *chdir_path;         ///< directory to run tools from; NULL = inherit the caller's cwd
+    bool non_interactive;           ///< one-shot: run the prompt to completion and exit, no TUI
 } agent_config;
 
+/** Lifecycle state of the agent's single worker thread. Drives what the TUI
+ * shows in the status line, so every long-running phase gets its own value
+ * rather than being lumped into a generic "busy". */
 typedef enum {
-    AGENT_WORKER_IDLE,
-    AGENT_WORKER_PREFILL,
-    AGENT_WORKER_GENERATING,
-    AGENT_WORKER_COMPACTING,
-    AGENT_WORKER_SAVING,
-    AGENT_WORKER_ERROR,
-    AGENT_WORKER_STOPPED,
+    AGENT_WORKER_IDLE,       ///< nothing in flight; waiting for a prompt
+    AGENT_WORKER_PREFILL,    ///< evaluating prompt tokens (prefill_done/prefill_total apply)
+    AGENT_WORKER_GENERATING, ///< decoding the assistant turn
+    AGENT_WORKER_COMPACTING, ///< transcript exceeded the context; summarising it down
+    AGENT_WORKER_SAVING,     ///< writing session state to the KV store
+    AGENT_WORKER_ERROR,      ///< a turn failed; agent_status::error holds the message
+    AGENT_WORKER_STOPPED,    ///< thread has exited; no further work will run
 } agent_worker_state;
 
+/** Worker progress published for the UI thread to render.
+ *
+ * Written by the worker, read by the renderer, so it is a snapshot rather than
+ * a live view: every field is self-consistent only within one publication. */
 typedef struct {
-    agent_worker_state state;
-    int prefill_done;
-    int prefill_total;
+    agent_worker_state state;  ///< which phase the worker is in
+    int prefill_done;          ///< prompt tokens evaluated so far this prefill
+    int prefill_total;         ///< prompt tokens this prefill will evaluate in total
+    /** Identifies WHICH prefill run the counters above belong to. A plain
+     * monotonic counter (::agent_next_prefill_label); the renderer compares it
+     * against the label it last drew to tell "this prefill advanced" from "a
+     * new prefill started and the counters reset", which are indistinguishable
+     * from prefill_done alone. */
     unsigned prefill_label;
-    double prefill_tps;
-    int generated;
-    double gen_tps;
+    double prefill_tps;        ///< prefill throughput, tokens/s
+    int generated;             ///< tokens emitted so far this assistant turn
+    double gen_tps;            ///< decode throughput, tokens/s
+    /** Sampling is currently forced to argmax. Set while the stream is inside
+     * (or may be entering) a DSML tool-call marker, where sampling noise would
+     * corrupt a structured token sequence. Scoped to one assistant round, so a
+     * malformed reply, EOS, or Ctrl+C cannot leave sampling stuck greedy. */
     bool greedy_sampling;
-    int ctx_used;
-    int ctx_size;
-    char error[256];
+    int ctx_used;              ///< context positions occupied by the transcript
+    int ctx_size;              ///< total context positions available
+    char error[256];           ///< message for AGENT_WORKER_ERROR; empty otherwise
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
 
+/** The agent's whole mutable world: engine handle, transcript, worker-thread
+ * plumbing, and the UI-visible status.
+ *
+ * TWO THREADS touch this: the worker (which runs the engine) and the UI thread
+ * (which renders and reads keys). Everything from `mu` down is shared state
+ * guarded by that mutex; the engine handle and transcript are the worker's
+ * alone. `cond` carries both directions of the handshake, so a wait on it must
+ * always re-check its predicate.
+ */
 typedef struct {
-    pulsar_engine *engine;
-    agent_config *cfg;
-    pulsar_session *session;
-    pulsar_tokens transcript;
-    char *cache_dir;
-    char *sysprompt_path;
-    char session_sha[41];
-    char *session_title;
-    uint64_t session_created_at;
+    pulsar_engine *engine;      ///< the loaded model; worker thread only
+    agent_config *cfg;          ///< resolved configuration, immutable after startup
+    pulsar_session *session;    ///< KV session backing the transcript
+    pulsar_tokens transcript;   ///< the conversation as tokens; source of truth for context use
+
+    char *cache_dir;            ///< directory holding persisted sessions
+    char *sysprompt_path;       ///< file the system prompt was loaded from, if any
+    char session_sha[41];       ///< session identity: 40 hex chars + NUL
+    char *session_title;        ///< human-readable session name for the picker
+    uint64_t session_created_at;///< unix seconds when the session was first created
+    /** A pre-rename session file to unlink once the new one is safely written.
+     * Deferred rather than deleted eagerly so a crash mid-save cannot leave the
+     * session with no file at all. */
     char *legacy_session_path_to_delete;
-    bool user_activity;
-    bool session_dirty;
-    pthread_t thread;
-    pthread_mutex_t mu;
-    pthread_cond_t cond;
-    int wake_fd[2];
-    FILE *trace;
-    bool wake_pending;
-    bool stop;
-    bool interrupt;
-    bool initialized;
-    bool save_requested;
-    bool compact_requested;
+    bool user_activity;         ///< the user has typed something this session (gates autosave)
+    bool session_dirty;         ///< transcript has changed since the last save
+
+    pthread_t thread;           ///< the worker thread
+    pthread_mutex_t mu;         ///< guards every field below, plus `status`
+    pthread_cond_t cond;        ///< worker/UI handshake; always re-check the predicate
+    int wake_fd[2];             ///< self-pipe so the UI's poll() wakes on worker events
+    FILE *trace;                ///< generation trace stream, or NULL
+    bool wake_pending;          ///< a wake byte is already in the pipe (coalesces writes)
+    bool stop;                  ///< shutdown requested; every wait loop must exit
+    bool interrupt;             ///< Ctrl+C: abandon the current turn, keep the session
+    bool initialized;           ///< engine + session are up and the worker may accept work
+    bool save_requested;        ///< UI asked for a session save at the next safe point
+    bool compact_requested;     ///< UI asked for a transcript compaction
+
+    /** Engine position where the current prefill began. Progress is reported as
+     * `current - progress_base`, which subtracts the REUSED cached prefix so the
+     * bar measures new work rather than replayed positions. */
     int progress_base;
-    double progress_started_at;
+    double progress_started_at; ///< wall-clock at prefill start, for the tokens/s rate
+    /** Transcript length when the system prompt was last (re)stated. A reminder
+     * is re-appended once the transcript has grown
+     * ::AGENT_SYSTEM_PROMPT_REMINDER_TOKENS beyond it, so a long session cannot
+     * drift away from its instructions. <= 0 means "never seen". */
     int last_system_prompt_reminder_at;
-    char *cmd_text;
-    agent_status status;
-    char *out;
-    size_t out_len;
-    size_t out_cap;
+    char *cmd_text;             ///< slash-command text handed from UI to worker
+
+    agent_status status;        ///< published progress snapshot the UI renders
+
+    char *out;                  ///< assistant output accumulated this turn
+    size_t out_len;             ///< bytes used in `out`
+    size_t out_cap;             ///< bytes allocated for `out`
+
+    /** Queued-user-message drain handshake.
+     *
+     * When a turn ends in a tool call, queued user messages must NOT preempt
+     * the tool. The worker sets `_pending` and waits; the UI thread answers by
+     * filling `_text` and setting `_answered`. The drain therefore happens only
+     * after the tool result is appended, so the next model input carries both
+     * the tool observation and the user's correction. */
     bool queued_user_drain_pending;
-    bool queued_user_drain_answered;
-    char *queued_user_drain_text;
-    bool datetime_context_injected;
-    char more_path[PATH_MAX];
-    int more_next_line;
-    bool more_bare;
-    bool more_valid;
-    agent_bash_job *bash_jobs;
-    int next_bash_job_id;
-    bool raw_mode_needs_restore;
+    bool queued_user_drain_answered;  ///< UI has filled `_text`; releases the worker's wait
+    char *queued_user_drain_text;     ///< drained queue contents, owned by the worker once taken
+
+    bool datetime_context_injected;   ///< the current date/time was already stated in this transcript
+
+    /** Continuation cursor for a truncated file read, so the `more` tool can
+     * resume where the last read stopped. `more_valid` is false when there is
+     * nothing to continue. */
+    char more_path[PATH_MAX];   ///< file the last read came from
+    int more_next_line;         ///< 1-based line the next chunk starts at
+    bool more_bare;             ///< reproduce raw bytes (no line-number prefixes), as the original read did
+    bool more_valid;            ///< the cursor above refers to a real truncated read
+
+    agent_bash_job *bash_jobs;  ///< linked list of background shell jobs
+    int next_bash_job_id;       ///< id handed to the next background job
+    bool raw_mode_needs_restore;///< the terminal is in raw mode and must be restored on exit
 } agent_worker;
 
 typedef struct agent_tail_capture {
@@ -219,186 +276,301 @@ typedef struct agent_tail_capture {
     size_t start;
     size_t len;
     size_t total;
-    void append(const char *s, size_t n);   /* was agent_tail_capture_append */
-    char *take(size_t *len);                 /* was agent_tail_capture_take */
+    void append(const char *s, size_t n);  ///< was agent_tail_capture_append
+    char *take(size_t *len);  ///< was agent_tail_capture_take
 } agent_tail_capture;
 
+/** Which run of held-back marker bytes the renderer is currently accumulating.
+ *
+ * `*` and `` ` `` cannot be emitted the moment they arrive: their meaning
+ * depends on how many follow (one star is emphasis, two are bold; three
+ * backticks open a fence). The renderer buffers the run and decides once it
+ * ends. */
 typedef enum {
-    AGENT_MD_PENDING_NONE,
-    AGENT_MD_PENDING_STAR,
-    AGENT_MD_PENDING_BACKTICK,
+    AGENT_MD_PENDING_NONE,      ///< not inside a marker run
+    AGENT_MD_PENDING_STAR,      ///< accumulating '*' (emphasis / bold)
+    AGENT_MD_PENDING_BACKTICK,  ///< accumulating '`' (inline code / fence)
 } agent_markdown_pending;
 
 typedef struct agent_syntax agent_syntax;
 
+/** Turns a stream of decoded tokens into styled terminal output.
+ *
+ * Everything here is INCREMENTAL: bytes are printed as they arrive, so the
+ * renderer must carry the state a one-pass formatter would keep on the stack.
+ * Three separate hold-back buffers exist because three different things can
+ * arrive split across token boundaries -- a UTF-8 sequence, a markdown marker
+ * run, and a possible DSML marker.
+ *
+ * Code blocks are shown raw as they stream, then the terminal row is repainted
+ * with highlighting at end-of-line -- but only when the repaint is safe (simple
+ * one-row ASCII lines). Long, tabbed, escaped or UTF-8 lines are left as
+ * streamed and only advance the highlighter's state.
+ */
 typedef struct {
-    pulsar_engine *engine;
-    agent_worker *worker;
-    bool format_thinking;
-    bool format_markdown;
-    bool in_think;
-    bool color_open;
-    bool use_color;
-    bool last_output_newline;
-    bool wrote_visible_output;
-    bool md_bold;
-    bool md_italic;
-    bool md_inline_code;
-    bool md_code_block;
-    bool md_fence_info;
-    bool md_code_line_start;
-    bool md_code_in_ml_comment;
+    pulsar_engine *engine;      ///< engine handle, for detokenising
+    agent_worker *worker;       ///< owning worker (output routing, capture)
+    bool format_thinking;       ///< style reasoning blocks distinctly
+    bool format_markdown;       ///< apply markdown styling at all
+    bool in_think;              ///< currently inside a reasoning block
+    bool color_open;            ///< an SGR colour sequence is open and must be closed
+    bool use_color;             ///< the sink accepts ANSI colour
+    bool last_output_newline;   ///< last byte written was '\n' (drives spacing decisions)
+    bool wrote_visible_output;  ///< anything non-empty has been shown this turn
+
+    bool md_bold;               ///< inside **bold**
+    bool md_italic;             ///< inside *italic*
+    bool md_inline_code;        ///< inside `inline code`
+    bool md_code_block;         ///< inside a fenced code block
+    bool md_fence_info;         ///< reading the info string on a fence opening line
+    bool md_code_line_start;    ///< at the start of a code-block line (prefix not yet written)
+    bool md_code_in_ml_comment; ///< highlighter state: inside a multi-line comment
+    /** Highlighter is running as a DRY RUN: compute state, emit nothing.
+     * Used to ask "would repainting this line change it?" without touching the
+     * terminal. See renderer_code_scan_line(). */
     bool md_syntax_silent;
+    /** Set by the highlighter whenever it produced a non-default colour. After
+     * a silent pass this is the answer to "is a repaint worth it?"; the caller
+     * saves and restores it around the dry run. */
     bool md_syntax_has_highlight;
-    agent_markdown_pending md_pending;
-    size_t md_pending_len;
-    const agent_syntax *md_syntax;
-    char md_fence_lang[32];
-    size_t md_fence_lang_len;
-    const char *md_code_line_prefix;
-    const char *md_code_line_prefix_color;
-    bool md_code_highlight_upto;
-    char *md_code_line;
-    size_t md_code_line_len;
-    size_t md_code_line_cap;
-    char pending[16];
-    size_t pending_len;
-    char utf8_pending[4];
-    size_t utf8_pending_len;
-    size_t utf8_pending_need;
-    agent_tail_capture *capture;
+
+    agent_markdown_pending md_pending;  ///< which marker run is being held back
+    size_t md_pending_len;              ///< how many bytes of that run are held
+
+    const agent_syntax *md_syntax;      ///< highlighter for the fence's language; NULL = none
+    char md_fence_lang[32];             ///< language tag from the fence info string
+    size_t md_fence_lang_len;           ///< bytes used in md_fence_lang
+    const char *md_code_line_prefix;        ///< gutter string printed before each code line
+    const char *md_code_line_prefix_color;  ///< SGR sequence for that gutter
+    bool md_code_highlight_upto;        ///< repaint the streamed row once the line completes
+
+    char *md_code_line;                 ///< the current code line, buffered for repaint
+    size_t md_code_line_len;            ///< bytes used
+    size_t md_code_line_cap;            ///< bytes allocated
+
+    char pending[16];                   ///< bytes withheld pending a formatting decision
+    size_t pending_len;                 ///< bytes used in `pending`
+    char utf8_pending[4];               ///< partial UTF-8 sequence split across tokens
+    size_t utf8_pending_len;            ///< continuation bytes received so far
+    size_t utf8_pending_need;           ///< total bytes this sequence requires
+
+    agent_tail_capture *capture;        ///< optional tail recorder, for /copy and transcripts
 } agent_token_renderer;
 
+/** One parsed tool-call parameter. */
 typedef struct {
-    char *name;
-    char *value;
+    char *name;      ///< parameter name, owned
+    char *value;     ///< parameter value as text, owned
+    /** The value was written as a quoted string. Kept because it is the only
+     * way to tell the string "true" from the boolean true once both are held
+     * as text. */
     bool is_string;
 } agent_tool_arg;
 
+/** One tool invocation: a name plus its parsed parameters. */
 typedef struct {
-    char *name;
-    agent_tool_arg *args;
-    int argc;
-    int argcap;
+    char *name;             ///< tool name, owned
+    agent_tool_arg *args;   ///< parameter array
+    int argc;               ///< parameters present
+    int argcap;             ///< parameters allocated
 } agent_tool_call;
 
+/** Growable list of tool calls parsed from one assistant turn. */
 typedef struct {
-    agent_tool_call *v;
-    int len;
-    int cap;
+    agent_tool_call *v;  ///< the calls
+    int len;             ///< calls present
+    int cap;             ///< calls allocated
 } agent_tool_calls;
 
+/** Where the DSML tool-call parser is in the stream.
+ *
+ * DSML arrives interleaved with ordinary prose, so the parser is a scanner
+ * that spends most of its life in SEARCH and only commits once a real opening
+ * marker appears. DONE and ERROR are terminal for the round. */
 typedef enum {
-    AGENT_DSML_SEARCH,
-    AGENT_DSML_STRUCTURAL,
-    AGENT_DSML_PARAM_VALUE,
-    AGENT_DSML_DONE,
-    AGENT_DSML_ERROR,
+    AGENT_DSML_SEARCH,      ///< scanning prose for an opening marker
+    AGENT_DSML_STRUCTURAL,  ///< inside markup: tool names, parameter names, delimiters
+    AGENT_DSML_PARAM_VALUE, ///< inside a parameter value, where prose is taken verbatim
+    AGENT_DSML_DONE,        ///< a complete tool-call block was parsed
+    AGENT_DSML_ERROR,       ///< malformed input; `error` holds the reason
 } agent_dsml_state;
 
+/** Incremental parser for DSML tool-call blocks.
+ *
+ * Fed one token at a time during generation, so every marker can arrive split
+ * across token boundaries. The raw text is retained and parsed by OFFSET
+ * (`parse_pos`) rather than consumed, which is what lets a partially-received
+ * marker be re-examined once more bytes land.
+ */
 typedef struct {
-    agent_dsml_state state;
-    char search_tail[64];
-    size_t search_len;
-    char *raw;
-    size_t raw_len;
-    size_t raw_cap;
-    size_t parse_pos;
-    agent_tool_call current;
-    char *param_name;
-    bool param_is_string;
-    size_t param_value_start;
+    agent_dsml_state state;   ///< current scanner state
+    char search_tail[64];     ///< trailing bytes kept in SEARCH so a marker split across tokens still matches
+    size_t search_len;        ///< bytes held in search_tail
+
+    char *raw;                ///< the full raw text seen this round
+    size_t raw_len;           ///< bytes used
+    size_t raw_cap;           ///< bytes allocated
+    size_t parse_pos;         ///< how far into `raw` the parser has consumed
+
+    agent_tool_call current;  ///< the call being assembled
+    char *param_name;         ///< name of the parameter currently being read
+    bool param_is_string;     ///< that parameter was opened as a quoted string
+    size_t param_value_start; ///< offset in `raw` where the value began
+
+    /** A PARTIAL closing marker is buffered at the tail of the current
+     * parameter value -- the bytes so far match `</|DSML|` but the marker is
+     * not complete. The sampler reads this to force argmax, so a structured
+     * marker cannot be corrupted by sampling noise halfway through. */
     bool param_close_prefix;
-    agent_tool_calls calls;
-    char error[160];
+
+    agent_tool_calls calls;   ///< completed calls for this round
+    char error[160];          ///< reason for AGENT_DSML_ERROR
 } agent_dsml_parser;
 
+/** How a tool parameter should be DISPLAYED while it streams.
+ *
+ * Classification is presentational, not semantic: it decides whether the
+ * visualiser shows the value inline, as a path, as a diff half, or as a
+ * syntax-highlighted block. */
 typedef enum {
-    AGENT_TOOL_PARAM_NORMAL,
-    AGENT_TOOL_PARAM_PATH,
-    AGENT_TOOL_PARAM_OFFSET,
-    AGENT_TOOL_PARAM_CONTENT,
-    AGENT_TOOL_PARAM_DIFF_OLD,
-    AGENT_TOOL_PARAM_DIFF_NEW,
-    AGENT_TOOL_PARAM_BASH_COMMAND,
+    AGENT_TOOL_PARAM_NORMAL,       ///< plain scalar shown inline
+    AGENT_TOOL_PARAM_PATH,         ///< a file path (rendered as a header)
+    AGENT_TOOL_PARAM_OFFSET,       ///< a numeric offset/count, folded into the header line
+    AGENT_TOOL_PARAM_CONTENT,      ///< a file body, shown as a highlighted block
+    AGENT_TOOL_PARAM_DIFF_OLD,     ///< the `old` half of an edit, shown as removals
+    AGENT_TOOL_PARAM_DIFF_NEW,     ///< the `new` half of an edit, shown as additions
+    AGENT_TOOL_PARAM_BASH_COMMAND, ///< a shell command, shown as a command line
 } agent_tool_param_kind;
 
+/** Renders a tool call as it streams, before it has been fully parsed.
+ *
+ * The point is that the user sees the tool and its arguments taking shape
+ * live, rather than a spinner followed by a wall of text. That means every
+ * decision has to be made on a partial value, so the visualiser keeps its own
+ * line-position state and cannot rely on the parser having finished.
+ */
 typedef struct {
-    bool active;
-    bool tool_announced;
-    bool param_active;
-    bool at_line_start;
-    bool last_output_newline;
-    agent_tool_param_kind param_kind;
-    char tool_name[64];
-    char param_name[64];
-    char param_end_tail[64];
-    size_t param_end_len;
-    bool read_style;
-    bool read_prefix_rendered;
-    bool read_line_rendered;
-    char read_path[512];
-    char read_start[32];
-    char read_max[32];
-    char read_whole[8];
-    char tool_path[512];
-    bool code_param_active;
+    bool active;                        ///< a tool call is currently being visualised
+    bool tool_announced;                ///< the tool's name header has been printed
+    bool param_active;                  ///< inside a parameter value
+    bool at_line_start;                 ///< the cursor is at column 0 of a fresh row
+    bool last_output_newline;           ///< last byte emitted was '\n'
+
+    agent_tool_param_kind param_kind;   ///< how the current parameter is displayed
+    char tool_name[64];                 ///< name of the tool being visualised
+    char param_name[64];                ///< name of the parameter being visualised
+    char param_end_tail[64];            ///< trailing bytes held back while a closing marker may be forming
+    size_t param_end_len;               ///< bytes held in param_end_tail
+
+    bool read_style;                    ///< render with the compact `read` layout
+    bool read_prefix_rendered;          ///< the read header (path + range) has been printed
+    bool read_line_rendered;            ///< at least one read body line has been printed
+    char read_path[512];                ///< `read` path argument, accumulated
+    char read_start[32];                ///< `read` start-line argument, accumulated
+    char read_max[32];                  ///< `read` max-lines argument, accumulated
+    char read_whole[8];                 ///< `read` whole-file flag, accumulated
+
+    char tool_path[512];                ///< path argument for non-read tools
+    bool code_param_active;             ///< the current parameter is being syntax-highlighted
 } agent_tool_visualizer;
 
+/** Rolling tail matcher for a DSML opening marker.
+ *
+ * A marker can be split across any number of tokens, so the detector keeps the
+ * last few bytes and re-tests on each arrival. Two instances exist per stream
+ * -- one for prose, one for the thinking region -- because a marker inside
+ * reasoning means something different from one in the reply. */
 typedef struct {
-    char tail[32];
-    size_t len;
+    char tail[32];  ///< most recent bytes, enough to hold any partial marker
+    size_t len;     ///< bytes currently held
 } agent_dsml_marker_detector;
 
+/** The top of the output pipeline: routes each token to the text renderer, the
+ * DSML parser, and the tool visualiser, and decides which of them owns the
+ * stream at any moment.
+ *
+ * This is where "is this prose or is this a tool call?" is answered, on
+ * incomplete input, without ever un-printing anything already shown.
+ */
 typedef struct {
-    agent_token_renderer *renderer;
-    agent_dsml_parser *parser;
-    agent_tool_visualizer viz;
-    bool in_think;
-    bool dsml_active;
+    agent_token_renderer *renderer;  ///< styled text output
+    agent_dsml_parser *parser;       ///< tool-call parser fed the same bytes
+    agent_tool_visualizer viz;       ///< live tool-call display
+
+    bool in_think;                   ///< inside the reasoning region
+    bool dsml_active;                ///< a DSML block is being parsed
+    /** The active DSML block was opened INSIDE the thinking region. It is
+     * still displayed, but it is not a real tool call -- the model is
+     * reasoning about a call, not making one. */
     bool dsml_ignored;
+    /** Re-rendering saved transcript text rather than streaming live. Suppresses
+     * cursor-control escapes, which must never leak into a pipe or a file. */
     bool replay;
-    char pending[16];
-    size_t pending_len;
+
+    char pending[16];                ///< bytes withheld pending a routing decision
+    size_t pending_len;              ///< bytes held in `pending`
+    /** Bytes of a POSSIBLE opening marker held back from display. A lone '<'
+     * is too common in prose to act on; past the second byte the held prefix is
+     * specifically DSML-shaped, and sampling is forced to argmax. */
     char dsml_start_tail[64];
-    size_t dsml_start_len;
-    agent_dsml_marker_detector plain_dsml;
-    agent_dsml_marker_detector think_dsml;
-    bool dsml_in_think;
-    bool dsml_in_think_reported;
-    bool post_think_gap;
-    bool tool_preflight_error;
-    char tool_preflight_error_msg[256];
+    size_t dsml_start_len;           ///< bytes held in dsml_start_tail
+
+    agent_dsml_marker_detector plain_dsml;  ///< marker detector for the reply region
+    agent_dsml_marker_detector think_dsml;  ///< marker detector for the reasoning region
+    bool dsml_in_think;              ///< the detector that fired was the thinking one
+    bool dsml_in_think_reported;     ///< that fact has already been surfaced (report once, not per token)
+    bool post_think_gap;             ///< a blank line is owed after the reasoning block closes
+
+    bool tool_preflight_error;       ///< the call was rejected before execution
+    char tool_preflight_error_msg[256];  ///< why it was rejected, for display
 } agent_stream_renderer;
 
+/** Stops the model retyping a long `edit old=...` block it has already
+ * uniquely anchored.
+ *
+ * While the old-text parameter streams, the next sampled token is inspected
+ * BEFORE eval: once the emitted prefix already identifies exactly one place in
+ * the file, and the model is still writing old text rather than closing the
+ * parameter, the caller evaluates a complete "[upto]" marker line instead.
+ * Saves the tokens, and the retyping is where drift creeps in. */
 typedef struct {
-    bool active;
-    bool done;
+    bool active;  ///< the emitted prefix is already a unique anchor
+    bool done;    ///< the marker has been substituted for this parameter
 } agent_edit_upto_forcer;
 
+/** Growable byte buffer for the interactive input line. */
 typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
+    char *ptr;   ///< buffer, owned
+    size_t len;  ///< bytes used
+    size_t cap;  ///< bytes allocated
 } agent_input_buf;
 
+/** A language definition for the code-block syntax highlighter.
+ *
+ * Deliberately small: enough to colour keywords, strings, and comments in a
+ * streamed terminal row, not a parser. */
 struct agent_syntax {
-    const char *name;
-    const char *aliases;
-    const char **keywords;
-    const char *singleline_comments[3];
-    const char *multiline_start;
-    const char *multiline_end;
-    unsigned flags;
-    const char *line_comment(const char *p) const;                                    /* was agent_syntax_line_comment */
-    bool match_keyword(const char *p, const char *line_end, size_t *out_len, int *out_hl) const; /* was agent_syntax_match_keyword */
+    const char *name;        ///< canonical language name, matched against the fence info string
+    const char *aliases;     ///< other accepted fence tags for this language
+    const char **keywords;   ///< NULL-terminated keyword list
+    const char *singleline_comments[3];  ///< up to three line-comment introducers
+    const char *multiline_start;  ///< block-comment opener, or NULL
+    const char *multiline_end;    ///< block-comment closer, or NULL
+    unsigned flags;          ///< per-language lexer options (AGENT_SYNTAX_* bits)
+    const char *line_comment(const char *p) const;  ///< was agent_syntax_line_comment
+    bool match_keyword(const char *p, const char *line_end, size_t *out_len, int *out_hl) const;  ///< was agent_syntax_match_keyword
 };
 
+/** Growable output buffer with a size ceiling.
+ *
+ * `truncated` is the important field: tool output is capped so a runaway
+ * command cannot blow out the context, and the flag is what lets the caller
+ * say so rather than silently returning a short result. */
 typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-    bool truncated;
+    char *ptr;       ///< buffer, owned
+    size_t len;      ///< bytes used
+    size_t cap;      ///< bytes allocated
+    bool truncated;  ///< the cap was hit; content is incomplete
 } agent_buf;
 
 typedef struct {
@@ -469,7 +641,7 @@ struct agent_bash_job {
     pid_t pid;
     int pipe_fd;
     int tmp_fd;
-    /* Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
+    /** Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
      * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
      * never lengthen.  Sized for exactly that, not PATH_MAX. */
     char path[32];
@@ -486,9 +658,9 @@ struct agent_bash_job {
     bool running;
     bool timed_out;
     struct agent_bash_job *next;
-    agent_worker *worker;  /* back-pointer for terminal state restoration */
+    agent_worker *worker;  ///< back-pointer for terminal state restoration
 
-    /* ---- methods (C++ port): 1:1 mirror of the agent_bash_* verb family;
+    /** ---- methods (C++ port): 1:1 mirror of the agent_bash_* verb family;
      * bodies keep the auto *job = this alias, logic verbatim. ---- */
     int display_lines() const;
     void note_output(const char *s, size_t n);
@@ -587,8 +759,20 @@ void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
                                        const char *extra);
 void agent_worker_note_system_prompt_seen(agent_worker *w);
 void agent_worker_maybe_append_datetime_context(agent_worker *w);
+/** The full tool/system reminder is separate from DSML syntax errors: it is a
+ * pressure-controlled refresh of the same trusted prompt shape used at startup.
+ * The built-in prompt is tokenized as rendered chat so DSML markers stay native
+ * control tokens; arbitrary -sys text remains ordinary text.
+ */
 void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w);
+/** Wake the UI thread after changing worker-visible state.  The byte in
+ * wake_fd is level-triggered with wake_pending so bursts of sampled tokens do
+ * not flood the pipe.
+ */
 void agent_wake_locked(agent_worker *w);
+/** Queue rendered output for the UI thread.  The worker never writes directly
+ * to the terminal, which keeps linenoise redraws serialized in one place.
+ */
 void agent_publish(agent_worker *w, const char *s, size_t n);
 void agent_publishf(agent_worker *w, const char *fmt, ...);
 void agent_set_status(agent_worker *w, agent_worker_state state);
@@ -628,9 +812,20 @@ void renderer_write_char(agent_token_renderer *r, char c);
 void renderer_finish(agent_token_renderer *r);
 void renderer_color(agent_token_renderer *r, const char *seq);
 void renderer_plain(agent_token_renderer *r, const char *s, size_t n);
+/** This is the single streaming display state machine for assistant output.  It
+ * hides raw DSML as soon as the tool_calls marker is complete, lets the DSML
+ * parser continue building executable calls, and paints semantic tool output
+ * from parser state changes.  The sampled transcript remains unchanged: only
+ * the terminal projection is rewritten.
+ */
 void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish);
 void worker_progress_cb(void *ud, const char *event, int current, int total);
 bool worker_should_interrupt(agent_worker *w);
+/** Ctrl+C is a latched request consumed by the worker.  Once an interrupted
+ * operation has reached a stable append-only boundary and is about to publish
+ * IDLE, the request must be acknowledged; otherwise the editor can observe an
+ * idle worker with a stale interrupt still pending.
+ */
 void worker_clear_interrupt(agent_worker *w);
 bool agent_err_is_interrupted(const char *err);
 bool worker_cancel_session_cb(void *ud);
@@ -666,12 +861,23 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);
 void agent_publishf_system_status(agent_worker *w, const char *fmt, ...);
+/** When a model turn finishes with a tool call, queued user messages should not
+ * preempt that tool.  The worker asks the UI thread for the queue contents only
+ * after the tool result is appended, so the next model input can contain both
+ * the tool observation and the user's pending correction.
+ */
 char *worker_request_queued_user_drain(agent_worker *w);
 bool worker_take_queued_user_drain_request(agent_worker *w);
 void worker_answer_queued_user_drain(agent_worker *w, char *text);
 int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
+/** Start a new session at the system/tool prompt.  A fixed sysprompt.kv
+ * checkpoint avoids paying this prefill cost repeatedly, but only when the
+ * rendered prompt text still matches the file.  The same fixed path is shared
+ * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
+ * model families rebuilds this cache instead of restoring incompatible KV.
+ */
 bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len);
 bool agent_worker_has_user_session(agent_worker *w);
 bool agent_worker_needs_save(agent_worker *w);
@@ -685,6 +891,9 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
 bool agent_worker_show_history(agent_worker *w, int user_turns,
                                       char *err, size_t err_len);
+/** Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
+ * ignored because it is an implementation cache, not a user session.
+ */
 void agent_worker_list_sessions(agent_worker *w);
 void agent_switch_completion_callback(const char *buf,
                                              linenoiseCompletions *lc);
@@ -702,6 +911,9 @@ int agent_parse_timeout(const char *s);
 int agent_parse_int_default(const char *s, int def, int min, int max);
 bool agent_parse_bool_default(const char *s, bool def);
 void agent_line_spans_free(agent_line_spans *spans);
+/** Split a text buffer into line spans.  content_end excludes CR/LF so callers
+ * can print or compare line content without newline spelling differences.
+ */
 void agent_split_lines(const char *data, size_t len, agent_line_spans *spans);
 int agent_read_file_bytes(const char *path, char **data, size_t *len,
                                  char *err, size_t errlen);
@@ -732,7 +944,13 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
                                                   size_t next_len);
 bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
+/** Old/new editing is intentionally conservative: exact old text must be unique.
+ * For large replacements, old may contain one [upto] marker: the head must be
+ * unique, and the tail must be unique after that head before the whole span is
+ * replaced.
+ */
 char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
+/** Implement the search tool using either literal matching or POSIX regex. */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
 void agent_bash_jobs_free(agent_worker *w);
 agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
@@ -744,7 +962,15 @@ char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool stop, bool remove_if_done);
 int agent_tool_job_id(const agent_tool_call *call);
 pid_t agent_tool_pid(const agent_tool_call *call);
+/** Execute all tool calls from one DSML block, preserving per-call labels in the
+ * combined result so the model can associate observations with calls.
+ */
 char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls);
+/** If compaction happens while a bash process is still alive, inject a small
+ * tool-role reminder into the rebuilt transcript.  Otherwise the summary could
+ * preserve the user's task but lose the fact that an external process still
+ * needs status/wait/stop handling.
+ */
 char *agent_bash_jobs_compaction_observation(agent_worker *w);
 bool agent_worker_compact(agent_worker *w, const char *reason,
                                  char *err, size_t err_len);
@@ -767,13 +993,27 @@ int worker_force_generated_text(agent_worker *w,
                                        size_t err_len);
 void worker_request_save(agent_worker *w);
 void worker_request_compact(agent_worker *w);
+/** Worker thread entry point.  The UI thread submits plain user text; this
+ * thread owns all DS4 session mutation, tool execution, and compaction.
+ */
 void *worker_main(void *arg);
 int set_nonblock(int fd, bool on, int *old_flags);
+/** Check and clear the raw_mode_needs_restore flag under the worker mutex.
+ * Returns true if the UI thread should verify/reapply linenoise raw mode.
+ */
 bool worker_check_raw_mode_restore(agent_worker *w);
 void drain_wake_fd(int fd);
+/** Submit one user turn if the worker is idle.  Busy submissions are rejected so
+ * the UI can keep the typed text editable instead of silently queueing it.
+ */
 bool worker_submit(agent_worker *w, const char *text);
+/** Request interruption at the next model/tool polling point. */
 void worker_interrupt(agent_worker *w);
+/** Stop the worker thread. */
 void worker_stop(agent_worker *w);
+/** The UI thread consumes output in batches.  Taking ownership of w->out under
+ * the mutex keeps terminal writes outside the lock while preserving order.
+ */
 void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_status *status);
 void worker_get_status(agent_worker *w, agent_status *status);
 bool worker_is_idle(agent_worker *w);
@@ -791,6 +1031,9 @@ char *agent_prompt_queue_take_all_echo(agent_prompt_queue *q);
 void agent_prompt_queue_free(agent_prompt_queue *q);
 void build_footer_text(const agent_status *st, const agent_prompt_queue *queue,
                               int cols, char *buf, size_t len);
+/** Drain stdin in nonblocking mode.  The outer event loop decides when queued
+ * bytes are fed to linenoiseEditFeed().
+ */
 void editor_read_stdin(agent_editor *ed);
 bool editor_take_queued_byte(agent_editor *ed, unsigned char byte);
 bool editor_take_bare_escape(agent_editor *ed);
@@ -798,7 +1041,12 @@ void editor_replace_input(agent_editor *ed, const char *text);
 void editor_restore_terminal_layout(agent_editor *ed);
 int editor_start(agent_editor *ed, const char *prompt,
                         const char *status, const char *initial);
+/** Stop the live editor and restore stdin flags. */
 void editor_stop(agent_editor *ed);
+/** Restore the live prompt after output.  The primary path draws it in the
+ * reserved bottom rows; the fallback path keeps the older one-row-below-output
+ * trick for terminals where scroll regions are unavailable.
+ */
 void editor_show(agent_editor *ed);
 void editor_set_prompt_status(agent_editor *ed, const char *prompt,
                                      const char *status);
@@ -813,12 +1061,26 @@ void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
                                         const char *prompt,
                                         const char *statusline);
+/** Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
+ * and model thread.  After this returns, all DS4 session mutation happens on
+ * the worker thread.
+ */
 int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg);
+/** Shut down the worker and release owned resources, including any live bash
+ * process groups.
+ */
 void agent_worker_free(agent_worker *w);
 bool agent_prompt_yes_no_ex(const char *prompt,
                                    const agent_yes_no_options *opts,
                                    bool *timed_out);
+/** Ask before discarding a dirty user session.  Fresh sessions that contain only
+ * the system prompt are deliberately ignored.
+ */
 bool agent_maybe_save_before_leaving_session(agent_worker *w);
+/** Process exit is different from /new or /switch: once the terminal is already
+ * restored, declining the save can terminate immediately and let the OS reclaim
+ * model/GPU resources instead of waiting for orderly teardown.
+ */
 agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w);
 
 /* ---- shared inline helpers ---- */
