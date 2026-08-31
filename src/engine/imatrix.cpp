@@ -1261,10 +1261,20 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
 
 
 
-/* When a server request shares a large prefix with the live checkpoint, extend
- * the KV cache with batched prefill instead of single-token decode.  On an M3
- * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
- * as a conservative crossover.  The env knob remains useful for retuning. */
+/* When a request shares a large prefix with the live checkpoint, extend the KV
+ * cache with batched prefill instead of the single-token encoder.
+ *
+ * ⚠ THE DEFAULT OF 4 IS UNMEASURED ON THIS HARDWARE.  It was chosen as a
+ * conservative crossover from an M3 Max measurement ("prefill is faster from
+ * 2-token suffixes upward") -- Metal-era, a backend this fork no longer has.
+ * Nobody has re-measured the crossover on GB10.
+ *
+ * It is load-bearing beyond perf: suffixes SHORTER than this are the last
+ * non-CLI caller of gpu_graph_encode_token_raw_swa, so this constant is what
+ * keeps the 872-line single-token encoder alive in the session path (L131).
+ * Lowering it to 1 would retire that caller -- but the two encoders are
+ * different code, so short-suffix sync would change bytes and must be graded
+ * against the reference, not just diffed.  See the L131 row. */
 uint32_t gpu_graph_resume_prefill_min_tokens(void) {
     const char *env = getenv("PULSAR_CUDA_RESUME_PREFILL_MIN");
     if (env && env[0]) {

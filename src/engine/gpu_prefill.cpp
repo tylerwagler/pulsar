@@ -2,8 +2,25 @@
 
 
 
-/* Encode a full single-token decode step on GPU.  This is the generation
- * hot path: update caches, run all layers, then produce logits. */
+/* Encode a full single-token decode step on GPU.
+ *
+ * ⚠ NO LONGER THE GENERATION HOT PATH.  It used to be; the comment said so
+ * until 2026-08-31.  Since L118 the server decodes through the batched quanta
+ * at every n >= 1, and since L130 pulsar_session::eval is a 1-row batch on its
+ * own bank, so nothing that serves a request reaches this encoder.
+ *
+ * TWO callers keep it alive, neither of them served decode (L131):
+ *   1. pulsar_session_sync's short-suffix checkpoint extension, for suffixes
+ *      below gpu_graph_resume_prefill_min_tokens() -- see the warning on that
+ *      function; its default is an unmeasured M3-Max-era constant.
+ *   2. generate_gpu_graph_raw_swa, the session-free one-shot greedy loop behind
+ *      pulsar_engine_generate_argmax (public API; the `pulsar` CLI's
+ *      non-interactive path).
+ *
+ * Retiring it means routing both through the batched encoder. That is the
+ * remaining half of ONE LANE, and it is a byte-changing move: this encoder and
+ * gpu_graph_encode_layer_batch are 872 lines of separately-maintained code that
+ * happen to agree, not one implementation. */
 static bool gpu_graph_encode_token_raw_swa(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
