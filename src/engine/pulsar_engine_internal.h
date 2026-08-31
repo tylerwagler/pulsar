@@ -1428,24 +1428,29 @@ struct pulsar_vocab {
     void dump_tokens(const token_vec *tokens) const;
 };
 
+/** The loaded model and everything derived from it.
+ *
+ * One engine owns the weights; MANY sessions share it. Everything here is
+ * immutable after open() except the cumulative metrics counters -- which is
+ * what makes concurrent sessions safe against a single engine. */
 struct pulsar_engine {
-    pulsar_model model;
-    pulsar_model dspark_model;
-    pulsar_vocab vocab;
-    pulsar_weights weights;
-    pulsar_dspark_weights dspark_weights;
-    pulsar_backend backend;
-    int dspark_draft_tokens;
-    char *directional_steering_file;
-    float *directional_steering_dirs;
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
-    uint32_t prefill_chunk;
-    bool gpu_ready;
-    bool dspark_ready;
-    bool dspark_external;   /* drafter opened from its own GGUF (own map/fd) */
-    pulsar_model overlay_model;
-    bool overlay_ready;
+    pulsar_model model;         ///< the target model's mapping and directory
+    pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
+    pulsar_vocab vocab;         ///< tokenizer tables and special ids
+    pulsar_weights weights;     ///< resolved target tensors, per layer
+    pulsar_dspark_weights dspark_weights;  ///< resolved drafter tensors
+    pulsar_backend backend;     ///< CPU or CUDA
+    int dspark_draft_tokens;    ///< configured draft depth k
+    char *directional_steering_file;   ///< steering-vector file path, or NULL
+    float *directional_steering_dirs;  ///< loaded steering directions, or NULL
+    float directional_steering_attn_scale;  ///< steering strength on the attention stream
+    float directional_steering_ffn_scale;   ///< steering strength on the FFN stream
+    uint32_t prefill_chunk;     ///< tokens per prefill chunk
+    bool gpu_ready;             ///< CUDA backend initialised and weights resident
+    bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
+    bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
+    pulsar_model overlay_model; ///< donor GGUF for --expert-overlay, if any
+    bool overlay_ready;         ///< overlay tensors resolved and swapped in
     /** Prometheus /metrics spec-decode counters (server /metrics endpoint via
      * pulsar_engine_spec_metrics). Incremented from the DSpark fused verify loop;
      * monotonic. GPU decode submission is single-threaded, so plain uint64 is
@@ -1467,15 +1472,32 @@ struct pulsar_engine {
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
     void destroy();                        /* was pulsar_engine_close */
     void summary();
+    /** Tokenizer table length. NOT the logits width -- see logits_width(). */
     int vocab_size();
+    /** Logits row width (the shape profile's n_vocab). Size every logits buffer
+     * with THIS. @return the row stride, in floats. */
     int logits_width() const;
+    /** Model name from the GGUF metadata. */
     const char *model_name();
+    /** Copy out the engine-cumulative speculative-decode counters. */
     void spec_metrics(pulsar_spec_metrics *out);
+    /** Stable id for this model, for cache keys and metrics labels. */
     int model_id();
+    /** True when the artifact is a REAP-pruned expert set rather than the full
+     * model -- the two have different expert counts and cannot share caches. */
     bool is_pruned() const;
+    /** TRUE per-session GPU cost at `ctx_size`: persistent KV + prefill working
+     * set + drafter state. The number admission control must use.
+     * @return bytes, or 0 if no session could be created. */
     uint64_t session_cost_bytes(int ctx_size);
+    /** session_cost_bytes() priced for an explicit bank-pool size, so the server
+     * can evaluate the (banks, ctx) fit table before committing to one.
+     * @param n_banks >= 1; 1 is the classic single-session cost. */
     uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
+    /** Demand-paged (not reserved) bytes ONE bank actually materialises at
+     * `ctx_size` -- the overcommit figure, below the reserved capacity. */
     uint64_t demand_paged_bytes_per_bank(int ctx_size);
+    /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
     int generate_argmax(const pulsar_tokens *prompt,
                         int n_predict, int ctx_size,
@@ -1486,8 +1508,12 @@ struct pulsar_engine {
                         void *progress_ud);
     int collect_imatrix(const char *dataset_path, const char *output_path,
                         int ctx_size, int max_prompts, int max_tokens);
+    /** Debug: print ids with decoded text to stderr. */
     void dump_tokens(const pulsar_tokens *tokens);
+    /** Bits per weight of the ROUTED expert tensors (the artifact's dominant
+     * quantisation), for reporting and tier selection. */
     int routed_quant_bits();
+    /** True when a usable drafter is loaded and speculation can run. */
     bool has_dspark();
 };
 
