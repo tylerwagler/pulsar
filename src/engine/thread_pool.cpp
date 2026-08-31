@@ -16,6 +16,23 @@ thread_local int g_parallel_depth = 0;
 
 } // namespace
 
+/** Persistent row-parallel worker pool for the CPU kernels.
+ *
+ * A GENERATION COUNTER, not a work queue. There is exactly one job in flight:
+ * `parallel_for_min_rows` publishes (fn, ctx, n_rows), bumps `generation_`,
+ * and broadcasts; every worker wakes, sees a generation it has not run,
+ * computes its OWN row range from its thread id, and reports completion by
+ * incrementing `done_`. No per-job allocation, no queue, and the row split is
+ * derived identically on every thread rather than handed out.
+ *
+ * That last property is load-bearing: the bit-exact gate compares CPU kernel
+ * output against the pre-port binary, and floating-point summation is not
+ * associative, so the row partition has to stay exactly what the C
+ * implementation used.
+ *
+ * The calling thread takes the first row range itself rather than idling, so
+ * an N-thread pool runs N ranges with N-1 workers.
+ */
 class ThreadPool {
 public:
     /* Lazy init: created on first parallel_for. A shutdown() returns the
@@ -59,6 +76,8 @@ public:
         }
     }
 
+    /** Stop the workers, destroy the sync primitives, and zero the pool back to
+     * its never-initialized state so a later parallel_for re-creates it. */
     void shutdown() {
         if (!initialized_) return;
 
@@ -117,8 +136,12 @@ public:
     }
 
 private:
+    /** pthread entry point: unpacks the thread id from `arg` and enters
+     * worker_main() on the singleton pool. */
     static void *worker_trampoline(void *arg);
 
+    /** Worker loop: wait for a new generation, compute this thread's row range
+     * from `tid`, run the kernel, count in as done. Exits on shutdown. */
     void worker_main(uint32_t tid) {
         uint32_t seen_generation = 0;
 
@@ -158,19 +181,22 @@ private:
         }
     }
 
-    pthread_t threads_[PULSAR_MAX_THREADS] = {};
-    pthread_mutex_t mutex_ = {};
-    pthread_cond_t work_cond_ = {};
-    pthread_cond_t done_cond_ = {};
-    uint32_t n_threads_ = 0;
-    uint32_t n_workers_ = 0;
+    pthread_t threads_[PULSAR_MAX_THREADS] = {};  ///< worker threads; [0] is unused (the caller is thread 0)
+    pthread_mutex_t mutex_ = {};        ///< guards every field below
+    pthread_cond_t work_cond_ = {};     ///< broadcast to release workers into a new generation
+    pthread_cond_t done_cond_ = {};     ///< signalled when the last worker finishes
+    uint32_t n_threads_ = 0;            ///< total row ranges, including the caller's
+    uint32_t n_workers_ = 0;            ///< spawned threads: n_threads_ - 1
+    /** Bumped once per dispatch. A worker compares it against the generation it
+     * last ran, which is what lets one broadcast release everyone exactly once
+     * with no queue and no per-worker flag. */
     uint32_t generation_ = 0;
-    uint32_t done_ = 0;
-    bool initialized_ = false;
-    bool shutdown_ = false;
-    pulsar_parallel_fn fn_ = nullptr;
-    void *ctx_ = nullptr;
-    uint64_t n_rows_ = 0;
+    uint32_t done_ = 0;                 ///< workers finished this generation
+    bool initialized_ = false;          ///< the pool is up (lazy init on first use)
+    bool shutdown_ = false;             ///< workers should exit their loop
+    pulsar_parallel_fn fn_ = nullptr;   ///< the kernel for the in-flight job
+    void *ctx_ = nullptr;               ///< its argument bundle
+    uint64_t n_rows_ = 0;               ///< rows to divide across the ranges
 };
 
 static ThreadPool g_pool;

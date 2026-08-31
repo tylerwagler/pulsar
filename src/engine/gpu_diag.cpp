@@ -302,23 +302,26 @@ bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
  * the server's estimate-vs-actual reconciliation (>10% drift warning) is the
  * enforcement that they stay in sync. */
 typedef struct {
-    uint32_t raw_cap;
-    uint32_t raw_window;
-    uint32_t ctx_size;
-    uint32_t prefill_cap;
-    uint32_t comp_cap;
+    uint32_t raw_cap;      ///< positions the raw KV ring holds
+    uint32_t raw_window;   ///< positions retained per layer in that ring
+    uint32_t ctx_size;     ///< session context size the graph is sized for
+    uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry
+    uint32_t comp_cap;     ///< worst-case compressed rows per layer (the ratio-4 bound)
     uint32_t attn_comp_stage_cap;          /* only meaningful under PULSAR_ATTN_PACK */
+    /** Per-layer compressed capacity, sized from each layer's ACTUAL ratio --
+     * a ratio-128 layer needs far fewer rows than the ratio-4 bound in
+     * comp_cap, and sizing every layer at that bound wastes most of it. */
     uint32_t layer_comp_cap[PULSAR_MAX_LAYER];
-    uint64_t hc_dim;
-    uint64_t mix_hc;
-    uint64_t q_rank;
-    uint64_t q_dim;
-    uint64_t low_dim;
-    uint64_t shared_dim;
-    uint64_t routed_mid_dim;
-    uint64_t vocab_dim;
-    uint64_t comp_width_max;
-    uint64_t indexer_q_dim;
+    uint64_t hc_dim;          ///< HC carrier width
+    uint64_t mix_hc;          ///< width of the HC mix projection output
+    uint64_t q_rank;          ///< low-rank query latent width
+    uint64_t q_dim;           ///< query width in head space
+    uint64_t low_dim;         ///< width of the attention output's low-rank 'a' projection
+    uint64_t shared_dim;      ///< shared-expert intermediate width
+    uint64_t routed_mid_dim;  ///< routed-expert intermediate width
+    uint64_t vocab_dim;       ///< output head width
+    uint64_t comp_width_max;  ///< widest compressed row across layers; sizes the shared staging
+    uint64_t indexer_q_dim;   ///< indexer query width
 } gpu_graph_dims;
 
 static void gpu_graph_compute_dims(
