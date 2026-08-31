@@ -581,7 +581,7 @@ bool gpu_graph_encode_decode_layer(
             fprintf(stderr, "pulsar: GPU graph compressor expects paired F16 compressor projections\n");
             ok = false;
         }
-        if (ok && emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
+        if (ok && emit && gpu_graph_n_comp(g, il) >= g->layer_comp_cap[il]) {
             fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
@@ -601,7 +601,7 @@ bool gpu_graph_encode_decode_layer(
                                                 PULSAR_N_EMBD, comp_width,
                                                 g->attn_norm, 1);
         }
-        const uint32_t comp_row = g->layer_n_comp[il];
+        const uint32_t comp_row = gpu_graph_n_comp(g, il);
         /* L124: the store below overwrites state slot pos %% 128 on ratio-128
          * layers -- save its current contents first so a ghost rewind can
          * restore the aliased committed value byte-exactly. */
@@ -650,7 +650,7 @@ bool gpu_graph_encode_decode_layer(
             }
             pulsar_gpu_tensor_free(comp_row_view);
         }
-        if (ok && emit) g->layer_n_comp[il]++;
+        if (ok && emit) gpu_graph_n_comp(g, il)++;
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * PULSAR_N_INDEXER_HEAD_DIM;
@@ -665,7 +665,7 @@ bool gpu_graph_encode_decode_layer(
                 fprintf(stderr, "pulsar: GPU graph indexer compressor expects paired F16 projections\n");
                 ok = false;
             }
-            if (ok && emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
+            if (ok && emit && gpu_graph_n_index_comp(g, il) >= g->layer_comp_cap[il]) {
                 fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
@@ -679,7 +679,7 @@ bool gpu_graph_encode_decode_layer(
                                                     PULSAR_N_EMBD, index_width,
                                                     g->attn_norm, 1);
             }
-            const uint32_t index_row = g->layer_n_index_comp[il];
+            const uint32_t index_row = gpu_graph_n_index_comp(g, il);
             if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                             g->comp_sc_cur,
                                                             g->layer_index_state_kv[il],
@@ -724,7 +724,7 @@ bool gpu_graph_encode_decode_layer(
                 if (ok) ok = gpu_graph_emit_keep_restore(g, il,
                         g->banks.n_banks ? g->banks.cur_bank : 0u, index_row, 1, true);
             }
-            if (ok && emit) g->layer_n_index_comp[il]++;
+            if (ok && emit) gpu_graph_n_index_comp(g, il)++;
             /* L120 value-half: indexer projection row banked after its
              * update (comp_*_cur hold the indexer rows here). */
             if (ok)
@@ -733,8 +733,8 @@ bool gpu_graph_encode_decode_layer(
             const uint32_t decode_sparse_threshold =
                 gpu_graph_decode_indexer_sparse_threshold(g);
             if (ok &&
-                g->layer_n_comp[il] > decode_sparse_threshold &&
-                g->layer_n_index_comp[il] > PULSAR_N_INDEXER_TOP_K) {
+                gpu_graph_n_comp(g, il) > decode_sparse_threshold &&
+                gpu_graph_n_index_comp(g, il) > PULSAR_N_INDEXER_TOP_K) {
                 const uint64_t indexer_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
                     !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_attn_q_b) ||
@@ -783,7 +783,7 @@ bool gpu_graph_encode_decode_layer(
                                                                     il,
                                                                     pos,
                                                                     1,
-                                                                    g->layer_n_index_comp[il],
+                                                                    gpu_graph_n_index_comp(g, il),
                                                                     &decode_index_stage_t0);
                 }
                 if (ok) {
@@ -791,7 +791,7 @@ bool gpu_graph_encode_decode_layer(
                                                                 g->indexer_qp,
                                                                 g->indexer_weights,
                                                                 g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
+                                                                gpu_graph_n_index_comp(g, il),
                                                                 PULSAR_N_INDEXER_HEAD,
                                                                 PULSAR_N_INDEXER_HEAD_DIM,
                                                                 index_scale) != 0;
@@ -801,12 +801,12 @@ bool gpu_graph_encode_decode_layer(
                                                                     il,
                                                                     pos,
                                                                     1,
-                                                                    g->layer_n_index_comp[il],
+                                                                    gpu_graph_n_index_comp(g, il),
                                                                     &decode_index_stage_t0);
                 }
                 if (ok) ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
                                                            g->indexer_scores,
-                                                           g->layer_n_index_comp[il],
+                                                           gpu_graph_n_index_comp(g, il),
                                                            1,
                                                            PULSAR_N_INDEXER_TOP_K) != 0;
                 if (ok && decode_index_stage_profile) {
@@ -814,7 +814,7 @@ bool gpu_graph_encode_decode_layer(
                                                                     il,
                                                                     pos,
                                                                     1,
-                                                                    g->layer_n_index_comp[il],
+                                                                    gpu_graph_n_index_comp(g, il),
                                                                     &decode_index_stage_t0);
                 }
                 /* Decode used to materialize a dense compressed-row mask and
@@ -852,14 +852,14 @@ bool gpu_graph_encode_decode_layer(
                      * the score/top-k/attention implementation while preserving
                      * PULSAR_N_INDEXER_TOP_K.
                      */
-                    n_selected = PULSAR_N_INDEXER_TOP_K < g->layer_n_index_comp[il]
+                    n_selected = PULSAR_N_INDEXER_TOP_K < gpu_graph_n_index_comp(g, il)
                         ? PULSAR_N_INDEXER_TOP_K
-                        : g->layer_n_index_comp[il];
+                        : gpu_graph_n_index_comp(g, il);
                 }
             }
         }
 
-        n_comp = g->layer_n_comp[il];
+        n_comp = gpu_graph_n_comp(g, il);
         comp_cache = g->layer_attn_comp_cache[il];
     }
     PULSAR_CUDA_PROFILE_DECODE_STAGE("compressor_indexer");

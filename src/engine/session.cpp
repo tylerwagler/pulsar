@@ -1447,12 +1447,12 @@ void pulsar_session::rewind(int pos) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t want = (uint32_t)pos / ratio;
-        if (s->graph.layer_n_comp[il] > want) {
+        if (gpu_graph_n_comp(&s->graph, il) > want) {
             if (ratio == 4) any_ratio4_crossed = true;
-            s->graph.layer_n_comp[il] = want;
+            gpu_graph_n_comp(&s->graph, il) = want;
         }
-        if (ratio == 4 && s->graph.layer_n_index_comp[il] > want)
-            s->graph.layer_n_index_comp[il] = want;
+        if (ratio == 4 && gpu_graph_n_index_comp(&s->graph, il) > want)
+            gpu_graph_n_index_comp(&s->graph, il) = want;
         /* Only the bank this session's checkpoint describes: other banks hold
          * their own positions and a rewind here says nothing about them. */
         if (rw_bank < PULSAR_MSEQ_MAX) {

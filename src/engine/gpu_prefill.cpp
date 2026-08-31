@@ -1251,7 +1251,7 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
                  pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
         }
-        uint32_t n_comp = g->layer_n_comp[il];
+        uint32_t n_comp = gpu_graph_n_comp(g, il);
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
             if (ok && n_comp > g->layer_comp_cap[il]) {
@@ -1308,7 +1308,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
             }
             if (ok) {
-                g->layer_n_comp[il] = n_comp;
+                gpu_graph_n_comp(g, il) = n_comp;
                 if (!mseq && !g->spec_comp_save_n && ratio == 4)
                     ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                           comp_width, false);
@@ -1367,7 +1367,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 const bool banked = mseq_aligned_run;
                 const uint32_t bank = banked ? run_bank : 0u;
                 const uint32_t comp_before = banked ? g->ms_n_comp[bank][il]
-                                                    : g->layer_n_comp[il];
+                                                    : gpu_graph_n_comp(g, il);
                 const uint32_t comp_chunk = n_tokens / ratio;
                 if (comp_before + comp_chunk > g->layer_comp_cap[il]) {
                     fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
@@ -1436,7 +1436,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
                 if (ok) {
                     if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
-                    else        g->layer_n_comp[il]    = comp_before + comp_chunk;
+                    else        gpu_graph_n_comp(g, il)    = comp_before + comp_chunk;
                     if (!banked && !g->spec_comp_save_n && ratio == 4)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               comp_width, false);
@@ -1472,7 +1472,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                     const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
                     uint32_t *const n_comp_slot = mseq ? &g->ms_n_comp[bank][il]
-                                                       : &g->layer_n_comp[il];
+                                                       : &gpu_graph_n_comp(g, il);
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && *n_comp_slot >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
@@ -1571,7 +1571,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     pulsar_gpu_tensor_free(kv_view);
                 }
             }
-            n_comp = g->layer_n_comp[il];
+            n_comp = gpu_graph_n_comp(g, il);
         }
         PULSAR_CUDA_PROFILE_ATTN_STAGE("compressor");
 
@@ -1708,7 +1708,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      n_tokens);
                 }
                 if (ok) {
-                    g->layer_n_index_comp[il] = n_comp;
+                    gpu_graph_n_index_comp(g, il) = n_comp;
                     if (!mseq && !g->spec_comp_save_n)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               index_width, true);
@@ -1752,7 +1752,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t bank = banked ? run_bank
                                                  : (g->banks.n_banks ? g->banks.cur_bank : 0u);
                     const uint32_t index_before = banked ? g->ms_n_index_comp[bank][il]
-                                                         : g->layer_n_index_comp[il];
+                                                         : gpu_graph_n_index_comp(g, il);
                     const uint32_t index_chunk = n_tokens / ratio;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
                         fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
@@ -1819,7 +1819,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (ok) {
                         if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
-                        else        g->layer_n_index_comp[il]    = index_before + index_chunk;
+                        else        gpu_graph_n_index_comp(g, il)    = index_before + index_chunk;
                         if (!banked && !g->spec_comp_save_n)
                             ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                                   index_width, true);
@@ -1853,7 +1853,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                         const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
                         uint32_t *const n_index_slot = mseq ? &g->ms_n_index_comp[bank][il]
-                                                            : &g->layer_n_index_comp[il];
+                                                            : &gpu_graph_n_index_comp(g, il);
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && *n_index_slot >= g->layer_comp_cap[il]) {
                             fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
@@ -3020,8 +3020,8 @@ bool gpu_graph_dspark_compressor_rollforward(
                 if (!ok) return false;
             }
         }
-        g->layer_n_comp[il] = (pos0 + n_positions) / ratio;
-        if (ratio == 4) g->layer_n_index_comp[il] = (pos0 + n_positions) / ratio;
+        gpu_graph_n_comp(g, il) = (pos0 + n_positions) / ratio;
+        if (ratio == 4) gpu_graph_n_index_comp(g, il) = (pos0 + n_positions) / ratio;
     }
     /* L120 value-half: the span is committed across every layer now. */
     for (uint32_t t = 0; t < n_positions; t++)

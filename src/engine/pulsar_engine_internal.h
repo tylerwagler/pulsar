@@ -1239,6 +1239,35 @@ typedef struct {
     uint32_t batch_multiseq_rows;
 } pulsar_gpu_graph;
 
+/* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
+ *
+ * The frontier is currently stored twice: the scalars below and the per-bank
+ * ms_n_comp[bank][il]. Nothing enforces that they agree, and L133 was the bill
+ * for that -- L120's fix clamped the scalars while the served path validates
+ * the per-bank copy, so a production bug closed on 08-27 still reproduced on
+ * 08-30. plans/ONE-STATE-MODEL.md is the collapse.
+ *
+ * This step changes NO behaviour: the bodies still return the scalars. Its
+ * whole purpose is that stage 1b then flips the representation in ONE place
+ * rather than at 71 call sites, on state that decides which KV rows attention
+ * reads.
+ *
+ * References, not get/set pairs: call sites use ++, =, and comparisons, and
+ * rewriting each of those by hand is exactly the kind of mechanical edit that
+ * introduces the bug this refactor exists to prevent. */
+static inline uint32_t &gpu_graph_n_comp(pulsar_gpu_graph *g, uint32_t il) {
+    return g->layer_n_comp[il];
+}
+static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t il) {
+    return g->layer_n_comp[il];
+}
+static inline uint32_t &gpu_graph_n_index_comp(pulsar_gpu_graph *g, uint32_t il) {
+    return g->layer_n_index_comp[il];
+}
+static inline uint32_t gpu_graph_n_index_comp(const pulsar_gpu_graph *g, uint32_t il) {
+    return g->layer_n_index_comp[il];
+}
+
 /* =========================================================================
  * Imatrix Collection.
  * =========================================================================

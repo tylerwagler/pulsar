@@ -156,11 +156,11 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
         bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        bytes += (uint64_t)g->layer_n_comp[il] * comp_row;
+        bytes += (uint64_t)gpu_graph_n_comp(g, il) * comp_row;
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
-            bytes += (uint64_t)g->layer_n_index_comp[il] * PULSAR_ENGINE_IDXFP4_ROWBYTES;
+            bytes += (uint64_t)gpu_graph_n_index_comp(g, il) * PULSAR_ENGINE_IDXFP4_ROWBYTES;
             bytes += layer_index_state_bytes(ratio);
             bytes += layer_index_state_bytes(ratio);
         }
@@ -489,10 +489,10 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     }
     if (payload_write_bytes(fp, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_write_u32(fp, g->layer_n_comp[il], err, errlen) != 0) return 1;
+        if (payload_write_u32(fp, gpu_graph_n_comp(g, il), err, errlen) != 0) return 1;
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
+        if (payload_write_u32(fp, gpu_graph_n_index_comp(g, il), err, errlen) != 0) return 1;
     }
 
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
@@ -513,7 +513,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
             rc = payload_write_attn_comp_pack(fp, g, il,
-                                              g->layer_n_comp[il],
+                                              gpu_graph_n_comp(g, il),
                                               buf,
                                               PULSAR_SESSION_IO_CHUNK,
                                               err,
@@ -536,7 +536,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
                                                     errlen);
         if (rc == 0 && ratio == 4) {
             rc = payload_write_index_comp(fp, g, il,
-                                          g->layer_n_index_comp[il],
+                                          gpu_graph_n_index_comp(g, il),
                                           buf,
                                           PULSAR_SESSION_IO_CHUNK,
                                           err,
@@ -772,8 +772,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_n_comp[il] = n_comp[il];
-        g->layer_n_index_comp[il] = n_index_comp[il];
+        gpu_graph_n_comp(g, il) = n_comp[il];
+        gpu_graph_n_index_comp(g, il) = n_index_comp[il];
     }
     /* L124: a loaded payload replaces the conversation; the undo ring's
      * entries describe the previous one's stores.  Zero it (the L120

@@ -19,7 +19,7 @@
  *   mseq_dirty = true  stops pulsar_session_eval.  checkpoint_valid does NOT
  *       cover it: pulsar_session_eval never reads checkpoint_valid — it calls
  *       gpu_graph_eval_token_raw_swa(..., s->checkpoint.len, ...)
- *       unconditionally, which reads g->layer_n_comp[il] (the cross-bank
+ *       unconditionally, which reads gpu_graph_n_comp(g, il) (the cross-bank
  *       superset) as its emit row, writes the compressor row there, and
  *       attends over every row below it — a previous tenant's bytes when the
  *       current bank's true frontier is lower.  Wrong logits, silently.  So

@@ -1373,8 +1373,8 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, ui
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = g->layer_n_comp[il];
-        g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
+        g->ms_n_comp[bank][il] = gpu_graph_n_comp(g, il);
+        g->ms_n_index_comp[bank][il] = gpu_graph_n_index_comp(g, il);
     }
     /* L120 value-half: the projection-ring span rides the same hand-off. */
     g->ms_proj_ring_lo[bank] = g->proj_ring_lo;
@@ -1444,8 +1444,8 @@ void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_n_comp[il] = g->ms_n_comp[bank][il];
-        g->layer_n_index_comp[il] = g->ms_n_index_comp[bank][il];
+        gpu_graph_n_comp(g, il) = g->ms_n_comp[bank][il];
+        gpu_graph_n_index_comp(g, il) = g->ms_n_index_comp[bank][il];
     }
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
@@ -1484,11 +1484,11 @@ uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t ban
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint32_t ncomp = (bank == cur) ? g->layer_n_comp[il]
+        const uint32_t ncomp = (bank == cur) ? gpu_graph_n_comp(g, il)
                                              : g->ms_n_comp[bank][il];
         bytes += (uint64_t)ncomp * attn_row;
         if (ratio == 4) {
-            const uint32_t nidx = (bank == cur) ? g->layer_n_index_comp[il]
+            const uint32_t nidx = (bank == cur) ? gpu_graph_n_index_comp(g, il)
                                                 : g->ms_n_index_comp[bank][il];
             bytes += (uint64_t)nidx * idx_row;
         }
@@ -1608,9 +1608,9 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint32_t have_comp = use_scalars ? g->layer_n_comp[il]
+            const uint32_t have_comp = use_scalars ? gpu_graph_n_comp(g, il)
                                                    : g->ms_n_comp[b][il];
-            const uint32_t have_index = use_scalars ? g->layer_n_index_comp[il]
+            const uint32_t have_index = use_scalars ? gpu_graph_n_index_comp(g, il)
                                                     : g->ms_n_index_comp[b][il];
             if (have_comp != p / ratio ||
                 (ratio == 4 && have_index != p / ratio)) {
@@ -1688,8 +1688,8 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        g->layer_n_comp[il] = sup[il];
-        if (ratio == 4) g->layer_n_index_comp[il] = sup[il];
+        gpu_graph_n_comp(g, il) = sup[il];
+        if (ratio == 4) gpu_graph_n_index_comp(g, il) = sup[il];
     }
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
@@ -1746,18 +1746,18 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
                 ok = false;
             }
         }
-        if (ok && g->layer_n_comp[il] != sup) {
+        if (ok && gpu_graph_n_comp(g, il) != sup) {
             fprintf(stderr,
                     "pulsar: multiseq step_end FAILED: layer %u superset %u "
                     "mutated mid-step (want %u)\n",
-                    il, g->layer_n_comp[il], sup);
+                    il, gpu_graph_n_comp(g, il), sup);
             ok = false;
         }
-        if (ok && ratio == 4 && g->layer_n_index_comp[il] != sup) {
+        if (ok && ratio == 4 && gpu_graph_n_index_comp(g, il) != sup) {
             fprintf(stderr,
                     "pulsar: multiseq step_end FAILED: layer %u indexer superset "
                     "%u mutated mid-step (want %u)\n",
-                    il, g->layer_n_index_comp[il], sup);
+                    il, gpu_graph_n_index_comp(g, il), sup);
             ok = false;
         }
     }
