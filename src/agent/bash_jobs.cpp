@@ -331,8 +331,13 @@ char *agent_bash_job::read_tail_lines(int max_lines) const {
 
 
 
-/* Build the tool result for a bash job.  mark_observed advances the per-job
- * cursor so the next status reports only fresh output. */
+/* Build the tool result for a bash job.  The first observation shows the HEAD
+ * of the output, every later one the TAIL; mark_observed is what flips it.
+ *
+ * NOTE: this used to say the cursor makes the next status report "only fresh
+ * output".  It does not -- observed_bytes/observed_display_lines are assigned
+ * here and read nowhere, so a repeated bash_status re-shows the same tail
+ * rather than the newly added bytes. */
 char *agent_bash_job::observation(bool mark_observed) {
     auto *job = this;
     job->poll();

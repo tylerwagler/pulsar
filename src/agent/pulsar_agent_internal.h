@@ -573,110 +573,166 @@ typedef struct {
     bool truncated;  ///< the cap was hit; content is incomplete
 } agent_buf;
 
+/** Session identity and title read back from a KV-store file. */
 typedef struct {
-    bool has_title_trailer;
-    bool legacy_identity;
-    char *title;
-    uint64_t created_at;
-    char sha[41];
+    bool has_title_trailer;  ///< the file carries a title trailer record
+    bool legacy_identity;    ///< identity came from the pre-trailer scheme (older file)
+    char *title;             ///< session title, owned; NULL when absent
+    uint64_t created_at;     ///< unix seconds the session was created
+    char sha[41];            ///< session identity: 40 hex chars + NUL
 } agent_kv_session_meta;
 
+/** Role marker attached to a line of rendered history, so the transcript view
+ * can style turns without re-parsing the token stream. */
 typedef enum {
-    AGENT_HISTORY_MARK_NONE,
-    AGENT_HISTORY_MARK_USER,
-    AGENT_HISTORY_MARK_ASSISTANT,
-    AGENT_HISTORY_MARK_EOS,
+    AGENT_HISTORY_MARK_NONE,      ///< continuation of the previous line
+    AGENT_HISTORY_MARK_USER,      ///< first line of a user turn
+    AGENT_HISTORY_MARK_ASSISTANT, ///< first line of an assistant turn
+    AGENT_HISTORY_MARK_EOS,       ///< end-of-turn boundary
 } agent_history_mark;
 
+/** Rendered history as borrowed line pointers plus a parallel marker array.
+ * Pointers are NOT owned -- they alias the rendered buffer. */
 typedef struct {
-    const char **v;
-    agent_history_mark *mark;
-    int len;
-    int cap;
+    const char **v;           ///< line starts, borrowed
+    agent_history_mark *mark; ///< role marker per line, same length as `v`
+    int len;                  ///< lines present
+    int cap;                  ///< lines allocated
 } agent_history_ptrs;
 
+/** One row in the session picker: the store entry plus its resolved title. */
 typedef struct {
-    pulsar_kvstore_entry entry;
-    char *title;
+    pulsar_kvstore_entry entry;  ///< the KV-store record
+    char *title;                 ///< display title, owned
 } agent_session_list_item;
 
+/** A session remembered for tab-completion, ordered by recency. */
 typedef struct {
-    char sha[41];
-    uint64_t last_used;
+    char sha[41];        ///< session identity: 40 hex chars + NUL
+    uint64_t last_used;  ///< unix seconds of last use; the sort key
 } agent_completion_session;
 
+/** Growable list of completion candidates. */
 typedef struct {
-    agent_completion_session *v;
-    int len;
-    int cap;
+    agent_completion_session *v;  ///< the sessions
+    int len;                      ///< entries present
+    int cap;                      ///< entries allocated
 } agent_completion_sessions;
 
+/** One line located inside a file buffer, as byte offsets.
+ *
+ * `content_end` and `end` differ by the line terminator, which is what lets a
+ * read reproduce bytes EXACTLY (CRLF included, final newline or not) while
+ * still being able to hand out the line without its ending. */
 typedef struct {
-    size_t start;
-    size_t content_end;
-    size_t end;
+    size_t start;        ///< offset of the first byte of the line
+    size_t content_end;  ///< offset just past the last content byte, terminator excluded
+    size_t end;          ///< offset just past the line terminator
 } agent_line_span;
 
+/** The line index of one file buffer. */
 typedef struct {
-    agent_line_span *v;
-    int len;
-    int cap;
+    agent_line_span *v;  ///< spans, in file order
+    int len;             ///< lines present
+    int cap;             ///< lines allocated
 } agent_line_spans;
 
+/** State for one grep-style search across files. */
 typedef struct {
-    const char *query;
-    const char *glob;
-    regex_t regex;
-    bool use_regex;
+    const char *query;    ///< the pattern, as given
+    const char *glob;     ///< restrict to paths matching this glob; NULL = all
+    regex_t regex;        ///< compiled pattern; valid only while `regex_ready`
+    bool use_regex;       ///< treat `query` as a regex rather than a literal
+    /** `regex` has been compiled and must be regfree()d. Separate from
+     * `use_regex` because a regex search whose pattern failed to compile has
+     * the first flag set and the second clear. */
     bool regex_ready;
-    bool case_sensitive;
-    int context;
-    int max_results;
-    int results;
-    agent_buf out;
+    bool case_sensitive;  ///< match case exactly
+    int context;          ///< lines of context to show around each hit
+    int max_results;      ///< stop after this many hits
+    int results;          ///< hits emitted so far
+    agent_buf out;        ///< accumulated result text
 } agent_search_ctx;
 
+/** One background shell command.
+ *
+ * Output goes to a temp FILE rather than being held in memory, so a command
+ * that prints megabytes cannot blow out the agent's heap or its context: the
+ * model is shown a bounded head or tail and the path to the rest.
+ */
 struct agent_bash_job {
-    int id;
-    pid_t pid;
-    int pipe_fd;
-    int tmp_fd;
+    int id;         ///< job id shown to the model (bash_status job=N)
+    pid_t pid;      ///< child process id
+    int pipe_fd;    ///< read end of the child's output pipe; -1 once closed
+    int tmp_fd;     ///< write end into the temp output file; -1 once closed
     /** Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
      * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
      * never lengthen.  Sized for exactly that, not PATH_MAX. */
     char path[32];
-    char *cmd;
-    double start_time;
-    double timeout_sec;
-    size_t bytes;
-    int newline_count;
-    char last_byte;
+    char *cmd;            ///< the command line, owned
+    double start_time;    ///< wall-clock at spawn, for elapsed_sec
+    double timeout_sec;   ///< kill the job after this long; 0 = no timeout
+    size_t bytes;         ///< output bytes captured so far
+    int newline_count;    ///< newlines seen, for the line count without a rescan
+    char last_byte;       ///< last byte captured; tells whether output ends in a newline
+
+    /** @note WRITE-ONLY as of this writing. Both counters are assigned in
+     * agent_bash_job::observation() and read NOWHERE. The intent was clearly an
+     * incremental cursor -- report only output added since the last look -- but
+     * only `observed_once` is actually consumed, and it selects HEAD (first
+     * observation) vs TAIL (every later one). A repeated bash_status therefore
+     * re-shows the same tail rather than just the new bytes. Either wire these
+     * up or delete them; they are not currently load-bearing. */
     size_t observed_bytes;
-    int observed_display_lines;
-    bool observed_once;
-    int exit_status;
-    bool running;
-    bool timed_out;
-    struct agent_bash_job *next;
+    int observed_display_lines;  ///< @see observed_bytes -- also write-only
+
+    bool observed_once;   ///< the job has been observed at least once; switches head display to tail
+    int exit_status;      ///< waitpid status once `running` is false
+    bool running;         ///< the child has not been reaped yet
+    bool timed_out;       ///< the job was killed by its timeout
+    struct agent_bash_job *next;  ///< next job in the worker's list
     agent_worker *worker;  ///< back-pointer for terminal state restoration
 
-    /** ---- methods (C++ port): 1:1 mirror of the agent_bash_* verb family;
-     * bodies keep the auto *job = this alias, logic verbatim. ---- */
+    /** @name Bash-job methods (C++ port)
+     *  1:1 mirror of the agent_bash_* verb family; bodies keep the
+     *  `auto *job = this` alias, logic verbatim.
+     *  @{
+     */
+    /** Output lines captured so far (newline count, plus a trailing partial). */
     int display_lines() const;
+    /** Account for `n` freshly captured bytes (byte and newline counters). */
     void note_output(const char *s, size_t n);
+    /** Release the job: close descriptors, unlink the temp file, free `cmd`. */
     void job_free();
+    /** Read whatever the child has written into the pipe right now. */
     void drain();
+    /** Record the child's exit `status` and mark the job no longer running. */
     void finalize(int status);
+    /** Non-blocking progress step: drain output, reap the child if it exited,
+     * and enforce the timeout. */
     void poll();
+    /** Read up to `max_lines` lines / `max_bytes` bytes from the START of the
+     * output. @param lines_read lines actually returned. @param byte_limited
+     * set when the byte cap, not the line cap, stopped the read.
+     * @return newly allocated text, caller frees. */
     char *read_head(int max_lines, size_t max_bytes, int *lines_read, bool *byte_limited) const;
+    /** Read the last `max_lines` lines of the output.
+     * @return newly allocated text, caller frees. */
     char *read_tail_lines(int max_lines) const;
+    /** Build the tool result describing this job: status line, then output.
+     * The FIRST observation shows the head of the output; later ones show the
+     * tail. @param mark_observed record that the model has now seen the job,
+     * which is what flips head display to tail. */
     char *observation(bool mark_observed);
+    /** @} */
 };
 
+/** Prompts typed while the model was busy, drained in order at the next safe
+ * point. Guarded by agent_worker::mu. */
 typedef struct {
-    char **v;
-    size_t len;
-    size_t cap;
+    char **v;    ///< queued prompt strings, owned
+    size_t len;  ///< prompts queued
+    size_t cap;  ///< slots allocated
 } agent_prompt_queue;
 
 typedef struct {
