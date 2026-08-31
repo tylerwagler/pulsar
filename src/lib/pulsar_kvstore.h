@@ -38,84 +38,115 @@ typedef enum {
     PULSAR_KVSTORE_REASON_SYS_PREFIX    = 7,
 } pulsar_kvstore_reason;
 
+/** Category of a message handed to the store's log callback, so the host can
+ * route cache chatter separately from real warnings. */
 typedef enum {
-    PULSAR_KVSTORE_LOG_DEFAULT,
-    PULSAR_KVSTORE_LOG_KVCACHE,
-    PULSAR_KVSTORE_LOG_WARNING,
+    PULSAR_KVSTORE_LOG_DEFAULT,  ///< ordinary informational message
+    PULSAR_KVSTORE_LOG_KVCACHE,  ///< cache hit/miss/store activity
+    PULSAR_KVSTORE_LOG_WARNING,  ///< something went wrong but was survivable
 } pulsar_kvstore_log_type;
 
 typedef struct {
-    /* The file name is the rendered byte prefix, not the token sequence. The
+    /** The file name is the rendered byte prefix, not the token sequence. The
      * payload still carries the exact tokens and graph state; the hash only
      * answers "does this checkpoint represent the bytes at the front of the
      * incoming prompt?" */
-    char sha[41];
-    char *path;
-    uint8_t quant_bits;
-    /* Stored in header byte 7.  Flash is 0 for backward compatibility with
+    char sha[41];        ///< hash of the rendered byte prefix: 40 hex chars + NUL
+    char *path;          ///< backing file, owned
+    uint8_t quant_bits;  ///< KV quantisation the payload was written with
+    /** Stored in header byte 7.  Flash is 0 for backward compatibility with
      * older cache files where this reserved byte was always written as zero. */
     uint8_t model_id;
-    uint8_t reason;
-    uint32_t tokens;
-    uint32_t hits;
-    uint32_t ctx_size;
-    uint8_t ext_flags;
-    uint64_t created_at;
-    uint64_t last_used;
-    uint64_t payload_bytes;
-    uint64_t text_bytes;
-    uint64_t file_size;
+    uint8_t reason;          ///< ::pulsar_kvstore_reason this checkpoint was written for
+    uint32_t tokens;         ///< prompt tokens the checkpoint covers
+    uint32_t hits;           ///< times this entry has been restored; the eviction recency signal
+    uint32_t ctx_size;       ///< context size the payload was captured at
+    uint8_t ext_flags;       ///< which optional trailers the file carries
+    uint64_t created_at;     ///< unix seconds the entry was written
+    uint64_t last_used;      ///< unix seconds of the last restore
+    uint64_t payload_bytes;  ///< bytes of graph/KV payload
+    uint64_t text_bytes;     ///< bytes of stored prefix text
+    uint64_t file_size;      ///< total file size, the unit the budget is spent in
 } pulsar_kvstore_entry;
 
+/** Store-placement policy: WHERE a checkpoint is cut, and how often.
+ *
+ * The cut position matters more than it looks. A checkpoint that ends a few
+ * tokens into volatile text is useless -- the next request diverges right
+ * there and reuses nothing -- so cuts are pulled back off the frontier and
+ * landed on an alignment boundary.
+ */
 typedef struct {
-    int min_tokens;
-    int cold_max_tokens;
-    int continued_interval_tokens;
+    int min_tokens;                ///< below this many tokens a checkpoint is not worth writing
+    int cold_max_tokens;           ///< cap on a cold checkpoint's length
+    int continued_interval_tokens; ///< write a continued checkpoint every this many new tokens
+    /** Back the cut off the frontier by this many tokens. The last few tokens
+     * before the frontier are the least stable part of a prompt; a checkpoint
+     * ending inside them rarely matches the next request. */
     int boundary_trim_tokens;
-    int boundary_align_tokens;
+    int boundary_align_tokens;     ///< round the cut down to a multiple of this
+    /** Extra margin below the chat anchor for a sys-prefix checkpoint, to clear
+     * harness-injected preamble jitter that would otherwise vary the cut. */
     int sys_prefix_margin_tokens;
 } pulsar_kvstore_options;
 
+/** An on-disk checkpoint store: a directory, a byte budget, and the index of
+ * what is in it. */
 typedef struct {
-    bool enabled;
-    char *dir;
-    uint64_t budget_bytes;
-    bool reject_different_quant;
-    pulsar_kvstore_options opt;
-    int continued_last_store_tokens;
-    pulsar_kvstore_entry *entry;
-    int len;
-    int cap;
-    const char *log_name;
-    void *log_ud;
-    void (*log)(void *ud, pulsar_kvstore_log_type type, const char *msg);
+    bool enabled;                  ///< the store is in use; everything is a no-op when false
+    char *dir;                     ///< directory holding the files, owned
+    uint64_t budget_bytes;         ///< total size ceiling; eviction keeps the store under it
+    bool reject_different_quant;   ///< refuse entries whose quant_bits differ from the running engine
+    pulsar_kvstore_options opt;    ///< placement policy
+    int continued_last_store_tokens;  ///< token count at the last continued write; the interval baseline
+    pulsar_kvstore_entry *entry;   ///< the index
+    int len;                       ///< entries present
+    int cap;                       ///< entries allocated
+    const char *log_name;          ///< prefix identifying this store in log lines
+    void *log_ud;                  ///< opaque userdata handed back to `log`
+    void (*log)(void *ud, pulsar_kvstore_log_type type, const char *msg);  ///< log sink; NULL to discard
 } pulsar_kvstore;
 
+/** What the eviction pass must NOT throw away: the entry the caller is about
+ * to use. Passed in so a store can make room for an incoming write without
+ * evicting the very checkpoint that write depends on. */
 typedef struct {
-    const char *text;
-    size_t text_len;
-    uint8_t model_id;
-    uint8_t quant_bits;
-    uint32_t ctx_size;
-    bool reject_different_quant;
+    const char *text;             ///< prefix text of the protected entry
+    size_t text_len;              ///< its length in bytes
+    uint8_t model_id;             ///< model the caller is running
+    uint8_t quant_bits;           ///< KV quantisation the caller is running
+    uint32_t ctx_size;            ///< context size the caller is running
+    bool reject_different_quant;  ///< treat a quant mismatch as unusable, hence evictable
 } pulsar_kvstore_eviction_context;
 
+/** Lets a caller append its own data to a checkpoint file.
+ *
+ * The store owns the payload; anything ELSE a restore needs -- the server's
+ * tool map, for instance -- rides along as a trailer written through these
+ * hooks. The store never interprets it, it only reserves the space and calls
+ * back at the right offset.
+ */
 typedef struct {
-    void *ud;
-    uint8_t ext_flag;
+    void *ud;           ///< opaque userdata passed to every hook
+    uint8_t ext_flag;   ///< ext_flags bit set on files carrying this trailer
+    /** Report the trailer's serialized size for `text`, so the store can size
+     * the file before writing. */
     bool (*serialized_size)(void *ud, const char *text, uint64_t *bytes_out);
+    /** Write the trailer at the current position of `fp`. */
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
+    /** Read the trailer back. @return entries loaded, 0 for none. */
     int (*load)(void *ud, FILE *fp, const void *wanted);
-    const void *load_wanted;
+    const void *load_wanted;  ///< passed as `wanted` to the load hook
 } pulsar_kvstore_trailer_hooks;
 
+/** What a restore actually produced, reported back to the caller. */
 typedef struct {
-    int tokens;
-    uint32_t text_bytes;
-    uint8_t quant_bits;
-    uint8_t ext_flags;
-    double load_ms;
-    char *path;
+    int tokens;            ///< prompt tokens restored; 0 means nothing was loaded
+    uint32_t text_bytes;   ///< bytes of prefix text restored
+    uint8_t quant_bits;    ///< KV quantisation the file was written with
+    uint8_t ext_flags;     ///< trailers the file carried
+    double load_ms;        ///< wall-clock spent loading, for the cache-hit metrics
+    char *path;            ///< file that satisfied the restore, owned by the caller
 } pulsar_kvstore_load_result;
 
 pulsar_kvstore_options pulsar_kvstore_default_options(void);
