@@ -280,7 +280,9 @@ the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
 - `PULSAR_CUDA_ATTN_F16` — fp16 tensor-core prefill attention (all window,
   indexed, banked and continued-prefill paths; reads the packed comp cache
   directly).
-- `PULSAR_CUDA_INDEXER_MXFP4` — block-scaled MXFP4 indexer scorer.
+- Block-scaled MXFP4 indexer scorer. Default-on; its opt-out switch
+  (`PULSAR_CUDA_INDEXER_MXFP4`) was retired in the v0.5.0 switch audit and the
+  packed indexer cache is now allocated unconditionally.
 - Split-KV decode attention with softmax merge (8 row-splits; the
   small-batch decode walk no longer serializes on 8 blocks). Default-on;
   its opt-out switch was retired in the v0.5.0 switch audit.
@@ -438,7 +440,8 @@ Tier-2 OVERCOMMIT auto-sized to 5 bank(s) for --ctx 1048576: eager floor
   touch, NOT charged); shared 5.28 GiB; admission est 6.26 GiB (batching ON)
 warmup generation: 4160 prompt + 12 decode tokens in 10.8 s;
   MemAvailable 16.08 -> 12.13 GiB (first-generation working set materialized)
-Tier-2 shared pool ACTIVE: 5 banks, spec_max_live=1, pool resident 26.80 GiB
+Tier-2 shared pool ACTIVE: 5 banks, unified batch decode (L118), per-bank
+  marginal 1.25 GiB (pool resident actual 26.80 GiB)
 Tier-2 2b guard ENABLED: touched budget 7.69 GiB (kv budget 13.95 - eager 6.26),
   spill dir ./ds4-spill
 ```
@@ -577,8 +580,10 @@ so a request's greedy continuation can depend on what else is co-scheduled at th
 moment — the same class of numerical nondeterminism as batched inference in other
 engines. Likewise, v0.3.1's head-grouped decode-attention kernel is not
 bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
-differ from the prior release (quality-verified neutral; set
-`PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
+differ from the prior release (quality-verified neutral). The
+`PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8` escape hatch that once restored the prior
+kernel was retired in the v0.5.0 switch audit — there is no longer a second
+kernel to fall back to.
 Two further guardrails keep a misbehaving client from wedging the server:
 concurrent client connections are capped (64; connections over the cap get an
 immediate 503 instead of piling up threads), and a whole-request read deadline

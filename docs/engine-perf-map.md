@@ -7,6 +7,13 @@
 > kernels hold ~72% of decode GPU time, and the F32 hc family named below now
 > computes in BF16 on tensor cores. For current decode attribution see the
 > v0.5.0 release notes and the kernel census that ships with them.
+>
+> **Also superseded: every `spec_max_live` reference below.** That knob and the
+> classic per-slot decode lane were deleted by L118 (2026-08-20). Decode now
+> runs the batched quanta at every n >= 1 — a solo session is a batch of one —
+> and speculation happens INSIDE the batch (spec-batched when every decoder can
+> speculate, plain-batched otherwise). Where the text says speculation moves
+> only the single-stream number, read it as a statement about 2026-08-08.
 
 
 Measured 2026-08-08 on sparky (GB10, sm_121, 48 SMs), `pulsar-bench` at a
@@ -332,6 +339,18 @@ result and the README figure as unverified on this box.
 
 ### Speculation vs batching: neither fork speculates in a batch
 
+> **SUPERSEDED for OUR fork (L118, shipped 2026-08-20).** The heading below was
+> true when measured and is now false for pulsar. The batched quanta run at
+> EVERY n_dec >= 1 -- a solo session is a batch of one -- and the scheduler
+> picks *spec-batched* when every decoder can speculate, *plain-batched*
+> otherwise (`server_sched.cpp`, worker_batched_decode_quantum). Speculation
+> therefore happens INSIDE the batch. The classic per-slot decode lane, its A/B
+> hatch, and the `spec_max_live` crossover knob are all deleted.
+>
+> The measurement and reasoning below are kept as the record of why the limit
+> existed and what it cost. Do NOT read the closing paragraph as an open
+> proposal -- it was taken up and is done.
+
 The donor hard-disables speculation whenever batched mode is active
 (ds4_server.c: the decode loop gates on !batched_mode, and boot logs "MTP
 speculative decoding is disabled while native session batching is active") --
@@ -341,10 +360,14 @@ the drafter while the donor's equivalent cannot exceed its plain rate.  Neither
 fork speculates across concurrent sessions; if DSpark's ~+30% single-stream
 gain applied to 4-5 batched sessions it would stack on the 54% aggregate lead.
 The hard part is that a rejected draft desyncs its session from the coalesced
-batch step.  For OUR fork that limit is a confirmed deliberate decision
+batch step.  For OUR fork that limit was a confirmed deliberate decision
 (2026-08-08), not an oversight -- spec_max_live=1 is where it was intentionally
-stopped.  Treat lifting it as a design proposal to bring to Tyler, not a bug
-fix.
+stopped.
+
+**It was lifted.** L118 unified the lanes and the spec-batched path now runs one
+speculative round per bank around a shared verify forward; the desync problem is
+handled by per-bank frontier snapshots (`pulsar_spec_round::frontier`) rather
+than by refusing to batch. The paragraph above is history, not a task.
 
 ## Measured dead ends -- tried on 2026-08-08, do not retry without new information
 

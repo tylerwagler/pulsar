@@ -133,10 +133,23 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
   (`VEC32_UE8M0`) on tensor cores, including the attention-output projections.
   MXFP4 expert prefill runs the CUTLASS mxf4×mxf4 block-scaled grouped GEMM
   (GB10 / `sm_120f` family).
-- **Decode:** custom fused kernels, memory-bound; activations stay raw f32
-  except inside MoE (Q8_K).
-- **FP8 KV cache**: the compressed cache is packed E4M3+scale storage by
-  default (`PULSAR_ATTN_PACK=1`); the raw window is F16 (`PULSAR_RAW_F16=1`).
+- **Decode:** custom fused kernels, memory-bound. Activations are STAGED in
+  f32 and encoded to E4M3 where they feed a block-scaled GEMM (the encoding is
+  cached per activation buffer — see `mxfp8_act_cache_t`). The MoE path stages
+  E4M3 too: its activation block is `block_mx_act_mmq`, renamed from upstream's
+  `block_q8_1_mmq` precisely because it no longer holds q8_1. There is no Q8_K
+  on any GPU path — that type survives only in the CPU matvec argument
+  bundles.
+- **KV cache**: ONE row format for every KV buffer since the L111 unification
+  — raw ring, comp pool, drafter ring, MTP cache and the current chunk all use
+  the same **NVFP4 384-B row** at head_dim 512 / n_rot 64 (224 B of e2m1
+  nibbles + 28 B of E4M3 scale codes + a 4-B f32 row scale + 128 B of bf16
+  rope). The authority is the block comment at `pulsar_cuda_internal.h:74`.
+  There is no alternative format and no conversion path from the retired e4m3
+  row — stale payloads refuse to load. `PULSAR_ATTN_PACK` and `PULSAR_RAW_F16`
+  are no longer switches: the first names the format, the second is gone.
+  Quantize EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
+  misrounds ~33% of blocks, so every later move is a byte move.
   Decode attention reads the packed cache natively. Prefill attention
   consumes a per-chunk dequantized **f32 shadow**
   (`gpu_graph_attn_comp_read_cache`) — deliberately: native packed prefill
@@ -145,10 +158,24 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
 
 ## Environment Variables
 
-All runtime tuning/diagnostic gates use the `PULSAR_CUDA_*` prefix (this fork
-renamed every `PULSAR_METAL_*` gate; there are no compatibility aliases).
-Also: `PULSAR_FP8_NO_MXCORE`, `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_GGUF_DIR`
-(download script).
+Kernel-level tuning and diagnostic gates use the `PULSAR_CUDA_*` prefix (this
+fork renamed every `PULSAR_METAL_*` gate; there are no compatibility aliases).
+That prefix is NOT universal: of 74 live `PULSAR_*` flags only 32 carry it.
+Engine and server knobs sit directly under `PULSAR_` — `PULSAR_EVAL_PIN`,
+`PULSAR_MSEQ_BANKS`, `PULSAR_OVERCOMMIT`, `PULSAR_MIXED_BATCH`,
+`PULSAR_ROUTE_DEBUG`, `PULSAR_ALLOC_GUARD`, the `PULSAR_DSPARK_*` family, and
+others.
+
+To enumerate them rather than trust this list:
+
+    grep -rhoE '"PULSAR_[A-Z0-9_]+"' src/ | tr -d '"' | sort -u
+
+⚠ Several once-documented switches no longer exist and now do NOTHING if set:
+`PULSAR_RAW_F16`, `PULSAR_FP8_NO_MXCORE`, `PULSAR_GGUF_DIR`,
+`PULSAR_CUDA_INDEXER_MXFP4`, `PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8`,
+`PULSAR_DUMP_ATTN`, `PULSAR_SPLITKV_DEBUG`. Most were retired in the v0.5.0
+switch audit, which deletes any opt-out with no real caller. Setting a deleted
+flag fails silently, so check the grep above before relying on one.
 
 ## Deferred Work
 

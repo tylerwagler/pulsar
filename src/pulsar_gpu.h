@@ -374,8 +374,9 @@ typedef struct {
  * defer Q norm+rope to the kernel or run the standalone kernel as before. */
 int pulsar_gpu_attn_f16_tier_on(void);
 
-/** Opaque packed-row carriers (L092).  The packed caches (584-B ATTN_PACK rows;
- * MXKV-FP4 indexer rows) used to travel as `const float *` -- a carrier type
+/** Opaque packed-row carriers (L092).  The packed caches (384-B NVFP4
+ * ATTN_PACK rows, see pulsar_cuda_internal.h; MXKV-FP4 indexer rows) used to
+ * travel as `const float *` -- a carrier type
  * that described nothing, so one direct raw_kv[i] anywhere was defect ten and
  * compiled clean.  Deliberately INCOMPLETE types: indexing or arithmetic is a
  * compile error, so every read goes through the format's accessor (or an
