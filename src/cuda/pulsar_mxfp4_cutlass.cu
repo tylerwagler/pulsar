@@ -506,16 +506,35 @@ static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
   return st==cutlass::Status::kSuccess ? 0 : 3;
 }
 
-// ---- Scratch layout shared by the sizing and execution paths (must stay in lock-step). ----
-// Everything the FFN needs beyond the weight/activation pointers it's called with: packed
-// activation buffers, their SF tables, the three GEMMs' float outputs, and the three GEMMs'
-// (usually zero-size, but not guaranteed) CUTLASS workspaces.
+/** Byte offsets carving ONE scratch allocation into everything the dense FFN
+ * needs beyond the weight and activation pointers it is called with: packed
+ * activation buffers, their scale-factor tables, the three GEMMs' float
+ * outputs, and the three GEMMs' CUTLASS workspaces (usually zero-size, but not
+ * guaranteed).
+ *
+ * @warning The sizing path and the execution path both derive their offsets
+ * from cutlass_ffn_scratch_layout(). That single function is what keeps them
+ * in lock-step -- there is no runtime check that a caller computing offsets
+ * some other way agrees with it, and a disagreement is silent memory
+ * corruption rather than a failure.
+ */
 struct pulsar_cutlass_ffn_scratch_layout {
-  size_t xA_off, xSF_off, midA_off, midSF_off, gate_off, up_off, mid_off;
-  size_t ws_gate_off, ws_up_off, ws_down_off;
-  size_t xSF_n, midSF_n;
-  size_t ws_gate_bytes, ws_up_bytes, ws_down_bytes;
-  size_t total_bytes;
+  size_t xA_off,          ///< packed E4M3 activations (1 byte/elem)
+         xSF_off,         ///< scale factors for xA
+         midA_off,        ///< packed E4M3 SwiGLU product, input to the down GEMM
+         midSF_off,       ///< scale factors for midA
+         gate_off,        ///< gate GEMM float output
+         up_off,          ///< up GEMM float output
+         mid_off;         ///< SwiGLU product, f32, before packing to midA
+  size_t ws_gate_off,     ///< CUTLASS workspace for the gate GEMM
+         ws_up_off,       ///< CUTLASS workspace for the up GEMM
+         ws_down_off;     ///< CUTLASS workspace for the down GEMM
+  size_t xSF_n,           ///< scale-factor entries for xA, tile-padded
+         midSF_n;         ///< scale-factor entries for midA, tile-padded
+  size_t ws_gate_bytes,   ///< size of the gate workspace
+         ws_up_bytes,     ///< size of the up workspace (same shape as gate)
+         ws_down_bytes;   ///< size of the down workspace
+  size_t total_bytes;     ///< allocation size the whole layout requires
 };
 
 static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
@@ -705,15 +724,27 @@ __global__ static void g_build_arrays(
   ptrD[e]   = D_base + (size_t)roff * N;
 }
 
-// Per-group device array set for one logical GEMM shape.
+/** Per-group device arrays for one logical GEMM shape in a grouped launch.
+ *
+ * A grouped GEMM runs many independent problems in one kernel, so every
+ * operand becomes an ARRAY indexed by group: one problem shape, one pointer,
+ * and one stride or scale-factor layout per group. All of these live in device
+ * memory and are filled by a setup kernel.
+ */
 struct GArrays {
-  GProbElem   *prob;
-  const GElemA **ptrA;  GStrideA *dA;
-  const GElemB **ptrB;  GStrideB *dB;
-  const GElemSF **ptrSFA; GLayoutSFA *lSFA;
-  const GElemSF **ptrSFB; GLayoutSFB *lSFB;
-  const GElemC **ptrC;  GStrideC *dC;
-  GElemD      **ptrD;   GStrideD *dD;
+  GProbElem   *prob;      ///< per-group problem shape (M, N, K)
+  const GElemA **ptrA;    ///< per-group A operand (packed activations)
+  GStrideA *dA;           ///< per-group A stride
+  const GElemB **ptrB;    ///< per-group B operand (expert weights)
+  GStrideB *dB;           ///< per-group B stride
+  const GElemSF **ptrSFA; ///< per-group A scale factors
+  GLayoutSFA *lSFA;       ///< per-group A scale-factor layout
+  const GElemSF **ptrSFB; ///< per-group B scale factors
+  GLayoutSFB *lSFB;       ///< per-group B scale-factor layout
+  const GElemC **ptrC;    ///< per-group C operand (accumulator source)
+  GStrideC *dC;           ///< per-group C stride
+  GElemD      **ptrD;     ///< per-group D operand (output)
+  GStrideD *dD;           ///< per-group D stride
 };
 
 static size_t g_arrays_bytes(int n_total){
@@ -771,11 +802,32 @@ static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int 
   return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
-// ---- Scratch layout for the grouped FFN (sizing and execution stay in lock-step). ----
+/** Byte offsets carving one scratch allocation for the GROUPED (MoE) FFN.
+ *
+ * Same contract as ::pulsar_cutlass_ffn_scratch_layout, with two additions:
+ * buffers are sized to `padded_total` rows rather than the token count, since
+ * each expert's rows are padded up to a tile boundary, and the per-group
+ * ::GArrays tables need space of their own.
+ *
+ * @warning Sizing and execution both go through grouped_scratch_layout(); that
+ * shared function is the only thing keeping them consistent.
+ */
 struct pulsar_grouped_scratch_layout {
-  size_t xA_off, xSF_off, gate_off, up_off, mid_off, midA_off, midSF_off;
-  size_t gu_arr_off, dn_arr_off, ws_gu_off, ws_dn_off;
-  size_t xSF_bytes, midSF_bytes, ws_bytes, total_bytes;
+  size_t xA_off,       ///< packed E4M3 activations, padded_total rows
+         xSF_off,      ///< scale factors for xA
+         gate_off,     ///< gate GEMM float output
+         up_off,       ///< up GEMM float output
+         mid_off,      ///< SwiGLU product, f32
+         midA_off,     ///< packed E4M3 SwiGLU product, input to the down GEMM
+         midSF_off;    ///< scale factors for midA
+  size_t gu_arr_off,   ///< GArrays table for the fused gate/up grouped GEMM
+         dn_arr_off,   ///< GArrays table for the down grouped GEMM
+         ws_gu_off,    ///< CUTLASS workspace for the gate/up grouped GEMM
+         ws_dn_off;    ///< CUTLASS workspace for the down grouped GEMM
+  size_t xSF_bytes,    ///< size of the xA scale-factor table
+         midSF_bytes,  ///< size of the midA scale-factor table
+         ws_bytes,     ///< size of one grouped workspace (both are equal)
+         total_bytes;  ///< allocation size the whole layout requires
 };
 
 static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
