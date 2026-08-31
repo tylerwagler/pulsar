@@ -1967,7 +1967,14 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
  * by (gate_type,down_type) via a CUDA-event pair around the impl, and dumps a table at exit.
  * The event sync perturbs host wall-time but the measured per-call GPU interval is accurate;
  * this is a diagnostic-only path (one getenv read, no per-token flag branching in production). */
-struct moe_time_bucket { uint32_t gate_type, down_type; double ms; uint64_t calls; };
+/** One (gate_type, down_type) row of the MoE timing table -- see the note
+ * above for how it is measured and why it is diagnostic-only. */
+struct moe_time_bucket {
+    uint32_t gate_type,  ///< quant type of the gate/up weights
+             down_type;  ///< quant type of the down weights
+    double ms;           ///< accumulated GPU time for this format pair
+    uint64_t calls;      ///< calls counted into `ms`
+};
 static moe_time_bucket g_moe_time[64];
 static int g_moe_time_n = 0;
 static void moe_time_dump(void){

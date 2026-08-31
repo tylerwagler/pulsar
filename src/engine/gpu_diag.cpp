@@ -44,7 +44,7 @@ void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 
 
-/* ---- f16-viability range sweep (diagnostic) -----------------------------
+/** ---- f16-viability range sweep (diagnostic) -----------------------------
  *
  * PULSAR_CUDA_RANGE_SWEEP=1 turns every debug-dump point into a range probe
  * instead of a file dump, so one prefill answers "can this f32 staging buffer

@@ -1,4 +1,4 @@
-/* pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
+/** pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
  * Produced by the multi-TU split of pulsar_cuda.cu; edit freely (the
  * generator is not part of the build).
  *
@@ -42,7 +42,7 @@
 #define CUDA_QK_K 256
 
 enum {
-    /* attention_decode_mixed_kernel stores raw-window scores plus visible
+    /** attention_decode_mixed_kernel stores raw-window scores plus visible
      * compressed scores in shared memory.  The host routes larger unmasked
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context.  11712 fits under the

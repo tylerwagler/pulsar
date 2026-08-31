@@ -64,8 +64,11 @@ static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
 
+/** RAII NVTX range around one MMQ launch, for profiler traces. Compiles to
+ * nothing without NVTX, and does nothing when `enabled` is false. */
 class ds4_mmq_nvtx_scope {
 public:
+    /** Open a range named `name` carrying `payload`, if `enabled`. */
     ds4_mmq_nvtx_scope(const char *name, uint64_t payload, bool enabled)
         : active_(enabled) {
 #if DS4_MMQ_HAS_NVTX
@@ -96,7 +99,7 @@ public:
     ds4_mmq_nvtx_scope &operator=(const ds4_mmq_nvtx_scope &) = delete;
 
 private:
-    bool active_;
+    bool active_;  ///< a range was opened and must be closed
 };
 
 // ----------------------------------------------------------------------------

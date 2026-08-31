@@ -46,6 +46,8 @@ typedef enum {
     PULSAR_KVSTORE_LOG_WARNING,  ///< something went wrong but was survivable
 } pulsar_kvstore_log_type;
 
+/** One checkpoint in the store's index: what it holds, where it lives, and the
+ * accounting the budget and eviction need. */
 typedef struct {
     /** The file name is the rendered byte prefix, not the token sequence. The
      * payload still carries the exact tokens and graph state; the hash only

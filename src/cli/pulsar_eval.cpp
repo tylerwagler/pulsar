@@ -2136,9 +2136,10 @@ static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, 
     free(tmp);
 }
 
+/** A line located in a buffer, as byte offsets. */
 typedef struct {
-    size_t start;
-    size_t end;
+    size_t start;  ///< offset of the line's first byte
+    size_t end;    ///< offset just past its last byte
 } line_span;
 
 static void tui_draw_stream(eval_ui *ui) {

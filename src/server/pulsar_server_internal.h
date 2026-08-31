@@ -263,6 +263,8 @@ typedef struct {
     int missing_ids;  ///< calls that could not be resolved at all
 } tool_replay_stats;
 
+/** One declared tool: its names, and the order its properties were declared
+ * in. See ::tool_schema_orders for why the order is kept. */
 typedef struct {
     char *name;            ///< tool name as the model sees it, owned
     char *wire_name;       ///< name as the client sent it, owned; these can differ

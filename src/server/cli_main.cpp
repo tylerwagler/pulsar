@@ -17,11 +17,13 @@
  * ledger, exactly like the scheduler's own logging.
  * ========================================================================= */
 
+/** Background memory-diagnostic sampler: polls the process's memory figures on
+ * its own thread and writes them to `out`. Diagnostic-only, off by default. */
 typedef struct {
-    server *s;
-    FILE   *out;
-    pthread_t thread;
-    bool    running;
+    server *s;         ///< the server being sampled
+    FILE   *out;       ///< where samples are written
+    pthread_t thread;  ///< the sampling thread
+    bool    running;   ///< clear to ask the thread to exit
 } memdiag;
 
 /* Sum of the given keys' kB values from a /proc status-style file; keys[i]

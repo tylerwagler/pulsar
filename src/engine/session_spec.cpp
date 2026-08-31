@@ -1,6 +1,6 @@
 #include "pulsar_engine_internal.h"
 
-/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
+/** Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
  * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
  * GREEDY throughput (only 3 positions to trim: full range within 1-3% and the
  * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING

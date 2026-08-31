@@ -36,6 +36,14 @@
 static constexpr int DS4_ACT_BLOCK_QK   = 32;
 static constexpr int DS4_ACT_BLOCK_VALS = 4 * DS4_ACT_BLOCK_QK;   // 128
 
+/** The MMQ activation staging block.
+ *
+ * @warning Renamed from upstream's `block_q8_1_mmq` and the rename is load-
+ * bearing: this fork fills it with E4M3 bit patterns plus a ue8m0 scale, NOT
+ * with int8 q8_1. VENDOR.md records that the old name was read as evidence the
+ * MoE still ran q8_1 activations and a whole scoping verdict was written on
+ * that mistake. Layout and size are byte-identical to upstream.
+ */
 struct block_mx_act_mmq {
     // The scale slot.  Only `d4` is used by the E4M3 producer (one ue8m0 byte
     // per 32 values, widened to float); the other two members are upstream's
