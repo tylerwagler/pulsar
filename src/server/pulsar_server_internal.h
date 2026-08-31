@@ -608,7 +608,7 @@ typedef struct {
     size_t emit_pos;             ///< bytes of generated text already turned into deltas
     bool active;                 ///< the stream has started
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
-    /** Thinking+tools: hold tentative answer text after the first </think>
+    /** Thinking+tools: hold tentative answer text after the first \</think\>
      * until a tool marker, stream end, or a SECOND close proves whether it
      * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
@@ -1169,7 +1169,7 @@ typedef struct {
     int          continued_last_store_tokens;
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
      * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
-     * <spill_dir>/spill-bank-<bank>.kv) while its conversation stays bound here; it
+     * \<spill_dir\>/spill-bank-\<bank\>.kv) while its conversation stays bound here; it
      * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
      * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
     bool         spilled;
@@ -1449,7 +1449,11 @@ struct server {
     bool kv_tool_map_measure_locked(const char *text, uint32_t *count_out, uint64_t *bytes_out);
     /** Serialized trailer size for `text`, taking `tool_mu` itself. */
     bool kv_tool_map_serialized_size(const char *text, uint64_t *bytes_out);
-    /** Append the trailer for `text` to `fp`. @param written_bytes bytes emitted. */
+    /** Append the trailer for `text` to `fp`.
+     * @param fp             open file, positioned where the trailer goes
+     * @param text           the prefix text whose tool entries are written
+     * @param written_bytes  bytes emitted
+     * @return true on success. */
     bool kv_tool_map_write(FILE *fp, const char *text, uint64_t *written_bytes);
     /** Read a trailer from the CURRENT position of `fp`, keeping the entries
      * named in `wanted`. @return entries loaded; 0 at clean EOF or on a
@@ -1465,9 +1469,16 @@ struct server {
     pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(const stop_list *wanted);
     /** Store the first `store_len` tokens of the live session as a checkpoint,
      * with explicit control over the text the entry is KEYED by.
-     * @param cache_text_override key text to use instead of the rendered
-     * prefix -- how a truncated preamble is stored under the bytes a future
-     * request will actually present. */
+     * @param sl                   slot holding the live session
+     * @param tokens               the token history being checkpointed
+     * @param store_len            how many of them the entry covers
+     * @param reason               logged, and classifies the write in metrics
+     * @param cache_text_override  key text to use instead of the rendered
+     *                             prefix -- how a truncated preamble is stored
+     *                             under the bytes a future request will present
+     * @param cache_text_ext       ext_flags to record on the entry
+     * @param cache_text_key       explicit key text, when it differs again
+     * @return true when an entry was written. */
     bool kv_cache_store_live_prefix_text(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason, const char *cache_text_override, uint8_t cache_text_ext, const char *cache_text_key);
     /** kv_cache_store_live_prefix_text() keyed by the rendered prefix itself. */
     bool kv_cache_store_live_prefix(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason);
@@ -1490,8 +1501,12 @@ struct server {
      * request form is the wrapper. @return prefix tokens loaded, 0 for a miss. */
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
     /** Try to satisfy `req`'s prompt from the disk cache.
-     * @return prefix tokens loaded, 0 for a miss. @param loaded_path_out the
-     * file used, owned by the caller. */
+     * @param sl                    slot whose session receives the payload
+     * @param req                   the request whose prompt is being resolved
+     * @param effective_prompt      rewritten to the prompt that should now be synced
+     * @param loaded_path_out       the file used, owned by the caller
+     * @param loaded_ext_flags_out  which trailers that file carried
+     * @return prefix tokens loaded, 0 for a miss. */
     int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out);
     /** Continue from the LIVE session when the request's prompt text is a byte
      * prefix of what the session already holds.
@@ -1605,18 +1620,18 @@ struct server {
     /** Record where the reasoning block ended, so a later turn can continue the
      * conversation without replaying hidden thinking the client never saw. */
     void remember_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content);
-    /** Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
+    /** Tool-call finish WITH thinking on: the model emitted \<think\>reasoning\</think\>
      * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
      * remember the exact bytes the NEXT request will render for this turn as a visible
      * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
      * next request byte-matches the key and continues from live KV — no rewrite, no
      * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
      * same visible transcript on disk (kv_cache_store_current).
-     * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
+     * render_chat_prompt_text ALWAYS re-renders the reasoning inside \<think\>…\</think\>
      * for a tool-context turn (prompt_render.cpp: `tool_context || i > last_user_idx`),
      * because agentic clients (opencode et al.) replay reasoning_content verbatim so
      * the model keeps its chain of thought across tool rounds.  So the key MUST carry
-     * the reasoning too — an earlier version dropped it (<think></think>), which byte-
+     * the reasoning too — an earlier version dropped it (\<think\>\</think\>), which byte-
      * diverges from every reasoning-preserving replay at the first reasoning byte and
      * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
      * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The

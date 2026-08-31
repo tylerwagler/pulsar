@@ -78,7 +78,11 @@ INCLUDE_GRAPH          = YES
 INCLUDED_BY_GRAPH      = NO
 DOT_IMAGE_FORMAT       = svg
 INTERACTIVE_SVG        = YES
-DOT_GRAPH_MAX_NODES    = 80
+# Four call/caller graphs were skipped at 80 (buf_puts had 94 callers,
+# gpu_graph_encode_layer_attention_batch 90 callees). 100 captures them; much
+# beyond that a graph stops being readable and the textual caller list is the
+# better tool anyway.
+DOT_GRAPH_MAX_NODES    = 100
 
 GENERATE_HTML          = YES
 GENERATE_LATEX         = NO

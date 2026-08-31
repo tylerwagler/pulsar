@@ -730,15 +730,29 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
 
 /** As below, but also emits the E4M3 + ue8m0 encoding into the activation-cache
  * slots, so a GEMV consuming this norm multiplies in the source's format.
- * NULL slots give the plain behaviour. */
+ * NULL slots give the plain behaviour.
+ *
+ * @param out            destination, f32
+ * @param x              input rows
+ * @param model_map      base of the model mapping the norm weight lives in
+ * @param model_size     its size; the bound the weight span is checked against
+ * @param weight_offset  byte offset of the norm weight within that mapping
+ * @param n              row width
+ * @param eps            RMS epsilon
+ * @param out_q          E4M3 activation-cache slot, or NULL for plain behaviour
+ * @param out_sf         matching ue8m0 scale slot, or NULL
+ * @param out_kbp        scale-table stride: k-blocks per row
+ * @param w_bf16         1 when this norm weight is stored bf16 (source format)
+ *                       rather than f32. Storage only -- the value is promoted
+ *                       to f32 before it multiplies, so an f32 tensor stays
+ *                       bit-exact. Pass the TENSOR's type; never assume, the
+ *                       drafter and the main model can differ.
+ * @return 0 on success.
+ */
 int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
         uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp,
-        /** 1 when this norm weight is stored bf16 (source format) rather
-         * than f32. Storage only -- the value is promoted to f32 before it
-         * multiplies, so an f32 tensor stays bit-exact. Pass the TENSOR's
-         * type; never assume, the drafter and the main model can differ. */
         int w_bf16);
 
 int pulsar_gpu_rms_norm_weight_tensor(
@@ -803,6 +817,30 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * uint32 rotation positions: a negative entry rotates at a garbage angle
  * rather than faulting.  gpu_graph_multiseq_step_begin is the host-side
  * validator that every position is > 0 before any launch sees the array. */
+/** Per-head RMS norm followed by the tail rope rotation, in one launch.
+ *
+ * The Q element type is read from `x` itself rather than passed: the RMS
+ * reduction and the rotation stay in f32 either way, and only the STORES
+ * narrow.
+ *
+ * @param x           queries, normed and rotated in place
+ * @param n_tok       rows
+ * @param n_head      heads per row
+ * @param head_dim    per-head width
+ * @param n_rot       rotary dimensions at the head's tail
+ * @param pos0        absolute position of row 0 (ignored when `positions` is given)
+ * @param n_ctx_orig  context length the RoPE settings were trained at
+ * @param inverse     rotate backwards (used when replaying a rewind)
+ * @param freq_base   RoPE base frequency
+ * @param freq_scale  linear frequency scaling
+ * @param ext_factor  YaRN extrapolation mix; 0 disables
+ * @param attn_factor YaRN attention temperature correction
+ * @param beta_fast   YaRN ramp start
+ * @param beta_slow   YaRN ramp end
+ * @param eps         RMS epsilon
+ * @param positions   optional per-row absolute positions; see the note above
+ * @return 0 on success.
+ */
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(
         pulsar_gpu_tensor *x,
         uint32_t          n_tok,
@@ -819,9 +857,6 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps,
-        /** The Q element type is read from `x` itself, not passed here.  The
-         * RMS reduction and the rope rotation stay in f32 either way; only
-         * the stores narrow. */
         const pulsar_gpu_tensor *positions);
 
 /* PULSAR_ATTN_PACK storage -- since the L111 unification (2026-08-27), ONE
@@ -859,6 +894,23 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
 uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
 uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 
+/** Quantise `n_rows` KV rows to E2M1 and store them packed.
+ *
+ * THE single E2M1 quantize of KV in the engine. Re-encoding already-packed FP4
+ * misrounds ~33% of blocks (norm_kv.cu), so every later move of these rows --
+ * scatter, fork, evict/restore, session save/load -- must be a BYTE move.
+ *
+ * @param x         f32 staging rows to quantise; mutated in place when keep_f32
+ * @param packed    destination for the packed rows
+ * @param out_row0  first row of `packed` to write
+ * @param n_rows    rows to quantise
+ * @param head_dim  per-head width
+ * @param n_rot     rotary dimensions at the head's tail
+ * @param keep_f32  write the dequantised values back into the f32 staging.
+ *                  OBSERVER-ONLY -- consumers read the packed rows. Pass
+ *                  gpu_graph_f32_store_observed_any() (L094).
+ * @return 0 on success.
+ */
 int pulsar_gpu_attn_pack_quantize_store_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
@@ -866,14 +918,6 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        /** keep_f32: write the dequantised values back into the f32 staging.
-         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
-         * gpu_graph_f32_store_observed_any() (L094).
-         *
-         * This kernel is the SINGLE E2M1 quantize of KV.  Re-encoding packed
-         * FP4 misrounds ~33% of blocks (norm_kv.cu), so every later move of
-         * these rows -- scatter, fork, evict/restore, session save/load --
-         * is a byte move. */
         bool              keep_f32);
 
 /** Fused rope + QAT for the indexer q projection: one launch replacing the
@@ -960,6 +1004,17 @@ int pulsar_gpu_rope_tail_tensor(
 /** Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
+/** Quantise one KV row and store it into the raw ring.
+ *
+ * @param kv         the f32 KV row to store; dequantised back into it when keep_f32
+ * @param raw_cache  the raw ring for this layer
+ * @param raw_cap    ring capacity; the slot is `row % raw_cap`
+ * @param row        absolute KV position being stored
+ * @param head_dim   per-head width
+ * @param n_rot      rotary dimensions at the head's tail
+ * @param keep_f32   see below
+ * @return 0 on success.
+ */
 int pulsar_gpu_kv_fp8_store_raw_tensor(
         pulsar_gpu_tensor *kv,
         pulsar_gpu_tensor *raw_cache,

@@ -718,8 +718,12 @@ struct agent_bash_job {
      * and enforce the timeout. */
     void poll();
     /** Read up to `max_lines` lines / `max_bytes` bytes from the START of the
-     * output. @param lines_read lines actually returned. @param byte_limited
-     * set when the byte cap, not the line cap, stopped the read.
+     * output.
+     * @param max_lines    line cap
+     * @param max_bytes    byte cap
+     * @param lines_read   lines actually returned
+     * @param byte_limited set when the BYTE cap, not the line cap, stopped the
+     *                     read -- the caller reports truncation differently
      * @return newly allocated text, caller frees. */
     char *read_head(int max_lines, size_t max_bytes, int *lines_read, bool *byte_limited) const;
     /** Read the last `max_lines` lines of the output.

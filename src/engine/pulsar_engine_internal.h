@@ -1962,14 +1962,25 @@ struct pulsar_session {
     /** FULL-prefix fork: clone `src`'s committed KV into `dst` and continue
      * there, leaving the trunk intact for other siblings. This is what makes a
      * branching conversation cheap -- the shared history is copied, not
-     * recomputed. @param n_cached tokens of `tokens` already committed in src.
+     * recomputed.
+     * @param src       bank to clone FROM; left intact
+     * @param dst       bank to clone INTO
+     * @param tokens    the full prompt the forked bank should hold
+     * @param n_tokens  its length
+     * @param n_cached  how many of `tokens` are already committed in src
      * @return tokens reused, negative on failure. */
     int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
     /** Is `bank` pinned against eviction because a fork is cloning from it?
      * The guard's victim picker must not free physical pages mid-clone. */
     bool bank_fork_pinned(uint32_t bank) const;
     /** PARTIAL-prefix fork: clone only the shared prefix, cut at a ratio-4
-     * boundary, and replay the rest. @return tokens reused, negative on failure. */
+     * boundary, and replay the rest.
+     * @param src       bank to clone FROM
+     * @param dst       bank to clone INTO
+     * @param tokens    the full prompt the forked bank should hold
+     * @param n_tokens  its length
+     * @param n_cached  shared prefix length to cut at
+     * @return tokens reused, negative on failure. */
     int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
     /** Would a partial fork from `src` at `n_cached` reuse enough to be worth
      * it? @return the reusable token count, 0 when a cold prefill is better. */
@@ -2010,14 +2021,27 @@ struct pulsar_session {
      * @return 0 on success. */
     int eval(int token, char *err, size_t errlen);
     /** Decode ONE row per request across `n` banks in a single batched step.
-     * Each row lands at its own bank's frontier. @param logits receives one row
-     * per request, `logits_cap` floats wide. @return 0 on success. */
+     * Each row lands at its own bank's frontier.
+     * @param reqs        one entry per participating bank
+     * @param n           entries in `reqs`
+     * @param logits      receives one row per request, in `reqs` order
+     * @param logits_cap  floats per row
+     * @param err         failure message buffer
+     * @param errlen      its size
+     * @return 0 on success. */
     int decode_multiseq(const pulsar_multiseq_req *reqs, uint32_t n,
                         float *logits, int logits_cap, char *err, size_t errlen);
     /** The general batched step: rows may belong to different banks AND carry
      * different row counts, so one call can mix decode rows with a prefill
-     * chunk. @param out_n_rows rows actually produced. @param max_head_runs
-     * caps how many separate output-head runs the step will perform.
+     * chunk.
+     * @param reqs           the rows to evaluate, any mix of banks and lengths
+     * @param n_rows         entries in `reqs`
+     * @param logits         receives the output-head rows
+     * @param logits_cap     floats per row
+     * @param out_n_rows     rows actually produced
+     * @param max_head_runs  caps how many separate output-head runs the step performs
+     * @param err            failure message buffer
+     * @param errlen         its size
      * @return 0 on success. */
     int decode_mixed(const pulsar_multiseq_req *reqs, uint32_t n_rows,
                      float *logits, int logits_cap, uint32_t *out_n_rows,
@@ -2052,13 +2076,31 @@ struct pulsar_session {
      * host history back in line with the KV. */
     void note_committed_tokens(const int *toks, int n);
     /** Generate with the drafter: propose a block, verify it against the target
-     * in one pass, and commit the accepted prefix. @param accepted receives the
-     * committed token ids. @param rng is advanced. @return tokens committed. */
+     * in one pass, and commit the accepted prefix.
+     * @param temperature   sampling temperature; 0 selects argmax
+     * @param top_k         top-k cutoff
+     * @param top_p         nucleus cutoff
+     * @param min_p         relative probability floor
+     * @param rng           sampler state; advanced by this call
+     * @param max_tokens    cap on tokens committed
+     * @param eos_token     stop once this is committed
+     * @param accepted      receives the committed token ids
+     * @param accepted_cap  its capacity
+     * @param err           failure message buffer
+     * @param errlen        its size
+     * @return tokens committed. */
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng, int max_tokens, int eos_token,
                              int *accepted, int accepted_cap, char *err, size_t errlen);
     /** Speculative generation seeded with a known `first_token` -- the forced-
      * continuation form, where the caller has already chosen the opening token.
+     * @param first_token   the opening token, committed as-is
+     * @param max_tokens    cap on tokens committed
+     * @param eos_token     stop once this is committed
+     * @param accepted      receives the committed token ids
+     * @param accepted_cap  its capacity
+     * @param err           failure message buffer
+     * @param errlen        its size
      * @return tokens committed. */
     int eval_speculative_block(int first_token, int max_tokens, int eos_token,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
@@ -2739,7 +2781,7 @@ uint32_t gpu_graph_raw_start_for_span(
         uint32_t               n_raw);
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
-/** PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
+/** PULSAR_PREFILL_SLICE=\<N\>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
  * work buffer (indexer_scores) is allocated with only N token
  * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
