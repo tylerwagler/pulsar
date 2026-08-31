@@ -264,10 +264,18 @@ __device__ static inline float4 attn_comp_row_ld4(const uint8_t *pr, uint32_t c4
     return v;
 }
 
+/** A device buffer plus the metadata needed to interpret its bytes.
+ *
+ * Deliberately NOT a shaped tensor: no dimensions, no strides. Shape lives at
+ * the call site, which is what lets one allocation be viewed several ways
+ * across a layer. What the buffer must carry is how wide an element is and
+ * what format it is in -- see `esz` and `fmt`, both of which exist because
+ * leaving that knowledge to consumers produced silent, type-legal bugs.
+ */
 struct pulsar_gpu_tensor {
-    void *ptr;
-    uint64_t bytes;
-    int owner;
+    void *ptr;        ///< device pointer
+    uint64_t bytes;   ///< allocation size
+    int owner;        ///< non-zero when this struct owns `ptr` and must free it
     /* Bytes per element.  0 = unspecified, which reads as f32: that keeps
      * every pre-existing alloc meaning exactly what it meant, so only a
      * buffer that is NOT f32 has to say so, once, where it is created.
@@ -409,32 +417,53 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
  * scale and per-16 partial sums.  Zero references in the tree -- the int8
  * activation arms it belonged to are gone and every expert GEMM stages E4M3. */
 
+/** One IQ2_XXS quantisation block as it appears in the model file. */
 typedef struct {
-    uint16_t d;
-    uint16_t qs[CUDA_QK_K / 8];
+    uint16_t d;                      ///< block scale, f16
+    uint16_t qs[CUDA_QK_K / 8];      ///< packed 2-bit quants plus their codebook selectors
 } cuda_block_iq2_xxs;
 
 /* ---- shared types ---- */
 
+/** A span of the memory-mapped model file, and where it lives on the device.
+ *
+ * A range can reach the GPU two ways: copied into the arena, or the host pages
+ * registered so the device addresses them directly. The `registered_*` fields
+ * describe the second case and the `arena_allocated` flag the first; they are
+ * mutually exclusive, and the flags are what tell teardown which cleanup a
+ * given range needs.
+ */
 struct cuda_model_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t bytes;
-    char *device_ptr;
-    void *registered_base;
-    char *registered_device_base;
-    uint64_t registered_bytes;
-    int host_registered;
-    int arena_allocated;
+    const void *host_base;          ///< mapping base this range is an offset into
+    uint64_t offset;                ///< byte offset of the range within the mapping
+    uint64_t bytes;                 ///< range length
+    char *device_ptr;               ///< device address of the range's first byte
+    void *registered_base;          ///< page-aligned host base actually registered
+    char *registered_device_base;   ///< device address corresponding to registered_base
+    uint64_t registered_bytes;      ///< bytes registered (>= `bytes`, page-rounded)
+    int host_registered;            ///< the host pages are registered and must be unregistered
+    int arena_allocated;            ///< the bytes were copied into the arena instead
 };
 
+/** Bump allocator holding model weights on the device. One allocation, carved
+ * by offset -- weights are written once at load and never freed individually,
+ * so nothing more is needed. */
 struct cuda_model_arena {
-    char *device_ptr;
-    uint64_t bytes;
-    uint64_t used;
+    char *device_ptr;  ///< base of the arena allocation
+    uint64_t bytes;    ///< total arena size
+    uint64_t used;     ///< bytes handed out so far; the bump pointer
 };
 
-struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; __nv_fp8_e4m3 *data; unsigned char *scale; };
+/** An MXFP8 weight matrix on the device: E4M3 values with their block scales
+ * kept in a separate table. */
+struct fp8_mx_weight {
+    const void *host_base;   ///< mapping base the source bytes came from
+    uint64_t offset,         ///< byte offset within that mapping
+             in_dim,         ///< input width (K)
+             out_dim;        ///< output width (N)
+    __nv_fp8_e4m3 *data;     ///< device E4M3 values
+    unsigned char *scale;    ///< device block scales, one per 32 values
+};
 
 /* ---- shared host globals ---- */
 
