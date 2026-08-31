@@ -1482,8 +1482,10 @@ struct server {
     bool kv_cache_store_live_prefix_text(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason, const char *cache_text_override, uint8_t cache_text_ext, const char *cache_text_key);
     /** kv_cache_store_live_prefix_text() keyed by the rendered prefix itself. */
     bool kv_cache_store_live_prefix(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason);
-    /** Store the slot's full current prefix. @param reason logged, and used to
-     * classify the write in metrics. */
+    /** Store the slot's full current prefix.
+     * @param sl      the slot whose session is checkpointed
+     * @param reason  logged, and classifies the write in metrics
+     * @return true when an entry was written. */
     bool kv_cache_store_current(session_slot *sl, const char *reason);
     /** Forget a disk entry whose write failed or whose file is unusable, so a
      * later load does not keep retrying a broken path. */
@@ -1771,8 +1773,10 @@ struct server {
     /** tool_memory_put_source() with source TOOL_MEMORY_RAM. */
     void tool_memory_put(const char *id, const char *dsml);
     /** Fill in each replayed message's tool bytes from memory.
-     * @param stats records what matched and what did not -- a miss is the
-     * reason a turn cold-prefills, so it is counted rather than swallowed. */
+     * @param msgs   the replayed conversation, filled in place
+     * @param stats  records what matched and what did not -- a miss is the
+     *               reason a turn cold-prefills, so it is counted rather than
+     *               swallowed. */
     void tool_memory_attach_to_messages(chat_msgs *msgs, tool_replay_stats *stats);
     /** Give every id-less call in `calls` a fresh id in `api`'s format.
      * Regenerates until the id collides with neither the batch nor anything in

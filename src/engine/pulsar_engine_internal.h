@@ -1541,7 +1541,9 @@ struct pulsar_engine {
     uint64_t session_cost_bytes(int ctx_size);
     /** session_cost_bytes() priced for an explicit bank-pool size, so the server
      * can evaluate the (banks, ctx) fit table before committing to one.
-     * @param n_banks >= 1; 1 is the classic single-session cost. */
+     * @param ctx_size context size to price
+     * @param n_banks  >= 1; 1 is the classic single-session cost
+     * @return bytes, or 0 if no session could be created. */
     uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
      * `ctx_size` -- the overcommit figure, below the reserved capacity. */

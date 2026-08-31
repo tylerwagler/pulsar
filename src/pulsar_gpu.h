@@ -506,6 +506,25 @@ int pulsar_gpu_argmax_tensor(
  * attention output projections, and DS4's tail-only RoPE.
  */
 
+/** The MXFP8 matmul workhorse: `n_tok` activation rows against a registered
+ * MXFP8 weight living in the model mapping.
+ *
+ * The output element type is read from `out` ITSELF (see
+ * pulsar_gpu_tensor_alloc_elt) rather than passed. That applies to every arm --
+ * cuBLASLt and the mmvq/NT kernels alike -- because a buffer written from two
+ * widths (a prefill chunk vs the drafter's n_draft) must not end up holding two
+ * element types.
+ *
+ * @param out            destination rows; its element type selects the store width
+ * @param model_map      base of the model mapping the weight lives in
+ * @param model_size     its size; the bound the weight span is checked against
+ * @param weight_offset  byte offset of the weight within that mapping
+ * @param in_dim         input width (K)
+ * @param out_dim        output width (N)
+ * @param x              activation rows
+ * @param n_tok          rows to multiply (M)
+ * @return 0 on success.
+ */
 int pulsar_gpu_matmul_mxfp8_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
@@ -514,11 +533,6 @@ int pulsar_gpu_matmul_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        /** The output element type is read from `out` itself (see
-         * pulsar_gpu_tensor_alloc_elt), not passed here.  It applies to EVERY
-         * arm -- cuBLASLt and the mmvq/NT kernels alike -- because a buffer
-         * written from two widths (prefill chunk vs drafter n_draft) must not
-         * end up holding two element types. */
         uint64_t                n_tok);
 
 /** Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
@@ -780,7 +794,37 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
  * the norm's own epilogue into the activation-cache slots, so the MXFP8
  * attn_q_b GEMM never runs a separate quantize pass over batch_qr_norm.  Pass
  * NULL slots for the plain behaviour.  Bit-exact: same value, same rounding the
- * standalone quantiser would have applied. */
+ * standalone quantiser would have applied.
+ *
+ * Normalises the Q and KV halves in ONE launch -- they share the row loop, so
+ * splitting them would read the same rows twice.
+ *
+ * @param q_out             normalised Q rows
+ * @param q                 Q input rows
+ * @param model_map         base of the model mapping the norm weights live in
+ * @param model_size        its size; the bound both weight spans are checked against
+ * @param q_weight_offset   byte offset of the Q norm weight
+ * @param q_n               Q row width
+ * @param kv_out            normalised KV rows
+ * @param kv                KV input rows
+ * @param kv_weight_offset  byte offset of the KV norm weight
+ * @param kv_n              KV row width
+ * @param rows              rows to normalise
+ * @param eps               RMS epsilon
+ * @param q_out_q           E4M3 activation-cache slot for Q, or NULL for plain behaviour
+ * @param q_out_sf          matching ue8m0 scale slot, or NULL
+ * @param q_out_kbp         scale-table stride: k-blocks per Q row
+ * @param q_w_bf16          1 when the Q norm weight is stored bf16 rather than f32
+ * @param kv_w_bf16         1 when the KV norm weight is stored bf16 rather than f32
+ * @param q_skip_f32        Drop q_out's f32 store, leaving the E4M3 emission as
+ *                          the buffer's ONLY content. Requires q_out_q. The
+ *                          caller must arm the cache and call note_mxfp8() +
+ *                          note_f32_skipped() straight after, and must NOT set
+ *                          this while a debug dump of that tensor is active --
+ *                          the dump reads f32 and would silently show stale
+ *                          bytes.
+ * @return 0 on success.
+ */
 int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         pulsar_gpu_tensor       *q_out,
         const pulsar_gpu_tensor *q,
@@ -799,11 +843,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         int                     q_out_kbp,
         int                     q_w_bf16,
         int                     kv_w_bf16,
-        /** Drop q_out's f32 store, leaving the E4M3 emission as the buffer's
-         * only content.  Requires q_out_q.  The caller must arm the cache and
-         * call note_mxfp8() + note_f32_skipped() straight after, and must NOT
-         * set this while a debug dump of that tensor is active -- the dump
-         * reads f32 and would silently show stale bytes. */
         int                     q_skip_f32);
 
 
@@ -933,16 +972,24 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
 
 /** QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
  * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
- * bit-identical to the fused rope+QAT entry above. */
+ * bit-identical to the fused rope+QAT entry above.
+ *
+ * @param x         f32 indexer rows, round-tripped in place
+ * @param packed    destination for the MXKV-FP4 rows
+ * @param out_row0  first row of `packed` to write
+ * @param n_rows    rows to process
+ * @param head_dim  per-head width
+ * @param keep_f32  write the dequantised values back into the f32 staging.
+ *                  OBSERVER-ONLY -- consumers read the packed rows. Pass
+ *                  gpu_graph_f32_store_observed_any() (L094).
+ * @return 0 on success.
+ */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
         uint32_t          out_row0,
         uint32_t          n_rows,
         uint32_t          head_dim,
-        /** keep_f32: write the dequantised values back into the f32 staging.
-         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
-         * gpu_graph_f32_store_observed_any() (L094). */
         bool              keep_f32);
 
 /* Tell the indexer score kernels the indexer compressed cache is stored
@@ -1003,8 +1050,8 @@ int pulsar_gpu_rope_tail_tensor(
 
 /** Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
- * attention cache row in one dispatch. */
-/** Quantise one KV row and store it into the raw ring.
+ * attention cache row in one dispatch -- quantise one KV row and store it into
+ * the raw ring.
  *
  * @param kv         the f32 KV row to store; dequantised back into it when keep_f32
  * @param raw_cache  the raw ring for this layer
@@ -1012,7 +1059,9 @@ int pulsar_gpu_rope_tail_tensor(
  * @param row        absolute KV position being stored
  * @param head_dim   per-head width
  * @param n_rot      rotary dimensions at the head's tail
- * @param keep_f32   see below
+ * @param keep_f32   write the dequantised values back into the f32 staging.
+ *                   OBSERVER-ONLY -- consumers read the packed rows. Pass
+ *                   gpu_graph_f32_store_observed_any() (L094).
  * @return 0 on success.
  */
 int pulsar_gpu_kv_fp8_store_raw_tensor(
@@ -1022,9 +1071,6 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          row,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        /** keep_f32: write the dequantised values back into the f32 staging.
-         * OBSERVER-ONLY -- consumers read the packed rows.  Pass
-         * gpu_graph_f32_store_observed_any() (L094). */
         bool              keep_f32);
 
 /** Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
@@ -1733,18 +1779,42 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
  * NOTE the _f16 in the name is a MISNOMER kept for call-site stability: this
  * emitted __half until the F16 weights were retired (2026-08-16) and it has
  * emitted E4M3 ever since.  There is no f16 anything on this path -- the
- * shipped artifact contains ZERO F16 tensors.  See ledger L079. */
+ * shipped artifact contains ZERO F16 tensors.  See ledger L079.
+ *
+ * @param out                 the HC collapse output
+ * @param norm_out            the f32 normalised rows
+ * @param norm_out_q          E4M3 activation-cache slot for norm_out; NULL writes only f32
+ * @param norm_out_sf         matching ue8m0 scale slot
+ * @param norm_out_kbp        scale-table stride: k-blocks per row
+ * @param norm_out_b          bf16 copy of norm_out (act-cache xb slot); NULL = skip (L086 T3)
+ * @param norm_f32_keep_from  f32 rows BELOW this index are dead stores and are
+ *                            skipped; 0 stores all. Pass nonzero ONLY with
+ *                            note_f32_skipped(), so the fallback backstop fails
+ *                            loud instead of reading unwritten bytes.
+ * @param split               per-stream split of the mix
+ * @param mix                 the HC mix projection output
+ * @param residual_hc         the HC residual being collapsed
+ * @param model_map           base of the model mapping the weights live in
+ * @param model_size          its size; the bound every weight span is checked against
+ * @param scale_offset        byte offset of the HC per-channel scale
+ * @param base_offset         byte offset of the HC per-channel base
+ * @param norm_weight_offset  byte offset of the norm weight
+ * @param n_rows              rows to process
+ * @param n_embd              embedding width
+ * @param n_hc                HC stream count
+ * @param sinkhorn_iters      Sinkhorn normalisation iterations for the collapse weights
+ * @param eps                 collapse epsilon
+ * @param norm_eps            RMS epsilon for the norm half
+ * @param norm_w_bf16         1 when the norm weight is stored bf16 rather than f32
+ * @return 0 on success.
+ */
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
         void                    *norm_out_q,
         void                    *norm_out_sf,
         int                      norm_out_kbp,
-        /* bf16 copy of norm_out (act-cache xb slot); NULL = skip (L086 T3) */
         void                    *norm_out_b,
-        /* f32 rows below this index are DEAD STORES and skipped; 0 = store all.
-         * Pass nonzero ONLY with note_f32_skipped() so the fallback backstop
-         * fails loud instead of reading unwritten bytes. */
         uint32_t                 norm_f32_keep_from,
         pulsar_gpu_tensor       *split,
         const pulsar_gpu_tensor *mix,
@@ -1767,7 +1837,22 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 /** Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
  * rms_norm_plain_tensor() followed by the matmul for `w_type`; see the kernel
  * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
- * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32. */
+ * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32.
+ *
+ * @param out            destination, f32
+ * @param model_map      base of the model mapping the mix weight lives in
+ * @param model_size     its size; the bound the weight span is checked against
+ * @param weight_offset  byte offset of the mix weight within that mapping
+ * @param in_dim         input width (K)
+ * @param out_dim        output width (N)
+ * @param x              the HC residual carrier to norm and mix
+ * @param eps            RMS epsilon
+ * @param w_type         ds4 tensor type of the mix weight: 1 F16, 30 BF16,
+ *                       0 F32. Templated rather than F16-gated -- the fusion is
+ *                       about avoiding a scratch round trip, not about the
+ *                       weight being 2 bytes.
+ * @return 0 on success.
+ */
 int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
@@ -1777,9 +1862,6 @@ int pulsar_gpu_hc_norm_mix_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         float                   eps,
-        /** ds4 tensor type of the mix weight: 1 F16, 30 BF16, 0 F32.
-         * Templated rather than F16-gated -- the fusion is about avoiding a
-         * scratch round trip, not about the weight being 2 bytes. */
         uint32_t                w_type);
 
 int pulsar_gpu_output_hc_weights_tensor(
