@@ -679,9 +679,9 @@ typedef struct {
     const uint8_t *gate_base[PULSAR_MAX_EXPERT];
     const uint8_t *up_base[PULSAR_MAX_EXPERT];
     const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
-    const pulsar_expert_pair *pairs;                    ///< number of (token, expert) pairs in this batch
+    const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< first expert id this call covers
+    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
     const uint32_t *active_expert;
     const float *pair_weight;
     float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
@@ -697,7 +697,7 @@ typedef struct {
     const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
     const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< first expert id this call covers
+    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
     const uint32_t *active_expert;
     uint64_t in_dim;                                    ///< input width (K)
     uint64_t out_dim;                                   ///< output width (N)
@@ -706,12 +706,12 @@ typedef struct {
 } matvec_q2_k_batch_down_ctx;
 
 typedef struct {
-    float *moe;                                         ///< the MoE sub-context this call belongs to
+    float *moe;                                         ///< MoE output accumulator this call adds into
     const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
     const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
-    const pulsar_expert_pair *pairs;                    ///< number of (token, expert) pairs in this batch
+    const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< first expert id this call covers
+    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
     const uint32_t *active_expert;
     uint32_t n_active;
     uint32_t n_tok;
@@ -721,8 +721,11 @@ typedef struct {
     uint64_t midq_blocks;
 } matvec_q2_k_batch_accum_rows_ctx;
 
+/** @note NO USERS. Declared here but referenced nowhere else in src/
+ * (checked across .c/.cpp/.cu/.h). Documented for completeness, but this is
+ * a DELETION CANDIDATE rather than live API. */
 typedef struct {
-    float *moe;                                         ///< the MoE sub-context this call belongs to
+    float *moe;                                         ///< MoE output accumulator this call adds into
     const float *down_pair;
     uint32_t n_tok;
     uint64_t out_dim;                                   ///< output width (N)
@@ -731,6 +734,9 @@ typedef struct {
 
 
 
+/** @note NO USERS. Declared here but referenced nowhere else in src/
+ * (checked across .c/.cpp/.cu/.h). Documented for completeness, but this is
+ * a DELETION CANDIDATE rather than live API. */
 typedef struct {
     float            *x;
     uint64_t          stride;
@@ -742,16 +748,22 @@ typedef struct {
     bool              inverse;
 } rope_tail_batch_ctx;
 
+/** @note NO USERS. Declared here but referenced nowhere else in src/
+ * (checked across .c/.cpp/.cu/.h). Documented for completeness, but this is
+ * a DELETION CANDIDATE rather than live API. */
 typedef struct {
-    float *mid;
-    const float *gate;
-    const float *up;
-    uint64_t n;
-    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
+    float *mid;        ///< destination: the SwiGLU product
+    const float *gate; ///< gate branch input
+    const float *up;   ///< up branch input
+    uint64_t n;        ///< elements to process
+    float clamp;       ///< SwiGLU exponent clamp (overflow guard)
 } swiglu_batch_ctx;
 
+/** @note NO USERS. Declared here but referenced nowhere else in src/
+ * (checked across .c/.cpp/.cu/.h). Documented for completeness, but this is
+ * a DELETION CANDIDATE rather than live API. */
 typedef struct {
-    float *moe;                                         ///< the MoE sub-context this call belongs to
+    float *moe;                                         ///< MoE output accumulator this call adds into
     const pulsar_model *model;
     const pulsar_layer_weights *layer;
     const float *norm;
@@ -761,6 +773,9 @@ typedef struct {
     uint32_t il;
 } routed_moe_tokens_ctx;
 
+/** @note NO USERS. Declared here but referenced nowhere else in src/
+ * (checked across .c/.cpp/.cu/.h). Documented for completeness, but this is
+ * a DELETION CANDIDATE rather than live API. */
 typedef struct {
     float *out_hc;
     const pulsar_model *model;
@@ -1338,19 +1353,19 @@ static inline uint32_t gpu_graph_n_index_comp(const pulsar_gpu_graph *g, uint32_
  * quantizer slices the vector for each expert.
  */
 typedef struct {
-    float *gate_up_sum2;   /* [active layer][active expert][hidden] */
-    float *down_sum2;      /* [active layer][active expert][expert FFN] */
-    uint32_t gate_up_count[PULSAR_MAX_LAYER][PULSAR_MAX_EXPERT];
-    uint32_t down_count[PULSAR_MAX_LAYER][PULSAR_MAX_EXPERT];
-    float *ffn_norm_buf;
-    float *routed_mid_buf;
-    int   *selected_buf;
-    float *sq_tmp;
-    uint32_t cap_tokens;
-    uint64_t observed_tokens;
-    uint64_t observed_routes;
-    uint32_t chunks;
-    const char *dataset_path;
+    float *gate_up_sum2;   ///< running sum of SQUARED activations per [layer][expert][hidden], gate/up inputs
+    float *down_sum2;      ///< running sum of squared activations per [layer][expert][ffn], down inputs
+    uint32_t gate_up_count[PULSAR_MAX_LAYER][PULSAR_MAX_EXPERT];  ///< rows accumulated into gate_up_sum2, the divisor for the mean
+    uint32_t down_count[PULSAR_MAX_LAYER][PULSAR_MAX_EXPERT];     ///< rows accumulated into down_sum2
+    float *ffn_norm_buf;   ///< host copy of batch_ffn_norm for the chunk being observed
+    float *routed_mid_buf; ///< host copy of batch_routed_mid (post route-weighting)
+    int   *selected_buf;   ///< host copy of batch_router_selected: which expert each row went to
+    float *sq_tmp;         ///< scratch for the per-row squaring pass
+    uint32_t cap_tokens;   ///< rows the host buffers can hold, i.e. the prefill chunk width
+    uint64_t observed_tokens; ///< tokens accumulated so far
+    uint64_t observed_routes; ///< (token, expert) routing decisions accumulated
+    uint32_t chunks;          ///< prefill chunks processed
+    const char *dataset_path; ///< calibration corpus being read
 } pulsar_imatrix_collector;
 
 typedef struct pulsar_vocab pulsar_vocab;
