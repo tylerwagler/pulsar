@@ -253,41 +253,48 @@ typedef enum {
     PULSAR_VARIANT_FLASH = 0,
 } pulsar_variant;
 
+/** The model's architectural constants, resolved once at load and then treated
+ * as compile-time-ish truth by the graph and kernels.
+ *
+ * Sizes here drive every buffer the engine allocates, so a mismatch against the
+ * GGUF is a load-time failure rather than a runtime surprise. Note n_vocab is
+ * the LOGITS row width -- the tokenizer table length lives on pulsar_vocab and
+ * the two are not required to agree (see pulsar_engine_logits_width()). */
 typedef struct {
-    const char *name;
-    pulsar_variant variant;
-    uint32_t n_layer;
-    uint32_t n_embd;
-    uint32_t n_vocab;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t n_head_dim;
-    uint32_t n_value_dim;
-    uint32_t n_rot;
-    uint32_t n_out_group;
-    uint32_t n_lora_q;
-    uint32_t n_lora_o;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_expert_shared;
-    uint32_t n_ff_exp;
-    uint32_t n_hash_layer;
-    uint32_t n_swa;
-    uint32_t n_indexer_head;
-    uint32_t n_indexer_head_dim;
-    uint32_t n_indexer_top_k;
-    uint32_t n_hc;
-    uint32_t n_hc_sinkhorn_iter;
-    float rms_eps;
-    float hc_eps;
-    float expert_weight_scale;
-    float swiglu_clamp_exp;
-    float rope_freq_base;
-    float rope_scale_factor;
-    float rope_yarn_beta_fast;
-    float rope_yarn_beta_slow;
-    float compress_rope_freq_base;
-    uint64_t rope_orig_ctx;
+    const char *name;          ///< human-readable profile name
+    pulsar_variant variant;    ///< architecture variant selector
+    uint32_t n_layer;          ///< transformer layers
+    uint32_t n_embd;           ///< residual/embedding width
+    uint32_t n_vocab;          ///< LOGITS row width; size logits buffers with this
+    uint32_t n_head;           ///< query heads
+    uint32_t n_head_kv;        ///< key/value heads (< n_head when grouped)
+    uint32_t n_head_dim;       ///< per-head key/query dimension
+    uint32_t n_value_dim;      ///< per-head value dimension (may differ from n_head_dim)
+    uint32_t n_rot;            ///< dimensions covered by rotary embedding
+    uint32_t n_out_group;      ///< output-head grouping factor
+    uint32_t n_lora_q;         ///< rank of the low-rank query path (attn_q_a/q_b)
+    uint32_t n_lora_o;         ///< rank of the low-rank attention-output path
+    uint32_t n_expert;         ///< routed experts per MoE layer
+    uint32_t n_expert_used;    ///< experts activated per token (top-k routing)
+    uint32_t n_expert_shared;  ///< always-on shared experts
+    uint32_t n_ff_exp;         ///< per-expert FFN hidden width
+    uint32_t n_hash_layer;     ///< layers using hash-based routing, if any
+    uint32_t n_swa;            ///< sliding-window attention span
+    uint32_t n_indexer_head;      ///< indexer tower heads
+    uint32_t n_indexer_head_dim;  ///< indexer per-head dimension
+    uint32_t n_indexer_top_k;     ///< compressed rows the indexer selects per query
+    uint32_t n_hc;                ///< hyper-connection streams
+    uint32_t n_hc_sinkhorn_iter;  ///< Sinkhorn normalisation iterations in the HC mix
+    float rms_eps;             ///< epsilon for the transformer RMSNorms
+    float hc_eps;              ///< epsilon for the HC normalisation
+    float expert_weight_scale; ///< scale applied to routed-expert gate weights
+    float swiglu_clamp_exp;    ///< clamp on the SwiGLU exponent (overflow guard)
+    float rope_freq_base;      ///< RoPE base frequency
+    float rope_scale_factor;   ///< RoPE frequency scaling (context extension)
+    float rope_yarn_beta_fast; ///< YaRN fast-interpolation beta
+    float rope_yarn_beta_slow; ///< YaRN slow-interpolation beta
+    float compress_rope_freq_base;  ///< RoPE base used inside the KV compressor
+    uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
 typedef struct {
@@ -487,47 +494,60 @@ typedef struct {
     uint64_t data_pos;
 } pulsar_array_ref;
 
+/** Half-open byte range [off, end) of the model mapping that an accelerator
+ * must have resident. Used to prefetch/pin exactly the spans a step touches. */
 typedef struct {
-    uint64_t off;
-    uint64_t end;
+    uint64_t off;  ///< first byte, offset into the model mapping
+    uint64_t end;  ///< one past the last byte
 } accelerator_tensor_span;
 
+/** Every weight tensor for ONE transformer layer, resolved from the GGUF at
+ * load time. Pointers are borrowed views into the memory-mapped model and stay
+ * valid for the engine's lifetime; a NULL member means the layer does not have
+ * that tensor (e.g. the compressor set exists only on compressing layers, and
+ * the routed-expert set only on MoE layers).
+ *
+ * Layout mirrors the DeepSeek-V4-Flash block: an HC (hyper-connection) mix
+ * around each of the two sublayers, attention with a low-rank Q path and a
+ * shared KV projection, a KV COMPRESSOR that emits one pooled row every
+ * `ratio` positions, a lighter INDEXER tower that scores which compressed rows
+ * to attend to, and a mixture-of-experts FFN with a always-on shared expert. */
 typedef struct {
-    pulsar_tensor *hc_attn_fn;
-    pulsar_tensor *hc_attn_scale;
-    pulsar_tensor *hc_attn_base;
-    pulsar_tensor *attn_norm;
-    pulsar_tensor *attn_q_a;
-    pulsar_tensor *attn_q_a_norm;
-    pulsar_tensor *attn_q_b;
-    pulsar_tensor *attn_kv;
-    pulsar_tensor *attn_kv_a_norm;
-    pulsar_tensor *attn_sinks;
-    pulsar_tensor *attn_output_a;
-    pulsar_tensor *attn_output_b;
-    pulsar_tensor *attn_compressor_ape;
-    pulsar_tensor *attn_compressor_kv;
-    pulsar_tensor *attn_compressor_gate;
-    pulsar_tensor *attn_compressor_norm;
-    pulsar_tensor *indexer_attn_q_b;
-    pulsar_tensor *indexer_proj;
-    pulsar_tensor *indexer_compressor_ape;
-    pulsar_tensor *indexer_compressor_kv;
-    pulsar_tensor *indexer_compressor_gate;
-    pulsar_tensor *indexer_compressor_norm;
-    pulsar_tensor *hc_ffn_fn;
-    pulsar_tensor *hc_ffn_scale;
-    pulsar_tensor *hc_ffn_base;
-    pulsar_tensor *ffn_norm;
-    pulsar_tensor *ffn_gate_tid2eid;
-    pulsar_tensor *ffn_gate_inp;
-    pulsar_tensor *ffn_exp_probs_b;
-    pulsar_tensor *ffn_gate_exps;
-    pulsar_tensor *ffn_up_exps;
-    pulsar_tensor *ffn_down_exps;
-    pulsar_tensor *ffn_gate_shexp;
-    pulsar_tensor *ffn_up_shexp;
-    pulsar_tensor *ffn_down_shexp;
+    pulsar_tensor *hc_attn_fn;       ///< HC mix weight feeding the attention sublayer
+    pulsar_tensor *hc_attn_scale;    ///< HC per-channel scale, attention side
+    pulsar_tensor *hc_attn_base;     ///< HC per-channel base/offset, attention side
+    pulsar_tensor *attn_norm;        ///< RMSNorm weight before attention
+    pulsar_tensor *attn_q_a;         ///< query down-projection (low-rank A factor)
+    pulsar_tensor *attn_q_a_norm;    ///< RMSNorm on the low-rank query latent
+    pulsar_tensor *attn_q_b;         ///< query up-projection (low-rank B factor) to head space
+    pulsar_tensor *attn_kv;          ///< fused key/value projection
+    pulsar_tensor *attn_kv_a_norm;   ///< RMSNorm on the KV latent
+    pulsar_tensor *attn_sinks;       ///< per-head attention sink logits (always-attendable slots)
+    pulsar_tensor *attn_output_a;    ///< attention output down-projection (A factor)
+    pulsar_tensor *attn_output_b;    ///< attention output up-projection (B factor) back to embedding
+    pulsar_tensor *attn_compressor_ape;   ///< compressor absolute-position embedding
+    pulsar_tensor *attn_compressor_kv;    ///< compressor KV projection: pools `ratio` rows into one
+    pulsar_tensor *attn_compressor_gate;  ///< compressor gate deciding each row's contribution
+    pulsar_tensor *attn_compressor_norm;  ///< RMSNorm inside the compressor
+    pulsar_tensor *indexer_attn_q_b;      ///< indexer query up-projection (its own head space)
+    pulsar_tensor *indexer_proj;          ///< indexer scoring projection
+    pulsar_tensor *indexer_compressor_ape;  ///< indexer compressor position embedding
+    pulsar_tensor *indexer_compressor_kv;   ///< indexer compressor KV projection
+    pulsar_tensor *indexer_compressor_gate; ///< indexer compressor gate
+    pulsar_tensor *indexer_compressor_norm; ///< RMSNorm inside the indexer compressor
+    pulsar_tensor *hc_ffn_fn;        ///< HC mix weight feeding the FFN sublayer
+    pulsar_tensor *hc_ffn_scale;     ///< HC per-channel scale, FFN side
+    pulsar_tensor *hc_ffn_base;      ///< HC per-channel base/offset, FFN side
+    pulsar_tensor *ffn_norm;         ///< RMSNorm weight before the FFN
+    pulsar_tensor *ffn_gate_tid2eid; ///< token-id to expert-id routing table (when the artifact ships one)
+    pulsar_tensor *ffn_gate_inp;     ///< router projection producing per-expert logits
+    pulsar_tensor *ffn_exp_probs_b;  ///< router bias added to the expert probabilities
+    pulsar_tensor *ffn_gate_exps;    ///< ROUTED experts, gate projection (expert-major)
+    pulsar_tensor *ffn_up_exps;      ///< routed experts, up projection
+    pulsar_tensor *ffn_down_exps;    ///< routed experts, down projection
+    pulsar_tensor *ffn_gate_shexp;   ///< SHARED expert gate projection (runs for every token)
+    pulsar_tensor *ffn_up_shexp;     ///< shared expert up projection
+    pulsar_tensor *ffn_down_shexp;   ///< shared expert down projection
 } pulsar_layer_weights;
 
 typedef struct {
