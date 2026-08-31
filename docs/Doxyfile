@@ -1,0 +1,72 @@
+# Doxygen configuration for pulsar.
+#
+# Build:  doxygen docs/Doxyfile      (output: docs/api/html/index.html)
+# Needs:  doxygen, and graphviz `dot` for the call/collaboration graphs.
+#
+# Scope note: this documents the ENGINE, not the vendored code. src/vendor is
+# excluded deliberately -- it is third-party and its comments are not ours to
+# curate.
+
+PROJECT_NAME           = "pulsar"
+PROJECT_BRIEF          = "CUDA inference engine for DeepSeek-V4-Flash (GB10)"
+OUTPUT_DIRECTORY       = docs/api
+CREATE_SUBDIRS         = NO
+OPTIMIZE_OUTPUT_FOR_C  = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+INPUT                  = src docs/DESIGN.md
+FILE_PATTERNS          = *.h *.hpp *.c *.cpp *.cu *.cuh *.md
+RECURSIVE              = YES
+EXCLUDE                = src/vendor
+EXCLUDE_PATTERNS       = */build/* */cutlass/*
+USE_MDFILE_AS_MAINPAGE = docs/DESIGN.md
+
+# The engine's real content is in static functions and struct internals;
+# without these the output documents almost nothing useful.
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_LOCAL_CLASSES  = YES
+INTERNAL_DOCS          = YES
+
+# Surface what is NOT yet documented -- the point of an exhaustive pass is
+# knowing what is left, so warnings are the progress meter.
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = docs/api/doxygen-warnings.log
+
+# CUDA: doxygen does not know these, and without the mapping every __global__
+# kernel is parsed as a syntax error rather than a function.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = __global__= \
+                         __device__= \
+                         __host__= \
+                         __shared__= \
+                         __restrict__= \
+                         __launch_bounds__(x)= \
+                         PULSAR_DOXYGEN=1
+EXTENSION_MAPPING      = cu=C++ cuh=C++
+
+HAVE_DOT               = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = NO
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+DOT_GRAPH_MAX_NODES    = 80
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# The ledger rows and design docs live in pulsar-notes (PRIVATE). Do NOT add
+# that tree here -- it must not end up in generated output that could be
+# published from the public repo.

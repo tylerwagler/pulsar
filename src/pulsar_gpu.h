@@ -26,7 +26,7 @@
  *     emitted only by the backend TUs about themselves.
  */
 
-/* Hyper-connection (HC) residual-stream storage precision (task #62).
+/** Hyper-connection (HC) residual-stream storage precision (task #62).
  * The source model runs a BF16 residual (config torch_dtype: bfloat16 — see
  * ds4-source-numerics); our HC carriers were f32, i.e. 2x the precision AND
  * bandwidth of the source with no fidelity gain. We narrow the STORAGE of the
@@ -43,7 +43,7 @@
 #define PULSAR_HC_ELT_SIZE 2u
 #define PULSAR_HC_ELT_FMT  PULSAR_ELT_BF16   /* pairs with pulsar_hc_t; bridge assert CUDA-side */
 
-/* Stored element size of batch_heads / heads -- the attention output, and the
+/** Stored element size of batch_heads / heads -- the attention output, and the
  * largest UNCONDITIONAL f32 activation store in the engine (~512 MiB at 4096
  * prefill; 21.5 GiB of writes per prefill, every layer, every arm).
  *
@@ -74,7 +74,7 @@
 #define PULSAR_HEADS_ELT_FMT  PULSAR_ELT_BF16   /* pairs with pulsar_heads_t; bridge assert CUDA-side */
 
 
-/* Q activation storage precision (L045).  batch_q is the largest activation in
+/** Q activation storage precision (L045).  batch_q is the largest activation in
  * the model -- pc * n_head * head_dim, 512 MiB at a 4096-token prefill -- and
  * it exists largely to be read back and narrowed: the shipped attention tier
  * packs Q to __half for HMMA on the very next instruction.  Storing it f32 is
@@ -96,7 +96,7 @@
 #define PULSAR_Q_ELT_SIZE 2u
 #define PULSAR_Q_ELT_FMT  PULSAR_ELT_F16   /* pairs with pulsar_q_t; bridge assert CUDA-side */
 
-/* Shared-expert gate/up staging element size (L033 increment 2).  Same
+/** Shared-expert gate/up staging element size (L033 increment 2).  Same
  * contract as the two above: this is the STORED width the alloc, the byte
  * budget, and any host stride math must agree on; the producer (the mxfp8
  * GEMM) and the consumer (the swiglu fold) both derive their kernel type from
@@ -104,7 +104,7 @@
 #define PULSAR_SHARED_ACT_ELT_SIZE 2u
 #define PULSAR_SHARED_ACT_ELT_FMT  PULSAR_ELT_F16   /* f16 staging; runtime-esz consumers */
 
-/* spec_logits row capacity.  The multi-row logits slab is sized to the
+/** spec_logits row capacity.  The multi-row logits slab is sized to the
  * deepest speculative verify / multiseq head the engine ever emits
  * (PULSAR_MSEQ_MAX), NOT to prefill_cap -- guards on row indices must check
  * against THIS, or the 16 lives only in a comment. */
@@ -118,7 +118,7 @@
 
 
 
-/* =========================================================================
+/** =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
  *
@@ -132,7 +132,7 @@ typedef struct pulsar_gpu_tensor pulsar_gpu_tensor;
 int pulsar_gpu_init(void);
 void pulsar_gpu_cleanup(void);
 
-/* Running total of live tensor-alloc bytes (owned allocations only, views
+/** Running total of live tensor-alloc bytes (owned allocations only, views
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
 uint64_t pulsar_gpu_tensor_alloc_bytes_current(void);
@@ -140,7 +140,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
 /* n_elems * esz bytes, with esz recorded on the tensor.  Use this for any
  * buffer whose elements are not f32; consumers then derive the type from
  * the tensor instead of being handed a flag that can disagree with it. */
-/* Element FORMAT of a tensor (L106 K15, Tyler: option A).  An element SIZE
+/** Element FORMAT of a tensor (L106 K15, Tyler: option A).  An element SIZE
  * cannot distinguish __half from __nv_bfloat16 (both 2 B) nor E4M3 from int8
  * from raw bytes (all 1 B), and this engine's dominant historical defect class
  * is clean-compiling byte reinterpretation -- including in the widening
@@ -166,12 +166,12 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
-/* Raw device pointer without a synchronize (for building device pointer tables). */
+/** Raw device pointer without a synchronize (for building device pointer tables). */
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor);
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count);
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 
-/* Fill a Q buffer from host f32, converting to the stored Q element type.
+/** Fill a Q buffer from host f32, converting to the stored Q element type.
  * Host callers cannot see pulsar_q_t (it is CUDA-only), so a plain
  * tensor_write of floats into a narrowed Q buffer is both an overrun and a
  * reinterpretation -- and it compiles.  `n` counts ELEMENTS, not bytes. */
@@ -181,7 +181,7 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
-/* Same copy on the per-thread stream, WITHOUT blocking the host. Only for
+/** Same copy on the per-thread stream, WITHOUT blocking the host. Only for
  * destinations consumed by a later kernel on that same stream -- stream order
  * covers those. Anything the host reads back, or that crosses streams, keeps
  * the blocking form above. */
@@ -189,7 +189,7 @@ int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                  const pulsar_gpu_tensor *src, uint64_t src_offset,
                                  uint64_t bytes);
 
-/* Batched D2D copy: prepare a device-side descriptor table over fixed tensor
+/** Batched D2D copy: prepare a device-side descriptor table over fixed tensor
  * allocations once (whole-tensor copies, byte counts multiples of 16; returns
  * NULL on any violation), then replay all copies with one kernel launch.
  * max_bytes is the largest descriptor's byte count (grid sizing). Built for the
@@ -199,7 +199,7 @@ void *pulsar_gpu_batched_copy_prepare(pulsar_gpu_tensor **dst, pulsar_gpu_tensor
 int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes);
 void pulsar_gpu_batched_copy_free(void *handle);
 
-/* Command-tape bracket. There is NO CUDA-graph capture behind this: the
+/** Command-tape bracket. There is NO CUDA-graph capture behind this: the
  * decode graph tape was measured at a +0.6% ceiling on GB10 (decode is
  * 98.9% GPU-busy, so replay has nothing to reclaim) and removed --
  * begin_commands returns 1 unconditionally, end_commands synchronizes.
@@ -213,7 +213,7 @@ int pulsar_gpu_flush_commands(void);
 int pulsar_gpu_end_commands(void);
 int pulsar_gpu_synchronize(void);
 
-/* L119 segment capture-or-replay for round-invariant decode-sweep stretches
+/** L119 segment capture-or-replay for round-invariant decode-sweep stretches
  * (plan 119 in pulsar-notes; supersedes the removed whole-sweep tape the
  * comment above describes — the unified batch lane measures 92% GPU-busy
  * unprofiled, and these reclaim its inter-launch gaps). seg_enter: 0 = run
@@ -237,10 +237,10 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uin
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd, uint64_t offset, uint64_t bytes, const char *label);
 int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void pulsar_gpu_print_memory_report(const char *label);
-/* cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
+/** cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
 void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
 
-/* =========================================================================
+/** =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
  *
@@ -280,7 +280,7 @@ int pulsar_gpu_indexer_score_one_tensor(
         float                   scale);
 
 
-/* Banked (multi-session) mode: positions/seq_id are per-row int32 device
+/** Banked (multi-session) mode: positions/seq_id are per-row int32 device
  * arrays (row t's absolute position and TRUE bank id), comp_cap the per-bank
  * compressed-row stride, n_banks the pool size; the comp cache operand is
  * the whole bank pool.  Per-row visible count = (qpos+1)/ratio (the engine's
@@ -312,7 +312,7 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                comp_cap,
         uint32_t                n_banks);
 
-/* L121: score ONE same-bank consecutive-position run of a banked decode span
+/** L121: score ONE same-bank consecutive-position run of a banked decode span
  * through the block-scaled MXFP4 tier.  All tensor views are positioned at
  * the run's first row; bank_index_comp is that bank's own comp slab view.
  * n_comp is the scores stride / scan bound (step-top superset), not the
@@ -335,7 +335,7 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
         uint32_t                ratio,
         float                   scale);
 
-/* Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
+/** Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
  * natively?  When it does, the engine hands it the packed cache directly and
  * skips dequantising into the f32 shadow -- 584 B/row instead of 2048, on the
  * rows that dominate the tile, plus one whole pass removed.  Bit-exact either
@@ -349,7 +349,7 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a
  * multiple of 16.  Operand format chosen by measurement, not preference --
  * see tests/attn_precision_fidelity.cc and docs/engine-perf-map.md. */
-/* Q-prep descriptor for the fused norm+rope Q load (L037 lever 3). Non-NULL
+/** Q-prep descriptor for the fused norm+rope Q load (L037 lever 3). Non-NULL
  * means `q` holds RAW projections: the consumer must apply the per-head RMS
  * norm and tail rope itself, bit-exactly matching head_rms_norm_rope_tail
  * (the fp16 kernel fuses it into its Q fragment build; a non-f16 path applies
@@ -369,12 +369,12 @@ typedef struct {
     float beta_slow;
 } pulsar_gpu_q_prep;
 
-/* True when the fp16 attention tier will take eligible batches (env tier on
+/** True when the fp16 attention tier will take eligible batches (env tier on
  * AND the device has the MMA path) -- the engine uses it to decide whether to
  * defer Q norm+rope to the kernel or run the standalone kernel as before. */
 int pulsar_gpu_attn_f16_tier_on(void);
 
-/* Opaque packed-row carriers (L092).  The packed caches (584-B ATTN_PACK rows;
+/** Opaque packed-row carriers (L092).  The packed caches (584-B ATTN_PACK rows;
  * MXKV-FP4 indexer rows) used to travel as `const float *` -- a carrier type
  * that described nothing, so one direct raw_kv[i] anywhere was defect ten and
  * compiled clean.  Deliberately INCOMPLETE types: indexing or arithmetic is a
@@ -428,7 +428,7 @@ int pulsar_gpu_attention_f16_prefill(
         uint32_t                head_dim,
         const pulsar_gpu_q_prep *q_prep);
 
-/* fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
+/** fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
  * (topk == NULL, the continued-prefill sweep).  Banked descriptors
  * (positions/seq_id/comp_bank_ptrs; all-or-nothing) and ATTN_PACK comp rows
@@ -463,7 +463,7 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t                n_banks,
         const pulsar_gpu_q_prep *q_prep);
 
-/* Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
+/** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or
  * failure; the caller checks the shape conditions itself so a 0 is always a
@@ -490,7 +490,7 @@ int pulsar_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
-/* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
+/** GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
 int pulsar_gpu_argmax_tensor(
         pulsar_gpu_tensor       *out_idx,
@@ -498,7 +498,7 @@ int pulsar_gpu_argmax_tensor(
         uint32_t                n_vocab);
 
 
-/* =========================================================================
+/** =========================================================================
  * Dense Projections, Norms, RoPE, and KV Rounding.
  * =========================================================================
  *
@@ -514,24 +514,24 @@ int pulsar_gpu_matmul_mxfp8_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
-        /* The output element type is read from `out` itself (see
+        /** The output element type is read from `out` itself (see
          * pulsar_gpu_tensor_alloc_elt), not passed here.  It applies to EVERY
          * arm -- cuBLASLt and the mmvq/NT kernels alike -- because a buffer
          * written from two widths (prefill chunk vs drafter n_draft) must not
          * end up holding two element types. */
         uint64_t                n_tok);
 
-/* Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
+/** Register one MXFP8 workhorse weight (attn_kv/q, attn_output, shared experts,
  * output head) by offset so the matmul above executes it; done once at load. */
 void pulsar_gpu_register_fp8_weight(uint64_t weight_offset);
 
-/* Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
+/** Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
  * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
 void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
 
-/* Batched-prefill activation quantization cache.
+/** Batched-prefill activation quantization cache.
  *
  * One normalized activation feeds several block-scaled MXFP8 projections per
  * layer; the per-GEMM activation quantization is a pure function of the buffer
@@ -545,7 +545,7 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset);
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
-/* Optional fused GPU operations.
+/** Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
  * that does not provide the fused kernel must still define the symbol and
@@ -587,7 +587,7 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
         int                     mid_kbp);
 
 
-/* Widest decode prefix the M-neutral kernel paths cover.  ONE authority: the
+/** Widest decode prefix the M-neutral kernel paths cover.  ONE authority: the
  * armed nt-caps in pulsar_cuda_matmul.cu, the MoE grouped/non-grouped boundary
  * (pulsar_cuda_moe.cu), and the PULSAR_MSEQ_MAX static_assert in the engine all
  * reference this.  A batched step's decode rows past this width would take a
@@ -596,7 +596,7 @@ int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
  * PULSAR_MSEQ_MAX past it must FAIL THE BUILD, not warn at runtime. */
 #define PULSAR_GPU_MNEUTRAL_ROWS_MAX 16u
 
-/* plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
+/** plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
  * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
  * rows run through the M-independent custom per-token kernels (byte-identical
  * across batch width), while the trailing prefill rows [n..M) take the fast
@@ -636,16 +636,16 @@ int pulsar_gpu_rms_norm_plain_tensor(
         uint32_t                n,
         float                   eps);
 
-/* Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
+/** Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
  * i.e. how far our int8 activations sit from the source's own format.  <0 on
  * failure. */
 double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
 
-/* Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
+/** Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
  * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
 int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
 
-/* Read n ELEMENTS of t to the host as f32, whatever width they are stored at.
+/** Read n ELEMENTS of t to the host as f32, whatever width they are stored at.
  *
  * pulsar_gpu_tensor_read copies BYTES, so a caller that wants floats has to
  * know the stored width -- and host code cannot see it (the esz field lives on
@@ -659,7 +659,7 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
 /* Reserve the activation cache's E4M3 slots and hand back both device pointers
  * plus the scale pitch, so a producer can emit the MX encoding from its own
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
-/* Producer-side BF16 activation slot (L086 T3): reserve the bf16 copy's
+/** Producer-side BF16 activation slot (L086 T3): reserve the bf16 copy's
  * storage for (x, n_tok, in_dim) so an epilogue can write it, then note() to
  * mark it valid once the kernel succeeded.  matmul_bf16_tensor then skips its
  * convert-on-miss for this exact key. */
@@ -673,7 +673,7 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch);
 
-/* GROUPED activation slots for the attn-output "a" projection (batch_heads).
+/** GROUPED activation slots for the attn-output "a" projection (batch_heads).
  * Reserves per-group E4M3 data plus a per-group swizzled E8M0 scale slab and
  * zeroes the scales, so the attention epilogue and rope_tail can emit the
  * encoding between them and the GEMM's quantize pass disappears.  `scale_slab`
@@ -686,7 +686,7 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
 void pulsar_gpu_mxfp8_gact_note(void);
 void pulsar_gpu_mxfp8_gact_disarm(void);
 
-/* Declare the E4M3 encoding current after a producer filled those slots. */
+/** Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 
 /* Record that the producer ALSO skipped this buffer's f32 store, so the f32
@@ -695,11 +695,11 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
  * or the GEMM reads a store that was never written and returns a well-formed
  * wrong answer.  Every f32-reading arm of the mxfp8 family checks this and
  * fails loudly rather than run. */
-/* keep_from: rows below it were skipped; rows >= keep it.  A full skip
+/** keep_from: rows below it were skipped; rows >= keep it.  A full skip
  * passes the arming n_tok. */
 void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from);
 
-/* Hand back the E4M3 encoding this buffer already carries, or 0 if the cache
+/** Hand back the E4M3 encoding this buffer already carries, or 0 if the cache
  * holds none for (ptr, n_tok, in_dim). Lets a consumer that would otherwise
  * quantize the f32 copy reuse the producer's encoding instead -- the routed-MoE
  * gather is the one that matters, since it re-encoded every gathered row.
@@ -711,7 +711,7 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
                                         const void **scale,
                                         int *kbp);
 
-/* Same lookup keyed on the raw device pointer, for callers that only ever held
+/** Same lookup keyed on the raw device pointer, for callers that only ever held
  * one (the routed-MoE path takes float* activations, not tensors). */
 int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
                                             uint64_t n_tok,
@@ -728,14 +728,14 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
-/* As below, but also emits the E4M3 + ue8m0 encoding into the activation-cache
+/** As below, but also emits the E4M3 + ue8m0 encoding into the activation-cache
  * slots, so a GEMV consuming this norm multiplies in the source's format.
  * NULL slots give the plain behaviour. */
 int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
         uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp,
-        /* 1 when this norm weight is stored bf16 (source format) rather
+        /** 1 when this norm weight is stored bf16 (source format) rather
          * than f32. Storage only -- the value is promoted to f32 before it
          * multiplies, so an f32 tensor stays bit-exact. Pass the TENSOR's
          * type; never assume, the drafter and the main model can differ. */
@@ -762,7 +762,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         float                   eps,
         int                     w_bf16);
 
-/* As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
+/** As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
  * the norm's own epilogue into the activation-cache slots, so the MXFP8
  * attn_q_b GEMM never runs a separate quantize pass over batch_qr_norm.  Pass
  * NULL slots for the plain behaviour.  Bit-exact: same value, same rounding the
@@ -785,7 +785,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         int                     q_out_kbp,
         int                     q_w_bf16,
         int                     kv_w_bf16,
-        /* Drop q_out's f32 store, leaving the E4M3 emission as the buffer's
+        /** Drop q_out's f32 store, leaving the E4M3 emission as the buffer's
          * only content.  Requires q_out_q.  The caller must arm the cache and
          * call note_mxfp8() + note_f32_skipped() straight after, and must NOT
          * set this while a debug dump of that tensor is active -- the dump
@@ -793,7 +793,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         int                     q_skip_f32);
 
 
-/* positions (both RoPE entries below): optional int32 [n_tok] DEVICE array of
+/** positions (both RoPE entries below): optional int32 [n_tok] DEVICE array of
  * per-row absolute positions for multi-session banked batches (rows of
  * different sessions sit at unrelated positions).  NULL keeps the classic
  * consecutive pos0+t rule bit-exactly — the multiseq degeneracy invariant.
@@ -819,7 +819,7 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow,
         float             eps,
-        /* The Q element type is read from `x` itself, not passed here.  The
+        /** The Q element type is read from `x` itself, not passed here.  The
          * RMS reduction and the rope rotation stay in f32 either way; only
          * the stores narrow. */
         const pulsar_gpu_tensor *positions);
@@ -839,7 +839,7 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
  * snapshots refuse loudly and re-prefill; there is deliberately no
  * conversion loader (an FP4 re-encode misrounds ~33%% of blocks; bytes are
  * the values).  Requires n_rot == 64 and (head_dim - n_rot) %% 16 == 0. */
-/* THE BACKEND'S OWN ROW GEOMETRY, so the engine can check its copy against it.
+/** THE BACKEND'S OWN ROW GEOMETRY, so the engine can check its copy against it.
  *
  * The packed KV row is defined TWICE -- PULSAR_ATTN_PACK_ROWBYTES(HD) in
  * src/cuda/pulsar_cuda_internal.h and PULSAR_ENGINE_ATTN_PACK_ROWBYTES in
@@ -866,7 +866,7 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        /* keep_f32: write the dequantised values back into the f32 staging.
+        /** keep_f32: write the dequantised values back into the f32 staging.
          * OBSERVER-ONLY -- consumers read the packed rows.  Pass
          * gpu_graph_f32_store_observed_any() (L094).
          *
@@ -876,7 +876,7 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
          * is a byte move. */
         bool              keep_f32);
 
-/* Fused rope + QAT for the indexer q projection: one launch replacing the
+/** Fused rope + QAT for the indexer q projection: one launch replacing the
  * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that
  * sequence (shared rotation device fn, same QAT body, same order). */
 int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
@@ -887,7 +887,7 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions);
 
-/* QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
+/** QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
  * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
  * bit-identical to the fused rope+QAT entry above. */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
@@ -896,7 +896,7 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         uint32_t          out_row0,
         uint32_t          n_rows,
         uint32_t          head_dim,
-        /* keep_f32: write the dequantised values back into the f32 staging.
+        /** keep_f32: write the dequantised values back into the f32 staging.
          * OBSERVER-ONLY -- consumers read the packed rows.  Pass
          * gpu_graph_f32_store_observed_any() (L094). */
         bool              keep_f32);
@@ -912,7 +912,7 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
  * drafter's, and the f32 batch buffer prefill handed attention for the current
  * chunk. None of the three is a format the source model uses. */
 
-/* As below, but also emits the grouped E4M3 encoding for the MX blocks this
+/** As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
  * half of the attn-output "a" activation: the fp16 attention epilogue emits
  * [0, head_dim - n_rot) and this emits the rest, because this kernel rewrites
@@ -957,7 +957,7 @@ int pulsar_gpu_rope_tail_tensor(
         float             beta_slow,
         const pulsar_gpu_tensor *positions);
 
-/* Release decode fused KV finalizer: after the standalone RoPE kernel, this
+/** Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
 int pulsar_gpu_kv_fp8_store_raw_tensor(
@@ -967,12 +967,12 @@ int pulsar_gpu_kv_fp8_store_raw_tensor(
         uint32_t          row,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        /* keep_f32: write the dequantised values back into the f32 staging.
+        /** keep_f32: write the dequantised values back into the f32 staging.
          * OBSERVER-ONLY -- consumers read the packed rows.  Pass
          * gpu_graph_f32_store_observed_any() (L094). */
         bool              keep_f32);
 
-/* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
+/** Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * pulsar_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
  * explicitly selected by the graph driver. */
 int pulsar_gpu_store_raw_kv_tensor(
@@ -982,7 +982,7 @@ int pulsar_gpu_store_raw_kv_tensor(
         uint32_t                row,
         uint32_t                head_dim);
 
-/* Banked mode (positions/seq_id non-NULL): row t stores to bank seq_id[t]'s
+/** Banked mode (positions/seq_id non-NULL): row t stores to bank seq_id[t]'s
  * ring at slot positions[t] %% raw_cap over the whole pool (raw_cache = the
  * bank slab, byte-bounded by n_banks); pos0 is ignored.  Dead rows (seq_id
  * out of pool) store nothing.  NULL/NULL/1 = classic consecutive store. */
@@ -997,7 +997,7 @@ int pulsar_gpu_store_raw_kv_batch_tensor(
         const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
 
-/* Same scatter, but the source rows are ALREADY PULSAR_ATTN_PACK.  Prefer this
+/** Same scatter, but the source rows are ALREADY PULSAR_ATTN_PACK.  Prefer this
  * wherever the caller has already packed the batch: re-quantising a buffer that
  * has been round-tripped is the ~5%-misround pattern the norm_kv header warns
  * about, and a byte copy makes the ring agree with what attention read by
@@ -1013,7 +1013,7 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(
         const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
 
-/* =========================================================================
+/** =========================================================================
  * KV Compression and Attention.
  * =========================================================================
  *
@@ -1062,7 +1062,7 @@ int pulsar_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens);
 
-/* L120 value-half: the ratio-4 two-group window shift as a standalone entry
+/** L120 value-half: the ratio-4 two-group window shift as a standalone entry
  * (the emit path runs it inside compressor_update).  The rewind-time window
  * replay re-runs store+shift over committed projections. */
 int pulsar_gpu_compressor_shift_ratio4_tensor(
@@ -1148,7 +1148,7 @@ int pulsar_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
+/** As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if
  * that tier actually ran and slots were supplied -- any other tier leaves it 0,
  * and the caller must not note() the activation cache in that case.  Note that
@@ -1176,7 +1176,7 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                head_dim,
         const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep);
 
-/* Batched decode attention.  The trailing descriptor quad enables multi-
+/** Batched decode attention.  The trailing descriptor quad enables multi-
  * session banked mode: positions/seq_id are int32 [n_tokens] DEVICE arrays
  * (row t's absolute query position and TRUE bank id), comp_cap is the
  * per-bank compressed-row stride and n_banks the pool size; the raw/comp KV
@@ -1336,7 +1336,7 @@ int pulsar_gpu_attention_output_low_tensor(
  * routing, shared SwiGLU, and the IQ2_XXS/Q2_K/MXFP4 routed experts.
  */
 
-/* SwiGLU over gate/up.  The result's E4M3 + E8M0 block-scale encoding is
+/** SwiGLU over gate/up.  The result's E4M3 + E8M0 block-scale encoding is
  * emitted from the epilogue into the activation-cache slots, so the shared_down
  * GEMM never runs a separate quantize pass over the mid tensor.  `mid_dim` is
  * the row width (the launch is flat over n = rows * mid_dim, so the MX row/col
@@ -1470,7 +1470,7 @@ int pulsar_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens);
 
-/* CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (PULSAR_TENSOR_CUTLASS_MXFP4, type 40).
+/** CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (PULSAR_TENSOR_CUTLASS_MXFP4, type 40).
  * out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T for T tokens ALL ROUTED TO ONE EXPERT
  * (the caller gathers per-expert rows via sorted_pairs before calling this, and scatters the
  * result back). Wg/Wu/Wd are that expert's CUTLASS-packed [data, then SF] blob pointers, sliced
@@ -1498,7 +1498,7 @@ int pulsar_cutlass_expert_ffn_scratch(
         uint8_t        *scratch,
         size_t          scratch_bytes);
 
-/* Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
+/** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
  * fp4-weight GEMV: one gate+up+swiglu launch and one down launch over all (token,expert)
  * slots, no sort, no host readback.  Activations are E4M3 (producer encoding when armed,
  * roundtripped from the f32 x otherwise) -- the same W4A8 operands as the grouped GEMM. down_out gets one pre-weighted FFN result
@@ -1538,7 +1538,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         const void     *act_sf,
         int             act_kbp);
 
-/* Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
+/** Grouped (ptr-array) MXFP4 prefill FFN: runs EVERY active expert's gate/up/down as a single
  * blockscaled grouped GEMM launch each -- replacing the per-expert host loop + blocking offsets
  * readback in routed_moe_launch_cutlass. Per-group problem shapes, A/B/D + SFA/SFB pointer arrays
  * and SF-layouts are built on device from `counts`/`padded_offsets`; there is no host readback.
@@ -1590,14 +1590,14 @@ int pulsar_cutlass_grouped_moe(
         int             act_kbp,
         const int32_t  *row_src_tok);
 
-/* Single-projection W4A8 GEMM for MIXED type-40 + iq2/q2k layers. Computes out[T,out_dim] =
+/** Single-projection W4A8 GEMM for MIXED type-40 + iq2/q2k layers. Computes out[T,out_dim] =
  * x[T,in_dim] . W[out_dim,in_dim]^T for ONE expert's type-40 CUTLASS weight (data at W_d, swizzled
  * SFB at W_sf), packing x to E4M3 dynamic block-scaled activations -- bit-identical to a single
  * projection of the uniform grouped path. Caller gathers x contiguously (T = tokens for that
  * expert) and sizes scratch once via pulsar_cutlass_proj_scratch_bytes(). No allocation, no sync. */
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim);
 
-/* Grouped single-projection W4A8 GEMM for MIXED layers -- one device-built ptr-array grouped GEMM
+/** Grouped single-projection W4A8 GEMM for MIXED layers -- one device-built ptr-array grouped GEMM
  * over 128-padded gathered activations: out[padded_total,out_dim] = x_gathered . W^T for every
  * active expert (W_base+e*W_stride data, +W_data_bytes swizzled SFB). No host readback, no per-expert
  * sync; bit-identical to the per-expert single-proj path (same pack + gather order + GEMM). Padding
@@ -1620,7 +1620,7 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
         const void *act_q, const void *act_sf, int act_kbp,
         const int32_t *row_src_tok);
 
-/* Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
+/** Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
  * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
 int pulsar_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
@@ -1631,11 +1631,11 @@ int pulsar_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *s
         const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
         int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
 
-/* Swizzled ue8m0 scale-factor element count for a CUTLASS B weight of shape (N,K);
+/** Swizzled ue8m0 scale-factor element count for a CUTLASS B weight of shape (N,K);
  * used by the offline repack CLI alongside pulsar_cutlass_pack_source. */
 size_t pulsar_cutlass_weight_sf_count(int N, int K);
 
-/* =========================================================================
+/** =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
  *
@@ -1652,7 +1652,7 @@ int pulsar_gpu_hc_weighted_sum_tensor(
         uint32_t                n_hc);
 
 
-/* Release decode fused HC pre-sublayer operation: split the HC mixer and
+/** Release decode fused HC pre-sublayer operation: split the HC mixer and
  * immediately reduce four HC streams into the active 4096-wide sublayer row. */
 int pulsar_gpu_hc_split_weighted_sum_tensor(
         pulsar_gpu_tensor       *out,
@@ -1668,7 +1668,7 @@ int pulsar_gpu_hc_split_weighted_sum_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
-/* Same, but also emits norm_out's E4M3 + swizzled E8M0 encoding (norm_out_q,
+/** Same, but also emits norm_out's E4M3 + swizzled E8M0 encoding (norm_out_q,
  * norm_out_sf, pitch norm_out_kbp) from the same registers that produce the f32
  * norm_out, so the MXFP8 consumers do not need a separate quantize pass over
  * the tensor.  Bit-exact: fmaxf is exact and max is order-independent, so any
@@ -1705,11 +1705,11 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps,
-        /* Storage of norm_w (attn_norm / ffn_norm): 1 = bf16, 0 = f32. */
+        /** Storage of norm_w (attn_norm / ffn_norm): 1 = bf16, 0 = f32. */
         int                     norm_w_bf16);
 
 
-/* Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
+/** Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
  * rms_norm_plain_tensor() followed by the matmul for `w_type`; see the kernel
  * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
  * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32. */
@@ -1722,7 +1722,7 @@ int pulsar_gpu_hc_norm_mix_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         float                   eps,
-        /* ds4 tensor type of the mix weight: 1 F16, 30 BF16, 0 F32.
+        /** ds4 tensor type of the mix weight: 1 F16, 30 BF16, 0 F32.
          * Templated rather than F16-gated -- the fusion is about avoiding a
          * scratch round trip, not about the weight being 2 bytes. */
         uint32_t                w_type);
@@ -1792,7 +1792,7 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-/* DSpark Markov + confidence heads */
+/** DSpark Markov + confidence heads */
 
 int pulsar_gpu_dspark_markov_chain_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
@@ -1834,7 +1834,7 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         uint32_t               n_hc,
         uint32_t               n_tokens);
 
-/* DSpark confidence head: per block position, confidence that the draft is
+/** DSpark confidence head: per block position, confidence that the draft is
  * accepted. hidden = post-hc_head drafter hidden [n_positions, hidden_dim];
  * token_ids = block token per position; markov_w1/proj resolved from the dspark
  * model map. Drives confidence-scheduled verification (sizing the draft length). */
@@ -1857,7 +1857,7 @@ int pulsar_gpu_dspark_confidence_score_model(
         int                     proj_bf16);
 
 
-/* ===========================================================================
+/** ===========================================================================
  * Wrong-arch build trap (checked at startup by pulsar_gpu_init).
  *
  * A plain `make` rebuilds stale CUDA objects WITHOUT CUDA_ARCH=sm_120f, so

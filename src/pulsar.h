@@ -64,10 +64,10 @@ typedef bool (*pulsar_session_cancel_fn)(void *ud);
 
 typedef struct {
     const char *model_path;
-    /* Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
+    /** Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
      * this opts out (memory saving for sampled-only workloads). */
     bool dspark_disable;
-    /* "FILE:PREFIX" — swap routed-expert tensors whose name starts with
+    /** "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
     const char *expert_overlay;
@@ -108,17 +108,17 @@ typedef struct {
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
 void pulsar_engine_close(pulsar_engine *e);
 void pulsar_engine_summary(pulsar_engine *e);
-/* Tokenizer table length. NOT the logits row width — see
+/** Tokenizer table length. NOT the logits row width — see
  * pulsar_engine_logits_width, and never size a logits buffer from this. */
 int pulsar_engine_vocab_size(pulsar_engine *e);
-/* Row width (in floats) of every logits buffer the engine writes: the shape
+/** Row width (in floats) of every logits buffer the engine writes: the shape
  * profile's n_vocab. Size logits buffers with THIS — it is the stride
  * pulsar_session_decode_multiseq writes its rows at, and the loader does not
  * check it against pulsar_engine_vocab_size. */
 int pulsar_engine_logits_width(const pulsar_engine *e);
 const char *pulsar_engine_model_name(pulsar_engine *e);
 
-/* DSpark speculative-decode counters for the server /metrics endpoint. All
+/** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often
  * draft position i was accepted; rate[i] = accepted_per_pos[i]/num_drafts. */
 typedef struct {
@@ -131,35 +131,35 @@ typedef struct {
     bool     has_dspark;            /* spec decode active */
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
-/* Per-session cumulative counters (accepted/draft/num_drafts/gen_tokens only;
+/** Per-session cumulative counters (accepted/draft/num_drafts/gen_tokens only;
  * accepted_per_pos left zero). Snapshot + diff across one request for a
  * per-response accept-rate the global engine counters cannot attribute under
  * concurrent decode. */
 void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out);
-/* Stable id for cache compatibility.  0 is the original Flash shape, so old
+/** Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int pulsar_engine_model_id(pulsar_engine *e);
-/* True when the loaded model is expert-pruned (REAP compact: some layers carry
+/** True when the loaded model is expert-pruned (REAP compact: some layers carry
  * fewer physical routed experts than the architecture's n_expert). Fidelity
  * tests against full-model reference vectors are meaningless when true. */
 bool pulsar_engine_is_pruned(pulsar_engine *e);
 const char *pulsar_backend_name(pulsar_backend backend);
 bool pulsar_think_mode_enabled(pulsar_think_mode mode);
 const char *pulsar_think_mode_name(pulsar_think_mode mode);
-/* The reasoning-effort prompt prefix rendered before the system message for
+/** The reasoning-effort prompt prefix rendered before the system message for
  * this mode ("" for NONE/LOW). Texts match the 0731 reference encoder. */
 const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
 const char *pulsar_think_max_prefix(void);
 uint32_t pulsar_think_max_min_context(void);
 pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size);
-/* Uses the active model shape selected by pulsar_engine_open(); call after opening
+/** Uses the active model shape selected by pulsar_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */
 pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
         pulsar_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
-/* Like pulsar_context_memory_estimate_with_prefill, but the persistent KV caches
+/** Like pulsar_context_memory_estimate_with_prefill, but the persistent KV caches
  * are sized with their real packed element/row widths (f16 raw + PULSAR_ATTN_PACK
  * attn comp + MXFP4 indexer) instead of the sizeof(float) upper bound.
  * WARNING: this covers ONLY the persistent KV rows plus a small scratch term —
@@ -171,31 +171,31 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
         pulsar_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
-/* TRUE total per-session GPU byte cost of pulsar_session_create(e, ctx_size):
+/** TRUE total per-session GPU byte cost of pulsar_session_create(e, ctx_size):
  * persistent KV caches + the full prefill working set (scaled by the engine's
  * prefill chunk) + speculative/DSpark drafter state when the engine has a
  * drafter loaded.  Shares sizing code with the graph allocator; this is the
  * number admission control must use.  Returns 0 if no session could be
  * created (no graph backend / weights not loaded). */
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size);
-/* Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
+/** Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
  * evaluates the (banks, ctx) fit table before committing PULSAR_MSEQ_BANKS. n_banks
  * >= 1; 1 is the classic single-session cost. */
 uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
                                               int n_banks);
-/* Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
+/** Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
  * context — the physical-on-touch VA the overcommit auto-size reserves but does
  * NOT charge at admission (only the eager floor is charged). 0 if no session
  * could be priced. */
 uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size);
-/* Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
+/** Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
  * KV bytes across the pool, summed from the per-bank compressor frontier
  * (deterministic; no MemAvailable). The eviction guard triggers on this; the
  * accounting-exactness gate proves it matches the physical cudaMemGetInfo delta.
  * For the current bank the live frontier is used; idle banks use their captured
  * frontier — capture the current bank first if you need it fully current. */
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
-/* Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
+/** Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
  * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
  * (reclaims physical on GB10); caller must have snapshotted the bank's KV to DISK
  * first (host RAM reclaims nothing on unified memory) and repointed away from it.
@@ -207,16 +207,16 @@ bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank);
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
-/* Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
+/** Raw per-bank comp/index KV disk snapshot (the eviction guard's bit-identical
  * mechanism; the D2H staging is transient — freed before free_physical). save:
  * precondition bank is installed (cur). load: reallocs physical + rebuilds the
  * base table + reinstalls counters, leaving bank installed. Return 0 on success. */
 int pulsar_session_bank_kv_save(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
 int pulsar_session_bank_kv_load(pulsar_session *s, uint32_t bank, FILE *fp, char *err, size_t errlen);
-/* Conservative per-bank comp/index growth over one q-token decode quantum (the
+/** Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
-/* Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
+/** Tier-2 PATH-A partial-prefix KV-reuse (plan-33 increment A) — FULL-PREFIX fork.
  * Clone bank `src`'s committed KV + host carry into bank `dst` (dst continues src's
  * conversation; the caller re-prefills only the divergent suffix). VALIDATES the
  * request tokens[0..n_cached) against src's committed history BEFORE any device
@@ -227,7 +227,7 @@ uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_
 int  pulsar_session_bank_fork(pulsar_session *s, uint32_t src, uint32_t dst,
                            const int *tokens, int n_tokens, int n_cached);
 bool pulsar_session_bank_fork_pinned(const pulsar_session *s, uint32_t bank);
-/* plan-33 increment C — PARTIAL-prefix fork: the request shares only
+/** plan-33 increment C — PARTIAL-prefix fork: the request shares only
  * tokens[0..n_cached) with src's history. Cuts at R = ((n_cached-4)/128)*128,
  * validates tokens[0..R+4) vs src BEFORE any device write, clones [0,R) (+ the
  * byte-stashed ratio-4 boundary row, emit-restored during the replay), and makes
@@ -249,7 +249,7 @@ enum {
 };
 int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t dst,
                                    const int *tokens, int n_tokens, int n_cached);
-/* Host-only feasibility probe for the partial fork: every check above EXCEPT the
+/** Host-only feasibility probe for the partial fork: every check above EXCEPT the
  * token compare (the caller already knows its common prefix) and the device copy.
  * Lets a scheduler route an infeasible cut (typically PULSAR_FORK_RING_SCROLLED
  * after a client compacts history) straight to a cold path instead of retrying a
@@ -257,12 +257,12 @@ int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t 
  * n_cached could proceed. Pure host reads; safe at routing time. */
 int  pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src,
                                             int n_cached);
-/* GPU bytes the session's create actually allocated (allocator delta measured
+/** GPU bytes the session's create actually allocated (allocator delta measured
  * across pulsar_session_create).  Reconcile against
  * pulsar_engine_session_cost_bytes after each create; commit this actual to any
  * memory ledger. */
 uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
-/* Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
+/** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
  * This competes with per-session KV for the unified-memory budget. */
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e);
@@ -310,10 +310,10 @@ int pulsar_token_assistant(pulsar_engine *e);
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size);
 void pulsar_session_free(pulsar_session *s);
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud);
-/* UI-only progress. It may report fine-grained progress inside a prefill chunk;
+/** UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud);
-/* Optional cooperative cancellation.  pulsar_session_sync() checks it only at
+/** Optional cooperative cancellation.  pulsar_session_sync() checks it only at
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns PULSAR_SESSION_SYNC_INTERRUPTED when it stops. */
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud);
@@ -326,7 +326,7 @@ typedef enum {
     PULSAR_SESSION_REWRITE_REBUILD_NEEDED = 1,
 } pulsar_session_rewrite_result;
 
-/* Synchronize the live session to a full prompt token prefix.  If the current
+/** Synchronize the live session to a full prompt token prefix.  If the current
  * checkpoint is a prefix, only the suffix is evaluated; otherwise the backend
  * state is refilled from scratch. */
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen);
@@ -336,7 +336,7 @@ pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
         char *err, size_t errlen);
 int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
 
-/* L115 — THE prefix-reuse authority.  Every "can this state serve this
+/** L115 — THE prefix-reuse authority.  Every "can this state serve this
  * prompt, and from which cut?" decision (routing, the worker's cache
  * resolver, session sync, and the bank fork validators) asks this and
  * nothing else.
@@ -376,7 +376,7 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
-/* Row-based twins of the two readers above (pulsar_sample_logits' relation to
+/** Row-based twins of the two readers above (pulsar_sample_logits' relation to
  * pulsar_session_sample): score a caller-supplied logits row.  The batched
  * decode entries return one row per bank and leave s->logits untouched by
  * contract, so a caller that samples from those rows must read its logprobs
@@ -388,7 +388,7 @@ int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n);
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
-/* Tier-2 batched multi-session decode (bank pool, PULSAR_MSEQ_BANKS >= 2): one
+/** Tier-2 batched multi-session decode (bank pool, PULSAR_MSEQ_BANKS >= 2): one
  * decode request per co-scheduled session, all advanced one token by ONE
  * weight sweep.  reqs[k] = {TRUE bank id, absolute position of `token`,
  * current input token}.
@@ -465,7 +465,7 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
  * is unobservable AND lets the head take the single-block identity path (no
  * two-block gather/resync, no wasted K-row prefill head GEMM). *out_n_rows is then
  * the emitted count (== min(n_runs, max_head_runs), with 0 meaning n_runs). */
-/* max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS (plan-34 inc 6): emit logits for
+/** max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS (plan-34 inc 6): emit logits for
  * EVERY row of the batch, logits row k == batch row k, *out_n_rows == n_rows.
  * This is the batched-speculative-verify contract: a run of K draft rows needs
  * all K logit rows for the accept walk, not just the run's last. The head takes
@@ -476,7 +476,7 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
                              uint32_t n_rows, float *logits, int logits_cap,
                              uint32_t *out_n_rows, uint32_t max_head_runs,
                              char *err, size_t errlen);
-/* Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
+/** Tier-2 unified bank model (server-facing).  A bank-pooled session's graph
  * hosts up to N co-scheduled conversations as banks; each server slot maps to a
  * bank id.  The pool size is chosen at session create (PULSAR_MSEQ_BANKS today);
  * pulsar_session_bank_count reports it (1 when not pooled).
@@ -499,7 +499,7 @@ int  pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank);
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank);
 
-/* plan-34 inc 6: batched speculative rounds. One ROUND verifies one bank's
+/** plan-34 inc 6: batched speculative rounds. One ROUND verifies one bank's
  * pending drafts against a forward the CALLER runs -- the fused classic loop
  * and the server's batched lane share every line of round logic; only the
  * forward differs (classic verify vs one shared decode_mixed ALL_ROWS step
@@ -519,7 +519,7 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank);
 typedef struct pulsar_spec_round pulsar_spec_round;
 pulsar_spec_round *pulsar_spec_round_new(void);
 void pulsar_spec_round_free(pulsar_spec_round *r);
-/* Upper bound on the rows the next round on the live bank will contribute to
+/** Upper bound on the rows the next round on the live bank will contribute to
  * a shared forward (1 base + pending drafts, before begin's trims). Check the
  * row budget against this BEFORE pulsar_session_spec_next_base: the base draw
  * consumes the carry, and a rejection-residual carry must be emitted exactly
@@ -531,13 +531,13 @@ uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
  * confidences to out[] and returns the pending count (0 = no saved state or
  * no pendings; the bank still gets its base row). The allocation these feed
  * is an UPPER bound on K -- round_begin's own validity trims still apply. */
-/* L112: the adaptive draft controller's current depth for a bank (live state
+/** L112: the adaptive draft controller's current depth for a bank (live state
  * for the live bank, saved carry otherwise; bank 0 in bankless sessions).
  * 0 = no drafter / nothing valid. Pure host read for metrics/monitoring. */
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank);
 uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
                                         float out[16]);
-/* The carry-or-sample base draw (the head of generate_speculative). Never
+/** The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
  * generate_speculative does. */
 int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
@@ -547,16 +547,16 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
                                  int first_token, int max_tokens, int accepted_cap,
                                  float temperature, int top_k, float top_p,
                                  float min_p, char *err, size_t errlen);
-/* Rows a begun round will occupy (1 + surviving drafts). Check the caller's
+/** Rows a begun round will occupy (1 + surviving drafts). Check the caller's
  * buffer space against this BEFORE fill_reqs -- fill_reqs writes this many
  * entries unconditionally. */
 uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
-/* Rows this round contributes to the shared forward: n_batch reqs
+/** Rows this round contributes to the shared forward: n_batch reqs
  * (first_token at the pre-round frontier, then the pending drafts). Returns
  * the row count written. */
 uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
                                   int first_token, pulsar_multiseq_req *out);
-/* Finish the round against the shared forward's logits block: `rows` points
+/** Finish the round against the shared forward's logits block: `rows` points
  * at the block, and this round's rows start at block row `row0` (row stride =
  * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
  * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
@@ -569,12 +569,12 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen);
 void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
-/* Arm (n_rows > 0) or disarm (0) the drafter anchor capture + Stage-B comp
+/** Arm (n_rows > 0) or disarm (0) the drafter anchor capture + Stage-B comp
  * saves for the NEXT batched forward -- the shared verify step saves every
  * row so each bank's round_end can consume its slice. Mirrors what the fused
  * loop does around its own forward. */
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
-/* Per-bank frontier readers for a bank-pooled session: the committed length,
+/** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live
  * checkpoint; others read their saved host carry).  pulsar_session_pos/_tokens/
@@ -586,7 +586,7 @@ int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
 int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
                                     const pulsar_tokens *prompt);
-/* Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
+/** Tier-2: reconcile the host checkpoint after a run of pulsar_session_decode_multiseq
  * steps advanced the LIVE (just bank_state_restore'd) bank's device KV frontier
  * without touching the host token history. Append the tokens multiseq committed,
  * in order, so pulsar_session_pos/_tokens/_common_prefix and any subsequent classic
@@ -605,14 +605,14 @@ int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void pulsar_session_invalidate(pulsar_session *s);
-/* Trim the committed history back to pos, keeping the KV below it live. For
+/** Trim the committed history back to pos, keeping the KV below it live. For
  * dropping trailing tokens the client never saw (mid-block speculative stop);
  * rewound rows are overwritten by the next prefill/eval. */
 void pulsar_session_rewind(pulsar_session *s, int pos);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);
-/* Multi-session serving: prefill quantum policy. A server that time-slices
+/** Multi-session serving: prefill quantum policy. A server that time-slices
  * prefill interrupts pulsar_session_sync() at chunk boundaries (via the cancel
  * callback) and re-issues the sync to resume. Returns the minimum remaining
  * suffix (target minus checkpoint, in tokens) that must still be pending for
@@ -625,13 +625,13 @@ bool pulsar_engine_has_dspark(pulsar_engine *e);
 int pulsar_engine_dspark_draft_tokens(pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
-/* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
+/** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 /* v3 (2026-08-11): the ATTN_PACK comp row's rope tail narrowed f32 -> bf16,
  * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
  * old stride, so it MUST be rejected rather than reinterpreted. */
-/* v4 (2026-08-17): the attn comp cache is stored as PULSAR_ATTN_PACK rows
+/** v4 (2026-08-17): the attn comp cache is stored as PULSAR_ATTN_PACK rows
  * rather than dequantised f32. v3 files are refused by the header check --
  * deliberately, since the row stride changed and a v3 file read as v4 would
  * decode noise into a KV cache rather than fail.
@@ -649,11 +649,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * cache rather than refusing to load.  The version still moves on format
  * changes -- this just means forgetting is no longer silent. */
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(7)  /* v7: unified NVFP4 rows -- raw AND comp strides changed (L111) */
-/* 13 shape/counters + 2 row strides (attn pack, indexer fp4). */
+/** 13 shape/counters + 2 row strides (attn pack, indexer fp4). */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 15u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
-/* stage_dir: directory for the transient staged file (the caller's disk
+/** stage_dir: directory for the transient staged file (the caller's disk
  * dir). NULL/"" falls back to /tmp -- avoid on tmpfs boxes, where staged
  * bytes are RAM (L110 F5). */
 int pulsar_session_stage_payload(pulsar_session *s, pulsar_session_payload_file *out,
