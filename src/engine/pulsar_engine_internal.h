@@ -1783,18 +1783,44 @@ struct pulsar_session {
      * pulsar_session_rewrite_requires_rebuild / _write_staged_payload /
      * _payload_file_free / _snapshot_free do not take a session and stay free. */
     static int create(pulsar_session **out, pulsar_engine *e, int ctx_size);
-    void destroy();                        /* was pulsar_session_free */
+    /** Tear down the session and release its GPU allocations. Behind pulsar_session_free(). */
+    void destroy();
+    /** Install the durable progress callback. Behind pulsar_session_set_progress(). */
     void set_progress(pulsar_session_progress_fn fn, void *ud);
+    /** Install the UI-only progress callback -- may fire mid-chunk, so it is NOT
+     * a durable KV checkpoint boundary. Behind pulsar_session_set_display_progress(). */
     void set_display_progress(pulsar_session_progress_fn fn, void *ud);
+    /** Install the cooperative cancellation hook, checked only at safe
+     * boundaries. Behind pulsar_session_set_cancel(). */
     void set_cancel(pulsar_session_cancel_fn fn, void *ud);
+    /** Copy out the cumulative speculative-decode counters. */
     void spec_metrics(pulsar_spec_metrics *out) const;
+    /** Resident KV bytes actually touched by the CURRENT bank -- the demand-paged
+     * figure, which is below the reserved capacity on a short session. */
     uint64_t touched_kv_bytes() const;
+
+    /* ---- Tier-2 bank pool: physical residency, spill, fork ---------------- */
+
+    /** Release one idle bank's ctx-scaled physical pages (cudaFree on its managed
+     * comp/index allocations). The only reclaim primitive that actually returns
+     * memory on GB10. The bank keeps its logical identity and can be re-armed
+     * with bank_alloc_physical(). @return false if the bank is live or pinned. */
     bool bank_free_physical(uint32_t bank);
+    /** Re-allocate physical for a previously freed bank, before installing it. */
     bool bank_alloc_physical(uint32_t bank);
+    /** True when the bank's physical has been released and its KV must be
+     * reloaded from disk before use. */
     bool bank_is_evicted(uint32_t bank) const;
+    /** touched_kv_bytes() for an arbitrary bank, live or idle. */
     uint64_t bank_touched_kv_bytes(uint32_t bank);
+    /** Write one bank's KV to `fp` bit-identically (the spill half of the
+     * eviction guard). @return 0 on success. */
     int bank_kv_save(uint32_t bank, FILE *fp, char *err, size_t errlen);
+    /** Reload a spilled bank's KV from `fp`, byte-for-byte. @return 0 on success. */
     int bank_kv_load(uint32_t bank, FILE *fp, char *err, size_t errlen);
+    /** Extra bytes ONE bank would demand-page in if the context grew to quantum
+     * `q` -- the admission question "can this session take another step" priced
+     * before committing to it. */
     uint64_t quantum_growth_bytes_per_bank(uint32_t q);
     int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
     bool bank_fork_pinned(uint32_t bank) const;
@@ -1806,29 +1832,62 @@ struct pulsar_session {
     int common_prefix(const pulsar_tokens *prompt);
     /** L115: the prefix-reuse authority (see pulsar.h). */
     void prefix_match(const pulsar_tokens *prompt, pulsar_prefix_match *out);
+    /** Highest-scoring token in the session's current logits row. */
     int argmax();
+    /** argmax() ignoring one id -- used to keep a forced continuation off EOS. */
     int argmax_excluding(int excluded_id);
+    /** Sample from the current logits with the given knobs. `rng` is advanced. */
     int sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+    /** Fill `out` with the k highest-logprob candidates. @return count written. */
     int top_logprobs(pulsar_token_score *out, int k);
+    /** Score one specific token from the current logits. */
     int token_logprob(int token, pulsar_token_score *out);
+    /** Copy the logits row out. Size `cap` with pulsar_engine_logits_width(),
+     * NOT with the tokenizer's vocab size. */
     int copy_logits(float *out, int cap);
+    /** Overwrite the session's logits row (replay/testing). */
     int set_logits(const float *logits, int n);
+    /** Decode ONE token at the session's current position and update the logits.
+     *
+     * Since L130 this runs the same batched step the server uses, as a 1-row
+     * batch on the session's own bank -- so there is no separate single-token
+     * kernel path any more. Fails loud when the session's per-bank state is
+     * stale (see mseq_dirty) rather than decoding against another bank's rows.
+     * @return 0 on success. */
     int eval(int token, char *err, size_t errlen);
     int decode_multiseq(const pulsar_multiseq_req *reqs, uint32_t n,
                         float *logits, int logits_cap, char *err, size_t errlen);
     int decode_mixed(const pulsar_multiseq_req *reqs, uint32_t n_rows,
                      float *logits, int logits_cap, uint32_t *out_n_rows,
                      uint32_t max_head_runs, char *err, size_t errlen);
+    /** Release the host-side per-bank carry (checkpoints, logits, pendings). */
     void bank_carry_free();
+    /** Number of banks in the pool; 1 when the pool is disabled. */
     int bank_count();
+    /** Point the graph's device views at `bank` and set cur_bank. Does NOT move
+     * host state -- bank_state_restore() is the full hand-off. */
     int bank_repoint(uint32_t bank);
+    /** Publish the live host+frontier state into `bank`'s slots. Callers pass the
+     * bank that is currently installed; the server does this when switching AWAY,
+     * which is what keeps idle banks' carry readable. */
     void bank_state_save(uint32_t bank);
+    /** Install `bank`: repoint device views, then restore its host carry. Clears
+     * the multiseq-poison flag. @return false if the bank cannot be installed. */
     bool bank_state_restore(uint32_t bank);
+    /** Committed token count for `bank`, live or idle. */
     int bank_pos(uint32_t bank);
-    int bank_spec_depth(uint32_t bank);   /* L112: adaptive depth, live-or-carry */
+    /** Adaptive draft depth for `bank`, read from the live state or its carry. */
+    int bank_spec_depth(uint32_t bank);
+    /** Borrowed view of `bank`'s committed token history. Do not free. */
     const pulsar_tokens *bank_tokens(uint32_t bank);
+    /** Longest common token prefix between `bank`'s history and `prompt`. */
     int bank_common_prefix(uint32_t bank, const pulsar_tokens *prompt);
+    /** Byte-level prefix match against `bank` -- the seam-aware form that reports
+     * live-side and prompt-side cuts separately (see pulsar_prefix_match). */
     void bank_prefix_match(uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out);
+    /** Append tokens to the session's checkpoint WITHOUT decoding them: for
+     * callers that committed rows through a batched step and must now bring the
+     * host history back in line with the KV. */
     void note_committed_tokens(const int *toks, int n);
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng, int max_tokens, int eos_token,
