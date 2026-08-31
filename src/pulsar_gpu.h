@@ -358,15 +358,15 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * Carries only the launch-invariant shape; pos0/positions stay the wrapper
  * params they already are. */
 typedef struct {
-    float eps;
-    uint32_t n_rot;
-    uint32_t n_ctx_orig;
-    float freq_base;
-    float freq_scale;
-    float ext_factor;
-    float attn_factor;
-    float beta_fast;
-    float beta_slow;
+    float eps;             ///< RMS-norm epsilon
+    uint32_t n_rot;        ///< rotary dimensions at the head's tail
+    uint32_t n_ctx_orig;   ///< context length the RoPE settings were trained at
+    float freq_base;       ///< RoPE base frequency
+    float freq_scale;      ///< linear frequency scaling (position interpolation)
+    float ext_factor;      ///< YaRN extrapolation mix; 0 disables it
+    float attn_factor;     ///< YaRN attention temperature correction
+    float beta_fast;       ///< YaRN ramp start, in rotations per context
+    float beta_slow;       ///< YaRN ramp end, in rotations per context
 } pulsar_gpu_q_prep;
 
 /** True when the fp16 attention tier will take eligible batches (env tier on

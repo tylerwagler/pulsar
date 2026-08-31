@@ -5,15 +5,20 @@
 #include <string.h>
 #include <unistd.h>
 
+/** SGR escape sequences for help output.
+ *
+ * Every field is an empty string when the sink is not a TTY, so the printers
+ * interpolate them unconditionally and colour disappears from a pipe without a
+ * single conditional at the call sites. */
 typedef struct {
-    const char *off;
-    const char *cyan;
-    const char *title;
-    const char *yellow;
-    const char *grey;
-    const char *red;
-    const char *white;
-    const char *bright;
+    const char *off;     ///< reset
+    const char *cyan;    ///< flags and option names
+    const char *title;   ///< section headings
+    const char *yellow;  ///< argument placeholders
+    const char *grey;    ///< de-emphasised detail
+    const char *red;     ///< warnings
+    const char *white;   ///< body text
+    const char *bright;  ///< emphasis
 } help_colors;
 
 static help_colors help_make_colors(FILE *fp) {

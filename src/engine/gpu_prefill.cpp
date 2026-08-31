@@ -467,21 +467,24 @@ static bool gpu_graph_q_stage_profile_boundary(
 
 
 
-/* One indexed-attention span: indexer score -> top-k -> indexed attention over
- * rows [s0, s0+sn) of the batch.  Shared by the chunked and zero-prefix loops,
- * which ran identical bodies over different operand sets.
+/** Operand set for one indexed-attention span: indexer score -> top-k ->
+ * indexed attention over rows [s0, s0+sn) of the batch.
  *
- * `mseq` controls only whether per-span descriptor views are built; every other
- * multiseq difference is already resolved into `op` by the caller. */
+ * Exists to collapse two loops into one body. The chunked and zero-prefix
+ * paths ran identical logic over different operands, so the CALLER resolves
+ * every multiseq difference into this struct and the span code stays single-
+ * form. `mseq` is the one exception -- it controls only whether per-span
+ * descriptor views get built.
+ */
 struct gpu_graph_span_ops {
-    pulsar_gpu_tensor       *comp_src;      /* attention comp-cache operand   */
-    pulsar_gpu_tensor       *raw_src;       /* raw KV cache operand           */
-    pulsar_gpu_tensor       *index_src;     /* indexer comp-cache operand     */
-    const pulsar_gpu_tensor *index_bases;   /* per-bank base table, or NULL   */
-    const pulsar_gpu_tensor *comp_bases;    /* per-bank base table, or NULL   */
-    uint32_t                 comp_cap;      /* per-bank stride, 0 when scalar */
-    uint32_t                 n_banks;       /* 1 when scalar                  */
-    bool                     mseq;
+    pulsar_gpu_tensor       *comp_src;  ///< attention comp-cache operand
+    pulsar_gpu_tensor       *raw_src;  ///< raw KV cache operand
+    pulsar_gpu_tensor       *index_src;  ///< indexer comp-cache operand
+    const pulsar_gpu_tensor *index_bases;  ///< per-bank base table, or NULL
+    const pulsar_gpu_tensor *comp_bases;  ///< per-bank base table, or NULL
+    uint32_t                 comp_cap;  ///< per-bank stride, 0 when scalar
+    uint32_t                 n_banks;  ///< 1 when scalar
+    bool                     mseq;          ///< build per-span descriptor views for the banked path
 };
 
 static bool gpu_graph_indexed_attention_span(
@@ -764,7 +767,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                   (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float))
             : NULL;
     pulsar_gpu_tensor *after_attn_hc_view = pulsar_gpu_tensor_view(
-            g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
+            g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);  ///< carrier
     bool ok = hc_mix_view && hc_split_view && after_attn_hc_view &&
               (attn_cur_view || !g->batch_attn_cur);
     /* The f16 activation slot and its flat_hc_skip_f32 companion are gone with
@@ -1016,7 +1019,7 @@ bool gpu_graph_encode_layer_attention_batch(
             g->q_prep.beta_fast = PULSAR_ROPE_YARN_BETA_FAST;
             g->q_prep.beta_slow = PULSAR_ROPE_YARN_BETA_SLOW;
             g->q_prep_active = 1;
-            prefill_q_norm_rope_fused = true;   /* deferred into attention */
+            prefill_q_norm_rope_fused = true;  ///< deferred into attention
         } else if (ok) {
             prefill_q_norm_rope_fused =
                 pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
@@ -2447,7 +2450,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     pulsar_gpu_tensor *next_hc_view = pulsar_gpu_tensor_view(
-            g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);   /* carrier */
+            g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);  ///< carrier
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
     void *ffn_norm_b = NULL;

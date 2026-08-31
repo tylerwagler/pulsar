@@ -668,11 +668,17 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
  *
  * Called by all 128 threads of the block, after the kernels' own bounds check --
  * the __syncthreads() below are as uniform here as they were when inlined. */
+/** One thread's result from the shared Hadamard + block-absmax step.
+ *
+ * Returned by value so the packing and non-packing indexer kernels can share
+ * ONE copy of that code -- see the note above: the packing kernel's contract is
+ * a bit-identical f32 result, and two hand-kept copies is exactly how such a
+ * contract rots silently. */
 struct indexer_had_t {
-    float    v;           /* this thread's transformed value */
-    uint32_t fp4_block;   /* which 32-wide FP4 block it lands in */
-    uint32_t lane;        /* its lane within that block */
-    uint32_t block_base;  /* absbuf[block_base] holds the block's absmax */
+    float    v;           ///< this thread's transformed value
+    uint32_t fp4_block;   ///< which 32-wide FP4 block it lands in
+    uint32_t lane;        ///< its lane within that block
+    uint32_t block_base;  ///< absbuf[block_base] holds the block's absmax
 };
 
 __device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
@@ -1907,13 +1913,19 @@ static inline float __uint_as_float_host(unsigned int b) {
     float f; memcpy(&f, &b, sizeof(f)); return f;
 }
 
+/** Device-side magnitude census for one tensor -- see the note above for what
+ * it is deciding.
+ *
+ * The extremes are kept as float BIT PATTERNS rather than floats because the
+ * reduction is done with integer atomics: for non-negative values the IEEE-754
+ * bit pattern is monotonic in the value, so an integer max IS a float max. */
 struct pulsar_range_stats_dev {
-    unsigned int amax_bits;      /* __float_as_uint of max|v| (monotonic for >=0) */
-    unsigned int amin_bits;      /* ... of min nonzero |v| */
-    unsigned long long n_over;   /* |v| > 65504 */
-    unsigned long long n_sub;    /* 0 < |v| < 6.1035e-5 */
-    unsigned long long n_inf;    /* +/-inf (representable in f16) */
-    unsigned long long n_nan;    /* NaN (a different problem entirely) */
+    unsigned int amax_bits;      ///< __float_as_uint of max|v| (monotonic for >=0)
+    unsigned int amin_bits;      ///< ... of min nonzero |v|
+    unsigned long long n_over;   ///< |v| > 65504, above f16 max
+    unsigned long long n_sub;    ///< 0 < |v| < 6.1035e-5, f16-subnormal territory
+    unsigned long long n_inf;    ///< +/-inf (representable in f16)
+    unsigned long long n_nan;    ///< NaN (a different problem entirely)
 };
 
 /* T is the tensor's STORED element type.  These two diagnostics used to cast
