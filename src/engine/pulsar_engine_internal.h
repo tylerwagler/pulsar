@@ -324,7 +324,7 @@ typedef struct {
 typedef pulsar_tokens token_vec;
 
 typedef struct {
-    const uint8_t *base;
+    const uint8_t *base;                                ///< weight bytes for this expert/row block, inside the model mapping
     uint64_t size;
     uint64_t pos;
     char error[256];
@@ -456,15 +456,17 @@ static inline bool pulsar_weight_is_plain_or_mxfp8(uint32_t type) {
            type == PULSAR_TENSOR_MXFP8_LT;
 }
 
+/** One entry of the GGUF tensor directory: where a tensor lives and how to
+ * read it. Describes bytes inside the model mapping; owns nothing. */
 typedef struct {
-    pulsar_str name;
-    uint32_t ndim;
-    uint64_t dim[PULSAR_MAX_DIMS];
-    uint32_t type;
-    uint64_t rel_offset;
-    uint64_t abs_offset;
-    uint64_t elements;
-    uint64_t bytes;
+    pulsar_str name;      ///< tensor name as it appears in the GGUF
+    uint32_t ndim;        ///< number of used entries in dim[]
+    uint64_t dim[PULSAR_MAX_DIMS];  ///< extents, fastest-varying first
+    uint32_t type;        ///< storage type (see the PULSAR_TENSOR_* family)
+    uint64_t rel_offset;  ///< offset from the file's tensor-data section start
+    uint64_t abs_offset;  ///< offset from the start of the mapping -- what the kernels take
+    uint64_t elements;    ///< product of dim[0..ndim)
+    uint64_t bytes;       ///< on-disk size, quantisation included
     /** Set only when this entry was swapped in from an overlay GGUF
      * (--expert-overlay): the payload lives at ext_map + abs_offset inside
      * the overlay file's mapping instead of the owning model's map. */
@@ -565,27 +567,34 @@ typedef struct {
     pulsar_layer_weights layer[PULSAR_MAX_LAYER];
 } pulsar_weights;
 
+/** DSpark drafter weights: the small model that proposes tokens for the target
+ * to verify. Shipped inside the same GGUF as `dspark.*` tensors, so a drafter
+ * is present or absent per artifact rather than per run.
+ *
+ * It reads the TARGET's hidden states at three anchor layers
+ * (target_layer_ids) rather than running its own full stack -- which is why the
+ * graph captures those hiddens during the target forward. */
 typedef struct {
-    pulsar_tensor *main_proj;
-    pulsar_tensor *main_norm;
-    pulsar_layer_weights layer[3];
-    pulsar_tensor *markov_w1;
-    pulsar_tensor *markov_w2;
-    pulsar_tensor *confidence_proj;
-    pulsar_tensor *hc_head_base;
-    pulsar_tensor *hc_head_fn;
-    pulsar_tensor *hc_head_scale;
-    pulsar_tensor *final_norm;
-    uint32_t embed_dim;
-    uint32_t vocab_size;
-    uint32_t target_layer_ids[3];
+    pulsar_tensor *main_proj;   ///< projects captured target hiddens into the drafter's width
+    pulsar_tensor *main_norm;   ///< RMSNorm on that projection
+    pulsar_layer_weights layer[3];  ///< the drafter's own three transformer layers
+    pulsar_tensor *markov_w1;   ///< Markov head, first projection (cheap next-token prior)
+    pulsar_tensor *markov_w2;   ///< Markov head, second projection
+    pulsar_tensor *confidence_proj;  ///< confidence head: scores how likely a draft is to be accepted, feeding the adaptive-depth controller
+    pulsar_tensor *hc_head_base;     ///< HC collapse for the drafter's output head, base
+    pulsar_tensor *hc_head_fn;       ///< HC collapse mix weight
+    pulsar_tensor *hc_head_scale;    ///< HC collapse per-channel scale
+    pulsar_tensor *final_norm;       ///< RMSNorm before the drafter's vocab projection
+    uint32_t embed_dim;              ///< drafter hidden width
+    uint32_t vocab_size;             ///< drafter output width; must match the target's logits width
+    uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
 } pulsar_dspark_weights;
 
 typedef struct {
-    float *out;
+    float *out;                                         ///< destination row(s), f32
     const uint16_t *data;
     const float *x;
-    uint64_t in_dim;
+    uint64_t in_dim;                                    ///< input width (K)
 } matvec_f16_ctx;
 
 /** THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
@@ -605,17 +614,17 @@ typedef struct {
 
 typedef struct {
     const float *x;
-    int8_t *xq;
+    int8_t *xq;                                         ///< quantised activation row the kernel multiplies against
     float *xscale;
-    uint64_t in_dim;
+    uint64_t in_dim;                                    ///< input width (K)
     uint64_t blocks;
 } quantize_q8_0_batch_ctx;
 
 typedef struct {
-    float *out;
+    float *out;                                         ///< destination row(s), f32
     const float *data;
     const float *x;
-    uint64_t in_dim;
+    uint64_t in_dim;                                    ///< input width (K)
 } matvec_f32_ctx;
 
 typedef struct {
@@ -623,8 +632,8 @@ typedef struct {
     float *out1;
     const uint8_t *base0;
     const uint8_t *base1;
-    const block_q8_K *xq;
-    uint64_t in_dim;
+    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
+    uint64_t in_dim;                                    ///< input width (K)
     uint64_t row_bytes0;
     uint64_t row_bytes1;
 } matvec_iq2_xxs_pair_ctx;
@@ -633,31 +642,31 @@ typedef struct {
     float *mid;
     const uint8_t *gate_base[PULSAR_MAX_EXPERT_USED];
     const uint8_t *up_base[PULSAR_MAX_EXPERT_USED];
-    const block_q8_K *xq;
-    float expert_weight[PULSAR_MAX_EXPERT_USED];
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT_USED];
-    uint64_t up_row_bytes[PULSAR_MAX_EXPERT_USED];
-    int n_expert;
+    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
+    float expert_weight[PULSAR_MAX_EXPERT_USED];        ///< router mixing weight applied per expert
+    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t out_dim;                                   ///< output width (N)
+    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT_USED];    ///< row stride of the expert's gate projection
+    uint64_t up_row_bytes[PULSAR_MAX_EXPERT_USED];      ///< row stride of the expert's up projection
+    int n_expert;                                       ///< number of experts addressed by this call
 } matvec_iq2_xxs_mid_ctx;
 
 typedef struct {
-    float *out;
-    const uint8_t *base;
-    const block_q8_K *xq;
-    uint64_t in_dim;
-    uint64_t row_bytes;
+    float *out;                                         ///< destination row(s), f32
+    const uint8_t *base;                                ///< weight bytes for this expert/row block, inside the model mapping
+    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t row_bytes;                                 ///< stride between weight rows, quantisation included
 } matvec_q2_k_ctx;
 
 typedef struct {
-    float *out;
-    const uint8_t *base[PULSAR_MAX_EXPERT_USED];
-    const block_q8_K *xq[PULSAR_MAX_EXPERT_USED];
-    uint64_t in_dim;
-    uint64_t row_bytes[PULSAR_MAX_EXPERT_USED];
-    int n_expert;
+    float *out;                                         ///< destination row(s), f32
+    const uint8_t *base[PULSAR_MAX_EXPERT_USED];        ///< weight bytes for this expert/row block, inside the model mapping
+    const block_q8_K *xq[PULSAR_MAX_EXPERT_USED];       ///< quantised activation row the kernel multiplies against
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t row_bytes[PULSAR_MAX_EXPERT_USED];         ///< stride between weight rows, quantisation included
+    int n_expert;                                       ///< number of experts addressed by this call
 } matvec_q2_k_accum_ctx;
 
 typedef struct {
@@ -669,54 +678,54 @@ typedef struct {
     float *mid;
     const uint8_t *gate_base[PULSAR_MAX_EXPERT];
     const uint8_t *up_base[PULSAR_MAX_EXPERT];
-    const block_q8_K *xq;
-    const pulsar_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
+    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
+    const pulsar_expert_pair *pairs;                    ///< number of (token, expert) pairs in this batch
+    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
+    const uint32_t *expert_offset;                      ///< first expert id this call covers
     const uint32_t *active_expert;
     const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT];
-    uint64_t up_row_bytes[PULSAR_MAX_EXPERT];
+    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t out_dim;                                   ///< output width (N)
+    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT];         ///< row stride of the expert's gate projection
+    uint64_t up_row_bytes[PULSAR_MAX_EXPERT];           ///< row stride of the expert's up projection
     uint64_t xq_blocks;
 } matvec_iq2_xxs_batch_mid_ctx;
 
 typedef struct {
     float *down_pair;
-    const uint8_t *base[PULSAR_MAX_EXPERT];
-    const block_q8_K *midq;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
+    const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
+    const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
+    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
+    const uint32_t *expert_offset;                      ///< first expert id this call covers
     const uint32_t *active_expert;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[PULSAR_MAX_EXPERT];
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t out_dim;                                   ///< output width (N)
+    uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
     uint64_t midq_blocks;
 } matvec_q2_k_batch_down_ctx;
 
 typedef struct {
-    float *moe;
-    const uint8_t *base[PULSAR_MAX_EXPERT];
-    const block_q8_K *midq;
-    const pulsar_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
+    float *moe;                                         ///< the MoE sub-context this call belongs to
+    const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
+    const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
+    const pulsar_expert_pair *pairs;                    ///< number of (token, expert) pairs in this batch
+    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
+    const uint32_t *expert_offset;                      ///< first expert id this call covers
     const uint32_t *active_expert;
     uint32_t n_active;
     uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[PULSAR_MAX_EXPERT];
+    uint64_t in_dim;                                    ///< input width (K)
+    uint64_t out_dim;                                   ///< output width (N)
+    uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
     uint64_t midq_blocks;
 } matvec_q2_k_batch_accum_rows_ctx;
 
 typedef struct {
-    float *moe;
+    float *moe;                                         ///< the MoE sub-context this call belongs to
     const float *down_pair;
     uint32_t n_tok;
-    uint64_t out_dim;
+    uint64_t out_dim;                                   ///< output width (N)
 } sum_down_pairs_ctx;
 
 
@@ -738,11 +747,11 @@ typedef struct {
     const float *gate;
     const float *up;
     uint64_t n;
-    float clamp;
+    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
 } swiglu_batch_ctx;
 
 typedef struct {
-    float *moe;
+    float *moe;                                         ///< the MoE sub-context this call belongs to
     const pulsar_model *model;
     const pulsar_layer_weights *layer;
     const float *norm;
