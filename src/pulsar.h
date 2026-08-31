@@ -38,16 +38,22 @@ typedef enum {
     PULSAR_LOG_ERROR,
 } pulsar_log_type;
 
+/** Growable token vector. Owns `v`; free with pulsar_tokens_free().
+ *
+ * `len` is the token count, `cap` the allocated slots. Many APIs accept a
+ * borrowed view built by pointing `v` at someone else's buffer and setting
+ * len == cap -- see the prefix helpers -- in which case it must NOT be freed. */
 typedef struct {
-    int *v;
-    int len;
-    int cap;
+    int *v;    ///< token ids, `cap` slots allocated, `len` in use
+    int len;   ///< number of valid tokens
+    int cap;   ///< allocated capacity in tokens
 } pulsar_tokens;
 
+/** One scored candidate token, as returned by the top-k/logprob helpers. */
 typedef struct {
-    int id;
-    float logit;
-    float logprob;
+    int id;         ///< token id
+    float logit;    ///< raw pre-softmax score
+    float logprob;  ///< natural log of the softmax probability
 } pulsar_token_score;
 
 #define PULSAR_DEFAULT_TEMPERATURE 1.0f
@@ -62,8 +68,10 @@ typedef bool (*pulsar_session_cancel_fn)(void *ud);
 
 #define PULSAR_SESSION_SYNC_INTERRUPTED 2
 
+/** Options for pulsar_engine_open(). Zero-initialise, then set what you need:
+ * every field's 0/NULL is a working default except `model_path`. */
 typedef struct {
-    const char *model_path;
+    const char *model_path;   ///< GGUF path; required
     /** Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
      * this opts out (memory saving for sampled-only workloads). */
     bool dspark_disable;
@@ -71,38 +79,48 @@ typedef struct {
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
     const char *expert_overlay;
-    pulsar_backend backend;
-    int n_threads;
-    uint32_t prefill_chunk;
-    int dspark_draft_tokens;
-    const char *directional_steering_file;
-    float directional_steering_attn;
-    float directional_steering_ffn;
-    bool inspect_only;
+    pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
+    int n_threads;               ///< CPU helper threads for host-side work
+    uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default
+    int dspark_draft_tokens;     ///< drafter depth k; 0 = model/engine default
+    const char *directional_steering_file;  ///< steering-vector file, or NULL
+    float directional_steering_attn;        ///< steering scale on the attention stream
+    float directional_steering_ffn;         ///< steering scale on the FFN stream
+    bool inspect_only;           ///< load and report, then stop: no session/graph allocation
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
 typedef void (*pulsar_generation_done_fn)(void *ud);
 
+/** GPU byte breakdown for one session at a given context size.
+ *
+ * Produced by pulsar_context_memory_estimate_packed(). For the number ADMISSION
+ * CONTROL must use, prefer pulsar_engine_session_cost_bytes(), which adds the
+ * prefill working set and drafter state on top of the persistent caches. */
 typedef struct {
-    uint64_t total_bytes;
-    uint64_t raw_bytes;
-    uint64_t compressed_bytes;
-    uint64_t scratch_bytes;
-    uint32_t prefill_cap;
-    uint32_t raw_cap;
-    uint32_t comp_cap;
+    uint64_t total_bytes;       ///< sum of the byte fields below
+    uint64_t raw_bytes;         ///< persistent raw (uncompressed) KV ring
+    uint64_t compressed_bytes;  ///< persistent compressed KV pool
+    uint64_t scratch_bytes;     ///< transient per-step working buffers
+    uint32_t prefill_cap;       ///< max tokens in one prefill chunk
+    uint32_t raw_cap;           ///< raw ring capacity, in rows
+    uint32_t comp_cap;          ///< compressed pool capacity, in rows
 } pulsar_context_memory;
 
+/** Serialized session state (KV + host bookkeeping) as an owned byte blob.
+ *
+ * Produced by the snapshot API and consumed by the restore API; the format is
+ * versioned and refuses payloads written by an incompatible build. */
 typedef struct {
-    uint8_t *ptr;
-    uint64_t len;
-    uint64_t cap;
+    uint8_t *ptr;   ///< owned buffer, `cap` bytes allocated
+    uint64_t len;   ///< bytes actually used
+    uint64_t cap;   ///< allocated capacity in bytes
 } pulsar_session_snapshot;
 
+/** An on-disk session payload: where it landed and how large it is. */
 typedef struct {
-    char *path;
-    uint64_t bytes;
+    char *path;      ///< owned path string; free with the payload API
+    uint64_t bytes;  ///< file size in bytes
 } pulsar_session_payload_file;
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
@@ -122,13 +140,13 @@ const char *pulsar_engine_model_name(pulsar_engine *e);
  * cumulative/monotonic since engine open. accepted_per_pos[i] counts how often
  * draft position i was accepted; rate[i] = accepted_per_pos[i]/num_drafts. */
 typedef struct {
-    uint64_t accepted_tokens;       /* accepted draft tokens */
-    uint64_t draft_tokens;          /* proposed/verified draft tokens */
-    uint64_t num_drafts;            /* draft rounds (verify steps with drafts) */
-    uint64_t gen_tokens;            /* tokens emitted by the spec loop */
-    uint64_t accepted_per_pos[16];  /* accepted count per draft position */
-    int      max_draft;             /* configured draft depth (dspark_draft_tokens) */
-    bool     has_dspark;            /* spec decode active */
+    uint64_t accepted_tokens;       ///< accepted draft tokens
+    uint64_t draft_tokens;          ///< proposed/verified draft tokens
+    uint64_t num_drafts;            ///< draft rounds (verify steps carrying drafts)
+    uint64_t gen_tokens;            ///< tokens emitted by the spec loop
+    uint64_t accepted_per_pos[16];  ///< accepted count per draft position; rate[i] = accepted_per_pos[i]/num_drafts
+    int      max_draft;             ///< configured draft depth (pulsar_engine_options::dspark_draft_tokens)
+    bool     has_dspark;            ///< true when speculative decode is active
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
 /** Per-session cumulative counters (accepted/draft/num_drafts/gen_tokens only;
@@ -355,9 +373,9 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
  * them is the hazard this struct exists to make impossible — a live-side
  * count used to index the request array can run past its end. */
 typedef struct {
-    int  live_cut;    /* live tokens whose bytes the prompt covers */
-    int  prompt_cut;  /* prompt tokens covering those same bytes */
-    bool seamed;      /* ids disagreed inside the covered region */
+    int  live_cut;    ///< live/bank-side token count: KV rows, cut points, rewind targets
+    int  prompt_cut;  ///< request-side token count for the SAME bytes: accounting, prefill bounds
+    bool seamed;      ///< token ids disagreed inside the covered region (same bytes, different split)
 } pulsar_prefix_match;
 
 void pulsar_tokens_prefix_match(pulsar_engine *e,
@@ -435,10 +453,15 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
  *
  * Returns 0 on success; 1 on a recoverable rejection (bad args/contract; no
  * state mutated); -1 on a fatal mid-sweep failure (tear the session down). */
+/** One row of a batched decode step: decode `token` for `bank` at `pos`.
+ *
+ * Rows for the same bank must be contiguous and consecutive in `pos`, and every
+ * batched bank's compressor frontier must be position-true on entry -- the
+ * driver rejects the step otherwise rather than corrupting KV. */
 typedef struct {
-    uint32_t bank;   /* TRUE bank id in the session's pool */
-    int32_t  pos;    /* absolute position of `token` (bank's committed length) */
-    int      token;  /* input token id decoded at `pos` */
+    uint32_t bank;   ///< TRUE bank id in the session's pool
+    int32_t  pos;    ///< absolute position of `token` (the bank's committed length)
+    int      token;  ///< input token id decoded at `pos`
 } pulsar_multiseq_req;
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
