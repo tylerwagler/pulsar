@@ -247,35 +247,41 @@ typedef struct {
 } tool_replay_stats;
 
 typedef struct {
-    char *name;
-    char *wire_name;
-    char *tool_namespace;
+    char *name;            ///< tool name as the model sees it, owned
+    char *wire_name;       ///< name as the client sent it, owned; these can differ
+    char *tool_namespace;  ///< namespace qualifying the tool, owned; NULL when none
     /** Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
     /** Anthropic web_search server tool: the SERVER executes calls to this
      * name mid-request (web_search.cpp); they never stop the turn. */
     bool server_web_search;
-    char **prop;
-    int len;
-    int cap;
+    char **prop;  ///< property names in DECLARED order, owned
+    int len;      ///< properties present
+    int cap;      ///< properties allocated
 } tool_schema_order;
 
+/** Declaration order for every tool in a request.
+ *
+ * Order is preserved because the rendered prompt must be byte-stable: JSON
+ * objects are unordered, but a re-render that permutes properties produces
+ * different bytes, and different bytes miss the prefix cache. */
 typedef struct {
-    tool_schema_order *v;
-    int len;
-    int cap;
+    tool_schema_order *v;  ///< one entry per declared tool
+    int len;               ///< tools present
+    int cap;               ///< tools allocated
 } tool_schema_orders;
 
+/** One message in a chat request, after parsing and before rendering. */
 typedef struct {
-    char *role;
-    char *content;
-    char *reasoning;
-    char *tool_call_id;
-    char **tool_call_ids;
-    int tool_call_ids_len;
-    int tool_call_ids_cap;
-    tool_calls calls;
+    char *role;           ///< "system", "user", "assistant", or "tool", owned
+    char *content;        ///< message text, owned
+    char *reasoning;      ///< the assistant's reasoning for this turn, owned; NULL when absent
+    char *tool_call_id;   ///< for a tool-result message, the call it answers, owned
+    char **tool_call_ids; ///< for a multi-result message, the calls it answers, owned
+    int tool_call_ids_len;  ///< ids present
+    int tool_call_ids_cap;  ///< ids allocated
+    tool_calls calls;     ///< for an assistant message, the calls it made
     /** True when this system-role entry carries the request's top-level
      * system/instructions FIELD (the parser appends it to the array). Field
      * content always renders in the system region; inline role:system
@@ -284,10 +290,11 @@ typedef struct {
     bool system_field;
 } chat_msg;
 
+/** A parsed conversation. */
 typedef struct {
-    chat_msg *v;
-    int len;
-    int cap;
+    chat_msg *v;  ///< the messages, in request order
+    int len;      ///< messages present
+    int cap;      ///< messages allocated
 } chat_msgs;
 
 typedef struct {
@@ -385,17 +392,25 @@ typedef struct {
  * hand (the session's own logits, or one row of a batched step's output) and
  * only later feeds it to gen_emit_token, so capture happens at the draw and is
  * consumed at the emit.  Exactly one token is ever in flight per slot. */
+/** Per-token logprobs for one request, captured at the draw and consumed at
+ * the emit.
+ *
+ * The split matters: the sampler has the distribution in hand and the emitter
+ * does not, so the `pending_*` fields hold exactly one token's worth of data
+ * between those two points. Exactly one token is ever in flight per slot,
+ * which is why one pending slot suffices rather than a queue.
+ */
 typedef struct {
-    bool enabled;
+    bool enabled;     ///< the client asked for logprobs
     int  top_k;  ///< client's top_logprobs, 0..PULSAR_SERVER_MAX_TOP_LOGPROBS
-    logprob_entry *v;
-    int  len;
-    int  cap;
+    logprob_entry *v; ///< committed entries, one per emitted token
+    int  len;         ///< entries present
+    int  cap;         ///< entries allocated
     int  streamed;  ///< entries already written to an SSE chunk
-    bool pending_valid;
-    float pending_logprob;
-    int  pending_n_top;
-    pulsar_token_score pending_top[PULSAR_SERVER_MAX_TOP_LOGPROBS];
+    bool pending_valid;    ///< a drawn-but-not-yet-emitted token's data is held below
+    float pending_logprob; ///< that token's logprob
+    int  pending_n_top;    ///< alternatives captured for it
+    pulsar_token_score pending_top[PULSAR_SERVER_MAX_TOP_LOGPROBS];  ///< those alternatives
 } logprob_ledger;
 
 typedef struct {
@@ -512,41 +527,50 @@ typedef enum {
 /* Shared states for protocol-specific DSML stream projections.  The model
  * still samples DSML; these states only translate already-sampled bytes into
  * OpenAI / Anthropic wire events while final parsing remains authoritative. */
+/** Projects a streaming DSML tool call into OpenAI tool_call deltas.
+ *
+ * A projection, not a parser: it translates already-sampled bytes into wire
+ * events so the client sees the call forming, while the FINAL parse of the
+ * complete text stays authoritative. The two can disagree mid-stream -- an
+ * incomplete marker, a malformed block -- and when they do, the final parse
+ * wins.
+ */
 typedef struct {
-    dsml_tool_stream_state state;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
-    size_t parse_pos;
-    int index;
-    bool active;
-    bool emitted_any;
-    bool args_open;
-    bool first_param;
-    bool param_is_string;
-    char **ids;
-    int ids_cap;
+    dsml_tool_stream_state state;  ///< where the projection is in the block
+    const char *tool_calls_end;    ///< marker literal ending the tool_calls block
+    const char *invoke_start;      ///< marker literal opening one invocation
+    const char *invoke_end;        ///< marker literal closing one invocation
+    const char *param_start;       ///< marker literal opening a parameter
+    const char *param_end;         ///< marker literal closing a parameter
+    size_t parse_pos;              ///< how far into the generated text the projection has consumed
+    int index;                     ///< index of the tool call being emitted (OpenAI numbers them)
+    bool active;                   ///< a tool block is being projected
+    bool emitted_any;              ///< at least one delta has gone out
+    bool args_open;                ///< the arguments JSON object is open and needs closing
+    bool first_param;              ///< next parameter needs no leading comma
+    bool param_is_string;          ///< current value is a JSON string, so it needs quoting and escaping
+    char **ids;                    ///< generated call ids, one per invocation, owned
+    int ids_cap;                   ///< entries allocated in `ids`
 } openai_tool_stream;
 
+/** OpenAI chat-completions SSE projection for one response. */
 typedef struct {
-    openai_stream_mode mode;
-    size_t emit_pos;
-    bool active;
-    bool checked_think_prefix;
+    openai_stream_mode mode;     ///< which OpenAI shape is being emitted
+    size_t emit_pos;             ///< bytes of generated text already turned into deltas
+    bool active;                 ///< the stream has started
+    bool checked_think_prefix;   ///< the leading `<think>` check has been done once
     /** Thinking+tools: hold tentative answer text after the first </think>
      * until a tool marker, stream end, or a SECOND close proves whether it
      * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
-    bool sent_reasoning;
-    bool sent_content;
+    bool sent_reasoning;  ///< a reasoning delta has been emitted
+    bool sent_content;    ///< a content delta has been emitted
     /** Borrowed (never owned): the request's logprob ledger, so the delta
      * emitters can attach the entries whose bytes the delta releases.  NULL
      * whenever the client did not ask for logprobs — openai_stream_start
      * zeroes it and only the job binds it. */
     logprob_ledger *lp;
-    openai_tool_stream tool;
+    openai_tool_stream tool;  ///< tool-call projection nested in this stream
 } openai_stream;
 
 typedef enum {
@@ -589,28 +613,39 @@ typedef enum {
     RESP_STREAM_SUPPRESS,
 } responses_stream_mode;
 
+/** /v1/responses SSE projection for one response.
+ *
+ * The Responses protocol is ITEM-structured rather than delta-structured: a
+ * reasoning item and a message item are opened, filled, and closed, each with
+ * a stable id and output_index. Most of the booleans here exist because those
+ * open/close events must be emitted exactly once and in order, even when the
+ * generation is interrupted, recovered, or resumed on a later quantum.
+ */
 typedef struct {
-    responses_stream_mode mode;
-    size_t emit_pos;
-    bool active;
-    bool checked_think_prefix;
+    responses_stream_mode mode;  ///< which item the projection is currently filling
+    size_t emit_pos;             ///< bytes of generated text already emitted
+    bool active;                 ///< the stream has started
+    bool checked_think_prefix;   ///< the leading `<think>` check has been done once
     /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0;
      * upstream left Responses out, but our leak is identical). */
     bool guard_second_reasoning;
-    bool reasoning_item_opened;
-    bool reasoning_item_closed;
-    bool reasoning_summary_started;
+    bool reasoning_item_opened;   ///< the reasoning item's added event has gone out
+    bool reasoning_item_closed;   ///< its done event has gone out
+    bool reasoning_summary_started;  ///< a reasoning_summary part has been opened
+    /** The reasoning block ended because the model closed it, not because the
+     * stream was cut short. Distinguishes a complete reasoning item from one
+     * truncated by a stop or an error, which must be closed differently. */
     bool reasoning_closed_naturally;
-    bool message_item_opened;
-    bool message_text_part_open;
-    bool message_item_closed;
-    bool reasoning_emitted_any;
-    bool message_emitted_any;
-    buf reasoning_text;
-    buf message_text;
-    char response_id[40];
-    char reasoning_id[40];
-    char message_id[40];
+    bool message_item_opened;     ///< the assistant message item's added event has gone out
+    bool message_text_part_open;  ///< a text part inside that item is open
+    bool message_item_closed;     ///< the message item's done event has gone out
+    bool reasoning_emitted_any;   ///< reasoning produced at least one delta
+    bool message_emitted_any;     ///< the message produced at least one delta
+    buf reasoning_text;           ///< accumulated reasoning, for the item's final value
+    buf message_text;             ///< accumulated message text, for the item's final value
+    char response_id[40];         ///< id of the response object
+    char reasoning_id[40];        ///< id of the reasoning item
+    char message_id[40];          ///< id of the assistant message item
     int reasoning_index;  ///< output_index of the reasoning item (0 if present)
     int message_index;  ///< output_index of the assistant message item
     int next_output_index;  ///< monotonic counter for upcoming output items
@@ -618,63 +653,70 @@ typedef struct {
 } responses_stream;
 
 /* Item identity per tool call must be stable across added/done/completed. */
+/** Identity of one tool call in a Responses stream, held stable across its
+ * added / done / completed events. */
 typedef struct {
-    char fc_id[40];
-    char call_id[64];
-    bool is_custom;
-    int output_index;
+    char fc_id[40];     ///< function-call item id
+    char call_id[64];   ///< call id the client echoes back with the tool output
+    bool is_custom;     ///< a custom tool rather than a function tool
+    int output_index;   ///< the item's position in the output array
 } responses_tool_item;
 
+/** What an Anthropic stream is currently emitting. */
 typedef enum {
-    ANTH_STREAM_THINKING,
-    ANTH_STREAM_TEXT,
-    ANTH_STREAM_TOOL,
-    ANTH_STREAM_SUPPRESS,
+    ANTH_STREAM_THINKING,  ///< filling a thinking block
+    ANTH_STREAM_TEXT,      ///< filling a text block
+    ANTH_STREAM_TOOL,      ///< filling a tool_use block
+    ANTH_STREAM_SUPPRESS,  ///< output withheld pending a decision about what it is
 } anthropic_stream_mode;
 
+/** Which content block is currently open on the Anthropic wire. */
 typedef enum {
-    ANTH_BLOCK_NONE,
-    ANTH_BLOCK_THINKING,
-    ANTH_BLOCK_TEXT,
-    ANTH_BLOCK_TOOL,
+    ANTH_BLOCK_NONE,      ///< no block open
+    ANTH_BLOCK_THINKING,  ///< a thinking block is open
+    ANTH_BLOCK_TEXT,      ///< a text block is open
+    ANTH_BLOCK_TOOL,      ///< a tool_use block is open
 } anthropic_block_type;
 
+/** Projects a streaming DSML tool call into Anthropic tool_use events.
+ * The Anthropic twin of ::openai_tool_stream; same projection contract. */
 typedef struct {
-    dsml_tool_stream_state state;
-    const dsml_syntax *syn;
-    size_t parse_pos;
-    int index;
-    bool active;
-    bool emitted_any;
-    bool args_open;
-    bool first_param;
-    bool param_is_string;
-    char **ids;
-    int ids_cap;
+    dsml_tool_stream_state state;  ///< where the projection is in the block
+    const dsml_syntax *syn;        ///< the marker literals this model's DSML uses
+    size_t parse_pos;              ///< how far into the generated text the projection has consumed
+    int index;                     ///< content-block index of the tool being emitted
+    bool active;                   ///< a tool block is being projected
+    bool emitted_any;              ///< at least one event has gone out
+    bool args_open;                ///< the input JSON object is open and needs closing
+    bool first_param;              ///< next parameter needs no leading comma
+    bool param_is_string;          ///< current value is a JSON string, so it needs quoting and escaping
+    char **ids;                    ///< generated tool_use ids, owned
+    int ids_cap;                   ///< entries allocated in `ids`
 } anthropic_tool_stream;
 
 /* Anthropic streaming uses the same sampled DSML bytes that will later be
  * parsed and remembered for exact continuation.  This state is only a wire
  * projection: it turns an in-progress DSML block into content_block/tool_use
  * SSE events, and never rewrites the model-visible transcript or cache key. */
+/** Anthropic messages SSE projection for one response. */
 typedef struct {
-    anthropic_stream_mode mode;
-    anthropic_block_type open_block;
+    anthropic_stream_mode mode;         ///< what is being emitted
+    anthropic_block_type open_block;    ///< which content block is open
     /** Borrowed from the request for the stream's lifetime: lets the tool-block
      * opener type server-executed tools as server_tool_use on the wire. */
     const tool_schema_orders *orders;
-    int next_index;
-    size_t emit_pos;
-    bool active;
-    bool checked_think_prefix;
+    int next_index;              ///< content-block index for the next block opened
+    size_t emit_pos;             ///< bytes of generated text already emitted
+    bool active;                 ///< the stream has started
+    bool checked_think_prefix;   ///< the leading `<think>` check has been done once
     /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0).
      * has_tools is copied from the request at start so the round reset can
      * re-arm without a request pointer. */
     bool guard_second_reasoning;
     bool has_tools;
-    bool sent_thinking;
-    bool sent_text;
-    anthropic_tool_stream tool;
+    bool sent_thinking;  ///< a thinking delta has been emitted
+    bool sent_text;      ///< a text delta has been emitted
+    anthropic_tool_stream tool;  ///< tool-call projection nested in this stream
 } anthropic_stream;
 
 typedef struct job job;
@@ -728,44 +770,65 @@ typedef pulsar_kvstore_options kv_cache_options;
 
 typedef pulsar_kvstore kv_disk_cache;
 
+/** Where a remembered tool entry came from. */
 typedef enum {
-    TOOL_MEMORY_RAM = 0,
-    TOOL_MEMORY_DISK = 1,
+    TOOL_MEMORY_RAM = 0,   ///< recorded live, this process
+    TOOL_MEMORY_DISK = 1,  ///< restored from a KV-file trailer
 } tool_memory_source;
 
 typedef struct tool_memory_entry tool_memory_entry;
 
+/** One remembered DSML tool-call block, shared by every call inside it.
+ *
+ * Blocks are refcounted rather than copied per call: one assistant turn can
+ * contain several invocations, and all of them need the same exact bytes to
+ * reproduce the prefix. */
 typedef struct {
-    char *dsml;
-    size_t len;
-    size_t bytes;
-    int refs;
+    char *dsml;    ///< the block's exact sampled bytes, owned
+    size_t len;    ///< length in bytes
+    size_t bytes;  ///< accounted size, charged against tool_memory::max_bytes
+    int refs;      ///< entries referring to this block; freed at zero
+    /** Visit stamp for one scan pass. Compared against tool_memory::scan_clock
+     * so a scan can skip blocks it has already counted without allocating a
+     * visited set. */
     uint64_t seen;
-    tool_memory_entry *entries;
+    tool_memory_entry *entries;  ///< list of entries in this block, via block_next
 } tool_memory_block;
 
+/** One remembered tool call, keyed by the id the client will echo back. */
 struct tool_memory_entry {
-    char *id;
-    tool_memory_block *block;
-    size_t bytes;
-    uint64_t stamp;
-    tool_memory_source source;
-    tool_memory_entry *prev;
-    tool_memory_entry *next;
-    tool_memory_entry *block_next;
+    char *id;                    ///< the call id, owned; the lookup key
+    tool_memory_block *block;    ///< block holding this call's bytes
+    size_t bytes;                ///< accounted size of this entry
+    uint64_t stamp;              ///< tool_memory::clock value at last use; the LRU key
+    tool_memory_source source;   ///< live or restored
+    tool_memory_entry *prev;     ///< LRU list, towards most recent
+    tool_memory_entry *next;     ///< LRU list, towards least recent
+    tool_memory_entry *block_next;  ///< next entry sharing the same block
 };
 
+/** Bounded LRU of tool calls and their exact sampled bytes.
+ *
+ * Exists so a replayed conversation can be matched against what the model
+ * actually produced. The client replays a tool RESULT and its call id; the
+ * bytes of the call itself may never have been visible to it, so without this
+ * the prefix cannot be reproduced and the turn cold-prefills.
+ *
+ * Bounded on BOTH count and bytes, and evicted LRU: this is a cache, and a
+ * conversation whose calls have aged out simply replays instead. Guarded by
+ * server::tool_mu, since client threads read it.
+ */
 typedef struct {
-    rax *by_id;
-    rax *by_block;
-    tool_memory_entry *head;
-    tool_memory_entry *tail;
-    int entries;
-    int max_entries;
-    size_t bytes;
-    size_t max_bytes;
-    uint64_t clock;
-    uint64_t scan_clock;
+    rax *by_id;                ///< id -> entry
+    rax *by_block;             ///< block bytes -> block, for deduplication
+    tool_memory_entry *head;   ///< most recently used
+    tool_memory_entry *tail;   ///< least recently used; the eviction victim
+    int entries;               ///< entries live
+    int max_entries;           ///< entry ceiling
+    size_t bytes;              ///< bytes accounted
+    size_t max_bytes;          ///< byte ceiling
+    uint64_t clock;            ///< monotonic; stamps entries on use for the LRU order
+    uint64_t scan_clock;       ///< monotonic; one value per scan pass, compared against block::seen
 } tool_memory;
 
 typedef struct {
@@ -1871,29 +1934,36 @@ typedef struct trace_cache_diag {
     int prompt_id[TRACE_CACHE_WINDOW];
 } trace_cache_diag;
 
+/** Userdata for the engine's prefill progress callback.
+ *
+ * Its ADDRESS is handed to the engine, so it must live at a stable location
+ * for the whole prefill -- it is embedded in gen_state rather than passed by
+ * value anywhere. Besides progress accounting it owns the SSE keepalive, since
+ * the callback is the only code that runs during a long prefill.
+ */
 typedef struct server_prefill_progress {
-    server *srv;
+    server *srv;         ///< owning server
     session_slot *slot;  ///< slot whose session is prefilling (worker thread)
-    req_kind kind;
-    int prompt_tokens;
-    int cached_tokens;
-    char ctx[48];
-    const char *phase;
-    bool has_tools;
-    bool responses_protocol;
-    double t0;
-    double last_t;
-    int last_current;
-    bool seen;
+    req_kind kind;       ///< which API shape the request arrived on
+    int prompt_tokens;   ///< prompt length being prefilled
+    int cached_tokens;   ///< of those, how many came from cache
+    char ctx[48];        ///< context span string, for log lines
+    const char *phase;   ///< current phase name, for log lines
+    bool has_tools;      ///< the request declared tools
+    bool responses_protocol;  ///< the request is on /responses
+    double t0;           ///< wall-clock at prefill start
+    double last_t;       ///< wall-clock of the last progress event, for interval rates
+    int last_current;    ///< `current` at that event
+    bool seen;           ///< at least one progress event has arrived
     /** SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
      * idle timeouts on the client side don't close the connection while the
      * server is busy doing prefill. */
-    int fd;
-    bool stream;
-    bool headers_sent;
-    bool stream_failed;
-    double last_keepalive;
+    int fd;                  ///< client socket, for the keepalive writes
+    bool stream;             ///< the client asked for SSE
+    bool headers_sent;       ///< SSE headers already went out (they precede generation)
+    bool stream_failed;      ///< a keepalive write failed; the client is gone
+    double last_keepalive;   ///< wall-clock of the last `:` comment line
 } server_prefill_progress;
 
 typedef struct thinking_state {
