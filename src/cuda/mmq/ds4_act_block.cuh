@@ -54,7 +54,7 @@ struct block_mx_act_mmq {
         half2 ds4[4];   // upstream q8_1: 16-bit scale + 16-bit partial sum per 32
         half  d2s6[8];  // upstream q8_1: scale per 64 + partial sums
     };
-    int8_t qs[DS4_ACT_BLOCK_VALS];   // e4m3 bit patterns (NOT int8 magnitudes)
+    int8_t qs[DS4_ACT_BLOCK_VALS];   ///< e4m3 bit patterns (NOT int8 magnitudes)
 };
 
 static_assert(sizeof(block_mx_act_mmq) == 144,

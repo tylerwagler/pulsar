@@ -307,7 +307,7 @@ typedef struct {
     uint32_t ctx_size;     ///< session context size the graph is sized for
     uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry
     uint32_t comp_cap;     ///< worst-case compressed rows per layer (the ratio-4 bound)
-    uint32_t attn_comp_stage_cap;          /* only meaningful under PULSAR_ATTN_PACK */
+    uint32_t attn_comp_stage_cap;  ///< rows the attention compressor staging buffer holds; only meaningful under PULSAR_ATTN_PACK
     /** Per-layer compressed capacity, sized from each layer's ACTUAL ratio --
      * a ratio-128 layer needs far fewer rows than the ratio-4 bound in
      * comp_cap, and sizing every layer at that bound wastes most of it. */
