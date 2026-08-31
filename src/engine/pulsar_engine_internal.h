@@ -472,20 +472,25 @@ typedef struct {
     uint64_t ext_size;
 } pulsar_tensor;
 
+/** A memory-mapped GGUF file plus its parsed directory.
+ *
+ * The mapping stays live for the engine's lifetime and every weight pointer in
+ * pulsar_layer_weights is a borrowed view into it -- nothing copies tensor data
+ * to the host. */
 typedef struct {
-    int fd;
-    const uint8_t *map;
-    uint64_t size;
+    int fd;                 ///< open file descriptor backing the mapping
+    const uint8_t *map;     ///< base of the read-only mapping
+    uint64_t size;          ///< mapped bytes
 
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint64_t alignment;
-    uint64_t tensor_data_pos;
-    uint64_t max_tensor_bytes;
+    uint32_t version;       ///< GGUF format version
+    uint64_t n_kv;          ///< metadata key/value pair count
+    uint64_t n_tensors;     ///< tensor directory entry count
+    uint64_t alignment;     ///< tensor data alignment declared by the file
+    uint64_t tensor_data_pos;   ///< byte offset where the tensor data section starts
+    uint64_t max_tensor_bytes;  ///< largest single tensor, for staging-buffer sizing
 
-    pulsar_kv *kv;
-    pulsar_tensor *tensors;
+    pulsar_kv *kv;             ///< parsed metadata pairs, n_kv entries
+    pulsar_tensor *tensors;    ///< parsed tensor directory, n_tensors entries
 } pulsar_model;
 
 typedef struct {
@@ -1366,32 +1371,51 @@ typedef struct {
 
 struct owned_str;  /* forward decl: bpe_rank() param; full def appears later */
 
+/** Byte-level BPE vocabulary and the special ids the chat template needs.
+ *
+ * ⚠ `n_vocab` here is the TOKENIZER TABLE LENGTH and is not required to equal
+ * pulsar_shape::n_vocab, which is the logits row width. Size logits buffers
+ * with the shape's value (pulsar_engine_logits_width()), never this one. */
 struct pulsar_vocab {
-    pulsar_str *token;
-    int n_vocab;
-    int bos_id;
-    int eos_id;
-    int user_id;
-    int assistant_id;
-    int think_start_id;
-    int think_end_id;
-    int dsml_id;
-    str_i32_table token_to_id;
-    str_i32_table merge_rank;
+    pulsar_str *token;     ///< id -> token bytes, n_vocab entries
+    int n_vocab;           ///< tokenizer table length (NOT the logits width)
+    int bos_id;            ///< beginning-of-sequence token
+    int eos_id;            ///< end-of-sequence token
+    int user_id;           ///< chat role marker: user turn
+    int assistant_id;      ///< chat role marker: assistant turn
+    int think_start_id;    ///< opens a reasoning span
+    int think_end_id;      ///< closes a reasoning span
+    int dsml_id;           ///< DSML tool-call marker
+    str_i32_table token_to_id;  ///< token bytes -> id, for the BPE merge loop
+    str_i32_table merge_rank;   ///< BPE merge priority; lower rank merges first
 
     /** ---- methods (C++ port): 1:1 mirror of the vocab verb family in
      * tokenizer.cpp; bodies keep the auto *vocab = this alias, logic verbatim.
      * Names kept as-is (none carry the pulsar_vocab type-name prefix). ---- */
+    /** Merge priority of the pair (a, b); lower merges first. @return rank, or a
+     * sentinel above every real rank when the pair is not in the merge table. */
     int bpe_rank(const owned_str *a, const owned_str *b) const;
+    /** Emit one pre-tokenized piece as ids, running the BPE merge loop over it. */
     void bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const;
+    /** Tokenize plain text: pre-tokenize, then BPE-merge each piece. */
     void bpe_tokenize_text(const char *text, token_vec *out) const;
+    /** Exact-match lookup of a token's id. @return the id, or -1 if absent. */
     int vocab_lookup(const char *text) const;
+    /** Populate the vocabulary from the model's GGUF metadata. */
     void vocab_load(const pulsar_model *model);
+    /** Release the vocabulary's owned tables. */
     void vocab_free();
+    /** Longest special-token match at `p`. @return true and set token/len on a hit. */
     bool special_token_at(const char *p, int *token, size_t *len) const;
+    /** Tokenize `n` bytes at `p`, honouring special tokens found inside the span. */
     void tokenize_span(const char *p, size_t n, token_vec *out) const;
+    /** Tokenize an ALREADY-RENDERED chat string -- the caller has applied the
+     * template, so role markers appear as literal special tokens. */
     void tokenize_rendered_chat_vocab(const char *text, token_vec *out) const;
+    /** Tokenize tool-result content, which may contain sequences that must not be
+     * interpreted as chat control tokens. */
     void bpe_tokenize_tool_result_text(const char *content, token_vec *out);
+    /** Debug: print ids with their decoded bytes to stderr. */
     void dump_tokens(const token_vec *tokens) const;
 };
 
@@ -1418,9 +1442,9 @@ struct pulsar_engine {
      * monotonic. GPU decode submission is single-threaded, so plain uint64 is
      * adequate for these monitoring counters. */
     uint64_t spec_accepted_tokens;         /* accepted draft tokens */
-    uint64_t spec_draft_tokens;            /* proposed/verified draft tokens */
-    uint64_t spec_num_drafts;              /* draft rounds (verify steps w/ drafts) */
-    uint64_t spec_gen_tokens;              /* tokens emitted by the spec loop */
+    uint64_t spec_draft_tokens;   ///< proposed/verified draft tokens (engine-cumulative)
+    uint64_t spec_num_drafts;     ///< draft rounds, i.e. verify steps carrying drafts
+    uint64_t spec_gen_tokens;     ///< tokens emitted by the speculative loop
     uint64_t spec_accepted_per_pos[16];    /* accepted count per draft position */
 
     /** ---- methods (C++ port): 1:1 mirror of the pulsar_engine_* verb family.
@@ -1529,9 +1553,9 @@ typedef struct pulsar_spec_carry_state {
      * pulsar_spec_drop_pendings helper below is the single authority), or a
      * later harvest would resurrect pendings the reset meant to kill. */
     bool dspark_chain_unharvested;
-    bool dspark_chain_conf;      /* conf scoring was launched for the chain */
-    uint32_t dspark_chain_n;     /* drafted depth of the in-flight chain */
-    uint32_t dspark_n_pending;
+    bool dspark_chain_conf;      ///< the confidence head ran for the in-flight chain
+    uint32_t dspark_chain_n;     ///< drafted depth of the in-flight chain
+    uint32_t dspark_n_pending;   ///< drafts proposed and awaiting verification
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
@@ -1560,16 +1584,18 @@ typedef struct pulsar_spec_carry_state {
      * draw on rejection) but NOT yet forwarded through the target. The next
      * generate_speculative call forwards it as batch position 0. Invalidated
      * with the pendings on rewind/invalidate/sync. */
-    int32_t spec_carry_token;
-    bool spec_carry_valid;
+    int32_t spec_carry_token;  ///< the drawn-but-unemitted base token
+    bool spec_carry_valid;     ///< false once the carry has been consumed or voided
     /** checkpoint.len the carry was drawn at; any session advance outside the
      * speculative path (sync, plain eval) moves it and voids the carry */
     int32_t spec_carry_pos;
     /** sampling params the carry was drawn under; a param change between calls
      * drops the carry and redraws from s->logits (exact: the carry was never
      * emitted or forwarded) */
-    float spec_carry_temp, spec_carry_top_p, spec_carry_min_p;
-    int spec_carry_top_k;
+    float spec_carry_temp;   ///< temperature the carry was drawn under
+    float spec_carry_top_p;  ///< top-p the carry was drawn under
+    float spec_carry_min_p;  ///< min-p the carry was drawn under
+    int spec_carry_top_k;    ///< top-k the carry was drawn under; a change voids the carry
     /** DTree Phase 0 (PULSAR_DTREE_STATS): the drafter #2 token for each
      * pending draft, carried from the drafting step to the verify step so a
      * rejection can be scored p2 = P(target correction == drafter #2 | #1
@@ -1637,8 +1663,10 @@ typedef struct pulsar_spec_carry_state {
      *      for p_Y, so acceptance craters. The guard drops them to avoid wasting
      *      verify rows, not to avoid bias.
      * Mirrors the spec_carry_* params guard. Greedy never needed this. */
-    float dspark_pending_temp, dspark_pending_top_p, dspark_pending_min_p;
-    int   dspark_pending_top_k;
+    float dspark_pending_temp;   ///< temperature the pending drafts were proposed under
+    float dspark_pending_top_p;  ///< top-p the drafts were proposed under
+    float dspark_pending_min_p;  ///< min-p the drafts were proposed under
+    int   dspark_pending_top_k;  ///< top-k the drafts were proposed under; the verify guard drops mismatched drafts
     /** --- Terminal yield-quench controller (spec-decode Item 4) ---
      * Per-request cumulative-regret gate: each fused spec step charges
      * debt += guard(n_batch) - tokens_committed (the breakeven yield minus the
@@ -1657,9 +1685,9 @@ typedef struct pulsar_spec_carry_state {
      * the dormant multi-bank driver would need per-bank copies (not wired —
      * generate_speculative already refuses when mseq_dirty). */
     float spec_quench_debt;    /* cumulative plain-token-equivalents lost */
-    float spec_quench_ewma;    /* EWMA of per-step margin (yield - guard) */
-    uint32_t spec_quench_steps;/* fused spec steps this request */
-    bool spec_quenched;        /* latched: plain decode for the remainder */
+    float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
+    uint32_t spec_quench_steps; ///< fused spec steps taken by this request
+    bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
     /** Per-SESSION mirror of the engine's cumulative DSpark counters. The engine
      * copies are global (Prometheus /metrics, cross-request); these let the
      * server compute a per-RESPONSE accept-rate/tokens-per-step by snapshotting
@@ -1668,9 +1696,9 @@ typedef struct pulsar_spec_carry_state {
      * worker. Incremented alongside the engine counters in the fused verify
      * loop; monotonic since session open (never reset per request). */
     uint64_t spec_accepted_tokens;
-    uint64_t spec_draft_tokens;
-    uint64_t spec_num_drafts;
-    uint64_t spec_gen_tokens;
+    uint64_t spec_draft_tokens;  ///< per-carry draft tokens proposed
+    uint64_t spec_num_drafts;    ///< per-carry draft rounds
+    uint64_t spec_gen_tokens;    ///< per-carry tokens emitted
 } pulsar_spec_carry_state;
 
 /** Drop pendings AND any unharvested in-flight chain (L108 P2). The single
