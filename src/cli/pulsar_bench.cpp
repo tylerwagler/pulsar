@@ -22,22 +22,32 @@
 #include <string.h>
 #include <time.h>
 
+/** A context-depth sweep: prefill and decode at a series of context sizes,
+ * reporting throughput at each.
+ *
+ * The sweep steps EITHER additively (step_incr) or multiplicatively
+ * (step_mul); step_mul == 1.0 selects the additive form, and one of the two
+ * must be set or the sweep would not advance.
+ */
 typedef struct {
-    const char *model_path;
-    const char *prompt_path;
-    const char *chat_prompt_path;
-    const char *system;
-    const char *csv_path;
-    pulsar_backend backend;
-    int threads;
-    int ctx_start;
-    int ctx_max;
+    const char *model_path;        ///< model to benchmark
+    const char *prompt_path;       ///< raw prompt text file
+    const char *chat_prompt_path;  ///< prompt to render through the chat template instead
+    const char *system;            ///< system prompt for the chat form
+    const char *csv_path;          ///< write per-step results here; NULL = stdout only
+    pulsar_backend backend;        ///< CPU or CUDA
+    int threads;                   ///< CPU worker threads
+    int ctx_start;                 ///< first context depth in the sweep
+    int ctx_max;                   ///< last context depth in the sweep
+    /** Context the session is ALLOCATED with, as opposed to the depths swept.
+     * Held fixed across the sweep so every step measures the same allocation
+     * and depth is the only variable; defaults to ctx_max + gen_tokens + 1. */
     int ctx_alloc;
-    int step_incr;
-    int gen_tokens;
-    uint32_t prefill_chunk;
-    double step_mul;
-    const char *dump_frontier_logits_dir;
+    int step_incr;                 ///< additive step between depths
+    int gen_tokens;                ///< tokens to decode at each depth
+    uint32_t prefill_chunk;        ///< prefill chunk size in rows
+    double step_mul;               ///< multiplicative step; 1.0 selects the additive form
+    const char *dump_frontier_logits_dir;  ///< write each step's frontier logits here, for divergence checks
 } bench_config;
 
 static double bench_now_sec(void) {
