@@ -801,14 +801,14 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
  * eager (fixed floor).  n_banks == 0 means the pool is disabled and the graph
  * owns plain single-session cache tensors. */
 typedef struct {
-    uint32_t n_banks;                        /* 0 = pool disabled */
-    uint32_t cur_bank;                       /* bank the installed views address */
-    uint64_t raw_bank_bytes;                 /* raw_cap * head_dim * raw elem */
-    uint64_t comp_bank_bytes[PULSAR_MAX_LAYER];  /* layer_comp_cap * comp row bytes */
-    uint64_t index_bank_bytes[PULSAR_MAX_LAYER]; /* layer_comp_cap * indexer row bytes */
-    uint64_t astate_bank_bytes[PULSAR_MAX_LAYER];/* attn compressor frontier lane */
-    uint64_t istate_bank_bytes[PULSAR_MAX_LAYER];/* indexer compressor frontier lane */
-    pulsar_gpu_tensor *raw[PULSAR_MAX_LAYER];
+    uint32_t n_banks;   ///< pool size; 0 = disabled and the graph owns plain single-session tensors
+    uint32_t cur_bank;  ///< bank the installed views currently address (0 when the pool is disabled)
+    uint64_t raw_bank_bytes;                     ///< one bank's raw ring: raw_cap * PULSAR_ATTN_PACK row bytes
+    uint64_t comp_bank_bytes[PULSAR_MAX_LAYER];  ///< per layer, one bank's compressed pool: layer_comp_cap * comp row bytes
+    uint64_t index_bank_bytes[PULSAR_MAX_LAYER]; ///< per layer, one bank's indexer pool (ratio-4 layers)
+    uint64_t astate_bank_bytes[PULSAR_MAX_LAYER];///< per layer, one bank's attention compressor state lane
+    uint64_t istate_bank_bytes[PULSAR_MAX_LAYER];///< per layer, one bank's indexer compressor state lane
+    pulsar_gpu_tensor *raw[PULSAR_MAX_LAYER];    ///< per layer, the bank-major raw KV ring slab
     /** Tier-2 task #55 (increment 2a): the ctx-scaled comp/index caches are now
      * ONE cudaMallocManaged allocation PER BANK (comp[il][bank]) instead of one
      * n_banks*bank_bytes slab — so the increment-2 eviction guard can cudaFree a
@@ -820,29 +820,29 @@ typedef struct {
      * table (comp_bases[il]/index_bases[il]): a device array of the n_banks
      * comp[il][*]->ptr, indexed by seq_id[t]. NULL when the pool is disabled
      * (single-session paths use the repointed view). */
-    pulsar_gpu_tensor *comp[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX];
-    pulsar_gpu_tensor *index[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX];
-    pulsar_gpu_tensor *comp_bases[PULSAR_MAX_LAYER];  /* [n_banks] device ptr array: comp[il][b]->ptr */
-    pulsar_gpu_tensor *index_bases[PULSAR_MAX_LAYER]; /* [n_banks] device ptr array: index[il][b]->ptr */
-    pulsar_gpu_tensor *askv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *comp[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX];   ///< compressed KV, ONE managed allocation per (layer, bank) so a single idle bank can be freed
+    pulsar_gpu_tensor *index[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX];  ///< indexer cache, same per-(layer,bank) shape
+    pulsar_gpu_tensor *comp_bases[PULSAR_MAX_LAYER];  ///< device array of the n_banks comp[il][*] pointers, indexed by seq_id[t]; NULL when the pool is disabled
+    pulsar_gpu_tensor *index_bases[PULSAR_MAX_LAYER]; ///< device array of the n_banks index[il][*] pointers, indexed by seq_id[t]
+    pulsar_gpu_tensor *askv[PULSAR_MAX_LAYER];  ///< attention compressor state lane, KV half
+    pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];  ///< attention compressor state lane, score half
+    pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];  ///< indexer compressor state lane, KV half
+    pulsar_gpu_tensor *issc[PULSAR_MAX_LAYER];  ///< indexer compressor state lane, score half
     /** L120 value-half: per-bank committed-projection ring lanes (ratio-4
      * layers only; 32 slots x width-256 f32 rows = 32 KiB/lane), attention +
      * indexer, kv + score.  Graph proj views repoint into these like the
      * state views above. */
-    pulsar_gpu_tensor *apkv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *apsc[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *ipkv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *ipsc[PULSAR_MAX_LAYER];
-    uint64_t pring_bank_bytes;
+    pulsar_gpu_tensor *apkv[PULSAR_MAX_LAYER];  ///< projection ring, attention KV (rewind value restore)
+    pulsar_gpu_tensor *apsc[PULSAR_MAX_LAYER];  ///< projection ring, attention score
+    pulsar_gpu_tensor *ipkv[PULSAR_MAX_LAYER];  ///< projection ring, indexer KV
+    pulsar_gpu_tensor *ipsc[PULSAR_MAX_LAYER];  ///< projection ring, indexer score
+    uint64_t pring_bank_bytes;                  ///< one bank's projection-ring lane: 32 slots x width-256 f32
     /** L124: per-bank ratio-128 undo lanes (32 slots x head_dim f32, kv +
      * score) -- the pre-store value of the state slot each ratio-128 store
      * overwrites, so a ghost rewind can restore byte-exactly. */
-    pulsar_gpu_tensor *rukv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *rusc[PULSAR_MAX_LAYER];
-    uint64_t rulane_bank_bytes;
+    pulsar_gpu_tensor *rukv[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane, KV half: pre-store slot values
+    pulsar_gpu_tensor *rusc[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane, score half
+    uint64_t rulane_bank_bytes;                 ///< one bank's undo lane: 32 slots x head_dim f32, kv + score
     /* Tier-2 Option F: per-bank DSpark drafter context ring, bank-major
      * (~6.75 MB/bank: raw 0.75 + prompt 6).  Allocated in
      * gpu_graph_init_dspark_target only when the pool is enabled AND the
@@ -857,14 +857,14 @@ typedef struct {
      * exactly like the live-state views (repoint already drops the baked
      * batched-copy tables, so the snapshot fast path re-prepares per bank).
      * NULL when the pool is spec-less. */
-    pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_issc[PULSAR_MAX_LAYER];
-    uint64_t dspark_raw_bank_bytes;      /* DRAFT_WINDOW * PULSAR_ATTN_PACK row (384 B) */
-    uint64_t dspark_prompt_bank_bytes;   /* DRAFT_WINDOW * n_embd  * f32 */
-    pulsar_gpu_tensor *dspark_raw[3];       /* N * dspark_raw_bank_bytes */
-    pulsar_gpu_tensor *dspark_prompt[3];    /* N * dspark_prompt_bank_bytes */
+    pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention KV; NULL when the pool is spec-less
+    pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention score
+    pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer KV
+    pulsar_gpu_tensor *spec_issc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer score
+    uint64_t dspark_raw_bank_bytes;      ///< one bank's drafter raw ring: DRAFT_WINDOW * PULSAR_ATTN_PACK row (384 B)
+    uint64_t dspark_prompt_bank_bytes;   ///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
+    pulsar_gpu_tensor *dspark_raw[3];       ///< per draft layer, bank-major drafter raw ring; NULL without a pool or drafter
+    pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
 } pulsar_bank_slabs;
 
 typedef struct {
@@ -912,12 +912,23 @@ typedef struct {
      * views.  proj_ring_lo/hi bound the contiguously-deposited span
      * ([hi-8, hi) capped by lo); a rewind outside the span skips the value
      * restore (degraded = pre-fix behavior, counters still clamped). */
-    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];
-    uint32_t proj_ring_lo;
-    uint32_t proj_ring_hi;
+    pulsar_gpu_tensor *layer_attn_proj_kv[PULSAR_MAX_LAYER];   ///< projection ring view, attention KV (ratio-4 layers; NULL elsewhere)
+    pulsar_gpu_tensor *layer_attn_proj_sc[PULSAR_MAX_LAYER];   ///< projection ring view, attention score
+    pulsar_gpu_tensor *layer_index_proj_kv[PULSAR_MAX_LAYER];  ///< projection ring view, indexer KV
+    pulsar_gpu_tensor *layer_index_proj_sc[PULSAR_MAX_LAYER];  ///< projection ring view, indexer score
+    /** Contiguously-deposited span [lo, hi) of the projection ring, in absolute
+     * positions. rewind() replays only when the span COVERS the rewound range;
+     * an uncovered span skips the value restore and degrades to counter-clamp
+     * only. A gap restarts the span (see gpu_graph_proj_ring_note_pos), which is
+     * what stops ghost-position deposits from ever being read back.
+     *
+     * ⚠ Deposits happen only for committed non-mseq, non-spec chunks, and the
+     * server decodes exclusively via multiseq -- so on the SERVED path this span
+     * covers prefill chunk tails only and the replay does not fire. Measured
+     * 2026-08-30: 0 taken / 2 skipped. The counter clamp is the half that is
+     * live everywhere. */
+    uint32_t proj_ring_lo;   ///< first position covered by the ring
+    uint32_t proj_ring_hi;   ///< one past the last covered position
 /** Depth of BOTH rewind-restore rings (the L120 projection ring above and the
  * L124 ratio-128 undo lanes): must exceed worst replay span (7) + deepest
  * per-round ghost overshoot, or ghost-position writes alias the slots a
@@ -942,11 +953,11 @@ typedef struct {
      * Aligned batch prefill does not capture (a rewind can never target
      * into it) and fork/spill zero the ring (degraded = pre-fix).  Lanes:
      * layer_r128_undo_* below; banked lanes ride the state-view repoint. */
-    pulsar_gpu_tensor *layer_r128_undo_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *layer_r128_undo_sc[PULSAR_MAX_LAYER];
-    uint32_t r128_undo_pos[32];
-    uint32_t r128_undo_head;   /* next push slot in the HOST ring */
-    uint32_t r128_undo_n;      /* live entries (<= 32) */
+    pulsar_gpu_tensor *layer_r128_undo_kv[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane view, KV half (pos %% 32 addressed)
+    pulsar_gpu_tensor *layer_r128_undo_sc[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane view, score half
+    uint32_t r128_undo_pos[32];  ///< host ring of stored positions, newest-first walked by rewind()
+    uint32_t r128_undo_head;     ///< next push slot in the host ring
+    uint32_t r128_undo_n;        ///< live entries (<= PULSAR_REWIND_RING_DEPTH)
     /** Scratch, per chunk: the per-row extension arm captured this chunk's
      * ratio-128 slots (the aligned batch arm does not capture, and must not
      * push notes -- a note without a capture would restore stale lane
