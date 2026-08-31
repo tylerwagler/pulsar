@@ -184,8 +184,16 @@ bool imatrix_collector_save(
 
 
 bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
-    memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
-    memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
+    /* STAGE 1b: zero THIS session's frontier -- i.e. the current bank's row.
+     * Other banks hold other slots' positions and a prefill reset here says
+     * nothing about them. (Before the collapse this zeroed the scalars, whose
+     * second job was clearing a stale multiseq superset; there is no superset
+     * any more, so that job is gone with it.) */
+    {
+        const uint32_t b = gpu_graph_cur_bank(g);
+        memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
+        memset(g->ms_n_index_comp[b], 0, sizeof(g->ms_n_index_comp[b]));
+    }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;

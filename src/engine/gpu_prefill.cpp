@@ -1308,7 +1308,12 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
             }
             if (ok) {
-                gpu_graph_n_comp(g, il) = n_comp;
+                /* STAGE 1b: n_comp is this ALIGNED chunk's frontier for ONE
+                 * sequence. Under mseq it was written to the scalar as a
+                 * read-only cross-bank superset; with the scalar gone that
+                 * write would land on cur_bank's real row and clobber it. The
+                 * banked arm publishes per bank at 1438, so skip it here. */
+                if (!mseq) gpu_graph_n_comp(g, il) = n_comp;
                 if (!mseq && !g->spec_comp_save_n && ratio == 4)
                     ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                           comp_width, false);
@@ -1471,8 +1476,11 @@ bool gpu_graph_encode_layer_attention_batch(
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                     const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
-                    uint32_t *const n_comp_slot = mseq ? &g->ms_n_comp[bank][il]
-                                                       : &gpu_graph_n_comp(g, il);
+                    /* STAGE 1b: one storage, selected by bank id. Non-mseq is
+                     * simply the current bank -- there is no separate scalar
+                     * for it to be "the classic case" in any more. */
+                    uint32_t *const n_comp_slot =
+                        &g->ms_n_comp[mseq ? bank : gpu_graph_cur_bank(g)][il];
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     if (emit && *n_comp_slot >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
@@ -1708,7 +1716,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      n_tokens);
                 }
                 if (ok) {
-                    gpu_graph_n_index_comp(g, il) = n_comp;
+                    /* STAGE 1b: indexer twin of the attn guard at 1316 -- under
+                     * mseq this was the read-only superset; the banked arm
+                     * publishes per bank at 1829. */
+                    if (!mseq) gpu_graph_n_index_comp(g, il) = n_comp;
                     if (!mseq && !g->spec_comp_save_n)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               index_width, true);
@@ -1852,8 +1863,8 @@ bool gpu_graph_encode_layer_attention_batch(
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
                         const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                         const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
-                        uint32_t *const n_index_slot = mseq ? &g->ms_n_index_comp[bank][il]
-                                                            : &gpu_graph_n_index_comp(g, il);
+                        uint32_t *const n_index_slot =
+                            &g->ms_n_index_comp[mseq ? bank : gpu_graph_cur_bank(g)][il];
                         const bool emit = ((pos + 1u) % ratio) == 0u;
                         if (emit && *n_index_slot >= g->layer_comp_cap[il]) {
                             fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);

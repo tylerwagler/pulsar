@@ -977,8 +977,9 @@ typedef struct {
      * gpu_graph_alloc_raw_cap allocates it unconditionally so the batched
      * paths work with speculation disabled. */
     pulsar_gpu_tensor *spec_logits;
-    uint32_t layer_n_comp[PULSAR_MAX_LAYER];
-    uint32_t layer_n_index_comp[PULSAR_MAX_LAYER];
+    /* STAGE 1b: the scalar frontier counters are GONE. They were a second copy
+     * of ms_n_comp[cur_bank][il] kept in sync by hand, and L133 was the bill.
+     * Use gpu_graph_n_comp()/gpu_graph_n_index_comp(). */
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -1255,17 +1256,25 @@ typedef struct {
  * References, not get/set pairs: call sites use ++, =, and comparisons, and
  * rewriting each of those by hand is exactly the kind of mechanical edit that
  * introduces the bug this refactor exists to prevent. */
+/* STAGE 1b: the per-bank slots are now the ONLY storage. The scalars are gone.
+ * A session with no pool allocated is simply bank 0 -- ms_n_comp is a
+ * fixed-size struct member, always present, and gpu_graph_bank_raw_pool()
+ * already falls back to the classic tensors for bank 0, so there is no
+ * "classic" case left to special-case. */
+static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
+    return g->banks.n_banks ? g->banks.cur_bank : 0u;
+}
 static inline uint32_t &gpu_graph_n_comp(pulsar_gpu_graph *g, uint32_t il) {
-    return g->layer_n_comp[il];
+    return g->ms_n_comp[gpu_graph_cur_bank(g)][il];
 }
 static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t il) {
-    return g->layer_n_comp[il];
+    return g->ms_n_comp[gpu_graph_cur_bank(g)][il];
 }
 static inline uint32_t &gpu_graph_n_index_comp(pulsar_gpu_graph *g, uint32_t il) {
-    return g->layer_n_index_comp[il];
+    return g->ms_n_index_comp[gpu_graph_cur_bank(g)][il];
 }
 static inline uint32_t gpu_graph_n_index_comp(const pulsar_gpu_graph *g, uint32_t il) {
-    return g->layer_n_index_comp[il];
+    return g->ms_n_index_comp[gpu_graph_cur_bank(g)][il];
 }
 
 /* =========================================================================

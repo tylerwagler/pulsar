@@ -1372,10 +1372,10 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, ui
 
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = gpu_graph_n_comp(g, il);
-        g->ms_n_index_comp[bank][il] = gpu_graph_n_index_comp(g, il);
-    }
+    /* STAGE 1b: the frontier is no longer copied here. ms_n_comp[bank] IS the
+     * storage now -- this loop had become a self-copy (callers capture the
+     * LIVE bank, and gpu_graph_n_comp resolves to exactly that row). The other
+     * fields below still have scalar twins and still ride the hand-off. */
     /* L120 value-half: the projection-ring span rides the same hand-off. */
     g->ms_proj_ring_lo[bank] = g->proj_ring_lo;
     g->ms_proj_ring_hi[bank] = g->proj_ring_hi;
@@ -1444,8 +1444,8 @@ void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_n_comp(g, il) = g->ms_n_comp[bank][il];
-        gpu_graph_n_index_comp(g, il) = g->ms_n_index_comp[bank][il];
+        /* STAGE 1b: self-copy. gpu_graph_bank_repoint() has already set
+         * cur_bank to `bank`, so this wrote ms_n_comp[bank] onto itself. */
     }
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
@@ -1723,9 +1723,11 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     g->batch_multiseq_rows = 0;
     /* Self-check (host ints only): every batched bank's frontier advanced to
      * exactly its position-derived value — (last_pos+1)/ratio — and the
-     * scalar superset (untouched since step top) equals the max over the
-     * batched banks.  A miss here is the silent-KV-corruption class; fail
-     * loud so the driver aborts the session instead of serving garbage. */
+     * position-derived value -- (last_pos+1)/ratio.  A miss here is the
+     * silent-KV-corruption class; fail loud so the driver aborts the session
+     * instead of serving garbage.
+     * STAGE 1b: the companion "scalar superset" check is gone with the scalar
+     * (see below) -- there is no longer a shared value for a bank to corrupt. */
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -1746,20 +1748,12 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
                 ok = false;
             }
         }
-        if (ok && gpu_graph_n_comp(g, il) != sup) {
-            fprintf(stderr,
-                    "pulsar: multiseq step_end FAILED: layer %u superset %u "
-                    "mutated mid-step (want %u)\n",
-                    il, gpu_graph_n_comp(g, il), sup);
-            ok = false;
-        }
-        if (ok && ratio == 4 && gpu_graph_n_index_comp(g, il) != sup) {
-            fprintf(stderr,
-                    "pulsar: multiseq step_end FAILED: layer %u indexer superset "
-                    "%u mutated mid-step (want %u)\n",
-                    il, gpu_graph_n_index_comp(g, il), sup);
-            ok = false;
-        }
+        /* STAGE 1b: the "scalar superset mutated mid-step" checks are gone with
+         * the scalar. They existed to catch corruption of a SHARED value that
+         * several banks' rows wrote through; there is no shared value now, so
+         * the failure mode is unrepresentable rather than merely detected.
+         * The per-bank assertions above are the real check and they remain. */
+        (void)sup;
     }
     return ok;
 }
