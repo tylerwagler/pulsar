@@ -1329,10 +1329,12 @@ int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  * once (the tensors are fixed allocations) and replayed with a single launch.
  * Copies are 16-byte vectorized; ds4 tensor allocations are 256B-aligned and
  * prepare rejects any byte count that is not a multiple of 16. */
+/** One device-to-device copy in a batched copy set -- see the note above for
+ * why they are batched. */
 typedef struct {
-    void *dst;
-    const void *src;
-    uint64_t bytes;
+    void *dst;        ///< destination, 16-byte aligned
+    const void *src;  ///< source, 16-byte aligned
+    uint64_t bytes;   ///< byte count; prepare rejects anything not a multiple of 16
 } pulsar_copy_desc;
 
 __global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32_t n_descs) {
@@ -1416,7 +1418,17 @@ int pulsar_gpu_begin_commands(void) { return 1; }
  * pays on GB10 — one dense graph per round (+1-2% solo, bitwise-proven).
  * Per-layer FFN segments measured -13% (cudaGraphLaunch is expensive on
  * integrated Blackwell; 43 small graphs/round lose) and are deleted. */
-typedef struct { uint64_t key; cudaGraphExec_t exec; uint32_t uses; int dead; } pulsar_seg_ent;
+/** One cached CUDA graph, keyed by the launch shape it was captured for. */
+typedef struct {
+    uint64_t key;           ///< hash of the launch shape this graph was captured for
+    cudaGraphExec_t exec;   ///< the instantiated graph
+    uint32_t uses;          ///< replays served, for the capture/replay counters
+    /** POISONED KEY: capture failed for this shape once, so never attempt it
+     * again -- fall back to eager launches for good. Cleared only by a full
+     * segment-cache reset. A retry loop here would re-pay a failing capture
+     * every round. */
+    int dead;
+} pulsar_seg_ent;
 #define PULSAR_SEG_SLOTS 1024u
 static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
 static int g_seg_capturing = 0;

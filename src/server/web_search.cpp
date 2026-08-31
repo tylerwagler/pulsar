@@ -143,10 +143,12 @@ char *web_search_query_from_arguments(const char *arguments_json) {
 
 /* ---- SearXNG HTTP fetch --------------------------------------------------- */
 
+/** A SearXNG endpoint split out of its configured URL. Fixed-size fields: a
+ * URL longer than these bounds is rejected rather than allocated for. */
 typedef struct {
-    char host[256];
-    char port[16];
-    char path[512];
+    char host[256];   ///< hostname, NUL-terminated
+    char port[16];    ///< port as text, ready for getaddrinfo
+    char path[512];   ///< request path, including any query prefix
 } web_search_endpoint;
 
 static bool web_search_parse_url(const char *url, web_search_endpoint *ep) {
@@ -292,10 +294,11 @@ static char *web_search_http_get(const web_search_endpoint *ep, const char *quer
 
 /* ---- SearXNG JSON -> canonical result chunks ------------------------------ */
 
+/** One search result, as rendered back into the model's context. */
 typedef struct {
-    char *title;
-    char *url;
-    char *snippet;
+    char *title;    ///< result title, owned
+    char *url;      ///< result URL, owned
+    char *snippet;  ///< result summary text, owned
 } web_search_hit;
 
 static void web_search_render_chunk(buf *b, const web_search_hit *hit) {
