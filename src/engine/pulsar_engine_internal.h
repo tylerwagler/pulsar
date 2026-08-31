@@ -322,9 +322,14 @@ typedef struct {
     int16_t bsums[QK_K / 16];      ///< sum of qs over each 16-element group
 } block_q8_K;
 
+/** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
+ *
+ * `qs` is not raw quants -- it packs indices INTO a fixed grid of 8-value
+ * patterns plus the sign bits, which is how the format reaches ~2.06 bits per
+ * weight. Decoding needs the grid table, not just these bytes. */
 typedef struct {
-    uint16_t d;
-    uint16_t qs[QK_K / 8];
+    uint16_t d;                  ///< block scale, f16
+    uint16_t qs[QK_K / 8];       ///< packed codebook indices and sign bits
 } block_iq2_xxs;
 
 
@@ -503,7 +508,7 @@ typedef struct {
      * (--expert-overlay): the payload lives at ext_map + abs_offset inside
      * the overlay file's mapping instead of the owning model's map. */
     const uint8_t *ext_map;
-    uint64_t ext_size;
+    uint64_t ext_size;   ///< size of that overlay mapping, for the bounds check
 } pulsar_tensor;
 
 /** A memory-mapped GGUF file plus its parsed directory.
@@ -638,7 +643,7 @@ typedef struct {
  */
 typedef struct {
     float *out;                                         ///< destination row(s), f32
-    const uint16_t *data;
+    const uint16_t *data;                               ///< weight rows, f16 (raw bits)
     const float *x;                                     ///< activation row the kernel multiplies against, f32
     uint64_t in_dim;                                    ///< input width (K)
 } matvec_f16_ctx;
@@ -725,6 +730,11 @@ typedef struct {
     int n_expert;                                       ///< number of experts addressed by this call
 } matvec_q2_k_accum_ctx;
 
+/** One (token, expert-slot) routing decision.
+ *
+ * A batched MoE step flattens the whole chunk's routing into a list of these,
+ * so an expert's work becomes a contiguous run rather than a scatter over
+ * tokens. */
 typedef struct {
     uint32_t token;                                     ///< token index within the batch
     uint32_t slot;                                      ///< which of the token's chosen experts this is
@@ -762,7 +772,7 @@ typedef struct {
     uint64_t in_dim;                                    ///< input width (K)
     uint64_t out_dim;                                   ///< output width (N)
     uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
-    uint64_t midq_blocks;
+    uint64_t midq_blocks;                               ///< Q8_K blocks per quantised SwiGLU row
 } matvec_q2_k_batch_down_ctx;
 
 /** Pools the batched down-projection's per-pair rows into per-token
@@ -775,12 +785,12 @@ typedef struct {
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
     const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
     const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
-    uint32_t n_active;
-    uint32_t n_tok;
+    uint32_t n_active;                                  ///< entries in active_expert
+    uint32_t n_tok;                                     ///< tokens in the batch; the output row count
     uint64_t in_dim;                                    ///< input width (K)
     uint64_t out_dim;                                   ///< output width (N)
     uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
-    uint64_t midq_blocks;
+    uint64_t midq_blocks;                               ///< Q8_K blocks per quantised SwiGLU row
 } matvec_q2_k_batch_accum_rows_ctx;
 
 /** @note NO USERS. Declared here but referenced nowhere else in src/
@@ -978,6 +988,28 @@ typedef struct {
     pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
 } pulsar_bank_slabs;
 
+/** Every device buffer one session needs, plus the host bookkeeping that says
+ * what is in them.
+ *
+ * NOT a graph in the framework sense -- there is no node list and nothing is
+ * traversed. It is a fixed set of named allocations reused in place by every
+ * layer, which is why the code below is verbose but predictable: each pointer
+ * names an actual DS4 stage rather than a slot in a generic arena.
+ *
+ * Three things live here that are easy to mistake for each other:
+ *
+ *  - DEVICE BUFFERS, holding the tensors themselves.
+ *  - HOST FRONTIER COUNTERS (layer_n_comp and the ms_* per-bank arrays), which
+ *    say how much of each buffer is live. These are bookkeeping the multiseq
+ *    driver owns; nothing on the device reads them.
+ *  - BANK VIEWS. When a pool is active the per-layer cache pointers are views
+ *    into ::pulsar_bank_slabs rather than owned allocations, re-pointed by
+ *    gpu_graph_bank_repoint. Freeing a view would free another bank's rows.
+ *
+ * During a multiseq step the scalar counters become cross-bank SUPERSETS
+ * rather than any one bank's frontier -- see the multiseq block below, which
+ * is the part to read before touching decode state.
+ */
 typedef struct {
     /** One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -1257,7 +1289,7 @@ typedef struct {
     pulsar_gpu_tensor *batch_comp_sc;               ///< batched twin: compressed score rows produced this chunk
     pulsar_gpu_tensor *batch_indexer_q;  ///< f32 rope staging, producer-internal (L090.4)
     pulsar_gpu_tensor *batch_indexer_qp;  ///< packed E2M1 Q rows -- what the scorers read
-    pulsar_gpu_tensor *batch_indexer_weights;
+    pulsar_gpu_tensor *batch_indexer_weights;  ///< batched twin: per-head indexer mixing weights
     pulsar_gpu_tensor *batch_heads;                 ///< batched twin: per-head attention output
     pulsar_gpu_tensor *batch_attn_low;              ///< batched twin: attention output through the low-rank 'a' projection
     pulsar_gpu_tensor *batch_attn_out;              ///< batched twin: attention output at embedding width
@@ -1553,6 +1585,8 @@ struct pulsar_engine {
      * would collide with the data member of the same name. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
     void destroy();  ///< was pulsar_engine_close
+    /** Print a human-readable model summary (shape, quantisation, memory) to
+     * stderr. */
     void summary();
     /** Tokenizer table length. NOT the logits width -- see logits_width(). */
     int vocab_size();
@@ -1581,6 +1615,10 @@ struct pulsar_engine {
     uint64_t demand_paged_bytes_per_bank(int ctx_size);
     /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
+    /** One-shot greedy generation: prefill `prompt`, then decode argmax until
+     * `n_predict` tokens or EOS, delivering each through `emit`. The
+     * self-contained path the CLI and the diagnostics use, with no session
+     * management for the caller to do. @return 0 on success. */
     int generate_argmax(const pulsar_tokens *prompt,
                         int n_predict, int ctx_size,
                         pulsar_token_emit_fn emit,
@@ -1588,6 +1626,9 @@ struct pulsar_engine {
                         void *emit_ud,
                         pulsar_session_progress_fn progress,
                         void *progress_ud);
+    /** Run the dataset through the model accumulating per-tensor activation
+     * magnitudes, and write the importance matrix used to steer quantisation.
+     * @return 0 on success. */
     int collect_imatrix(const char *dataset_path, const char *output_path,
                         int ctx_size, int max_prompts, int max_tokens);
     /** Debug: print ids with decoded text to stderr. */
@@ -1642,7 +1683,7 @@ typedef struct {
      * draw scatters q in, reads, then re-zeros only q's own ids, so the clear
      * is O(|q|) rather than a full-vocab memset. */
     float *qmap;
-    uint32_t qmap_cap;
+    uint32_t qmap_cap;  ///< entries allocated in qmap; sized by n_vocab, not by `cap`
 } pulsar_sample_scratch;
 
 void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
@@ -1838,7 +1879,7 @@ typedef struct pulsar_bank_carry {
     token_vec checkpoint;  ///< deep copy of s->checkpoint
     float    *logits;  ///< PULSAR_N_VOCAB floats, owned
     float    *dspark_pending_qrows;  ///< dspark_pending_qrows_cap floats, owned
-    uint32_t  dspark_pending_qrows_cap;
+    uint32_t  dspark_pending_qrows_cap;  ///< floats allocated in dspark_pending_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
     /** Whole speculative/DSpark shadow, mirrored by value (single assignment in
@@ -1933,7 +1974,7 @@ struct pulsar_session {
      * allocated on the first pulsar_session_bank_state_save; NULL / bank_carry_n==0
      * when the pool is disabled (single-session use never touches it). */
     pulsar_bank_carry *bank_carry;
-    uint32_t bank_carry_n;
+    uint32_t bank_carry_n;   ///< carries allocated; 0 when the pool is disabled
 
     /** ---- methods (C++ port): 1:1 mirror of the pulsar_session_* verb family.
      * The public API in pulsar.h stays the free-function facade (defined in
@@ -2122,6 +2163,8 @@ struct pulsar_session {
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */
     int save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen);
+    /** Restore the session from a snapshot taken by save_snapshot().
+     * @return 0 on success. */
     int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
 

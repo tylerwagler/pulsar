@@ -228,15 +228,20 @@ typedef enum {
 
 typedef struct server server;
 
+/** One tool call, as the client sees it. Arguments stay as raw JSON TEXT
+ * rather than a parsed structure -- reproducing the prefix later needs the
+ * exact bytes, and a re-serialised parse is not byte-identical. */
 typedef struct {
-    char *id;
-    char *name;
-    char *arguments;
+    char *id;         ///< call id the client echoes back with the result, owned
+    char *name;       ///< tool name, owned
+    char *arguments;  ///< arguments as raw JSON text, owned
 } tool_call;
 
+/** The tool calls parsed from one assistant turn, plus the bytes they came
+ * from. */
 typedef struct {
-    tool_call *v;
-    int len;
+    tool_call *v;     ///< the calls, in emission order
+    int len;          ///< calls present
     int cap;          ///< calls allocated
     /** The exact sampled DSML bytes these calls were parsed from, owned. Kept
      * because reproducing a prefix requires the bytes the model actually
@@ -329,8 +334,9 @@ typedef struct {
  * these fields never influence sampling/rng/logits. All rates are derived in
  * the JSON emitter (guarded divisions), so a zero denominator omits a rate
  * rather than emitting NaN/inf. */
+/** Per-response timings -- see the note above for the emission contract. */
 typedef struct {
-    bool valid;
+    bool valid;     ///< the timings below were populated; suppresses a half-filled object
     double ttft_s;  ///< wall time from request start to first emitted token
     double prefill_s;  ///< wall time spent in prefill (request start -> decode start)
     double decode_s;  ///< wall time spent decoding (decode start -> finish)
@@ -398,8 +404,8 @@ typedef struct {
  * response, and the alternatives considered at that position. */
 typedef struct {
     logprob_token tok;  ///< the token that was actually emitted
-    size_t end_off;
-    int    n_top;
+    size_t end_off;  ///< byte watermark: where this token's text ends in the response
+    int    n_top;    ///< alternatives recorded in `top`
     logprob_token *top;  ///< owned; n_top alternatives, descending
 } logprob_entry;
 
@@ -439,9 +445,16 @@ typedef struct {
     pulsar_token_score pending_top[PULSAR_SERVER_MAX_TOP_LOGPROBS];  ///< those alternatives
 } logprob_ledger;
 
+/** One parsed request, normalised across the three supported APIs.
+ *
+ * `kind` and `api` are separate on purpose: the same logical operation (a chat
+ * completion) arrives in three different wire shapes, and the response has to
+ * go back in the shape it came from. Everything below is protocol-neutral;
+ * `api` is what the emitters branch on.
+ */
 typedef struct {
-    req_kind kind;
-    api_style api;
+    req_kind kind;             ///< what the request asks for (completion, chat, embedding, ...)
+    api_style api;             ///< which wire protocol it arrived on; the response must match
     pulsar_tokens prompt;      ///< the rendered prompt as tokens
     char *model;               ///< model name to serve, owned
     bool model_from_request;   ///< the client named the model (vs the server default)
@@ -759,7 +772,7 @@ typedef struct {
      * has_tools is copied from the request at start so the round reset can
      * re-arm without a request pointer. */
     bool guard_second_reasoning;
-    bool has_tools;
+    bool has_tools;      ///< copied from the request at start, so a round reset can re-arm without it
     bool sent_thinking;  ///< a thinking delta has been emitted
     bool sent_text;      ///< a text delta has been emitted
     anthropic_tool_stream tool;  ///< tool-call projection nested in this stream
@@ -879,8 +892,11 @@ typedef struct {
     uint64_t scan_clock;       ///< monotonic; one value per scan pass, compared against block::seen
 } tool_memory;
 
+/** A slot's binding between tool-call ids and the frontier they were sampled
+ * at -- the state that lets a tool result continue its own conversation rather
+ * than cold-prefilling. */
 typedef struct {
-    bool valid;
+    bool valid;  ///< the binding below is populated
     /** Token frontier of a live assistant tool-call turn. Continuing from this
      * point preserves hidden thinking and sampled DSML bytes that are not
      * necessarily present in the client-visible replay. */
@@ -889,7 +905,7 @@ typedef struct {
      * Responses uses this because visible replay can omit hidden reasoning.
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
-    size_t visible_len;
+    size_t visible_len;   ///< length of visible_text in bytes
     /** Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
@@ -1120,13 +1136,19 @@ typedef struct gen_state gen_state;
  * are provisioned lazily and evicted LRU-first by the scheduler (worker
  * thread only) — an evicted slot is a reusable hole (provisioned == false,
  * state SLOT_EVICTED) below the n_slots high-water mark. */
+/** One session-pool slot -- see the note above for the lifecycle.
+ *
+ * A slot is a pure BANK DESCRIPTOR, not a session: all engine work goes through
+ * the single shared server.sess, and a slot names which bank of it holds this
+ * conversation.
+ */
 typedef struct {
     bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
     uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
     int          committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
     struct job  *active_job;  ///< request bound to this slot, or NULL
     gen_state   *gen;  ///< resumable state for active_job
-    slot_state   state;
+    slot_state   state;  ///< lifecycle state; SLOT_EVICTED marks a reusable hole
     int          ctx_size;  ///< context this slot was admitted for
     uint64_t     est_cost_bytes;  ///< ledger-committed session cost (ACTUAL resident bytes once the session exists; the true-cost estimate only gates admission before the create)
     uint64_t     tokens_emitted;  ///< decode bookkeeping for the scheduler
@@ -1153,9 +1175,9 @@ typedef struct {
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
      * so a continuation can never match another slot's frontier. */
-    live_tool_state responses_live;
-    live_tool_state anthropic_live;
-    visible_live_state thinking_live;
+    live_tool_state responses_live;      ///< Responses call-id binding at this slot's frontier
+    live_tool_state anthropic_live;      ///< Anthropic tool_use binding at this slot's frontier
+    visible_live_state thinking_live;    ///< what the client can replay at this slot's frontier
 } session_slot;
 
 /* Forward declarations / relocated types referenced by struct server's member
