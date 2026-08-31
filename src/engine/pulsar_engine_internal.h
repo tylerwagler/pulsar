@@ -1784,11 +1784,22 @@ typedef struct pulsar_bank_carry {
 } pulsar_bank_carry;
 
 
+/** One conversation's state: the KV it owns, the tokens that produced it, and
+ * the host bookkeeping that must stay in step with both.
+ *
+ * Sessions are NOT thread-safe individually; concurrency comes from running
+ * several banks inside one session (see pulsar_bank_slabs), which is why the
+ * server owns a single pool session rather than one session per request.
+ *
+ * The central invariant is that `checkpoint` describes exactly the tokens whose
+ * KV rows the graph holds for the CURRENT bank. Every operation that can break
+ * that -- sync, rewind, a multiseq step, a bank switch -- either restores it or
+ * sets a flag that makes the next classic call fail loud. */
 struct pulsar_session {
-    pulsar_engine *engine;
-    pulsar_gpu_graph graph;
-    token_vec checkpoint;
-    float *logits;
+    pulsar_engine *engine;    ///< borrowed; the engine outlives every session
+    pulsar_gpu_graph graph;   ///< this session's device state (KV, scratch, bank views)
+    token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
+    float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
     /** Reused working set for the sampled speculative acceptance walk's
      * full-vocab distribution builds (one per accepted position). Per-session,
      * never shared: concurrent sessions each run their own walk. */
@@ -1802,15 +1813,15 @@ struct pulsar_session {
      * Only ever live inside one speculative eval call (the fused and block
      * paths never overlap: block tail-calls fused). */
     float *spec_row_scratch;
-    pulsar_session_progress_fn progress;
-    void *progress_ud;
-    pulsar_session_progress_fn display_progress;
-    void *display_progress_ud;
-    pulsar_session_cancel_fn cancel;
-    void *cancel_ud;
-    uint32_t prefill_cap;
-    int ctx_size;
-    bool checkpoint_valid;
+    pulsar_session_progress_fn progress;   ///< durable progress callback: fires at real checkpoint boundaries
+    void *progress_ud;                     ///< user data for progress
+    pulsar_session_progress_fn display_progress;  ///< UI-only progress; may fire MID-chunk, so not a checkpoint boundary
+    void *display_progress_ud;             ///< user data for display_progress
+    pulsar_session_cancel_fn cancel;       ///< cooperative cancellation hook, polled at safe points only
+    void *cancel_ud;                       ///< user data for cancel
+    uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
+    int ctx_size;                          ///< allocated context length, in tokens
+    bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
     /** A multiseq step has run and the graph's CLASSIC per-bank state is no
      * longer re-establishable by bookkeeping alone: the scalar frontier
      * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
@@ -1977,17 +1988,39 @@ struct pulsar_session {
                              int *accepted, int accepted_cap, char *err, size_t errlen);
     int eval_speculative_block(int first_token, int max_tokens, int eos_token,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
+    /** Discard the conversation: clear the checkpoint, drop spec carry and
+     * pendings, and disarm the rewind rings so a NEXT conversation can never
+     * restore this one's rows. The graph keeps its allocations. */
     void invalidate();
+    /** Undo back to `pos` tokens: trim the checkpoint, drop speculative state,
+     * and clamp every compressing layer's frontier to pos/ratio.
+     *
+     * The clamp is unconditional and is what keeps the next step admissible.
+     * A second, best-effort half restores the VALUES of re-emitted compressed
+     * rows from the projection ring -- only when the ring covers the rewound
+     * span, which on the served (multiseq) path it does not. */
     void rewind(int pos);
+    /** Committed token count for the current bank. */
     int pos();
+    /** Allocated context length, in tokens. */
     int ctx();
+    /** Smallest suffix worth prefilling as its own chunk: below this the fixed
+     * per-chunk cost dominates and the caller should extend instead. */
     uint32_t prefill_quantum_min_suffix() const;
+    /** Borrowed view of the committed token history. Do not free. */
     const pulsar_tokens *tokens();
+    /** Serialized size of this session's payload, in bytes. */
     uint64_t payload_bytes();
+    /** Write the payload to a fresh file under `stage_dir` and report where it
+     * landed -- the disk-KV store's write path. @return 0 on success. */
     int stage_payload(pulsar_session_payload_file *out, const char *stage_dir,
                       char *err, size_t errlen);
+    /** Write the payload to an open stream. @return 0 on success. */
     int save_payload(FILE *fp, char *err, size_t errlen);
+    /** Read a payload back, replacing this session's state. Refuses a payload
+     * whose version or shape does not match this build. @return 0 on success. */
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+    /** Capture the session into an owned in-memory blob. @return 0 on success. */
     int save_snapshot(pulsar_session_snapshot *snap, char *err, size_t errlen);
     int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
