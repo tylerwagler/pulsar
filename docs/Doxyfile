@@ -18,8 +18,27 @@ AUTOLINK_SUPPORT       = YES
 INPUT                  = src docs/DESIGN.md
 FILE_PATTERNS          = *.h *.hpp *.c *.cpp *.cu *.cuh *.md
 RECURSIVE              = YES
-EXCLUDE                = src/vendor
-EXCLUDE_PATTERNS       = */build/* */cutlass/*
+# VENDORED CODE IS OUT OF SCOPE, and this is a correctness rule rather than a
+# taste one. src/cuda/mmq/VENDOR.md records that mma.cuh, mmid.*, ggml-common.h
+# and the ggml redirect headers are byte-identical to llama.cpp pin 5c0e946 and
+# are therefore "free to replace outright" on a re-sync. Adding our own doc
+# comments to them would destroy exactly that property and turn a clean
+# re-vendor into a merge. ds4_cuda_env.cuh is a derived extract of upstream's
+# common.cuh and carries the same argument.
+#
+# Our own adapters in that directory (ds4_mmq*, ds4_mmid*, ds4_ggml_stubs*,
+# ds4_act_block.cuh, ds4_quantize_e4m3.cu) stay IN scope -- they are ours to
+# document.
+EXCLUDE                = src/vendor \
+                         src/cuda/mmq/mma.cuh \
+                         src/cuda/mmq/mmid.cu \
+                         src/cuda/mmq/mmid.cuh \
+                         src/cuda/mmq/ggml-common.h \
+                         src/cuda/mmq/ggml.h \
+                         src/cuda/mmq/ggml-impl.h \
+                         src/cuda/mmq/ggml-cuda.h \
+                         src/cuda/mmq/ds4_cuda_env.cuh
+EXCLUDE_PATTERNS       = */build/* */cutlass/* */vendors/*
 USE_MDFILE_AS_MAINPAGE = docs/DESIGN.md
 
 # The engine's real content is in static functions and struct internals;
