@@ -1681,16 +1681,21 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             return false;
         }
     }
-    /* All rejection points passed: NOW commit the cur-bank capture (the
-     * scalars are still the pre-step classic values here — the superset
-     * write below is the first scalar mutation). */
+    /* All rejection points passed: NOW commit the cur-bank capture. */
     if (capture_cur) gpu_graph_bank_counters_capture(g, cur_bank);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        gpu_graph_n_comp(g, il) = sup[il];
-        if (ratio == 4) gpu_graph_n_index_comp(g, il) = sup[il];
-    }
+    /* STAGE 1b: the cross-bank SUPERSET is no longer written anywhere.
+     *
+     * This loop used to publish max-over-banks into the scalars, which the step
+     * then treated as a read-only working value. With the scalars gone that
+     * write lands on ms_n_comp[cur_bank] -- i.e. it overwrites one real bank's
+     * frontier with the maximum across all of them, and step_end catches it as
+     * "bank N layer 2 frontier 18/18 want 17" whenever another bank is ahead.
+     *
+     * sup[] is still computed above because the comp-cap rejection needs it;
+     * it is a bound check, not stored state. Every consumer of the frontier
+     * during the step reads its own bank: the per-row loop through
+     * ms_n_comp[ms_seq_id[t]], the kernels through the per-row comp_counts[]
+     * device array. */
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
     /* plan-34 inc 2/3/4: arm the M-independent custom GEMMs for the DECODE PREFIX
