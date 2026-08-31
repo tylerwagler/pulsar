@@ -1062,8 +1062,8 @@ typedef struct {
      * layer_index_comp_cache.  Also reused for session-save dequant and
      * session-load repack. */
     pulsar_gpu_tensor *idx_comp_stage;
-    pulsar_gpu_tensor *indexer_q;      /* f32 rope staging, producer-internal (L090.4) */
-    pulsar_gpu_tensor *indexer_qp;     /* packed E2M1 Q rows -- what the scorers read */
+    pulsar_gpu_tensor *indexer_q;  ///< f32 rope staging, producer-internal (L090.4)
+    pulsar_gpu_tensor *indexer_qp;  ///< packed E2M1 Q rows -- what the scorers read
     pulsar_gpu_tensor *indexer_weights;  ///< indexer gate weights per compressed row
     pulsar_gpu_tensor *indexer_scores;   ///< indexer relevance score per compressed row
     pulsar_gpu_tensor *comp_selected;    ///< top-k compressed row ids the attention will read
@@ -1109,7 +1109,7 @@ typedef struct {
      * reference prefills this window; an empty or stale window collapses
      * drafter acceptance). dspark_prompt_n counts captured prompt positions. */
     pulsar_gpu_tensor *dspark_prompt_h[3];
-    uint32_t dspark_prompt_n;    /* positions captured: ring valid for [lo, n) */
+    uint32_t dspark_prompt_n;  ///< positions captured: ring valid for [lo, n)
     uint32_t dspark_prompt_lo;
     /** Fused spec loop (P2): per-position anchor hiddens captured during the
      * verify batch — [spec cap, N_EMBD] per anchor layer. dspark_capture_batch_n
@@ -1132,27 +1132,21 @@ typedef struct {
     uint32_t spec_comp_save_n;                  ///< arms the save; 0 = off. Also suppresses projection-ring deposits, since a speculative row is not committed
     /** Persistent drafter scratch (was per-call cudaMalloc/cudaFree churn --
      * cudaFree device-syncs, and the fused loop projects/seeds up to 5x/step). */
-    pulsar_gpu_tensor *dspark_concat;       /* [3*N_EMBD] target_h concat */
-    pulsar_gpu_tensor *dspark_proj_out;     /* [N_EMBD] pre-norm projection */
+    pulsar_gpu_tensor *dspark_concat;  ///< [3*N_EMBD] target_h concat
+    pulsar_gpu_tensor *dspark_proj_out;  ///< [N_EMBD] pre-norm projection
     /** Confidence scoring scratch, persistent for the same reason as the two
      * above: it is touched once per fused spec step and n_draft is clamped to
      * 16, so a per-step alloc/free pair bought nothing but device
      * serialization. */
-    pulsar_gpu_tensor *dspark_conf_scores;  /* [16] f32 per-draft confidence */
-    pulsar_gpu_tensor *dspark_conf_tokens;  /* [16] i32 refined draft ids   */
-    pulsar_gpu_tensor *dspark_embed_tokens; /* [16] i32 draft ids for the embed
-                                             * upload (L104 fix B: was a
-                                             * cudaMalloc/free PER DRAFTER
-                                             * FORWARD in gpu_decode) */
-    pulsar_gpu_tensor *dspark_refined_ids;  /* [17] i32: L108 P1 device-chained
-                                             * greedy walk -- [0] seeded with the
-                                             * base token, reduce pos p writes
-                                             * the winner to [p+1] */
-    pulsar_gpu_tensor *dspark_refined2_ids; /* [17] i32 runner-ups (DTree) */
-    pulsar_gpu_tensor *dspark_seed_kv;      /* [HEAD_DIM] seed kv scratch */
-    pulsar_gpu_tensor *dspark_seed_norm;    /* [HEAD_DIM] */
-    pulsar_gpu_tensor *dspark_seed_rot;     /* [HEAD_DIM] */
-    pulsar_gpu_tensor *dspark_markov_logits; /* [N_VOCAB] markov refine scratch */
+    pulsar_gpu_tensor *dspark_conf_scores;  ///< [16] f32 per-draft confidence
+    pulsar_gpu_tensor *dspark_conf_tokens;  ///< [16] i32 refined draft ids
+    pulsar_gpu_tensor *dspark_embed_tokens;  ///< [16] i32 draft ids for the embed upload (L104 fix B: was a cudaMalloc/free PER DRAFTER FORWARD in gpu_decode)
+    pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
+    pulsar_gpu_tensor *dspark_refined2_ids;  ///< [17] i32 runner-ups (DTree)
+    pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
+    pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
+    pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
+    pulsar_gpu_tensor *dspark_markov_logits;  ///< [N_VOCAB] markov refine scratch
 
     /** DSpark draft KV raw caches (one per draft layer, window=128) */
     pulsar_gpu_tensor *dspark_raw_cache[3];
@@ -1199,8 +1193,8 @@ typedef struct {
     pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;               ///< batched twin: compressed KV rows produced this chunk
     pulsar_gpu_tensor *batch_comp_sc;               ///< batched twin: compressed score rows produced this chunk
-    pulsar_gpu_tensor *batch_indexer_q;   /* f32 rope staging, producer-internal (L090.4) */
-    pulsar_gpu_tensor *batch_indexer_qp;  /* packed E2M1 Q rows -- what the scorers read */
+    pulsar_gpu_tensor *batch_indexer_q;  ///< f32 rope staging, producer-internal (L090.4)
+    pulsar_gpu_tensor *batch_indexer_qp;  ///< packed E2M1 Q rows -- what the scorers read
     pulsar_gpu_tensor *batch_indexer_weights;
     pulsar_gpu_tensor *batch_heads;                 ///< batched twin: per-head attention output
     pulsar_gpu_tensor *batch_attn_low;              ///< batched twin: attention output through the low-rank 'a' projection
@@ -1256,25 +1250,25 @@ typedef struct {
      * batch_positions/batch_seq_id the device arrays the kernels read.
      * All four are lazily allocated (prefill_cap entries) on the first
      * multiseq step; NULL in production single-session serving. */
-    uint32_t ms_n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
-    uint32_t ms_n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
+    uint32_t ms_n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];        ///< compressed KV rows per (bank, layer); the authoritative frontier
+    uint32_t ms_n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];  ///< compressed INDEX rows per (bank, layer); ratio-4 only
     /** L120 value-half: per-bank projection-ring span bounds (see
      * proj_ring_lo/hi), captured/installed with ms_n_comp.  Zeroed on fork
      * and spill-restore: an uncovered rewind skips the value restore. */
-    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];
-    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];
+    uint32_t ms_proj_ring_lo[PULSAR_MSEQ_MAX];  ///< oldest position the bank's projection ring still covers
+    uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];  ///< one past the newest; lo == hi means the ring is empty
     /** L124: per-bank undo-log host state, captured/installed with ms_n_comp;
      * zeroed on fork and spill-restore. */
-    uint32_t ms_r128_undo_pos[PULSAR_MSEQ_MAX][32];
-    uint32_t ms_r128_undo_head[PULSAR_MSEQ_MAX];
-    uint32_t ms_r128_undo_n[PULSAR_MSEQ_MAX];
+    uint32_t ms_r128_undo_pos[PULSAR_MSEQ_MAX][32];  ///< positions in the bank's undo log, newest at head
+    uint32_t ms_r128_undo_head[PULSAR_MSEQ_MAX];     ///< ring index the next entry is written at
+    uint32_t ms_r128_undo_n[PULSAR_MSEQ_MAX];        ///< entries currently live (<= PULSAR_REWIND_RING_DEPTH)
     /** Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the
      * device rings themselves are banked slabs, pulsar_bank_slabs.dspark_*).
      * Captured/installed alongside ms_n_comp so each bank keeps a WARM drafter
      * window under N=2 spec-time-slice — the whole point of Option F. */
-    uint32_t ms_dspark_n_raw[PULSAR_MSEQ_MAX][3];
-    uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];
-    uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];
+    uint32_t ms_dspark_n_raw[PULSAR_MSEQ_MAX][3];   ///< per-bank raw-ring fill for each of the drafter's 3 rings
+    uint32_t ms_dspark_prompt_n[PULSAR_MSEQ_MAX];   ///< drafter prompt-window length held by the bank
+    uint32_t ms_dspark_prompt_lo[PULSAR_MSEQ_MAX];  ///< first position of that window
     /** Tier-2 PATH-A partial-prefix KV-reuse (plan-33). Net-new. ms_emit_keep[bank]
      * is the ratio-4 boundary-row restore threshold: 0 = inactive (increment A
      * full-prefix fork clears it; increment C's partial cut sets R/4+1 and the
@@ -1282,22 +1276,27 @@ typedef struct {
      * row0 < it). fork_pin[bank] is a transient eviction pin so the guard's victim
      * picker cannot free_physical a source bank mid-clone (plan-33 anti-corruption
      * guarantee). Both zero-initialised with the graph. */
-    uint32_t ms_emit_keep[PULSAR_MSEQ_MAX];
-    uint8_t  fork_pin[PULSAR_MSEQ_MAX];
+    uint32_t ms_emit_keep[PULSAR_MSEQ_MAX];  ///< ratio-4 boundary-row restore threshold; 0 = inactive
+    uint8_t  fork_pin[PULSAR_MSEQ_MAX];      ///< transient eviction pin: the guard must not free a bank being cloned
     /** Boundary-row stash (inc C): one PACKED row per (bank, layer) — the ratio-4
      * comp row R/4 and index row R/4 copied byte-for-byte at fork_copy_cut, and
      * byte-REPLACED over the replay's recomputed row by gpu_graph_emit_keep_restore
      * (never re-encoded: bit-exact for MXFP8-pack AND the non-idempotent MXFP4 QAT
      * alike). Sized n_banks * PULSAR_N_LAYER * row_bytes at slab alloc; NULL when the
      * pool is disabled. */
-    pulsar_gpu_tensor *emit_stash_comp;
-    pulsar_gpu_tensor *emit_stash_index;
-    int32_t *ms_positions;
-    int32_t *ms_seq_id;
-    pulsar_gpu_tensor *batch_positions;
-    pulsar_gpu_tensor *batch_seq_id;
+    pulsar_gpu_tensor *emit_stash_comp;   ///< stashed packed comp row per (bank, layer)
+    pulsar_gpu_tensor *emit_stash_index;  ///< stashed packed index row per (bank, layer)
+
+    int32_t *ms_positions;                ///< HOST mirror: KV position of each row in the step
+    int32_t *ms_seq_id;                   ///< HOST mirror: owning bank of each row in the step
+    pulsar_gpu_tensor *batch_positions;   ///< DEVICE copy of ms_positions, read by the kernels
+    pulsar_gpu_tensor *batch_seq_id;      ///< DEVICE copy of ms_seq_id, read by the kernels
+    /** A multiseq step is in flight. Armed by gpu_graph_multiseq_step_begin for
+     * EVERY batched step -- one row or sixteen -- which is what makes the
+     * batched lane the only decode lane. While armed, the scalar layer_n_comp
+     * counters are cross-bank SUPERSETS rather than any one bank's frontier. */
     bool batch_multiseq;
-    uint32_t batch_multiseq_rows;
+    uint32_t batch_multiseq_rows;         ///< rows in the current step
 } pulsar_gpu_graph;
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
@@ -1393,7 +1392,7 @@ typedef struct {
     uint64_t used;
 } str_i32_table;
 
-struct owned_str;  /* forward decl: bpe_rank() param; full def appears later */
+struct owned_str;  ///< forward decl: bpe_rank() param; full def appears later
 
 /** Byte-level BPE vocabulary and the special ids the chat template needs.
  *
@@ -1470,11 +1469,11 @@ struct pulsar_engine {
      * pulsar_engine_spec_metrics). Incremented from the DSpark fused verify loop;
      * monotonic. GPU decode submission is single-threaded, so plain uint64 is
      * adequate for these monitoring counters. */
-    uint64_t spec_accepted_tokens;         /* accepted draft tokens */
+    uint64_t spec_accepted_tokens;  ///< accepted draft tokens
     uint64_t spec_draft_tokens;   ///< proposed/verified draft tokens (engine-cumulative)
     uint64_t spec_num_drafts;     ///< draft rounds, i.e. verify steps carrying drafts
     uint64_t spec_gen_tokens;     ///< tokens emitted by the speculative loop
-    uint64_t spec_accepted_per_pos[16];    /* accepted count per draft position */
+    uint64_t spec_accepted_per_pos[16];  ///< accepted count per draft position
 
     /** ---- methods (C++ port): 1:1 mirror of the pulsar_engine_* verb family.
      * The public API in pulsar.h stays the free-function facade (defined in
@@ -1485,7 +1484,7 @@ struct pulsar_engine {
      * NOTE: pulsar_engine_dspark_draft_tokens stays a free function — a member
      * would collide with the data member of the same name. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
-    void destroy();                        /* was pulsar_engine_close */
+    void destroy();  ///< was pulsar_engine_close
     void summary();
     /** Tokenizer table length. NOT the logits width -- see logits_width(). */
     int vocab_size();
@@ -1552,16 +1551,16 @@ typedef struct {
  * Caller-owned and NOT shared: each concurrent session runs its own sampled
  * acceptance walk, so this lives on pulsar_session, never on pulsar_engine. */
 typedef struct {
-    sample_candidate *cand;   /* sorted candidates              */
-    uint64_t *keys;           /* packed (sort key << 32 | id)   */
-    uint64_t *tmp;            /* radix ping-pong buffer         */
+    sample_candidate *cand;  ///< sorted candidates
+    uint64_t *keys;  ///< packed (sort key << 32 | id)
+    uint64_t *tmp;  ///< radix ping-pong buffer
     /** Gather target for the min-p prefilter path: survivors are collected
      * into `cand` in ascending-id order (probs computed once, alongside the
      * full-vocab sum), then gathered here in descending sort order. A second
      * buffer because the gather cannot run in place and the degenerate
      * all-equal-logits case keeps every candidate (m == cap). */
     sample_candidate *cand2;
-    uint32_t cap;             /* elements reserved in each      */
+    uint32_t cap;  ///< elements reserved in each
     /** Dense token->q(prob) map for pulsar_sample_dist_draw_residual, which needs
      * q(x) for each x in p's support: the linear pulsar_sample_dist_prob scan
      * would make that O(|p|*|q|) — 1.6e10 at full vocab. Sized by token id
@@ -1662,28 +1661,10 @@ typedef struct pulsar_spec_carry_state {
      * draft reads the engine's --dspark-draft value, which is thereby the
      * STARTING depth, not a fixed width). Persists across requests in a
      * session on purpose: a client's workload regime usually does too. */
-    int spec_adaptive_depth;   /* bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct */
-    bool spec_depth_down_forgiven; /* L107 v2: one down-signal was vetoed on a
-                                    * still-confident tail; a second consecutive
-                                    * one backs off regardless */
-    uint8_t spec_depth_rounds_since_up; /* L107 v5: rounds since the last UP,
-                                    * saturating at 255; a down within 2 of an
-                                    * up is a FAILED EXCURSION and triggers the
-                                    * cooldown; a down after a sustained ride
-                                    * carries no penalty (v4's blanket cooldown
-                                    * cost ~0.9 t/s on BOTH server workloads by
-                                    * suppressing profitable climbs). */
-    uint8_t spec_depth_climb_cooldown; /* L107 v4: rounds remaining in which UP
-                                    * is suppressed after a failed excursion.
-                                    * Raw-completion prose oscillated 2->3->4->
-                                    * crash forever (29 transitions/192 tok,
-                                    * -14%): each failed excursion burns a deep
-                                    * round, and tail conf does NOT separate
-                                    * good climbs from bad (a 0.93 tail climbed
-                                    * into commit=0). Cooldown makes excursions
-                                    * rare after they fail; structured's downs
-                                    * are rare (and v3-forgiven rounds are not
-                                    * downs), so its climb is untouched. */
+    int spec_adaptive_depth;  ///< bounds: PULSAR_SPEC_DEPTH_{MIN,MAX} below the struct
+    bool spec_depth_down_forgiven;  ///< L107 v2: one down-signal was vetoed on a still-confident tail; a second consecutive one backs off regardless
+    uint8_t spec_depth_rounds_since_up;  ///< L107 v5: rounds since the last UP, saturating at 255; a down within 2 of an up is a FAILED EXCURSION and triggers the cooldown; a down after a sustained ride carries no penalty (v4's blanket cooldown cost ~0.9 t/s on BOTH server workloads by suppressing profitable climbs).
+    uint8_t spec_depth_climb_cooldown;  ///< L107 v4: rounds remaining in which UP is suppressed after a failed excursion. Raw-completion prose oscillated 2->3->4-> crash forever (29 transitions/192 tok, -14%): each failed excursion burns a deep round, and tail conf does NOT separate good climbs from bad (a 0.93 tail climbed into commit=0). Cooldown makes excursions rare after they fail; structured's downs are rare (and v3-forgiven rounds are not downs), so its climb is untouched.
     /** --- Temperature-matched draft sampling (spec-decode Item 1) ---
      * At temperature > 0 the drafts above are DRAWN from a temperature-matched
      * proposal q (the drafter's refined logits filtered at the request's
@@ -1734,7 +1715,7 @@ typedef struct pulsar_spec_carry_state {
      * Multiseq note: this state belongs to the classic single-request flow;
      * the dormant multi-bank driver would need per-bank copies (not wired —
      * generate_speculative already refuses when mseq_dirty). */
-    float spec_quench_debt;    /* cumulative plain-token-equivalents lost */
+    float spec_quench_debt;  ///< cumulative plain-token-equivalents lost
     float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
     uint32_t spec_quench_steps; ///< fused spec steps taken by this request
     bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
@@ -1779,11 +1760,11 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s);
  * mirror of the identically-named pulsar_session field; the speculative/DSpark
  * scalars are carried wholesale as one embedded pulsar_spec_carry_state. */
 typedef struct pulsar_bank_carry {
-    bool      valid;                 /* has this bank's state ever been saved */
+    bool      valid;  ///< has this bank's state ever been saved
     /** heap-backed (owned): */
-    token_vec checkpoint;            /* deep copy of s->checkpoint */
-    float    *logits;                /* PULSAR_N_VOCAB floats, owned */
-    float    *dspark_pending_qrows;  /* dspark_pending_qrows_cap floats, owned */
+    token_vec checkpoint;  ///< deep copy of s->checkpoint
+    float    *logits;  ///< PULSAR_N_VOCAB floats, owned
+    float    *dspark_pending_qrows;  ///< dspark_pending_qrows_cap floats, owned
     uint32_t  dspark_pending_qrows_cap;
     /** scalar mirrors: */
     bool      checkpoint_valid;
@@ -1794,8 +1775,8 @@ typedef struct pulsar_bank_carry {
      * gpu_graph_bank_counters_install and then clears it unconditionally.  The
      * old mirror field was write-only (saved, never read) and has been dropped. */
     pulsar_spec_carry_state spec;
-    void copy(const pulsar_bank_carry *sc);   /* was bank_carry_copy */
-    void free_one();                          /* was bank_carry_free_one */
+    void copy(const pulsar_bank_carry *sc);  ///< was bank_carry_copy
+    void free_one();  ///< was bank_carry_free_one
 } pulsar_bank_carry;
 
 
@@ -1874,7 +1855,7 @@ struct pulsar_session {
      * this, so it swaps this host pool for a resident device buffer instead of
      * reshaping the format. */
     float *dspark_pending_qrows;
-    uint32_t dspark_pending_qrows_cap;   /* floats reserved */
+    uint32_t dspark_pending_qrows_cap;  ///< floats reserved
     /** Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
      * allocated on the first pulsar_session_bank_state_save; NULL / bank_carry_n==0
      * when the pool is disabled (single-session use never touches it). */
@@ -2057,6 +2038,9 @@ typedef struct {
  * spec_quench_reset (session_spec.cpp) re-arms the terminal yield quench at
  * request boundaries (sync/invalidate/rewind/load_payload). */
 void payload_set_err(char *err, size_t errlen, const char *msg);
+/** Re-arm at request boundaries (the same sites that drop the carry and
+ * pendings). All-zero == armed, matching the xcalloc'd session.
+ */
 void spec_quench_reset(pulsar_session *s);
 
 /** ---- shared globals ---- */
@@ -2081,7 +2065,16 @@ extern uint32_t g_requested_threads;
 bool pulsar_backend_uses_graph(pulsar_backend backend);
 void iq2xxs_signed_grid_init(void);
 void pulsar_die(const char *msg);
+/** Attention compression is read from GGUF metadata after validating that it
+ * matches the exact layout expected for the loaded model shape.
+ */
 uint32_t pulsar_layer_compress_ratio(uint32_t il);
+/** Physically-present routed-expert count for a layer. For an un-pruned model
+ * (or any layer whose keep_count was not set) this is the full n_expert; for a
+ * REAP ds4-compact-v1 model the pruned layers report their dense survivor
+ * count. Only the expert *weight* tensors are trimmed to this; the router and
+ * bias stay padded to n_expert.
+ */
 uint32_t pulsar_layer_n_expert(uint32_t il);
 uint32_t pulsar_expected_layer_compress_ratio(uint32_t il);
 void pulsar_die_errno(const char *what, const char *path);
@@ -2121,6 +2114,10 @@ bool model_get_f32_compat(const pulsar_model *m, const char *key, float *out);
 bool model_get_bool(const pulsar_model *m, const char *key, bool *out);
 bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *out);
 void model_close(pulsar_model *m);
+/** Open and map the GGUF once.  The GPU path needs a shared mapping for
+ * no-copy GPU buffers; tokenizer/inspection opens use a private read-only
+ * mapping instead.
+ */
 void model_open(pulsar_model *m, const char *path, bool gpu_mapping);
 void model_summary(const pulsar_model *m);
 pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name);
@@ -2130,6 +2127,9 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count,
                                             const char *skip_prefix);
+/** Return the in-place tensor payload inside the mapped GGUF (or inside the
+ * overlay file's mapping for --expert-overlay swapped tensors).
+ */
 const void *tensor_data(const pulsar_model *m, const pulsar_tensor *t);
 uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *overlay,
                                     const char *prefix);
@@ -2167,14 +2167,25 @@ bool routed_expert_gate_down_layout(
         uint64_t         *down_row_bytes);
 bool weights_have_output_head(const pulsar_weights *w);
 const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w);
+/** Validate metadata values that affect semantics: attention shape, HC count,
+ * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp.
+ */
 void config_validate_model(const pulsar_model *m);
+/** Bind tensor names once into the fixed DS4 layer layout.  This is the point
+ * where stringly GGUF metadata becomes direct model-specific pointers.
+ */
 void weights_bind(pulsar_weights *w, const pulsar_model *m);
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
 void weights_free(pulsar_weights *w);
+/** Load one token embedding row and expand it to float activations. */
 void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out);
+/** RMSNorm without a learned scale, used by hyper-connection control vectors. */
 void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);
+/** Standard DS4 RMSNorm with learned per-channel scale. */
 void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps);
+/** Normalize each attention head independently after Q projection. */
 void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps);
+/** Dense F16 matvec for small control projections such as HC and router heads. */
 void matvec_f16(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
@@ -2262,6 +2273,7 @@ void layer_kv_projection_normed_one(
         const pulsar_layer_weights * layer,
         const float       * normed,
         float             * kv);
+/** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
 void rope_tail_layer_inplace(
@@ -2376,6 +2388,7 @@ float max_abs_diff(const float *a, const float *b, uint64_t n);
 float rms_abs_diff(const float *a, const float *b, uint64_t n);
 uint64_t argmax_f32(const float *x, uint64_t n);
 void print_vec_stats(const char *name, const float *x, uint64_t n);
+/** Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(pulsar_gpu_graph *g);
 bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n);
 bool gpu_graph_load_directional_steering(
@@ -2467,13 +2480,33 @@ uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
  * the per-bank compressor frontier. See the definitions in gpu_diag.cpp. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
+/** Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
+ * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
+ * read their captured ms_n_comp.  The increment-2b guard uses this for the
+ * per-bank Δ projection and the smallest-frontier victim tie-break.
+ */
 uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
+/** Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
+ * decode quantum of `q` tokens: Σ_layers( ceil(q/ratio)·comp_row + q·index_row ).
+ * The index term charges q (not ceil(q/ratio)) rows — a deliberate over-estimate
+ * so the guard fires EARLY (safe side). Position-independent, so total Δ =
+ * n_live_growing_banks × this.
+ */
 uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
 /** Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
  * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
  * + base-table rebuild). See gpu_diag.cpp. */
 bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank);
+/** Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
+ * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
+ * touch) and rebuild its base-table entries to the new pointers. The caller then
+ * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * slab already present is left untouched. Returns false on OOM.
+ */
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank);
+/** True when `bank`'s comp/index physical is currently freed (evicted) — the
+ * server checks this before restoring on a returning request.
+ */
 bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank);
 /** Tier-2 PATH-A full-prefix fork (plan-33 inc A): D2D clone src bank's committed
  * KV into dst + mirror frontier counters. Caller validates + pins src first. */
@@ -2488,6 +2521,12 @@ bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank
  * the pool is enabled, else the classic single-session tensor (== bank 0).
  * NULL for layers without that cache kind. */
 pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, uint32_t il);
+/** Nominal comp/index operand for the batched attention/indexer wrappers. With
+ * per-bank split allocations there is no single slab; the batched (descriptor)
+ * path addresses banks through the base-pointer table (below), so this returns
+ * bank 0's allocation as the nominal typed operand (its per-bank size drives the
+ * wrappers' buffer-size validation). Pool disabled → the classic tensor.
+ */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t il);
 /** Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
@@ -2613,6 +2652,12 @@ uint32_t gpu_graph_raw_start_for_span(
         uint32_t               n_raw);
 uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
+/** PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
+ * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
+ * work buffer (indexer_scores) is allocated with only N token
+ * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
+ * 0 restores the historical full-chunk buffers.
+ */
 uint32_t gpu_graph_prefill_slice(void);
 /* True when PULSAR_IDX_FP4 is set (cached). When on, the ratio-4 indexer
  * compressed cache is stored MXKV-FP4-packed (PULSAR_ENGINE_IDXFP4_ROWBYTES/row,
@@ -2891,9 +2936,17 @@ bool gpu_graph_verify_suffix_tops(
         int                   *row_tops,
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
+/** Pick a raw SWA cache size for GPU.  During batched prefill it must cover
+ * the previous window plus the current ubatch.
+ */
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap);
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
+/** When a server request shares a large prefix with the live checkpoint, extend
+ * the KV cache with batched prefill instead of single-token decode.  On an M3
+ * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
+ * as a conservative crossover.  The env knob remains useful for retuning.
+ */
 uint32_t gpu_graph_resume_prefill_min_tokens(void);
 void embed_prompt(
         const pulsar_model   * model,
@@ -2916,7 +2969,7 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 int sample_argmax(const float *logits, uint32_t n_vocab);
 typedef struct {
     int *ids;
-    float *probs;   /* renormalized over the filtered nucleus */
+    float *probs;  ///< renormalized over the filtered nucleus
     uint32_t n;
 } pulsar_sample_dist;
 
@@ -2975,6 +3028,9 @@ int generate_gpu_graph_raw_swa(
         void              * progress_ud);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
+/** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
+ * so a stale accidental second run is more dangerous than a normal CLI error.
+ */
 void pulsar_acquire_instance_lock(void);
 
 /** ---- shared inline helpers ---- */
