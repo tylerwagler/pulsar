@@ -235,15 +235,25 @@ typedef struct {
 typedef struct {
     tool_call *v;
     int len;
-    int cap;
+    int cap;          ///< calls allocated
+    /** The exact sampled DSML bytes these calls were parsed from, owned. Kept
+     * because reproducing a prefix requires the bytes the model actually
+     * produced, not a re-serialisation of the parse. */
     char *raw_dsml;
 } tool_calls;
 
+/** How a replayed conversation's tool calls were resolved.
+ *
+ * `missing_ids` is the one that matters operationally: an unresolved id means
+ * the exact bytes are gone, the prefix cannot be reproduced, and the turn
+ * cold-prefills. It is counted rather than swallowed so a slow turn can be
+ * explained after the fact.
+ */
 typedef struct {
-    int mem;
-    int disk;
-    int canonical;
-    int missing_ids;
+    int mem;          ///< calls resolved from in-memory tool memory
+    int disk;         ///< calls resolved from a KV-file trailer
+    int canonical;    ///< calls resolved by canonicalising the client's own text
+    int missing_ids;  ///< calls that could not be resolved at all
 } tool_replay_stats;
 
 typedef struct {
@@ -297,11 +307,16 @@ typedef struct {
     int cap;      ///< messages allocated
 } chat_msgs;
 
+/** A list of strings, used for stop sequences and for sets of tool-call ids.
+ *
+ * `max_len` is cached rather than recomputed: a stop scan must back up by the
+ * longest entry to catch a sequence straddling a chunk boundary, and that
+ * happens on every chunk. */
 typedef struct {
-    char **v;
-    int len;
-    int cap;
-    size_t max_len;
+    char **v;         ///< the strings, owned
+    int len;          ///< entries present
+    int cap;          ///< entries allocated
+    size_t max_len;   ///< longest entry in bytes; the scan back-up distance
 } stop_list;
 
 /* Per-response timing metrics, surfaced in the additive "timings" object that
@@ -589,22 +604,34 @@ typedef enum {
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
+/** The DSML marker literals for one model.
+ *
+ * Kept as a table rather than hardcoded so the parsers, the stream
+ * projections, and the decode tracker all agree on the same six strings by
+ * construction instead of by three copies staying in sync. */
 typedef struct {
-    const char *tool_calls_start;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
+    const char *tool_calls_start;  ///< opens the tool-calls block
+    const char *tool_calls_end;    ///< closes it
+    const char *invoke_start;      ///< opens one invocation
+    const char *invoke_end;        ///< closes it
+    const char *param_start;       ///< opens a parameter
+    const char *param_end;         ///< closes it
 } dsml_syntax;
 
+/** Tracks where generation is inside a DSML block, at DECODE time.
+ *
+ * Runs during sampling rather than after it, so it can tell the sampler when a
+ * structured region is in progress. The two JSON flags exist because a
+ * parameter value can be JSON, and a marker-looking byte sequence inside a
+ * JSON string is text, not a marker.
+ */
 typedef struct {
-    dsml_track_mode mode;
-    dsml_decode_state decode;
-    const dsml_syntax *syn;
-    size_t pos;
-    bool json_in_string;
-    bool json_escaped;
+    dsml_track_mode mode;      ///< what the tracker is watching for
+    dsml_decode_state decode;  ///< where it currently is
+    const dsml_syntax *syn;    ///< marker literals for this model; borrowed
+    size_t pos;                ///< how far into the generated text it has consumed
+    bool json_in_string;       ///< inside a JSON string, where markers do not apply
+    bool json_escaped;         ///< previous byte was a backslash, so this one is literal
 } dsml_decode_tracker;
 
 typedef enum {
@@ -1384,7 +1411,13 @@ struct server {
     /** Build the trailer read/write callbacks the KV store uses for a file,
      * bound to the tool ids in `wanted`. */
     pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(const stop_list *wanted);
+    /** Store the first `store_len` tokens of the live session as a checkpoint,
+     * with explicit control over the text the entry is KEYED by.
+     * @param cache_text_override key text to use instead of the rendered
+     * prefix -- how a truncated preamble is stored under the bytes a future
+     * request will actually present. */
     bool kv_cache_store_live_prefix_text(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason, const char *cache_text_override, uint8_t cache_text_ext, const char *cache_text_key);
+    /** kv_cache_store_live_prefix_text() keyed by the rendered prefix itself. */
     bool kv_cache_store_live_prefix(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason);
     /** Store the slot's full current prefix. @param reason logged, and used to
      * classify the write in metrics. */
@@ -1400,6 +1433,9 @@ struct server {
     /** Write a "continued" cache entry if the slot has advanced far enough past
      * the last one. Cheap no-op when it has not. */
     void kv_cache_maybe_store_continued(session_slot *sl);
+    /** kv_cache_try_load() keyed on raw prompt TEXT rather than a request.
+     * The cache is keyed by rendered bytes, so this is the primitive and the
+     * request form is the wrapper. @return prefix tokens loaded, 0 for a miss. */
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
     /** Try to satisfy `req`'s prompt from the disk cache.
      * @return prefix tokens loaded, 0 for a miss. @param loaded_path_out the
@@ -1510,6 +1546,9 @@ struct server {
      * client-visible tool_use.
      */
     bool gen_web_search_round(session_slot *sl, const tool_calls *calls, const char *pre_content, const char *pre_reasoning);
+    /** Report a prefill failure to the client. Handles the case where SSE
+     * headers already went out for the keepalive: the error must then be an
+     * event in the open stream, not an HTTP status. */
     void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
     /** Record where the reasoning block ended, so a later turn can continue the
      * conversation without replaying hidden thinking the client never saw. */
@@ -1609,37 +1648,87 @@ struct server {
     void generate_job_step(session_slot *sl);
     /** Unbind: drain deferred client bytes, free the resumable state. */
     void generate_job_end(session_slot *sl);
+    /** @name Live tool-state bindings
+     *  A protocol tool loop is not "a new prompt with a long prefix": the
+     *  client replays a tool RESULT plus a call id, and the authoritative
+     *  prefix is the live KV -- including hidden reasoning the client never
+     *  saw and cannot replay. These record what a slot's frontier holds so a
+     *  following request can be bound back to the session that owns its
+     *  conversation, and appended to rather than cold-prefilled.
+     *  @{
+     */
+    /** Forget the slot's remembered reasoning checkpoint. */
     void thinking_live_clear(session_slot *sl);
+    /** Record the visible text at the slot's current frontier, so a later turn
+     * can tell what the client actually saw from what stayed hidden. */
     void thinking_live_remember(session_slot *sl, const char *visible_text);
+    /** Bind `calls` and the visible text to the slot's current frontier as a
+     * Responses continuation point. */
     void responses_live_remember(session_slot *sl, const char *visible_text, const tool_calls *calls);
+    /** Anthropic equivalent; Anthropic uses only the call-id side of the state. */
     void anthropic_live_remember(session_slot *sl, const tool_calls *calls);
+    /** Drop the slot's Responses binding. */
     void responses_live_clear(session_slot *sl);
+    /** Drop the slot's Anthropic binding. */
     void anthropic_live_clear(session_slot *sl);
+    /** Is `id` bound on ANY slot? Answers "can this be served live at all", not
+     * "which slot" -- a cheap pre-check before routing. */
     bool responses_live_has_call_id(const char *id);
+    /** Anthropic equivalent of responses_live_has_call_id(). */
     bool anthropic_live_has_call_id(const char *id);
+    /** Does `sl`'s binding hold ALL of `ids` at exactly `live_tokens`? Both
+     * halves matter: a matching id set at a MOVED frontier is not a valid
+     * continuation point. */
     bool responses_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
+    /** Anthropic equivalent of responses_live_matches_request(). */
     bool anthropic_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
     /** Scheduler routing (worker thread): find the slot whose live binding holds
      * ALL of the request's continuation ids at that slot's current frontier, so
      * the job can be bound to the session that owns its conversation.
      */
     session_slot * live_slot_for_ids(const stop_list *ids, bool anthropic);
+    /** live_slot_for_ids() for the Responses protocol. */
     session_slot * responses_live_slot_for_ids(const stop_list *ids);
+    /** live_slot_for_ids() for the Anthropic protocol. */
     session_slot * anthropic_live_slot_for_ids(const stop_list *ids);
+    /** @} */
+
+    /** Is `id` present in tool memory? Takes `tool_mu`. */
     bool tool_memory_has_id(const char *id);
+    /** Remember every call in `calls`, so a later replay can reproduce the
+     * exact bytes the model produced for them. */
     void tool_memory_remember(const tool_calls *calls);
+    /** Remember one call, recording whether it came from live generation or was
+     * restored from a KV-file trailer. */
     void tool_memory_put_source(const char *id, const char *dsml, tool_memory_source source);
+    /** tool_memory_put_source() with source TOOL_MEMORY_RAM. */
     void tool_memory_put(const char *id, const char *dsml);
+    /** Fill in each replayed message's tool bytes from memory.
+     * @param stats records what matched and what did not -- a miss is the
+     * reason a turn cold-prefills, so it is counted rather than swallowed. */
     void tool_memory_attach_to_messages(chat_msgs *msgs, tool_replay_stats *stats);
     /** Give every id-less call in `calls` a fresh id in `api`'s format.
      * Regenerates until the id collides with neither the batch nor anything in
      * tool memory, so a replayed conversation can never bind to the wrong call. */
     void assign_tool_call_ids(tool_calls *calls, api_style api);
+    /** @name Request tracing
+     *  All writes are serialised on `trace_mu`, so tracing is safe from any
+     *  thread; `id` correlates every line belonging to one request.
+     *  @{
+     */
+    /** Write raw bytes into the trace for request `id`. */
     void trace_piece(uint64_t id, const char *piece, size_t len);
+    /** Write a formatted event line into the trace for request `id`. */
     void trace_event(uint64_t id, const char *fmt, ...);
+    /** Record how the prompt was resolved: what the caches supplied, what the
+     * tool replay matched, and which file was used. This is the record that
+     * explains a cold prefill after the fact. */
     void trace_write_cache_diag(const trace_cache_diag *d, const tool_replay_stats *tool_replay, int cached, const char *cache_source, int disk_cached, const char *disk_path);
+    /** Open a trace for `j`. @return the trace id every later call passes back. */
     uint64_t trace_begin(const job *j, int cached, int effective_prompt_tokens, const trace_cache_diag *cache_diag, const char *cache_source, int disk_cached, const char *disk_path);
+    /** Close the trace: outcome, token counts, what the final parse produced. */
     void trace_finish(uint64_t id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
+    /** @} */
     /** Append `j` to the queue and wake the worker. Takes `mu`.
      * @return false when the server is stopping and the job was not queued. */
     bool enqueue(job *j);
@@ -1766,6 +1855,11 @@ struct server {
     bool worker_try_bind();
     /** Detach a finished job from its slot and wake its client thread. */
     void worker_finish_slot(session_slot *sl);
+    /** Advance every slot in `dec` by one batched decode quantum.
+     *
+     * THE decode lane: all `n` slots step together through the shared multiseq
+     * path, each row landing at its own bank's frontier. Since L118 there is no
+     * classic per-slot alternative -- a single decoding slot is simply n == 1. */
     void worker_batched_decode_quantum(session_slot **dec, int n);
     /** plan-34 inc 6: the SPEC batched quantum. Same skeleton as
      * worker_batched_decode_quantum, but each sweep runs one speculative ROUND
@@ -1866,6 +1960,7 @@ struct server {
     session_slot * choose_slot_for_job(job *j, int *reject_ctx, bool *waiting_owner, bool *clobbers, provision_refusal *refusal);
     /** const readers (take a const server *s in the C predecessor). */
     bool should_canonicalize_tool_checkpoint(const tool_calls *calls) const;
+    /** Longest common token prefix between the slot's history and `prompt`. */
     int slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
     /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
      * the request-side count (accounting, prefill bounds) read `prompt_cut`;
@@ -1880,6 +1975,7 @@ struct server {
      * (startup) slot so every request can always run on slot 0.
      */
     int job_needed_ctx(const job *j) const;
+    /** The slot's committed KV position -- where a continuation would append. */
     int slot_frontier_pos(const session_slot *sl) const;
     /** Context a lazily provisioned slot would be created with for this job: the
      * secondary-slot default, raised to the job's need, capped at slot 0's ctx.
