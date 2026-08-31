@@ -1,6 +1,6 @@
 #include "pulsar_engine_internal.h"
 
-/** Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
+/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
  * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
  * GREEDY throughput (only 3 positions to trim: full range within 1-3% and the
  * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING
@@ -1032,7 +1032,7 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s) {
     }
 }
 
-/* inc-6: one speculative ROUND's state, threaded between round_begin (rows
+/** inc-6: one speculative ROUND's state, threaded between round_begin (rows
  * assembled, frontier snapshotted, checkpoint pushed), the verify forward
  * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
  * the batched lane), and round_end (walk, state, emit, redraft). */

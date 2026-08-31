@@ -1,6 +1,6 @@
 #include "pulsar_engine_internal.h"
 
-/** Persistent CPU worker pool. Split out of util.cpp in the C++ port.
+/* Persistent CPU worker pool. Split out of util.cpp in the C++ port.
  *
  * Decode reuses these threads instead of creating pthreads in the token
  * loop. The row partitioning below must stay exactly as the C
@@ -11,7 +11,7 @@ namespace pulsar {
 
 namespace {
 
-/** Nested parallel_for calls run serially on the calling thread. */
+/* Nested parallel_for calls run serially on the calling thread. */
 thread_local int g_parallel_depth = 0;
 
 } // namespace
@@ -35,7 +35,7 @@ thread_local int g_parallel_depth = 0;
  */
 class ThreadPool {
 public:
-    /* Lazy init: created on first parallel_for. A shutdown() returns the
+    /** Lazy init: created on first parallel_for. A shutdown() returns the
      * pool to the never-initialized state, so a later use re-creates it —
      * the same lifecycle the C implementation had. */
     void ensure_init() {
@@ -97,7 +97,7 @@ public:
         memset(this, 0, sizeof(*this));
     }
 
-    /* Run a row-parallel CPU kernel, falling back to serial execution for
+    /** Run a row-parallel CPU kernel, falling back to serial execution for
      * small jobs or nested calls where spawning more work would only add
      * latency. */
     void parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx,

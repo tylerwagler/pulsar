@@ -44,7 +44,7 @@ void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 
 
-/** ---- f16-viability range sweep (diagnostic) -----------------------------
+/* ---- f16-viability range sweep (diagnostic) -----------------------------
  *
  * PULSAR_CUDA_RANGE_SWEEP=1 turns every debug-dump point into a range probe
  * instead of a file dump, so one prefill answers "can this f32 staging buffer
@@ -294,7 +294,7 @@ bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
  * GPU Release Graph Allocation.
  * ========================================================================= */
 
-/* Derived capacities and tensor dimensions for one session's GPU graph.
+/** Derived capacities and tensor dimensions for one session's GPU graph.
  * Computed by gpu_graph_compute_dims and shared by the allocator
  * (gpu_graph_alloc_raw_cap) and the sizing estimate (gpu_graph_session_bytes)
  * so admission control and the allocator can never disagree about the derived

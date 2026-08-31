@@ -1,4 +1,4 @@
-/** pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
+/* pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
  * Produced by the multi-TU split of pulsar_cuda.cu; edit freely (the
  * generator is not part of the build).
  *
@@ -42,7 +42,7 @@
 #define CUDA_QK_K 256
 
 enum {
-    /** attention_decode_mixed_kernel stores raw-window scores plus visible
+    /* attention_decode_mixed_kernel stores raw-window scores plus visible
      * compressed scores in shared memory.  The host routes larger unmasked
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context.  11712 fits under the
@@ -276,7 +276,7 @@ struct pulsar_gpu_tensor {
     void *ptr;        ///< device pointer
     uint64_t bytes;   ///< allocation size
     int owner;        ///< non-zero when this struct owns `ptr` and must free it
-    /* Bytes per element.  0 = unspecified, which reads as f32: that keeps
+    /** Bytes per element.  0 = unspecified, which reads as f32: that keeps
      * every pre-existing alloc meaning exactly what it meant, so only a
      * buffer that is NOT f32 has to say so, once, where it is created.
      *
@@ -285,7 +285,7 @@ struct pulsar_gpu_tensor {
      * restating the stride -- produced eight distinct defects in one
      * narrowing, all of them type-legal and all of them silent. */
     uint32_t esz;
-    /* Element FORMAT (L106 K15).  0 (PULSAR_ELT_F32) for every plain alloc,
+    /** Element FORMAT (L106 K15).  0 (PULSAR_ELT_F32) for every plain alloc,
      * so pre-existing zero-initialised tensors keep meaning what they meant;
      * set from the *_ELT_FMT authority at alloc_elt, inherited by views. */
     uint32_t fmt;

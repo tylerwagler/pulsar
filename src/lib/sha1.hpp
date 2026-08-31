@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/** Minimal SHA-1 (C++ port of the kvstore-internal implementation). Used for
+/* Minimal SHA-1 (C++ port of the kvstore-internal implementation). Used for
  * content-addressed checkpoint names, not for security. */
 
 namespace pulsar {
@@ -74,7 +74,7 @@ public:
         }
     }
 
-    /* One-shot digest rendered as 40 lowercase hex chars + NUL. */
+    /** One-shot digest rendered as 40 lowercase hex chars + NUL. */
     static void bytes_hex(const void *ptr, size_t len, char out[41]) {
         Sha1 c;
         c.update(ptr, len);
