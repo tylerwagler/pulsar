@@ -557,14 +557,17 @@ typedef struct {
     pulsar_tensor *ffn_down_shexp;   ///< shared expert down projection
 } pulsar_layer_weights;
 
+/** Every weight tensor of the target model: the per-layer stacks plus the
+ * embedding and output head. Tensors point into the model mapping; the struct
+ * owns none of them. */
 typedef struct {
-    pulsar_tensor *token_embd;
-    pulsar_tensor *output_hc_base;
-    pulsar_tensor *output_hc_fn;
-    pulsar_tensor *output_hc_scale;
-    pulsar_tensor *output_norm;
-    pulsar_tensor *output;
-    pulsar_layer_weights layer[PULSAR_MAX_LAYER];
+    pulsar_tensor *token_embd;       ///< token embedding table
+    pulsar_tensor *output_hc_base;   ///< HC per-channel base/offset, output-head side
+    pulsar_tensor *output_hc_fn;     ///< HC mix weight feeding the output head
+    pulsar_tensor *output_hc_scale;  ///< HC per-channel scale, output-head side
+    pulsar_tensor *output_norm;      ///< final RMSNorm before the vocab projection
+    pulsar_tensor *output;           ///< vocab projection (the output head)
+    pulsar_layer_weights layer[PULSAR_MAX_LAYER];  ///< per-layer weight stacks
 } pulsar_weights;
 
 /** DSpark drafter weights: the small model that proposes tokens for the target
@@ -1019,10 +1022,10 @@ typedef struct {
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
      * saved frontiers. */
-    pulsar_gpu_tensor *spec_attn_state_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_attn_state_score[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_index_state_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_index_state_score[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *spec_attn_state_kv[PULSAR_MAX_LAYER];     ///< saved attention compressed KV frontier, per layer
+    pulsar_gpu_tensor *spec_attn_state_score[PULSAR_MAX_LAYER];  ///< saved attention compressed scores, per layer
+    pulsar_gpu_tensor *spec_index_state_kv[PULSAR_MAX_LAYER];    ///< saved indexer compressed KV frontier, per layer
+    pulsar_gpu_tensor *spec_index_state_score[PULSAR_MAX_LAYER]; ///< saved indexer compressed scores, per layer
     /** Batched-copy descriptor tables for the frontier snapshot (layer->spec)
      * and restore (spec->layer) copy sets: one kernel launch instead of ~126
      * cudaMemcpy calls per direction. Built lazily on first snapshot; NULL
@@ -1050,14 +1053,14 @@ typedef struct {
      * layer compression ratio instead of pessimistically using the ratio-4 cap
      * for every ratio-128 layer. */
     uint32_t layer_comp_cap[PULSAR_MAX_LAYER];
-    uint32_t attn_comp_stage_cap;
+    uint32_t attn_comp_stage_cap;  ///< rows the attention compressor staging buffer can hold
 
     /** Per-layer work tensors.  They are reused in place by every layer instead
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
-    pulsar_gpu_tensor *comp_kv_cur;
-    pulsar_gpu_tensor *comp_sc_cur;
-    pulsar_gpu_tensor *attn_comp_stage;
+    pulsar_gpu_tensor *comp_kv_cur;      ///< this layer's freshly compressed KV rows
+    pulsar_gpu_tensor *comp_sc_cur;      ///< this layer's freshly compressed score rows
+    pulsar_gpu_tensor *attn_comp_stage;  ///< staging the attention compressor writes through
     /** f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
      * the QAT+pack step stores them MXKV-FP4-packed into the persistent
@@ -1096,29 +1099,29 @@ typedef struct {
     pulsar_gpu_tensor *logits;           ///< vocab logits row (width = pulsar_shape::n_vocab)
 
     /** DSpark target hidden capture buffers */
-    pulsar_gpu_tensor *dspark_target_h[3];
-    pulsar_gpu_tensor *dspark_main_x;
-    uint32_t dspark_target_layer_ids[3];
+    pulsar_gpu_tensor *dspark_target_h[3];  ///< target hiddens captured at the three anchor layers
+    pulsar_gpu_tensor *dspark_main_x;       ///< target-model input the drafter conditions on
+    uint32_t dspark_target_layer_ids[3];    ///< which target layers the anchors are taken from
     /** Bulk prefill anchor-hidden capture for drafter retraining
      * (PULSAR_DSPARK_PREFILL_DUMP): per-chunk [prefill_cap, N_EMBD] buffers, one
      * per anchor layer. dspark_bulk_n is armed to the chunk's token count by
      * the prefill path and cleared by the drain; 0 everywhere else. */
-    pulsar_gpu_tensor *dspark_bulk_h[3];
-    uint32_t dspark_bulk_n;
+    pulsar_gpu_tensor *dspark_bulk_h[3];  ///< per-chunk anchor hiddens, one buffer per anchor layer
+    uint32_t dspark_bulk_n;               ///< tokens armed for capture this chunk; 0 = off
     /** Prompt-window capture for drafter seeding: the anchor hiddens of the
      * last <=128 prompt positions, kept as a position%128 ring so the fused
      * loop can seed the drafter's context window at generation start (the
      * reference prefills this window; an empty or stale window collapses
      * drafter acceptance). dspark_prompt_n counts captured prompt positions. */
-    pulsar_gpu_tensor *dspark_prompt_h[3];
+    pulsar_gpu_tensor *dspark_prompt_h[3];  ///< prompt-window anchor hiddens, as a position%128 ring
     uint32_t dspark_prompt_n;  ///< positions captured: ring valid for [lo, n)
-    uint32_t dspark_prompt_lo;
+    uint32_t dspark_prompt_lo;  ///< oldest position the ring still holds
     /** Fused spec loop (P2): per-position anchor hiddens captured during the
      * verify batch — [spec cap, N_EMBD] per anchor layer. dspark_capture_batch_n
      * != 0 arms the capture in gpu_graph_encode_layer_batch for that many
      * positions; 0 = off (prefill and plain decode unaffected). */
-    pulsar_gpu_tensor *dspark_target_h_batch[3];
-    uint32_t dspark_capture_batch_n;
+    pulsar_gpu_tensor *dspark_target_h_batch[3];  ///< per-position anchor hiddens from the verify batch
+    uint32_t dspark_capture_batch_n;              ///< positions to capture; 0 = off
     /** Fused spec loop Stage B (no-replay rollback): per-position compressor
      * projections saved during the verify batch, so a partial accept can roll
      * the recurrent pool state forward from the frontier snapshot WITHOUT
@@ -1151,15 +1154,15 @@ typedef struct {
     pulsar_gpu_tensor *dspark_markov_logits;  ///< [N_VOCAB] markov refine scratch
 
     /** DSpark draft KV raw caches (one per draft layer, window=128) */
-    pulsar_gpu_tensor *dspark_raw_cache[3];
-    uint32_t dspark_n_raw[3];
+    pulsar_gpu_tensor *dspark_raw_cache[3];  ///< the drafter's raw KV ring, one per draft layer
+    uint32_t dspark_n_raw[3];                ///< positions held in each ring
 
     /** Override compression ratio for DSpark draft layers (set to 0 before
      * calling gpu_graph_encode_decode_layer for draft model forwarding). */
     int comp_ratio_override;
 
-    uint32_t prefill_cap;
-    uint32_t raw_window;
+    uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry; sizes the batch tensors
+    uint32_t raw_window;   ///< positions the raw (uncompressed) KV ring retains per layer
 
     /** Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
      * tokens moves through layer 0, then layer 1, and so on, updating the same
@@ -1914,13 +1917,30 @@ struct pulsar_session {
      * `q` -- the admission question "can this session take another step" priced
      * before committing to it. */
     uint64_t quantum_growth_bytes_per_bank(uint32_t q);
+    /** FULL-prefix fork: clone `src`'s committed KV into `dst` and continue
+     * there, leaving the trunk intact for other siblings. This is what makes a
+     * branching conversation cheap -- the shared history is copied, not
+     * recomputed. @param n_cached tokens of `tokens` already committed in src.
+     * @return tokens reused, negative on failure. */
     int bank_fork(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
+    /** Is `bank` pinned against eviction because a fork is cloning from it?
+     * The guard's victim picker must not free physical pages mid-clone. */
     bool bank_fork_pinned(uint32_t bank) const;
+    /** PARTIAL-prefix fork: clone only the shared prefix, cut at a ratio-4
+     * boundary, and replay the rest. @return tokens reused, negative on failure. */
     int bank_fork_partial(uint32_t src, uint32_t dst, const int *tokens, int n_tokens, int n_cached);
+    /** Would a partial fork from `src` at `n_cached` reuse enough to be worth
+     * it? @return the reusable token count, 0 when a cold prefill is better. */
     int bank_fork_partial_feasible(uint32_t src, int n_cached);
+    /** Bring the session's KV in line with `prompt`: reuse the common prefix and
+     * evaluate the rest. The main prefill entry point. @return 0 on success. */
     int sync(const pulsar_tokens *prompt, char *err, size_t errlen);
+    /** Rewrite the session to `prompt` given an already-computed `common`
+     * prefix length, rather than re-deriving it. */
     pulsar_session_rewrite_result rewrite_from_common(const pulsar_tokens *prompt, int common,
                                                       char *err, size_t errlen);
+    /** Longest common TOKEN prefix between the session's history and `prompt`.
+     * For the byte-level, seam-aware answer use prefix_match(). */
     int common_prefix(const pulsar_tokens *prompt);
     /** L115: the prefix-reuse authority (see pulsar.h). */
     void prefix_match(const pulsar_tokens *prompt, pulsar_prefix_match *out);
@@ -1947,8 +1967,16 @@ struct pulsar_session {
      * stale (see mseq_dirty) rather than decoding against another bank's rows.
      * @return 0 on success. */
     int eval(int token, char *err, size_t errlen);
+    /** Decode ONE row per request across `n` banks in a single batched step.
+     * Each row lands at its own bank's frontier. @param logits receives one row
+     * per request, `logits_cap` floats wide. @return 0 on success. */
     int decode_multiseq(const pulsar_multiseq_req *reqs, uint32_t n,
                         float *logits, int logits_cap, char *err, size_t errlen);
+    /** The general batched step: rows may belong to different banks AND carry
+     * different row counts, so one call can mix decode rows with a prefill
+     * chunk. @param out_n_rows rows actually produced. @param max_head_runs
+     * caps how many separate output-head runs the step will perform.
+     * @return 0 on success. */
     int decode_mixed(const pulsar_multiseq_req *reqs, uint32_t n_rows,
                      float *logits, int logits_cap, uint32_t *out_n_rows,
                      uint32_t max_head_runs, char *err, size_t errlen);
@@ -1981,9 +2009,15 @@ struct pulsar_session {
      * callers that committed rows through a batched step and must now bring the
      * host history back in line with the KV. */
     void note_committed_tokens(const int *toks, int n);
+    /** Generate with the drafter: propose a block, verify it against the target
+     * in one pass, and commit the accepted prefix. @param accepted receives the
+     * committed token ids. @param rng is advanced. @return tokens committed. */
     int generate_speculative(float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng, int max_tokens, int eos_token,
                              int *accepted, int accepted_cap, char *err, size_t errlen);
+    /** Speculative generation seeded with a known `first_token` -- the forced-
+     * continuation form, where the caller has already chosen the opening token.
+     * @return tokens committed. */
     int eval_speculative_block(int first_token, int max_tokens, int eos_token,
                                int *accepted, int accepted_cap, char *err, size_t errlen);
     /** Discard the conversation: clear the checkpoint, drop spec carry and
