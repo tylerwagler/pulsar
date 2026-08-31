@@ -6,6 +6,14 @@
 
 namespace pulsar {
 
+/** Makes host allocation inside a guarded phase FATAL, to catch a decode step
+ * that has stopped reusing its preallocated scratch.
+ *
+ * An opt-in developer tool, not a production safeguard: it arms only when
+ * PULSAR_ALLOC_GUARD is set, read once, so the begin/end call sites on the hot
+ * path are a hard no-op otherwise. Process-wide state, which is fine because it
+ * is a single-threaded diagnostic and never on in a served build.
+ */
 class AllocGuard {
 public:
     /* Only arms when PULSAR_ALLOC_GUARD is set in the environment, so the
@@ -13,6 +21,8 @@ public:
      * opt-in developer tool: `PULSAR_ALLOC_GUARD=1` makes any host allocation
      * inside a guarded phase fatal, to catch a decode step that has stopped
      * reusing its preallocated scratch. Read once. */
+    /** Arm the guard for `phase`, whose name appears in the failure message.
+     * No-op unless PULSAR_ALLOC_GUARD was set at first use. */
     void begin(const char *phase) {
         static const int armed = getenv("PULSAR_ALLOC_GUARD") != nullptr;
         if (!armed) return;
@@ -20,11 +30,15 @@ public:
         enabled_ = true;
     }
 
+    /** Disarm. Safe to call when never armed. */
     void end() {
         enabled_ = false;
         phase_ = nullptr;
     }
 
+    /** Called from every checked allocator. Prints the offending operation and
+     * EXITS when armed -- the point is to stop at the allocation, where the
+     * stack still names the caller, rather than to report it later. */
     void check(const char *op, size_t size) const {
         if (!enabled_) return;
         fprintf(stderr,
@@ -37,8 +51,8 @@ public:
     }
 
 private:
-    bool enabled_ = false;
-    const char *phase_ = nullptr;
+    bool enabled_ = false;          ///< a guarded phase is currently open
+    const char *phase_ = nullptr;   ///< its name, for the failure message; borrowed
 };
 
 static AllocGuard g_alloc_guard;

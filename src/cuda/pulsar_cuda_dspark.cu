@@ -326,9 +326,18 @@ int pulsar_gpu_dspark_markov_step_model(
 }
 
 
+/** Device buffers the chained markov walk reduces into.
+ *
+ * Two winners per position, not one: `id`/`val` carry the argmax the chain
+ * itself follows, and `id2`/`val2` the runner-up, which is what the DTree
+ * branch and the measurement path consume. Kept device-side for the whole
+ * chain so the walk needs no host round trip. */
 struct DsparkReduceBufsChain {
-    pulsar_gpu_tensor *id, *val, *id2, *val2;
-    uint32_t cap;
+    pulsar_gpu_tensor *id,    ///< winner token id per position; the chain's own feed
+                      *val,   ///< winner score per position
+                      *id2,   ///< runner-up token id per position
+                      *val2;  ///< runner-up score per position
+    uint32_t cap;             ///< positions the buffers can hold
 };
 
 /* L108 P1: device-chained greedy markov walk.  Launches the whole n_draft

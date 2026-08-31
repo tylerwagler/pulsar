@@ -55,11 +55,15 @@ void *cuda_tmp_alloc(uint64_t bytes, const char *what);
  *
  * Lifetime is the slot's scratch buffer: valid until the next reservation on
  * that slot. */
+/** Bump arena over one scratch reservation -- see the contract above. */
 typedef struct {
-    uint8_t    *base;
-    uint64_t    cap;
-    uint64_t    used;
-    const char *what;
+    uint8_t    *base;   ///< reservation base; slices are offsets from here
+    uint64_t    cap;    ///< reservation size
+    uint64_t    used;   ///< bytes handed out; the bump pointer
+    const char *what;   ///< caller label, for the out-of-scratch diagnostic
+    /** Sticky: once a take() overruns, every later take() fails too. That is
+     * what makes ONE NULL check after the last take sufficient, and what stops
+     * a partial success from handing back aliased memory. */
     int         failed;
 } cuda_arena;
 
