@@ -270,12 +270,18 @@ typedef struct {
     bool raw_mode_needs_restore;///< the terminal is in raw mode and must be restored on exit
 } agent_worker;
 
+/** Fixed-size ring keeping the LAST N bytes of a stream.
+ *
+ * For output that must stay bounded but whose end is the interesting part --
+ * the tail of a long tool result. `total` keeps counting past `cap`, so the
+ * caller can report how much was dropped rather than silently truncating.
+ */
 typedef struct agent_tail_capture {
-    char *buf;
-    size_t cap;
-    size_t start;
-    size_t len;
-    size_t total;
+    char *buf;      ///< ring storage, owned
+    size_t cap;     ///< ring capacity
+    size_t start;   ///< index of the oldest retained byte
+    size_t len;     ///< bytes currently retained (<= cap)
+    size_t total;   ///< bytes ever appended, including those overwritten
     void append(const char *s, size_t n);  ///< was agent_tail_capture_append
     char *take(size_t *len);  ///< was agent_tail_capture_take
 } agent_tail_capture;
@@ -735,49 +741,75 @@ typedef struct {
     size_t cap;  ///< slots allocated
 } agent_prompt_queue;
 
+/** The interactive input line, pinned below streaming output.
+ *
+ * The hard part is that the model is writing to the same terminal the user is
+ * typing into. The editor claims a scroll region so generated text scrolls
+ * ABOVE a fixed prompt row, and most of the geometry below exists to keep that
+ * prompt where the user left it as output arrives and the terminal resizes.
+ *
+ * Input is read in non-blocking chunks by the outer event loop rather than by
+ * linenoise, so two terminal protocols have to be handled here instead of
+ * inside the editor: cursor-position reports and bracketed paste.
+ */
 typedef struct {
-    struct linenoiseState edit;
-    char *input;
-    char prompt[160];
-    char status[4096];
-    int old_stdin_flags;
-    bool active;
-    bool hidden;
-    bool output_line_open;
-    bool prompt_below_output;
-    int output_col;
-    bool scroll_region;
-    int term_rows;
-    int term_cols;
-    int output_bottom;
-    int prompt_row;
-    int reserved_rows;
-    bool output_cursor_saved;
-    bool output_at_scroll_boundary;
-    double last_prompt_redraw_time;
+    struct linenoiseState edit;  ///< the underlying linenoise editor
+    char *input;                 ///< the committed line, owned; NULL until Enter
+    char prompt[160];            ///< prompt string drawn before the input
+    char status[4096];           ///< status text drawn with the prompt
+
+    int old_stdin_flags;         ///< saved stdin flags, restored on teardown
+    bool active;                 ///< the editor is installed and drawing
+    bool hidden;                 ///< temporarily hidden while something else owns the screen
+
+    bool output_line_open;       ///< streamed output left the cursor mid-line
+    bool prompt_below_output;    ///< the prompt sits below the output region
+    int output_col;              ///< column the output cursor stopped at
+    bool scroll_region;          ///< a terminal scroll region is installed
+    int term_rows;               ///< terminal height as last measured
+    int term_cols;               ///< terminal width as last measured
+    int output_bottom;           ///< last row belonging to the output region
+    int prompt_row;              ///< row the prompt is pinned to
+    int reserved_rows;           ///< rows reserved below the output for prompt and status
+    bool output_cursor_saved;    ///< the output cursor position is saved and must be restored
+    bool output_at_scroll_boundary;  ///< output stopped exactly at the region's last row
+    double last_prompt_redraw_time;  ///< wall-clock of the last redraw, to rate-limit repainting
+
+    /** Partial cursor-position report (ESC[rows;colsR) held while its bytes
+     * arrive. Since the event loop reads stdin in chunks, a CPR can be split;
+     * incomplete bytes are buffered rather than fed to linenoise, which would
+     * interpret them as keystrokes. */
     char cpr_buf[32];
-    size_t cpr_len;
+    size_t cpr_len;              ///< bytes held in cpr_buf
+
+    /** A bracketed-paste envelope is open: ESC[200~ was seen, ESC[201~ was
+     * not. Bytes keep flowing into linenoise's queue, but the editor is NOT
+     * stepped while this is set -- otherwise newlines inside a paste get
+     * interpreted as Enter and submit a partial line. */
     bool paste_open;
-    bool paste_start_pending;
-    char paste_tail[6];
-    size_t paste_tail_len;
+    bool paste_start_pending;    ///< the tail is a PREFIX of ESC[200~; the marker may still be arriving
+    char paste_tail[6];          ///< last few bytes, enough to recognise either paste marker
+    size_t paste_tail_len;       ///< bytes held in paste_tail
 } agent_editor;
 
+/** Result of testing buffered bytes against the cursor-position-report shape. */
 typedef enum {
-    CPR_INVALID,
-    CPR_PARTIAL,
-    CPR_COMPLETE,
+    CPR_INVALID,   ///< cannot be a CPR; feed the bytes through as input
+    CPR_PARTIAL,   ///< a valid PREFIX of a CPR; keep buffering
+    CPR_COMPLETE,  ///< a complete CPR; consume it
 } cpr_state;
 
+/** What a yes/no prompt should do if it times out. */
 typedef enum {
-    AGENT_YES_NO_AUTO_NONE,
-    AGENT_YES_NO_AUTO_NO,
-    AGENT_YES_NO_AUTO_YES,
+    AGENT_YES_NO_AUTO_NONE,  ///< never time out; wait for an answer
+    AGENT_YES_NO_AUTO_NO,    ///< answer no on timeout
+    AGENT_YES_NO_AUTO_YES,   ///< answer yes on timeout
 } agent_yes_no_auto;
 
+/** Timeout policy for an interactive yes/no prompt. */
 typedef struct {
-    int timeout_sec;
-    agent_yes_no_auto timeout_answer;
+    int timeout_sec;                    ///< seconds to wait; 0 = wait forever
+    agent_yes_no_auto timeout_answer;   ///< the answer to assume when it expires
 } agent_yes_no_options;
 
 typedef enum {
