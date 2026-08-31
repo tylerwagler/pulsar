@@ -225,7 +225,9 @@ Required before this goes near the engine:
 2. **End-to-end logits KL** against the A1 reference — the suite-v1 run that is
    already outstanding for the MMQ fold-order work.
 3. `mixed_neutrality_gate` and `algo_stability_gate` for regressions.
-4. A **calibrated** speed harness following `tests/attn_indexed_bench.cu`:
+4. A **calibrated** speed harness following the pattern of the since-deleted
+   `tests/attn_indexed_bench.cu` (removed in a71e346; see `git show a71e346`
+   for the last version):
    `#include` the shipped `.cu` so it drives the real file-static kernel, with
    a gate that brackets the engine's observed per-launch range. A synthetic
    bench measuring a different regime than the engine is the documented cause

@@ -865,7 +865,8 @@ __global__ static void attention_indexed_mixed_kernel(
  * short_scoreboard (MIO / shared memory) at 3.49 of ~9.3 cycles per
  * issue-active, so more resident warps is the obvious lever.
  *
- * MEASURED, harness `tests/attn_indexed_bench.cu` at the shipped shape:
+ * MEASURED, harness `tests/attn_indexed_bench.cu` (deleted a71e346) at the
+ * shipped shape:
  *   min_blocks   sub-batch 4   sub-batch 7
  *   (none)          9.957         10.098 ms
  *   2               6.998          7.097 ms   <- 1.42x, shipped
@@ -1656,7 +1657,8 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
          * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08
          * (PULSAR_CUDA_ATTN_F16=0 opts out): fp16 operands change the numbers,
          * and the suite-v1 KL run is what cleared the flip — the component
-         * measurement (tests/attn_precision_fidelity.cc: top-1 attention
+         * measurement (tests/attn_precision_fidelity.cc, deleted a71e346:
+         * top-1 attention
          * position preserved ~100%, KL <= 3e-7) was evidence, not the gate.
          * Shape conditions are checked by the launcher itself, and a 0 return
          * here is a REAL failure, so it is reported rather than silently

@@ -1,7 +1,7 @@
 /* Correctness gate for the block-scaled indexer scorer.
  *
  * #includes the shipped .cu so it drives the REAL kernel, not a copy (the
- * pattern tests/attn_indexed_bench.cu uses).
+ * pattern the since-deleted tests/attn_indexed_bench.cu used; a71e346).
  *
  * The oracle applies the SAME E4M3 quantisation and the SAME cache decode in
  * f64, so quantisation error cancels and what remains is purely whether the

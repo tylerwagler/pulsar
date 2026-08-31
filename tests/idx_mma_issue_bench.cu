@@ -52,7 +52,7 @@ __global__ static void bench_mxf8f6f4(float *sink, int iters) {
 
 /* The attention question (docs/engine-perf-map.md): attention is 22-25% of
  * prefill with pipe_tensor at 0%, and moving it onto the tensor cores means
- * choosing an operand format.  tests/attn_precision_fidelity.cc measures what
+ * choosing an operand format.  pulsar_cuda_attn_f16.cu's header measures what
  * each format COSTS; these two measure what fp16 and bf16 BUY, against the
  * block-scaled rates above and against the FP32 FMA pipe it runs on today.
  * m16n8k16 with f32 accumulate = 2048 MAC/inst. */
@@ -163,7 +163,7 @@ int main(void) {
         printf("\n  mxf4nvf4 / mxf8f6f4 = %.2fx on MACs\n", t4 / t8);
 
     /* The attention format question: what each candidate buys. */
-    printf("\n  attention operand candidates (see tests/attn_precision_fidelity.cc\n"
+    printf("\n  attention operand candidates (see pulsar_cuda_attn_f16.cu\n"
            "  for what each one COSTS):\n");
     const double tf16 = run(bench_f16,  blocks, threads, "f16 m16n8k16",  2048.0);
     const double tbf  = run(bench_bf16, blocks, threads, "bf16 m16n8k16", 2048.0);

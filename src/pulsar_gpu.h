@@ -348,7 +348,10 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * kernel behind the attention launchers, which do the tensor-level checking.
  * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a
  * multiple of 16.  Operand format chosen by measurement, not preference --
- * see tests/attn_precision_fidelity.cc and docs/engine-perf-map.md. */
+ * the operand study is in src/cuda/pulsar_cuda_attn_f16.cu's header, and
+ * docs/engine-perf-map.md.  (It used to cite tests/attn_precision_fidelity.cc,
+ * deleted in a71e346 -- L106 K8 -- when its dump-format producer left the
+ * tree.) */
 /** Q-prep descriptor for the fused norm+rope Q load (L037 lever 3). Non-NULL
  * means `q` holds RAW projections: the consumer must apply the per-head RMS
  * norm and tail rope itself, bit-exactly matching head_rms_norm_rope_tail

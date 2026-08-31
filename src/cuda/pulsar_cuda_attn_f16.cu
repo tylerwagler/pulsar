@@ -1,7 +1,8 @@
 /* Attention on the tensor cores, fp16 operands, f32 accumulate.
  *
  * WHY fp16 AND NOT SOMETHING SMALLER.  Measured, not assumed
- * (tests/attn_precision_fidelity.cc, real activations, f64 reference):
+ * (harness tests/attn_precision_fidelity.cc, real activations, f64 reference;
+ *  the harness itself was deleted in a71e346 -- these numbers are its record):
  *   format  rate          top-1 attention position preserved
  *   f32     14.5 TMAC/s   100%      <- what the FMA-pipe kernel does today
  *   fp16    62.9 (4.3x)   ~100%     <- this kernel

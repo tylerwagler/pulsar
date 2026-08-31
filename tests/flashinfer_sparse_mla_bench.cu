@@ -11,7 +11,8 @@
  * include/flashinfer/attention/sparse_mla_sm120 headers are needed; the torch
  * binding TU is deliberately not compiled.
  *
- * OUR REFERENCE, from tests/attn_indexed_bench.cu calibrated to the engine ramp
+ * OUR REFERENCE, from the since-deleted tests/attn_indexed_bench.cu (a71e346)
+ * calibrated to the engine ramp
  * at 3.9%, at the plateau (sub-batch 4+, causal depth >= 2048):
  *     attention_indexed_mixed_heads8_online_kernel<8,16>  6.917 ms / 512 tokens
  *

@@ -79,7 +79,8 @@ head.  That is a FlashAttention-style rewrite, not a tweak.
 
 #### The operand-format decision, measured
 
-`tests/attn_precision_fidelity.cc` scores each candidate on REAL activations
+`tests/attn_precision_fidelity.cc` (deleted in a71e346; results preserved in
+`src/cuda/pulsar_cuda_attn_f16.cu`'s header) scored each candidate on REAL activations
 (dumped with `PULSAR_DUMP_ATTN`, 24 tokens x 64 heads against an f64 reference),
 and `tests/idx_mma_issue_bench.cu` measures what each one buys.
 

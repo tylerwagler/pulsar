@@ -7,7 +7,8 @@
  * two transposed phases, the k-split reduction and the online-softmax
  * bookkeeping are right.  A layout bug does not show up as a small error here;
  * it shows up as garbage, which is the point -- what fp16 COSTS was settled
- * separately in tests/attn_precision_fidelity.cc, so this test only asks
+ * separately -- see pulsar_cuda_attn_f16.cu's header table (the old
+ * attn_precision_fidelity.cc went in a71e346) -- so this test only asks
  * whether the kernel computes the function it claims to.
  *
  * WHERE THE RESIDUAL COMES FROM.  It settles at ~4e-4 worst-case, not the ~1e-6
@@ -285,7 +286,8 @@ int main(int argc, char **argv) {
 
     /* ---- compare ---------------------------------------------------------- */
     /* Per (token, head) relative L2, the same scale-aware measure
-     * tests/attn_precision_fidelity.cc reports, so the two are comparable.  A
+     * pulsar_cuda_attn_f16.cu's header table reports, so the two are
+     * comparable.  A
      * plain elementwise max-relative is useless here: an output element that
      * happens to sit near zero divides a normal rounding difference by almost
      * nothing and reports ~1.0 while the vector is perfectly good. */
