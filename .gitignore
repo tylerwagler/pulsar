@@ -71,3 +71,4 @@ gguf-tools/libds4q_reflow.so
 # NOT a submodule: git must not manage this path.  Point CUTLASS_DIR at a clone.
 /cutlass/
 /cutlass
+docs/api/
