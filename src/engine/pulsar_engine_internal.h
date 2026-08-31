@@ -304,10 +304,16 @@ typedef struct {
     uint16_t dmin;
 } block_q2_K;
 
+/** Q8_K activation block: int8 quants with one f32 scale.
+ *
+ * `bsums` is the reason this format exists rather than plain int8. A K-quant
+ * weight carries a per-sub-block minimum, and the dot product needs
+ * sum(activations) over each 16-element group to apply it. Precomputing those
+ * sums at quantisation time keeps the inner loop a pure int8 dot. */
 typedef struct {
-    float   d;
-    int8_t  qs[QK_K];
-    int16_t bsums[QK_K / 16];
+    float   d;                     ///< scale: dequantised value is d * qs[i]
+    int8_t  qs[QK_K];              ///< quantised activations
+    int16_t bsums[QK_K / 16];      ///< sum of qs over each 16-element group
 } block_q8_K;
 
 typedef struct {
@@ -316,18 +322,32 @@ typedef struct {
 } block_iq2_xxs;
 
 
+/** A borrowed string slice: pointer plus length, NOT NUL-terminated.
+ *
+ * GGUF strings are length-prefixed and live inside the mapping, so copying
+ * them to make them NUL-terminated would mean allocating for every metadata
+ * key in the file. */
 typedef struct {
-    const char *ptr;
-    uint64_t len;
+    const char *ptr;  ///< first byte; points into the mapping, not owned
+    uint64_t len;     ///< length in bytes
 } pulsar_str;
 
 typedef pulsar_tokens token_vec;
 
+/** Bounds-checked sequential reader over a byte buffer, used to parse the GGUF
+ * header without trusting its length fields.
+ *
+ * Every read bounds-checks against `size` before advancing `pos`, and returns
+ * false rather than reading out of range. Each read reports its OWN result --
+ * a failure does not disable the cursor, so callers must check every call
+ * (weights.cpp does). What is first-wins is the MESSAGE: set_error() only
+ * writes `error` when it is still empty, so the text names the first failure
+ * and the offset it happened at, not the most recent one. */
 typedef struct {
-    const uint8_t *base;                                ///< weight bytes for this expert/row block, inside the model mapping
-    uint64_t size;
-    uint64_t pos;
-    char error[256];
+    const uint8_t *base;   ///< start of the buffer being read
+    uint64_t size;         ///< buffer length; the bound every read is checked against
+    uint64_t pos;          ///< current read offset
+    char error[256];       ///< first failure message; empty while the cursor is healthy
 } pulsar_cursor;
 
 typedef void (*pulsar_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
@@ -430,10 +450,13 @@ enum {
     PULSAR_TENSOR_IQ2_XXS_MMQ = 43,
 };
 
+/** One GGUF metadata entry, held as a key plus an OFFSET rather than a parsed
+ * value: values vary in type and length, and most are never read, so parsing
+ * is deferred to whoever actually asks for the key. */
 typedef struct {
-    pulsar_str key;
-    uint32_t type;
-    uint64_t value_pos;
+    pulsar_str key;     ///< metadata key, borrowed from the mapping
+    uint32_t type;      ///< GGUF type code of the value
+    uint64_t value_pos; ///< byte offset of the value within the file
 } pulsar_kv;
 
 /** THE accept set for gpu_graph_matmul_plain_tensor -- ONE definition.
@@ -1185,7 +1208,7 @@ typedef struct {
      * consumers apply the standalone kernel via the dispatch fallback).
      * Set per layer at the Q-path norm decision in gpu_prefill. */
     pulsar_gpu_q_prep q_prep;
-    int q_prep_active;
+    int q_prep_active;  ///< the fused norm+rope Q path is armed for this layer
     pulsar_gpu_tensor *batch_kv_raw;                ///< batched twin: fused KV projection output, pre-norm
     pulsar_gpu_tensor *batch_kv;                    ///< batched twin: KV latent after its RMSNorm
     /** The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.
@@ -1220,9 +1243,9 @@ typedef struct {
     pulsar_gpu_tensor *batch_routed_down;           ///< batched twin: routed experts, per-expert down output
     pulsar_gpu_tensor *batch_routed_out;            ///< batched twin: routed experts pooled by mixing weight
     pulsar_gpu_tensor *batch_ffn_out;               ///< batched twin: shared + routed FFN output
-    pulsar_gpu_tensor *directional_steering_dirs;
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
+    pulsar_gpu_tensor *directional_steering_dirs;  ///< steering direction vectors; NULL when steering is off
+    float directional_steering_attn_scale;         ///< strength applied at the attention sublayer
+    float directional_steering_ffn_scale;          ///< strength applied at the FFN sublayer
 
     /** Tier-2 bank pool (see pulsar_bank_slabs above).  banks.n_banks == 0 keeps
      * the classic single-session layout; >= 2 makes the per-layer cache
@@ -1541,10 +1564,13 @@ typedef struct owned_str {
     uint64_t len;
 } owned_str;
 
+/** One token under consideration by the sampler. Carries both the raw logit
+ * and the normalised probability because the filters need different ones --
+ * top-k sorts on the logit, min-p compares probabilities. */
 typedef struct {
-    int id;
-    float logit;
-    float prob;
+    int id;       ///< token id
+    float logit;  ///< raw logit
+    float prob;   ///< probability after softmax over the candidate set
 } sample_candidate;
 
 /** Reusable working set for pulsar_sample_dist_build's full-vocab (top_k <= 0)
@@ -2057,16 +2083,23 @@ struct pulsar_session {
     int load_snapshot(const pulsar_session_snapshot *snap, char *err, size_t errlen);
 };
 
+/** Snapshot of every layer's compressed-row frontier, taken before a
+ * speculative block so a rejected draft can be rolled back exactly. */
 typedef struct {
-    uint32_t n_comp[PULSAR_MAX_LAYER];
-    uint32_t n_index_comp[PULSAR_MAX_LAYER];
+    uint32_t n_comp[PULSAR_MAX_LAYER];        ///< attention compressed rows per layer
+    uint32_t n_index_comp[PULSAR_MAX_LAYER];  ///< indexer compressed rows per layer
 } pulsar_spec_frontier;
 
+/** Userdata wrapping a caller's progress callback during sync().
+ *
+ * The engine reports absolute positions; the wrapper holds the session and
+ * prompt so it can hand the caller's own callback the context it needs without
+ * the engine having to know about it. */
 typedef struct {
-    pulsar_session *session;
-    const pulsar_tokens *prompt;
-    pulsar_session_progress_fn user;
-    void *user_ud;
+    pulsar_session *session;            ///< session being synced
+    const pulsar_tokens *prompt;        ///< prompt being synced to
+    pulsar_session_progress_fn user;    ///< the caller's callback
+    void *user_ud;                      ///< the caller's userdata
 } pulsar_sync_progress;
 
 /** ---- helpers shared across the session_*.cpp TUs ----
