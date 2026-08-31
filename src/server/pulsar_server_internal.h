@@ -207,10 +207,12 @@
 
 /* ---- shared types ---- */
 
+/** Growable byte buffer. The server's workhorse for accumulating response
+ * text, JSON, and SSE payloads. */
 typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
+    char *ptr;   ///< bytes, owned
+    size_t len;  ///< bytes used
+    size_t cap;  ///< bytes allocated
 } buf;
 
 typedef enum {
@@ -348,10 +350,12 @@ typedef struct {
  * Buckets are non-cumulative here; send_metrics accumulates them on the way
  * out, which is the form Prometheus wants. */
 #define PULSAR_HIST_BUCKETS 14
+/** Fixed-bucket Prometheus histogram instance -- counters only; see the note
+ * above for why the bounds live elsewhere. */
 typedef struct {
-    uint64_t bucket[PULSAR_HIST_BUCKETS];
+    uint64_t bucket[PULSAR_HIST_BUCKETS];  ///< non-cumulative counts; send_metrics accumulates on the way out
     uint64_t count;  ///< also serves as the +Inf bucket
-    double   sum;
+    double   sum;    ///< sum of observed values, for the _sum series
 } pulsar_hist;
 
 /* Defined in http_server.cpp, next to the emitter that prints the le= labels
@@ -378,13 +382,20 @@ static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, dou
  * strings, partial UTF-8 and half-written DSML tags), so the byte watermark is
  * what decides which SSE chunk an entry rides on; without it a chunk could
  * carry logprobs for a token whose text it has not sent yet. */
+/** One token and its logprob, carrying the token's RAW bytes.
+ *
+ * The bytes are kept rather than re-derived because a token's text is not
+ * recoverable from the response stream: it can be partial UTF-8, or inside a
+ * string the projection has rewritten. */
 typedef struct {
-    int    token;
+    int    token;      ///< token id
     char  *piece;  ///< owned raw token bytes (may be partial UTF-8)
-    size_t piece_len;
-    float  logprob;
+    size_t piece_len;  ///< length of `piece` in bytes
+    float  logprob;    ///< the token's logprob
 } logprob_token;
 
+/** One committed logprob entry: the emitted token, where its bytes end in the
+ * response, and the alternatives considered at that position. */
 typedef struct {
     logprob_token tok;  ///< the token that was actually emitted
     size_t end_off;
@@ -511,17 +522,25 @@ typedef struct {
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
 } request;
 
+/** One key/value pair from a parsed JSON object. */
 typedef struct {
-    char *key;
-    char *value;
+    char *key;       ///< the key, owned
+    char *value;     ///< the value as text, owned
+    /** The value was written as a quoted string -- the only way to tell the
+     * string "true" from the boolean true once both are held as text. */
     bool is_string;
+    /** This occurrence has been consumed. Lookups take the next UNUSED match,
+     * so a duplicate key resolves to its occurrences in order rather than
+     * collapsing to one. */
     bool used;
 } json_arg;
 
+/** A parsed JSON object, kept as an ordered list rather than a map -- order is
+ * preserved for byte-stable re-rendering, and duplicate keys are retained. */
 typedef struct {
-    json_arg *v;
-    int len;
-    int cap;
+    json_arg *v;  ///< the pairs, in document order
+    int len;      ///< pairs present
+    int cap;      ///< pairs allocated
 } json_args;
 
 typedef enum {
@@ -761,12 +780,14 @@ typedef struct job job;
  * immediately, and a peer that accepts no bytes for
  * PULSAR_SERVER_SEND_STALL_TIMEOUT_MS (or overflows the pending cap) fails the
  * stream, which the generation loop reports exactly as before. */
+/** Deferred, non-blocking writer for one bound job's socket. See the note
+ * above for the contract. */
 typedef struct {
-    int fd;
+    int fd;       ///< the job's non-blocking client socket
     buf pending;  ///< accepted-but-unsent bytes, in wire order
     size_t off;  ///< consumed prefix of pending
     long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending)
-    bool failed;
+    bool failed;  ///< the stream has failed; further writes are refused
     /** Wall clock of the last client bytes ACCEPTED by this writer (queued or
      * sent), 0 until the first. Every streamed byte funnels through
      * slot_writer_send, so this is the one honest "when did the client last
@@ -875,15 +896,22 @@ typedef struct {
     stop_list call_ids;
 } live_tool_state;
 
+/** What a slot's frontier looks like from the CLIENT's side.
+ *
+ * The distinction this type exists to hold: the live payload and the text the
+ * client can replay are not the same thing, because hidden reasoning sits in
+ * one and not the other. Matching a replayed prompt against the live session
+ * has to compare against `visible_text`, not against the frontier itself.
+ */
 typedef struct {
-    bool valid;
+    bool valid;  ///< the state below has been populated
     /** Token frontier of the live sampled session.  The visible text below is
      * what clients will replay, but the payload at this frontier may also
      * contain hidden thinking tokens that are intentionally absent from that
      * visible replay. */
     int live_tokens;
-    char *visible_text;
-    size_t visible_len;
+    char *visible_text;   ///< the replayable text at that frontier, owned
+    size_t visible_len;   ///< its length in bytes
 } visible_live_state;
 
 /* ---- Session pool (multi-session serving, increment 1) ----
@@ -1989,19 +2017,27 @@ struct server {
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
  * valid without heap-allocating per-request job objects. */
+/** One queued request, and the handshake between its client thread and the
+ * worker.
+ *
+ * OWNERSHIP IS ONE-WAY: only the worker pops and frees a job. The client
+ * thread parks on `cv` until the worker signals `done`, even when its socket
+ * has already died -- it flags `cancelled` and keeps waiting rather than
+ * unlinking. Every queued-job helper depends on that invariant.
+ */
 struct job {
-    int fd;
-    request req;
-    bool done;
+    int fd;        ///< client socket
+    request req;   ///< the parsed request
+    bool done;     ///< the worker has finished with this job; releases the client thread
     /** Set (under mu) by the client thread when its socket dies while the job
      * is still queued; the worker reaps the job pre-bind. The client thread
      * NEVER unlinks or frees — it stays parked on cv until the worker
      * signals done, preserving the worker-only pop/free invariant the
      * queued-job protect helpers depend on (see worker_try_bind). */
     bool cancelled;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    job *next;
+    pthread_mutex_t mu;  ///< guards this job's own flags
+    pthread_cond_t cv;   ///< signalled when `done` is set
+    job *next;           ///< next job in the server's queue
     /** Which provisioning refusal this job has already been counted against, so
      * the /metrics counter records jobs blocked rather than bind retries (the
      * worker re-attempts the head every quantum). PROVISION_OK = not counted;
@@ -2010,24 +2046,37 @@ struct job {
     provision_refusal refusal_counted;
 };
 
+/** Server-side names for the KV-store write reasons.
+ *
+ * Each is defined AS the corresponding ::pulsar_kvstore_reason value rather
+ * than as an independent number, so the two enums cannot drift apart: the
+ * values are the store's, only the spelling is local. */
 typedef enum {
-    KV_REASON_UNKNOWN   = PULSAR_KVSTORE_REASON_UNKNOWN,
-    KV_REASON_COLD      = PULSAR_KVSTORE_REASON_COLD,
-    KV_REASON_CONTINUED = PULSAR_KVSTORE_REASON_CONTINUED,
-    KV_REASON_EVICT     = PULSAR_KVSTORE_REASON_EVICT,
-    KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,
-    KV_REASON_SYS_PREFIX = PULSAR_KVSTORE_REASON_SYS_PREFIX,
+    KV_REASON_UNKNOWN   = PULSAR_KVSTORE_REASON_UNKNOWN,     ///< unspecified
+    KV_REASON_COLD      = PULSAR_KVSTORE_REASON_COLD,        ///< a fresh prefix checkpoint
+    KV_REASON_CONTINUED = PULSAR_KVSTORE_REASON_CONTINUED,   ///< an extension of an existing one
+    KV_REASON_EVICT     = PULSAR_KVSTORE_REASON_EVICT,       ///< written because the slot is being evicted
+    KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,    ///< written on server shutdown
+    KV_REASON_SYS_PREFIX = PULSAR_KVSTORE_REASON_SYS_PREFIX, ///< the shared preamble cut (system prompt + tools)
 } kv_cache_reason;
 
+/** A window of token ids around the point where a replayed prompt stopped
+ * matching the live session.
+ *
+ * The single most useful artefact when a turn cold-prefills unexpectedly: it
+ * shows the ids on BOTH sides at the divergence, so the cause -- a retokenised
+ * boundary, an injected reminder, a stripped reasoning block -- is visible in
+ * the trace instead of requiring a reproduction.
+ */
 typedef struct trace_cache_diag {
-    bool valid;
-    int old_pos;
-    int prompt_len;
-    int common;
-    int start;
-    int count;
-    int live_id[TRACE_CACHE_WINDOW];
-    int prompt_id[TRACE_CACHE_WINDOW];
+    bool valid;       ///< the window below was captured
+    int old_pos;      ///< the live session's position before this request
+    int prompt_len;   ///< length of the incoming prompt
+    int common;       ///< tokens that matched; the divergence point
+    int start;        ///< first position covered by the window
+    int count;        ///< positions captured (<= TRACE_CACHE_WINDOW)
+    int live_id[TRACE_CACHE_WINDOW];    ///< the live session's ids across the window
+    int prompt_id[TRACE_CACHE_WINDOW];  ///< the incoming prompt's ids across the same window
 } trace_cache_diag;
 
 /** Userdata for the engine's prefill progress callback.
@@ -2062,10 +2111,15 @@ typedef struct server_prefill_progress {
     double last_keepalive;   ///< wall-clock of the last `:` comment line
 } server_prefill_progress;
 
+/** Tracks whether generation is inside a reasoning block.
+ *
+ * Fed the raw byte stream, so it keeps a rolling tail: a `</think>` tag can
+ * arrive split across any number of tokens, and the boundary has to be found
+ * without buffering the whole completion. */
 typedef struct thinking_state {
-    bool inside;
+    bool inside;   ///< currently inside a reasoning block
     char tail[8];  ///< Long enough for "</think>".
-    int tail_len;
+    int tail_len;  ///< bytes currently held in `tail`
     bool tail_ends_with(const char *s) const;  ///< was thinking_tail_ends_with
     void feed(const char *p, size_t len);  ///< was thinking_state_feed
 } thinking_state;
@@ -2222,29 +2276,35 @@ struct gen_state {
  * and idempotent-by-clock, so it is safe to call every worker pass. */
 bool gen_stream_heartbeat(gen_state *g);
 
+/** A parsed HTTP request line and body. Method and path are fixed-size because
+ * anything longer than these bounds is rejected rather than allocated for. */
 typedef struct {
-    char method[8];
-    char path[256];
-    char *body;
-    size_t body_len;
+    char method[8];    ///< HTTP method, NUL-terminated
+    char path[256];    ///< request path, NUL-terminated
+    char *body;        ///< request body, owned; NULL when there is none
+    size_t body_len;   ///< body length in bytes
 } http_request;
 
+/** Argument handed to a client thread at spawn: the server and the socket it
+ * owns for the connection's lifetime. */
 typedef struct {
-    server *srv;
-    int fd;
+    server *srv;  ///< the server
+    int fd;       ///< the accepted socket this thread owns
 } client_arg;
 
+/** Startup configuration, resolved once from CLI flags and immutable
+ * afterwards -- the worker reads it without locking on that basis. */
 typedef struct {
-    pulsar_engine_options engine;
-    const char *host;
-    int port;
-    int ctx_size;
-    int default_tokens;
-    const char *trace_path;
-    const char *kv_disk_dir;
-    bool kv_disk_disable;
-    uint64_t kv_disk_space_mb;
-    kv_cache_options kv_cache;
+    pulsar_engine_options engine;  ///< model/runtime options for the engine
+    const char *host;              ///< listen address
+    int port;                      ///< listen port
+    int ctx_size;                  ///< per-bank context size
+    int default_tokens;            ///< generation cap when a request does not set one
+    const char *trace_path;        ///< request trace file; NULL disables tracing
+    const char *kv_disk_dir;       ///< directory for the on-disk KV cache
+    bool kv_disk_disable;          ///< turn the disk cache off entirely
+    uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
+    kv_cache_options kv_cache;     ///< checkpoint placement policy
     /** Base URL of the SearXNG-compatible backend for the Anthropic web_search
      * server tool (e.g. http://searxng.defense.lan:8888). NULL disables the
      * feature: web_search tool entries are then dropped at parse so the model
