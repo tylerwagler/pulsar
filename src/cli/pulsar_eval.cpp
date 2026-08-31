@@ -82,14 +82,15 @@ typedef enum {
     EVAL_THINK_CLOSE_HARD,
 } eval_think_close_kind;
 
+/** One benchmark question. */
 typedef struct {
-    const char *source;
-    const char *id;
-    const char *domain;
-    const char *title;
-    const char *question;
-    const char *choice[EVAL_MAX_CHOICES];
-    const char *answer;
+    const char *source;    ///< benchmark the case comes from
+    const char *id;        ///< case id within that benchmark
+    const char *domain;    ///< subject area, for per-domain scoring
+    const char *title;     ///< short human-readable label
+    const char *question;  ///< the prompt text
+    const char *choice[EVAL_MAX_CHOICES];  ///< multiple-choice options; NULL-terminated
+    const char *answer;    ///< the correct choice
 } eval_case;
 
 static const eval_case eval_cases[] = {
@@ -1278,86 +1279,127 @@ static const eval_case eval_cases[] = {
     },
 };
 
+/** Growable byte buffer for generated text. */
 typedef struct {
-    char *v;
-    size_t len;
-    size_t cap;
+    char *v;      ///< bytes, owned
+    size_t len;   ///< bytes used
+    size_t cap;   ///< bytes allocated
 } byte_buf;
 
+/** Per-byte style codes running parallel to a ::byte_buf, so the TUI can
+ * repaint text without re-deciding how each byte should look. */
 typedef struct {
-    unsigned char *v;
-    size_t len;
-    size_t cap;
+    unsigned char *v;  ///< one style code per byte of the paired buffer
+    size_t len;        ///< entries used
+    size_t cap;        ///< entries allocated
 } style_buf;
 
+/** Everything the eval run was configured with. */
 typedef struct {
-    const char *model_path;
-    const char *trace_path;
+    const char *model_path;   ///< model to evaluate
+    const char *trace_path;   ///< write a full generation trace here; NULL = none
+    /** Re-grade an existing trace instead of generating. Lets a scoring change
+     * be applied to a completed run without spending GPU time again. */
     const char *regrade_trace_path;
-    const char *case_sequence;
-    pulsar_backend backend;
-    int threads;
-    int ctx_size;
-    int max_tokens;
-    int question_limit;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    int pause_ms;
-    uint32_t prefill_chunk;
+    const char *case_sequence;///< explicit case ids to run, in order; NULL = all
+    pulsar_backend backend;   ///< CPU or CUDA
+    int threads;              ///< CPU worker threads
+    int ctx_size;             ///< session context size
+    int max_tokens;           ///< generation cap per case
+    int question_limit;       ///< stop after this many cases; 0 = no limit
+    float temperature;        ///< sampling temperature
+    float top_p;              ///< nucleus cutoff
+    float min_p;              ///< relative probability floor
+    uint64_t seed;            ///< RNG seed
+    int pause_ms;             ///< delay between cases, for watching a run live
+    uint32_t prefill_chunk;   ///< prefill chunk size in rows
+
+    /** @name Thinking-budget controller
+     *  A reasoning model can spend an entire generation budget inside `<think>`
+     *  and fail a case with no visible answer at all. These bound that without
+     *  changing what is being measured.
+     *  @{
+     */
+    /** Below this many remaining tokens, ACCEPT the model's own intent to stop
+     * thinking: close the block if `</think>` is already ranked within
+     * soft_limit_think_close_rank. Conservative -- it only agrees with a
+     * decision the model was close to making. */
     int soft_limit_reply_budget;
+    /** Below this many remaining tokens, FORCE the block closed regardless of
+     * the distribution. A uniform benchmark rule reserving a fixed answer
+     * budget, rather than failing the case outright. */
     int hard_limit_reply_budget;
+    /** How near the top `</think>` must be for the soft limit to accept it. */
     int soft_limit_think_close_rank;
-    pulsar_think_mode think_mode;
-    bool plain;
-    bool self_test_extractors;
+    /** @} */
+
+    pulsar_think_mode think_mode;  ///< reasoning mode for the run
+    bool plain;                    ///< plain output, no TUI
+    bool self_test_extractors;     ///< run the answer-extractor self-tests and exit
 } eval_config;
 
+/** How a case's reasoning block ended, recorded for the trace: a forced close
+ * is a property of the RUN, not of the model, and scoring has to be able to
+ * tell them apart. */
 typedef struct {
-    eval_think_close_kind kind;
-    int token_index;
-    int remaining_budget;
-    int rank;
+    eval_think_close_kind kind;  ///< natural, soft-forced, or hard-forced
+    int token_index;             ///< token at which the block closed
+    int remaining_budget;        ///< tokens left at that point
+    int rank;                    ///< rank of `</think>` when a soft close accepted it
 } eval_think_close_info;
 
+/** The eval run's terminal UI: a case list on the left, the live generation on
+ * the right, and the run clock.
+ *
+ * Holds BORROWED pointers into the run's own arrays (`cases`, `status`,
+ * `guess`, the token counts) rather than copies, so what is drawn is always
+ * what the run currently believes. It frees none of them.
+ */
 typedef struct {
-    int cols;
-    int rows;
-    int left_w;
-    int right_x;
-    int right_w;
-    int body_y;
-    int body_h;
-    bool active;
-    bool enabled;
-    const eval_case *cases;
-    int ncases;
-    eval_status *status;
-    char (*guess)[EVAL_ANSWER_MAX];
-    int *prompt_tokens;
-    int *generated_tokens;
-    int active_case;
-    int generated;
-    int max_tokens;
-    int think_max_tokens;
-    int prefill_current;
-    int prefill_total;
-    double phase_start_sec;
-    double speed_tps;
+    int cols;    ///< terminal width
+    int rows;    ///< terminal height
+    int left_w;  ///< width of the case-list column
+    int right_x; ///< column the generation pane starts at
+    int right_w; ///< width of the generation pane
+    int body_y;  ///< first row of the scrolling body
+    int body_h;  ///< height of the scrolling body
+
+    bool active;  ///< the UI is currently drawing
+    bool enabled; ///< the UI was requested at all (false under --plain)
+
+    const eval_case *cases;   ///< borrowed: the case table
+    int ncases;               ///< cases in the run
+    eval_status *status;      ///< borrowed: per-case status
+    char (*guess)[EVAL_ANSWER_MAX];  ///< borrowed: per-case extracted answer
+    int *prompt_tokens;       ///< borrowed: per-case prompt length
+    int *generated_tokens;    ///< borrowed: per-case generated length
+
+    int active_case;      ///< case currently running
+    int generated;        ///< tokens generated in it so far
+    int max_tokens;       ///< its generation cap
+    int think_max_tokens; ///< its thinking budget
+    int prefill_current;  ///< prefill rows done
+    int prefill_total;    ///< prefill rows total
+
+    double phase_start_sec;   ///< wall-clock the current phase began
+    double speed_tps;         ///< current tokens/s
+    /** Accumulated run time EXCLUDING paused stretches. Accumulated rather than
+     * derived from a start timestamp, so pausing does not inflate it. */
     double run_elapsed_sec;
-    double run_last_sec;
-    bool run_clock_active;
-    bool selection_active;
-    int selected_case;
-    int requested_case;
-    bool paused;
-    bool quit_requested;
-    byte_buf stream;
-    style_buf styles;
-    bool in_think;
-    char pending_tag[16];
-    size_t pending_tag_len;
+    double run_last_sec;      ///< wall-clock at the last tick, for the next delta
+    bool run_clock_active;    ///< the clock is running (not paused)
+
+    bool selection_active;  ///< the user is browsing the case list
+    int selected_case;      ///< case under the cursor
+    int requested_case;     ///< case the user asked to jump to; -1 = none
+    bool paused;            ///< the run is paused
+    bool quit_requested;    ///< the user asked to stop
+
+    byte_buf stream;        ///< generated text of the active case
+    style_buf styles;       ///< per-byte style codes for `stream`
+    bool in_think;          ///< the generation is inside a reasoning block
+    char pending_tag[16];   ///< partial `<think>`/`</think>` tag split across tokens
+    size_t pending_tag_len; ///< bytes held in pending_tag
 } eval_ui;
 
 static eval_ui *global_ui;
@@ -1402,18 +1444,24 @@ static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
     snprintf(dst, dstlen, "%02lluh:%02llum", hours, minutes);
 }
 
+/** Keyboard input for the eval TUI, read on its own thread.
+ *
+ * The reader thread only RECORDS what was pressed; the run loop consumes the
+ * flags at a safe point. Nothing here touches the engine, so a keypress can
+ * never interleave with a generation step.
+ */
 typedef struct {
-    bool enabled;
-    bool raw_mode;
-    bool thread_started;
-    volatile sig_atomic_t running;
-    pthread_t thread;
-    pthread_mutex_t mu;
-    struct termios orig_termios;
-    int move_delta;
-    bool enter_pressed;
-    bool pause_pressed;
-    bool quit_pressed;
+    bool enabled;        ///< input handling was requested
+    bool raw_mode;       ///< the terminal is in raw mode and must be restored
+    bool thread_started; ///< the reader thread is running and must be joined
+    volatile sig_atomic_t running;  ///< clear to ask the reader thread to exit
+    pthread_t thread;    ///< the reader thread
+    pthread_mutex_t mu;  ///< guards the pressed flags below
+    struct termios orig_termios;  ///< saved terminal settings, restored on exit
+    int move_delta;      ///< accumulated cursor movement, +1 per down, -1 per up
+    bool enter_pressed;  ///< select the case under the cursor
+    bool pause_pressed;  ///< toggle pause
+    bool quit_pressed;   ///< stop the run
 } eval_input;
 
 static eval_input global_input = {
@@ -1652,7 +1700,7 @@ static void term_clear_to_eol(void) {
 }
 
 static int tui_right_text_w(const eval_ui *ui) {
-    /* Avoid writing the physical last column.  Many terminals defer wrapping
+    /** Avoid writing the physical last column.  Many terminals defer wrapping
      * until the next byte after the last column, which would spill right-pane
      * status text into the next row's left pane. */
     return ui->right_w > 1 ? ui->right_w - 1 : ui->right_w;
@@ -1798,7 +1846,7 @@ static void tui_start_input(void) {
     if (!isatty(STDIN_FILENO)) return;
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
-    /* The input thread is intentionally boring: it never writes to the terminal,
+    /** The input thread is intentionally boring: it never writes to the terminal,
      * it only queues navigation/control state.  Rendering remains owned by the
      * main thread and follows the same full-frame redraw path as the
      * noninteractive UI. Keep ISIG set so Ctrl-C still restores the alternate
@@ -1898,7 +1946,7 @@ static void tui_restore(void) {
 }
 
 static void tui_signal_restore(int sig) {
-    /* Signal handlers cannot safely run the full tui_restore() path: that path
+    /** Signal handlers cannot safely run the full tui_restore() path: that path
      * joins the input thread and uses stdio.  For Ctrl-C / termination, do the
      * minimal terminal repair directly, then re-raise the signal with its
      * default action so the process status remains correct. */
@@ -1963,7 +2011,7 @@ static void tui_draw_left(eval_ui *ui) {
     const int shown = ui->ncases < visible_rows ? ui->ncases : visible_rows;
     int first = 0;
     if (shown > 0 && ui->ncases > shown) {
-        /* The list follows the selection cursor, not the running test.  This
+        /** The list follows the selection cursor, not the running test.  This
          * makes arrow navigation visible immediately.  When normal execution
          * advances, main() moves the selection to the new active case so the
          * viewport naturally follows the work again. */
@@ -2445,7 +2493,7 @@ static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_toke
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
-    /* Counted blocks make regrading robust against model output that happens
+    /** Counted blocks make regrading robust against model output that happens
      * to contain trace-looking delimiters or embedded CASE headers. */
     fprintf(trace, "%s_BEGIN bytes=%zu\n", label, len);
     if (len) {
@@ -2660,7 +2708,7 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
         if (c == ' ' || c == '\t' || c == ',' || c == ';') p--;
         else break;
     }
-    /* Read the immediately preceding word (letters/apostrophe), lowercased. */
+    /** Read the immediately preceding word (letters/apostrophe), lowercased. */
     const char *wend = p;
     while (p > start && (isalpha((unsigned char)p[-1]) || p[-1] == '\'')) p--;
     size_t wlen = (size_t)(wend - p);
@@ -2669,7 +2717,7 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
     for (size_t i = 0; i < wlen; i++) w[i] = (char)tolower((unsigned char)p[i]);
     w[wlen] = '\0';
 
-    /* Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
+    /** Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
     if (wlen >= 3 && strcmp(w + wlen - 3, "n't") == 0) return true;
 
     static const char *cues[] = {
@@ -2713,7 +2761,7 @@ static char find_answer_letter(const char *generated, int nchoices) {
                 char before = p == visible ? ' ' : p[-1];
                 char after = p[1];
                 if (!is_letter_boundary(before, after)) continue;
-                /* A standalone capital that begins a same-line English word
+                /** A standalone capital that begins a same-line English word
                  * ("A careful ...") or a contraction ("I'll ...") is prose,
                  * not the model's pick: the real letter comes later on the
                  * line. Skip it; the reverse scan below still recovers it if
@@ -2724,7 +2772,7 @@ static char find_answer_letter(const char *generated, int nchoices) {
                     while (*w == ' ' || *w == '\t') w++;
                     if (islower((unsigned char)*w)) continue;
                 }
-                /* A distractor explicitly rejected before the pick on the same
+                /** A distractor explicitly rejected before the pick on the same
                  * line ("not B, ... D") must not win over the real choice. */
                 if (mc_letter_is_negated(answer, p)) continue;
                 return c;
@@ -2780,11 +2828,11 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
-        /* Restrict to the final answer line: digits after it (continued
+        /** Restrict to the final answer line: digits after it (continued
          * reasoning, footnotes, years) must not override the answer. */
         const char *nl = (const char *)memchr(answer, '\n', (size_t)(end - answer));
         if (nl) end = nl;
-        /* When the line shows arithmetic ("m+n = 256+37 = 293") the stated
+        /** When the line shows arithmetic ("m+n = 256+37 = 293") the stated
          * result is the right-hand side of the LAST '='. Otherwise the first
          * integer on the line is the answer (keeps "Final answer: 082"). */
         const char *eq = NULL;
@@ -2910,7 +2958,7 @@ static bool compsec_answer_matches(const char *expected_spec, const char *got_sp
         if (!expected[i]) return false;
         hit = true;
     }
-    /* The prompt asks the model for the single best line, or the smallest exact
+    /** The prompt asks the model for the single best line, or the smallest exact
      * set when the bug cannot be localized to one line.  The hidden expected
      * answer may be a small audited range when adjacent lines are equivalent
      * locations for the same bug.  Any model-supplied line must be inside that
@@ -3490,7 +3538,7 @@ static int run_extractor_self_tests(void) {
         "MC: a leading pick followed by 'not B' is still graded as the pick",
         &mc_d, "</think>Answer: D, not B", "D");
 
-    /* Integer: when the answer line shows the arithmetic, the graded value
+    /** Integer: when the answer line shows the arithmetic, the graded value
      * must be the stated result (right of the last '='), not the first
      * summand/factor; digits on later lines must not leak in either. Many
      * embedded AIME2025 cases ask for a derived sum (m+n, a+b+c, ...). */
@@ -4131,7 +4179,7 @@ int main(int argc, char **argv) {
             break;
         }
         if (result == EVAL_RUN_QUIT) break;
-        /* A successful case should advance to the next pending benchmark.  If a
+        /** A successful case should advance to the next pending benchmark.  If a
          * stale quit flag ever survives here, clear it; real q handling either
          * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
          * the next idle iteration. */
