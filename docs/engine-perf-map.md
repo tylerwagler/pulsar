@@ -81,7 +81,8 @@ head.  That is a FlashAttention-style rewrite, not a tweak.
 
 `tests/attn_precision_fidelity.cc` (deleted in a71e346; results preserved in
 `src/cuda/pulsar_cuda_attn_f16.cu`'s header) scored each candidate on REAL activations
-(dumped with `PULSAR_DUMP_ATTN`, 24 tokens x 64 heads against an f64 reference),
+(dumped with `PULSAR_DUMP_ATTN`, 24 tokens x 64 heads against an f64 reference;
+that dump path went with the harness in a71e346 and the flag no longer exists),
 and `tests/idx_mma_issue_bench.cu` measures what each one buys.
 
 What it buys, measured on GB10:
@@ -269,7 +270,8 @@ emit (m, l, o) partials to static device scratch (graph-safe, 16.8 MiB);
 applies the sink once.  gridDim.z == 1 is bit-identical to the old walk and
 still serves n_tokens > 8.  All three heads8 sites route through one
 dispatcher; PULSAR_CUDA_DECODE_SPLITKV=0 opts out (bit-identical restore,
-verified 1e-26).  PULSAR_SPLITKV_DEBUG=1 A/Bs both walks per call.
+verified 1e-26).  PULSAR_SPLITKV_DEBUG=1 used to A/B both walks per call; that
+debug switch was retired in the v0.5.0 switch audit and now does nothing.
 
 Measured, locked clocks, v5mx4-mmqaligned (baseline -> split):
     2k  18.41 -> 20.72  (+12.5%, flips the last Entrpi-winning cell: 19.85)

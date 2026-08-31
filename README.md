@@ -209,8 +209,10 @@ A few things this fork's GGUFs do beyond upstream:
   unpruned; the shipped v4 file's header says otherwise, and the claim was
   an error.)
 - **Merged DSpark drafter.** The speculative drafter's tensors ship inside
-  the same GGUF file (spliced by `gguf-tools/merge_dspark_gguf.py`); see the
-  speculative decoding section below.
+  the same GGUF file, emitted there by the quantizer's `--dspark-template`
+  pass; see the speculative decoding section below. (The old standalone
+  `merge_dspark_gguf.py` splice was deleted 2026-08-19 when that stage
+  collapsed into the quantizer — see `docs/ARTIFACT_BUILD.md`.)
 
 `download_model.sh` fetches this fork's shipped GGUF from our release repo:
 
@@ -283,9 +285,11 @@ the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
 - Block-scaled MXFP4 indexer scorer. Default-on; its opt-out switch
   (`PULSAR_CUDA_INDEXER_MXFP4`) was retired in the v0.5.0 switch audit and the
   packed indexer cache is now allocated unconditionally.
-- Split-KV decode attention with softmax merge (8 row-splits; the
-  small-batch decode walk no longer serializes on 8 blocks). Default-on;
-  its opt-out switch was retired in the v0.5.0 switch audit.
+- `PULSAR_CUDA_DECODE_SPLITKV` — split-KV decode attention with softmax merge
+  (8 row-splits; the small-batch decode walk no longer serializes on 8 blocks).
+  `=0` still opts out, and the engine says so on the startup line that
+  announces the tier. (The separate `PULSAR_SPLITKV_DEBUG` A/B switch, which
+  ran both walks per call, WAS retired in the v0.5.0 switch audit.)
 
 | Context | Prefill (t/s, cold) | Decode plain (t/s) |
 | ---: | ---: | ---: |

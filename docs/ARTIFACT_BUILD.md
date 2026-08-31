@@ -8,6 +8,21 @@ because the NAS copy has a different name. Both are now pinned below.
 
 ## ✅ VERIFIED 2026-08-12 — this recipe has been executed end to end
 
+> ⚠ **CHECK THE TARGET BEFORE TRUSTING THE SHA (noted 2026-08-31).** The
+> verification below is dated 2026-08-12 and its type census includes
+> **F16 359**. The F16 weights were retired four days later on 2026-08-16
+> (L079) — `src/cuda/pulsar_gpu.h` now states that "the shipped artifact
+> contains ZERO F16 tensors". Those two statements describe artifacts on
+> either side of that change.
+>
+> So `b4c4ac7c…` is the sha of the **pre-L079** artifact. Before treating a
+> mismatch as a rebuild error, confirm which artifact is actually being served
+> (`gguf-tools/deepseek4-quantize --audit <file>` on the GB10 box, or read the
+> type census straight out of the served GGUF's header). If the served file no
+> longer carries F16 tensors, this section needs a re-verified sha and census
+> rather than a footnote — that is a release-prep task for sparky, not a doc
+> edit, and it is deliberately not guessed at here.
+
 A full rebuild from the source weights was run and compared against the served
 artifact `v5mx4-0731-ltdraft.gguf`:
 
@@ -29,7 +44,7 @@ where someone's disk was; a hash says which imatrix it was. The KV is now a
 fixed 64 hex chars, so it is identical on every machine and the one remaining
 metadata divergence (and the 32-byte `data_pos` shift it caused) is gone.
 
-SHA-256 is implemented in `quantize/dsq_sha256.c` to keep the quantizer
+SHA-256 is implemented in `gguf-tools/quantize/dsq_sha256.c` to keep the quantizer
 dependency-free. It self-tests against the FIPS 180-4 vectors on first use,
 including a multi-block case, because a silently wrong hash would stamp a
 confident and meaningless identity into every artifact. It was also checked

@@ -12,7 +12,7 @@ look for what.
 | `src/engine/` | session lifecycle, prefill/decode graph encoding, KV bookkeeping, tokenizer |
 | `src/cuda/` | kernels: attention, MoE, matmul/GEMV, compressor, indexer, drafter |
 | `src/server/` | HTTP server, scheduler, request/slot machinery, OpenAI/Anthropic-shaped APIs |
-| `src/cli/` | `pulsar-cli` (chat), `pulsar-bench` (throughput), `pulsar-eval` (quality) |
+| `src/cli/` | `pulsar` (chat; built from `pulsar_cli.cpp`), `pulsar-bench` (throughput), `pulsar-eval` (quality) |
 | `src/agent/` | agentic tool loop built on the server |
 | `src/lib/` | shared helpers (KV store, help text) |
 | `src/vendor/` | third-party: `rax` radix tree, `linenoise` (upstream copyright; not documented here) |
@@ -36,8 +36,11 @@ A request moves through three stages:
 ### Banks
 
 Concurrent sequences live in **banks**: per-sequence KV slabs inside one session
-object. The scheduler installs one bank at a time for classic work
-(`server::bank_switch`) and batches rows from several banks for a decode round.
+object. A decode round batches rows from several banks at once; the scheduler
+installs a single bank (`server::bank_switch`) only for the operations that are
+still one-bank-at-a-time — finishing a request, writing a checkpoint. There is
+no longer a per-slot decode lane: since L118 the batched quanta run at every
+n >= 1, so a solo session is a batch of one.
 
 A session with no pool allocated behaves as **bank 0** — `gpu_graph_bank_pool_count()`
 reports 1 and the bank accessors fall back to the classic tensors — so
@@ -98,6 +101,12 @@ Two properties are load-bearing and worth stating plainly:
 
 ## Generated documentation
 
-`doxygen docs/Doxyfile` → `docs/api/html/index.html`. Undocumented declarations
-are reported in `docs/api/doxygen-warnings.log`; that log is the progress meter
-for the in-flight documentation pass.
+`doxygen docs/Doxyfile` → `docs/api/html/index.html`, with call, caller and
+collaboration graphs (needs graphviz `dot`).
+
+Coverage is complete: every declaration in scope carries documentation, and
+`docs/api/doxygen-warnings.log` is the check that it stays that way — treat a
+new warning as a regression, not as a backlog item. Vendored llama.cpp files are
+deliberately OUT of scope; the Doxyfile's exclude list explains why (they are
+byte-identical to the upstream pin and must stay that way for a clean
+re-vendor).
