@@ -593,11 +593,11 @@ typedef struct {
 typedef struct {
     float *out;                                         ///< destination row(s), f32
     const uint16_t *data;
-    const float *x;
+    const float *x;                                     ///< activation row the kernel multiplies against, f32
     uint64_t in_dim;                                    ///< input width (K)
 } matvec_f16_ctx;
 
-/** THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
+/* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
  *
  * Six ctx structs (matvec_q8_0_ctx, _pair_ctx, _grouped_ctx,
  * matmul_q8_0_batch_ctx, _pair_batch_ctx, _grouped_batch_ctx),
@@ -612,36 +612,38 @@ typedef struct {
  * run.  block_q8_K itself stays -- other declarations still reference it, and
  * whether THOSE are live is a separate audit. */
 
+/** Work item for the CPU Q8_0 activation quantiser: one row in, one quantised
+ * row plus its scales out. */
 typedef struct {
-    const float *x;
+    const float *x;                                     ///< source activation row, f32
     int8_t *xq;                                         ///< quantised activation row the kernel multiplies against
-    float *xscale;
+    float *xscale;                                      ///< per-block scale for each quantised block
     uint64_t in_dim;                                    ///< input width (K)
-    uint64_t blocks;
+    uint64_t blocks;                                    ///< quantisation blocks spanning in_dim
 } quantize_q8_0_batch_ctx;
 
 typedef struct {
     float *out;                                         ///< destination row(s), f32
-    const float *data;
-    const float *x;
+    const float *data;                                  ///< weight rows, f32
+    const float *x;                                     ///< activation row the kernel multiplies against, f32
     uint64_t in_dim;                                    ///< input width (K)
 } matvec_f32_ctx;
 
 typedef struct {
-    float *out0;
-    float *out1;
-    const uint8_t *base0;
-    const uint8_t *base1;
+    float *out0;                                        ///< destination row for the first of the pair, f32
+    float *out1;                                        ///< destination row for the second of the pair, f32
+    const uint8_t *base0;                               ///< weight bytes for the first row of the pair
+    const uint8_t *base1;                               ///< weight bytes for the second row of the pair
     const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
     uint64_t in_dim;                                    ///< input width (K)
-    uint64_t row_bytes0;
-    uint64_t row_bytes1;
+    uint64_t row_bytes0;                                ///< row stride for base0, quantisation included
+    uint64_t row_bytes1;                                ///< row stride for base1, quantisation included
 } matvec_iq2_xxs_pair_ctx;
 
 typedef struct {
-    float *mid;
-    const uint8_t *gate_base[PULSAR_MAX_EXPERT_USED];
-    const uint8_t *up_base[PULSAR_MAX_EXPERT_USED];
+    float *mid;                                         ///< destination: the SwiGLU product
+    const uint8_t *gate_base[PULSAR_MAX_EXPERT_USED];   ///< weight bytes of each expert's gate projection
+    const uint8_t *up_base[PULSAR_MAX_EXPERT_USED];     ///< weight bytes of each expert's up projection
     const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
     float expert_weight[PULSAR_MAX_EXPERT_USED];        ///< router mixing weight applied per expert
     float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
@@ -670,35 +672,35 @@ typedef struct {
 } matvec_q2_k_accum_ctx;
 
 typedef struct {
-    uint32_t token;
-    uint32_t slot;
+    uint32_t token;                                     ///< token index within the batch
+    uint32_t slot;                                      ///< which of the token's chosen experts this is
 } pulsar_expert_pair;
 
 typedef struct {
-    float *mid;
-    const uint8_t *gate_base[PULSAR_MAX_EXPERT];
-    const uint8_t *up_base[PULSAR_MAX_EXPERT];
+    float *mid;                                         ///< destination: the SwiGLU product
+    const uint8_t *gate_base[PULSAR_MAX_EXPERT];        ///< weight bytes of each expert's gate projection
+    const uint8_t *up_base[PULSAR_MAX_EXPERT];          ///< weight bytes of each expert's up projection
     const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
     const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
     const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;
-    const float *pair_weight;
+    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
+    const float *pair_weight;                           ///< router mixing weight per (token, expert) pair
     float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
     uint64_t in_dim;                                    ///< input width (K)
     uint64_t out_dim;                                   ///< output width (N)
     uint64_t gate_row_bytes[PULSAR_MAX_EXPERT];         ///< row stride of the expert's gate projection
     uint64_t up_row_bytes[PULSAR_MAX_EXPERT];           ///< row stride of the expert's up projection
-    uint64_t xq_blocks;
+    uint64_t xq_blocks;                                 ///< quantisation blocks per activation row
 } matvec_iq2_xxs_batch_mid_ctx;
 
 typedef struct {
-    float *down_pair;
+    float *down_pair;                                   ///< destination: per-pair down-projection output
     const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
     const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
     const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;
+    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
     uint64_t in_dim;                                    ///< input width (K)
     uint64_t out_dim;                                   ///< output width (N)
     uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
@@ -712,7 +714,7 @@ typedef struct {
     const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
     const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
     const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;
+    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
     uint32_t n_active;
     uint32_t n_tok;
     uint64_t in_dim;                                    ///< input width (K)
