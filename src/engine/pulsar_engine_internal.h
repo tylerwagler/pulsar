@@ -1010,11 +1010,11 @@ typedef struct {
      * and restore (spec->layer) copy sets: one kernel launch instead of ~126
      * cudaMemcpy calls per direction. Built lazily on first snapshot; NULL
      * handle falls back to the per-tensor copy loop. */
-    void *spec_snap_copies;
-    void *spec_restore_copies;
-    uint32_t spec_frontier_copy_n;
-    uint64_t spec_frontier_copy_max_bytes;
-    int spec_frontier_copy_init;
+    void *spec_snap_copies;      ///< baked batched-copy handle, layer -> spec direction
+    void *spec_restore_copies;   ///< baked batched-copy handle, spec -> layer direction
+    uint32_t spec_frontier_copy_n;          ///< tensors in each copy set
+    uint64_t spec_frontier_copy_max_bytes;  ///< largest single copy, for staging
+    int spec_frontier_copy_init;            ///< tri-state: unbuilt / built / permanently failed (falls back to the per-tensor loop)
     /** Shared multi-row logits slab (16 rows x n_vocab f32), written by every
      * batched multi-row output head: the DSpark draft/verify passes,
      * gpu_graph_verify_suffix_tops, and the Tier-2 batched multi-session
@@ -1109,12 +1109,12 @@ typedef struct {
      * exact rows -> bit-identical state). [17 rows x width] per compressed
      * layer; the indexer compressor reuses batch_comp_kv/sc so it needs its
      * own save. spec_comp_save_n arms the save (0 = off). */
-    pulsar_gpu_tensor *spec_comp_kv_save[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_comp_sc_save[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_icomp_kv_save[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_icomp_sc_save[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *spec_comp_scratch_row;   /* emit sink during roll-forward */
-    uint32_t spec_comp_save_n;
+    pulsar_gpu_tensor *spec_comp_kv_save[PULSAR_MAX_LAYER];   ///< saved attention compressed rows a rejected draft must not keep
+    pulsar_gpu_tensor *spec_comp_sc_save[PULSAR_MAX_LAYER];   ///< saved attention compressed scores
+    pulsar_gpu_tensor *spec_icomp_kv_save[PULSAR_MAX_LAYER];  ///< saved indexer compressed rows (the indexer reuses batch_comp_*, so it needs its own save)
+    pulsar_gpu_tensor *spec_icomp_sc_save[PULSAR_MAX_LAYER];  ///< saved indexer compressed scores
+    pulsar_gpu_tensor *spec_comp_scratch_row;   ///< emit sink during roll-forward: absorbs writes that must not land in the real cache
+    uint32_t spec_comp_save_n;                  ///< arms the save; 0 = off. Also suppresses projection-ring deposits, since a speculative row is not committed
     /** Persistent drafter scratch (was per-call cudaMalloc/cudaFree churn --
      * cudaFree device-syncs, and the fused loop projects/seeds up to 5x/step). */
     pulsar_gpu_tensor *dspark_concat;       /* [3*N_EMBD] target_h concat */
@@ -1155,16 +1155,16 @@ typedef struct {
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
     pulsar_gpu_tensor *prefill_tokens;
-    pulsar_gpu_tensor *batch_cur_hc;
-    pulsar_gpu_tensor *batch_next_hc;
-    pulsar_gpu_tensor *batch_flat_hc;
-    pulsar_gpu_tensor *batch_hc_mix;
-    pulsar_gpu_tensor *batch_hc_split;
-    pulsar_gpu_tensor *batch_attn_cur;
-    pulsar_gpu_tensor *batch_attn_norm;
-    pulsar_gpu_tensor *batch_qr;
-    pulsar_gpu_tensor *batch_qr_norm;
-    pulsar_gpu_tensor *batch_q;
+    pulsar_gpu_tensor *batch_cur_hc;                ///< batched twin: HC residual carrier
+    pulsar_gpu_tensor *batch_next_hc;               ///< batched twin: HC residual for the next layer (swapped with batch_cur_hc each layer)
+    pulsar_gpu_tensor *batch_flat_hc;               ///< batched twin: HC streams flattened for the mix GEMV
+    pulsar_gpu_tensor *batch_hc_mix;                ///< batched twin: HC mix projection output
+    pulsar_gpu_tensor *batch_hc_split;              ///< batched twin: per-stream split of the mix
+    pulsar_gpu_tensor *batch_attn_cur;              ///< batched twin: attention sublayer input
+    pulsar_gpu_tensor *batch_attn_norm;             ///< batched twin: RMSNorm output feeding the projections
+    pulsar_gpu_tensor *batch_qr;                    ///< batched twin: low-rank query latent
+    pulsar_gpu_tensor *batch_qr_norm;               ///< batched twin: normalised query latent
+    pulsar_gpu_tensor *batch_q;                     ///< batched twin: queries in head space
     /** L037 lever 3: when q_prep_active, batch_q holds RAW head projections
      * for the current layer and every attention call this chunk passes
      * &q_prep so the f16 kernel fuses norm+rope into its Q load (non-f16
@@ -1172,8 +1172,8 @@ typedef struct {
      * Set per layer at the Q-path norm decision in gpu_prefill. */
     pulsar_gpu_q_prep q_prep;
     int q_prep_active;
-    pulsar_gpu_tensor *batch_kv_raw;
-    pulsar_gpu_tensor *batch_kv;
+    pulsar_gpu_tensor *batch_kv_raw;                ///< batched twin: fused KV projection output, pre-norm
+    pulsar_gpu_tensor *batch_kv;                    ///< batched twin: KV latent after its RMSNorm
     /** The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.
      * batch_kv above stays f32 because norm/rope/fp8-quantize are in-place
      * elementwise passes over it, which is f32-as-scratch and is what torch does
@@ -1182,30 +1182,30 @@ typedef struct {
      * the chunk's own KV was attended at 4 bytes/element while every later
      * chunk read the same rows out of the packed ring at 384 B/row. */
     pulsar_gpu_tensor *batch_kv_pack;
-    pulsar_gpu_tensor *batch_comp_kv;
-    pulsar_gpu_tensor *batch_comp_sc;
+    pulsar_gpu_tensor *batch_comp_kv;               ///< batched twin: compressed KV rows produced this chunk
+    pulsar_gpu_tensor *batch_comp_sc;               ///< batched twin: compressed score rows produced this chunk
     pulsar_gpu_tensor *batch_indexer_q;   /* f32 rope staging, producer-internal (L090.4) */
     pulsar_gpu_tensor *batch_indexer_qp;  /* packed E2M1 Q rows -- what the scorers read */
     pulsar_gpu_tensor *batch_indexer_weights;
-    pulsar_gpu_tensor *batch_heads;
-    pulsar_gpu_tensor *batch_attn_low;
-    pulsar_gpu_tensor *batch_attn_out;
-    pulsar_gpu_tensor *batch_after_attn_hc;
-    pulsar_gpu_tensor *batch_ffn_cur;
-    pulsar_gpu_tensor *batch_ffn_norm;
-    pulsar_gpu_tensor *batch_shared_gate;
-    pulsar_gpu_tensor *batch_shared_up;
-    pulsar_gpu_tensor *batch_shared_mid;
-    pulsar_gpu_tensor *batch_shared_out;
-    pulsar_gpu_tensor *batch_router_logits;
-    pulsar_gpu_tensor *batch_router_probs;
-    pulsar_gpu_tensor *batch_router_selected;
-    pulsar_gpu_tensor *batch_router_weights;
-    pulsar_gpu_tensor *batch_routed_up;
-    pulsar_gpu_tensor *batch_routed_mid;
-    pulsar_gpu_tensor *batch_routed_down;
-    pulsar_gpu_tensor *batch_routed_out;
-    pulsar_gpu_tensor *batch_ffn_out;
+    pulsar_gpu_tensor *batch_heads;                 ///< batched twin: per-head attention output
+    pulsar_gpu_tensor *batch_attn_low;              ///< batched twin: attention output through the low-rank 'a' projection
+    pulsar_gpu_tensor *batch_attn_out;              ///< batched twin: attention output at embedding width
+    pulsar_gpu_tensor *batch_after_attn_hc;         ///< batched twin: HC residual after the attention sublayer
+    pulsar_gpu_tensor *batch_ffn_cur;               ///< batched twin: FFN sublayer input
+    pulsar_gpu_tensor *batch_ffn_norm;              ///< batched twin: RMSNorm output feeding the FFN
+    pulsar_gpu_tensor *batch_shared_gate;           ///< batched twin: shared expert, gate branch
+    pulsar_gpu_tensor *batch_shared_up;             ///< batched twin: shared expert, up branch
+    pulsar_gpu_tensor *batch_shared_mid;            ///< batched twin: shared expert, SwiGLU product
+    pulsar_gpu_tensor *batch_shared_out;            ///< batched twin: shared expert, down output
+    pulsar_gpu_tensor *batch_router_logits;         ///< batched twin: per-expert routing logits
+    pulsar_gpu_tensor *batch_router_probs;          ///< batched twin: routing probabilities
+    pulsar_gpu_tensor *batch_router_selected;       ///< batched twin: chosen expert ids
+    pulsar_gpu_tensor *batch_router_weights;        ///< batched twin: per-expert mixing weights
+    pulsar_gpu_tensor *batch_routed_up;             ///< batched twin: routed experts, up branch
+    pulsar_gpu_tensor *batch_routed_mid;            ///< batched twin: routed experts, SwiGLU product
+    pulsar_gpu_tensor *batch_routed_down;           ///< batched twin: routed experts, per-expert down output
+    pulsar_gpu_tensor *batch_routed_out;            ///< batched twin: routed experts pooled by mixing weight
+    pulsar_gpu_tensor *batch_ffn_out;               ///< batched twin: shared + routed FFN output
     pulsar_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
