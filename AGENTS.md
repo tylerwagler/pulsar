@@ -77,9 +77,10 @@ Everything else stays `static`. The cross-module surface is `src/pulsar.h`,
 ```sh
 make cutlass                          # once: clone the pinned CUTLASS
                                       # (or set CUTLASS_DIR=/path/to/cutlass)
-make cuda-spark          # DGX Spark / GB10 (CUDA_ARCH=sm_120f)
-make cuda-generic        # other local CUDA GPUs (CUDA_ARCH=native)
-make cuda CUDA_ARCH=sm_N # explicit -arch, e.g. cross-builds
+make cuda-spark                          # DGX Spark / GB10; rebuilds
+                                         # pulsar-server at CUDA_ARCH=sm_120f
+make pulsar-server CUDA_ARCH=native      # other local CUDA GPUs
+make pulsar-server CUDA_ARCH=sm_N        # explicit -arch, e.g. cross-builds
 ```
 
 Binaries land in the repo root: `pulsar`, `pulsar-server`, `pulsar-agent`, `pulsar-bench`,

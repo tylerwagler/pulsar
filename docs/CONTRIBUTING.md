@@ -11,8 +11,15 @@ is when an important correctness bug is fixed and it requires some speed penalty
 
 ## Correctness Regression Tests
 
-Build the CUDA binaries first (`make cuda-spark` for DGX Spark / GB10,
-`make cuda-generic` for other local CUDA GPUs):
+Build the CUDA binaries first. `make cuda-spark` is the GB10 shortcut and
+rebuilds `pulsar-server` at `CUDA_ARCH=sm_120f`; on any other CUDA GPU name the
+target and the arch yourself, because `CUDA_ARCH` defaults to empty:
+
+    make pulsar-server CUDA_ARCH=native
+
+There is no `cuda-generic` target. To build the other binaries, name them
+(`pulsar`, `pulsar-agent`, `pulsar-bench`, `pulsar-eval`) with the same
+`CUDA_ARCH`:
 
 ```sh
 make clean
