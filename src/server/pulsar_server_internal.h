@@ -250,10 +250,10 @@ typedef struct {
     char *name;
     char *wire_name;
     char *tool_namespace;
-    /* Distinguish the Responses hosted tool from a normal function that
+    /** Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
-    /* Anthropic web_search server tool: the SERVER executes calls to this
+    /** Anthropic web_search server tool: the SERVER executes calls to this
      * name mid-request (web_search.cpp); they never stop the turn. */
     bool server_web_search;
     char **prop;
@@ -276,7 +276,7 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
-    /* True when this system-role entry carries the request's top-level
+    /** True when this system-role entry carries the request's top-level
      * system/instructions FIELD (the parser appends it to the array). Field
      * content always renders in the system region; inline role:system
      * MESSAGES follow the leading-run rule instead (L113) — position in the
@@ -307,17 +307,17 @@ typedef struct {
  * rather than emitting NaN/inf. */
 typedef struct {
     bool valid;
-    double ttft_s;       /* wall time from request start to first emitted token */
-    double prefill_s;    /* wall time spent in prefill (request start -> decode start) */
-    double decode_s;     /* wall time spent decoding (decode start -> finish) */
-    int prompt_n;        /* total prompt tokens (prefill target) */
-    int cached_n;        /* prompt tokens served from a cache (<= prompt_n) */
-    int decode_n;        /* completion tokens emitted */
-    bool spec_active;    /* DSpark speculative decode ran this request */
-    uint64_t spec_accepted; /* accepted draft tokens (this request) */
-    uint64_t spec_draft;    /* proposed/verified draft tokens (this request) */
-    uint64_t spec_drafts;   /* draft rounds (this request) */
-    uint64_t spec_gen;      /* tokens emitted by the spec loop (this request) */
+    double ttft_s;  ///< wall time from request start to first emitted token
+    double prefill_s;  ///< wall time spent in prefill (request start -> decode start)
+    double decode_s;  ///< wall time spent decoding (decode start -> finish)
+    int prompt_n;  ///< total prompt tokens (prefill target)
+    int cached_n;  ///< prompt tokens served from a cache (<= prompt_n)
+    int decode_n;  ///< completion tokens emitted
+    bool spec_active;  ///< DSpark speculative decode ran this request
+    uint64_t spec_accepted;  ///< accepted draft tokens (this request)
+    uint64_t spec_draft;  ///< proposed/verified draft tokens (this request)
+    uint64_t spec_drafts;  ///< draft rounds (this request)
+    uint64_t spec_gen;  ///< tokens emitted by the spec loop (this request)
 } req_timings;
 
 /* Fixed-bucket Prometheus histogram. The bucket bounds are shared per metric
@@ -328,7 +328,7 @@ typedef struct {
 #define PULSAR_HIST_BUCKETS 14
 typedef struct {
     uint64_t bucket[PULSAR_HIST_BUCKETS];
-    uint64_t count;   /* also serves as the +Inf bucket */
+    uint64_t count;  ///< also serves as the +Inf bucket
     double   sum;
 } pulsar_hist;
 
@@ -340,7 +340,7 @@ extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS];
 /* Record one observation. Values above the last bound fall only into +Inf,
  * which the emitter derives from count, so no bucket is touched for them. */
 static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, double v) {
-    if (!(v >= 0.0)) return; /* drops NaN as well as negatives */
+    if (!(v >= 0.0)) return;  ///< drops NaN as well as negatives
     int i = 0;
     while (i < PULSAR_HIST_BUCKETS - 1 && v > bounds[i]) i++;
     if (v <= bounds[i]) h->bucket[i]++;
@@ -358,16 +358,16 @@ static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, dou
  * carry logprobs for a token whose text it has not sent yet. */
 typedef struct {
     int    token;
-    char  *piece;                /* owned raw token bytes (may be partial UTF-8) */
+    char  *piece;  ///< owned raw token bytes (may be partial UTF-8)
     size_t piece_len;
     float  logprob;
 } logprob_token;
 
 typedef struct {
-    logprob_token tok;           /* the token that was actually emitted */
+    logprob_token tok;  ///< the token that was actually emitted
     size_t end_off;
     int    n_top;
-    logprob_token *top;          /* owned; n_top alternatives, descending */
+    logprob_token *top;  ///< owned; n_top alternatives, descending
 } logprob_entry;
 
 /* Per-request OpenAI logprobs state.  Inert (and allocation-free) unless the
@@ -387,11 +387,11 @@ typedef struct {
  * consumed at the emit.  Exactly one token is ever in flight per slot. */
 typedef struct {
     bool enabled;
-    int  top_k;                  /* client's top_logprobs, 0..PULSAR_SERVER_MAX_TOP_LOGPROBS */
+    int  top_k;  ///< client's top_logprobs, 0..PULSAR_SERVER_MAX_TOP_LOGPROBS
     logprob_entry *v;
     int  len;
     int  cap;
-    int  streamed;               /* entries already written to an SSE chunk */
+    int  streamed;  ///< entries already written to an SSE chunk
     bool pending_valid;
     float pending_logprob;
     int  pending_n_top;
@@ -408,7 +408,7 @@ typedef struct {
     char *raw_body;
     char *prompt_text;
     tool_schema_orders tool_orders;
-    /* >0 iff the request advertised the Anthropic web_search server tool (and
+    /** >0 iff the request advertised the Anthropic web_search server tool (and
      * the server has a backend configured): the remaining-use budget. */
     int web_search_max_uses;
     int max_tokens;
@@ -416,7 +416,7 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
-    /* Presence flags: true iff the CLIENT sent the parameter in the request
+    /** Presence flags: true iff the CLIENT sent the parameter in the request
      * body. request_init() fills the value fields with engine defaults at
      * parse time, so the values alone cannot distinguish "explicitly 1.0"
      * from "absent" — downstream policy (e.g. think-mode defaults in
@@ -426,7 +426,7 @@ typedef struct {
     bool has_top_k;
     bool has_top_p;
     bool has_min_p;
-    /* OpenAI logprobs (chat completions only).  `logprobs` alone reports the
+    /** OpenAI logprobs (chat completions only).  `logprobs` alone reports the
      * chosen token's logprob; `top_logprobs` additionally asks for that many
      * alternatives per position and is rejected without logprobs:true, per the
      * OpenAI contract. */
@@ -440,7 +440,7 @@ typedef struct {
     req_timings timings;
     pulsar_think_mode think_mode;
     bool has_tools;
-    /* tool_choice="required" (OpenAI) / {"type":"any"|"tool"} (Anthropic):
+    /** tool_choice="required" (OpenAI) / {"type":"any"|"tool"} (Anthropic):
      * force a tool call. The prompt is prefilled into an open DSML tool_calls
      * block (thinking skipped) and generate_job seeds the output with the
      * SAME opener so the model must complete an invoke. forced_tool_name is
@@ -449,11 +449,11 @@ typedef struct {
     bool force_tool_call;
     char *forced_tool_name;
     bool prompt_preserves_reasoning;
-    /* For /v1/responses: emit reasoning_summary_* events / fields only when the
+    /** For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
     bool reasoning_summary_emit;
-    /* Responses continuation contract:
+    /** Responses continuation contract:
      *
      * A live Responses tool loop is not a normal "new prompt with a long
      * prefix" request.  The protocol gives tool outputs a call_id that binds
@@ -532,13 +532,13 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    /* Thinking+tools: hold tentative answer text after the first </think>
+    /** Thinking+tools: hold tentative answer text after the first </think>
      * until a tool marker, stream end, or a SECOND close proves whether it
      * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
-    /* Borrowed (never owned): the request's logprob ledger, so the delta
+    /** Borrowed (never owned): the request's logprob ledger, so the delta
      * emitters can attach the entries whose bytes the delta releases.  NULL
      * whenever the client did not ask for logprobs — openai_stream_start
      * zeroes it and only the job binds it. */
@@ -591,7 +591,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    /* See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0;
+    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0;
      * upstream left Responses out, but our leak is identical). */
     bool guard_second_reasoning;
     bool reasoning_item_opened;
@@ -608,10 +608,10 @@ typedef struct {
     char response_id[40];
     char reasoning_id[40];
     char message_id[40];
-    int reasoning_index;   /* output_index of the reasoning item (0 if present) */
-    int message_index;     /* output_index of the assistant message item */
-    int next_output_index; /* monotonic counter for upcoming output items */
-    int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    int reasoning_index;  ///< output_index of the reasoning item (0 if present)
+    int message_index;  ///< output_index of the assistant message item
+    int next_output_index;  ///< monotonic counter for upcoming output items
+    int sequence;  ///< monotonic per-event sequence_number Codex consumes
 } responses_stream;
 
 /* Item identity per tool call must be stable across added/done/completed. */
@@ -657,14 +657,14 @@ typedef struct {
 typedef struct {
     anthropic_stream_mode mode;
     anthropic_block_type open_block;
-    /* Borrowed from the request for the stream's lifetime: lets the tool-block
+    /** Borrowed from the request for the stream's lifetime: lets the tool-block
      * opener type server-executed tools as server_tool_use on the wire. */
     const tool_schema_orders *orders;
     int next_index;
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    /* See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0).
+    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0).
      * has_tools is copied from the request at start so the round reset can
      * re-arm without a request pointer. */
     bool guard_second_reasoning;
@@ -691,11 +691,11 @@ typedef struct job job;
  * stream, which the generation loop reports exactly as before. */
 typedef struct {
     int fd;
-    buf pending;                 /* accepted-but-unsent bytes, in wire order */
-    size_t off;                  /* consumed prefix of pending */
-    long long stall_deadline_ms; /* 0 = disarmed (nothing pending) */
+    buf pending;  ///< accepted-but-unsent bytes, in wire order
+    size_t off;  ///< consumed prefix of pending
+    long long stall_deadline_ms;  ///< 0 = disarmed (nothing pending)
     bool failed;
-    /* Wall clock of the last client bytes ACCEPTED by this writer (queued or
+    /** Wall clock of the last client bytes ACCEPTED by this writer (queued or
      * sent), 0 until the first. Every streamed byte funnels through
      * slot_writer_send, so this is the one honest "when did the client last
      * hear from us" clock — the heartbeat below reads it. */
@@ -712,11 +712,11 @@ typedef struct {
 #define PULSAR_SERVER_HEARTBEAT_MS 5000
 
 void slot_writer_init(slot_writer *w, int fd);
-void slot_writer_install(slot_writer *w);   /* thread-local; NULL uninstalls */
-bool slot_writer_flush(slot_writer *w);     /* non-blocking best effort */
+void slot_writer_install(slot_writer *w);  ///< thread-local; NULL uninstalls
+bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
-bool slot_writer_drain(slot_writer *w);     /* blocking, stall-timeout bounded */
+bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);
 
 typedef pulsar_kvstore_entry kv_entry;
@@ -767,16 +767,16 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    /* Token frontier of a live assistant tool-call turn. Continuing from this
+    /** Token frontier of a live assistant tool-call turn. Continuing from this
      * point preserves hidden thinking and sampled DSML bytes that are not
      * necessarily present in the client-visible replay. */
     int live_tokens;
-    /* Optional rendered conversation text that the client is expected to replay.
+    /** Optional rendered conversation text that the client is expected to replay.
      * Responses uses this because visible replay can omit hidden reasoning.
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
-    /* Tool-call ids generated at the same live frontier. A following tool
+    /** Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
     stop_list call_ids;
@@ -784,7 +784,7 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    /* Token frontier of the live sampled session.  The visible text below is
+    /** Token frontier of the live sampled session.  The visible text below is
      * what clients will replay, but the payload at this frontier may also
      * contain hidden thinking tokens that are intentionally absent from that
      * visible replay. */
@@ -1000,29 +1000,16 @@ typedef struct gen_state gen_state;
  * thread only) — an evicted slot is a reusable hole (provisioned == false,
  * state SLOT_EVICTED) below the n_slots high-water mark. */
 typedef struct {
-    bool         provisioned;             /* false until admitted; cleared on
-                                             eviction (the slot is a reusable
-                                             hole). Every reader that used to
-                                             skip sess == NULL skips this. */
-    uint32_t     bank;                    /* Tier-2: this slot's bank id in the
-                                             shared pool (slot i -> bank i). 0 in
-                                             classic (non-pooled) mode. */
-    int          committed_pos;           /* Tier-2: this bank's committed KV
-                                             frontier length (== pulsar_session_pos
-                                             when this bank is the live one).
-                                             Kept current at every op boundary so
-                                             routing/metrics can read a non-live
-                                             bank's position without a bank swap. */
-    struct job  *active_job;              /* request bound to this slot, or NULL */
-    gen_state   *gen;                     /* resumable state for active_job */
+    bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
+    uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
+    int          committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
+    struct job  *active_job;  ///< request bound to this slot, or NULL
+    gen_state   *gen;  ///< resumable state for active_job
     slot_state   state;
-    int          ctx_size;                /* context this slot was admitted for */
-    uint64_t     est_cost_bytes;          /* ledger-committed session cost (ACTUAL
-                                             resident bytes once the session exists;
-                                             the true-cost estimate only gates
-                                             admission before the create) */
-    uint64_t     tokens_emitted;          /* decode bookkeeping for the scheduler */
-    /* L114 counter watermark: session position up to which computed prefill
+    int          ctx_size;  ///< context this slot was admitted for
+    uint64_t     est_cost_bytes;  ///< ledger-committed session cost (ACTUAL resident bytes once the session exists; the true-cost estimate only gates admission before the create)
+    uint64_t     tokens_emitted;  ///< decode bookkeeping for the scheduler
+    /** L114 counter watermark: session position up to which computed prefill
      * rows have been ticked into w_prefill_chunk_tokens. Advanced by BOTH the
      * classic progress callback and the mixed lane's fused sub-chunk commit
      * (same position coordinate), so their overlap can never double-count.
@@ -1030,18 +1017,18 @@ typedef struct {
      * per prefill: a rebuild that recomputes below the mark deliberately does
      * not re-tick (position-progress semantics, not GPU-work accounting). */
     int          prefill_counted;
-    uint64_t     last_serviced_us;        /* last quantum wall-clock (scheduler) */
-    /* Per-conversation continued-store frontier (see kv_cache_tracker_bind):
+    uint64_t     last_serviced_us;  ///< last quantum wall-clock (scheduler)
+    /** Per-conversation continued-store frontier (see kv_cache_tracker_bind):
      * the shared pulsar_kvstore keeps one continued_last_store_tokens field, but
      * the schedule it tracks belongs to this slot's conversation. */
     int          continued_last_store_tokens;
-    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
+    /** Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
      * bank's comp/index PHYSICAL was cudaFree'd (raw KV bit-identical on disk at
      * <spill_dir>/spill-bank-<bank>.kv) while its conversation stays bound here; it
      * is restored (alloc_physical + kv_load) before this slot next decodes. Distinct
      * from SLOT_EVICTED (which frees the bank for a DIFFERENT conversation). */
     bool         spilled;
-    /* Protocol live bindings for THIS slot's sampled KV frontier (guarded by
+    /** Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
      * so a continuation can never match another slot's frontier. */
@@ -1073,17 +1060,17 @@ typedef enum {
 
 struct server {
     pulsar_engine *engine;
-    /* The ONE session (created at startup, freed once at shutdown): classic
+    /** The ONE session (created at startup, freed once at shutdown): classic
      * mode == 1 bank-less slot (slot 0), pool mode == pool_banks banks over
      * it. Slots are pure bank descriptors; all engine work goes through this
      * pointer. */
     pulsar_session *sess;
-    /* Session pool. slots[0..n_slots) are provisioned; the worker thread is
+    /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
      * published under mu for readers on client threads). */
     session_slot slots[PULSAR_SESSION_POOL_CAP];
-    int          n_slots;            /* provisioned slots (worker-owned; published under mu) */
-    /* Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
+    int          n_slots;  ///< provisioned slots (worker-owned; published under mu)
+    /** Tier-2 bank-pool state (worker thread only). `pool_banks` > 0 means the
      * shared-pool flip is active: all live slots share server.sess and each
      * owns one bank; `live_bank` is the bank whose device views + host carry are
      * currently installed on that session (server_bank_switch lazily saves the
@@ -1092,7 +1079,7 @@ struct server {
      * batched quanta at every n >= 1. */
     int          pool_banks;
     int          live_bank;
-    /* plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
+    /** plan-34 phase-2 inc 5: fused mixed-batch lane (PULSAR_MIXED_BATCH, default OFF,
      * read once at startup). When ON, the worker folds ONE prefilling slot's next
      * chunk (a K-row prefill run) into the decode quantum's first mixed step
      * (pulsar_session_decode_mixed) instead of advancing it as a separate classic
@@ -1100,34 +1087,34 @@ struct server {
      * separate one-prefill-chunk time-slice (byte-identical). Only meaningful in
      * pool mode (pool_banks>0). */
     bool         mixed_batch_enabled;
-    /* Deep-concurrent guard for the fused lane: when the aggregate committed
+    /** Deep-concurrent guard for the fused lane: when the aggregate committed
      * depth (sum of committed_pos) of the active decode set exceeds this many
      * rows, worker_find_fuse_prefill refuses to fuse — the decode step is
      * already bandwidth-saturated and folding prefill in displaces decode
      * (the measured -48% tg regime). 0 disables the guard. */
     int          mixed_deep_guard_rows;
-    /* Prefill rows folded into EACH decode step of a fused quantum (PULSAR_MIXED_CHUNK,
+    /** Prefill rows folded into EACH decode step of a fused quantum (PULSAR_MIXED_CHUNK,
      * read once; default 32). Spreading the prefill uniformly across the quantum's
      * steps (vs one big chunk on one step) is what trades the time-slice's per-
      * interval decode STALL for a small uniform per-token cost — the p99 lever. */
     int          mixed_chunk_tokens;
-    /* plan-33 inc B: warm full-prefix FORK routing (PULSAR_WARM_FORK, default on;
+    /** plan-33 inc B: warm full-prefix FORK routing (PULSAR_WARM_FORK, default on;
      * read once at startup). When a request's prompt token-extends an idle warm
      * bank's committed history, the router forks that trunk into a FREE bank and
      * continues there, leaving the trunk intact for siblings. */
     bool         warm_fork_enabled;
-    /* plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
+    /** plan-33 inc D: minimum shared-prefix TOKEN count for a PARTIAL fork-cut to
      * be worth it (below this, reusing so few tokens loses to a plain cold
      * prefill; a full-prefix match still forks regardless). PULSAR_WARM_PARTIAL_MIN,
      * read once at startup; floored to the ratio-4 align (partial cuts below R
      * reuse nothing). */
     int          warm_partial_min;
-    /* The pool's shared per-bank context (boot --ctx).  Its own field
+    /** The pool's shared per-bank context (boot --ctx).  Its own field
      * because slot 0's ctx_size used to double as this reference — and a
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
      * provision with ctx 0 (banks the router then skipped forever). */
     int          pool_ctx_size;
-    /* PULSAR_EVAL_PIN=1: history-independent serving for reproducible evals.
+    /** PULSAR_EVAL_PIN=1: history-independent serving for reproducible evals.
      * Kills every cross-request reuse channel at its choke point — thinking-
      * bind routing, warm forks, and in-place prefix continuation (common
      * prefix reported as 0, so every request cold-prefills from position 0).
@@ -1136,13 +1123,10 @@ struct server {
      * dependence on identical requests at temperature 0; this flag is how an
      * eval pins behavior WITHOUT changing production defaults. */
     bool         eval_pin;
-    uint64_t     bank_marginal_bytes; /* Tier-2: per-bank ledger charge in pooled
-                                         mode (even split of the admitted pool
-                                         cost; conservative, demand-paged reality
-                                         is smaller). 0 in classic mode. */
-    uint64_t     kv_budget_bytes;    /* admission ceiling computed at startup */
-    uint64_t     kv_committed_bytes; /* sum of est_cost_bytes over live slots (under mu) */
-    /* Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
+    uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
+    uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
+    uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
+    /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and a spill dir
      * exists). `guard_touched_budget` is the resident-KV ceiling the guard keeps
      * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
@@ -1154,7 +1138,7 @@ struct server {
     uint64_t     guard_eager_bytes;
     uint64_t     guard_evictions;
     char         spill_dir[512];
-    /* Trivial-match threshold for the choose-vs-provision routing decision:
+    /** Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.cpp; immutable after
      * startup, worker thread reads only). */
@@ -1162,7 +1146,7 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
-    const char *web_search_url; /* see server_config.web_search_url */
+    const char *web_search_url;  ///< see server_config.web_search_url
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -1170,9 +1154,9 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
-    time_t started;                  /* wall-clock when the listener came up (uptime for /health) */
+    time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;
-    /* /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
+    /** /metrics scheduler + prefill gauges (all under mu). n_queued = jobs
      * enqueued not yet bound to a slot; n_generating = jobs bound to slots
      * (0..n_slots, time-sliced by the single worker). m_* are cumulative
      * prefill counters feeding the Prometheus prompt-throughput and
@@ -1186,9 +1170,9 @@ struct server {
      * made vllm:generation_tokens_total report zero throughput on a fully busy
      * server. The worker thread is the only writer; publish_metrics_snapshot
      * copies it under mu. */
-    uint64_t w_gen_tokens;        /* worker-owned, no lock */
-    uint64_t m_gen_tokens;        /* published copy, read by send_metrics */
-    /* L114: chunk-granular prefill counter (computed rows only, accumulated in
+    uint64_t w_gen_tokens;  ///< worker-owned, no lock
+    uint64_t m_gen_tokens;  ///< published copy, read by send_metrics
+    /** L114: chunk-granular prefill counter (computed rows only, accumulated in
      * server_progress_cb per prefill_chunk event). vllm:prompt_tokens_total
      * stays request-granular (finish-time, cache-exact); this one advances
      * every ~4s chunk so a scraper can build prefill rate CURVES — flat spots
@@ -1196,78 +1180,105 @@ struct server {
      * attribution instrument). */
     uint64_t w_prefill_chunk_tokens;
     uint64_t m_prefill_chunk_tokens;
-    /* L117: live EMA of ms per emitted token in the spec-batched lane
+    /** L117: live EMA of ms per emitted token in the spec-batched lane
      * (worker-owned). Denominator of the overflow argmax's cost threshold:
      * a marginal draft row is admitted while survival >= marginal_ms / this.
      * 0 until the first quantum; the argmax uses a 45 ms prior until then. */
     float    spec_ms_per_tok_ema;
-    /* L123: the batched lane's shared ALL_ROWS logits landing buffer
+    /** L123: the batched lane's shared ALL_ROWS logits landing buffer
      * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
      * first quantum. It was a per-quantum malloc/free — 16.5 MB of
      * demand-zero pages faulted back in on every touch cycle, a measured
      * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
     float   *spec_lane_logits;
-    /* Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
+    /** Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is
      * this" from "no speculative decoding ran at all". */
     int w_decode_lane;
     int m_decode_lane;
-    uint64_t m_prompt_tokens;     /* cumulative prompt tokens prefilled */
-    uint64_t m_prefix_queries;    /* cumulative prompt tokens seen (hit-rate denom) */
-    uint64_t m_prefix_hits;       /* cumulative prompt tokens served from prefix cache */
+    uint64_t m_prompt_tokens;  ///< cumulative prompt tokens prefilled
+    uint64_t m_prefix_queries;  ///< cumulative prompt tokens seen (hit-rate denom)
+    uint64_t m_prefix_hits;  ///< cumulative prompt tokens served from prefix cache
     /* Worker-published /metrics snapshots (under mu). The CUDA-state audit
      * above forbids engine calls on client threads, so the worker exports
      * per-slot KV positions/contexts and the engine spec-decode counters here
      * (server_publish_metrics_snapshot, at bind time and once per quantum);
      * send_metrics reads only these. */
-    int m_slot_pos[PULSAR_SESSION_POOL_CAP];  /* pulsar_session_pos per provisioned slot */
-    int m_slot_ctx[PULSAR_SESSION_POOL_CAP];  /* ctx_size per provisioned slot */
-    /* Per-slot generation phase and prefill progress. Without these a scraper
+    int m_slot_pos[PULSAR_SESSION_POOL_CAP];  ///< pulsar_session_pos per provisioned slot
+    int m_slot_ctx[PULSAR_SESSION_POOL_CAP];  ///< ctx_size per provisioned slot
+    /** Per-slot generation phase and prefill progress. Without these a scraper
      * cannot tell a slot that is prefilling from one that is decoding: both
      * only show m_slot_pos advancing, and a prefill chunk and a decode quantum
      * are indistinguishable once sampled at scrape cadence.
      * Stored as gen_phase + 1, so 0 (a zeroed server, or a slot with no bound
      * job) reads as idle rather than as GEN_PREFILL_COLD. */
     int m_slot_phase[PULSAR_SESSION_POOL_CAP];
-    int m_slot_depth[PULSAR_SESSION_POOL_CAP]; /* L112: adaptive draft depth per slot (0 = n/a) */
-    int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  /* tokens synced so far */
-    int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP]; /* prefill target, 0 if not prefilling */
-    pulsar_spec_metrics m_spec;               /* engine spec-decode counters */
+    int m_slot_depth[PULSAR_SESSION_POOL_CAP];  ///< L112: adaptive draft depth per slot (0 = n/a)
+    int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  ///< tokens synced so far
+    int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP];  ///< prefill target, 0 if not prefilling
+    pulsar_spec_metrics m_spec;  ///< engine spec-decode counters
     /* Request-latency histograms. req_timings is already computed for every
      * request (generate_job_end) and was previously only serialized into the
      * response body; observe_request_timings folds it in here so /metrics can
      * report TTFT and per-token latency. Worker thread writes, under mu. */
-    pulsar_hist m_h_ttft;        /* seconds to first emitted token */
-    pulsar_hist m_h_tpot;        /* seconds per output token (decode_s/decode_n) */
-    pulsar_hist m_h_e2e;         /* seconds, request start -> finish */
-    pulsar_hist m_h_prompt_tok;  /* prompt tokens per request */
-    pulsar_hist m_h_gen_tok;     /* completion tokens per request */
+    pulsar_hist m_h_ttft;  ///< seconds to first emitted token
+    pulsar_hist m_h_tpot;  ///< seconds per output token (decode_s/decode_n)
+    pulsar_hist m_h_e2e;  ///< seconds, request start -> finish
+    pulsar_hist m_h_prompt_tok;  ///< prompt tokens per request
+    pulsar_hist m_h_gen_tok;  ///< completion tokens per request
     uint64_t m_requests_finished;
     /* Slot-pool lifecycle. Eviction forces the next turn of that conversation
      * to replay from a checkpoint, which is the dominant tail-latency source
      * on a busy pool, and none of it was previously observable. */
-    uint64_t m_evictions;        /* slots evicted to make room */
-    uint64_t m_spills;           /* banks spilled to disk by the guard */
-    uint64_t m_restores;         /* spilled banks brought back */
-    uint64_t m_restore_failures; /* spilled bank could not be restored */
-    /* Why the queue is stuck. Counted once per job (job::refusal_counted) so a
+    uint64_t m_evictions;  ///< slots evicted to make room
+    uint64_t m_spills;  ///< banks spilled to disk by the guard
+    uint64_t m_restores;  ///< spilled banks brought back
+    uint64_t m_restore_failures;  ///< spilled bank could not be restored
+    /** Why the queue is stuck. Counted once per job (job::refusal_counted) so a
      * head that cannot bind for many quanta registers once, not once a tick. */
     uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
-    int m_queue_block_reason;    /* provision_refusal + 1 of a stuck head; 0 = not blocked */
+    int m_queue_block_reason;  ///< provision_refusal + 1 of a stuck head; 0 = not blocked
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 
-    /* ---- methods (C++ port): 1:1 mirror of the server_ / worker_ verb family;
-     * bodies keep the auto *s = this alias, numerics/logic verbatim. ---- */
+    /** @name Server methods (C++ port)
+     *  1:1 mirror of the server_ / worker_ verb family; bodies keep the
+     *  `auto *s = this` alias, numerics/logic verbatim.
+     *  @{
+     */
     bool send_model(int fd, const char *id);
     bool send_models(int fd);
+    /** Liveness probe (/healthz, /ping): is the process alive at all? Always 200
+     * while the process runs — deliberately independent of readiness/drain state,
+     * so a k8s liveness probe never restarts a server that is merely draining.
+     * Lock-free, engine-free (safe on a client thread).
+     */
     bool send_liveness(int fd);
+    /** Readiness + status (/health): is the server ready to accept work, and what
+     * is it doing right now? 200 {"status":"ok",...} when serving; 503
+     * {"status":"draining",...} once shutdown has been requested so a load
+     * balancer stops routing to it. Reads only the worker-published snapshot under
+     * mu (same discipline as /metrics — no engine calls on the client thread).
+     */
     bool send_health(int fd);
+    /** Version + build identity (/version), vLLM/OpenAI convention. Version is the
+     * git-describe string baked in at build time (see Makefile).
+     */
     bool send_version(int fd);
+    /** Root banner so a bare GET / (browsers, uptime probes) gets a 200 with the
+     * version and a pointer to the real endpoints instead of a 404.
+     */
     bool send_root(int fd);
+    /** Prometheus /metrics — DSpark speculative-decode counters in vLLM naming, so
+     * tool-eval-bench --spec-live (and any vLLM-oriented scraper) reads acceptance
+     * rate, acceptance length, and the per-position waterfall unchanged. All
+     * counters are cumulative since engine open; gauges are point-in-time.
+     * Series in the pulsar: namespace are additions with no vLLM equivalent; a
+     * vLLM-oriented scraper ignores them.
+     */
     bool send_metrics(int fd);
     void client_done();
     bool kv_tool_map_measure_locked(const char *text, uint32_t *count_out, uint64_t *bytes_out);
@@ -1286,30 +1297,187 @@ struct server {
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
     int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out);
     int live_text_prefix_prompt(session_slot *sl, const request *req, pulsar_tokens *effective_prompt);
+    /** Tool-output-only Responses continuation.
+     * Some clients send just the new tool outputs after a tool call.  There is no
+     * long visible prefix to match in that shape; the call_id itself is the
+     * protocol binding to the previous live assistant output.  Use it only when the
+     * remembered live frontier and call-id set match exactly.
+     */
     int responses_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt, int *matched_ids);
+    /** Tool-result Anthropic continuation.
+     * /v1/messages has no server-side response object like the OpenAI Responses
+     * API, but its tool_use_id is still a precise continuation handle inside a live
+     * local agent loop.  When the IDs and live token frontier match, continue from
+     * the sampled DSML state and append only the user tool_result suffix.
+     */
     int anthropic_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt, int *matched_ids);
+    /** Visible-replay Responses continuation.
+     * Other clients send the full visible transcript on every turn even though the
+     * API semantics still make the request a continuation.  For Responses, exact
+     * token-prefix matching is the wrong first question: hidden reasoning may be
+     * live in KV but absent from the replay by design.  Instead, verify that the
+     * request's rendered text begins with the visible transcript remembered at the
+     * live frontier.  If it does, continue from the live token prefix and tokenize
+     * only the bytes after that visible boundary.
+     * If this check fails, DS4 has no special Responses state to trust.  The caller
+     * then uses normal token/text/disk matching, which is the correct fallback for
+     * cold starts, edits, restarts, or cross-client replays.
+     */
     int responses_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
+    /** Tool-less thinking continuation.
+     * Chat/completions and Anthropic do not have a previous_response_id object that
+     * binds a later request to the last sampled turn.  Still, after a normal
+     * tool-less thinking answer, the next prompt renderer intentionally omits that
+     * hidden reasoning.  The live KV state is richer than the visible transcript.
+     * Remembering the visible transcript as a key lets us keep the sampled hidden
+     * KV when the next request clearly extends that same visible history.  This is
+     * the same byte-prefix idea used by the disk cache: the client-visible text
+     * selects the checkpoint, while the payload stays the exact sampled token
+     * frontier.  If the visible key does not match, callers fall back to ordinary
+     * token/text/disk matching.
+     */
     int thinking_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
+    /** Routing probe (choose_slot_for_job): does this slot's live thinking
+     * binding mark it as the warm continuation of req's visible transcript?
+     * Same guards as thinking_live_visible_prefix_prompt above, but byte-prefix
+     * check only — no tokenization, no effective-prompt build (gen_begin redoes
+     * the full resolution on the chosen slot). The router needs this because
+     * the token common prefix UNDERSTATES relatedness for thinking chats: the
+     * client replays visible content while the slot's sampled frontier holds
+     * the hidden reasoning too, so a short token match can still be the same
+     * conversation. Returns the matched visible-key length (>0) so the caller
+     * can prefer the most recent frontier if several slots hold bindings for
+     * prefixes of one conversation, or 0 for no match. Never dereferences
+     * s->sess (the caller passes the slot's live position).
+     */
     size_t thinking_live_binds_prompt(session_slot *sl, const request *req, int live_pos);
+    /** Validate Responses tool outputs before rendering.
+     * A tool output with a call_id is meaningful only if either:
+     * 1. DS4 still has the matching live assistant call in memory, or
+     * 2. the same request replays the prior assistant call item.
+     * Case 1 is the fast, protocol-native continuation path: keep the live KV and
+     * append only the tool result.  Case 2 is stateless replay after restart or
+     * branching.  In thinking mode, case 2 is less faithful if the replay omits
+     * reasoning state for the assistant call.  Official Responses clients can
+     * carry that state with reasoning items / encrypted reasoning content; when
+     * they do not, the request is still renderable as visible history.  Mark that
+     * condition so generate_job() can prefer live / visible checkpoints and emit a
+     * warning if it must fall back to visible replay instead of aborting the
+     * session.
+     */
     bool responses_validate_tool_outputs(const chat_msgs *msgs, pulsar_think_mode think_mode, bool *requires_live_tool_state, bool *requires_live_reasoning, char *err, size_t errlen);
+    /** Validate Anthropic tool results before rendering.
+     * A tool_result.tool_use_id is valid if it is either still bound to the live
+     * Anthropic assistant tool-call frontier or the same request replays the prior
+     * assistant tool_use block.  The first case is the fast path: keep the sampled
+     * KV and append only the tool-result suffix.  The second case is a normal
+     * stateless replay, where exact DSML tool memory can restore the sampled tool
+     * bytes before prefix matching.  A tool-result-only request with an unknown
+     * live id has no safe prefix to reconstruct, so report a clear client error.
+     */
     bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
     bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix, int *tokens_appended, char *err, size_t errlen);
     bool continue_after_invalid_dsml(session_slot *sl, const request *r, const thinking_state *thinking, const char *detail, int *tokens_appended, char *err, size_t errlen);
+    /** Execute one server-side web_search round: run the query against the
+     * configured SearXNG backend, surface the result to the client as
+     * server_tool_use/web_search_tool_result content, splice the result text into
+     * the live session as an ordinary tool_result turn, and re-enter decode within
+     * the same request.  Returns false when this call is not server-executed (or
+     * the splice failed) — the caller then finishes the turn as a normal
+     * client-visible tool_use.
+     */
     bool gen_web_search_round(session_slot *sl, const tool_calls *calls, const char *pre_content, const char *pre_reasoning);
     void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
     void remember_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content);
+    /** Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
+     * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
+     * remember the exact bytes the NEXT request will render for this turn as a visible
+     * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
+     * next request byte-matches the key and continues from live KV — no rewrite, no
+     * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
+     * same visible transcript on disk (kv_cache_store_current).
+     * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
+     * for a tool-context turn (prompt_render.cpp: `tool_context || i > last_user_idx`),
+     * because agentic clients (opencode et al.) replay reasoning_content verbatim so
+     * the model keeps its chain of thought across tool rounds.  So the key MUST carry
+     * the reasoning too — an earlier version dropped it (<think></think>), which byte-
+     * diverges from every reasoning-preserving replay at the first reasoning byte and
+     * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
+     * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
+     * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
+     * for non-tool-context requests (should_remember_thinking_checkpoint bails when
+     * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay.
+     */
     void remember_tool_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    /** After a successful tool-call finish, make the live checkpoint match what the
+     * next request will render.  Usually that is just the exact DSML remembered by
+     * tool id.  If a client sends a tool call without an id we know, the fallback
+     * renderer still builds valid DSML from JSON, and this function either rewrites
+     * the short suffix in place or reloads an older disk checkpoint before replay.
+     */
     void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    /** Shared failure epilogue for both prefill phases (the old duplicated blocks
+     * after each pulsar_session_sync failure). Token vectors and the disk path are
+     * freed centrally by gen_state_free.
+     */
     void gen_prefill_fail(session_slot *sl);
+    /** Resolve the prompt against every cache layer and decide the prefill plan.
+     * Clients resend full prompts as text.  The worker first tries the old exact
+     * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
+     * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
+     * hits we build a fresh effective prompt from the checkpoint's exact token
+     * history plus a newly tokenized string suffix; the canonical full-prompt
+     * tokens are not sliced because BPE may merge across the byte boundary.  Cold
+     * prompt caching is handled before generation: if the stable checkpoint is
+     * shorter than the full prompt, we prefill to that boundary, store it, and
+     * immediately continue to the real prompt.  The live graph therefore always
+     * moves forward.
+     */
     void gen_begin(session_slot *sl);
+    /** One prefill quantum: (re-)issue the sync toward the phase's target; the
+     * cancel callback stops it after one completed chunk and the checkpoint
+     * carries the progress to the next quantum.
+     */
     void gen_step_prefill(session_slot *sl);
+    /** Runs once, in the same quantum that completed the main prefill: clear stale
+     * live bindings, persist checkpoints, emit response identity, and start the
+     * protocol stream projections that persist across all decode quanta.
+     */
     void gen_stream_begin(session_slot *sl);
+    /** (Re)initialize a decode attempt: the body of the old decode_again label.
+     * Runs both for a fresh request and after a tool-error recovery appended a
+     * model-visible correction to the live session.
+     */
     void gen_decode_init(session_slot *sl);
+    /** Emit one already-decoded token into the response stream: append it to the
+     * accumulated text, feed the thinking/DSML trackers, run stop-string and
+     * tool-marker detection, and drive every active protocol stream projection
+     * (plain SSE / OpenAI / Anthropic / Responses). Returns true when the decode
+     * loop must STOP after this token (EOS, a stop string, a completed tool_calls
+     * block, or a client write error), with g->finish (and g->err on error) set.
+     * Factored out of the classic decode loop's per-token inner loop (Tier-2 Step 5)
+     * so every driver shares ONE emit path: the classic spec/plain decode loop
+     * below AND the batched multi-session lanes (which sample each live bank's
+     * row on the host, then call this to stream that bank's slot). It touches
+     * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
+     * call except pulsar_token_text. That host-only property is what makes the
+     * L116 tool admission to the batched lanes sound: all tool-marker tracking,
+     * thinking-recovery, and stop handling here runs identically in every lane.
+     * Behavior for the single-session path is byte-identical to the
+     * pre-factoring inner loop.
+     */
     bool gen_emit_token(session_slot *sl, int token);
+    /** Post-decode epilogue: tool repair/recovery, final parse, protocol live
+     * state, checkpoints, the final response, and logging. Recovery paths loop
+     * back to GEN_DECODE_INIT (the old goto decode_again).
+     */
     void gen_step_finish(session_slot *sl);
     void gen_state_free(session_slot *sl);
+    /** Bind a dequeued job to the slot and resolve its prompt (the first quantum). */
     void generate_job_begin(session_slot *sl, job *j);
+    /** Advance the job by one quantum. */
     void generate_job_step(session_slot *sl);
+    /** Unbind: drain deferred client bytes, free the resumable state. */
     void generate_job_end(session_slot *sl);
     void thinking_live_clear(session_slot *sl);
     void thinking_live_remember(session_slot *sl, const char *visible_text);
@@ -1321,6 +1489,10 @@ struct server {
     bool anthropic_live_has_call_id(const char *id);
     bool responses_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
     bool anthropic_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
+    /** Scheduler routing (worker thread): find the slot whose live binding holds
+     * ALL of the request's continuation ids at that slot's current frontier, so
+     * the job can be bound to the session that owns its conversation.
+     */
     session_slot * live_slot_for_ids(const stop_list *ids, bool anthropic);
     session_slot * responses_live_slot_for_ids(const stop_list *ids);
     session_slot * anthropic_live_slot_for_ids(const stop_list *ids);
@@ -1338,38 +1510,237 @@ struct server {
     bool enqueue(job *j);
     void close_resources();
     bool bank_switch(int bank);
+    /** Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
+     * always protected (a sibling still matches it); LRU-superseded victims go
+     * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
+     * body (snapshot + ledger release + bank reset). Worker thread only; returns
+     * true when a bank was freed.
+     */
     bool fork_make_room(const session_slot *trunk, bool superseded_only = false);
     bool bank_restore_spilled(int bank);
+    /** plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
+     * committed history is a token-prefix of ANOTHER live bank's history (a sibling
+     * that already extends past it) — its KV is redundant, so evicting it loses the
+     * least. Returns such a slot's index (the least-recently-served among them), or
+     * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
+     * host-carry reads routing already uses on idle banks; no CUDA, no install).
+     */
     int pick_superseded_idle(const bool *protect);
+    /** Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
+     * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical.
+     */
     bool spill_bank(session_slot *victim);
+    /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
+     * set, no active job, not already spilled. -1 if none.
+     */
     int guard_pick_victim(session_slot **dec, int n);
     void guard_maybe_evict(session_slot **dec, int n);
+    /** Publish the /metrics snapshots — per-slot KV position/context and the
+     * engine spec-decode counters — into plain server fields under mu. Client
+     * threads must never call into the engine (CUDA-state audit,
+     * pulsar_server_internal.h), so the worker exports these at startup (cli_main,
+     * before the worker thread runs), after binds, and once per quantum;
+     * send_metrics reads only the snapshots. Host-int copies, no GPU work.
+     */
     void publish_metrics_snapshot();
+    /** Fold one finished request's timings into the /metrics histograms. Called by
+     * the worker from generate_job_end, where req_timings has just been computed;
+     * this only reads that struct, so it adds no hot-path work.
+     */
     void observe_request_timings(const req_timings *t, double e2e_s);
+    /** Record why the head job could not be bound. Counted once per job, not once
+     * per bind attempt: the worker retries the head every quantum, so counting
+     * each attempt would turn one stuck request into thousands of "refusals". The
+     * companion gauge reports the reason the queue is blocked right now.
+     */
     void note_provision_refusal(job *j, provision_refusal refusal);
+    /** Bump a /metrics counter under mu. Worker-thread callers only; the lock is
+     * what keeps the value coherent for send_metrics reading on a client thread.
+     * Never called with mu already held — the mutex is not recursive.
+     */
     void count_metric(uint64_t *counter);
+    /** Parse-time id lookups run on client threads before the request is bound to
+     * a slot, so they scan every provisioned slot's live binding. n_slots is
+     * published under mu (its owning lock) — take mu for the snapshot rather than
+     * asserting cross-lock visibility. A momentarily stale snapshot would only
+     * miss a slot provisioned this instant, whose bindings are still empty.
+     */
     int n_slots_snapshot();
+    /** Mark slots some QUEUED live-tool-state continuation still needs: that KV
+     * frontier exists only on its owner slot, so evicting it would turn the
+     * queued job into a 409 the moment it binds. The queue is snapshotted under
+     * mu; the job pointers stay valid afterwards because only this worker pops
+     * jobs and each client thread blocks on its job condvar until then. The
+     * owner lookups (tool_mu + session pos) run after mu is released — the two
+     * locks are never nested.
+     */
     void worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]);
+    /** Soft eviction protection: OR into protect[] every bank that is some QUEUED
+     * job's best USABLE warm match. Without this the fresh-path domino recurs:
+     * job A's eviction lands on job B's warm trunk, and B — often the very next
+     * bind — cold-replays its whole history. "Usable" is the operative word: a
+     * match whose partial cut the raw ring has scrolled past (a compacted client)
+     * is dead warmth and stays evictable — protecting it would evict live warmth
+     * in its stead. Best-effort by contract: callers retry without this overlay
+     * when it leaves no victim, so binding always progresses. Worker thread only
+     * (slot_common_prefix reads engine host carries).
+     */
     void worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]);
+    /** Pointless-eviction guard #2: evicting is only worth its cost if releasing
+     * idle sessions can actually admit the provisioning the head job needs.
+     * If even reclaiming EVERY unprotected idle slot leaves admission refusing,
+     * skip eviction entirely — the head is genuinely waiting for a busy slot to
+     * free, and evicting warm idle sessions would only churn snapshots. (Host
+     * arithmetic only: pulsar_engine_session_cost_bytes is the same sizing code the
+     * allocator uses, no CUDA work; runs only on failed bind attempts. Guard #1
+     * is the provisioning-refusal reason check in worker_try_bind.)
+     */
     bool worker_eviction_could_help(const job *j, const bool *protect);
+    /** Evict one idle slot (LRU victim): snapshot to the disk kv cache when
+     * possible, free the session, release the ledger, and leave the slot entry
+     * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
+     * unavailable snapshot only costs the returning client a re-prefill — the
+     * eviction itself proceeds, and the response always belongs to the right
+     * conversation because the freed KV can never be read again. Returns false
+     * when nothing is evictable. Worker thread only.
+     */
     bool worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]);
+    /** Bind the head job to a slot if routing allows it. Strict FIFO: when the
+     * head must wait (its owner slot is busy, or no fitting slot is free), later
+     * jobs wait behind it — simple and starvation-free. Returns true when the
+     * head was consumed: bound to a slot, or failed explicitly (a continuation
+     * that cannot fit its owner slot — see choose_slot_for_job). When the head
+     * cannot be placed cleanly (nothing fits, or only a warm slot it would
+     * clobber), it is not waiting on a busy owner, and the provisioning refusal
+     * is one eviction can relieve (full pool / full ledger — never the
+     * MemAvailable floor, see the increment-4 block above), idle slots are
+     * evicted LRU-first until the head binds without clobbering or eviction
+     * stops helping — then the clobber fallback binds it exactly like the
+     * increment-3 scheduler did.
+     */
     bool worker_try_bind();
+    /** Detach a finished job from its slot and wake its client thread. */
     void worker_finish_slot(session_slot *sl);
     void worker_batched_decode_quantum(session_slot **dec, int n);
+    /** plan-34 inc 6: the SPEC batched quantum. Same skeleton as
+     * worker_batched_decode_quantum, but each sweep runs one speculative ROUND
+     * per bank instead of one token: per bank under its restored state we draw
+     * the base token (carry or fresh), begin the round (guards, frontier
+     * snapshot, checkpoint push), and contribute its rows; ONE decode_mixed
+     * ALL_ROWS forward covers every bank's rows with the drafter capture +
+     * Stage-B saves armed; then per bank round_end walks its slice, rolls state,
+     * redrafts, and we emit the accepted tokens through the same slot machinery
+     * the plain lane uses. Tokens per weight-stream compound: batching x
+     * acceptance ([[L076]]).
+     * Emission mirrors gen_decode's L073 discipline: a mid-emit stop (tool-call
+     * end, stop string) rewinds the ghost tail so the bank's history never
+     * carries tokens the client did not see (pulsar_session_rewind also clears
+     * the pendings/carry, which is exactly right -- they were conditioned on the
+     * ghosts).
+     */
     void worker_spec_batched_quantum(session_slot **dec, int n);
+    /** plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
+     * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
+     * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
+     * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
+     * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
+     * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
+     * when the flag is off, not in pool mode, or nothing qualifies.
+     */
     session_slot * worker_find_fuse_prefill();
+    /** plan-34 phase-2 inc 5 — FUSED mixed-batch quantum. One decode quantum whose EVERY
+     * step folds a small (s->mixed_chunk_tokens) prefill run for `pf` into the SAME
+     * pulsar_session_decode_mixed sweep as the decode banks (true continuous batching,
+     * P=1). Decode banks advance exactly as worker_batched_decode_quantum — the inc-4
+     * neutrality gate proves a co-scheduled prefill does not perturb them — so their
+     * per-request output is unchanged in shape. The prefill advances up to
+     * QUANTUM*chunk tokens, SPREAD uniformly across the steps so no single decode step
+     * eats a whole chunk (the p99 lever vs the time-slice's per-interval decode stall).
+     * pf's FIRST chunk (pos 0) and FINAL tail (<= chunk) stay CLASSIC: the tail's
+     * pulsar_session_sync carries the prefill->decode completion (kv-cache store,
+     * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
+     * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
+     * note_committed_tokens).
+     */
     void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
+    /** Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
+     * the whole n-bank pool was allocated and admitted ONCE at startup, so this is
+     * pure host bookkeeping — find a free bank slot, install it, reset it to an
+     * empty conversation (so gen_begin sees pos 0 / no stale prefix), and charge
+     * the even-split per-bank marginal to the ledger. The only runtime pressure is
+     * the demand-paged comp/index pages a bank touches as it fills; the belt-and-
+     * suspenders MemAvailable floor still guards each provision. Returns NULL with
+     * *refusal set on a full pool or a tight box (never on a create/admission
+     * failure — there is no runtime create).
+     */
     session_slot * provision_bank(provision_refusal *refusal);
     session_slot * provision_slot(int ctx, provision_refusal *refusal);
+    /** Route the job to a slot. Preferences, in order:
+     * 1. A live-tool-state continuation binds to the slot that owns its call
+     * ids (waiting for it if busy — running it elsewhere could only 409).
+     * A continuation whose prompt cannot fit its owner slot's context can
+     * never run: it must not run elsewhere (the live tool state exists only
+     * on the owner), and leaving it queued would wedge the FIFO forever
+     * behind an unbindable head — so it is failed explicitly through
+     * *reject_ctx with the same context_length_exceeded client error the
+     * front door sends (http_server.cpp / request_exceeds_context; the front
+     * door checks against slot 0's ctx and cannot see the owner's smaller
+     * one).
+     * 2. A free fitting slot whose live thinking binding byte-matches the
+     * request's visible transcript is that conversation's warm continuation
+     * and wins outright (thinking_live_binds_prompt): for thinking chats
+     * the client replays visible content while the slot's frontier holds
+     * the hidden reasoning, so the token common prefix understates
+     * relatedness and must not out-vote the binding.
+     * 3. Among free slots with enough context, the longest common token prefix
+     * wins, keeping a client's follow-ups on their warm KV.
+     * 4. A job whose best token match is TRIVIAL — header-deep only, against a
+     * slot holding meaningful warm state past the match
+     * (server_slot_match_is_trivial) — prefers a fresh lazily provisioned
+     * slot over clobbering that conversation (budget permitting); with the
+     * pool exhausted it falls back to the warmest free slot exactly like
+     * the single-session server did. (Through v0.2.0 this gate required
+     * common == 0, which rendered chat traffic can never produce — every
+     * rendered prompt shares the template header, measured 4–9 common
+     * tokens across distinct conversations — so sequential conversations
+     * always clobbered slot 0 and the pool never provisioned; task #24
+     * bounce repro, fixed in task #30.)
+     * Returns NULL when the job must wait for a slot to free — except when
+     * *reject_ctx is set nonzero (the owner slot's ctx_size), which means the
+     * job can never run and must be failed, not left queued. *waiting_owner is
+     * set when the NULL means "the continuation's owner slot is busy": eviction
+     * cannot help that job, only the owner finishing can. *clobbers is set when
+     * the returned slot would overwrite another conversation's warm KV — the
+     * caller may prefer evict(LRU)+provision over that (increment 4). *refusal
+     * reports why a fresh provisioning was refused (PROVISION_OK when none was
+     * attempted or it succeeded) so the eviction path can act only on refusals
+     * eviction relieves.
+     */
     session_slot * choose_slot_for_job(job *j, int *reject_ctx, bool *waiting_owner, bool *clobbers, provision_refusal *refusal);
-    /* const readers (take a const server *s in the C predecessor). */
+    /** const readers (take a const server *s in the C predecessor). */
     bool should_canonicalize_tool_checkpoint(const tool_calls *calls) const;
     int slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    /** L115: the one prefix-reuse question, asked of a slot.  Callers that need
+     * the request-side count (accounting, prefill bounds) read `prompt_cut`;
+     * callers that need KV rows or a cut point read `live_cut`.  Across a seam
+     * these differ, and keeping them in one struct is what stops a live-side
+     * count from being used to index the request array.
+     */
     void slot_prefix_match(const session_slot *sl, const pulsar_tokens *prompt,
                            pulsar_prefix_match *out) const;
+    /** Context a request needs from a slot: prompt plus generation budget (plus a
+     * small allowance for tool-error recovery injections), capped at the largest
+     * (startup) slot so every request can always run on slot 0.
+     */
     int job_needed_ctx(const job *j) const;
     int slot_frontier_pos(const session_slot *sl) const;
+    /** Context a lazily provisioned slot would be created with for this job: the
+     * secondary-slot default, raised to the job's need, capped at slot 0's ctx.
+     * Shared by the provisioning path and the eviction could-it-help precheck so
+     * they price the same session shape.
+     */
     int provision_ctx_for_job(const job *j) const;
+    /** @} */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -1379,7 +1750,7 @@ struct job {
     int fd;
     request req;
     bool done;
-    /* Set (under mu) by the client thread when its socket dies while the job
+    /** Set (under mu) by the client thread when its socket dies while the job
      * is still queued; the worker reaps the job pre-bind. The client thread
      * NEVER unlinks or frees — it stays parked on cv until the worker
      * signals done, preserving the worker-only pop/free invariant the
@@ -1388,7 +1759,7 @@ struct job {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
-    /* Which provisioning refusal this job has already been counted against, so
+    /** Which provisioning refusal this job has already been counted against, so
      * the /metrics counter records jobs blocked rather than bind retries (the
      * worker re-attempts the head every quantum). PROVISION_OK = not counted;
      * jobs are memset to zero at creation, so that is the natural initial
@@ -1418,7 +1789,7 @@ typedef struct trace_cache_diag {
 
 typedef struct server_prefill_progress {
     server *srv;
-    session_slot *slot; /* slot whose session is prefilling (worker thread) */
+    session_slot *slot;  ///< slot whose session is prefilling (worker thread)
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
@@ -1430,7 +1801,7 @@ typedef struct server_prefill_progress {
     double last_t;
     int last_current;
     bool seen;
-    /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
+    /** SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
      * idle timeouts on the client side don't close the connection while the
      * server is busy doing prefill. */
@@ -1443,10 +1814,10 @@ typedef struct server_prefill_progress {
 
 typedef struct thinking_state {
     bool inside;
-    char tail[8]; /* Long enough for "</think>". */
+    char tail[8];  ///< Long enough for "</think>".
     int tail_len;
-    bool tail_ends_with(const char *s) const;   /* was thinking_tail_ends_with */
-    void feed(const char *p, size_t len);        /* was thinking_state_feed */
+    bool tail_ends_with(const char *s) const;  ///< was thinking_tail_ends_with
+    void feed(const char *p, size_t len);  ///< was thinking_state_feed
 } thinking_state;
 
 /* Resumable per-job generation state machine (moved verbatim from
@@ -1467,10 +1838,10 @@ struct gen_state {
     job *j;
     gen_phase phase;
 
-    /* prompt/cache resolution (owned by gen_begin, read by later phases) */
+    /** prompt/cache resolution (owned by gen_begin, read by later phases) */
     char err[160];
     pulsar_tokens effective_prompt;
-    const pulsar_tokens *prompt_for_sync; /* &j->req.prompt or &effective_prompt */
+    const pulsar_tokens *prompt_for_sync;  ///< &j->req.prompt or &effective_prompt
     bool responses_protocol;
     bool responses_live_continuation;
     bool anthropic_live_continuation;
@@ -1478,29 +1849,23 @@ struct gen_state {
     char *disk_cache_path;
     int prompt_tokens;
     double t0;
-    double first_token_t;  /* wall time the first output token was produced (TTFT);
-                            * 0 until set. Request-lifetime: survives decode_again
-                            * so it reflects the genuinely first token emitted. */
+    double first_token_t;  ///< wall time the first output token was produced (TTFT); 0 until set. Request-lifetime: survives decode_again so it reflects the genuinely first token emitted.
     uint64_t trace_id;
     char ctx_span[48];
     char req_flags[64];
-    server_prefill_progress progress; /* stable address: callback userdata */
+    server_prefill_progress progress;  ///< stable address: callback userdata
     int cold_store_len;
-    bool cold_store_is_anchor; /* cold_store_len is a chat_anchor_pos preamble
-                                * cut (shared system prompt + tools, before the
-                                * task message) -> stored as "sys-prefix" so
-                                * eviction keeps the one file every new
-                                * conversation can text-prefix restore from */
+    bool cold_store_is_anchor;  ///< cold_store_len is a chat_anchor_pos preamble cut (shared system prompt + tools, before the task message) -> stored as "sys-prefix" so eviction keeps the one file every new conversation can text-prefix restore from
     int suppressed_continued_last;
     pulsar_tokens cold_prefix;
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
-    uint32_t prefill_min_suffix; /* 0 = interrupting is never exact */
-    int prefill_chunks_done;     /* chunks completed in the current sync call */
+    uint32_t prefill_min_suffix;  ///< 0 = interrupting is never exact
+    int prefill_chunks_done;  ///< chunks completed in the current sync call
     int prefill_last_current;
     int prefill_total;
 
-    /* response identity + per-protocol stream projections; these live across
+    /** response identity + per-protocol stream projections; these live across
      * quanta AND across decode_again recovery attempts */
     char id[96];
     bool structured_stream;
@@ -1511,7 +1876,7 @@ struct gen_state {
     bool responses_live_chat;
     long responses_created_at;
     bool dsml_recovery_attempted;
-    /* Server-executed web_search state (request lifetime).  completion_total
+    /** Server-executed web_search state (request lifetime).  completion_total
      * accumulates tokens across decode attempts so continued generations spend
      * one shared max_tokens budget; web_rounds_json holds prebuilt Anthropic
      * content blocks (thinking/text/server_tool_use/web_search_tool_result,
@@ -1521,9 +1886,9 @@ struct gen_state {
     buf web_rounds_json;
     uint64_t rng;
 
-    /* decode attempt state (reset by GEN_DECODE_INIT) */
+    /** decode attempt state (reset by GEN_DECODE_INIT) */
     buf text;
-    logprob_ledger logprobs;   /* per-token target distributions; see the type */
+    logprob_ledger logprobs;  ///< per-token target distributions; see the type
     size_t plain_stream_pos;
     size_t stop_scan_from;
     const char *finish;
@@ -1543,10 +1908,10 @@ struct gen_state {
      * response reported impossible values (tokens/step 27.4). Filled where
      * the truth lives: the lane knows each round's drafted rows and
      * committed tokens for exactly this slot. */
-    uint64_t req_spec_draft;    /* draft tokens proposed+verified, this request */
-    uint64_t req_spec_accepted; /* draft tokens accepted, this request */
-    uint64_t req_spec_rounds;   /* spec rounds (incl. base-only quenched), this request */
-    uint64_t req_spec_gen;      /* tokens emitted by spec rounds, this request */
+    uint64_t req_spec_draft;  ///< draft tokens proposed+verified, this request
+    uint64_t req_spec_accepted;  ///< draft tokens accepted, this request
+    uint64_t req_spec_rounds;  ///< spec rounds (incl. base-only quenched), this request
+    uint64_t req_spec_gen;  ///< tokens emitted by spec rounds, this request
     double last_decode_log_t;
     int last_decode_log_completion;
     thinking_state thinking;
@@ -1556,7 +1921,7 @@ struct gen_state {
     bool dspark_spec_enabled;
     dsml_decode_tracker dsml_tracker;
 
-    /* Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
+    /** Tier-2 batched-decode lane state (worker_batched_decode_quantum). A slot
      * becomes batch_active when it joins the shared multiseq lane; it stays
      * there until it finishes (no mid-conversation batched->classic switch, so
      * no stale-logits hazard). batch_feed_token is the next token to commit at
@@ -1569,12 +1934,12 @@ struct gen_state {
     int  batch_feed_token;
     int  batch_feed_pos;
     pulsar_tokens batch_pending;
-    /* plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
+    /** plan-34 inc 5: this prefill slot is not fusable (a fused step rejected its
      * run as not-position-true, e.g. a cache-warm resume); route it CLASSIC. Set
      * once by the fused quantum on giveup; the classic path handles it correctly. */
     bool no_fuse;
 
-    /* deferred, non-blocking client writes (installed for send_all) */
+    /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;
 };
 
@@ -1606,7 +1971,7 @@ typedef struct {
     bool kv_disk_disable;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
-    /* Base URL of the SearXNG-compatible backend for the Anthropic web_search
+    /** Base URL of the SearXNG-compatible backend for the Anthropic web_search
      * server tool (e.g. http://searxng.defense.lan:8888). NULL disables the
      * feature: web_search tool entries are then dropped at parse so the model
      * never emits un-executable calls. */
@@ -1627,7 +1992,7 @@ void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
-void pulsar_die(const char *msg); /* engine util.cpp; aborts the process */
+void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
