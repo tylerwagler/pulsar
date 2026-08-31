@@ -49,10 +49,13 @@ static void show(pulsar_session *s, const char *when, int pos) {
     pulsar_gpu_graph *g = &s->graph;
     const uint32_t il = 2;
     const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    printf("%-34s pos=%-5d want=%-5u scalar_n_comp=%-5u ms_n_comp[0]=%-5u%s\n",
-           when, pos, ratio ? (uint32_t)pos / ratio : 0u,
-           g->layer_n_comp[il], g->ms_n_comp[0][il],
-           (ratio && g->ms_n_comp[0][il] != (uint32_t)pos / ratio) ? "   <-- per-bank DIVERGED" : "");
+    /* ONE storage since the stage-1b collapse: the accessor and ms_n_comp[0]
+     * are the same memory, so printing both would be theatre. Print the value
+     * and whether it matches the position. */
+    const uint32_t have = gpu_graph_n_comp(g, il);
+    printf("%-34s pos=%-5d want=%-5u n_comp=%-5u%s\n",
+           when, pos, ratio ? (uint32_t)pos / ratio : 0u, have,
+           (ratio && have != (uint32_t)pos / ratio) ? "   <-- NOT position-true" : "");
 }
 
 int main(int argc, char **argv) {
@@ -110,15 +113,18 @@ int main(int argc, char **argv) {
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t want = (uint32_t)target / ratio;
-            CHECK(g->layer_n_comp[il] == want,
-                  "layer %u scalar n_comp %u want %u", il, g->layer_n_comp[il], want);
-            CHECK(g->ms_n_comp[b][il] == want,
-                  "layer %u PER-BANK ms_n_comp[%u] %u want %u (L120's other half)",
-                  il, b, g->ms_n_comp[b][il], want);
+            /* Since stage 1b there is ONE frontier, so the old "both copies
+             * agree" assertion is tautological and has been dropped rather
+             * than left as decoration. What still has teeth is that the rewind
+             * CLAMPED it: that is the L120 half which is live on every path,
+             * and the L133 divergence is now unrepresentable by construction. */
+            CHECK(gpu_graph_n_comp(g, il) == want,
+                  "layer %u n_comp %u want %u (bank %u)",
+                  il, gpu_graph_n_comp(g, il), want, b);
             if (ratio == 4) {
-                CHECK(g->ms_n_index_comp[b][il] == want,
-                      "layer %u PER-BANK ms_n_index_comp[%u] %u want %u",
-                      il, b, g->ms_n_index_comp[b][il], want);
+                CHECK(gpu_graph_n_index_comp(g, il) == want,
+                      "layer %u n_index_comp %u want %u (bank %u)",
+                      il, gpu_graph_n_index_comp(g, il), want, b);
             }
         }
     }

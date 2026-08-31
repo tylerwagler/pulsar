@@ -461,9 +461,9 @@ static void check_superset(pulsar_gpu_graph *g, const char *what) {
         uint32_t mx = 0;
         for (uint32_t b = 0; b < gpu_graph_bank_pool_count(g); b++)
             if (g->ms_n_comp[b][il] > mx) mx = g->ms_n_comp[b][il];
-        CHECK(g->layer_n_comp[il] == mx,
+        CHECK(gpu_graph_n_comp(g, il) == mx,
               "%s: layer %u superset %u != max(banks) %u", what, il,
-              g->layer_n_comp[il], mx);
+              gpu_graph_n_comp(g, il), mx);
     }
 }
 
