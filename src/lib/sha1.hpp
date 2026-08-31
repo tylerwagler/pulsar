@@ -10,10 +10,22 @@
 
 namespace pulsar {
 
+/** Streaming SHA-1.
+ *
+ * @warning NOT for security. SHA-1 is collision-broken; this exists to give
+ * checkpoints content-addressed names, where an adversary is not part of the
+ * threat model. Do not reach for it as a general hash.
+ *
+ * Usage is the standard three-step: update() any number of times, then final()
+ * once. final() consumes the state (it appends the padding through update()),
+ * so a subsequent update() without reset() would continue a finished digest.
+ */
 class Sha1 {
 public:
+    /** Construct ready to hash; equivalent to a fresh reset(). */
     Sha1() { reset(); }
 
+    /** Return to the initial state so the object can hash a new message. */
     void reset() {
         h_[0] = 0x67452301u;
         h_[1] = 0xefcdab89u;
@@ -24,6 +36,8 @@ public:
         used_ = 0;
     }
 
+    /** Absorb `len` bytes. Buffers a partial 64-byte block internally, so
+     * callers may feed arbitrary chunk sizes. */
     void update(const void *ptr, size_t len) {
         const uint8_t *p = static_cast<const uint8_t *>(ptr);
         bytes_ += len;
@@ -41,6 +55,8 @@ public:
         }
     }
 
+    /** Append the padding and length, and write the 20-byte digest to `out`.
+     * Consumes the state -- call reset() before reusing the object. */
     void final(uint8_t out[20]) {
         uint64_t bits = bytes_ * 8;
         uint8_t one = 0x80;
@@ -67,6 +83,7 @@ public:
         hex20(digest, out);
     }
 
+    /** Render a 20-byte digest as 40 lowercase hex chars + NUL. */
     static void hex20(const uint8_t in[20], char out[41]) {
         static const char hex[] = "0123456789abcdef";
         for (int i = 0; i < 20; i++) {
@@ -77,10 +94,12 @@ public:
     }
 
 private:
+    /** 32-bit left rotate. */
     static uint32_t rol32(uint32_t v, int n) {
         return (v << n) | (v >> (32 - n));
     }
 
+    /** Mix one 64-byte block into the running state. */
     void transform(const uint8_t block[64]) {
         uint32_t w[80];
         for (int i = 0; i < 16; i++) {
@@ -123,10 +142,10 @@ private:
         h_[4] += e;
     }
 
-    uint32_t h_[5];
-    uint64_t bytes_;
-    uint8_t block_[64];
-    size_t used_;
+    uint32_t h_[5];       ///< running chaining state
+    uint64_t bytes_;      ///< total message length; the length field final() appends
+    uint8_t block_[64];   ///< partial block buffered between update() calls
+    size_t used_;         ///< bytes buffered in block_
 };
 
 } // namespace pulsar

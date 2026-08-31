@@ -1037,14 +1037,16 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s) {
  * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
  * the batched lane), and round_end (walk, state, emit, redraft). */
 typedef struct pulsar_spec_round {
-    uint32_t K;
-    uint32_t n_batch;
-    int saved_len;
-    bool pend_sampled;
-    int32_t pend[16];
-    int32_t pend_alt[16];
-    float pend_conf[16];
-    int row_tops[16];
+    uint32_t K;             ///< draft depth this round: tokens the drafter proposed
+    uint32_t n_batch;       ///< rows the verify forward evaluates (K + the base row)
+    int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
+    bool pend_sampled;      ///< the pendings below were sampled rather than left from a prior round
+    int32_t pend[16];       ///< the drafted token ids, in draft order
+    int32_t pend_alt[16];   ///< runner-up per draft position, for the DTree branch
+    float pend_conf[16];    ///< confidence head's score per draft position
+    int row_tops[16];       ///< the target's argmax per verify row; the accept comparison
+    /** Frontier snapshot taken before the drafter touched anything, so a
+     * partial accept can roll every layer's compressed state back exactly. */
     pulsar_spec_frontier frontier;
 } pulsar_spec_round;
 
@@ -1680,10 +1682,14 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank,
     return r->n_batch;
 }
 
-/* Row source over the server-held ALL_ROWS logits block. */
+/** Row source over the server-held ALL_ROWS logits block.
+ *
+ * The batched lane runs one spec round per bank around ONE shared forward, so
+ * a round reads its rows out of the shared block at an offset rather than
+ * owning a logits buffer of its own. */
 typedef struct {
-    const float *rows;
-    uint32_t row0;
+    const float *rows;  ///< borrowed: the shared ALL_ROWS logits block
+    uint32_t row0;      ///< first row belonging to this round
 } spec_block_rows;
 
 static bool spec_row_read_block(void *ud, uint32_t row, float *out) {
