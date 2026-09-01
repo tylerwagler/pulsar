@@ -890,7 +890,7 @@ static int indexer_scores_launch(
         if (!announced) {
             announced = 1;
             fprintf(stderr, "pulsar: indexer scorer = block-scaled MXFP4 tier "
-                            "(Q quantised to E4M3)\n");
+                            "(packed E2M1 Q, consumed natively)\n");
         }
         return pulsar_gpu_indexer_scores_mxfp4(
                 (float *)scores->ptr, (const pulsar_mxkv_pack_t *)q->ptr,
