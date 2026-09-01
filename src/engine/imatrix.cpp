@@ -1089,6 +1089,20 @@ int gpu_graph_decode_multiseq_batch(
      * write we do not make. */
     /* inc 3: heap the row-indexed token copy (was [PULSAR_MSEQ_MAX]) so a K-row
      * prefill chunk fits. n_active <= prefill_cap. */
+    /* Decode phase timing (PULSAR_MSEQ_PROFILE).  Read ONCE into a static:
+     * this runs per decode step, so a getenv here would be a per-step libc
+     * lookup for a switch that cannot change after start.  Every now_sec()
+     * below is behind the flag, so an unset build makes no clock calls.
+     *
+     * Exists because the batched lane had NO encode/execute split while the
+     * old single-token encoder did, which meant the two could only ever be
+     * compared by inference.  That cost two wrong root-cause hypotheses (L131).
+     * When decode looks slow, this is the first thing to run. */
+    static int ms_prof_env = -1;
+    if (ms_prof_env < 0) ms_prof_env = getenv("PULSAR_MSEQ_PROFILE") ? 1 : 0;
+    const bool ms_prof = ms_prof_env == 1;
+    const double t_enter = ms_prof ? now_sec() : 0.0;
+
     int *cur_tokens = (int *)xmalloc((size_t)n_active * sizeof(int));
     memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
     token_vec cur;
@@ -1107,7 +1121,9 @@ int gpu_graph_decode_multiseq_batch(
 
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
+    const double t_gathered = ms_prof ? now_sec() : 0.0;
     if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur)) return 0;
+    const double t_armed = ms_prof ? now_sec() : 0.0;
 
     /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
      * A K-row prefill run advances the KV by K but only its last row's logits
@@ -1155,6 +1171,12 @@ int gpu_graph_decode_multiseq_batch(
         ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
                                           (uint32_t)pos[0], n_active);
     }
+    /* HOST time to encode all PULSAR_N_LAYER layers. On a single-stream
+     * drafter-off decode this is the LARGER half of the step (measured
+     * 2026-09-01: ~32 ms encode against ~25 ms of GPU). Under the served
+     * config -- several banks, drafter on -- the GPU is 95-97% busy and this
+     * is hidden. See the decode-is-host-encode-bound note. */
+    const double t_layers_encoded = ms_prof ? now_sec() : 0.0;
     if (head_single_block) {
         /* Hot path: the emitted runs are the leading identity rows [0,head_runs)
          * (all length-1) — head in the SAME block, no gather, no extra synchronize.
@@ -1186,6 +1208,7 @@ int gpu_graph_decode_multiseq_batch(
     /* Disarm + per-bank frontier self-check even when the sweep failed. The
      * step_end check covers EVERY bank (incl. a prefill run whose head we skipped),
      * so a skipped-head run's KV frontier is still validated. */
+    const double t_executed = ms_prof ? now_sec() : 0.0;
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
 
@@ -1195,6 +1218,19 @@ int gpu_graph_decode_multiseq_batch(
     if (out_n_rows) *out_n_rows = head_runs;
     ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
                              (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+    if (ms_prof) {
+        const double t_done = now_sec();
+        fprintf(stderr,
+                "pulsar: mseq step n=%u rows=%u  gather=%.3f arm=%.3f "
+                "encode=%.3f exec=%.3f read=%.3f  total=%.3f ms\n",
+                n_active, head_runs,
+                (t_gathered - t_enter) * 1000.0,
+                (t_armed - t_gathered) * 1000.0,
+                (t_layers_encoded - t_armed) * 1000.0,
+                (t_executed - t_layers_encoded) * 1000.0,
+                (t_done - t_executed) * 1000.0,
+                (t_done - t_enter) * 1000.0);
+    }
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
      * which desynchronizes its sampling from the committed KV — treat as

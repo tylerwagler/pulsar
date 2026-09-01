@@ -954,6 +954,9 @@ tests/rewind_frontier_gate.o: tests/rewind_frontier_gate.cpp src/engine/pulsar_e
 tests/mseq_rewind_probe.o: tests/mseq_rewind_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mseq_rewind_probe.cpp
 
+tests/resume_suffix_probe.o: tests/resume_suffix_probe.cpp src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/resume_suffix_probe.cpp
+
 tests/token_seam_gate.o: tests/token_seam_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/token_seam_gate.cpp
 
@@ -1034,6 +1037,9 @@ tests/rewind_frontier_gate: tests/rewind_frontier_gate.o src/lib/pulsar_help.o $
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/mseq_rewind_probe: tests/mseq_rewind_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/resume_suffix_probe: tests/resume_suffix_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/token_seam_gate: tests/token_seam_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
