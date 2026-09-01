@@ -1189,11 +1189,9 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
                  pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
         }
-        /* DEAD as written and now provably so: the zero_prefix arm below
-         * reassigns n_comp from n_tokens before any use, and the else arm
-         * uses its own per-bank locals. Declared without a frontier read so
-         * this cannot look like a batch-wide frontier query -- there is no
-         * such thing during a step that spans banks. */
+        /* The comp bound the attention launch below hands the kernels for
+         * the WHOLE batch. Both arms assign it before that use: zero_prefix
+         * from this chunk's own emit count, the else arm at its tail. */
         uint32_t n_comp = 0u;
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
@@ -1522,7 +1520,30 @@ bool gpu_graph_encode_layer_attention_batch(
                     pulsar_gpu_tensor_free(kv_view);
                 }
             }
-            /* was a refresh of the dead n_comp above; nothing reads it. */
+            /* L139. The attention launch below takes ONE comp bound for the
+             * whole batch: each kernel row derives its visible rows from its
+             * own position and CLAMPS to this (pulsar_cuda_attention.cu names
+             * it "the cross-bank superset clamp"). Classic: the session's
+             * post-emit frontier, as it always was. Banked: the max over the
+             * batch of each row's emit-inclusive bound, (pos+1)/ratio -- the
+             * value step_begin computes as sup[] and step_end asserts every
+             * batched bank reached. Derived from the positions, never read
+             * from a bank's row: stage 1b made this read resolve to cur_bank's
+             * row, and cur_bank is the device VIEW binding, not a batch
+             * member -- with a prefill bank installed it clamped every deeper
+             * decode bank to the prefill bank's depth (mixed-neutrality gate
+             * 4: bank 1 diverged, bank 0 sat below the clamp). The follow-up
+             * that zeroed it as "dead" made the kernels skip compressed
+             * attention outright (n_comp == 0 is "no comp operand"). */
+            if (mseq) {
+                n_comp = 0u;
+                for (uint32_t t = 0; t < n_tokens; t++) {
+                    const uint32_t v = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
+                    if (v > n_comp) n_comp = v;
+                }
+            } else {
+                n_comp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+            }
         }
         PULSAR_CUDA_PROFILE_ATTN_STAGE("compressor");
 

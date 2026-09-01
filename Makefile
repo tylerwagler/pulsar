@@ -398,8 +398,11 @@ seam-check:
 # pulsar-server/pulsar_test process, `sync; echo 3 > /proc/sys/vm/drop_caches`,
 # check `free -g` headroom (the model is ~87 GB).
 FRONTIER_MODEL ?= ./ds4flash.gguf
+# 3 banks, not 2: clause (c) binds the graph's device views to an idle third
+# bank while the two-bank step runs, so a frontier access that resolves
+# through cur_bank has somewhere to land that the step must not touch.
 cuda-frontier-gate: tests/multiseq_frontier_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
 
 # L120 rewind position-truth gate: compressor frontier pair == pos/ratio
 # across ghost-tail rewinds and incremental continuations (see the header of

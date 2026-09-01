@@ -25,9 +25,15 @@
  *   (b) frontier isolation: a bank whose rows close no ratio group keeps its
  *       ms counters AND its cache bytes bit-untouched while its batchmate
  *       emits (checked at ratio 4 in S2 and at ratio 128 + ratio 4 in S3).
- *   (c) the scalar superset equals max over banks after the step and is
- *       written only at step top (structural; step_end re-verifies, and this
- *       gate re-asserts equality against the ms counters).
+ *   (c) frontier containment: the step's frontier writes land ONLY on the
+ *       banks it batched; every other bank's ms counters read back
+ *       bit-identical. The step runs with the graph's device views bound to
+ *       an IDLE third bank (cur_bank), so a frontier access that resolves
+ *       through the view binding instead of the row's bank id lands on a
+ *       bank the step must not touch and fails here (L139). This replaces
+ *       the "scalar superset == max over banks" clause: stage 1b deleted the
+ *       scalar, and asserting the accessor against the max only re-stated
+ *       "cur_bank is the deepest bank", which was never an invariant.
  *
  * Scenarios (S1-S3 keep the increment-2 globally-consecutive shape; S4-S5
  * exercise the increment-3 relaxation — banks at UNRELATED positions, only
@@ -454,16 +460,31 @@ static void check_frontiers(pulsar_gpu_graph *g, uint32_t bank, uint32_t end_pos
     }
 }
 
-static void check_superset(pulsar_gpu_graph *g, const char *what) {
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        uint32_t mx = 0;
-        for (uint32_t b = 0; b < gpu_graph_bank_pool_count(g); b++)
-            if (g->ms_n_comp[b][il] > mx) mx = g->ms_n_comp[b][il];
-        CHECK(gpu_graph_n_comp(g, il) == mx,
-              "%s: layer %u superset %u != max(banks) %u", what, il,
-              gpu_graph_n_comp(g, il), mx);
+/* (c) frontier containment: every pool bank's counters, snapped at step top;
+ * a bank outside the batch must read back bit-identical after the step. */
+typedef struct {
+    uint32_t n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
+    uint32_t n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
+} frontier_snap;
+
+static void frontier_snap_take(const pulsar_gpu_graph *g, frontier_snap *s) {
+    memcpy(s->n_comp, g->ms_n_comp, sizeof(s->n_comp));
+    memcpy(s->n_index_comp, g->ms_n_index_comp, sizeof(s->n_index_comp));
+}
+
+static void check_containment(const pulsar_gpu_graph *g, const frontier_snap *before,
+                              int a_bank, int b_bank, const char *what) {
+    for (uint32_t b = 0; b < gpu_graph_bank_pool_count(g); b++) {
+        if ((int)b == a_bank || (int)b == b_bank) continue;
+        const char *tag = b == gpu_graph_cur_bank(g) ? " (the view-bound bank)" : "";
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            CHECK(g->ms_n_comp[b][il] == before->n_comp[b][il],
+                  "%s: idle bank %u layer %u ms_n_comp %u != %u at step top%s",
+                  what, b, il, g->ms_n_comp[b][il], before->n_comp[b][il], tag);
+            CHECK(g->ms_n_index_comp[b][il] == before->n_index_comp[b][il],
+                  "%s: idle bank %u layer %u ms_n_index_comp %u != %u at step top%s",
+                  what, b, il, g->ms_n_index_comp[b][il], before->n_index_comp[b][il], tag);
+        }
     }
 }
 
@@ -505,6 +526,23 @@ static bool mixed_scenario_order(int a_bank, int a_len, int b_bank, int b_len,
            populate_bank(s, (uint32_t)a_bank, 0, a_len))
         : (populate_bank(s, (uint32_t)a_bank, 0, a_len) &&
            populate_bank(s, (uint32_t)b_bank, 1, b_len));
+    /* (c): bind the device views to an IDLE bank -- neither batched -- so a
+     * frontier access resolving through cur_bank instead of the row's bank id
+     * lands on a bank this step must not touch. Needs a 3-bank pool (the
+     * Makefile target sets it); with 2 the binding stays on whichever bank
+     * populated last, which populate_b_first already swaps. */
+    int idle_bank = -1;
+    if (ok) {
+        for (uint32_t b = 0; b < gpu_graph_bank_pool_count(g); b++)
+            if ((int)b != a_bank && (int)b != b_bank) { idle_bank = (int)b; break; }
+        if (idle_bank >= 0 && !gpu_graph_bank_repoint(g, (uint32_t)idle_bank)) {
+            fprintf(stderr, "%s: repoint to idle bank %d failed\n", what, idle_bank);
+            ok = false;
+        }
+    }
+    frontier_snap fs;
+    memset(&fs, 0, sizeof(fs));
+    if (ok) frontier_snap_take(g, &fs);
     bank_snap a_pre;
     memset(&a_pre, 0, sizeof(a_pre));
     const uint32_t snap_rows = (uint32_t)(a_len / 4 + 3);
@@ -513,7 +551,7 @@ static bool mixed_scenario_order(int a_bank, int a_len, int b_bank, int b_len,
     if (ok) {
         check_frontiers(g, (uint32_t)a_bank, (uint32_t)a_end_pos, what);
         check_frontiers(g, (uint32_t)b_bank, (uint32_t)b_end_pos, what);
-        check_superset(g, what);
+        check_containment(g, &fs, a_bank, b_bank, what);
         if (check_a_untouched)
             check_bank_vs_snap(g, (uint32_t)a_bank, &a_pre, a_row_r4, a_row_r128, what);
         ok = collect_emit_rows(g, (uint32_t)a_bank, a_row_r4, a_row_r128, a_out) &&
@@ -679,7 +717,7 @@ int main(int argc, char **argv) {
     }
 
     /* ---- S4: banks at UNRELATED positions (increment-3 relaxation) ----
-     * Same checks as S1 (frontiers, superset, swap invariance, solo refs)
+     * Same checks as S1 (frontiers, containment, swap invariance, solo refs)
      * but bank A sits ~460 positions behind bank B, so every per-row
      * position-derived stage (RoPE q/kv/indexer-q/inverse, ring slots,
      * visible-comp) computes different values per bank within one step. */
