@@ -229,7 +229,7 @@ help:
 cuda-spark:
 	$(MAKE) -B pulsar-server CUDA_ARCH=sm_120f
 
-pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/rax.o $(CORE_OBJS)
+pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
 # Development tools, not part of the shipped release. The release is just
@@ -906,7 +906,7 @@ src/engine/%.o: src/engine/%.c src/engine/pulsar_engine_internal.h src/pulsar.h 
 src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
-src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/rax.h
+src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/agent/%.o: src/agent/%.cpp src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -921,7 +921,7 @@ src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp
 src/agent/%.o: src/agent/%.c src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
 
-src/server/%.o: src/server/%.c src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/rax.h
+src/server/%.o: src/server/%.c src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/cli/%.o: src/cli/%.c src/pulsar.h src/lib/pulsar_help.h src/vendor/linenoise.h
@@ -930,10 +930,10 @@ src/cli/%.o: src/cli/%.c src/pulsar.h src/lib/pulsar_help.h src/vendor/linenoise
 src/lib/%.o: src/lib/%.c src/pulsar.h $(LIB_HDRS)
 	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
 
-src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h src/vendor/rax.h src/vendor/rax_malloc.h
+src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) -Wno-write-strings -c -o $@ $<
 
-tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/rax.h
+tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -1081,8 +1081,8 @@ tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o
 tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/rax.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)

@@ -12,7 +12,10 @@
 #include "pulsar_gpu.h"
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
-#include "rax.h"
+
+#include <new>
+#include <string>
+#include <unordered_map>
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -881,9 +884,24 @@ struct tool_memory_entry {
  * conversation whose calls have aged out simply replays instead. Guarded by
  * server::tool_mu, since client threads read it.
  */
+/** Exact-match lookup for the two tool-memory indexes.
+ *
+ * These were a vendored radix tree (rax) using five of its twenty-six entry
+ * points -- new, find, insert, remove, free.  Nothing ever iterated, seeked a
+ * prefix or walked a range, which is the entire reason to prefer a radix tree
+ * over a hash map, so three thousand lines were serving as a map.
+ *
+ * Keys are built with an explicit length rather than from a C string, because a
+ * block key is raw dsml bytes; today those bytes come from strlen at the call
+ * site and cannot contain a NUL, but the key type should not be what enforces
+ * that.  Held by POINTER so tool_memory stays trivially memset-able -- its
+ * free() zeroes the whole struct. */
+typedef std::unordered_map<std::string, tool_memory_entry *> tool_memory_id_map;
+typedef std::unordered_map<std::string, tool_memory_block *> tool_memory_block_map;
+
 typedef struct {
-    rax *by_id;                ///< id -> entry
-    rax *by_block;             ///< block bytes -> block, for deduplication
+    tool_memory_id_map    *by_id;     ///< id -> entry
+    tool_memory_block_map *by_block;  ///< block bytes -> block, for deduplication
     tool_memory_entry *head;   ///< most recently used
     tool_memory_entry *tail;   ///< least recently used; the eviction victim
     int entries;               ///< entries live

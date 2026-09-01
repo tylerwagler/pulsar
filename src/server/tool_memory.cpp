@@ -60,8 +60,10 @@ static size_t tool_memory_max_bytes(const tool_memory *m) {
 
 static void tool_memory_init_locked(tool_memory *m) {
     if (m->by_id && m->by_block) return;
-    m->by_id = raxNew();
-    m->by_block = raxNew();
+    /* nothrow, because the established contract here is die() on allocation
+     * failure rather than an exception unwinding out of a locked region. */
+    m->by_id    = new (std::nothrow) tool_memory_id_map();
+    m->by_block = new (std::nothrow) tool_memory_block_map();
     if (!m->by_id || !m->by_block) die("out of memory");
 }
 
@@ -114,8 +116,8 @@ tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         const char *dsml,
                                                         size_t len) {
     if (!m->by_block || !dsml || len == 0) return NULL;
-    void *v = raxFind(m->by_block, (unsigned char *)dsml, len);
-    return v == raxNotFound ? NULL : (tool_memory_block *)v;
+    auto it = m->by_block->find(std::string(dsml, len));
+    return it == m->by_block->end() ? NULL : it->second;
 }
 
 
@@ -131,7 +133,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     b->dsml = xstrndup(dsml, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
-    if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
+    if (!m->by_block->emplace(std::string(b->dsml, b->len), b).second) {
         free(b->dsml);
         free(b);
         die("out of memory");
@@ -145,10 +147,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
 static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *b) {
     if (!b) return;
     if (--b->refs > 0) return;
-    if (m->by_block) {
-        void *old = NULL;
-        (void)raxRemove(m->by_block, (unsigned char *)b->dsml, b->len, &old);
-    }
+    if (m->by_block) m->by_block->erase(std::string(b->dsml, b->len));
     if (m->bytes >= b->bytes) m->bytes -= b->bytes;
     else m->bytes = 0;
     free(b->dsml);
@@ -159,10 +158,7 @@ static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *
 
 static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e) {
     if (!e) return;
-    if (m->by_id && e->id) {
-        void *old = NULL;
-        (void)raxRemove(m->by_id, (unsigned char *)e->id, strlen(e->id), &old);
-    }
+    if (m->by_id && e->id) m->by_id->erase(std::string(e->id));
     tool_memory_unlink(m, e);
     if (e->block) tool_block_unlink_entry(e->block, e);
     if (m->bytes >= e->bytes) m->bytes -= e->bytes;
@@ -188,8 +184,8 @@ static void tool_memory_prune_locked(tool_memory *m) {
 static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
                                                         const char *id) {
     if (!m->by_id || !id || !id[0]) return NULL;
-    void *v = raxFind(m->by_id, (unsigned char *)id, strlen(id));
-    return v == raxNotFound ? NULL : (tool_memory_entry *)v;
+    auto it = m->by_id->find(std::string(id));
+    return it == m->by_id->end() ? NULL : it->second;
 }
 
 
@@ -223,7 +219,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     b->entries = e;
     b->refs++;
 
-    if (!raxInsert(m->by_id, (unsigned char *)e->id, strlen(e->id), e, NULL)) {
+    if (!m->by_id->emplace(std::string(e->id), e).second) {
         tool_block_unlink_entry(b, e);
         free(e->id);
         free(e);
@@ -240,8 +236,8 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
 
 void tool_memory_free(tool_memory *m) {
     while (m->tail) tool_memory_remove_entry_locked(m, m->tail);
-    if (m->by_id) raxFree(m->by_id);
-    if (m->by_block) raxFree(m->by_block);
+    delete m->by_id;
+    delete m->by_block;
     memset(m, 0, sizeof(*m));
 }
 
