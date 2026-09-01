@@ -100,22 +100,6 @@ void *xrealloc(void *ptr, size_t size) {
 
 
 
-void *xmalloc_zeroed(size_t n, size_t size) {
-    if (size != 0 && n > SIZE_MAX / size) pulsar_die("allocation size overflow");
-    const size_t total = n * size;
-    void *p = xmalloc(total ? total : 1);
-    /*
-     * This is intentionally not calloc(). Large untouched calloc ranges may be
-     * represented by the VM through shared zero-page bookkeeping. The decode
-     * KV cache grows one token at a time, so using calloc here can move thousands
-     * of first-touch faults into generation.
-     *
-     * Explicitly writing the zeroes while the cache is allocated keeps those VM
-     * faults out of the token loop and gives the cache private resident pages.
-     */
-    memset(p, 0, total);
-    return p;
-}
 
 
 

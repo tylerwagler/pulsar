@@ -52,15 +52,6 @@ float layer_rope_freq_scale(uint32_t il) {
 
 
 
-float sigmoid_stable(float x) {
-    if (x >= 0.0f) {
-        const float e = expf(-x);
-        return 1.0f / (1.0f + e);
-    } else {
-        const float e = expf(x);
-        return e / (1.0f + e);
-    }
-}
 
 
 

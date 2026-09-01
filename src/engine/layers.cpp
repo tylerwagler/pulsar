@@ -63,12 +63,4 @@ int sample_argmax(const float *logits, uint32_t n_vocab);
  * reference path with the GPU executor.
  */
 
-float max_abs_diff(const float *a, const float *b, uint64_t n) {
-    float max_diff = 0.0f;
-    for (uint64_t i = 0; i < n; i++) {
-        const float diff = fabsf(a[i] - b[i]);
-        if (diff > max_diff) max_diff = diff;
-    }
-    return max_diff;
-}
 

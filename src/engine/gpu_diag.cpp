@@ -4,14 +4,6 @@
 
 
 
-float rms_abs_diff(const float *a, const float *b, uint64_t n) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) {
-        const double d = (double)a[i] - (double)b[i];
-        ss += d * d;
-    }
-    return n ? (float)sqrt(ss / (double)n) : 0.0f;
-}
 
 
 
@@ -26,21 +18,6 @@ uint64_t argmax_f32(const float *x, uint64_t n) {
 
 
 
-void print_vec_stats(const char *name, const float *x, uint64_t n) {
-    float minv = PULSAR_POS_INF;
-    float maxv = PULSAR_NEG_INF;
-    double ss = 0.0;
-
-    for (uint64_t i = 0; i < n; i++) {
-        const float v = x[i];
-        if (v < minv) minv = v;
-        if (v > maxv) maxv = v;
-        ss += (double)v * v;
-    }
-
-    printf("%s: min=%g max=%g rms=%g\n",
-        name, minv, maxv, sqrt(ss / (double)n));
-}
 
 
 

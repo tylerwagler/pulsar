@@ -71,6 +71,5 @@ typedef struct {
 int      cuda_arena_begin(cuda_arena *a, uint64_t bytes, const char *what);
 int      cuda_arena_begin_slot(cuda_arena *a, int slot, uint64_t bytes, const char *what);
 void    *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align);
-uint64_t cuda_arena_used(const cuda_arena *a);
 
 #endif /* PULSAR_CUDA_SCRATCH_H */

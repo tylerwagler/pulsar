@@ -331,17 +331,6 @@ static bool gpu_graph_norm_mix_plain(
 
 
 
-void gpu_graph_capture_dspark_target_hc(pulsar_gpu_graph *g, uint32_t il) {
-    int slot = -1;
-    for (int i = 0; i < 3; i++) {
-        if (il == g->dspark_target_layer_ids[i]) { slot = i; break; }
-    }
-    if (slot < 0 || !g->dspark_target_h[slot]) return;
-
-    pulsar_gpu_dspark_hc_mean_reduce(g->dspark_target_h[slot],
-                                   g->after_ffn_hc,
-                                   PULSAR_N_EMBD, PULSAR_N_HC);
-}
 
 
 

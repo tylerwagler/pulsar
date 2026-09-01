@@ -46,19 +46,6 @@ double now_sec(void) {
 
 
 
-void sleep_sec(double sec) {
-    if (sec <= 0.0 || !isfinite(sec)) return;
-    struct timespec req;
-    req.tv_sec = (time_t)sec;
-    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1000000000.0);
-    if (req.tv_nsec < 0) req.tv_nsec = 0;
-    if (req.tv_nsec >= 1000000000L) {
-        req.tv_sec++;
-        req.tv_nsec -= 1000000000L;
-    }
-    /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
-    (void)nanosleep(&req, &req);
-}
 
 
 

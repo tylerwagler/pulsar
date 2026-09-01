@@ -226,6 +226,3 @@ void pulsar_parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *
 
 
 
-void pulsar_parallel_for(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx) {
-    pulsar_parallel_for_min_rows(n_rows, fn, ctx, 512);
-}

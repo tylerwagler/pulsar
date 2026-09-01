@@ -39,40 +39,6 @@ uint32_t gpu_graph_raw_start_for_span(
 
 
 
-uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
-    (void)g;
-    static int parsed = -1;
-    static uint32_t cached = 0;
-    if (parsed < 0) {
-        parsed = 0;
-        const char *env = getenv("PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD");
-        if (env && env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(env, &end, 10);
-            while (end && isspace((unsigned char)*end)) end++;
-            if (end != env && end && *end == '\0' &&
-                (v == 64ul || v == 128ul || v == 256ul || v == 512ul ||
-                 v == 1024ul || v == 2048ul || v == 4096ul)) {
-                cached = (uint32_t)v;
-                parsed = 1;
-            } else {
-                fprintf(stderr,
-                        "pulsar: invalid PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
-                        "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
-                        env);
-            }
-        }
-    }
-    if (parsed > 0) return cached;
-
-    /* Keep dense attention longer than the legacy 512-row window by default.
-     * Around the 2K frontier the sparse path's score/top-k setup dominates
-     * the smaller attention scan, while larger contexts benefit from sparse
-     * indexed attention.  This threshold changes only the implementation used
-     * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by PULSAR_N_INDEXER_TOP_K. */
-    return 1024u;
-}
 
 
 

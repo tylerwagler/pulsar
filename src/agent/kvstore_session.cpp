@@ -389,25 +389,6 @@ void agent_publish_system_status(agent_worker *w, const char *msg) {
 
 
 
-void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) {
-    char stack[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(stack, sizeof(stack), fmt, ap);
-    va_end(ap);
-    if (n <= 0) return;
-    if ((size_t)n < sizeof(stack)) {
-        agent_publish_system_status(w, stack);
-        return;
-    }
-
-    char *heap = (char *)agent_xmalloc((size_t)n + 1);
-    va_start(ap, fmt);
-    vsnprintf(heap, (size_t)n + 1, fmt, ap);
-    va_end(ap);
-    agent_publish_system_status(w, heap);
-    free(heap);
-}
 
 
 

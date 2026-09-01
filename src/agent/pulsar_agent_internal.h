@@ -952,7 +952,6 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
                                char *err, size_t err_len);
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 void agent_publish_system_status(agent_worker *w, const char *msg);
-void agent_publishf_system_status(agent_worker *w, const char *fmt, ...);
 /** When a model turn finishes with a tool call, queued user messages should not
  * preempt that tool.  The worker asks the UI thread for the queue contents only
  * after the tool result is appended, so the next model input can contain both

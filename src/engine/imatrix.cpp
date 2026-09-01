@@ -1430,14 +1430,4 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
 
 
 
-void embed_prompt(
-        const pulsar_model   * model,
-        const pulsar_weights * weights,
-        const token_vec   * tokens,
-        uint32_t            n_embd,
-        float             * out) {
-    for (int i = 0; i < tokens->len; i++) {
-        embed_token_f16(model, weights, tokens->v[i], out + (uint64_t)i * n_embd);
-    }
-}
 

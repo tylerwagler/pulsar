@@ -204,8 +204,6 @@ void *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align) {
     return a->base + off;
 }
 
-uint64_t cuda_arena_used(const cuda_arena *a) { return a ? a->used : 0; }
-
 void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return cuda_tmp_reserve_slot(CUDA_SCRATCH_MAIN, bytes, what);
 }

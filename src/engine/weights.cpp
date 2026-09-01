@@ -1256,14 +1256,6 @@ void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, 
 
 
 
-/* RMSNorm without a learned scale, used by hyper-connection control vectors. */
-void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
-
-    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale;
-}
 
 
 
@@ -1278,17 +1270,6 @@ void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n
 
 
 
-/* Normalize each attention head independently after Q projection. */
-void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
-    for (uint32_t h = 0; h < n_head; h++) {
-        float *head = x + (uint64_t)h * head_dim;
-        double ss = 0.0;
-        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
-
-        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
-        for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
-    }
-}
 
 
 
@@ -1328,36 +1309,9 @@ static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
 
 
 
-/* Dense F16 matvec for small control projections such as HC and router heads. */
-void matvec_f16(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    if (w->type != 1 || w->ndim != 2) pulsar_die("expected a 2D F16 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    matvec_f16_ctx ctx = {
-        .out = out,
-        .data = (const uint16_t *)tensor_data(m, w),
-        .x = x,
-        .in_dim = in_dim,
-    };
-
-    const uint64_t ops = in_dim * out_dim;
-    const uint64_t min_rows = ops >= 262144 ? 1 : 512;
-    pulsar_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
-}
 
 
 
-void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    if (w->type != 1 || w->ndim != 2) pulsar_die("expected a 2D F16 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    const uint16_t *data = (const uint16_t *)tensor_data(m, w);
-    for (uint64_t o = 0; o < out_dim; o++) {
-        out[o] = dot_f16_row(data + o * in_dim, x, in_dim);
-    }
-}
 
 
 
@@ -1419,37 +1373,9 @@ float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i)
 
 
 
-float tensor_2d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t x, uint64_t y) {
-    if (t->ndim != 2 || x >= t->dim[0] || y >= t->dim[1]) {
-        pulsar_die("tensor 2D index is out of bounds");
-    }
-    return tensor_1d_value(m, t, y * t->dim[0] + x);
-}
 
 
 
-/* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
-const uint8_t *tensor_expert_bytes(
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        uint32_t          expert,
-        uint64_t         *in_dim,
-        uint64_t         *out_dim,
-        uint64_t         *row_bytes) {
-    if (w->ndim != 3) pulsar_die("expected a 3D expert tensor");
-    if (expert >= w->dim[2]) pulsar_die("expert id is outside expert tensor");
-
-    *in_dim = w->dim[0];
-    *out_dim = w->dim[1];
-
-    const gguf_type_info *info = tensor_type(w->type);
-    if (!info || info->block_elems == 0) pulsar_die("unsupported expert tensor type");
-    const uint64_t blocks = (*in_dim + info->block_elems - 1) / info->block_elems;
-    *row_bytes = blocks * info->block_bytes;
-
-    const uint64_t expert_bytes = *out_dim * *row_bytes;
-    return (const uint8_t *)tensor_data(m, w) + (uint64_t)expert * expert_bytes;
-}
 
 
 

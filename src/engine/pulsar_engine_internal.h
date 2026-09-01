@@ -2229,14 +2229,11 @@ void *xcalloc(size_t n, size_t size);
 void *xmalloc(size_t size);
 char *pulsar_strdup(const char *s);
 void *xrealloc(void *ptr, size_t size);
-void *xmalloc_zeroed(size_t n, size_t size);
 double now_sec(void);
-void sleep_sec(double sec);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
 bool read_f32_binary_file(const char *path, float *data, uint64_t n);
 void pulsar_threads_shutdown(void);
 void pulsar_parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx, uint64_t min_parallel_rows);
-void pulsar_parallel_for(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx);
 void cursor_error(pulsar_cursor *c, const char *msg);
 bool cursor_read(pulsar_cursor *c, void *dst, uint64_t n);
 bool cursor_skip(pulsar_cursor *c, uint64_t n);
@@ -2321,25 +2318,10 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
 void weights_free(pulsar_weights *w);
 /** Load one token embedding row and expand it to float activations. */
 void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out);
-/** RMSNorm without a learned scale, used by hyper-connection control vectors. */
-void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);
 /** Standard DS4 RMSNorm with learned per-channel scale. */
 void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps);
-/** Normalize each attention head independently after Q projection. */
-void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps);
-/** Dense F16 matvec for small control projections such as HC and router heads. */
-void matvec_f16(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
-void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i);
-float tensor_2d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t x, uint64_t y);
-const uint8_t *tensor_expert_bytes(
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        uint32_t          expert,
-        uint64_t         *in_dim,
-        uint64_t         *out_dim,
-        uint64_t         *row_bytes);
 void matvec_iq2_xxs_expert_pair_prequant(
         float            *out0,
         float            *out1,
@@ -2436,7 +2418,6 @@ void rope_tail_layer_batch_inplace(
         uint32_t          il,
         bool              inverse,
         uint32_t          n_tok);
-float sigmoid_stable(float x);
 float silu(float x);
 float softplus_stable(float x);
 void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp);
@@ -2526,10 +2507,7 @@ void layer_ffn_tokens_parallel(
 uint32_t pulsar_default_raw_cap(uint32_t ctx_size);
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
-float max_abs_diff(const float *a, const float *b, uint64_t n);
-float rms_abs_diff(const float *a, const float *b, uint64_t n);
 uint64_t argmax_f32(const float *x, uint64_t n);
-void print_vec_stats(const char *name, const float *x, uint64_t n);
 /** Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(pulsar_gpu_graph *g);
 bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n);
@@ -2801,7 +2779,6 @@ uint32_t gpu_graph_raw_start_for_span(
         const pulsar_gpu_graph *g,
         uint32_t               last_pos,
         uint32_t               n_raw);
-uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g);
 bool gpu_graph_env_flag(const char *name, int *cache);
 /** PULSAR_PREFILL_SLICE=\<N\>: process the prefill [indexer score -> top-k ->
  * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
@@ -2845,7 +2822,6 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       first_row,
         uint32_t       rows);
 void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t);
-void gpu_graph_capture_dspark_target_hc(pulsar_gpu_graph *g, uint32_t il);
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -3074,27 +3050,10 @@ bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *lo
 uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap);
 uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
-/** When a server request shares a large prefix with the live checkpoint, extend
- * the KV cache with batched prefill instead of single-token decode.  On an M3
- * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
- * as a conservative crossover.  The env knob remains useful for retuning.
- */
-void embed_prompt(
-        const pulsar_model   * model,
-        const pulsar_weights * weights,
-        const token_vec   * tokens,
-        uint32_t            n_embd,
-        float             * out);
 void token_vec_push(token_vec *tv, int token);
 void token_vec_free(token_vec *tv);
 bool cpu_directional_steering_enabled(
         const float *dirs,
-        float        scale);
-void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
         float        scale);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);

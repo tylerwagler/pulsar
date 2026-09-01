@@ -118,27 +118,6 @@ bool cpu_directional_steering_enabled(
 
 
 
-void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
-        float        scale) {
-    if (!cpu_directional_steering_enabled(dirs, scale) || !x || rows == 0) return;
-
-    const float *dir = dirs + (uint64_t)il * PULSAR_N_EMBD;
-    for (uint32_t row = 0; row < rows; row++) {
-        float *xr = x + (uint64_t)row * PULSAR_N_EMBD;
-        float dot = 0.0f;
-        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
-            dot += xr[i] * dir[i];
-        }
-        const float coeff = scale * dot;
-        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
-            xr[i] -= coeff * dir[i];
-        }
-    }
-}
 
 
 
