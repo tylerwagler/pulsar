@@ -2218,7 +2218,15 @@ struct gen_state {
     gen_phase phase;   ///< resume point: which step runs on the next quantum
 
     /** prompt/cache resolution (owned by gen_begin, read by later phases) */
-    char err[160];                   ///< failure reason for the error paths
+    /** Failure reason for the error paths.
+     *
+     * Wider than the 160-byte buffers the engine fills, because every
+     * writer wraps one: "spec round begin failed: %s" and its three
+     * siblings prepend 24-28 characters, so at 160 the engine's own
+     * message lost its tail -- the END of a diagnostic, which is where
+     * the specifics are.  gcc reported this as -Wformat-truncation on
+     * four snprintf sites and nothing was reading warnings. */
+    char err[256];
     pulsar_tokens effective_prompt;  ///< prompt after template rendering and any cache-driven rewrite
     const pulsar_tokens *prompt_for_sync;  ///< &j->req.prompt or &effective_prompt
     bool responses_protocol;          ///< request came in on the /responses API
