@@ -8,20 +8,36 @@ because the NAS copy has a different name. Both are now pinned below.
 
 ## ✅ VERIFIED 2026-08-12 — this recipe has been executed end to end
 
-> ⚠ **CHECK THE TARGET BEFORE TRUSTING THE SHA (noted 2026-08-31).** The
-> verification below is dated 2026-08-12 and its type census includes
-> **F16 359**. The F16 weights were retired four days later on 2026-08-16
-> (L079) — `src/cuda/pulsar_gpu.h` now states that "the shipped artifact
-> contains ZERO F16 tensors". Those two statements describe artifacts on
-> either side of that change.
+> ⚠ **THIS SECTION DESCRIBES A SUPERSEDED ARTIFACT. MEASURED 2026-09-01.**
 >
-> So `b4c4ac7c…` is the sha of the **pre-L079** artifact. Before treating a
-> mismatch as a rebuild error, confirm which artifact is actually being served
-> (`gguf-tools/deepseek4-quantize --audit <file>` on the GB10 box, or read the
-> type census straight out of the served GGUF's header). If the served file no
-> longer carries F16 tensors, this section needs a re-verified sha and census
-> rather than a footnote — that is a release-prep task for sparky, not a doc
-> edit, and it is deliberately not guessed at here.
+> The verification below is dated 2026-08-12 and reproduces
+> `v5mx4-0731-ltdraft.gguf`. That is not what the GB10 box serves any more.
+> Inspecting the artifact actually on `/srv/models` (`pulsar --inspect`):
+>
+> | type | doc's census (2026-08-12) | served now |
+> |---|---:|---:|
+> | f32 | 536 | 430 |
+> | **f16** | **359** | **0** |
+> | **bf16** | — | **445** |
+> | mxfp8_lt | 370 | 390 |
+> | iq2_xxs_mmq | 91 | 91 |
+> | cutlass_mxfp4 | 47 | 47 |
+> | i32 | 3 | 3 |
+> | **total** | 1406 | 1406 |
+>
+> The 359 F16 tensors became bf16 when L079 retired F16 weights (2026-08-16),
+> four days after this section was written — which is why
+> `src/pulsar_gpu.h` states the shipped artifact contains ZERO F16 tensors, and
+> it is right. Tensor-data size differs too (the served file is
+> 92,769,087,904 B against the 92,490,470,016 B recorded here), so
+> `b4c4ac7c…` cannot match and a mismatch is NOT a rebuild error.
+>
+> **What still holds:** the pipeline, the inputs table, the stage collapse and
+> the gates below are all current — this recipe is how you build an artifact.
+> **What does not:** the sha, the census and the file size are a record of the
+> 2026-08-12 run, not a target to reproduce. Re-verifying them against a
+> current build is open release-prep work; the numbers above are an inspection
+> of the served file, not a rebuild.
 
 A full rebuild from the source weights was run and compared against the served
 artifact `v5mx4-0731-ltdraft.gguf`:
