@@ -1843,12 +1843,25 @@ int generate_gpu_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = gpu_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
+        /* ONE LANE (L131).  This used to call gpu_graph_eval_token_raw_swa --
+         * the separate single-token graph encoder -- while the server decoded
+         * through gpu_graph_decode_multiseq_batch.  Two encoders meant this
+         * path, which is what `pulsar -p` and the diagnostics run, measured
+         * code production never executes.
+         *
+         * A 1-row batch on bank 0 is the same work: with no pool allocated
+         * gpu_graph_bank_pool_count() reports 1 and the bank accessors fall
+         * back to the classic tensors, so this costs no extra slab and no
+         * extra memory.  The call submits and reads back its own logits, which
+         * is why there is no begin/end_commands pair here any more. */
+        int     ms_tok[1]  = { token };
+        int32_t ms_pos[1]  = { (int32_t)pos };
+        int32_t ms_bank[1] = { (int32_t)gpu_graph_cur_bank(&g) };
+        /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal. */
+        ok = gpu_graph_decode_multiseq_batch(&g, model, weights,
+                                             ms_tok, ms_pos, ms_bank, 1u,
+                                             logits, NULL, 0u,
+                                             /*capture_cur=*/true) == 1;
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();

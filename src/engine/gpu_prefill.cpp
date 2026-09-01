@@ -9,18 +9,22 @@
  * at every n >= 1, and since L130 pulsar_session::eval is a 1-row batch on its
  * own bank, so nothing that serves a request reaches this encoder.
  *
- * TWO callers keep it alive, neither of them served decode (L131):
- *   1. pulsar_session_sync's short-suffix checkpoint extension, for suffixes
- *      below gpu_graph_resume_prefill_min_tokens() -- see the warning on that
- *      function; its default is an unmeasured M3-Max-era constant.
- *   2. generate_gpu_graph_raw_swa, the session-free one-shot greedy loop behind
- *      pulsar_engine_generate_argmax (public API; the `pulsar` CLI's
- *      non-interactive path).
+ * L131 CLOSED BOTH ITS CALLERS.  Nothing reaches this encoder at the default
+ * configuration any more:
+ *   1. pulsar_session_sync's short-suffix extension -- closed by lowering
+ *      gpu_graph_resume_prefill_min_tokens() to 1, so every positive suffix
+ *      takes the batched branch.
+ *   2. generate_gpu_graph_raw_swa (behind pulsar_engine_generate_argmax, the
+ *      `pulsar` CLI's non-interactive path) -- closed by routing its decode
+ *      loop through a 1-row gpu_graph_decode_multiseq_batch, the same shape
+ *      L130 used for pulsar_session::eval.
  *
- * Retiring it means routing both through the batched encoder. That is the
- * remaining half of ONE LANE, and it is a byte-changing move: this encoder and
- * gpu_graph_encode_layer_batch are 872 lines of separately-maintained code that
- * happen to agree, not one implementation. */
+ * ⚠ IT IS STILL COMPILED AND STILL REACHABLE, deliberately:
+ * PULSAR_CUDA_RESUME_PREFILL_MIN=4 restores caller 1 without a rebuild. That is
+ * the rollback lever for two byte-changing moves that have NOT yet been graded
+ * against the reference. Once the gate has run, this encoder, that knob and the
+ * dead loop in pulsar_session_sync are deleted together -- roughly 900 lines,
+ * and the end of the second decode implementation. */
 static bool gpu_graph_encode_token_raw_swa(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
