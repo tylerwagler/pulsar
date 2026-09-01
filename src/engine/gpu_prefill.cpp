@@ -1220,7 +1220,12 @@ bool gpu_graph_encode_layer_attention_batch(
             ok = pulsar_gpu_tensor_copy_async(g->spec_comp_kv_save[il], 0, g->batch_comp_kv, 0, sb) != 0 &&
                  pulsar_gpu_tensor_copy_async(g->spec_comp_sc_save[il], 0, g->batch_comp_sc, 0, sb) != 0;
         }
-        uint32_t n_comp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        /* DEAD as written and now provably so: the zero_prefix arm below
+         * reassigns n_comp from n_tokens before any use, and the else arm
+         * uses its own per-bank locals. Declared without a frontier read so
+         * this cannot look like a batch-wide frontier query -- there is no
+         * such thing during a step that spans banks. */
+        uint32_t n_comp = 0u;
         if (zero_prefix) {
             n_comp = n_tokens / ratio;
             if (ok && n_comp > g->layer_comp_cap[il]) {
@@ -1548,7 +1553,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     pulsar_gpu_tensor_free(kv_view);
                 }
             }
-            n_comp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+            /* was a refresh of the dead n_comp above; nothing reads it. */
         }
         PULSAR_CUDA_PROFILE_ATTN_STAGE("compressor");
 
