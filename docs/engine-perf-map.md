@@ -1,5 +1,32 @@
 # Where prefill time actually goes
 
+> **Scope and currency (checked 2026-09-01).** This is a PREFILL map. Its ranked
+> targets were measured 2026-08-08/09/10 and remain the reference for prefill.
+>
+> Its DECODE content is superseded. The decode per-kernel profile was re-taken on
+> 2026-09-01 against dev `ff98f93` and three of its conclusions changed:
+>
+> * **Nobody is bandwidth-bound** — every decode kernel sits at <=34% memory
+>   throughput. Do not price a lever by bytes saved.
+> * **Occupancy is not the lever.** `grouped_fp8mx_a_warp8_a8` went from 53% to
+>   ~92% achieved occupancy (L132 took rows-per-warp 4 -> 1, quadrupling the
+>   grid) and SM throughput moved only 15-16% -> ~18%. Two points for double the
+>   resident warps.
+> * **The skinny-output starvation in `matmul_nt` is gone, and not because we
+>   fixed it.** There is no grid-24 population left; the 16384->24 hc projection
+>   now runs as cuBLASLt's
+>   `nvjet_sm121_tss_mma_64x24x128_..._splitK_TNNN`, which already split-Ks it.
+>   The hand-written split-K lever is closed.
+>
+> What replaced it: a small-kernel tail. Over 400 launches with the drafter
+> live, 57 are `fill_f32_kernel` and 31 are `f32_to_bf16_kernel` — 22% of all
+> launches, at grids of 8-64 blocks. Those are "why does this launch at all"
+> questions, not kernel-tuning ones.
+>
+> Full table, method and the raw-log locations are in the L138 decode profile
+> (2026-09-01) in the investigations notes.
+
+
 > **Scope note (added v0.5.0, 2026-08-25):** this document's measurements are
 > from 2026-08-08 and remain broadly valid for PREFILL shape attribution. The
 > DECODE side has since been re-attributed from scratch: decode is ~97%
