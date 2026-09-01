@@ -156,7 +156,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
     if (tool != PULSAR_HELP_SERVER) {
-        opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
         opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     }
     if (full) {

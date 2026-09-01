@@ -80,7 +80,6 @@ typedef struct {
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
     const char *expert_overlay;
     pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
-    int n_threads;               ///< CPU helper threads for host-side work
     uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default
     int dspark_draft_tokens;     ///< drafter depth k; 0 = model/engine default
     const char *directional_steering_file;  ///< steering-vector file, or NULL

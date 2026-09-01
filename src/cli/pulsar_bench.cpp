@@ -36,7 +36,6 @@ typedef struct {
     const char *system;            ///< system prompt for the chat form
     const char *csv_path;          ///< write per-step results here; NULL = stdout only
     pulsar_backend backend;        ///< CPU or CUDA
-    int threads;                   ///< CPU worker threads
     int ctx_start;                 ///< first context depth in the sweep
     int ctx_max;                   ///< last context depth in the sweep
     /** Context the session is ALLOCATED with, as opposed to the depths swept.
@@ -147,8 +146,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else {
@@ -322,7 +319,6 @@ int main(int argc, char **argv) {
          * drafter (spec-decode throughput has its own timed-server protocol) */
         .dspark_disable = true,
         .backend = cfg.backend,
-        .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
     };
     pulsar_engine *engine = NULL;

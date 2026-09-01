@@ -1303,7 +1303,6 @@ typedef struct {
     const char *regrade_trace_path;
     const char *case_sequence;///< explicit case ids to run, in order; NULL = all
     pulsar_backend backend;   ///< CPU or CUDA
-    int threads;              ///< CPU worker threads
     int ctx_size;             ///< session context size
     int max_tokens;           ///< generation cap per case
     int question_limit;       ///< stop after this many cases; 0 = no limit
@@ -1621,8 +1620,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.soft_limit_think_close_rank = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--pause-ms")) {
             c.pause_ms = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -4106,7 +4103,6 @@ int main(int argc, char **argv) {
         /* keep KL/quality probes on plain decode with max memory headroom */
         .dspark_disable = true,
         .backend = cfg.backend,
-        .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
     };
     pulsar_engine *engine = NULL;
