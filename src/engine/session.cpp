@@ -318,7 +318,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
-    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     pulsar_acquire_instance_lock();
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
@@ -615,7 +614,6 @@ void pulsar_engine::destroy() {
     if (!e) return;
     weights_free(&e->weights);
     e->vocab.vocab_free();
-    pulsar_threads_shutdown();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
     pulsar_gpu_cleanup();

@@ -110,11 +110,6 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
 
 
 
-bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale) {
-    return dirs && scale != 0.0f;
-}
 
 
 

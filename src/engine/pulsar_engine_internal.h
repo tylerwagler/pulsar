@@ -163,7 +163,6 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
 #define PULSAR_MAX_DIMS   8
 
 
-#define PULSAR_MAX_THREADS 32
 
 
 /** MXKV FP4 row bytes for the indexer compressed cache (head_dim 128):
@@ -360,7 +359,6 @@ typedef struct {
     char error[256];       ///< first failure message; empty while the cursor is healthy
 } pulsar_cursor;
 
-typedef void (*pulsar_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
 /** =========================================================================
  * GGUF Parsing and Model Mapping.
@@ -646,16 +644,6 @@ typedef struct {
  * them, which is why a grep for "q8" kept finding a CPU int8 path that could not
  * run.  block_q8_K itself stays -- other declarations still reference it, and
  * whether THOSE are live is a separate audit. */
-
-/** One (token, expert-slot) routing decision.
- *
- * A batched MoE step flattens the whole chunk's routing into a list of these,
- * so an expert's work becomes a contiguous run rather than a scatter over
- * tokens. */
-typedef struct {
-    uint32_t token;                                     ///< token index within the batch
-    uint32_t slot;                                      ///< which of the token's chosen experts this is
-} pulsar_expert_pair;
 
 /* =========================================================================
  * KV Cache and Compressors.
@@ -2060,16 +2048,10 @@ extern uint32_t g_pulsar_compress_ratios[PULSAR_MAX_LAYER];
  * tensors are dense-trimmed to this count. Read from reap.layer.keep_count. */
 extern uint32_t g_pulsar_layer_expert_count[PULSAR_MAX_LAYER];
 extern int g_pulsar_lock_fd;
-extern const uint64_t iq2xxs_grid[256];
-extern int8_t iq2xxs_signed_grid[256][128][8];
-extern int8_t iq2xxs_signs[128][8];
-extern pthread_once_t iq2xxs_signed_grid_once;
-extern uint32_t g_requested_threads;
 
 /** ---- shared functions ---- */
 
 bool pulsar_backend_uses_graph(pulsar_backend backend);
-void iq2xxs_signed_grid_init(void);
 void pulsar_die(const char *msg);
 /** Attention compression is read from GGUF metadata after validating that it
  * matches the exact layout expected for the loaded model shape.
@@ -2096,8 +2078,6 @@ void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
 bool read_f32_binary_file(const char *path, float *data, uint64_t n);
-void pulsar_threads_shutdown(void);
-void pulsar_parallel_for_min_rows(uint64_t n_rows, pulsar_parallel_fn fn, void *ctx, uint64_t min_parallel_rows);
 void cursor_error(pulsar_cursor *c, const char *msg);
 bool cursor_read(pulsar_cursor *c, void *dst, uint64_t n);
 bool cursor_skip(pulsar_cursor *c, uint64_t n);
@@ -2148,17 +2128,6 @@ static inline const void *tensor_map_base(const pulsar_model *m, const pulsar_te
 static inline uint64_t tensor_map_size(const pulsar_model *m, const pulsar_tensor *t) {
     return t->ext_map ? t->ext_size : m->size;
 }
-void f16_round_inplace_cpu(float *x, uint32_t n);
-void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim);
-void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim);
-void pulsar_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y);
-void pulsar_vec_dot_iq2_xxs_pair_q8_K(
-        int n,
-        float *s0,
-        float *s1,
-        const block_iq2_xxs *x0,
-        const block_iq2_xxs *x1,
-        const block_q8_K *y);
 uint32_t required_u32(const pulsar_model *m, const char *key);
 PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t);
 bool routed_expert_gate_down_layout(
@@ -2185,189 +2154,11 @@ void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, 
 /** Standard DS4 RMSNorm with learned per-channel scale. */
 void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps);
 void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
-float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i);
-void matvec_iq2_xxs_expert_pair_prequant(
-        float            *out0,
-        float            *out1,
-        const pulsar_model  *m,
-        const pulsar_tensor *w0,
-        const pulsar_tensor *w1,
-        const block_q8_K *xq,
-        uint32_t          expert);
-void matvec_iq2_xxs_experts_mid_prequant(
-        float            *mid,
-        const pulsar_model  *m,
-        const pulsar_tensor *gate_w,
-        const pulsar_tensor *up_w,
-        const block_q8_K *xq,
-        const int        *selected,
-        const float      *expert_weight,
-        int               n_expert,
-        float             clamp);
-void matvec_q2_k_expert(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const float      *x,
-        uint32_t          expert);
-void matvec_q2_k_experts_accum_prequant(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const block_q8_K *xq,
-        const int        *selected,
-        int               n_expert);
-void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1);
-void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1);
-void matvec_experts_mid_prequant(
-        float            *mid,
-        const pulsar_model  *m,
-        const pulsar_tensor *gate_w,
-        const pulsar_tensor *up_w,
-        const block_q8_K *xq,
-        const int        *selected,
-        const float      *expert_weight,
-        int               n_expert,
-        float             clamp);
-void matvec_experts_down_accum_prequant(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const block_q8_K *xq,
-        const int        *selected,
-        int               n_expert);
-void matvec_expert_pair_prequant(
-        float            *out0,
-        float            *out1,
-        const pulsar_model  *m,
-        const pulsar_tensor *w0,
-        const pulsar_tensor *w1,
-        const block_q8_K *xq,
-        uint32_t          expert);
-void matvec_expert_down(
-        float            *out,
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        const float      *x,
-        uint32_t          expert);
-void layer_q_projection_with_lora_one(
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * norm,
-        float             * q,
-        float             * qr_norm);
-void layer_kv_projection_normed_one(
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * normed,
-        float             * kv);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
-void rope_tail_layer_inplace(
-        float            * x,
-        uint32_t           n_head,
-        uint32_t           head_dim,
-        uint32_t           n_rot,
-        uint32_t           pos,
-        uint32_t           il,
-        bool               inverse);
-void rope_tail_layer_batch_inplace(
-        float            *x,
-        uint64_t          stride,
-        uint32_t          n_head,
-        uint32_t          head_dim,
-        uint32_t          n_rot,
-        uint32_t          pos0,
-        uint32_t          il,
-        bool              inverse,
-        uint32_t          n_tok);
 float silu(float x);
-float softplus_stable(float x);
 void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp);
-void layer_shared_ffn_one(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * x);
-void layer_hash_selected_experts(
-        int                    selected[PULSAR_MAX_EXPERT_USED],
-        const pulsar_model       *model,
-        const pulsar_layer_weights *layer,
-        int                    token);
-void layer_hash_router_weights_from_probs(
-        float             weights_out[PULSAR_MAX_EXPERT_USED],
-        const float       probs[PULSAR_MAX_EXPERT],
-        const int          selected[PULSAR_MAX_EXPERT_USED]);
-void layer_hash_router_weights_one(
-        float             weights_out[PULSAR_MAX_EXPERT_USED],
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * x,
-        const int          selected[PULSAR_MAX_EXPERT_USED]);
-void layer_topk_selected_experts(
-        int                    selected[PULSAR_MAX_EXPERT_USED],
-        float                  expert_weight[PULSAR_MAX_EXPERT_USED],
-        const pulsar_model       *model,
-        const pulsar_layer_weights *layer,
-        const float           *x);
-void layer_topk_selected_experts_from_probs(
-        int                    selected[PULSAR_MAX_EXPERT_USED],
-        float                  expert_weight[PULSAR_MAX_EXPERT_USED],
-        const pulsar_model       *model,
-        const pulsar_layer_weights *layer,
-        const float           probs[PULSAR_MAX_EXPERT]);
-void layer_routed_moe_one_prealloc(
-        float             * out,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * x,
-        uint32_t            il,
-        int                 token,
-        float               clamp,
-        float              * mid_all,
-        block_q8_K         * xq,
-        block_q8_K         * midq);
-void layer_ffn_one(
-        float             * out_hc,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * inp_hc,
-        uint32_t            il,
-        int                 token,
-        const float       * steering_dirs,
-        float               steering_scale,
-        bool                trace);
-void layer_ffn_batch(
-        float             * out_hc,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale);
-void layer_ffn_shared_batch(
-        float             * out_hc,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale);
-void layer_ffn_tokens_parallel(
-        float             * out_hc,
-        const pulsar_model   * model,
-        const pulsar_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale);
 uint32_t pulsar_default_raw_cap(uint32_t ctx_size);
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
@@ -2916,9 +2707,6 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
                                                    uint32_t prefill_chunk);
 void token_vec_push(token_vec *tv, int token);
 void token_vec_free(token_vec *tv);
-bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);
 /** The candidate distribution a sampler draws from, after filtering. */

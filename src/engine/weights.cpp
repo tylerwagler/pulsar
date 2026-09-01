@@ -1349,19 +1349,6 @@ void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const
 
 
 
-float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i) {
-    if (i >= t->elements) pulsar_die("tensor scalar index is out of bounds");
-    if (t->type == 0) {
-        const float *p = (const float *)tensor_data(m, t);
-        return p[i];
-    }
-    if (t->type == 1) {
-        const uint16_t *p = (const uint16_t *)tensor_data(m, t);
-        return f16_to_f32(p[i]);
-    }
-    pulsar_die("unsupported tensor scalar type");
-    return 0.0f;
-}
 
 
 
