@@ -1278,9 +1278,9 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
      * state (rebuild path) and clears the flag. */
     if (s->mseq_dirty) {
         snprintf(err, errlen,
-                 "session eval after a multiseq decode step: classic per-bank "
-                 "state is stale (frontier counters hold a cross-bank "
-                 "superset); re-sync the session first");
+                 "session eval after a multiseq decode step: this session's "
+                 "per-bank state needs re-establishing; re-sync the session "
+                 "first");
         return 1;
     }
     pulsar_engine *e = s->engine;

@@ -435,12 +435,14 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
  * buffer's capacity IN FLOATS and must be at least n * that width — size it
  * with pulsar_engine_logits_width, never pulsar_engine_vocab_size.
  *
- * On success the session's classic single-bank bookkeeping is INVALIDATED
- * (the scalar frontier counters now hold a cross-bank superset and the
- * checkpoint no longer describes any one bank): the caller owns per-bank
- * histories, and classic per-bank work must re-establish state explicitly.
- * Until it does, the classic single-session entries that would decode
- * against those superset counters FAIL LOUD rather than corrupt KV:
+ * On success the session's single-bank bookkeeping is INVALIDATED -- the
+ * checkpoint no longer describes any one bank, and a step that touched OTHER
+ * banks leaves this session's per-bank carry needing re-establishment. The
+ * caller owns per-bank histories and must re-establish state explicitly.
+ * (This used to say the scalar frontier counters hold a cross-bank SUPERSET;
+ * stage 1b deleted those scalars, so that particular shape is now
+ * unrepresentable. The invalidation and the guard below are unchanged.)
+ * Until it does, the single-session entries FAIL LOUD rather than corrupt KV:
  * pulsar_session_eval, pulsar_session_generate_speculative and
  * pulsar_session_eval_speculative_block all return an error. A pulsar_session_sync
  * (which rebuilds from zero) re-establishes state and clears the condition.
