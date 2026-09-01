@@ -291,6 +291,72 @@ ATTN_GATE_ARCH ?= sm_120f
 # keeps these three correct -- the generated .d files are.  They are KEPT as the
 # floor: on a first build, or immediately after `make clean`, no .d exists yet
 # and a hand-listed prerequisite is all make has.
+# ---- standalone probes ---------------------------------------------------
+# Modelless, single-TU investigations that answer one question each.  Several
+# are cited from SHIPPED source as the provenance for a kernel's layout
+# (pulsar_cuda_attn_f16.cu -> attn_mma_probe, pulsar_cuda_indexer_mxfp4.cu and
+# docs/indexer-mxfp4-scorer.md -> idx_mxfp4_probe, docs/engine-perf-map.md ->
+# idx_mma_issue_bench), so they are documentation with a compiler attached.
+#
+# They had NO targets until now, which is exactly how two of them rotted in
+# silence.  `make probes` builds every one that is known to build, so the next
+# rename breaks a build instead of a claim nobody re-checks.
+#
+# IDX_PROBE_GENCODE pins the VIRTUAL and real arch to the 'a' variant, and the
+# -gencode form is required: -arch=sm_121a still emits a compute_121 PTX
+# fallback pass, and ptxas rejects .block_scale / .kind::mxf4nvf4 there just as
+# it does at compute_120.  The shipped indexer TU dodges the whole problem by
+# guarding on __CUDA_ARCH_FAMILY_SPECIFIC__; these standalone probes have no
+# such guard, so the fallback pass must not exist at all.  This is the recipe
+# each probe's own header documents -- do not "simplify" it to -arch.
+IDX_PROBE_GENCODE ?= -gencode arch=compute_121a,code=sm_121a
+
+PROBES = tests/attn_mma_probe tests/fp16_fold_probe tests/mxfp8_mma_probe \
+         tests/e4m3_staging_probe tests/idx_mxfp4_probe tests/idx_mma_issue_bench
+
+.PHONY: probes
+probes: $(PROBES)
+
+tests/attn_mma_probe: tests/attn_mma_probe.cu Makefile
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -o $@ $<
+
+# --use_fast_math is the POINT here: it asks whether the optimizer folds the
+# fp16 round-trip to identity, which it only can under these flags.
+tests/fp16_fold_probe: tests/fp16_fold_probe.cu Makefile
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -o $@ $<
+
+tests/mxfp8_mma_probe: tests/mxfp8_mma_probe.cu Makefile \
+                            src/cuda/mmq/ds4_mxfp8_mma.cuh
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda/mmq -o $@ $<
+
+tests/e4m3_staging_probe: tests/e4m3_staging_probe.cu Makefile \
+                            src/cuda/mmq/ds4_quantize_e4m3.cu src/cuda/mmq/ds4_act_block.cuh
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda/mmq -o $@ $<
+
+tests/idx_mxfp4_probe: tests/idx_mxfp4_probe.cu Makefile
+	$(NVCC) -O3 $(IDX_PROBE_GENCODE) -o $@ $<
+
+tests/idx_mma_issue_bench: tests/idx_mma_issue_bench.cu Makefile
+	$(NVCC) -O3 $(IDX_PROBE_GENCODE) -o $@ $<
+
+# DELIBERATELY NOT in PROBES, both because they do not build today:
+#
+#   tests/idx_mxfp4_kernel_test.cu -- the correctness gate for the shipped
+#     block-scaled indexer scorer.  Broken since f9fbafe ("the indexer Q
+#     container IS the quantized encoding now"): the kernel takes
+#     pulsar_mxkv_pack_t* for q and comp and dropped its trailing fp4 argument,
+#     the test still passes float*/uint8_t* and 13 arguments, and
+#     idx_pack_q_kernel no longer exists.  Its ORACLE is stale too -- it models
+#     Q as an E4M3 round-trip where the producer now emits packed E2M1.
+#     Repairing it means host-packing 68 B Q rows (64 B of e2m1 nibbles + 4
+#     scale bytes) and decoding those same bytes in the oracle.  Note the trap:
+#     Q's stored scale byte is BIASED +1 (idx_expand_q_kernel does `r[..] - 1`)
+#     while comp's is a plain ue8m0.  Needs a GPU to validate, so it is not
+#     wired up on a claim.
+#
+#   tests/flashinfer_sparse_mla_bench.cu -- needs FlashInfer's
+#     csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
+
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
                             src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
