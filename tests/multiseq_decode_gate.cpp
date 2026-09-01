@@ -6,11 +6,12 @@
  *
  * WHAT THIS GATE ASSERTS (and what it deliberately does not)
  * ---------------------------------------------------------
- * The batched multi-session sweep (gpu_graph_encode_layer_batch) is a
- * DIFFERENT KERNEL PATH from classic single-token decode
- * (gpu_graph_encode_decode_layer): different attention/indexer tiers,
- * different GEMM shapes, different accumulation order.  The two paths are
- * NOT bit-identical, and that predates this code: the batch sweep already
+ * The batched multi-session sweep (gpu_graph_encode_layer_batch) used to be a
+ * DIFFERENT KERNEL PATH from a classic single-token decode
+ * (gpu_graph_encode_decode_layer, deleted in L131): different
+ * attention/indexer tiers, different GEMM shapes, different accumulation
+ * order.  The two were NOT bit-identical, and that predated this code -- the
+ * comparison legs below are what established it.  The batch sweep already
  * diverged from classic decode on the increment-2 baseline (2c16d73) at the
  * same step and the same token ids the 1-row multiseq path produces
  * (control harness temp/t2i3_pathctl.c, which uses only the pre-existing

@@ -17,13 +17,19 @@
  *       re-establishes per-bank truth.
  *
  *   mseq_dirty = true  stops pulsar_session_eval.  checkpoint_valid does NOT
- *       cover it: pulsar_session_eval never reads checkpoint_valid — it calls
- *       gpu_graph_eval_token_raw_swa(..., s->checkpoint.len, ...)
- *       unconditionally, which reads gpu_graph_n_comp(g, il) (the cross-bank
- *       superset) as its emit row, writes the compressor row there, and
- *       attends over every row below it — a previous tenant's bytes when the
- *       current bank's true frontier is lower.  Wrong logits, silently.  So
- *       eval fails loud while dirty instead of corrupting.
+ *       cover it: eval never reads checkpoint_valid, it just decodes at
+ *       s->checkpoint.len on whatever bank is installed.
+ *
+ *       ⚠ The MECHANISM here has been rewritten twice; the HAZARD has not
+ *       changed.  This used to describe eval calling gpu_graph_eval_token_raw_swa
+ *       and reading a cross-bank SUPERSET as its emit row — writing the
+ *       compressor row there and attending over a previous tenant's bytes.
+ *       Both halves of that are now gone: L130 made eval a 1-row batch on its
+ *       own bank, and stage 1b deleted the scalar superset (gpu_graph_n_comp
+ *       reads ms_n_comp[cur_bank] directly).  What remains is that a multiseq
+ *       step which touched OTHER banks leaves this session's per-bank carry
+ *       needing re-establishment, so eval fails loud while dirty rather than
+ *       decoding against state it cannot vouch for.
  *
  * The caller owns per-bank histories and must re-establish per-bank state
  * explicitly to resume classic work on a bank: a fresh pulsar_session_sync

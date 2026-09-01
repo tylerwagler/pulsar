@@ -878,13 +878,12 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  *     gpu_graph_encode_output_head_batch,
  *     gpu_graph_encode_dspark_output_head_batch (both gpu_decode.cpp)
  *
- * ⚠ gpu_graph_encode_decode_layer arms four buffers and disarms NONE, so the
- * pairing rule above holds for the batch path only.  It is safe today for a
- * reason the rule does not state: the single-token buffers it arms (attn_norm,
- * qr_norm, ffn_norm, shared_mid) are separate allocations from the batch_*
- * buffers and from the output head's own scratch, so no later consumer can
- * present a matching key.  That is an aliasing accident, not an invariant --
- * see the decode audit's D3. */
+ * (L131 removed the caveat that used to sit here: gpu_graph_encode_decode_layer
+ * armed four buffers and disarmed NONE, which was safe only by the accident
+ * that its single-token buffers were separate allocations from the batch_*
+ * ones -- an aliasing accident rather than an invariant, per the decode audit's
+ * D3. That encoder is gone, so the pairing rule now holds everywhere without an
+ * exception.) */
 #define PULSAR_ACT_SLOTS 6
 
 /** One slot of the per-thread activation quantisation cache.

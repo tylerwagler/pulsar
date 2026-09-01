@@ -839,8 +839,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
         pulsar_tokens_starts_with(prompt, &s->checkpoint))
     {
         const int suffix = prompt->len - s->checkpoint.len;
-        const uint32_t resume_min = gpu_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (suffix > 0) {
             bool cancelled = false;
             pulsar_sync_progress progress = {
                 .session = s,
@@ -879,30 +878,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             return 0;
         }
 
-        /* L131: DEAD AT THE DEFAULT.  gpu_graph_resume_prefill_min_tokens() is
-         * now 1, so the batched branch above takes every suffix > 0 and
-         * returns; this loop is reached only when suffix == 0, where it runs
-         * zero iterations.  It survives solely so
-         * PULSAR_CUDA_RESUME_PREFILL_MIN=4 can restore the old single-token
-         * behaviour without a rebuild while the byte change is being graded.
-         * Delete it together with that knob once the gate has run. */
-        for (int i = s->checkpoint.len; i < prompt->len; i++) {
-            if (pulsar_session_cancelled(s)) {
-                snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = true;
-                return PULSAR_SESSION_SYNC_INTERRUPTED;
-            }
-            if (!gpu_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                (uint32_t)prompt->v[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                s->logits))
-            {
-                snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
-                s->checkpoint_valid = false;
-                return 1;
-            }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
-        }
+        /* L131: suffix == 0 means the checkpoint already IS the prompt --
+         * nothing to evaluate.  The single-token fallback that used to live
+         * here is gone with its encoder; every positive suffix takes the
+         * batched branch above. */
         return 0;
     }
 
@@ -1633,13 +1612,12 @@ int pulsar_session_prefill_cap(pulsar_session *s) {
  *     changing batch shapes and therefore cuBLASLt algo selection; exact
  *     replay is lost. Return 0: the caller must not interrupt at all.
  *
- *   - Below gpu_graph_resume_prefill_min_tokens() remaining tokens,
- *     pulsar_session_sync extends the checkpoint by single-token decode evals
- *     instead of a final batched chunk. Interrupting with less than this left
- *     would change which path evaluates the tail. Return that minimum, so the
- *     caller only interrupts while (target - checkpoint) >= the returned
- *     value. (When resume is disabled via PULSAR_CUDA_RESUME_PREFILL_MIN<=0 the
- *     minimum is UINT32_MAX and the comparison never permits interruption.) */
+ *   - There USED to be a third condition: below a crossover, sync extended the
+ *     checkpoint by single-token decode evals instead of a batched chunk, so
+ *     interrupting with less than that left would change which path evaluated
+ *     the tail. L131 deleted the single-token encoder, so the tail is always a
+ *     batched chunk and the hazard cannot arise. Any positive suffix resumes
+ *     exactly; the minimum is simply 1. */
 uint32_t pulsar_session::prefill_quantum_min_suffix() const {
     auto *s = this;
     if (!s) return 0;
@@ -1659,6 +1637,6 @@ uint32_t pulsar_session::prefill_quantum_min_suffix() const {
         }
     }
     if (align > 1 && s->graph.prefill_cap % align != 0) return 0;
-    return gpu_graph_resume_prefill_min_tokens();
+    return 1u;
 }
 

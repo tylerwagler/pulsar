@@ -1183,7 +1183,7 @@ typedef struct {
     uint32_t dspark_n_raw[3];                ///< positions held in each ring
 
     /** Override compression ratio for DSpark draft layers (set to 0 before
-     * calling gpu_graph_encode_decode_layer for draft model forwarding). */
+     * forwarding the draft model). */
     int comp_ratio_override;
 
     uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry; sizes the batch tensors
@@ -2845,17 +2845,6 @@ pulsar_gpu_tensor *gpu_graph_attn_comp_prefill_target(
         uint32_t       first_row,
         uint32_t       rows);
 void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t);
-bool gpu_graph_encode_decode_layer(
-        pulsar_gpu_graph  *g,
-        const pulsar_model        *model,
-        const pulsar_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos,
-        pulsar_gpu_tensor       *raw_cache,
-        uint32_t                raw_cap,
-        uint32_t                raw_row,
-        uint32_t                n_raw,
-        int                     token);
 void gpu_graph_capture_dspark_target_hc(pulsar_gpu_graph *g, uint32_t il);
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
@@ -2913,7 +2902,6 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
         uint64_t                out_dim,
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
-uint32_t gpu_graph_token_split_after_layers(void);
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,
@@ -2996,13 +2984,6 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens);
-bool gpu_graph_eval_token_raw_swa(
-        pulsar_gpu_graph *g,
-        const pulsar_model       *model,
-        const pulsar_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits);
 /** save_row0 (inc 6, W2): the first row of THIS session's positions within
  * the verify forward's comp-save buffers. Classic single-bank rounds pass 0;
  * the batched lane passes the bank's row offset in the shared batch. */
@@ -3098,7 +3079,6 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning.
  */
-uint32_t gpu_graph_resume_prefill_min_tokens(void);
 void embed_prompt(
         const pulsar_model   * model,
         const pulsar_weights * weights,

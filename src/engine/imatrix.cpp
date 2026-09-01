@@ -1262,42 +1262,6 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
 
 
 
-/* When a request shares a large prefix with the live checkpoint, extend the KV
- * cache with batched prefill instead of the single-token encoder.
- *
- * DEFAULT IS 1 (L131, Tyler 2026-08-31): every non-empty suffix takes the
- * batched path, so pulsar_session_sync no longer reaches
- * gpu_graph_encode_token_raw_swa at all.  The old default was 4, carried over
- * from an M3 Max measurement ("prefill is faster from 2-token suffixes upward")
- * -- Metal-era, a backend this fork no longer has -- and it was the last thing
- * keeping the 872-line single-token encoder alive in the session path.
- *
- * ⚠ NOT YET GRADED.  The two encoders are separately-maintained code that
- * happens to agree, so 1-3 token suffixes now produce DIFFERENT BYTES than
- * before.  That is expected, not a bug, but it has to be graded against the
- * B300 reference rather than diffed against the previous build:
- *
- *     on sparky, PULSAR_REF_DIR set:  make cuda-prefill-gate
- *
- * plus a check that a 1-token chunked prefill is not slower than the
- * single-token encode it replaces.
- *
- * THE ENV KNOB IS THE ROLLBACK.  PULSAR_CUDA_RESUME_PREFILL_MIN=4 restores the
- * old behaviour without a rebuild; keep it until the gate has run.  Once the
- * grade is in, the knob and the single-token loop in pulsar_session_sync go
- * together -- an opt-out with no real caller gets deleted. */
-uint32_t gpu_graph_resume_prefill_min_tokens(void) {
-    const char *env = getenv("PULSAR_CUDA_RESUME_PREFILL_MIN");
-    if (env && env[0]) {
-        char *endp = NULL;
-        const long v = strtol(env, &endp, 10);
-        if (endp != env) {
-            if (v <= 0) return UINT32_MAX;
-            return (uint32_t)v;
-        }
-    }
-    return 1u;
-}
 
 
 
