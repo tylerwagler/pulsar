@@ -199,7 +199,7 @@ int main(int argc, char **argv) {
      * Whether the factor SHOULD be 4 is tracked in the ledger; it is invisible
      * in production because these scores feed only a top-k, and a uniform
      * positive scale cannot reorder a ranking. */
-    const double kTierScale = 4.0;   /* measured; see the ledger row */
+    const double kTierScale = 1.0;   /* L137: the tier reproduces storage semantics exactly */
 
     double max_rel = 0.0, sum_abs = 0.0, sum_ref = 0.0;
     double ratio_lo = 1e300, ratio_hi = -1e300;

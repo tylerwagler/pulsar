@@ -154,8 +154,8 @@ __device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
  * E2M1 codes and E8M0 scales; the MMA takes e2m1 operands in 8-bit containers
  * (nibble at bits [5:2], decoding 4x nominal -- the measured contract above).
  * So "staging" is a nibble spread plus a scale-byte rebias:
- *   sf_hw = s - 1   (+1 for the 128-vs-127 bias, -2 for the 4x container),
- * the SAME rebias the K side applies to its identical rows.  Nothing is
+ *   sf_hw = s       (no rebias -- see the K-side note),
+ * the SAME treatment the K side applies to its identical rows.  Nothing is
  * decoded and nothing is re-encoded: no amax, no rounding, no second scale
  * derivation anywhere in the scorer.
  * (The old e4m3 staging decoded the row to f32 and re-encoded; E4M3-for-Q was
@@ -175,8 +175,11 @@ static void idx_expand_q_kernel(
     const uint32_t two = *(const uint16_t *)(r + lane * 2u);   /* 4 nibbles, dims 4*lane.. */
     ((uint32_t *)(qa + (uint64_t)row * IDX_HEAD_DIM))[lane] = idx_spread4(two);
     if ((lane & 7u) == 0u) {
-        const int b = (int)r[(IDX_HEAD_DIM / 2u) + (lane >> 3u)] - 1;
-        qsf[(uint64_t)row * IDX_KSLABS + (lane >> 3u)] = (uint8_t)(b < 0 ? 0 : b);
+        /* NO rebias: sf_hw == the stored byte.  See the K-side note below --
+         * measured, the e2m1 x e2m1 container decodes plain and the scale bias
+         * is the spec's 127, so the stored ue8m0 byte passes through. */
+        qsf[(uint64_t)row * IDX_KSLABS + (lane >> 3u)] =
+            r[(IDX_HEAD_DIM / 2u) + (lane >> 3u)];
     }
 }
 
@@ -278,8 +281,23 @@ static void idx_scores_mxfp4_kernel(
         const uint8_t *row = comp + (uint64_t)comp_i * PULSAR_MXKV_FP4_ROWBYTES(128u);
         *dst = *(const uint16_t *)(row + u * 2u);
         if (u < IDX_KSLABS) {
-            const int sfb = (int)row[64u + u] - 1;   /* +1 bias, -2 for the 4x */
-            sSFB[c * IDX_KSLABS + u] = (uint8_t)(sfb < 0 ? 0 : sfb);
+            /* NO rebias: the stored ue8m0 byte IS the hardware scale factor.
+             *
+             * This was `- 1`, documented as "+1 for the 128-vs-127 ue8m0 bias,
+             * -2 for the nibble<<2 container's 4x".  Both of those are real
+             * effects and both were measured -- but in idx_mxfp4_probe's
+             * PHASE0e, which used an e4m3 A-side operand.  This kernel is
+             * e2m1 x e2m1 at scale_vec::1X, where the bits[5:2] container
+             * decodes PLAIN and the bias is the spec's 127.  The two wrong
+             * corrections nearly cancelled, leaving every score at exactly
+             * storage/4 -- uniform, so it looked like a working kernel, and
+             * invisible downstream because these scores feed only a top-k and
+             * a uniform positive scale cannot reorder a ranking.
+             *
+             * Caught 2026-09-01 by repairing this tier's correctness gate,
+             * which had not compiled since f9fbafe (L137).  The gate now pins
+             * the relationship at 1.0 and mutation-fails if it drifts. */
+            sSFB[c * IDX_KSLABS + u] = row[64u + u];
         }
     }
     __syncthreads();
