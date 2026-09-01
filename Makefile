@@ -1,18 +1,20 @@
-CC ?= cc
 NATIVE_CPU_FLAG ?= -march=native
 
 DEBUG_FLAGS ?= -g
 # Header dependency generation; see the ALL_OBJS/PULSAR_DEPS block below for why.
 PULSAR_DEPFLAGS := -MMD -MP
 
-CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
-CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
-
-# C++ port (pulsar): host TUs migrate .c -> .cpp one at a time. The FP and
-# optimization flags MUST stay identical to CFLAGS so a ported TU generates
-# the same math as its C predecessor (the per-TU bit-exact gate depends on
-# it). -fno-exceptions/-fno-rtti is the project style: hot paths never throw,
-# fatal errors keep the pulsar_die() contract.
+# The .c -> .cpp port is COMPLETE: no C translation unit remains, so the C
+# compiler, CFLAGS and the five src/*/%.o-from-%.c pattern rules are gone, along
+# with the instruction to keep CFLAGS and CXXFLAGS identical.  That rule existed
+# so a freshly ported TU generated the same math as its C predecessor, and there
+# are no predecessors left to match.
+#
+# -ffast-math with -fno-finite-math-only is still deliberate and still load
+# bearing: it is the FP contract the numerics gates were calibrated against, so
+# it is not a knob to turn casually.  -fno-exceptions/-fno-rtti is project
+# style -- hot paths never throw, and fatal errors keep the pulsar_die()
+# contract.
 CXX ?= g++
 CXXFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c++23
 CXXFLAGS += -D_GNU_SOURCE -fno-finite-math-only -fno-exceptions -fno-rtti
@@ -36,8 +38,6 @@ PULSAR_GIT_HEAD := $(shell git rev-parse --git-path HEAD 2>/dev/null)
 ifneq ($(PULSAR_GIT_HEAD),)
 src/server/cli_main.o src/server/http_server.o: $(PULSAR_GIT_HEAD)
 endif
-CFLAGS += -DPULSAR_VERSION_STR='"$(PULSAR_VERSION_STR)"'
-CFLAGS += $(PULSAR_DEPFLAGS)
 
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
@@ -119,12 +119,12 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 
 PULSAR_INC = -Isrc -Isrc/lib -Isrc/vendor
 
-ENGINE_SRCS = $(wildcard src/engine/*.c) $(wildcard src/engine/*.cpp)
-ENGINE_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(ENGINE_SRCS)))
-AGENT_SRCS = $(wildcard src/agent/*.c) $(wildcard src/agent/*.cpp)
-AGENT_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(AGENT_SRCS)))
-SERVER_SRCS = $(wildcard src/server/*.c) $(wildcard src/server/*.cpp)
-SERVER_OBJS = $(patsubst %.cpp,%.o,$(patsubst %.c,%.o,$(SERVER_SRCS)))
+ENGINE_SRCS = $(wildcard src/engine/*.cpp)
+ENGINE_OBJS = $(ENGINE_SRCS:.cpp=.o)
+AGENT_SRCS = $(wildcard src/agent/*.cpp)
+AGENT_OBJS = $(AGENT_SRCS:.cpp=.o)
+SERVER_SRCS = $(wildcard src/server/*.cpp)
+SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
 CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
@@ -172,9 +172,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 # cost nothing, and on a first build (no .d yet) they are all make has.
 ALL_OBJS = $(CORE_OBJS) $(AGENT_OBJS) $(SERVER_OBJS) \
            $(patsubst %.cpp,%.o,$(wildcard src/cli/*.cpp)) \
-           $(patsubst %.c,%.o,$(wildcard src/cli/*.c)) \
            $(patsubst %.cpp,%.o,$(wildcard src/lib/*.cpp)) \
-           $(patsubst %.c,%.o,$(wildcard src/lib/*.c)) \
            $(patsubst %.cpp,%.o,$(wildcard src/vendor/*.cpp)) \
            $(patsubst %.cpp,%.o,$(wildcard tests/*.cpp))
 PULSAR_DEPS = $(ALL_OBJS:.o=.d)
@@ -899,9 +897,6 @@ gates:
 	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
 	exit $$rc
 
-src/engine/%.o: src/engine/%.c src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
-
 # Ported C++ TUs (pulsar). One rule per source dir, mirroring the .c rules.
 src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
@@ -917,18 +912,6 @@ src/cli/%.o: src/cli/%.cpp src/pulsar.h src/lib/pulsar_help.h src/vendor/linenoi
 
 src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
-
-src/agent/%.o: src/agent/%.c src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
-	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
-
-src/server/%.o: src/server/%.c src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
-	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
-
-src/cli/%.o: src/cli/%.c src/pulsar.h src/lib/pulsar_help.h src/vendor/linenoise.h
-	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
-
-src/lib/%.o: src/lib/%.c src/pulsar.h $(LIB_HDRS)
-	$(CC) $(CFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) -Wno-write-strings -c -o $@ $<
