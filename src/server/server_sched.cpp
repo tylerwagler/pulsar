@@ -1940,13 +1940,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                  * the old unconditional cap is byte-identical (isolation
                  * invariant, see the lane-gate note above). vLLM #47808 is
                  * the same design upstream.
-                 * L111/L121 refresh (ROWCOST 2026-08-27, post score-tier
-                 * fix): the marginal row cost is DEPTH-FLAT — ~8 ms/row at
-                 * 2048, 8192, and 24576 alike, identical on e4m3 and NVFP4
-                 * KV.  The old 8.4→11 depth ramp was the naive score
-                 * kernel's rows x depth term (L121), not a property of the
-                 * engine; the depth scan it required is gone with it. */
-                const float marginal_ms = 8.0f;
+                 * L111/L121 established the cost is DEPTH-FLAT (the old
+                 * 8.4→11 ramp was the naive score kernel's rows x depth
+                 * term, not a property of the engine).  L136 refresh
+                 * (ROWCOST 2026-08-31, dev 87eec09): 6.4 ms/row @2048,
+                 * 5.9 @24576 — the 8.0 measured on 08-27 predated L129's
+                 * MoE fusion, which moved the whole sweep ~9%.  A stage
+                 * decomposition (L134) puts ~83% of this in routed-MoE
+                 * expert compute, so expect the number to move with MoE
+                 * kernel work, not with KV/indexer work. */
+                const float marginal_ms = 6.0f;
                 const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                                   s->spec_ms_per_tok_ema : 45.0f;
                 const float thr = marginal_ms / ema;
