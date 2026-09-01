@@ -76,3 +76,4 @@ gguf-tools/libds4q_reflow.so
 /cutlass/
 /cutlass
 docs/api/
+/tests/idx_mxfp4_kernel_test

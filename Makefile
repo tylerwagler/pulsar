@@ -312,7 +312,8 @@ ATTN_GATE_ARCH ?= sm_120f
 IDX_PROBE_GENCODE ?= -gencode arch=compute_121a,code=sm_121a
 
 PROBES = tests/attn_mma_probe tests/fp16_fold_probe tests/mxfp8_mma_probe \
-         tests/e4m3_staging_probe tests/idx_mxfp4_probe tests/idx_mma_issue_bench
+         tests/e4m3_staging_probe tests/idx_mxfp4_probe tests/idx_mma_issue_bench \
+         tests/idx_mxfp4_kernel_test
 
 .PHONY: probes
 probes: $(PROBES)
@@ -339,23 +340,18 @@ tests/idx_mxfp4_probe: tests/idx_mxfp4_probe.cu Makefile
 tests/idx_mma_issue_bench: tests/idx_mma_issue_bench.cu Makefile
 	$(NVCC) -O3 $(IDX_PROBE_GENCODE) -o $@ $<
 
-# DELIBERATELY NOT in PROBES, both because they do not build today:
-#
-#   tests/idx_mxfp4_kernel_test.cu -- the correctness gate for the shipped
-#     block-scaled indexer scorer.  Broken since f9fbafe ("the indexer Q
-#     container IS the quantized encoding now"): the kernel takes
-#     pulsar_mxkv_pack_t* for q and comp and dropped its trailing fp4 argument,
-#     the test still passes float*/uint8_t* and 13 arguments, and
-#     idx_pack_q_kernel no longer exists.  Its ORACLE is stale too -- it models
-#     Q as an E4M3 round-trip where the producer now emits packed E2M1.
-#     Repairing it means host-packing 68 B Q rows (64 B of e2m1 nibbles + 4
-#     scale bytes) and decoding those same bytes in the oracle.  Note the trap:
-#     Q's stored scale byte is BIASED +1 (idx_expand_q_kernel does `r[..] - 1`)
-#     while comp's is a plain ue8m0.  Needs a GPU to validate, so it is not
-#     wired up on a claim.
-#
-#   tests/flashinfer_sparse_mla_bench.cu -- needs FlashInfer's
-#     csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
+# The correctness gate for the shipped block-scaled indexer scorer.  It drives
+# the REAL kernel by #including it, so it needs the same include path the
+# engine TU gets.  Repaired and mutation-validated 2026-09-01 (it had not
+# compiled since f9fbafe); see the ledger row for the one open question it
+# surfaced -- the tier reproduces the storage semantics to f32 precision up to a
+# uniform factor of exactly 4.
+tests/idx_mxfp4_kernel_test: tests/idx_mxfp4_kernel_test.cu Makefile \
+                            src/cuda/pulsar_cuda_indexer_mxfp4.cu src/cuda/pulsar_cuda_internal.h
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# DELIBERATELY NOT in PROBES: tests/flashinfer_sparse_mla_bench.cu needs
+# FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
 
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
                             src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
