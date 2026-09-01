@@ -879,6 +879,13 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             return 0;
         }
 
+        /* L131: DEAD AT THE DEFAULT.  gpu_graph_resume_prefill_min_tokens() is
+         * now 1, so the batched branch above takes every suffix > 0 and
+         * returns; this loop is reached only when suffix == 0, where it runs
+         * zero iterations.  It survives solely so
+         * PULSAR_CUDA_RESUME_PREFILL_MIN=4 can restore the old single-token
+         * behaviour without a rebuild while the byte change is being graded.
+         * Delete it together with that knob once the gate has run. */
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
             if (pulsar_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
