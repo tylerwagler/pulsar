@@ -1436,19 +1436,23 @@ void pulsar_session::rewind(int pos) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t want = (uint32_t)pos / ratio;
-        if (gpu_graph_n_comp(&s->graph, il) > want) {
-            if (ratio == 4) any_ratio4_crossed = true;
-            gpu_graph_n_comp(&s->graph, il) = want;
-        }
-        if (ratio == 4 && gpu_graph_n_index_comp(&s->graph, il) > want)
-            gpu_graph_n_index_comp(&s->graph, il) = want;
-        /* Only the bank this session's checkpoint describes: other banks hold
-         * their own positions and a rewind here says nothing about them. */
+        /* ONE clamp, on the bank this session's checkpoint describes. Other
+         * banks hold other slots' positions and a rewind here says nothing
+         * about them.
+         *
+         * This was TWO clamps -- "clamp BOTH representations", the scalar and
+         * the per-bank row -- which was right when they were separate storage
+         * (L120 clamped one, L133 was the bill for missing the other). Stage 1b
+         * made them the same memory, so the pair became one value clamped
+         * twice; with the bank now named, that is visible rather than
+         * something you have to know. */
         if (rw_bank < PULSAR_MSEQ_MAX) {
-            if (s->graph.ms_n_comp[rw_bank][il] > want)
-                s->graph.ms_n_comp[rw_bank][il] = want;
-            if (ratio == 4 && s->graph.ms_n_index_comp[rw_bank][il] > want)
-                s->graph.ms_n_index_comp[rw_bank][il] = want;
+            if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) {
+                if (ratio == 4) any_ratio4_crossed = true;
+                gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
+            }
+            if (ratio == 4 && gpu_graph_n_index_comp(&s->graph, rw_bank, il) > want)
+                gpu_graph_n_index_comp(&s->graph, rw_bank, il) = want;
         }
     }
     /* ⚠ MEASURED LIMIT (2026-08-30): the replay below does NOT fire on the

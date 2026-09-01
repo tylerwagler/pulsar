@@ -1209,17 +1209,34 @@ typedef struct {
 static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
     return g->banks.n_banks ? g->banks.cur_bank : 0u;
 }
-static inline uint32_t &gpu_graph_n_comp(pulsar_gpu_graph *g, uint32_t il) {
-    return g->ms_n_comp[gpu_graph_cur_bank(g)][il];
+/* THE BANK IS EXPLICIT.  These used to take (g, il) and resolve through
+ * gpu_graph_cur_bank(), which reads `banks.cur_bank` -- documented as "bank the
+ * installed views currently address".  That is a DEVICE VIEW BINDING, set by
+ * gpu_graph_bank_repoint() and by nothing else.  It is not a session identity.
+ *
+ * The two coincide for classic single-session work, and diverge exactly where
+ * it matters: during a batched step spanning several banks, the views are bound
+ * to ONE of them, so an unqualified "what is the frontier?" resolves to
+ * whichever bank was repointed last -- an artifact of setup order, not a
+ * property of the step.  L139 is that divergence: a co-scheduled step left
+ * cur_bank on the prefill bank (2) where a decode-only step left it on the last
+ * decode bank (1), and the same read returned a different bank's row.
+ *
+ * So the caller names the bank.  Classic paths pass gpu_graph_cur_bank(g) --
+ * still correct there, and now visibly a CHOICE rather than a default.  Batched
+ * paths pass the row's seq_id.  A site that cannot name a bank is a site that
+ * did not know whose frontier it was reading. */
+static inline uint32_t &gpu_graph_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
+    return g->ms_n_comp[bank][il];
 }
-static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t il) {
-    return g->ms_n_comp[gpu_graph_cur_bank(g)][il];
+static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
+    return g->ms_n_comp[bank][il];
 }
-static inline uint32_t &gpu_graph_n_index_comp(pulsar_gpu_graph *g, uint32_t il) {
-    return g->ms_n_index_comp[gpu_graph_cur_bank(g)][il];
+static inline uint32_t &gpu_graph_n_index_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
+    return g->ms_n_index_comp[bank][il];
 }
-static inline uint32_t gpu_graph_n_index_comp(const pulsar_gpu_graph *g, uint32_t il) {
-    return g->ms_n_index_comp[gpu_graph_cur_bank(g)][il];
+static inline uint32_t gpu_graph_n_index_comp(const pulsar_gpu_graph *g, uint32_t bank, uint32_t il) {
+    return g->ms_n_index_comp[bank][il];
 }
 
 /** =========================================================================

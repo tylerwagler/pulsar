@@ -1464,11 +1464,11 @@ uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t ban
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint32_t ncomp = (bank == cur) ? gpu_graph_n_comp(g, il)
+        const uint32_t ncomp = (bank == cur) ? gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)
                                              : g->ms_n_comp[bank][il];
         bytes += (uint64_t)ncomp * attn_row;
         if (ratio == 4) {
-            const uint32_t nidx = (bank == cur) ? gpu_graph_n_index_comp(g, il)
+            const uint32_t nidx = (bank == cur) ? gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)
                                                 : g->ms_n_index_comp[bank][il];
             bytes += (uint64_t)nidx * idx_row;
         }
@@ -1588,9 +1588,9 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint32_t have_comp = use_scalars ? gpu_graph_n_comp(g, il)
+            const uint32_t have_comp = use_scalars ? gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)
                                                    : g->ms_n_comp[b][il];
-            const uint32_t have_index = use_scalars ? gpu_graph_n_index_comp(g, il)
+            const uint32_t have_index = use_scalars ? gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)
                                                     : g->ms_n_index_comp[b][il];
             if (have_comp != p / ratio ||
                 (ratio == 4 && have_index != p / ratio)) {

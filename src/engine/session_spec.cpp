@@ -359,8 +359,8 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
 
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        f->n_comp[il] = gpu_graph_n_comp(g, il);
-        f->n_index_comp[il] = gpu_graph_n_index_comp(g, il);
+        f->n_comp[il] = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        f->n_index_comp[il] = gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il);
     }
     if (ok && g->spec_snap_copies) {
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -399,8 +399,8 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        gpu_graph_n_comp(g, il) = f->n_comp[il];
-        gpu_graph_n_index_comp(g, il) = f->n_index_comp[il];
+        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = f->n_comp[il];
+        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = f->n_index_comp[il];
     }
     if (ok && g->spec_restore_copies) {
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
