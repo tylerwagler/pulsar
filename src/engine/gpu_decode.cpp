@@ -552,6 +552,7 @@ bool gpu_graph_dspark_draft_forward(
         ok = hc_mix_view && hc_split_view && ffn_cur_view;
         /* RMS norm: flat HC from batch_cur_hc */
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
+            /*out_b=*/NULL,
             g->batch_flat_hc, g->batch_cur_hc,
             (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS) != 0;
         /* HC → mix projection */
@@ -912,11 +913,22 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = output_pre && output_weights && output_embd && output_norm && logits;
 
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+    /* The output head's hc projection is a BF16-weight GEMM (output_hc_fn via
+     * pulsar_gpu_matmul_f32_tensor -> the shared bf16 core), so emit the bf16
+     * copy from the norm epilogue rather than letting the GEMM convert
+     * hc_dim floats every step.  L086 T3. */
+    void *out_flat_b = NULL;
+    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                        (uint64_t)hc_dim, &out_flat_b)) {
+        out_flat_b = NULL;
+    }
+    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, out_flat_b,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
+    if (ok && out_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                   (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
                                                  (const pulsar_model *)model,
                                                  weights->output_hc_fn,
@@ -994,8 +1006,17 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
     bool ok = output_pre && output_weights && output_embd && output_norm && logits;
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
+    /* Same as the main output head above: dw->hc_head_fn is a BF16-weight
+     * GEMM, so the epilogue emits the copy it needs. */
+    void *dsp_flat_b = NULL;
+    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                        (uint64_t)hc_dim, &dsp_flat_b)) {
+        dsp_flat_b = NULL;
+    }
+    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
                                                      (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS) != 0;
+    if (ok && dsp_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                   (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
                                                hc_dim, PULSAR_N_HC, g->batch_flat_hc, n_tokens) != 0;
     if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights, output_pre,

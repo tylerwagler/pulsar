@@ -23,12 +23,28 @@
  * never the adds.  The shared-memory pairwise tree is byte-for-byte the old one
  * (no warp shuffles, no split-K): every float op happens in the same sequence,
  * so this is bit-exact by construction, not by measurement. */
+/* BF16 narrowing, byte-for-byte the expression f32_to_bf16_kernel uses in
+ * pulsar_cuda_matmul.cu.  Written out rather than calling __float2bfloat16():
+ * this epilogue REPLACES that kernel's output for the same values, so the two
+ * must agree bit-for-bit, and "the intrinsic is also round-to-nearest-even"
+ * is an assumption where copying the expression is a guarantee. */
+__device__ __forceinline__ static uint16_t pulsar_f32_to_bf16_rne(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   ///< round-to-nearest-even
+}
+
 template <uint32_t BLK, uint32_t UNROLL>
-__global__ static void rms_norm_plain_kernel(float *out, const pulsar_hc_t *x, uint32_t n, uint32_t rows, float eps) {
+__global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
+                                             const pulsar_hc_t *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const pulsar_hc_t *xr = x + (uint64_t)row * n;
     float *orow = out + (uint64_t)row * n;
+    /* Optional producer-side BF16 copy (L086 T3).  The consumer of this buffer
+     * is a BF16 GEMM (pulsar_gpu_matmul_f32_tensor runs the shared bf16 core),
+     * so emitting here deletes its convert pass rather than moving it: the
+     * value is already in a register and already scaled. */
+    uint16_t *brow = out_b ? (uint16_t *)out_b + (uint64_t)row * n : nullptr;
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
     uint32_t i = tid;
@@ -57,10 +73,16 @@ __global__ static void rms_norm_plain_kernel(float *out, const pulsar_hc_t *x, u
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) v[u] = pulsar_hc_load(xr, i + u * BLK);
         #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) orow[i + u * BLK] = v[u] * scale;
+        for (uint32_t u = 0; u < UNROLL; u++) {
+            const float o = v[u] * scale;
+            orow[i + u * BLK] = o;
+            if (brow) brow[i + u * BLK] = pulsar_f32_to_bf16_rne(o);
+        }
     }
     for (; i < n; i += BLK) {
-        orow[i] = pulsar_hc_load(xr, i) * scale;
+        const float o = pulsar_hc_load(xr, i) * scale;
+        orow[i] = o;
+        if (brow) brow[i] = pulsar_f32_to_bf16_rne(o);
     }
 }
 
@@ -985,18 +1007,23 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 int pulsar_gpu_rms_norm_plain_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
-    rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, (const pulsar_hc_t *)x->ptr, n, 1, eps);
+    rms_norm_plain_kernel<256, 8><<<1, 256>>>((float *)out->ptr, nullptr, (const pulsar_hc_t *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 
 
-int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
+int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
-    /* The f16 destination and its skip_f32 companion are gone with the last F16
-     * weight (2026-08-16): every caller passed NULL/0, so the emission could
-     * never fire and the f32 store could never be skipped. */
+    /* The F16 destination that used to sit here went out with the last F16
+     * weight (2026-08-16) -- every caller passed NULL, so it could never fire.
+     * `out_b` is its BF16 successor and is NOT the same thing: the consumer
+     * (pulsar_gpu_matmul_f32_tensor -> the shared bf16 core) genuinely wants
+     * BF16, and BF16 is the right 16-bit format here -- 8 exponent bits keep
+     * f32's range, where F16's 5 never did.  NULL is still valid and still
+     * emits nothing. */
     rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr,
+                                                 (uint16_t *)out_b,
                                                  (const pulsar_hc_t *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }

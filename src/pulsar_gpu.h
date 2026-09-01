@@ -748,6 +748,12 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(
         pulsar_gpu_tensor       *out,
+        /** Optional BF16 copy of the normalised rows (L086 T3), from
+         *  pulsar_gpu_bf16_act_slot().  NULL emits nothing.  This buffer's
+         *  consumer is a BF16 GEMM -- pulsar_gpu_matmul_f32_tensor resolves a
+         *  bf16 weight and runs the shared bf16 core -- so emitting from the
+         *  epilogue DELETES its convert pass rather than relocating it. */
+        void                    *out_b,
         const pulsar_gpu_tensor *x,
         uint32_t                n,
         uint32_t                rows,
