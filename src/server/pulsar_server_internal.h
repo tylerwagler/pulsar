@@ -1356,6 +1356,15 @@ struct server {
      * a marginal draft row is admitted while survival >= marginal_ms / this.
      * 0 until the first quantum; the argmax uses a 45 ms prior until then. */
     float    spec_ms_per_tok_ema;
+    /** L136: how often the overflow argmax actually binds.  overflow_rounds
+     * counts sweeps whose demand exceeded the shared row budget; thr_cut_rows
+     * counts candidate rows the COST THRESHOLD priced out (budget still
+     * unspent) — the only rows whose fate the marginal_ms constant decides.
+     * Worker-owned/mirrored like the counters above. */
+    uint64_t w_spec_overflow_rounds;
+    uint64_t m_spec_overflow_rounds;
+    uint64_t w_spec_thr_cut_rows;
+    uint64_t m_spec_thr_cut_rows;
     /** L123: the batched lane's shared ALL_ROWS logits landing buffer
      * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
      * first quantum. It was a per-quantum malloc/free — 16.5 MB of

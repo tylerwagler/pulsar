@@ -457,6 +457,18 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:spec_decode_gen_tokens_total Tokens emitted by the fused spec loop only.\n");
     buf_puts(&b, "# TYPE pulsar:spec_decode_gen_tokens_total counter\n");
     buf_printf(&b, "pulsar:spec_decode_gen_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
+    /* L136: overflow-argmax bind frequency.  overflow_rounds = sweeps whose
+     * row demand exceeded the shared budget; thr_cut_rows = candidate rows
+     * the cost threshold priced out with budget unspent — the only decisions
+     * the marginal_ms constant makes. */
+    buf_puts(&b, "# HELP pulsar:spec_overflow_rounds_total Spec sweeps whose row demand exceeded the shared budget.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_overflow_rounds_total counter\n");
+    buf_printf(&b, "pulsar:spec_overflow_rounds_total %llu\n",
+               (unsigned long long)s->m_spec_overflow_rounds);
+    buf_puts(&b, "# HELP pulsar:spec_thr_cut_rows_total Draft rows priced out by the overflow cost threshold with budget unspent.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_thr_cut_rows_total counter\n");
+    buf_printf(&b, "pulsar:spec_thr_cut_rows_total %llu\n",
+               (unsigned long long)s->m_spec_thr_cut_rows);
     /* Prefix-cache hit rate (scraper computes hits/queries). */
     buf_puts(&b, "# HELP vllm:prefix_cache_queries_total Cumulative prompt tokens looked up in the prefix cache.\n");
     buf_puts(&b, "# TYPE vllm:prefix_cache_queries_total counter\n");

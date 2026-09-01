@@ -1316,6 +1316,8 @@ void server::publish_metrics_snapshot() {
     s->m_spec = m;
     s->m_gen_tokens = s->w_gen_tokens;
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
+    s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
+    s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
     s->m_decode_lane = s->w_decode_lane;
     pthread_mutex_unlock(&s->mu);
 }
@@ -1948,6 +1950,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 const float ema = s->spec_ms_per_tok_ema > 1.0f ?
                                   s->spec_ms_per_tok_ema : 45.0f;
                 const float thr = marginal_ms / ema;
+                s->w_spec_overflow_rounds++;
                 int budget = (int)PULSAR_SPEC_LOGITS_ROWS - n_live;
                 while (budget > 0) {
                     int bi = -1;
@@ -1958,7 +1961,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                             bi = i;
                         }
                     }
-                    if (bi < 0 || bv < thr) break;
+                    if (bi < 0) break;
+                    if (bv < thr) {
+                        /* L136: everything left is priced out by the cost
+                         * table while budget remains — the only rows whose
+                         * fate marginal_ms decides (survival is monotone,
+                         * so all remaining candidates are <= bv < thr). */
+                        for (int i = 0; i < n; i++)
+                            s->w_spec_thr_cut_rows += npend[i] - (uint32_t)k_alloc[i];
+                        break;
+                    }
                     k_alloc[bi]++;
                     budget--;
                 }
