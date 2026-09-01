@@ -417,12 +417,6 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
  * scale and per-16 partial sums.  Zero references in the tree -- the int8
  * activation arms it belonged to are gone and every expert GEMM stages E4M3. */
 
-/** One IQ2_XXS quantisation block as it appears in the model file. */
-typedef struct {
-    uint16_t d;                      ///< block scale, f16
-    uint16_t qs[CUDA_QK_K / 8];      ///< packed 2-bit quants plus their codebook selectors
-} cuda_block_iq2_xxs;
-
 /* ---- shared types ---- */
 
 /** A span of the memory-mapped model file, and where it lives on the device.

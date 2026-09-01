@@ -102,6 +102,21 @@
 // either, and the code that tests them takes the same arm it always did.
 // ----------------------------------------------------------------------------
 
+// The arch-capability family below is upstream's, and it is DELIBERATELY kept
+// whole even though a dead-code sweep can show that FAST_FP16_AVAILABLE,
+// AMPERE_MMA_AVAILABLE and BLACKWELL_MMA_AVAILABLE have no reader in the
+// reduced source set we carry.  Do not delete them on that evidence:
+//
+//   * They are upstream predicates that upstream kernels test.  Pulling any
+//     further MMQ kernel across drops code guarded by them, and a MISSING
+//     capability macro does not fail the build -- it silently selects the #else
+//     stub.  That already happened once here, to TURING_MMA_AVAILABLE, and it
+//     produced a clean compile with every logit wrong (see the block below).
+//   * An unused #define with no body costs nothing to keep and cannot be
+//     mis-measured; an absent one costs a debugging session.
+//
+// This note exists because the sweep that flagged them will run again.
+
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 #define FP16_AVAILABLE
 #endif

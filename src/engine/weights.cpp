@@ -1298,14 +1298,6 @@ static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n)
 
 
 
-static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_f16_ctx *ctx = static_cast<matvec_f16_ctx *>(vctx);
-
-    for (uint64_t o = row0; o < row1; o++) {
-        const uint16_t *row = ctx->data + o * ctx->in_dim;
-        ctx->out[o] = dot_f16_row(row, ctx->x, ctx->in_dim);
-    }
-}
 
 
 

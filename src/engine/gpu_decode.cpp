@@ -100,20 +100,6 @@ int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 
 
-static bool gpu_graph_decode_kv_store(
-        pulsar_gpu_tensor *kv,
-        pulsar_gpu_tensor *raw_cache,
-        uint32_t          raw_cap,
-        uint32_t          raw_row) {
-
-    return pulsar_gpu_kv_fp8_store_raw_tensor(kv,
-                                             raw_cache,
-                                             raw_cap,
-                                             raw_row,
-                                             PULSAR_N_HEAD_DIM,
-                                             PULSAR_N_ROT,
-                                             gpu_graph_f32_store_observed_any()) != 0;
-}
 
 
 
@@ -146,9 +132,6 @@ uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
  * comp format parameter at all -- but the comment outlived the function and
  * ended up describing the unrelated one below. */
 
-static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
-    return pulsar_weight_is_plain_or_mxfp8(w->type);
-}
 
 
 

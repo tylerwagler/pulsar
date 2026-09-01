@@ -55,7 +55,6 @@
 #endif
 
 #define PULSAR_NEG_INF (-1.0e30f)
-#define PULSAR_POS_INF ( 1.0e30f)
 #define PULSAR_DEFAULT_RMS_EPS ( 1.0e-6f)
 #define PULSAR_DEFAULT_HC_EPS  ( 1.0e-6f)
 #define PULSAR_DEFAULT_SWIGLU_CLAMP_EXP    (10.0f)
@@ -633,21 +632,6 @@ typedef struct {
     uint32_t target_layer_ids[3];    ///< TARGET layer indices whose hiddens the drafter consumes
 } pulsar_dspark_weights;
 
-/** Argument bundle for a thread-pool matvec worker.
- *
- * The pool dispatches a ::pulsar_parallel_fn over a row range, so everything a
- * worker needs beyond (row0, row1) arrives through one void*. That is the only
- * reason these structs exist -- they are call frames, not state.
- *
- * THIS one: f16 weights against an f32 activation row.
- */
-typedef struct {
-    float *out;                                         ///< destination row(s), f32
-    const uint16_t *data;                               ///< weight rows, f16 (raw bits)
-    const float *x;                                     ///< activation row the kernel multiplies against, f32
-    uint64_t in_dim;                                    ///< input width (K)
-} matvec_f16_ctx;
-
 /* THE WHOLE CPU Q8_0 SURFACE WAS HERE, and it is gone (2026-08-18).
  *
  * Six ctx structs (matvec_q8_0_ctx, _pair_ctx, _grouped_ctx,
@@ -663,73 +647,6 @@ typedef struct {
  * run.  block_q8_K itself stays -- other declarations still reference it, and
  * whether THOSE are live is a separate audit. */
 
-/** Work item for the CPU Q8_0 activation quantiser: one row in, one quantised
- * row plus its scales out. */
-typedef struct {
-    const float *x;                                     ///< source activation row, f32
-    int8_t *xq;                                         ///< quantised activation row the kernel multiplies against
-    float *xscale;                                      ///< per-block scale for each quantised block
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t blocks;                                    ///< quantisation blocks spanning in_dim
-} quantize_q8_0_batch_ctx;
-
-/** f32 weights against an f32 activation row. */
-typedef struct {
-    float *out;                                         ///< destination row(s), f32
-    const float *data;                                  ///< weight rows, f32
-    const float *x;                                     ///< activation row the kernel multiplies against, f32
-    uint64_t in_dim;                                    ///< input width (K)
-} matvec_f32_ctx;
-
-/** IQ2_XXS gate+up PAIR: two weight rows sharing one quantised
- * activation, so the activation is loaded once for both. */
-typedef struct {
-    float *out0;                                        ///< destination row for the first of the pair, f32
-    float *out1;                                        ///< destination row for the second of the pair, f32
-    const uint8_t *base0;                               ///< weight bytes for the first row of the pair
-    const uint8_t *base1;                               ///< weight bytes for the second row of the pair
-    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t row_bytes0;                                ///< row stride for base0, quantisation included
-    uint64_t row_bytes1;                                ///< row stride for base1, quantisation included
-} matvec_iq2_xxs_pair_ctx;
-
-/** IQ2_XXS routed experts, gate+up through SwiGLU: produces the `mid`
- * product for up to PULSAR_MAX_EXPERT_USED experts in one call. */
-typedef struct {
-    float *mid;                                         ///< destination: the SwiGLU product
-    const uint8_t *gate_base[PULSAR_MAX_EXPERT_USED];   ///< weight bytes of each expert's gate projection
-    const uint8_t *up_base[PULSAR_MAX_EXPERT_USED];     ///< weight bytes of each expert's up projection
-    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
-    float expert_weight[PULSAR_MAX_EXPERT_USED];        ///< router mixing weight applied per expert
-    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t out_dim;                                   ///< output width (N)
-    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT_USED];    ///< row stride of the expert's gate projection
-    uint64_t up_row_bytes[PULSAR_MAX_EXPERT_USED];      ///< row stride of the expert's up projection
-    int n_expert;                                       ///< number of experts addressed by this call
-} matvec_iq2_xxs_mid_ctx;
-
-/** Q2_K weights against one quantised activation row. */
-typedef struct {
-    float *out;                                         ///< destination row(s), f32
-    const uint8_t *base;                                ///< weight bytes for this expert/row block, inside the model mapping
-    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t row_bytes;                                 ///< stride between weight rows, quantisation included
-} matvec_q2_k_ctx;
-
-/** Q2_K down projection ACCUMULATING across experts: each expert's
- * contribution is summed into the same output row. */
-typedef struct {
-    float *out;                                         ///< destination row(s), f32
-    const uint8_t *base[PULSAR_MAX_EXPERT_USED];        ///< weight bytes for this expert/row block, inside the model mapping
-    const block_q8_K *xq[PULSAR_MAX_EXPERT_USED];       ///< quantised activation row the kernel multiplies against
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t row_bytes[PULSAR_MAX_EXPERT_USED];         ///< stride between weight rows, quantisation included
-    int n_expert;                                       ///< number of experts addressed by this call
-} matvec_q2_k_accum_ctx;
-
 /** One (token, expert-slot) routing decision.
  *
  * A batched MoE step flattens the whole chunk's routing into a list of these,
@@ -739,59 +656,6 @@ typedef struct {
     uint32_t token;                                     ///< token index within the batch
     uint32_t slot;                                      ///< which of the token's chosen experts this is
 } pulsar_expert_pair;
-
-/** Batched IQ2_XXS gate+up: walks a (token, expert) pair list rather
- * than a fixed per-token expert set, so one call covers a whole chunk. */
-typedef struct {
-    float *mid;                                         ///< destination: the SwiGLU product
-    const uint8_t *gate_base[PULSAR_MAX_EXPERT];        ///< weight bytes of each expert's gate projection
-    const uint8_t *up_base[PULSAR_MAX_EXPERT];          ///< weight bytes of each expert's up projection
-    const block_q8_K *xq;                               ///< quantised activation row the kernel multiplies against
-    const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
-    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
-    const float *pair_weight;                           ///< router mixing weight per (token, expert) pair
-    float clamp;                                        ///< SwiGLU exponent clamp (overflow guard)
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t out_dim;                                   ///< output width (N)
-    uint64_t gate_row_bytes[PULSAR_MAX_EXPERT];         ///< row stride of the expert's gate projection
-    uint64_t up_row_bytes[PULSAR_MAX_EXPERT];           ///< row stride of the expert's up projection
-    uint64_t xq_blocks;                                 ///< quantisation blocks per activation row
-} matvec_iq2_xxs_batch_mid_ctx;
-
-/** Batched Q2_K down projection, producing one output row per
- * (token, expert) pair before pooling. */
-typedef struct {
-    float *down_pair;                                   ///< destination: per-pair down-projection output
-    const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
-    const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
-    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t out_dim;                                   ///< output width (N)
-    uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
-    uint64_t midq_blocks;                               ///< Q8_K blocks per quantised SwiGLU row
-} matvec_q2_k_batch_down_ctx;
-
-/** Pools the batched down-projection's per-pair rows into per-token
- * outputs, weighted by the router. */
-typedef struct {
-    float *moe;                                         ///< MoE output accumulator this call adds into
-    const uint8_t *base[PULSAR_MAX_EXPERT];             ///< weight bytes for this expert/row block, inside the model mapping
-    const block_q8_K *midq;                             ///< quantised SwiGLU product staged for the down projection
-    const pulsar_expert_pair *pairs;                    ///< the (token, expert) pair array this call walks
-    const uint32_t *pair_ids;                           ///< flattened (token, expert) pair ids
-    const uint32_t *expert_offset;                      ///< per-expert start offset into the pair array
-    const uint32_t *active_expert;                      ///< ids of the experts with at least one pair this call
-    uint32_t n_active;                                  ///< entries in active_expert
-    uint32_t n_tok;                                     ///< tokens in the batch; the output row count
-    uint64_t in_dim;                                    ///< input width (K)
-    uint64_t out_dim;                                   ///< output width (N)
-    uint64_t row_bytes[PULSAR_MAX_EXPERT];              ///< stride between weight rows, quantisation included
-    uint64_t midq_blocks;                               ///< Q8_K blocks per quantised SwiGLU row
-} matvec_q2_k_batch_accum_rows_ctx;
 
 /* =========================================================================
  * KV Cache and Compressors.

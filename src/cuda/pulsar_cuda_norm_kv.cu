@@ -384,20 +384,6 @@ __device__ static float dsv4_e2m1fn_value_dev(int i) {
 
 
 
-__device__ static float dsv4_e2m1fn_dequant_dev(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
-    float ax = fminf(fabsf(x), 6.0f);
-    int best = 0;
-    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
-    for (int i = 1; i < 8; i++) {
-        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
-        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
-            best = i;
-            best_diff = diff;
-        }
-    }
-    return sign * dsv4_e2m1fn_value_dev(best);
-}
 
 /* Encode to an OCP E2M1 (float_e2m1_t) 4-bit nibble: [sign:1][magnitude:3].
  * The magnitude table matches dsv4_e2m1fn_value_dev, i.e. CUTLASS float_e2m1_t. */

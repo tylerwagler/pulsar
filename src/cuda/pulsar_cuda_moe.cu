@@ -941,12 +941,16 @@ static int routed_moe_launch_mixed40(
         : (caseA ? pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_in_dim, (int)expert_mid_dim)
                  : pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_mid_dim, (int)out_dim));
 
-    uint64_t off = 0;
-    /* Twelve buffers from one reservation.  The last four (gate/up/mid/out
+    /* Fourteen buffers from one reservation.  The last four (gate/up/mid/out
      * gathers) are consumed further down; they are TAKEN here with the rest so
      * every slice comes from one bump sequence rather than being reconstructed
      * from a saved offset at the point of use -- which is the pattern that lets
-     * a stale offset survive a layout change. */
+     * a stale offset survive a layout change.
+     *
+     * The bump itself belongs to cuda_arena_take.  A `uint64_t off = 0` stood
+     * here from the hand-rolled version it replaced; nvcc had been reporting it
+     * unreferenced, and the count in this comment said twelve while the note
+     * below said thirteen and the code took fourteen. */
     const uint64_t total_scratch =
         cutlass_moe_align_up(counts_b, A)  + cutlass_moe_align_up(offsets_b, A) +
         cutlass_moe_align_up(cursors_b, A) + cutlass_moe_align_up(sorted_b, A) +
@@ -972,7 +976,7 @@ static int routed_moe_launch_mixed40(
     float    *out_g_buf    = (float *)cuda_arena_take(&ar, og_b, A);
     int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_b, A);
     uint8_t  *proj_scratch = (uint8_t *)cuda_arena_take(&ar, proj_b, A);
-    if (!proj_scratch) return 0;  /* take() latches: one check covers all thirteen */
+    if (!proj_scratch) return 0;  /* take() latches: one check covers all fourteen */
     float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
     float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
 

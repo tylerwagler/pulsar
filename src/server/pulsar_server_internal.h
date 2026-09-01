@@ -2111,7 +2111,11 @@ struct job {
  *
  * Each is defined AS the corresponding ::pulsar_kvstore_reason value rather
  * than as an independent number, so the two enums cannot drift apart: the
- * values are the store's, only the spelling is local. */
+ * values are the store's, only the spelling is local.
+ *
+ * The TYPE NAME has no user -- every reference is to a member -- so a sweep for
+ * unused types will keep proposing this for deletion.  It is not unused; the
+ * members below are the interface, and removing the typedef removes them. */
 typedef enum {
     KV_REASON_UNKNOWN   = PULSAR_KVSTORE_REASON_UNKNOWN,     ///< unspecified
     KV_REASON_COLD      = PULSAR_KVSTORE_REASON_COLD,        ///< a fresh prefix checkpoint
