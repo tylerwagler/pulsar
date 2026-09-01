@@ -713,15 +713,46 @@ bool gpu_graph_encode_layer_attention_batch(
     void *attn_norm_q = NULL, *attn_norm_sf = NULL; int attn_norm_kbp = 0;
     void *attn_norm_b = NULL;
     uint32_t attn_norm_keep_from = 0u;
+    /* batch_flat_hc's reader is the "plain F32" GEMM below, which since
+     * L079/L087 is not f32 at all: pulsar_gpu_matmul_f32_tensor resolves a bf16
+     * copy of the weight and runs the SHARED bf16 core, because these weights'
+     * source math is bf16.  So this buffer has a BF16 consumer, and without a
+     * producer-side copy that consumer converted hc_dim floats per layer per
+     * step -- the T3 census named it as in_dim=16384, cover=0, at every n_tok
+     * the run produced.  Emit from the epilogue instead: the value is already
+     * in a register and already scaled, so this deletes the convert rather
+     * than moving it.
+     *
+     * Still NO e4m3 arm() here -- that half of the old note stands.  There is
+     * no MXFP8 consumer of this buffer, so an E4M3 slot would claim one of the
+     * six and reset validity bits nobody reads. */
+    void *flat_hc_b = NULL;
+    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                        (uint64_t)hc_dim, &flat_hc_b)) {
+        flat_hc_b = NULL;   /* no slot: the consumer converts, as before */
+        /* Name the miss once per n_tok.  A reservation failure is invisible
+         * otherwise -- the consumer just converts, exactly as it did before
+         * this change, so the census cannot distinguish "not wired" from
+         * "wired but refused a slot". */
+        static uint32_t seen_n[8]; static int n_seen_n = 0;
+        int known_n = 0;
+        for (int i = 0; i < n_seen_n; i++) if (seen_n[i] == n_tokens) { known_n = 1; break; }
+        if (!known_n && n_seen_n < 8) {
+            seen_n[n_seen_n++] = n_tokens;
+            fprintf(stderr, "pulsar: flat_hc bf16 slot REFUSED (n_tok=%u hc_dim=%u)\n",
+                    n_tokens, (uint32_t)hc_dim);
+        }
+    }
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                      flat_hc_b,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
-    /* No arm() for batch_flat_hc: its only reader is the plain F32 GEMM below
-     * (hc_attn_fn is F32), no e4m3_slot is ever reserved for it, and no MXFP8
-     * consumer exists -- so arming only claimed one of the six cache slots and
-     * reset validity bits nobody read. */
+    /* note() only after the kernel SUCCEEDED -- validity must not outlive a
+     * failed launch, or the consumer reads a slot that was never written. */
+    if (ok && flat_hc_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                  (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_attn_fn,
@@ -2390,12 +2421,21 @@ bool gpu_graph_encode_layer_ffn_batch(
     void *ffn_norm_q = NULL, *ffn_norm_sf = NULL; int ffn_norm_kbp = 0;
     void *ffn_norm_b = NULL;
     uint32_t ffn_norm_keep_from = 0u;
+    /* Same bf16 epilogue as the attention side, same reason -- see the note
+     * there.  Still no e4m3 arm(). */
+    void *flat_hc_b_ffn = NULL;
+    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                        (uint64_t)hc_dim, &flat_hc_b_ffn)) {
+        flat_hc_b_ffn = NULL;
+    }
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                      flat_hc_b_ffn,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       PULSAR_RMS_EPS) != 0;
-    /* No arm() for batch_flat_hc -- see the note on the attention side. */
+    if (ok && flat_hc_b_ffn) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                      (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_ffn_fn,
