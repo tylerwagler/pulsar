@@ -932,9 +932,12 @@ typedef struct {
  * Three things live here that are easy to mistake for each other:
  *
  *  - DEVICE BUFFERS, holding the tensors themselves.
- *  - HOST FRONTIER COUNTERS (layer_n_comp and the ms_* per-bank arrays), which
- *    say how much of each buffer is live. These are bookkeeping the multiseq
- *    driver owns; nothing on the device reads them.
+ *  - HOST FRONTIER COUNTERS (the ms_* per-bank arrays), which say how much of
+ *    each buffer is live. These are bookkeeping the multiseq driver owns;
+ *    nothing on the device reads them. Read the compressed frontier through
+ *    gpu_graph_n_comp() / gpu_graph_n_index_comp(), never by reaching into the
+ *    array -- stage 1b deleted the scalar twins precisely so there is one
+ *    store to get wrong.
  *  - BANK VIEWS. When a pool is active the per-layer cache pointers are views
  *    into ::pulsar_bank_slabs rather than owned allocations, re-pointed by
  *    gpu_graph_bank_repoint. Freeing a view would free another bank's rows.
@@ -1255,20 +1258,22 @@ typedef struct {
     /** Tier-2 banked multiseq step state (increment 2 — per-bank compressor
      * frontiers).  The authoritative per-bank compressed-row counters are
      * ms_n_comp / ms_n_index_comp (indexed by TRUE bank id, never a packed
-     * row ordinal); they are HOST bookkeeping owned by the multiseq driver:
-     * gpu_graph_bank_repoint swaps device views only, and classic
-     * single-session work against a repointed bank runs on the scalar
-     * layer_n_comp counters — use gpu_graph_bank_counters_install /
-     * _capture at the boundary.
+     * row ordinal); they are HOST bookkeeping owned by the multiseq driver,
+     * and gpu_graph_bank_repoint swaps device views only.
      *
-     * During a multiseq step (batch_multiseq armed by
-     * gpu_graph_multiseq_step_begin), the scalar layer_n_comp /
-     * layer_n_index_comp become CROSS-BANK SUPERSETS, written exactly once
-     * at step top — the step's emit-inclusive visibility bound,
-     * max over rows of (pos+1)/ratio — and never mutated mid-forward (the
-     * structural avoidance of the reference fork's context-killing race:
-     * cross-bank maxima are launch/scratch bounds only, never bank
-     * addresses or extents).  The batched emit loop writes each emitted row
+     * ⚠ STAGE 1b (1a0bd1a) DELETED THE SCALAR TWINS. There is no
+     * layer_n_comp / layer_n_index_comp any more: gpu_graph_n_comp() and
+     * gpu_graph_n_index_comp() resolve to ms_n_comp[cur_bank][il], and a
+     * session with no pool is simply bank 0, so there is no "classic case"
+     * left to special-case or to hand off at a boundary. That is the fix for
+     * the class that produced L133, where a correctness fix landed on one of
+     * two copies and the second could not be seen; the divergence is now
+     * unrepresentable rather than merely repaired.
+     *
+     * The two ALIGNED-chunk writes that used to publish a CROSS-BANK SUPERSET
+     * are consequently guarded !mseq — with the scalar gone such a write would
+     * land on cur_bank's real row and clobber it — and the banked arms publish
+     * per bank instead.  The batched emit loop writes each emitted row
      * into seq_id[t]'s bank at that bank's frontier and bumps ONLY that
      * bank's ms counter; per-row raw-ring state needs no bookkeeping at all
      * (the ring is position-indexed: slot = pos % raw_cap per bank).
@@ -1320,8 +1325,10 @@ typedef struct {
     pulsar_gpu_tensor *batch_seq_id;      ///< DEVICE copy of ms_seq_id, read by the kernels
     /** A multiseq step is in flight. Armed by gpu_graph_multiseq_step_begin for
      * EVERY batched step -- one row or sixteen -- which is what makes the
-     * batched lane the only decode lane. While armed, the scalar layer_n_comp
-     * counters are cross-bank SUPERSETS rather than any one bank's frontier. */
+     * batched lane the only decode lane. While armed, the aligned-chunk
+     * frontier publishes are guarded off (see the multiseq block above): with
+     * the scalar twins deleted in stage 1b there is no superset slot to write,
+     * and the banked arms publish per bank instead. */
     bool batch_multiseq;
     uint32_t batch_multiseq_rows;         ///< rows in the current step
 } pulsar_gpu_graph;
@@ -1867,13 +1874,17 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
-    /** A multiseq step has run and the graph's CLASSIC per-bank state is no
-     * longer re-establishable by bookkeeping alone: the scalar frontier
-     * counters (layer_n_comp / layer_n_index_comp) hold a cross-bank
-     * SUPERSET, not any single bank's truth.  Any classic entry that decodes
-     * against those scalars (pulsar_session_eval) would emit its compressor row
-     * at the superset index and attend over the rows below it — a previous
-     * tenant's bytes — producing wrong logits SILENTLY.  checkpoint_valid
+    /** A multiseq step has run and this session's per-bank state is no longer
+     * re-establishable by bookkeeping alone.
+     *
+     * ⚠ The MECHANISM changed in stage 1b, the HAZARD did not. It used to be
+     * that the scalar frontier counters held a cross-bank superset and a
+     * classic entry decoding against them would emit at the superset index and
+     * attend over a previous tenant's bytes. Those scalars are gone
+     * (gpu_graph_n_comp() reads ms_n_comp[cur_bank] directly), so that exact
+     * shape is unrepresentable — but a step that touched OTHER banks still
+     * leaves this session's notion of which bank is live, and the rest of the
+     * per-bank carry, needing a re-establish. Keep the guard.  checkpoint_valid
      * does NOT cover this: pulsar_session_eval never reads it.  Set on every
      * decode_multiseq path that armed a step; cleared only where per-bank
      * device state is legitimately re-established (pulsar_session_sync's rebuild
@@ -2598,8 +2609,10 @@ uint32_t gpu_graph_bank_pool_n(void);
  * Contract: call only between fully synchronized forwards — the previous
  * bank's enqueued work must be complete, because the graph pointers change
  * under every subsequent launch.  This swaps DEVICE views only: the host
- * per-session state (layer_n_comp/layer_n_index_comp, ring fill, positions,
- * spec-shadow contents) is the caller's to save/restore per bank.  On
+ * per-session state (ring fill, positions, spec-shadow contents) is the
+ * caller's to save/restore per bank.  The compressed frontier is NOT in that
+ * list any more — ms_n_comp is indexed by bank, and repoint sets cur_bank, so
+ * the accessors follow automatically (stage 1b).  On
  * failure the views may be mixed-bank — treat the graph as dead. */
 bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank);
 /** Effective pool size for banked kernel launches: banks.n_banks, or 1 when
@@ -2612,8 +2625,8 @@ uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
 /** Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
- * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
- * read their captured ms_n_comp.  The increment-2b guard uses this for the
+ * from its compressor frontier.  Every bank -- live or idle -- reads
+ * ms_n_comp[bank] now; stage 1b removed the separate live-scalar case.  The increment-2b guard uses this for the
  * per-bank Δ projection and the smallest-frontier victim tie-break.
  */
 uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
@@ -2674,11 +2687,18 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32
 pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
 pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
 pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-/** Host counter hand-off between classic single-session work (scalar
- * layer_n_comp/layer_n_index_comp) and the per-bank ms counters.  Capture
- * after classic per-bank work (admission prefill, replay) so the ms arrays
- * reflect that bank's committed frontier; install before classic per-bank
- * work so the scalars are that bank's counts again. */
+/** Host state hand-off for the fields that still have scalar twins.
+ *
+ * ⚠ THE COMPRESSED FRONTIER NO LONGER RIDES THIS. Stage 1b deleted
+ * layer_n_comp/layer_n_index_comp, so install's frontier loop is empty and
+ * capture's half is gone: ms_n_comp is indexed by bank and the accessors follow
+ * cur_bank on their own. What these still carry is the drafter ring state
+ * (dspark_n_raw, dspark_prompt_lo/n), the projection ring bounds
+ * (proj_ring_lo/hi) and the ratio-128 undo log (r128_undo_*) — the twins stage
+ * 2 is meant to collapse.
+ *
+ * Capture after per-bank work so those arrays reflect the bank; install before
+ * per-bank work resumes so the scalars are that bank's again. */
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
 

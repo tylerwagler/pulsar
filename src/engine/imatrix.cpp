@@ -1026,10 +1026,11 @@ bool gpu_graph_verify_suffix_tops(
  * positions; every bank's frontier position-true; no position-0 rows — for
  * plain decode each bank contributes exactly one row, trivially satisfying
  * the run rules).  The caller owns per-bank host bookkeeping: ms counters
- * current (gpu_graph_bank_counters_capture after any classic per-bank work),
- * and after this step the scalar layer_n_comp counters hold the CROSS-BANK
- * SUPERSET — gpu_graph_bank_counters_install(bank) before any classic
- * single-bank work resumes.  NEVER co-schedule speculation with n_active >= 2
+ * current (gpu_graph_bank_counters_capture after any per-bank work), and
+ * gpu_graph_bank_counters_install(bank) before per-bank work resumes.  Since
+ * stage 1b that hand-off no longer carries the compressed frontier — that is
+ * ms_n_comp[bank], which needs no hand-off — only the drafter ring, projection
+ * ring and r128 undo twins.  NEVER co-schedule speculation with n_active >= 2
  * (contract; the scheduler's alone->spec / shared->plain switch).
  *
  * logits: out [n_active * PULSAR_N_VOCAB] host rows, row k = bank[k]'s

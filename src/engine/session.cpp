@@ -951,12 +951,17 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    /* The rebuild path is the one place classic per-bank truth is legitimately
-     * re-established: reset_prefill_state zeroes layer_n_comp /
-     * layer_n_index_comp, so the scalars stop holding any multiseq superset
-     * and the prefill below refills them from zero against the installed
-     * bank.  (The prefix-resume path above cannot be reached while dirty —
-     * decode_multiseq clears checkpoint_valid, which that path gates on.) */
+    /* The rebuild path is the one place this session's per-bank truth is
+     * legitimately re-established: reset_prefill_state zeroes
+     * ms_n_comp[cur_bank] / ms_n_index_comp[cur_bank] and the prefill below
+     * refills them from zero against the installed bank.  Other banks hold
+     * other slots' positions and a reset here says nothing about them.
+     *
+     * (Before stage 1b this zeroed the scalar twins, whose second job was
+     * clearing a stale multiseq superset; there is no superset any more, so
+     * that job went with them.  The prefix-resume path above still cannot be
+     * reached while dirty — decode_multiseq clears checkpoint_valid, which
+     * that path gates on.) */
     s->mseq_dirty = false;
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
