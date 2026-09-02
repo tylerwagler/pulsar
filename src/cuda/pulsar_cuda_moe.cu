@@ -1856,8 +1856,11 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                     (unsigned long long)(mid ? mid->bytes : 0),
                     (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
         }
-        /* inc 2: raise the M-independent GEMV cap to PULSAR_MSEQ_MAX (8) for a batched
-         * step so 5..8 keep the per-token path instead of the grouped GEMM. */
+        /* inc 2 (2026-07): raised the M-independent GEMV cap to what was then
+         * PULSAR_MSEQ_MAX (8) for a batched step so 5..8 kept the per-token
+         * path instead of the grouped GEMM.  MSEQ_MAX is 16 now, and L152
+         * (2026-09-02) tied the ARMED cap to PULSAR_GPU_MNEUTRAL_ROWS_MAX; the
+         * unarmed 8 below is that historical value. */
         /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
          * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
          * blocking per-layer offsets readback. Both arms are 8 now; the 5..8 path
