@@ -638,29 +638,6 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
-// ---- extern-C expert FFN (standalone/test convenience): allocates+frees its own scratch and
-// synchronizes before returning. The engine never calls this -- it calls the scratch variant
-// above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
-// here is exactly the hot-path cost the engine path exists to avoid. ----
-int pulsar_cutlass_expert_ffn(
-    float *out, const float *x,
-    const uint8_t *Wg_d, const ElementSF *Wg_sf,
-    const uint8_t *Wu_d, const ElementSF *Wu_sf,
-    const uint8_t *Wd_d, const ElementSF *Wd_sf,
-    const float *weights, float clamp,
-    int T, int in_dim, int mid_dim, int out_dim){
-  size_t scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(T, in_dim, mid_dim, out_dim);
-  uint8_t *scratch=nullptr;
-  cudaMalloc(&scratch, scratch_bytes);
-  int rc = pulsar_cutlass_expert_ffn_scratch(out,x,Wg_d,reinterpret_cast<const uint8_t*>(Wg_sf),
-                                          Wu_d,reinterpret_cast<const uint8_t*>(Wu_sf),
-                                          Wd_d,reinterpret_cast<const uint8_t*>(Wd_sf),
-                                          weights,clamp,
-                                          T,in_dim,mid_dim,out_dim,scratch,scratch_bytes);
-  cudaDeviceSynchronize();
-  cudaFree(scratch);
-  return rc;
-}
 
 // ============================================================================================
 // GROUPED MXFP4 PREFILL FFN — single ptr-array grouped GEMM per logical matmul (gate/up/down),

@@ -1590,7 +1590,8 @@ int pulsar_gpu_routed_moe_batch_tensor(
  * least pulsar_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes; size once for the
  * layer's shape at the largest T a single expert can see and reuse across every expert and
  * every CUTLASS-typed layer sharing that shape -- this function does no allocation and no
- * synchronization, unlike pulsar_cutlass_expert_ffn (used only by the standalone test). */
+ * synchronization (the malloc+synchronize convenience wrapper that once sat beside it had no
+ * caller and is gone, L142). */
 size_t pulsar_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim);
 int pulsar_cutlass_expert_ffn_scratch(
         float          *out,
