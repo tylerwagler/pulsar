@@ -90,8 +90,11 @@ bug, not a design change.
       mixed, spec rounds).
 
 ## Open items for bring-up
-- Slab must be host-coherent + GPU-visible on GB10 (unified memory; register
-  once via ibv_reg_mr) — negative path already exercised.
+- **Slab (resolved on-pair 2026-09-02):** `cudaMallocManaged` does NOT register
+  with `ibv_reg_mr` on GB10 (EFAULT). Host-pinned (`malloc` + `cudaHostRegister`)
+  registers and the probe passes over RDMA — engine slice 4c must allocate the
+  slab host-pinned, not managed (kernels still write it directly over unified
+  memory; no D2H/H2D bounce).
 - Two-cable RDMA: pick device explicitly (`PULSAR_TP_RDMA_DEV`); bench 1-link
   vs 2-link.
 - Caveat recorded, not re-litigated: community reports the shipped

@@ -76,6 +76,18 @@ memory registers with `ibv_reg_mr` and moves 16 KiB partials over RoCE, the
 plan's "register-once GPU-visible slabs, no D2H/H2D bounce" holds. If it fails,
 capture the `cudaGetErrorString`/`strerror` now — it changes the slab design.
 
+> **VERDICT (pair-verified 2026-09-02):** `cudaMallocManaged` does **not**
+> register — `ibv_reg_mr(14091976) : Bad address` on both ranks (device pages
+> aren't HCA-pinnable). The host-pinned path (`malloc` + `cudaHostRegister` +
+> `ibv_reg_mr`) **does** register, and the full probe passes over real RDMA on
+> the 9.x wire (`mr=registered`, gates/batch/big both ranks). The engine slab
+> (4c) must use the **host-pinned registered slab** — GB10 unified memory still
+> lets kernels write it directly (no D2H/H2D bounce). The probe defaults to
+> host-pinned; `PULSAR_TP_SLAB_MANAGED=1` reproduces the failed managed attempt.
+> `nvidia-peermem` exists on disk but is not loaded — a future true-GDR path
+> (`cuMemCreate` + dma-buf + `ibv_reg_dmabuf_mr`) stays available if
+> device-resident slabs ever matter.
+
 ## 5. RDMA link bench — 1-link vs 2-link (supports the two-cable note) — ~5 min
 
 Run the PLAN 102 probe's RDMA halves (not on production without a window):

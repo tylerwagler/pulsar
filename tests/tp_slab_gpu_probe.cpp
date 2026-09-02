@@ -73,24 +73,52 @@ static int run_rank(pulsar_tp *tp, int rank) {
                 pulsar_tp_is_rdma(tp) ? "rdma" : "tcp");
 
     const size_t slab_bytes = (size_t)pulsar_tp_slab_bytes(N_LAYER, N_EMBD);
+    /* Slab allocation strategy — the runbook step-4 question, answered on the
+     * pair (2026-09-02): cudaMallocManaged is NOT HCA-registrable on GB10
+     * (ibv_reg_mr rejects the pages with EFAULT / "Bad address"); the classic
+     * GPUDirect-from-host pattern (page-locked cudaHostRegister memory) IS
+     * accepted by ibv_reg_mr, and GB10 unified memory lets kernels touch it
+     * directly (no D2H/H2D bounce).  Host-pinned is therefore the default and
+     * the slab design the engine (4c) must follow.  To reproduce the failed
+     * managed attempt: PULSAR_TP_SLAB_MANAGED=1. */
+    const bool hostpin = !(getenv("PULSAR_TP_SLAB_MANAGED") &&
+                           getenv("PULSAR_TP_SLAB_MANAGED")[0]);
     void *base = NULL;
-    cudaError_t ce = cudaMallocManaged(&base, slab_bytes);
-    if (ce != cudaSuccess || !base) {
-        std::fprintf(stderr,
-                     "rank %d: cudaMallocManaged(%zu) failed: %s — requires a "
-                     "CUDA device (this binary is for the pair)\n",
-                     rank, slab_bytes, cudaGetErrorString(ce));
-        return 2;
+    const char *alloc_mode = "cudaMallocManaged";
+    if (!hostpin) {
+        cudaError_t ce = cudaMallocManaged(&base, slab_bytes);
+        if (ce != cudaSuccess || !base) {
+            std::fprintf(stderr,
+                         "rank %d: cudaMallocManaged(%zu) failed: %s — requires a "
+                         "CUDA device (this binary is for the pair)\n",
+                         rank, slab_bytes, cudaGetErrorString(ce));
+            return 2;
+        }
+    } else {
+        alloc_mode = "malloc+cudaHostRegister";
+        if (posix_memalign(&base, 4096, slab_bytes) != 0 || !base) {
+            std::fprintf(stderr, "rank %d: posix_memalign(%zu) failed\n",
+                         rank, slab_bytes);
+            return 2;
+        }
+        cudaError_t ce = cudaHostRegister(base, slab_bytes, cudaHostRegisterMapped);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "rank %d: cudaHostRegister(%zu) failed: %s\n",
+                         rank, slab_bytes, cudaGetErrorString(ce));
+            free(base);
+            return 2;
+        }
     }
     std::memset(base, 0, slab_bytes);
     char err[256];
     if (!pulsar_tp_attach_slab(tp, base, err, sizeof(err))) {
-        CHECK(0, "rank %d: attach_slab (cudaMallocManaged): %s", rank, err);
-        cudaFree(base);
+        CHECK(0, "rank %d: attach_slab (%s): %s", rank, alloc_mode, err);
+        if (hostpin) { cudaHostUnregister(base); free(base); } else cudaFree(base);
         return 1;
     }
-    std::printf("rank %d: slab attached, GPU-visible (%zu bytes), mr=%s\n",
-                rank, slab_bytes, pulsar_tp_is_rdma(tp) ? "registered" : "tcp-stage");
+    std::printf("rank %d: slab attached, GPU-visible (%zu bytes, %s), mr=%s\n",
+                rank, slab_bytes, alloc_mode,
+                pulsar_tp_is_rdma(tp) ? "registered" : "tcp-stage");
 
     pulsar_tp_slab s;
     pulsar_tp_slab_layout_init(N_LAYER, N_EMBD, &s);
@@ -142,7 +170,7 @@ static int run_rank(pulsar_tp *tp, int rank) {
     }
 
     pulsar_tp_free(tp);
-    cudaFree(base);
+    if (hostpin) { cudaHostUnregister(base); free(base); } else cudaFree(base);
     if (g_failures) {
         std::fprintf(stderr, "tp_slab_probe: rank %d: %d FAILURE(S)\n", rank, g_failures);
         return 1;
