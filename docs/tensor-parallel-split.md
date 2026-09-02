@@ -94,7 +94,10 @@ bug, not a design change.
   with `ibv_reg_mr` on GB10 (EFAULT). Host-pinned (`malloc` + `cudaHostRegister`)
   registers and the probe passes over RDMA — engine slice 4c must allocate the
   slab host-pinned, not managed (kernels still write it directly over unified
-  memory; no D2H/H2D bounce).
+  memory; no D2H/H2D bounce). **GPUDirect RDMA is unavailable on this platform**
+  (tests/tp_dmabuf_probe: attrs 110/116 = 0, CUDA-13 GPURDMA flag rejected,
+  dma-buf import EINVAL) — so host-pinned is final, not a stopgap. Recheck the
+  probe if the nvidia driver ever advertises `GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED`.
 - Two-cable RDMA: pick device explicitly (`PULSAR_TP_RDMA_DEV`); bench 1-link
   vs 2-link.
 - Caveat recorded, not re-litigated: community reports the shipped

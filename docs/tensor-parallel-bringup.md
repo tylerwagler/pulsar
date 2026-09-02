@@ -84,9 +84,14 @@ capture the `cudaGetErrorString`/`strerror` now — it changes the slab design.
 > (4c) must use the **host-pinned registered slab** — GB10 unified memory still
 > lets kernels write it directly (no D2H/H2D bounce). The probe defaults to
 > host-pinned; `PULSAR_TP_SLAB_MANAGED=1` reproduces the failed managed attempt.
-> `nvidia-peermem` exists on disk but is not loaded — a future true-GDR path
-> (`cuMemCreate` + dma-buf + `ibv_reg_dmabuf_mr`) stays available if
-> device-resident slabs ever matter.
+> **GPUDirect RDMA is NOT available on this platform** (tests/tp_dmabuf_probe,
+> verified on-pair): `GPU_DIRECT_RDMA_SUPPORTED=0` and
+> `GDR_WITH_VMM_SUPPORTED=0`, `cuMemCreate` rejects the CUDA-13 GPURDMA flag,
+> and the exported dma-buf is refused by `ibv_reg_dmabuf_mr` (EINVAL) — the
+> driver cannot produce GDR-capable memory no matter what. `nvidia-peermem`
+> (stale DKMS left-over, not in `dkms status`, fails to insert) could not
+> change that anyway. Host-pinned is therefore the final slab design; rerun
+> `tests/tp_dmabuf_probe` after any nvidia driver update to recheck attr 110.
 
 ## 5. RDMA link bench — 1-link vs 2-link (supports the two-cable note) — ~5 min
 

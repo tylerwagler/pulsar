@@ -76,7 +76,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
 PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 
-.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe
+.PHONY: all help clean test seam-check cuda-spark cuda-regression cuda-attn-gates cuda-frontier-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -594,6 +594,17 @@ tests/tp_slab_gpu_probe: tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp
 
 tp-slab-probe: tests/tp_slab_gpu_probe
 	@echo "built tests/tp_slab_gpu_probe; run on the pair per docs/tensor-parallel-bringup.md"
+
+# TP GPUDirect capability probe (slab-class verdict): the full dma-buf GDR
+# sequence -- VMM pinned alloc, CUDA-13 GPURDMA flag, export-to-posix-fd,
+# ibv_reg_dmabuf_mr.  Builds on any box with CUDA + libibverbs-dev; run on the
+# pair.  NEGATIVE on GB10/driver 610 (attrs 110/116 = 0; dma-buf import EINVAL)
+# -- see tests/tp_dmabuf_probe.cpp.  Recheck after any nvidia driver update.
+tests/tp_dmabuf_probe: tests/tp_dmabuf_probe.cpp
+	$(CXX) $(CXXFLAGS) -std=c++17 -I$(CUDA_HOME)/include -o $@ tests/tp_dmabuf_probe.cpp -L$(CUDA_HOME)/lib64/stubs -L$(CUDA_HOME)/lib64 -lcuda -l:libibverbs.so.1
+
+tp-dmabuf-probe: tests/tp_dmabuf_probe
+	@echo "built tests/tp_dmabuf_probe; run on the pair (GDR negative on GB10/610)"
 
 test: pulsar_test seam-check
 	./pulsar_test
