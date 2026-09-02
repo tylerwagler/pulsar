@@ -43,6 +43,23 @@
  * still demands byte-identity vs the decode-only step of the same width. */
 #define N_DEC_MAX ((int)PULSAR_MSEQ_MAX - 1)   /* +1 bank goes to the prefill run */
 static int g_n_dec = 2;
+/* L152 stage dump (diagnostic): with L152_DUMP_DIR set (and the engine's
+ * PULSAR_CUDA_GRAPH_DUMP_NAME/LAYER pointing at the batched-step stages), each
+ * GATE 5R step dumps under <dir>/<tag>_ -- bat_f / bat_r for the batched step,
+ * solo<k> for bank k alone -- and the per-bank re-prefills that build the
+ * fixture under <dir>/skip_ (delete those).  tools/l152_dumpcmp.py reads them. */
+static const char *g_dump_dir = NULL;
+static const char *g_dump_tag = NULL;
+static void dump_prefix(const char *tag) {
+    if (!g_dump_dir) return;
+    char pfx[512];
+    /* Outside the step under test the prefix points under /dev/null so the
+     * fixture's per-bank re-prefill dumps fail to open instead of filling the
+     * disk with 43 layers of prefill tensors per step. */
+    if (!tag) snprintf(pfx, sizeof(pfx), "/dev/null/skip");
+    else      snprintf(pfx, sizeof(pfx), "%s/%s", g_dump_dir, tag);
+    setenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX", pfx, 1);
+}
 #define C0    128               /* prefill bank's classic first chunk (lifts frontier off 0) */
 #define K_PRE 64                /* prefill run length; >8 => grouped MoE suffix taken */
 #define PBASE 700               /* prefill bank token region (distinct from decode banks) */
@@ -235,6 +252,7 @@ static bool multirun_step_logits(int rpb, int only_bank, float *out) {
  * ISSUE order; *issued lists the bank of each run in that order. */
 static bool multirun_step_rows(const int *rpb_of, int only_bank, bool reverse, float *out, int *issued) {
     pulsar_session *s = NULL;
+    dump_prefix("skip");   /* the fixture re-prefills dump under skip_ (L152 diag) */
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
     pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
@@ -269,8 +287,10 @@ static bool multirun_step_rows(const int *rpb_of, int only_bank, bool reverse, f
             }
         }
         uint32_t got = 0;
+        dump_prefix(g_dump_tag);
         const int rc = pulsar_session_decode_mixed(s, reqs, n_rows, out, (int)(n_rows * (uint32_t)vocab),
                                                 &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err);
+        dump_prefix("skip");
         if (rc != 0 || got != n_rows) {
             fprintf(stderr, "multirun ALL_ROWS decode_mixed(rows=%u) rc=%d got=%u: %s\n", n_rows, rc, got, err); ok = false;
         }
@@ -388,10 +408,13 @@ int main(int argc, char **argv) {
         for (int k = 0; k < g_n_dec; k++) { total += rpb_of[k]; if (rpb_of[k] > rmax) rmax = rpb_of[k]; }
         printf("GATE 5R: run lengths per bank:"); for (int k = 0; k < g_n_dec; k++) printf(" %d", rpb_of[k]); printf(" (total %d rows)\n", total);
         const uint32_t vocab = PULSAR_N_VOCAB;
+        g_dump_dir = getenv("L152_DUMP_DIR");
         for (int rev = 0; rev < 2; rev++) {
             float *all = (float *)malloc((size_t)total * vocab * sizeof(float));
             float *solo = (float *)malloc((size_t)rmax * vocab * sizeof(float));
             int issued[N_DEC_MAX], one[N_DEC_MAX];
+            char solo_tag[32];
+            g_dump_tag = rev ? "bat_r" : "bat_f";
             if (!all || !solo || !multirun_step_rows(rpb_of, -1, rev != 0, all, issued)) {
                 fprintf(stderr, "GATE 5R: batched step failed\n"); g_fail = 1; free(all); free(solo); continue;
             }
@@ -399,6 +422,8 @@ int main(int argc, char **argv) {
             for (int slot = 0; slot < g_n_dec; slot++) {
                 const int k = issued[slot];
                 const int RPB = rpb_of[k];
+                snprintf(solo_tag, sizeof(solo_tag), "solo%d", k);
+                g_dump_tag = solo_tag;
                 if (!multirun_step_rows(rpb_of, k, false, solo, one)) { fprintf(stderr, "GATE 5R: solo %d failed\n", k); g_fail = 1; break; }
                 for (int j = 0; j < RPB; j++) {
                     const float *a = all + (row_off + (size_t)j) * vocab;

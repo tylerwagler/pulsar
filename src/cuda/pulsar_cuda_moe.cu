@@ -1878,7 +1878,22 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * pulsar-notes rows/L117.md). GEMV vs grouped was byte-identical at
          * widths 6/8 (above); M=1 verified the same way (probe logits hash,
          * see the row). */
-        const uint32_t moe_gemv_cap = 8u;
+        /* L152 2026-09-02: the cap was a bare 8, INSIDE the M-neutral range
+         * (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16).  So an armed 9..16-row step took
+         * routed_moe_launch_cutlass_dispatch's fixed-tile projection while the
+         * same bank's rows in a <= 8-row step took this GEMV.  The two agree
+         * to the last bit on MOST rows and not on all (a final-rounding
+         * difference that shows up in ~1 element per 50k, e.g. one bf16 hidden
+         * element of one drafter row at layer 0), which is exactly the
+         * row-selective non-identity both L150 (batched drafter identical at 8
+         * rows, not at 9) and L152 (GATE 5R: bank 0 rows 2-4 off by whole
+         * logits at 10 rows, byte-identical at 8) bisected to.  The in-file
+         * "byte-identical at widths 6/8" note above compared the two paths
+         * only where both were reachable, i.e. never above 8.  An armed step
+         * now takes the GEMV for the whole neutral range; unarmed callers
+         * (classic prefill) keep the old cap. */
+        const uint32_t moe_gemv_cap = pulsar_gpu_matmul_batch_mneutral()
+                ? PULSAR_GPU_MNEUTRAL_ROWS_MAX : 8u;
         if (n_tokens >= 1u && n_tokens <= moe_gemv_cap &&
             mid && mid->ptr && down && down->ptr && out && out->ptr &&
             selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
@@ -1934,7 +1949,11 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * fallback, so it is deliberately NOT flagged here. */
         {
             static int gemv_batch_logged = 0;
-            if (n_tokens >= 1u && n_tokens <= 4u && !gemv_batch_logged) {
+            /* L152: an ARMED step of any width <= moe_gemv_cap falling through
+             * is a neutrality break (the rows would take the other kernel), so
+             * it is announced at every armed width, not only 2..4. */
+            const uint32_t warn_cap = pulsar_gpu_matmul_batch_mneutral() ? moe_gemv_cap : 4u;
+            if (n_tokens >= 1u && n_tokens <= warn_cap && !gemv_batch_logged) {
                 gemv_batch_logged = 1;
                 fprintf(stderr,
                         "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",

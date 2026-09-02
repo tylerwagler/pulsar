@@ -1431,16 +1431,18 @@ __global__ static void attention_decode_split_merge_kernel(
  * launch at a time on one stream, so a single scratch is safe; a future
  * multi-stream decode would need per-stream scratch.
  *
- * L150/L152 (2026-09-02): the token cap MUST cover every row count the
- * M-neutral decode step can carry (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16), not
- * just 8.  The split tier's softmax merge rounds differently from the
- * single-walk kernel, so with the cap at 8 a bank's rows computed one way in
- * a <= 8-row step and another way in a 9..16-row step -- the batched drafter
- * forward was byte-identical to its serialized twin at 8 rows and not at 9,
- * and the base verify step (GATE 5) was identical at 8 rows and off by whole
- * logit units at 10 (the tier switch amplified through 43 layers of MoE
- * routing).  Every gate to that date had run at <= 8 rows; production's 9-12
- * row verify step was the only caller on the other side of the cap. */
+ * L150/L152 (2026-09-02): the token cap covers every row count the M-neutral
+ * decode step can carry (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16), not just 8.  The
+ * split tier's softmax merge rounds differently from the single-walk kernel,
+ * so a cap inside the neutral range means a bank's rows compute one way in a
+ * <= cap-row step and another way above it.  Raised on principle: the 8-vs-9
+ * row non-identity that L150 and L152 bisected to was NOT this cap (measured:
+ * 8 -> 16 changed no bit of either gate, because the batched verify step
+ * takes the fp16 indexed tier and the drafter forward the raw fp16 tier;
+ * neither reaches this launcher above one token).  That defect was the MoE
+ * GEMV cap in pulsar_cuda_moe.cu (moe_gemv_cap).  This launcher is reached
+ * with 9..16 tokens only when the fp16 tiers decline (non-causal batches,
+ * oversized comp), and there the same argument applies. */
 #define PULSAR_DEC_SPLITKV_S 8u
 #define PULSAR_DEC_SPLITKV_MAX_TOKENS 16u
 #define PULSAR_DEC_SPLITKV_MAX_HEADS 128u
