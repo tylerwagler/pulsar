@@ -90,7 +90,32 @@ __global__ static void matmul_nt_kernel(
     #pragma unroll
     for (int t = 0; t < NT; t++) sum[t] = 0.0f;
     const WT *wr = w + row * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+    /* L144: the same per-thread walk (i = tid, tid + 256, ...) and the same
+     * FMA sequence per accumulator, but the loads of U consecutive strides are
+     * issued before any of their FMAs.  As one dependent load per FMA the
+     * 16384-wide hc rows ran at 27 GB/s on a grid of 24 blocks -- a latency
+     * chain, not a bandwidth limit.  Accumulation ORDER is untouched, so every
+     * output is bit-identical (L109 N1's split-K changed the order and cost 8%
+     * tokens/step -- 35220f6).  U shrinks with NT to keep xv[] in registers. */
+    constexpr int U = NT <= 4 ? 8 : (NT <= 8 ? 4 : 2);
+    const uint64_t stride = blockDim.x;
+    uint64_t i = threadIdx.x;
+    for (; i + (uint64_t)(U - 1) * stride < in_dim; i += (uint64_t)U * stride) {
+        float wv[U];
+        float xv[U][NT];
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+            wv[u] = pulsar_wt_load(wr, i + (uint64_t)u * stride);
+            #pragma unroll
+            for (int t = 0; t < NT; t++) xv[u][t] = pulsar_at_load(x, t * in_dim + i + (uint64_t)u * stride);
+        }
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+            #pragma unroll
+            for (int t = 0; t < NT; t++) sum[t] += wv[u] * xv[u][t];
+        }
+    }
+    for (; i < in_dim; i += stride) {
         const float wv = pulsar_wt_load(wr, i);
         #pragma unroll
         for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(x, t * in_dim + i);
@@ -151,7 +176,22 @@ __global__ static void matmul_bf16_kernel(
     float sum = 0.0f;
     const uint16_t *wr = w + row * in_dim;
     const __nv_bfloat16 *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+    /* L144: loads for 8 strides hoisted ahead of their FMAs; walk and
+     * accumulation order unchanged -- see matmul_nt_kernel. */
+    constexpr int U = 8;
+    const uint64_t stride = blockDim.x;
+    uint64_t i = threadIdx.x;
+    for (; i + (uint64_t)(U - 1) * stride < in_dim; i += (uint64_t)U * stride) {
+        float wv[U], xv[U];
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+            wv[u] = bf16_to_f32(wr[i + (uint64_t)u * stride]);
+            xv[u] = __bfloat162float(xr[i + (uint64_t)u * stride]);
+        }
+        #pragma unroll
+        for (int u = 0; u < U; u++) sum += wv[u] * xv[u];
+    }
+    for (; i < in_dim; i += stride) {
         sum += bf16_to_f32(wr[i]) * __bfloat162float(xr[i]);
     }
     __shared__ float partial[256];
@@ -1883,7 +1923,7 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(OT *out, const __nv_fp8_e4m3 *
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             const float wj = __half2float((__half)q[j]) * sc;
-            #pragma unroll
+                #pragma unroll
             for (int t = 0; t < NT; t++) acc[t] += wj * xk[(size_t)t * in_dim + j];
         }
     }
