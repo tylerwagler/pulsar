@@ -995,6 +995,23 @@ typedef struct {
     pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
     pulsar_gpu_tensor *dspark_refined2_ids;  ///< [17] i32 runner-ups (DTree)
     pulsar_gpu_tensor *dspark_prefilter_sel;  ///< L149: [16 x PULSAR_DSPARK_PREFILTER_ROW_I32] i32 min-p prefilter output rows
+    /** L149 phase 2: compact verify rows. spec_round_begin accumulates, over
+     * the rounds begun since the last step, whether EVERY one is in the sparse
+     * min-p contract and the most permissive floor among them;
+     * pulsar_session_spec_arm_capture arms the step from that. An armed
+     * ALL_ROWS head then runs the min-p prefilter over its rows and reads the
+     * compact block into spec_compact_host INSTEAD of the full logits, and the
+     * accept walk builds each target distribution from the row's candidates
+     * (a device read of that one row is the per-row fallback). A more negative
+     * floor only widens the candidate superset, so the min over rounds is safe
+     * for every round. */
+    bool     spec_compact_acc_ok;
+    uint32_t spec_compact_acc_n;
+    float    spec_compact_acc_delta;
+    bool     spec_compact_armed;
+    float    spec_compact_delta;
+    int32_t *spec_compact_host;   ///< PULSAR_SPEC_LOGITS_ROWS x PULSAR_DSPARK_PREFILTER_ROW_I32, owned
+    uint32_t spec_compact_rows;   ///< rows [0, spec_compact_rows) hold this step's compact output (0 = none)
     pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
     pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
     pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
@@ -2704,6 +2721,11 @@ bool gpu_graph_verify_suffix_tops(
         int                   *row_tops,
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
+/** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
+ * spec_logits rows [row0, row0+n_rows) and read the compact block into
+ * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to
+ * row0+n_rows on success, 0 on failure. Blocking read (one small copy). */
+bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
 /** Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch.
  */

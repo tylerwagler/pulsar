@@ -1239,8 +1239,19 @@ int gpu_graph_decode_multiseq_batch(
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
-    ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
-                             (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+    if (head_all_rows && g->spec_compact_armed) {
+        /* L149 phase 2: every round in this step is in the sparse min-p
+         * contract -- read the prefilter's compact block (16 KB/row) instead of
+         * the 517 KB rows; the caller's `logits` block is left untouched and
+         * the accept walk builds from candidates (device row read as fallback). */
+        ok = gpu_graph_spec_compact_read(g, 0u, head_runs) ||
+             pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
+                                    (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+    } else {
+        g->spec_compact_rows = 0;
+        ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
+                                 (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+    }
     if (ms_prof) {
         const double t_done = now_sec();
         fprintf(stderr,
@@ -1262,6 +1273,25 @@ int gpu_graph_decode_multiseq_batch(
 }
 
 
+
+bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows) {
+    g->spec_compact_rows = 0;
+    if (!g || !g->spec_logits || !g->spec_compact_host || !g->dspark_prefilter_sel ||
+        n_rows == 0 || row0 + n_rows > PULSAR_SPEC_LOGITS_ROWS)
+        return false;
+    const uint64_t row_i32 = PULSAR_DSPARK_PREFILTER_ROW_I32;
+    if (!pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, g->spec_logits,
+                                        (uint64_t)row0 * PULSAR_N_VOCAB * sizeof(float),
+                                        n_rows, PULSAR_N_VOCAB, PULSAR_N_VOCAB,
+                                        g->spec_compact_delta, PULSAR_DSPARK_PREFILTER_CAP))
+        return false;
+    if (!pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0,
+                                g->spec_compact_host + (size_t)row0 * row_i32,
+                                (uint64_t)n_rows * row_i32 * sizeof(int32_t)))
+        return false;
+    g->spec_compact_rows = row0 + n_rows;
+    return true;
+}
 
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits) {
     if (!g || !g->spec_logits || !logits || row >= PULSAR_SPEC_LOGITS_ROWS) return false;

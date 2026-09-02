@@ -2290,6 +2290,11 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->dspark_refined2_ids = pulsar_gpu_tensor_alloc(17ull * sizeof(int32_t));
         g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
             16ull * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+        g->spec_compact_host = (int32_t *)xmalloc(
+            (size_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+        g->spec_compact_rows = 0;
+        g->spec_compact_armed = false;
+        g->spec_compact_acc_n = 0;
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
              g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&

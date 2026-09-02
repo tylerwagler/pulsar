@@ -558,8 +558,30 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
  * p/q with the draft-time-params q rebuild -- see the walk comment there). */
 typedef bool (*spec_row_read_fn)(void *ud, uint32_t row, float *out);
 
+/* L149 phase 2: build row `row`'s target distribution from the compact
+ * prefilter block when the request is in the sparse min-p contract and the
+ * row's candidate set fit the cap. false = caller reads the full row. */
+static bool spec_compact_dist(const int32_t *compact, uint32_t row,
+                              float temperature, int top_k, float top_p, float min_p,
+                              pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
+    if (!compact || row >= PULSAR_SPEC_LOGITS_ROWS ||
+        !(temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
+          min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && min_p <= 1.0f))
+        return false;
+    const int32_t *h = compact + (size_t)row * PULSAR_DSPARK_PREFILTER_ROW_I32;
+    const uint32_t n = (uint32_t)h[0];
+    if (n == 0 || n > PULSAR_DSPARK_PREFILTER_CAP) return false;
+    float max_logit;
+    memcpy(&max_logit, &h[2], sizeof(max_logit));
+    return pulsar_sample_dist_build_prefiltered(h + 3,
+                                                (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP),
+                                                n, max_logit, temperature, min_p,
+                                                scratch, out) != 0;
+}
+
 static int spec_accept_walk(pulsar_session *s,
                             spec_row_read_fn read_row, void *read_ud,
+                            const int32_t *compact, uint32_t row0,
                             const int *row_tops,
                             const int32_t *pend, uint32_t K, bool pend_sampled,
                             float temperature, int top_k, float top_p, float min_p,
@@ -573,13 +595,16 @@ static int spec_accept_walk(pulsar_session *s,
             s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
         float *row_logits = s->spec_row_scratch;
         while (commit < (int)K) {
-            if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
-                *out_carry_tok = -1;
-                return -1;
-            }
             pulsar_sample_dist dist;
-            pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &s->sample_scratch, &dist);
+            if (!spec_compact_dist(compact, row0 + (uint32_t)commit, temperature, top_k,
+                                   top_p, min_p, &s->sample_scratch, &dist)) {
+                if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
+                    *out_carry_tok = -1;
+                    return -1;
+                }
+                pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
+                                      top_p, min_p, &s->sample_scratch, &dist);
+            }
             const bool accepted_row = pend_sampled
                 ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
                                             s->spec.dspark_pending_q[commit], rng)
@@ -1126,6 +1151,26 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     static int dtree_stats_env = -1;
     const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     memset(r, 0, sizeof(*r));
+    /* L149 phase 2: accumulate, for the step this round will ride, whether
+     * every round is in the sparse min-p contract and the most permissive
+     * floor among them (pulsar_session_spec_arm_capture arms from this). A
+     * round that begins here but sits the step out only makes the result more
+     * conservative (ok=false) or the superset wider (lower floor): both safe. */
+    {
+        const bool in_contract = temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
+                                 min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && min_p <= 1.0f &&
+                                 PULSAR_N_VOCAB <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX;
+        const float d = in_contract
+            ? (float)((double)temperature * (log((double)min_p) - 1e-3)) : 0.0f;
+        if (g->spec_compact_acc_n == 0) {
+            g->spec_compact_acc_ok = in_contract;
+            g->spec_compact_acc_delta = d;
+        } else {
+            g->spec_compact_acc_ok = g->spec_compact_acc_ok && in_contract;
+            if (d < g->spec_compact_acc_delta) g->spec_compact_acc_delta = d;
+        }
+        g->spec_compact_acc_n++;
+    }
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
     int &saved_len = r->saved_len;
@@ -1241,6 +1286,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           float temperature, int top_k, float top_p, float min_p,
                           uint64_t *rng,
                           spec_row_read_fn read_row, void *read_ud, uint32_t row0,
+                          const int32_t *compact,
                           double t0,
                           int *accepted, int accepted_cap,
                           char *err, size_t errlen) {
@@ -1275,7 +1321,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * The rejected row's replacement becomes the carry token. All three paths
      * yield the exact per-token target distribution. */
     int carry_tok = -1;
-    const int commit_rc = spec_accept_walk(s, read_row, read_ud,
+    const int commit_rc = spec_accept_walk(s, read_row, read_ud, compact, row0,
                                            row_tops, pend, K, pend_sampled,
                                            temperature, top_k, top_p, min_p,
                                            rng, &carry_tok);
@@ -1572,12 +1618,20 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     /* ONE batched forward: base decode + draft verify + anchor capture. */
     g->dspark_capture_batch_n = r.n_batch;
     g->spec_comp_save_n = r.n_batch;   /* Stage-B: save per-position comp projections */
+    /* L149 phase 2: this lane's step carries exactly the round begun above */
+    g->spec_compact_armed = g->spec_compact_acc_n > 0 && g->spec_compact_acc_ok;
+    g->spec_compact_delta = g->spec_compact_acc_delta;
+    g->spec_compact_acc_n = 0;
+    g->spec_compact_acc_ok = false;
     bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
                                            &s->checkpoint,
                                            (uint32_t)r.saved_len, r.n_batch,
                                            r.K ? r.row_tops : NULL, NULL);
     g->dspark_capture_batch_n = 0;
     g->spec_comp_save_n = 0;
+    if (ok && g->spec_compact_armed) (void)gpu_graph_spec_compact_read(g, 0u, r.n_batch);
+    else g->spec_compact_rows = 0;
+    g->spec_compact_armed = false;
     if (!ok) {
         s->checkpoint.len = r.saved_len;
         (void)spec_frontier_restore(&r.frontier, s);
@@ -1589,8 +1643,9 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
 
     return spec_round_end(s, &r, first_token, eos_token,
                           temperature, top_k, top_p, min_p, rng,
-                          spec_row_read_classic, g, 0u, t0,
-                          accepted, accepted_cap, err, errlen);
+                          spec_row_read_classic, g, 0u,
+                          g->spec_compact_rows >= r.n_batch ? g->spec_compact_host : NULL,
+                          t0, accepted, accepted_cap, err, errlen);
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -1756,6 +1811,18 @@ static bool spec_row_read_block(void *ud, uint32_t row, float *out) {
     return true;
 }
 
+/* L149 phase 2: row source over this step's device rows at a bank's offset
+ * (the compact path never brought the full block to the host). */
+typedef struct {
+    pulsar_gpu_graph *g;
+    uint32_t row0;
+} spec_dev_rows;
+
+static bool spec_row_read_dev(void *ud, uint32_t row, float *out) {
+    const spec_dev_rows *d = (const spec_dev_rows *)ud;
+    return gpu_graph_read_spec_logits_row(d->g, d->row0 + row, out);
+}
+
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                int first_token, int eos_token,
                                float temperature, int top_k, float top_p,
@@ -1763,6 +1830,35 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
+    pulsar_gpu_graph *g = &s->graph;
+    /* L149 phase 2: the step read the compact block instead of `rows`. Row
+     * argmaxes come from its headers (the host tie rule, computed on device);
+     * the walk builds from candidates; any row that needs its full logits
+     * (no finite max, overflow, the s->logits refresh) is read from the
+     * device, where this step's rows still sit. */
+    if (g->spec_compact_rows >= row0 + r->n_batch && g->spec_compact_host) {
+        if (!s->spec_row_scratch)
+            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
+        for (uint32_t i = 0; i < r->K && i < 16u; i++) {
+            const int32_t *h = g->spec_compact_host +
+                               (size_t)(row0 + i) * PULSAR_DSPARK_PREFILTER_ROW_I32;
+            if (h[1] >= 0) {
+                r->row_tops[i] = h[1];
+            } else {
+                if (!gpu_graph_read_spec_logits_row(g, row0 + i, s->spec_row_scratch)) {
+                    snprintf(err, errlen, "spec compact: row %u readback failed", row0 + i);
+                    return -1;
+                }
+                r->row_tops[i] = (int)sample_argmax(s->spec_row_scratch, PULSAR_N_VOCAB);
+            }
+        }
+        spec_dev_rows src = { g, row0 };
+        return spec_round_end(s, r, first_token, eos_token,
+                              temperature, top_k, top_p, min_p, rng,
+                              spec_row_read_dev, &src, row0, g->spec_compact_host,
+                              0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
+                              accepted, accepted_cap, err, errlen);
+    }
     /* Greedy walk consumes per-row argmaxes; the classic forward computes
      * them on-device, the shared block computes them here. Draft i is judged
      * against round-local row i (the row that PREDICTS it). */
@@ -1773,7 +1869,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     spec_block_rows src = { rows, row0 };
     return spec_round_end(s, r, first_token, eos_token,
                           temperature, top_k, top_p, min_p, rng,
-                          spec_row_read_block, &src, row0,
+                          spec_row_read_block, &src, row0, NULL,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                           accepted, accepted_cap, err, errlen);
 }
@@ -1804,8 +1900,19 @@ uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
 }
 
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
-    s->graph.dspark_capture_batch_n = n_rows;
-    s->graph.spec_comp_save_n = n_rows;
+    pulsar_gpu_graph *g = &s->graph;
+    g->dspark_capture_batch_n = n_rows;
+    g->spec_comp_save_n = n_rows;
+    /* L149 phase 2: arm (n_rows > 0) the compact verify read from the rounds
+     * begun since the last step; disarm and reset the accumulator after it. */
+    if (n_rows > 0) {
+        g->spec_compact_armed = g->spec_compact_acc_n > 0 && g->spec_compact_acc_ok;
+        g->spec_compact_delta = g->spec_compact_acc_delta;
+    } else {
+        g->spec_compact_armed = false;
+        g->spec_compact_acc_n = 0;
+        g->spec_compact_acc_ok = false;
+    }
 }
 
 void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
