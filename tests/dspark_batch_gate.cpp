@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
@@ -172,12 +173,29 @@ static int run_shape(const char *name, const float *temps, int ticks) {
         memcpy(rng_a, rngs, sizeof(rngs));
         memcpy(rng_b, rngs, sizeof(rngs));
         draft_result ser[NB], bat[NB];
+        /* stage capture: the drafter's base logits rows and post-head hidden
+         * rows per bank after each serialized redraft (rows [0, n_draft) of
+         * the forward), to say WHERE a batched difference enters */
+        float *ser_logits[NB] = {NULL, NULL, NULL};
+        float *ser_hidden[NB] = {NULL, NULL, NULL};
+        uint32_t ser_nd[NB] = {0, 0, 0};
         for (int b = 0; b < NB; b++) {
             pulsar_spec_round *one = r[b];
             const uint32_t bank = (uint32_t)b;
             uint64_t *rp = &rng_a[b];
             if (pulsar_session_spec_redraft_batch(s, &one, &bank, &rp, 1, err, sizeof(err)) != 0)
                 CHECK(0, "%s: tick %d serialized redraft bank %d: %s", name, t, b, err);
+            draft_result d;
+            memset(&d, 0, sizeof(d));
+            if (pulsar_session_spec_redraft_peek(one, d.ids, d.conf, &d.n_draft, &d.keep, &d.sampled)) {
+                ser_nd[b] = d.n_draft;
+                ser_logits[b] = (float *)malloc((size_t)d.n_draft * (size_t)vocab * sizeof(float));
+                ser_hidden[b] = (float *)malloc((size_t)d.n_draft * PULSAR_N_EMBD * sizeof(float));
+                pulsar_gpu_tensor_read(s->graph.spec_logits, 0, ser_logits[b],
+                                       (uint64_t)d.n_draft * (uint64_t)vocab * sizeof(float));
+                pulsar_gpu_tensor_read(s->graph.batch_ffn_cur, 0, ser_hidden[b],
+                                       (uint64_t)d.n_draft * PULSAR_N_EMBD * sizeof(float));
+            }
         }
         peek_all(r, NB, ser);
         /* (b) batched, from equal rng copies; the rounds still hold their
@@ -189,6 +207,38 @@ static int run_shape(const char *name, const float *temps, int ticks) {
                 CHECK(0, "%s: tick %d batched redraft: %s", name, t, err);
         }
         peek_all(r, NB, bat);
+        /* stage comparison: batched rows sit at [base_row_b, +n_draft) with the
+         * greedy banks first in bank order (all-greedy: bank order) */
+        {
+            float *bl = (float *)malloc((size_t)ROWS * (size_t)vocab * sizeof(float));
+            float *bh = (float *)malloc((size_t)ROWS * PULSAR_N_EMBD * sizeof(float));
+            uint32_t total = 0;
+            for (int b = 0; b < NB; b++) total += ser_nd[b];
+            pulsar_gpu_tensor_read(s->graph.spec_logits, 0, bl, (uint64_t)total * (uint64_t)vocab * sizeof(float));
+            pulsar_gpu_tensor_read(s->graph.batch_ffn_cur, 0, bh, (uint64_t)total * PULSAR_N_EMBD * sizeof(float));
+            /* row order: greedy banks (temps == 0) first, then sampled, each in bank order */
+            uint32_t off = 0;
+            for (int pass = 0; pass < 2; pass++)
+                for (int b = 0; b < NB; b++) {
+                    if ((pass == 0) != (temps[b] <= 0.0f)) continue;
+                    if (!ser_logits[b]) continue;
+                    for (uint32_t k = 0; k < ser_nd[b]; k++) {
+                        const float *sl = ser_logits[b] + (size_t)k * vocab;
+                        const float *ql = bl + (size_t)(off + k) * vocab;
+                        const float *sh = ser_hidden[b] + (size_t)k * PULSAR_N_EMBD;
+                        const float *qh = bh + (size_t)(off + k) * PULSAR_N_EMBD;
+                        int nl = 0, nh = 0; float ml = 0, mh = 0;
+                        for (int v = 0; v < vocab; v++) if (sl[v] != ql[v]) { nl++; float d = fabsf(sl[v] - ql[v]); if (d > ml) ml = d; }
+                        for (uint32_t v = 0; v < PULSAR_N_EMBD; v++) if (sh[v] != qh[v]) { nh++; float d = fabsf(sh[v] - qh[v]); if (d > mh) mh = d; }
+                        if (nl || nh)
+                            printf("  STAGE %s tick %d bank %d row %u: hidden differs in %d/%u (max %.3g), logits differ in %d/%d (max %.3g)\n",
+                                   name, t, b, k, nh, PULSAR_N_EMBD, (double)mh, nl, vocab, (double)ml);
+                    }
+                    off += ser_nd[b];
+                }
+            free(bl); free(bh);
+        }
+        for (int b = 0; b < NB; b++) { free(ser_logits[b]); free(ser_hidden[b]); }
         for (int b = 0; b < NB; b++) {
             CHECK(ser[b].present == bat[b].present, "%s: tick %d bank %d present %d vs %d", name, t, b,
                   ser[b].present, bat[b].present);
