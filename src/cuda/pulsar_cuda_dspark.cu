@@ -836,3 +836,314 @@ int pulsar_gpu_distill_top64_tensor(
         (uint16_t *)tail_lse->ptr, (int32_t *)inexact->ptr, row0);
     return cuda_ok(cudaGetLastError(), "distill top64 lse");
 }
+
+
+/* =====================================================================
+ * L150: bank-batched markov refine.
+ *
+ * The single-bank kernels above stream all of markov_w2 (129,280 x 256 bf16,
+ * 66 MB) once per draft position PER BANK; the served lane ran three banks'
+ * drafter passes back to back, so a tick paid 3 x n_draft streams. These
+ * kernels take N banks per launch: each thread loads a w2 row element once
+ * and dots it against N w1 rows (one per bank's previous token), so one
+ * stream serves every bank.
+ *
+ * BYTE-EXACT with the single-bank kernels by construction: per bank the dot
+ * accumulates the same products in the same i order into its own
+ * accumulator, the value is base + dot exactly as before, the per-block top-2
+ * uses the same strict-'>' update over the same block -> vocab mapping, and
+ * the reduce is the same merge. The greedy identity gate (rows/L150.md) pins
+ * it; any red there is a bug, not tolerance.
+ *
+ * Layouts: refined_logits [n_banks][vocab]; per-block partials
+ * [n_banks][gridDim.x]; the bank's base row is base_logits[(base_row[b] +
+ * base_row_add) * base_row_stride]; the previous token for bank b is
+ * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_BANKS_MAX. */
+template <bool W1BF16, bool W2BF16>
+__global__ static void dspark_markov_step_banks_kernel(
+        float *__restrict__ refined_logits,
+        int32_t *__restrict__ block_best_id,
+        float *__restrict__ block_best_val,
+        int32_t *__restrict__ block_second_id,
+        float *__restrict__ block_second_val,
+        const float *__restrict__ base_logits,
+        const int32_t *__restrict__ base_row,
+        uint32_t base_row_add,
+        uint64_t base_row_stride,
+        const void *markov_w1,
+        const void *markov_w2,
+        const int32_t *__restrict__ prev,
+        uint32_t prev_stride,
+        uint32_t n_banks,
+        uint32_t vocab_size,
+        uint32_t embed_dim) {
+    enum { MAXB = PULSAR_DSPARK_BANKS_MAX };
+    uint64_t embed_base[MAXB];
+    const float *base[MAXB];
+    float best_val[MAXB], second_val[MAXB];
+    int32_t best_id[MAXB], second_id[MAXB];
+    for (uint32_t b = 0; b < MAXB; b++) {
+        embed_base[b] = 0; base[b] = base_logits;
+        best_val[b] = -INFINITY; best_id[b] = 0; second_val[b] = -INFINITY; second_id[b] = 0;
+        if (b < n_banks) {
+            int32_t pt = prev[(uint64_t)b * prev_stride];
+            if (pt < 0 || (uint32_t)pt >= vocab_size) pt = 0;
+            embed_base[b] = (uint64_t)pt * embed_dim;
+            base[b] = base_logits + ((uint64_t)base_row[b] + base_row_add) * base_row_stride;
+        }
+    }
+    for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
+         v += blockDim.x * gridDim.x) {
+        float dot[MAXB];
+        for (uint32_t b = 0; b < MAXB; b++) dot[b] = 0.0f;
+        const uint64_t w2_base = (uint64_t)v * embed_dim;
+        for (uint32_t i = 0; i < embed_dim; i++) {
+            const float w2v = pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, w2_base + i);
+            for (uint32_t b = 0; b < n_banks; b++)
+                dot[b] += w2v * pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base[b] + i);
+        }
+        for (uint32_t b = 0; b < n_banks; b++) {
+            const float val = base[b][v] + dot[b];
+            refined_logits[(uint64_t)b * vocab_size + v] = val;
+            if (val > best_val[b]) { second_val[b] = best_val[b]; second_id[b] = best_id[b];
+                                     best_val[b] = val; best_id[b] = (int32_t)v; }
+            else if (val > second_val[b]) { second_val[b] = val; second_id[b] = (int32_t)v; }
+        }
+    }
+
+    __shared__ float best_vals[256];
+    __shared__ int32_t best_ids[256];
+    __shared__ float sec_vals[256];
+    __shared__ int32_t sec_ids[256];
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t b = 0; b < n_banks; b++) {
+        best_vals[tid] = best_val[b];
+        best_ids[tid] = best_id[b];
+        sec_vals[tid] = second_val[b];
+        sec_ids[tid] = second_id[b];
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float ob = best_vals[tid];        const int32_t oi = best_ids[tid];
+                const float os = sec_vals[tid];
+                const float nb = best_vals[tid + stride]; const int32_t ni = best_ids[tid + stride];
+                const float ns = sec_vals[tid + stride]; const int32_t nj = sec_ids[tid + stride];
+                if (nb > ob) {
+                    best_vals[tid] = nb; best_ids[tid] = ni;
+                    if (ob > ns) { sec_vals[tid] = ob; sec_ids[tid] = oi; }
+                    else         { sec_vals[tid] = ns; sec_ids[tid] = nj; }
+                } else if (nb > os) {
+                    sec_vals[tid] = nb; sec_ids[tid] = ni;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const uint64_t o = (uint64_t)b * gridDim.x + blockIdx.x;
+            block_best_id[o] = best_ids[0];
+            block_best_val[o] = best_vals[0];
+            block_second_id[o] = sec_ids[0];
+            block_second_val[o] = sec_vals[0];
+        }
+        __syncthreads();
+    }
+}
+
+/* One block per bank: the same merge as dspark_markov_reduce_kernel over that
+ * bank's partials, winners written to dst[b * dst_stride] (and the runner-up
+ * to dst2 likewise). */
+__global__ static void dspark_markov_reduce_banks_kernel(
+        int32_t *__restrict__ dst_top1,
+        int32_t *__restrict__ dst_top2,
+        uint32_t dst_stride,
+        const int32_t *__restrict__ ids,
+        const float *__restrict__ vals,
+        const int32_t *__restrict__ ids2,
+        const float *__restrict__ vals2,
+        uint32_t n_blocks) {
+    const uint32_t b = blockIdx.x;
+    ids += (uint64_t)b * n_blocks; vals += (uint64_t)b * n_blocks;
+    ids2 += (uint64_t)b * n_blocks; vals2 += (uint64_t)b * n_blocks;
+    float best_val = -INFINITY;
+    int32_t best_id = 0;
+    float sec_val = -INFINITY;
+    int32_t sec_id = 0;
+    for (uint32_t k = threadIdx.x; k < n_blocks; k += blockDim.x) {
+        const float nb = vals[k];  const int32_t ni = ids[k];
+        const float ns = vals2[k]; const int32_t nj = ids2[k];
+        if (nb > best_val) {
+            if (best_val > ns) { sec_val = best_val; sec_id = best_id; }
+            else               { sec_val = ns;       sec_id = nj; }
+            best_val = nb; best_id = ni;
+        } else if (nb > sec_val) {
+            sec_val = nb; sec_id = ni;
+        }
+    }
+    __shared__ float best_vals[256];
+    __shared__ int32_t best_ids[256];
+    __shared__ float sec_vals[256];
+    __shared__ int32_t sec_ids[256];
+    const uint32_t tid = threadIdx.x;
+    best_vals[tid] = best_val;
+    best_ids[tid] = best_id;
+    sec_vals[tid] = sec_val;
+    sec_ids[tid] = sec_id;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float ob = best_vals[tid];          const int32_t oi = best_ids[tid];
+            const float os = sec_vals[tid];
+            const float nb = best_vals[tid + stride]; const int32_t ni = best_ids[tid + stride];
+            const float ns = sec_vals[tid + stride];  const int32_t nj = sec_ids[tid + stride];
+            if (nb > ob) {
+                best_vals[tid] = nb; best_ids[tid] = ni;
+                if (ob > ns) { sec_vals[tid] = ob; sec_ids[tid] = oi; }
+                else         { sec_vals[tid] = ns; sec_ids[tid] = nj; }
+            } else if (nb > os) {
+                sec_vals[tid] = nb; sec_ids[tid] = ni;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dst_top1[(uint64_t)b * dst_stride] = best_ids[0];
+        if (dst_top2) dst_top2[(uint64_t)b * dst_stride] = sec_ids[0];
+    }
+}
+
+/* Per-bank partials for the banked kernels; grown on demand, thread_local for
+ * the same reasons as DsparkReduceBufs above. */
+struct DsparkReduceBufsBanks {
+    pulsar_gpu_tensor *id, *val, *id2, *val2;
+    uint32_t cap;   /* n_banks * grid_dim slots */
+};
+
+static bool dspark_markov_banks_args_ok(
+        const pulsar_gpu_tensor *refined_logits, const pulsar_gpu_tensor *ids_dev,
+        const pulsar_gpu_tensor *ids2_dev, uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, uint32_t n_banks, uint32_t n_draft,
+        uint32_t vocab_size, uint32_t embed_dim) {
+    if (!refined_logits || !ids_dev || !ids2_dev || !base_logits || !base_row_dev) return false;
+    if (n_banks == 0 || n_banks > PULSAR_DSPARK_BANKS_MAX || n_draft == 0 || n_draft > 16) return false;
+    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return false;
+    if (ids_stride < n_draft + 1) return false;
+    if (refined_logits->bytes < (uint64_t)n_banks * vocab_size * sizeof(float)) return false;
+    if (ids_dev->bytes  < (uint64_t)n_banks * ids_stride * sizeof(int32_t)) return false;
+    if (ids2_dev->bytes < (uint64_t)n_banks * ids_stride * sizeof(int32_t)) return false;
+    if (base_row_dev->bytes < (uint64_t)n_banks * sizeof(int32_t)) return false;
+    if (base_row_stride_bytes < (uint64_t)vocab_size * sizeof(float) ||
+        base_row_stride_bytes % sizeof(float) != 0) return false;
+    /* the caller's base rows are bounded by its own row budget; the kernel
+     * indexes base_logits by (base_row[b] + pos) * stride and trusts it */
+    return true;
+}
+
+static int dspark_markov_banks_launch(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, pulsar_gpu_tensor *ids2_dev,
+        uint32_t ids_stride, const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, const void *dspark_model_map,
+        uint64_t dspark_model_size, uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t pos_first, uint32_t pos_count,
+        const pulsar_gpu_tensor *prev_override, /* NULL: chain feed ids[b][pos]; else [n_banks] i32 */
+        uint32_t vocab_size, uint32_t embed_dim, int w1_bf16, int w2_bf16) {
+    const uint64_t w1_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t w2_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
+    if (markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset) return 0;
+    if (markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset) return 0;
+    const void *w1 = cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const void *w2 = cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
+    if (!w1 || !w2) return 0;
+
+    const uint32_t block_dim = 256;
+    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    if (grid_dim > 65535) return 0;
+    static thread_local DsparkReduceBufsBanks bb = {};
+    const uint32_t need = n_banks * grid_dim;
+    if (need > bb.cap) {
+        pulsar_gpu_tensor_free(bb.id);
+        pulsar_gpu_tensor_free(bb.val);
+        pulsar_gpu_tensor_free(bb.id2);
+        pulsar_gpu_tensor_free(bb.val2);
+        const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;
+        bb.id   = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
+        bb.val  = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(float));
+        bb.id2  = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
+        bb.val2 = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(float));
+        bb.cap  = (bb.id && bb.val && bb.id2 && bb.val2) ? cap : 0;
+    }
+    if (!bb.id || !bb.val || !bb.id2 || !bb.val2) return 0;
+
+    int32_t *ids = (int32_t *)ids_dev->ptr;
+    int32_t *ids2 = (int32_t *)ids2_dev->ptr;
+    for (uint32_t pos = pos_first; pos < pos_first + pos_count; pos++) {
+        const int32_t *prev = prev_override ? (const int32_t *)prev_override->ptr : ids + pos;
+        const uint32_t prev_stride = prev_override ? 1u : ids_stride;
+#define PULSAR_MARKOV_BANKS_LAUNCH(A, B)                                    \
+        dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim>>>(       \
+            (float *)refined_logits->ptr,                                     \
+            (int32_t *)bb.id->ptr, (float *)bb.val->ptr,                      \
+            (int32_t *)bb.id2->ptr, (float *)bb.val2->ptr,                    \
+            (const float *)base_logits->ptr, (const int32_t *)base_row_dev->ptr, \
+            pos, base_row_stride_bytes / sizeof(float),                       \
+            w1, w2, prev, prev_stride, n_banks, vocab_size, embed_dim)
+        if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_BANKS_LAUNCH(true, true);
+        else if (w1_bf16)         PULSAR_MARKOV_BANKS_LAUNCH(true, false);
+        else if (w2_bf16)         PULSAR_MARKOV_BANKS_LAUNCH(false, true);
+        else                      PULSAR_MARKOV_BANKS_LAUNCH(false, false);
+#undef PULSAR_MARKOV_BANKS_LAUNCH
+        dspark_markov_reduce_banks_kernel<<<n_banks, 256>>>(
+            ids + pos + 1, ids2 + pos + 1, ids_stride,
+            (const int32_t *)bb.id->ptr,  (const float *)bb.val->ptr,
+            (const int32_t *)bb.id2->ptr, (const float *)bb.val2->ptr,
+            grid_dim);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+int pulsar_gpu_dspark_markov_chain_banks_model(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
+        pulsar_gpu_tensor *ids2_dev, uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev,
+        const void *dspark_model_map, uint64_t dspark_model_size,
+        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
+        int w1_bf16, int w2_bf16) {
+    if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids2_dev, ids_stride, base_logits,
+                                     base_row_stride_bytes, base_row_dev, n_banks, n_draft,
+                                     vocab_size, embed_dim))
+        return 0;
+    return dspark_markov_banks_launch(refined_logits, ids_dev, ids2_dev, ids_stride, base_logits,
+                                      base_row_stride_bytes, base_row_dev, dspark_model_map,
+                                      dspark_model_size, markov_w1_offset, markov_w2_offset,
+                                      n_banks, 0u, n_draft, NULL, vocab_size, embed_dim,
+                                      w1_bf16, w2_bf16);
+}
+
+int pulsar_gpu_dspark_markov_step_banks_model(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
+        pulsar_gpu_tensor *ids2_dev, uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
+        const void *dspark_model_map, uint64_t dspark_model_size,
+        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
+        int w1_bf16, int w2_bf16) {
+    if (!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t)) return 0;
+    if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids2_dev, ids_stride, base_logits,
+                                     base_row_stride_bytes, base_row_dev, n_banks, pos + 1,
+                                     vocab_size, embed_dim))
+        return 0;
+    return dspark_markov_banks_launch(refined_logits, ids_dev, ids2_dev, ids_stride, base_logits,
+                                      base_row_stride_bytes, base_row_dev, dspark_model_map,
+                                      dspark_model_size, markov_w1_offset, markov_w2_offset,
+                                      n_banks, pos, 1u, prev_dev, vocab_size, embed_dim,
+                                      w1_bf16, w2_bf16);
+}

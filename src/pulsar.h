@@ -598,6 +598,24 @@ void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
  * row so each bank's round_end can consume its slice. Mirrors what the fused
  * loop does around its own forward. */
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
+/** L150: the batched lane's round_end DEFERS drafting; after every bank's
+ * round_end (and bank_state_save) call this once with the live rounds, their
+ * banks and each bank's rng: it runs ONE drafter pass over all requesting banks
+ * and leaves each bank's draft in its round. Never switches banks. Returns 0
+ * (banks that could not be served keep no pendings and take a plain step next),
+ * -1 with err on a device failure. Then, per bank, under the server's own bank
+ * switch and before its bank_state_save, pulsar_session_spec_redraft_commit
+ * stamps that bank's shadow with its draft. */
+int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds,
+                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      char *err, size_t errlen);
+void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r);
+/** Gate-facing: read a batched redraft's result out of the round before it is
+ * committed (ids[0] = the base, ids[1..n_draft] = the drafts; conf per draft
+ * position; keep = the confidence-trimmed pending count). 1 if a result is
+ * present, else 0. */
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+                                     uint32_t *n_draft, uint32_t *keep, int *sampled);
 /** Per-bank frontier readers for a bank-pooled session: the committed length,
  * token history, and common-prefix-with-prompt of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live

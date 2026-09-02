@@ -2166,6 +2166,38 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
             emitted_total += done;
         }
+        /* L150: round_end deferred every bank's redraft; run ONE drafter pass
+         * over all of them (the engine reads their saved ring counters and the
+         * bank-major rings, and never switches banks), then stamp each bank's
+         * draft into its shadow under this scheduler's own bank switch. A
+         * device failure here is not fatal: the banks keep no pendings and take
+         * a plain n=1 step next round. */
+        {
+            pulsar_spec_round *live_rounds[PULSAR_SPEC_LOGITS_ROWS];
+            uint32_t live_banks[PULSAR_SPEC_LOGITS_ROWS];
+            uint64_t *live_rngs[PULSAR_SPEC_LOGITS_ROWS];
+            int nl = 0;
+            for (int q = 0; q < m && nl < (int)PULSAR_SPEC_LOGITS_ROWS; q++) {
+                session_slot *sl = dec[live_idx[q]];
+                if (!rounds[live_idx[q]] || !sl->gen || sl->gen->phase != GEN_DECODE) continue;
+                live_rounds[nl] = rounds[live_idx[q]];
+                live_banks[nl] = (uint32_t)sl->bank;
+                live_rngs[nl] = &sl->gen->rng;
+                nl++;
+            }
+            char rerr[160];
+            if (nl > 0 &&
+                pulsar_session_spec_redraft_batch(pool, live_rounds, live_banks, live_rngs, nl,
+                                                  rerr, sizeof rerr) != 0)
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: batched redraft failed: %s (banks take a plain step)",
+                           rerr);
+            for (int q = 0; q < nl; q++) {
+                if (!s->bank_switch(live_banks[q])) continue;
+                pulsar_session_spec_redraft_commit(pool, live_rounds[q]);
+                pulsar_session_bank_state_save(pool, live_banks[q]);
+            }
+        }
         /* /metrics granularity: publish per ROUND, not per quantum.  A
          * quantum (16 tokens) takes ~1 s at deep-context rates, and a
          * scraper polling faster than the publish cadence sees its deltas

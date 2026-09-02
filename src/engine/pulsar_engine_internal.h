@@ -1003,6 +1003,8 @@ typedef struct {
     pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
     pulsar_gpu_tensor *dspark_refined2_ids;  ///< [17] i32 runner-ups (DTree)
     pulsar_gpu_tensor *dspark_prefilter_sel;  ///< L149: [16 x PULSAR_DSPARK_PREFILTER_ROW_I32] i32 min-p prefilter output rows
+    pulsar_gpu_tensor *dspark_bank_meta;      ///< L150: [2 x PULSAR_DSPARK_BANKS_MAX] i32: per-bank base row, per-bank sampled prev token
+    pulsar_gpu_tensor *dspark_row_meta;       ///< L150: [7 x PULSAR_SPEC_LOGITS_ROWS] i32 per-row rope/visibility positions per layer + bank id for the banked drafter forward
     /** L149 phase 2: compact verify rows. spec_round_begin accumulates, over
      * the rounds begun since the last step, whether EVERY one is in the sparse
      * min-p contract and the most permissive floor among them;
@@ -2540,6 +2542,21 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor         *base_logits_out,
         const int32_t            draft_ids[],
         uint32_t                n_draft);
+/** L150: the same forward over the rows of n_banks banks at once (contract at
+ * the definition); n_banks == 1 with NULL arrays == the single-bank forward. */
+bool gpu_graph_dspark_draft_forward_banks(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *base_model,
+        const pulsar_weights       *base_weights,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        pulsar_gpu_tensor         *base_logits_out,
+        const int32_t            draft_ids[],
+        uint32_t                n_rows,
+        uint32_t                n_banks,
+        const uint32_t          *row_bank,
+        const uint32_t         (*bank_n_raw)[3],
+        const uint32_t          *bank_n_draft);
 bool gpu_graph_matmul_plain_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_model        *model,

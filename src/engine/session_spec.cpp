@@ -1118,6 +1118,32 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s) {
  * assembled, frontier snapshotted, checkpoint pushed), the verify forward
  * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
  * the batched lane), and round_end (walk, state, emit, redraft). */
+/* L150: what a bank's redraft needs, recorded by round_end in the batched lane
+ * (which defers drafting), consumed by pulsar_session_spec_redraft_batch. */
+typedef struct {
+    bool     valid;         ///< round_end reached the drafting point with main_x ready
+    int32_t  next_base;     ///< the carry: batch position 0 of the next round
+    uint32_t n_draft;       ///< the bank's depth at round_end (spec_cur_depth), <= 16
+    uint32_t n_batch;
+    int      commit;
+    float    temperature, top_p, min_p;
+    int      top_k;
+    /* results, filled by the batched redraft; committed into the bank's shadow
+     * by pulsar_session_spec_redraft_commit under the server's bank switch */
+    bool     done;
+    bool     sample_drafts;
+    uint32_t keep;
+    bool     have_conf;
+    int32_t  refined[17];
+    int32_t  refined2[17];
+    float    conf[16];
+    float    q_drawn[16];                                  ///< q(pend[i]) per position (sampled)
+    uint32_t qn[16];                                       ///< stored proposal dist size (0 = row fallback)
+    int32_t  qids[16][PULSAR_DSPARK_QDIST_CAP];
+    float    qprobs[16][PULSAR_DSPARK_QDIST_CAP];
+    float   *qrows;                                        ///< [16][PULSAR_N_VOCAB] fallback rows, lazily owned
+} spec_redraft_req;
+
 typedef struct pulsar_spec_round {
     uint32_t K;             ///< draft depth this round: tokens the drafter proposed
     uint32_t n_batch;       ///< rows the verify forward evaluates (K + the base row)
@@ -1130,6 +1156,7 @@ typedef struct pulsar_spec_round {
     /** Frontier snapshot taken before the drafter touched anything, so a
      * partial accept can roll every layer's compressed state back exactly. */
     pulsar_spec_frontier frontier;
+    spec_redraft_req redraft;   ///< L150: batched-lane deferred redraft (see the typedef)
 } pulsar_spec_round;
 
 /* Assemble the round: load/guard the pendings, seed the prompt window if
@@ -1150,7 +1177,13 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     static int dtree_stats_env = -1;
     const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
-    memset(r, 0, sizeof(*r));
+    {
+        /* the round is reused across rounds; its redraft record's lazily-owned
+         * fallback rows (L150) survive the reset, everything else is cleared */
+        float *qrows = r->redraft.qrows;
+        memset(r, 0, sizeof(*r));
+        r->redraft.qrows = qrows;
+    }
     /* L149 phase 2: accumulate, for the step this round will ride, whether
      * every round is in the sparse min-p contract and the most permissive
      * floor among them (pulsar_session_spec_arm_capture arms from this). A
@@ -1287,6 +1320,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           uint64_t *rng,
                           spec_row_read_fn read_row, void *read_ud, uint32_t row0,
                           const int32_t *compact,
+                          bool defer_redraft,
                           double t0,
                           int *accepted, int accepted_cap,
                           char *err, size_t errlen) {
@@ -1583,6 +1617,25 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         return n_accept;
     }
 
+    if (defer_redraft) {
+        /* L150: the batched lane drafts every bank in ONE pass after all the
+         * walks (pulsar_session_spec_redraft_batch). Record what this bank's
+         * redraft needs and leave the shadow with no pendings: a bank the batch
+         * cannot serve simply takes a plain n=1 step next round. */
+        pulsar_spec_drop_pendings(&s->spec);
+        spec_redraft_req *q = &r->redraft;
+        q->valid = main_x_ready;
+        q->done = false;
+        q->next_base = (int32_t)next_base;
+        q->n_draft = n_draft;
+        q->n_batch = n_batch;
+        q->commit = commit;
+        q->temperature = temperature;
+        q->top_k = top_k;
+        q->top_p = top_p;
+        q->min_p = min_p;
+        return n_accept;
+    }
     const uint32_t keep = spec_round_redraft(s, next_base, main_x_ready,
                                              n_batch, commit,
                                              temperature, top_k, top_p, min_p, rng);
@@ -1645,7 +1698,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                           temperature, top_k, top_p, min_p, rng,
                           spec_row_read_classic, g, 0u,
                           g->spec_compact_rows >= r.n_batch ? g->spec_compact_host : NULL,
-                          t0, accepted, accepted_cap, err, errlen);
+                          false, t0, accepted, accepted_cap, err, errlen);
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -1743,10 +1796,14 @@ int pulsar_session::eval_speculative_block(int first_token,
 /* ---- plan-34 inc 6: the batched-lane round API (pulsar.h) --------------- */
 
 pulsar_spec_round *pulsar_spec_round_new(void) {
-    return (pulsar_spec_round *)xmalloc(sizeof(pulsar_spec_round));
+    pulsar_spec_round *r = (pulsar_spec_round *)xmalloc(sizeof(pulsar_spec_round));
+    memset(r, 0, sizeof(*r));
+    return r;
 }
 
 void pulsar_spec_round_free(pulsar_spec_round *r) {
+    if (!r) return;
+    free(r->redraft.qrows);   /* L150: the lazily-owned fallback rows */
     free(r);
 }
 
@@ -1856,6 +1913,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         return spec_round_end(s, r, first_token, eos_token,
                               temperature, top_k, top_p, min_p, rng,
                               spec_row_read_dev, &src, row0, g->spec_compact_host,
+                              true /* L150: redraft deferred to the batch */,
                               0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                               accepted, accepted_cap, err, errlen);
     }
@@ -1870,8 +1928,398 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     return spec_round_end(s, r, first_token, eos_token,
                           temperature, top_k, top_p, min_p, rng,
                           spec_row_read_block, &src, row0, NULL,
+                          true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                           accepted, accepted_cap, err, errlen);
+}
+
+
+static bool redraft_qrows_reserve(spec_redraft_req *q) {
+    if (!q->qrows) q->qrows = (float *)xmalloc((size_t)16 * PULSAR_N_VOCAB * sizeof(float));
+    return q->qrows != NULL;
+}
+
+/* L150: one redraft group -- the banks order[0..n_sel) whose rows fit the
+ * M-neutral row budget together. Greedy banks come first in `order` (the
+ * caller sorted them), so within the group they are the prefix. */
+static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
+                              const uint32_t *banks, uint64_t **rngs,
+                              const int *order, int n_sel,
+                              char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    const pulsar_dspark_weights *w = &e->dspark_weights;
+    const uint32_t embed_dim = 256;
+    const uint32_t vocab_size = w->vocab_size;
+    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
+    const void *dmap = e->dspark_model.map;
+    const uint64_t dsize = e->dspark_model.size;
+    static int dtree_stats_env = -1;
+    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
+    int n_g = 0;
+    for (int j = 0; j < n_sel; j++) if (!rounds[order[j]]->redraft.sample_drafts) n_g++;
+    const int n_s = n_sel - n_g;
+    /* rows */
+    int32_t draft_ids[PULSAR_SPEC_LOGITS_ROWS];
+    uint32_t row_bank[PULSAR_SPEC_LOGITS_ROWS];
+    uint32_t bank_n_raw[PULSAR_MSEQ_MAX][3];
+    uint32_t bank_n_draft[PULSAR_MSEQ_MAX];
+    int32_t base_row[PULSAR_DSPARK_BANKS_MAX] = {0};
+    uint32_t n_rows = 0, max_draft_g = 0, max_draft_s = 0;
+    for (int j = 0; j < n_sel; j++) {
+        spec_redraft_req *q = &rounds[order[j]]->redraft;
+        const uint32_t bank = banks[order[j]];
+        if (bank >= g->banks.n_banks || n_rows + q->n_draft > PULSAR_SPEC_LOGITS_ROWS) {
+            snprintf(err, errlen, "redraft batch: rows exceed the drafter budget");
+            return -1;
+        }
+        base_row[j] = (int32_t)n_rows;
+        for (uint32_t li = 0; li < 3; li++) bank_n_raw[bank][li] = g->ms_dspark_n_raw[bank][li];
+        bank_n_draft[bank] = q->n_draft;
+        for (uint32_t k = 0; k < q->n_draft; k++) {
+            draft_ids[n_rows] = k == 0 ? q->next_base : PULSAR_DSPARK_NOISE_TOKEN_ID;
+            row_bank[n_rows] = bank;
+            n_rows++;
+        }
+        if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
+        else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
+        q->refined[0] = q->next_base;
+        q->refined2[0] = -1;
+        for (int k = 1; k < 17; k++) { q->refined[k] = 0; q->refined2[k] = -1; }
+        for (int k = 0; k < 16; k++) { q->qn[k] = 0; q->q_drawn[k] = 0.0f; q->conf[k] = -1.0f; }
+        q->have_conf = false;
+        q->keep = q->n_draft;
+    }
+    /* the chain reads base rows (base_row[b] + pos) for pos < the group's max
+     * depth: a shallower bank's extra positions read the next bank's rows or
+     * the slab tail -- harmless, discarded -- but must stay inside the block */
+    if ((uint32_t)base_row[n_sel - 1] + (n_g == n_sel ? max_draft_g : max_draft_s) >
+        PULSAR_SPEC_LOGITS_ROWS) {
+        snprintf(err, errlen, "redraft batch: chain rows exceed the block");
+        return -1;
+    }
+
+    if (!gpu_graph_dspark_draft_forward_banks(g, &e->model, &e->weights, &e->dspark_model, w,
+                                              g->spec_logits, draft_ids, n_rows,
+                                              (uint32_t)n_sel, row_bank, bank_n_raw, bank_n_draft)) {
+        snprintf(err, errlen, "redraft batch: draft forward failed");
+        return -1;
+    }
+    if (pulsar_gpu_tensor_bytes(g->dspark_markov_logits) < (uint64_t)n_sel * vocab_bytes) {
+        snprintf(err, errlen, "redraft batch: markov scratch too small");
+        return -1;
+    }
+    /* device meta: base rows [0, MAX), sampled prev tokens [MAX, 2 MAX) */
+    int32_t meta[2 * PULSAR_DSPARK_BANKS_MAX];
+    memset(meta, 0, sizeof(meta));
+    for (int j = 0; j < n_sel; j++) meta[j] = base_row[j];
+    /* seed the chain feed: ids[j][0] = next_base */
+    int32_t ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
+    memset(ids_seed, 0, sizeof(ids_seed));
+    for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = rounds[order[j]]->redraft.next_base;
+    if (!pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, meta, sizeof(meta)) ||
+        !pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, ids_seed,
+                                 (uint64_t)n_sel * 17 * sizeof(int32_t))) {
+        snprintf(err, errlen, "redraft batch: meta upload failed");
+        return -1;
+    }
+    const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
+    const int w1_bf16 = w->markov_w1->type == PULSAR_TENSOR_BF16;
+    const int w2_bf16 = w->markov_w2->type == PULSAR_TENSOR_BF16;
+
+    /* greedy banks: the whole chain on device, ids read back once */
+    if (n_g > 0) {
+        if (!pulsar_gpu_dspark_markov_chain_banks_model(
+                g->dspark_markov_logits, g->dspark_refined_ids, g->dspark_refined2_ids, 17u,
+                g->spec_logits, spec_row_bytes, g->dspark_bank_meta,
+                dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
+                (uint32_t)n_g, max_draft_g, vocab_size, embed_dim, w1_bf16, w2_bf16)) {
+            snprintf(err, errlen, "redraft batch: markov chain failed");
+            return -1;
+        }
+    }
+    /* sampled banks: one step per position across banks, host draws between */
+    if (n_s > 0) {
+        pulsar_gpu_tensor *refined_s = pulsar_gpu_tensor_view(
+            g->dspark_markov_logits, (uint64_t)n_g * vocab_bytes, (uint64_t)n_s * vocab_bytes);
+        pulsar_gpu_tensor *ids_s = pulsar_gpu_tensor_view(
+            g->dspark_refined_ids, (uint64_t)n_g * 17 * sizeof(int32_t), (uint64_t)n_s * 17 * sizeof(int32_t));
+        pulsar_gpu_tensor *ids2_s = pulsar_gpu_tensor_view(
+            g->dspark_refined2_ids, (uint64_t)n_g * 17 * sizeof(int32_t), (uint64_t)n_s * 17 * sizeof(int32_t));
+        pulsar_gpu_tensor *base_s = pulsar_gpu_tensor_view(
+            g->dspark_bank_meta, (uint64_t)n_g * sizeof(int32_t), (uint64_t)n_s * sizeof(int32_t));
+        pulsar_gpu_tensor *prev_s = pulsar_gpu_tensor_view(
+            g->dspark_bank_meta, (uint64_t)PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t),
+            (uint64_t)n_s * sizeof(int32_t));
+        bool ok = refined_s && ids_s && ids2_s && base_s && prev_s;
+        /* the most permissive floor across the sampled banks: a superset for each */
+        float delta = 0.0f;
+        bool all_sparse = true;
+        for (int j = n_g; j < n_sel && ok; j++) {
+            const spec_redraft_req *q = &rounds[order[j]]->redraft;
+            const bool sparse = q->top_k <= 0 && q->top_p == 1.0f &&
+                                q->min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && q->min_p <= 1.0f &&
+                                vocab_size <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX;
+            if (!sparse) { all_sparse = false; continue; }
+            const float d = (float)((double)q->temperature * (log((double)q->min_p) - 1e-3));
+            if (j == n_g || d < delta) delta = d;
+        }
+        int32_t *sel = ok ? (int32_t *)xmalloc((size_t)n_s * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t)) : NULL;
+        int32_t prev[PULSAR_DSPARK_BANKS_MAX];
+        for (uint32_t pos = 0; ok && pos < max_draft_s; pos++) {
+            for (int j = n_g; j < n_sel; j++) prev[j - n_g] = rounds[order[j]]->redraft.refined[pos];
+            ok = pulsar_gpu_tensor_write(prev_s, 0, prev, (uint64_t)n_s * sizeof(int32_t)) &&
+                 pulsar_gpu_dspark_markov_step_banks_model(
+                     refined_s, ids_s, ids2_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
+                     dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
+                     (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_bf16);
+            bool have_sel = false;
+            if (ok && all_sparse)
+                have_sel = pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, refined_s, 0,
+                                                          (uint32_t)n_s, vocab_size, vocab_size,
+                                                          delta, PULSAR_DSPARK_PREFILTER_CAP) &&
+                           pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel,
+                                                  (uint64_t)n_s * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+            for (int j = n_g; j < n_sel && ok; j++) {
+                spec_redraft_req *q = &rounds[order[j]]->redraft;
+                if (pos >= q->n_draft) continue;
+                pulsar_sample_dist qd;
+                bool built = false;
+                if (have_sel) {
+                    const int32_t *h = sel + (size_t)(j - n_g) * PULSAR_DSPARK_PREFILTER_ROW_I32;
+                    const uint32_t n_c = (uint32_t)h[0];
+                    float max_logit;
+                    memcpy(&max_logit, &h[2], sizeof(max_logit));
+                    if (n_c > 0 && n_c <= PULSAR_DSPARK_PREFILTER_CAP)
+                        built = pulsar_sample_dist_build_prefiltered(
+                                    h + 3, (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP), n_c,
+                                    max_logit, q->temperature, q->min_p, &s->sample_scratch, &qd) != 0;
+                }
+                if (built && qd.n <= PULSAR_DSPARK_QDIST_CAP) {
+                    q->qn[pos] = qd.n;
+                    memcpy(q->qids[pos], qd.ids, (size_t)qd.n * sizeof(int32_t));
+                    memcpy(q->qprobs[pos], qd.probs, (size_t)qd.n * sizeof(float));
+                } else {
+                    /* full row: the residual will need it, and the build may too */
+                    if (!redraft_qrows_reserve(q)) { ok = false; break; }
+                    float *row = q->qrows + (size_t)pos * PULSAR_N_VOCAB;
+                    if (!pulsar_gpu_tensor_read(refined_s, (uint64_t)(j - n_g) * vocab_bytes, row, vocab_bytes)) {
+                        if (built) pulsar_sample_dist_free(&qd);
+                        ok = false; break;
+                    }
+                    if (!built)
+                        pulsar_sample_dist_build(row, PULSAR_N_VOCAB, q->temperature, q->top_k, q->top_p,
+                                              q->min_p, &s->sample_scratch, &qd);
+                    q->qn[pos] = 0;
+                }
+                const int drawn = pulsar_sample_dist_draw(&qd, rngs[order[j]]);
+                q->refined[pos + 1] = (int32_t)drawn;
+                q->q_drawn[pos] = pulsar_sample_dist_prob(&qd, drawn);
+                pulsar_sample_dist_free(&qd);
+            }
+        }
+        free(sel);
+        pulsar_gpu_tensor_free(refined_s);
+        pulsar_gpu_tensor_free(ids_s);
+        pulsar_gpu_tensor_free(ids2_s);
+        pulsar_gpu_tensor_free(base_s);
+        pulsar_gpu_tensor_free(prev_s);
+        if (!ok) {
+            snprintf(err, errlen, "redraft batch: sampled markov loop failed");
+            return -1;
+        }
+    }
+    /* greedy ids (and everyone's runner-ups) come back in one read each */
+    if (n_g > 0 || dtree_stats) {
+        int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17], ids2_all[PULSAR_DSPARK_BANKS_MAX * 17];
+        if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_sel * 17 * sizeof(int32_t)) ||
+            !pulsar_gpu_tensor_read(g->dspark_refined2_ids, 0, ids2_all, (uint64_t)n_sel * 17 * sizeof(int32_t))) {
+            snprintf(err, errlen, "redraft batch: ids readback failed");
+            return -1;
+        }
+        for (int j = 0; j < n_sel; j++) {
+            spec_redraft_req *q = &rounds[order[j]]->redraft;
+            for (uint32_t k = 1; k <= q->n_draft; k++) {
+                if (j < n_g) q->refined[k] = ids_all[j * 17 + k];
+                q->refined2[k] = ids2_all[j * 17 + k];
+            }
+        }
+    }
+    /* confidence over every row: tok row (b,k) = refined_b[k], as the
+     * single-bank path feeds it (tok_dev <- refined[0..n_draft)) */
+    const float tau = dspark_conf_sched_tau();
+    if (tau > 0.0f || dtree_stats) {
+        int32_t toks[PULSAR_SPEC_LOGITS_ROWS];
+        float confs[PULSAR_SPEC_LOGITS_ROWS];
+        for (int j = 0; j < n_sel; j++) {
+            const spec_redraft_req *q = &rounds[order[j]]->redraft;
+            for (uint32_t k = 0; k < q->n_draft; k++) toks[base_row[j] + k] = q->refined[k];
+        }
+        if (pulsar_gpu_tensor_bytes(g->dspark_conf_tokens) < (uint64_t)n_rows * sizeof(int32_t) ||
+            pulsar_gpu_tensor_bytes(g->dspark_conf_scores) < (uint64_t)n_rows * sizeof(float) ||
+            !pulsar_gpu_tensor_write(g->dspark_conf_tokens, 0, toks, (uint64_t)n_rows * sizeof(int32_t)) ||
+            !pulsar_gpu_dspark_confidence_score_model(g->dspark_conf_scores, g->batch_ffn_cur,
+                                                     g->dspark_conf_tokens, dmap, dsize,
+                                                     w->markov_w1->abs_offset,
+                                                     w->confidence_proj->abs_offset,
+                                                     n_rows, PULSAR_N_EMBD, embed_dim, vocab_size,
+                                                     w1_bf16,
+                                                     w->confidence_proj->type == PULSAR_TENSOR_BF16) ||
+            !pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, confs, (uint64_t)n_rows * sizeof(float))) {
+            snprintf(err, errlen, "redraft batch: confidence failed");
+            return -1;
+        }
+        for (int j = 0; j < n_sel; j++) {
+            spec_redraft_req *q = &rounds[order[j]]->redraft;
+            q->have_conf = true;
+            for (uint32_t k = 0; k < q->n_draft; k++) q->conf[k] = confs[base_row[j] + k];
+            if (tau > 0.0f) {
+                uint32_t k = 0;
+                while (k < q->n_draft && q->conf[k] >= tau) k++;
+                q->keep = k;
+            }
+        }
+    }
+    return 0;
+}
+
+/* =====================================================================
+ * L150: batched redraft -- one drafter pass for every bank of the tick.
+ *
+ * The batched lane's round_end records each bank's redraft request and
+ * defers. This runs the draft forward over all requesting banks' rows at once
+ * (gpu_graph_dspark_draft_forward_banks: rope/store/visibility positions per
+ * row, bank-major rings), the markov refine with one weight stream per
+ * position across banks, and the confidence head over every row, then leaves
+ * each bank's results in its round. It NEVER switches banks -- it reads the
+ * banks' ring counters from the saved carries (g->ms_dspark_n_raw) and the
+ * rings from the slabs -- so the server's bank_switch bookkeeping stays the
+ * single authority; pulsar_session_spec_redraft_commit stamps a bank's shadow
+ * under the server's switch.
+ *
+ * Byte-exact per bank with the serialized single-bank redraft (the kernels are
+ * exact by construction; each bank draws from its own rng in the same order);
+ * the greedy identity gate pins it. Diagnostics of the single-bank path
+ * (DSPARK_Q lines, the on-policy and ring dumps, dspark_dump_step) are not
+ * emitted here: they are dev instruments of the classic lane. */
+int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds,
+                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    pulsar_gpu_graph *g = &s->graph;
+    const pulsar_dspark_weights *w = &e->dspark_weights;
+    const uint32_t vocab_size = w->vocab_size;
+    if (!rounds || !banks || !rngs || n <= 0) return 0;
+    if (!g->dspark_markov_logits || !g->dspark_refined_ids || !g->dspark_refined2_ids ||
+        !g->dspark_bank_meta || !g->dspark_conf_scores || !g->dspark_conf_tokens ||
+        !g->dspark_prefilter_sel || g->banks.n_banks == 0) {
+        snprintf(err, errlen, "redraft batch: drafter scratch missing");
+        return -1;
+    }
+    /* greedy banks first, then sampled, so each group is contiguous in rows
+     * and in the bank arrays */
+    int order[PULSAR_DSPARK_BANKS_MAX];
+    int n_sel = 0, n_g = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < n && n_sel < (int)PULSAR_DSPARK_BANKS_MAX; i++) {
+            spec_redraft_req *q = &rounds[i]->redraft;
+            if (!q->valid || q->n_draft == 0) continue;
+            const bool sampled = q->temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
+            if ((pass == 0) != !sampled) continue;
+            q->sample_drafts = sampled;
+            order[n_sel++] = i;
+            if (!sampled) n_g++;
+        }
+    if (n_sel == 0) return 0;
+    (void)n_g;
+
+    /* groups: consecutive banks whose rows fit the M-neutral row budget the
+     * banked forward arms (PULSAR_GPU_MNEUTRAL_ROWS_MAX), at most
+     * PULSAR_DSPARK_BANKS_MAX banks each; production (3 banks x <=4 drafts) is
+     * one group. A bank whose depth alone exceeds the budget is refused. */
+    for (int gs = 0; gs < n_sel;) {
+        int ge = gs;
+        uint32_t rows = 0;
+        while (ge < n_sel && ge - gs < (int)PULSAR_DSPARK_BANKS_MAX &&
+               rows + rounds[order[ge]]->redraft.n_draft <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+            rows += rounds[order[ge]]->redraft.n_draft;
+            ge++;
+        }
+        if (ge == gs) {
+            snprintf(err, errlen, "redraft batch: a bank's depth exceeds the row budget");
+            return -1;
+        }
+        const int rc = spec_redraft_group(s, rounds, banks, rngs, order + gs, ge - gs, err, errlen);
+        if (rc != 0) return rc;
+        gs = ge;
+    }
+    for (int j = 0; j < n_sel; j++) rounds[order[j]]->redraft.done = true;
+    return 0;
+}
+
+/* L150: stamp the CURRENT bank's shadow from its batched redraft result. The
+ * caller has switched to the round's bank and saves it afterwards. Mirrors the
+ * tail of spec_round_redraft field for field; the greedy identity gate is what
+ * keeps the two in step. */
+void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {
+    spec_redraft_req *q = &r->redraft;
+    if (!q->valid || !q->done) return;
+    static int dtree_stats_env = -1;
+    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
+    s->spec.dspark_pending_base = q->next_base;
+    s->spec.dspark_chain_unharvested = false;
+    s->spec.dspark_n_pending = q->keep;
+    for (uint32_t i = 0; i < q->keep; i++) s->spec.dspark_pending[i] = q->refined[i + 1];
+    s->spec.dspark_pending_sampled = q->sample_drafts;
+    s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
+    s->spec.dspark_pending_temp = q->temperature;
+    s->spec.dspark_pending_top_k = q->top_k;
+    s->spec.dspark_pending_top_p = q->top_p;
+    s->spec.dspark_pending_min_p = q->min_p;
+    for (uint32_t i = 0; i < q->keep; i++)
+        s->spec.dspark_pending_conf[i] = q->have_conf ? q->conf[i] : -1.0f;
+    if (dtree_stats)
+        for (uint32_t i = 0; i < q->keep; i++) s->spec.dspark_pending_alt[i] = q->refined2[i + 1];
+    if (q->sample_drafts) {
+        bool need_rows = false;
+        for (uint32_t i = 0; i < q->n_draft; i++) {
+            s->spec.dspark_pending_q[i] = q->q_drawn[i];
+            s->spec.dspark_pending_qn[i] = q->qn[i];
+            if (q->qn[i] > 0) {
+                memcpy(s->spec.dspark_pending_qids[i], q->qids[i], (size_t)q->qn[i] * sizeof(int32_t));
+                memcpy(s->spec.dspark_pending_qprobs[i], q->qprobs[i], (size_t)q->qn[i] * sizeof(float));
+            } else {
+                need_rows = true;
+            }
+        }
+        if (need_rows && q->qrows) {
+            const uint32_t need = q->n_draft * PULSAR_N_VOCAB;
+            if (s->dspark_pending_qrows_cap < need) {
+                free(s->dspark_pending_qrows);
+                s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
+                s->dspark_pending_qrows_cap = need;
+            }
+            for (uint32_t i = 0; i < q->n_draft; i++)
+                if (q->qn[i] == 0)
+                    memcpy(s->dspark_pending_qrows + (size_t)i * PULSAR_N_VOCAB,
+                           q->qrows + (size_t)i * PULSAR_N_VOCAB,
+                           (size_t)PULSAR_N_VOCAB * sizeof(float));
+        }
+    }
+    q->done = false;
+    q->valid = false;
+}
+
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+                                     uint32_t *n_draft, uint32_t *keep, int *sampled) {
+    if (!r || !r->redraft.valid || !r->redraft.done) return 0;
+    const spec_redraft_req *q = &r->redraft;
+    if (ids) memcpy(ids, q->refined, sizeof(q->refined));
+    if (conf) memcpy(conf, q->conf, sizeof(q->conf));
+    if (n_draft) *n_draft = q->n_draft;
+    if (keep) *keep = q->keep;
+    if (sampled) *sampled = q->sample_drafts ? 1 : 0;
+    return 1;
 }
 
 uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,

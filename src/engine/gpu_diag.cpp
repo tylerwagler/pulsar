@@ -2302,14 +2302,22 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->dspark_seed_kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         g->dspark_seed_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         g->dspark_seed_rot = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-        g->dspark_markov_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_VOCAB * sizeof(float));
-        g->dspark_conf_scores = pulsar_gpu_tensor_alloc(16ull * sizeof(float));
-        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
+        /* L150: the drafter scratch holds every bank of a batched redraft
+         * (PULSAR_DSPARK_BANKS_MAX banks of refined logits / chain ids, a
+         * confidence row per drafted row); the single-bank paths use slot 0. */
+        g->dspark_markov_logits = pulsar_gpu_tensor_alloc(
+            (uint64_t)PULSAR_DSPARK_BANKS_MAX * PULSAR_N_VOCAB * sizeof(float));
+        g->dspark_conf_scores = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(float));
+        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        g->dspark_bank_meta = pulsar_gpu_tensor_alloc(2ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
+        ok = ok && g->dspark_bank_meta;
         g->dspark_embed_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
-        g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * sizeof(int32_t));
-        g->dspark_refined2_ids = pulsar_gpu_tensor_alloc(17ull * sizeof(int32_t));
+        g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
+        g->dspark_refined2_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
         g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
             16ull * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+        g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        ok = ok && g->dspark_row_meta;
         g->spec_compact_host = (int32_t *)xmalloc(
             (size_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
         g->spec_compact_rows = 0;

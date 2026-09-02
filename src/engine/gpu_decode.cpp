@@ -485,6 +485,105 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor         *base_logits_out,
         const int32_t            draft_ids[],
         uint32_t                n_draft) {
+    /* L150: the single-bank forward is the banked one at n_banks == 1 -- the
+     * scalar-position code path, byte-identical to before. */
+    return gpu_graph_dspark_draft_forward_banks(g, base_model, base_weights, dspark_model, w,
+                                                base_logits_out, draft_ids, n_draft,
+                                                1u, NULL, NULL, NULL);
+}
+
+/* L150: the drafter forward over the rows of several banks at once. Row t
+ * belongs to bank row_bank[t] (ids in [0, g->banks.n_banks)); rows of one bank
+ * are contiguous and in draft order; bank b has bank_n_draft[b] rows and its
+ * three drafter rings hold bank_n_raw[b][li] positions. n_banks == 1 with the
+ * three arrays NULL is the classic single-bank forward on the CURRENT bank's
+ * repointed ring views (scalar positions, unchanged). With n_banks > 1 the
+ * per-row position arrays go up in ONE write and the attention/store calls
+ * take the banked arm over the bank-major slabs: rope and KV-store positions
+ * are each row's true position (n_raw_b + k); the attention VISIBILITY
+ * position is the bank's last draft position (n_raw_b + n_draft_b - 1) for
+ * every row of that bank, which reproduces today's non-causal window
+ * [0, n_raw_b + n_draft_b) and ring start exactly (rows/L150.md). */
+bool gpu_graph_dspark_draft_forward_banks(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *base_model,
+        const pulsar_weights       *base_weights,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        pulsar_gpu_tensor         *base_logits_out,
+        const int32_t            draft_ids[],
+        uint32_t                n_draft,
+        uint32_t                n_banks,
+        const uint32_t          *row_bank,
+        const uint32_t         (*bank_n_raw)[3],
+        const uint32_t          *bank_n_draft) {
+    const bool banked = row_bank != NULL;
+    if (banked && (n_banks == 0 || !bank_n_raw || !bank_n_draft || !g->dspark_row_meta ||
+                   g->banks.n_banks == 0 || n_draft > PULSAR_SPEC_LOGITS_ROWS ||
+                   !g->banks.dspark_raw[0] || !g->banks.dspark_raw[1] || !g->banks.dspark_raw[2]))
+        return false;
+    /* per-row device arrays: rope/store position per layer, visibility per
+     * layer, bank id -- one upload for the whole forward */
+    pulsar_gpu_tensor *meta_rope[3] = {NULL, NULL, NULL};
+    pulsar_gpu_tensor *meta_vis[3] = {NULL, NULL, NULL};
+    pulsar_gpu_tensor *meta_seq = NULL;
+    if (banked) {
+        int32_t meta[7 * PULSAR_SPEC_LOGITS_ROWS];
+        uint32_t k = 0, prev_bank = UINT32_MAX;
+        for (uint32_t t = 0; t < n_draft; t++) {
+            const uint32_t b = row_bank[t];
+            if (b >= g->banks.n_banks) return false;
+            k = (b == prev_bank) ? k + 1u : 0u;
+            prev_bank = b;
+            for (uint32_t li = 0; li < 3; li++) {
+                meta[(li * 2 + 0) * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)(bank_n_raw[b][li] + k);
+                meta[(li * 2 + 1) * PULSAR_SPEC_LOGITS_ROWS + t] =
+                    (int32_t)(bank_n_raw[b][li] + bank_n_draft[b] - 1u);
+            }
+            meta[6 * PULSAR_SPEC_LOGITS_ROWS + t] = (int32_t)b;
+        }
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        const uint64_t rb = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t);
+        bool vok = true;
+        for (uint32_t li = 0; li < 3; li++) {
+            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 0) * rb,
+                                                   (uint64_t)n_draft * sizeof(int32_t));
+            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 1) * rb,
+                                                  (uint64_t)n_draft * sizeof(int32_t));
+            vok = vok && meta_rope[li] && meta_vis[li];
+        }
+        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb,
+                                          (uint64_t)n_draft * sizeof(int32_t));
+        if (!vok || !meta_seq) {
+            for (uint32_t li = 0; li < 3; li++) {
+                pulsar_gpu_tensor_free(meta_rope[li]);
+                pulsar_gpu_tensor_free(meta_vis[li]);
+            }
+            pulsar_gpu_tensor_free(meta_seq);
+            return false;
+        }
+    }
+    struct MetaGuard {
+        pulsar_gpu_tensor **r, **v, *s;
+        bool armed;
+        ~MetaGuard() {
+            for (int i = 0; i < 3; i++) { pulsar_gpu_tensor_free(r[i]); pulsar_gpu_tensor_free(v[i]); }
+            pulsar_gpu_tensor_free(s);
+            if (armed) pulsar_gpu_matmul_set_batch_mneutral(0);
+        }
+    } meta_guard = { meta_rope, meta_vis, meta_seq, false };
+    if (banked) {
+        /* M-NEUTRAL for the whole banked forward (the verify step's L146 rule):
+         * every dense GEMM, the grouped attention-output GEMV, the head and the
+         * MoE take their row-independent arms, so a bank's rows compute the
+         * same bytes whether it rides the forward alone or with others. Without
+         * this, 3 rows take the nt kernels and 9 rows take cuBLASLt, and the
+         * identity gate sees 1-4% confidence drift and the odd flipped draft.
+         * The cap is the arms' row budget; the caller groups banks to fit. */
+        if (n_draft > PULSAR_GPU_MNEUTRAL_ROWS_MAX) return false;
+        pulsar_gpu_matmul_set_batch_mneutral((int)n_draft);
+        meta_guard.armed = true;
+    }
     /* L106 K2a: the drafter hand-rolls its attention half and never passes
      * through the batch encode whose first act is the gact disarm -- so a
      * gact entry armed and noted by a prior prefill chunk or spec verify of
@@ -519,7 +618,6 @@ bool gpu_graph_dspark_draft_forward(
                                               n_draft,
                                               PULSAR_N_EMBD,
                                               PULSAR_N_HC) != 0;
-    if (!ok) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
@@ -623,7 +721,7 @@ bool gpu_graph_dspark_draft_forward(
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
-            NULL) != 0;
+            banked ? meta_rope[li] : NULL) != 0;
 
         /* --- KV projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
@@ -646,7 +744,8 @@ bool gpu_graph_dspark_draft_forward(
             PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL) != 0;
+            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+            banked ? meta_rope[li] : NULL) != 0;
         /* No fake-quantise pass here.  batch_kv has no reader after the store
          * below, and that store packs the rows itself -- so round-tripping first
          * only fed already-quantized values to a fresh quantizer, which is the
@@ -657,10 +756,19 @@ bool gpu_graph_dspark_draft_forward(
         /* --- Store draft KV transiently in ring buffer for attention --- */
         const uint32_t saved_n_raw = g->dspark_n_raw[li];
         const uint32_t kv_store_pos = saved_n_raw % raw_cap;
-        if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(
-            g->dspark_raw_cache[li], g->batch_kv,
-            raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
-            NULL, NULL, 1) != 0;
+        if (ok) {
+            if (banked)
+                /* row t -> bank row_bank[t]'s ring at slot rope_pos[t] % raw_cap */
+                ok = pulsar_gpu_store_raw_kv_batch_tensor(
+                    g->banks.dspark_raw[li], g->batch_kv,
+                    raw_cap, 0u, n_draft, PULSAR_N_HEAD_DIM,
+                    meta_rope[li], meta_seq, g->banks.n_banks) != 0;
+            else
+                ok = pulsar_gpu_store_raw_kv_batch_tensor(
+                    g->dspark_raw_cache[li], g->batch_kv,
+                    raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
+                    NULL, NULL, 1) != 0;
+        }
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
         const uint32_t raw_start = vis_raw > raw_cap
@@ -668,19 +776,39 @@ bool gpu_graph_dspark_draft_forward(
 
         /* --- Non-causal raw batch attention ---
          * Queries are at positions [saved_n_raw, saved_n_raw+n_draft).
-         * Visible raw entries span [0, vis_raw) — all cached + current draft rows. */
-        if (ok) ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
-            g->batch_heads,
-            dspark_model->map, dspark_model->size,
-            layer->attn_sinks->abs_offset,
-            g->batch_q, g->dspark_raw_cache[li],
-            n_draft, saved_n_raw,
-            cap_raw, raw_cap, raw_start,
-            0,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-            1,
-            NULL, NULL, 0, 1,
-                                          NULL /* q pre-normed */) != 0;
+         * Visible raw entries span [0, vis_raw) — all cached + current draft rows.
+         * Banked: per row, the kernel derives the window from the VISIBILITY
+         * position (the bank's last draft position) with window = raw_cap, which
+         * yields exactly cap_raw / raw_start / first_raw_pos of the scalar path
+         * for that bank; scalar n_raw/raw_start are ignored there. */
+        if (ok) {
+            if (banked)
+                ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+                    g->batch_heads,
+                    dspark_model->map, dspark_model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q, g->banks.dspark_raw[li],
+                    n_draft, 0u,
+                    0u, raw_cap, 0u,
+                    raw_cap,
+                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
+                    1,
+                    meta_vis[li], meta_seq, 0, g->banks.n_banks,
+                    NULL /* q pre-normed */) != 0;
+            else
+                ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+                    g->batch_heads,
+                    dspark_model->map, dspark_model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q, g->dspark_raw_cache[li],
+                    n_draft, saved_n_raw,
+                    cap_raw, raw_cap, raw_start,
+                    0,
+                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
+                    1,
+                    NULL, NULL, 0, 1,
+                    NULL /* q pre-normed */) != 0;
+        }
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
                                              (uint64_t)n_draft * PULSAR_N_HEAD * PULSAR_N_HEAD_DIM, li, pos0);
@@ -698,7 +826,8 @@ bool gpu_graph_dspark_draft_forward(
             PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, true,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL) != 0;
+            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+            banked ? meta_rope[li] : NULL) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
         if (ok) ok = pulsar_gpu_attention_output_batch_tensor(
             g->batch_attn_out, g->batch_attn_low,
