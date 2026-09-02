@@ -1426,12 +1426,23 @@ __global__ static void attention_decode_split_merge_kernel(
 
 /* Split-KV partial scratch: static device storage so the split launch is
  * CUDA-graph-safe (no allocation at capture or replay time) and needs no
- * per-call setup.  Sized for the worst gated shape (8 tokens x 128 heads x
- * 8 splits x 512 dims = 16.8 MiB).  The decode step executes one attention
+ * per-call setup.  Sized for the worst gated shape (16 tokens x 128 heads x
+ * 8 splits x 512 dims = 33.6 MiB).  The decode step executes one attention
  * launch at a time on one stream, so a single scratch is safe; a future
- * multi-stream decode would need per-stream scratch. */
+ * multi-stream decode would need per-stream scratch.
+ *
+ * L150/L152 (2026-09-02): the token cap MUST cover every row count the
+ * M-neutral decode step can carry (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16), not
+ * just 8.  The split tier's softmax merge rounds differently from the
+ * single-walk kernel, so with the cap at 8 a bank's rows computed one way in
+ * a <= 8-row step and another way in a 9..16-row step -- the batched drafter
+ * forward was byte-identical to its serialized twin at 8 rows and not at 9,
+ * and the base verify step (GATE 5) was identical at 8 rows and off by whole
+ * logit units at 10 (the tier switch amplified through 43 layers of MoE
+ * routing).  Every gate to that date had run at <= 8 rows; production's 9-12
+ * row verify step was the only caller on the other side of the cap. */
 #define PULSAR_DEC_SPLITKV_S 8u
-#define PULSAR_DEC_SPLITKV_MAX_TOKENS 8u
+#define PULSAR_DEC_SPLITKV_MAX_TOKENS 16u
 #define PULSAR_DEC_SPLITKV_MAX_HEADS 128u
 /* CONCURRENCY (multi-stream decode, mid-roadmap): a single shared __device__
  * partials buffer is safe only while one thread submits decode. It CANNOT be
