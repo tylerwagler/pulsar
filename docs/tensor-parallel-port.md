@@ -13,13 +13,18 @@ comments can cite (like the Lnnn tags elsewhere).
 - **This is a forward-port, not a restore.** Our fork point (80ebbc3) predates
   upstream's TP; upstream's two-machine TP is Metal-only, so the GPU half is new
   CUDA work and only the transport (ds4_tp.c ~2.2k lines) lifts.
-- **Interconnect is characterized (read-only, 2026-08-26):** the pair is wired
-  direct-attach 200G NDR RoCE on `rocep1s0f1` (192.168.0.12/.13), RS-FEC, 0 CRC
-  errors; no `nvidia_peermem` loaded yet TP2 runs at speed (GB10 unified-memory
-  registerable-slabs thesis holds). Production pair is off-limits (read-only,
-  ~10 GB free) — engine bring-up needs a spare box. **TWO QSFP cables are
-  attached** (all four CX-7 ports LINK_UP); the bench must measure 1-link vs
-  2-link (documented Spark-pair results: ~13.5 GB/s single NIC vs ~24.5 GB/s
+- **Interconnect is characterized (read-only, 2026-08-26, re-verified 2026-09-02):**
+  the pair has TWO direct-attach 200G NDR RoCE wires: `rocep1s0f1`
+  (192.168.0.12/.13 — the NCCL/vLLM wire) and `roceP2p1s0f1`
+  (192.168.9.12/.13/30, MTU 9000 — the TP bring-up wire, separate from NCCL),
+  RS-FEC, 0 CRC errors; no `nvidia_peermem` loaded yet TP2 runs at speed
+  (GB10 unified-memory registerable-slabs thesis holds). Production pair is
+  off-limits (read-only, ~10 GB free) — engine bring-up needs a spare box or
+  an approved window; a co-tenant transport/probe run can pin
+  `PULSAR_TP_RDMA_DEV=roceP2p1s0f1` and stay on the 9.x wire.
+  **TWO QSFP cables are attached** (all four CX-7 ports LINK_UP; `rocep1s0f0`
+  and `roceP2p1s0f0` carry no IP); the bench must measure 1-link vs 2-link
+  (documented Spark-pair results: ~13.5 GB/s single NIC vs ~24.5 GB/s
   merged). The transport keeps RDMA device selection explicit so a later
   multi-link merge stays possible.
 

@@ -18,6 +18,11 @@ hosts, and a multi-HCA box prints a "pin the SAME cable on both ranks with
 PULSAR_TP_RDMA_DEV=<hca>" warning when the env is unset. The runbook step 3
 must set `PULSAR_TP_RDMA_DEV` identically on both ranks (physical cable
 identity cannot be inferred from inside the process).
+**Pair record (2026-09-02):** the two cabled wires are `rocep1s0f1`
+(`192.168.0.x` — the NCCL/vLLM wire) and `roceP2p1s0f1` (`192.168.9.12-.13/30`,
+MTU 9000 — the TP bring-up wire). For a co-tenant run on the work pair, pin
+`PULSAR_TP_RDMA_DEV=roceP2p1s0f1` on both ranks; traffic stays off the wire
+vLLM uses. (`rocep1s0f0` and `roceP2p1s0f0` are LINK_UP with no IP.)
 
 ### F2 — [HIGH, FIXED] GID scan was Mac/Thunderbolt-only
 The GID scan accepted only IPv4-mapped `::ffff:` GIDs — upstream's two-Mac
@@ -29,6 +34,10 @@ pair** (not a graceful TCP demotion — see F3).
 accepts the first non-link-local (non-`fe80`) GID when no IPv4-mapped one
 exists. Runtime confirmation on the pair still required (expect index 3 on
 the CX-7).
+**Verified 2026-09-02:** on `roceP2p1s0f1` (the 9.x TP wire) the IPv4 GID
+(`::ffff:c0a8:090c/d` = 192.168.9.12/.13) lives at index **189** (dup 200),
+not 3 — high-index placement, so the fallback scan is the path that works
+here, not the index-3 assumption. No override needed on this device.
 
 ### F3 — [MEDIUM, RUNBOOK] RDMA bring-up failure is fatal, not TCP
 Once the hello advertises `rdma_ok`, a later `tp_rdma_open` failure aborts

@@ -23,11 +23,22 @@ If a session needs a full engine build first: `make cuda-spark`.
 ## 1. Interconnect sanity (read-only, ~1 min) — both boxes
 
 ```sh
-rdma link; ibv_devinfo -l                 # 4 HCAs; the two cabled ports ACTIVE
-ip -br addr                              # 192.168.0.12/.13 (NCCL wire) + 192.168.1.12/.13 (mgmt)
-cat /sys/class/net/enp1s0f1np1/speed      # 200000 (2 cables attached; note both)
+rdma link; ibv_devinfo -l                 # 4 HCAs; all four ports ACTIVE/LINK_UP
+ip -br addr         # 192.168.0.12/.13 (NCCL wire) + 192.168.9.12/.13 (TP wire)
+                    # + 192.168.1.12/.13 (mgmt)
+cat /sys/class/net/enP2p1s0f1np1/mtu      # 9000 on the TP wire
 ```
-Pass: the `rocep1s0f1` port carrying `192.168.0.x` is ACTIVE on both sides.
+Pass: the `rocep1s0f1` port carrying `192.168.0.x` AND `roceP2p1s0f1` carrying
+`192.168.9.x` are both ACTIVE on both sides.
+
+> **TP wire (verified 2026-09-02 on ca1070wk30007/008):** the second 200G cable is
+> `enP2p1s0f1np1` / `roceP2p1s0f1` / `192.168.9.12-.13/30`, MTU 9000, IPv4 GID
+> present (high index — the fallback scan picks it up; `PULSAR_TP_RDMA_GID_INDEX`
+> not needed). It is **separate from the NCCL wire** (`enp1s0f1np1` /
+> `rocep1s0f1` / `192.168.0.x`), so a co-tenant run dials the 9.x address and
+> pins `PULSAR_TP_RDMA_DEV=roceP2p1s0f1` on BOTH ranks (tp-pair-bringup.sh
+> threads it through every leg) and never touches the wire vLLM/NCCL uses.
+> `rocep1s0f0` and `roceP2p1s0f0` are LINK_UP but carry no IP — ignore them.
 
 ## 2. Cross-host transport over TCP (fail-safe first, ~2 min)
 
