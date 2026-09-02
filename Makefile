@@ -557,6 +557,16 @@ tests/tp_cmd_stress_test: tests/tp_cmd_stress_test.cpp src/tp/pulsar_tp.cpp src/
 tp-cmd-stress-test: tests/tp_cmd_stress_test
 	./tests/tp_cmd_stress_test
 
+# TP verify/commit reference-grading test (host half of slice 4e): the pure
+# decision rule (all-match vs first-mismatch stop) plus a few hundred leader
+# verify + commit rounds against a worker that mirrors the grade from the
+# drafts -- the grading+commit lockstep the real pair will run.  Host-only.
+tests/tp_verify_test: tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp_verify.h src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp.cpp
+
+tp-verify-test: tests/tp_verify_test
+	./tests/tp_verify_test
+
 # TP tiny-buffer regression (audit F9): the TCP fallback's alternating
 # write/read rounds must complete even when the socket buffers are clamped
 # small (PULSAR_TP_TEST_TINY_BUFFERS=1 -> 32K bufs) -- the conditition under
@@ -589,5 +599,5 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_identity_test tests/tp_wide_test tests/tp_fault_test tests/tp_cmd_stress_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_identity_test tests/tp_wide_test tests/tp_fault_test tests/tp_cmd_stress_test tests/tp_verify_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
