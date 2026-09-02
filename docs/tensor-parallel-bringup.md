@@ -98,11 +98,26 @@ capture the `cudaGetErrorString`/`strerror` now — it changes the slab design.
 Run the PLAN 102 probe's RDMA halves (not on production without a window):
 ```sh
 # per link: ib_send_lat -d <hca> -s 16384 -n 5000 -F, then -d <hca2> ...
-# record 16 KiB round-trip for each of the two cabld links; expect ~10-30 us.
+# record 16 KiB round-trip for each of the two cabled links; expect ~10-30 us.
 # PULSAR_TP_RDMA_DEV=<hca> pins the transport's device per rank for the A/B.
 ```
 Pass: numbers recorded into `pulsar-notes` (1-link vs 2-link; merged 2-link if
 later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
+
+> **RESULT (pair-verified 2026-09-02, perftest 6.28 both sides):**
+> 16 KiB send latency, 5000 iters:
+> - 9.x TP wire (`roceP2p1s0f1`, off vLLM): avg **4.64 µs**, typical 4.58, min
+>   4.28, max 9.87, stdev 0.08, p99 5.07, p99.9 5.62.
+> - 0.x NCCL wire (`rocep1s0f1`, co-tenant with vLLM): avg **4.77 µs**, typical
+>   4.78, min 4.51, max 12.79, stdev 0.07, p99 4.94, p99.9 5.19.
+> Both links are ~same latency (well under the transport's 10-30 µs budget) —
+> the two-cable question is answered on latency: symmetric.  The 13.5 vs
+> 24.5 GB/s single-vs-merged bandwidth difference (port doc) is throughput,
+> not latency.  Requires MATCHING perftest on both ranks: box A (DOCA repo,
+> 26.01.5-1) and box B (Ubuntu, 24.01.0) failed the negotiation handshake
+> ("Failed to exchange negotiation parameters") until B was aligned up to the
+> Mellanox DOCA 26.01.5-1 build (repo + key: `doca.list` signed-by
+> `/etc/apt/trusted.gpg.d/GPG-KEY-Mellanox.pub`).
 
 ## 6. (After 4c) first live engine pair — prefill-TP before decode-TP
 
