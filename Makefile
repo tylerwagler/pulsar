@@ -1039,7 +1039,7 @@ tests/resume_suffix_probe.o: tests/resume_suffix_probe.cpp src/pulsar.h
 tests/token_seam_gate.o: tests/token_seam_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/token_seam_gate.cpp
 
-tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_decode_gate.cpp
 
 tests/mseq_rowcost_probe.o: tests/mseq_rowcost_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -1066,13 +1066,13 @@ tests/bank_fork_gate.o: tests/bank_fork_gate.cpp src/engine/pulsar_engine_intern
 tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/session_payload_gate.cpp
 
-tests/algo_stability_gate.o: tests/algo_stability_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
 tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.cpp
 
-tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.cpp
 
 # Public-API only (pulsar.h): the gate must build unchanged against the baseline

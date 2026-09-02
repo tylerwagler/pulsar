@@ -17,8 +17,9 @@
  *
  * ASSERTIONS:
  *  - HARD: bank 0's logits are byte-identical across the BATCHED tier M in
- *    {2,4,5,8} — i.e. adding rows, INCLUDING crossing the M=4->5 custom->cuBLASLt
- *    boundary, does not perturb the target. This is the property inc 4 relies on.
+ *    {2,4,5,8,12,16} — i.e. adding rows, INCLUDING crossing the M=4->5
+ *    custom->cuBLASLt boundary and the 8->9 MoE GEMV cap (L152), does not
+ *    perturb the target. This is the property inc 4 relies on.
  *  - REPORTED: M=1 vs M=2 (the single-row kernel tier the inc-1 multiseq gate
  *    excludes by construction) — informational, not fatal by itself.
  * The first differing float index + the two values are printed so a real algo
@@ -30,6 +31,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,49 +50,18 @@ static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 49
 static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158,
                                              177, 233, 140, 201, 169, 150, 120, 205};
 
-static char *read_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
-    fclose(fp); buf[n] = '\0'; if (len_out) *len_out = (size_t)n; return buf;
-}
-
-static bool make_prompt(int k, pulsar_tokens *p) {
-    memset(p, 0, sizeof(*p));
-    const int off = g_prompt_off[k], len = g_prompt_len[k];
-    if (off + len > g_toks.len) return false;
-    p->v = (int *)malloc((size_t)len * sizeof(int));
-    if (!p->v) return false;
-    memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
-    p->len = p->cap = len;
-    return true;
-}
-
 /* Run ONE batched decode step at width M on a fresh session; copy bank 0's logit
  * row (PULSAR_N_VOCAB floats) into row0_out. Returns false on any engine failure. */
 static bool bank0_logits_at_width(int M, float *row0_out) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
-    bool ok = (int)gpu_graph_bank_pool_count(g) >= M;
-    if (!ok) fprintf(stderr, "pool too small: %u < %d (set PULSAR_MSEQ_BANKS)\n",
-                     gpu_graph_bank_pool_count(g), M);
+    bool ok = gate_pool_fits(s, (uint32_t)M);
     char err[256];
     int argtok[GATE_MAX_N];
-    for (int k = 0; ok && k < M; k++) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p;
-        ok = make_prompt(k, &p);
-        if (ok && pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-            fprintf(stderr, "populate bank %d failed: %s\n", k, err); ok = false;
-        }
-        if (ok) { gpu_graph_bank_counters_capture(g, (uint32_t)k); argtok[k] = pulsar_session_argmax(s); }
-        pulsar_tokens_free(&p);
-    }
+    for (int k = 0; ok && k < M; k++)
+        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k],
+                                &argtok[k], "populate");
     float *logits = ok ? (float *)malloc((size_t)M * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
     if (ok) {
@@ -110,12 +81,6 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
     return ok;
 }
 
-/* first differing float index, or -1 if byte-identical over `n` floats. */
-static long first_diff(const float *a, const float *b, long n) {
-    for (long i = 0; i < n; i++) if (a[i] != b[i]) return i;
-    return -1;
-}
-
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
@@ -123,14 +88,10 @@ int main(int argc, char **argv) {
     if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats)\n");
 
-    size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
-    if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
-    memset(&g_toks, 0, sizeof g_toks);
-    pulsar_tokenize_text(g_e, text, &g_toks); free(text);
     int need = 0;
     for (int k = 0; k < GATE_MAX_N; k++)
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
-    if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
+    if (!gate_load_story(g_e, &g_toks, need)) return 1;
 
     const int vocab = (int)PULSAR_N_VOCAB;
     /* 12 and 16 added 2026-09-02: the armed range above 8 rows had no width
@@ -151,7 +112,7 @@ int main(int argc, char **argv) {
     int ref;   /* widths[1] == 2 */
     ref = 1;
     for (int wi = 0; wi < nW; wi++) {
-        const long d = first_diff(row[wi], row[ref], vocab);
+        const long d = gate_first_diff(row[wi], row[ref], vocab);
         const bool batched = widths[wi] >= 2;
         if (d < 0) {
             printf("ALGO-STABILITY: bank0 logits M=%d == M=2 (byte-identical)\n", widths[wi]);
@@ -170,7 +131,7 @@ int main(int argc, char **argv) {
     }
 
 done:
-    for (int wi = 0; wi < 8; wi++) free(row[wi]);
+    for (int wi = 0; wi < nW; wi++) free(row[wi]);
     pulsar_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "ALGO-STABILITY GATE: FAIL\n"); return 1; }
     printf("ALGO-STABILITY GATE: PASS\n");

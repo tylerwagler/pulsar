@@ -29,6 +29,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_fixture.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -90,14 +91,6 @@ static void init_banks(void) {
     }
 }
 
-static char *read_file(const char *p, size_t *n) {
-    FILE *f = fopen(p, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long s = ftell(f); fseek(f, 0, SEEK_SET);
-    char *b = (char *)malloc((size_t)s + 1);
-    if (!b || fread(b, 1, (size_t)s, f) != (size_t)s) { fclose(f); free(b); return NULL; }
-    fclose(f); b[s] = 0; if (n) *n = (size_t)s; return b;
-}
-
 /* Populate decode banks + (if K>0) the prefill bank on a FRESH session, run ONE
  * fused decode_mixed step, and copy back: each decode bank's logit row into
  * dec_rows[k] (N_DEC * vocab), and (K>0) the prefill run's last-position logits
@@ -108,41 +101,21 @@ static char *read_file(const char *p, size_t *n) {
 static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *pre_row) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
     const uint32_t n_pre_bank = (K > 0) ? 1u : 0u;
     const uint32_t need_banks = (uint32_t)g_n_dec + n_pre_bank;
-    bool ok = gpu_graph_bank_pool_count(g) >= need_banks;
-    if (!ok) fprintf(stderr, "pool too small: %u < %u (set PULSAR_MSEQ_BANKS)\n",
-                     gpu_graph_bank_pool_count(g), need_banks);
+    bool ok = gate_pool_fits(s, need_banks);
     char err[256];
     int argtok[N_DEC_MAX];
 
     /* decode banks: sync prompt, capture frontier, record next token. */
-    for (int k = 0; ok && k < g_n_dec; k++) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
-        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-            fprintf(stderr, "decode bank %d sync failed: %s\n", k, err); ok = false; break;
-        }
-        gpu_graph_bank_counters_capture(g, (uint32_t)k);
-        argtok[k] = pulsar_session_argmax(s);
-    }
+    for (int k = 0; ok && k < g_n_dec; k++)
+        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_off[k], g_len[k], &argtok[k], "decode bank");
     /* prefill bank (bank N_DEC): classic first chunk [0,C0) to lift its frontier
      * off 0 (step_begin rejects pos-0), then the K prefill rows extend [C0,C0+K). */
     const int *pptr = g_toks.v + PBASE;
-    if (ok && K > 0) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)g_n_dec)) ok = false;
-        if (ok) {
-            pulsar_session_invalidate(s);
-            pulsar_tokens p = { .v = (int *)pptr, .len = C0, .cap = C0 };
-            if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-                fprintf(stderr, "prefill bank first-chunk sync failed: %s\n", err); ok = false;
-            }
-        }
-        if (ok) gpu_graph_bank_counters_capture(g, (uint32_t)g_n_dec);
-    }
+    if (ok && K > 0)
+        ok = gate_populate_bank(s, (uint32_t)g_n_dec, pptr, C0, NULL, "prefill bank first chunk");
 
     const uint32_t n_rows = (uint32_t)g_n_dec + (K > 0 ? (uint32_t)K : 0u);
     pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
@@ -193,21 +166,12 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
 static bool multirun_step_logits(int rpb, int only_bank, float *out) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
-    bool ok = gpu_graph_bank_pool_count(g) >= (uint32_t)g_n_dec;
+    bool ok = gate_pool_fits(s, (uint32_t)g_n_dec);
     char err[256];
     int argtok[N_DEC_MAX];
-    for (int k = 0; ok && k < g_n_dec; k++) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
-        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-            fprintf(stderr, "multirun bank %d sync failed: %s\n", k, err); ok = false; break;
-        }
-        gpu_graph_bank_counters_capture(g, (uint32_t)k);
-        argtok[k] = pulsar_session_argmax(s);
-    }
+    for (int k = 0; ok && k < g_n_dec; k++)
+        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_off[k], g_len[k], &argtok[k], "multirun");
     const int n_banks_issued = only_bank >= 0 ? 1 : g_n_dec;
     const uint32_t n_rows = (uint32_t)(n_banks_issued * rpb);
     pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
@@ -254,21 +218,12 @@ static bool multirun_step_rows(const int *rpb_of, int only_bank, bool reverse, f
     pulsar_session *s = NULL;
     dump_prefix("skip");   /* the fixture re-prefills dump under skip_ (L152 diag) */
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
     const int vocab = (int)PULSAR_N_VOCAB;
-    bool ok = gpu_graph_bank_pool_count(g) >= (uint32_t)g_n_dec;
+    bool ok = gate_pool_fits(s, (uint32_t)g_n_dec);
     char err[256];
     int argtok[N_DEC_MAX];
-    for (int k = 0; ok && k < g_n_dec; k++) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
-        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-            fprintf(stderr, "multirun bank %d sync failed: %s\n", k, err); ok = false; break;
-        }
-        gpu_graph_bank_counters_capture(g, (uint32_t)k);
-        argtok[k] = pulsar_session_argmax(s);
-    }
+    for (int k = 0; ok && k < g_n_dec; k++)
+        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_off[k], g_len[k], &argtok[k], "multirun");
     uint32_t n_rows = 0;
     for (int k = 0; k < g_n_dec; k++) if (only_bank < 0 || k == only_bank) n_rows += (uint32_t)rpb_of[k];
     pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
@@ -321,10 +276,6 @@ static bool classic_resume(int K, float *out_lg, int *next_tok) {
     return ok;
 }
 
-static long first_diff(const float *a, const float *b, long n) {
-    for (long i = 0; i < n; i++) if (a[i] != b[i]) return i;
-    return -1;
-}
 
 /* GATE 5R (L152): the multi-run step's EVERY row, batched vs solo, in both bank
  * orders.  `spec` is one run length for every bank or a comma list per bank
@@ -378,7 +329,7 @@ static void gate5r_run(const char *spec, bool fatal) {
             for (int j = 0; j < RPB; j++) {
                 const float *a = all + (row_off + (size_t)j) * vocab;
                 const float *b = solo + (size_t)j * vocab;
-                long d = first_diff(a, b, (long)vocab);
+                long d = gate_first_diff(a, b, (long)vocab);
                 if (d < 0) {
                     if (!fatal) printf("%s %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", tag, rev ? "reversed" : "forward", k, slot, j, RPB);
                 } else {
@@ -411,13 +362,9 @@ int main(int argc, char **argv) {
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only "
            "formats)  (n_dec=%d K=%d)\n", g_n_dec, K_PRE);
 
-    size_t tl = 0; char *txt = read_file("tests/long_context_story_prompt.txt", &tl);
-    if (!txt) { fprintf(stderr, "prompt read failed\n"); return 1; }
-    memset(&g_toks, 0, sizeof g_toks);
-    pulsar_tokenize_text(g_e, txt, &g_toks); free(txt);
     int need = PBASE + C0 + K_PRE + 1;
     for (int k = 0; k < g_n_dec; k++) if (g_off[k] + g_len[k] > need) need = g_off[k] + g_len[k];
-    if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
+    if (!gate_load_story(g_e, &g_toks, need)) return 1;
 
     const int vocab = (int)PULSAR_N_VOCAB;
     float *ref_dec = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));   /* decode-only M=N_DEC */
@@ -434,7 +381,7 @@ int main(int argc, char **argv) {
 
     /* GATE 4: each decode bank byte-identical decode-only vs fused (full head). */
     for (int k = 0; k < g_n_dec; k++) {
-        const long d = first_diff(mix_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
+        const long d = gate_first_diff(mix_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
         if (d < 0) {
             printf("GATE 4 NEUTRALITY: decode bank %d logits M=%d (decode-only) == M=%d (+%d-row prefill) "
                    "BYTE-IDENTICAL\n", k, g_n_dec, g_n_dec + K_PRE, K_PRE);
@@ -451,7 +398,7 @@ int main(int argc, char **argv) {
      * BYTE-IDENTICAL to decode-only — the prefill's intermediate logits are never
      * consumed, and skipping them must not perturb the decode banks. */
     for (int k = 0; k < g_n_dec; k++) {
-        const long d = first_diff(lv1_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
+        const long d = gate_first_diff(lv1_dec + (size_t)k * vocab, ref_dec + (size_t)k * vocab, vocab);
         if (d < 0) {
             printf("GATE 4b LEVER-1: decode bank %d logits (intermediate fused, head-skip) == decode-only "
                    "BYTE-IDENTICAL\n", k);
@@ -498,7 +445,7 @@ int main(int argc, char **argv) {
             for (int k = 0; mr_ok && k < g_n_dec; k++) mr_ok = multirun_step_logits(RPB, k, mr_solo);
             if (!mr_ok) { fprintf(stderr, "GATE 5 FAIL: multi-run step failed\n"); g_fail = 1; }
             for (int k = 0; mr_ok && k < g_n_dec; k++) {
-                const long d = first_diff(mr_all + (size_t)k * vocab, mr_solo + (size_t)k * vocab, vocab);
+                const long d = gate_first_diff(mr_all + (size_t)k * vocab, mr_solo + (size_t)k * vocab, vocab);
                 if (d < 0) {
                     printf("GATE 5 MULTI-RUN: bank %d run of %d rows, batched (%d rows) == solo (%d rows) BYTE-IDENTICAL\n",
                            k, RPB, rows_total, RPB);

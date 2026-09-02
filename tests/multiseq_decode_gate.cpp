@@ -71,6 +71,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_fixture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,26 +98,9 @@ static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 
         } \
     } while (0)
 
-static double now_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static char *read_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long n = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
-    fclose(fp);
-    buf[n] = '\0';
-    if (len_out) *len_out = (size_t)n;
-    return buf;
-}
-
+/* A malloc'd COPY of prompt k (the stale-classic and time-slice legs below
+ * hand it to sessions that outlive the call and free it themselves; the
+ * populate paths use token views through gate_populate_bank instead). */
 static bool make_prompt(int k, pulsar_tokens *p) {
     memset(p, 0, sizeof(*p));
     const int off = g_prompt_off[k], len = g_prompt_len[k];
@@ -128,16 +112,22 @@ static bool make_prompt(int k, pulsar_tokens *p) {
     return true;
 }
 
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 /* Classic greedy solo reference for prompt k: prefill + STEPS plain decode
  * steps; stream[j] = argmax emitted at position len+j (stream[0] is the
  * prefill continuation).  *secs = the timed classic decode loop. */
 static bool solo_stream(int k, int steps, int *stream, double *secs) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_tokens p;
-    bool ok = make_prompt(k, &p);
+    pulsar_tokens p = { .v = g_toks.v + g_prompt_off[k], .len = g_prompt_len[k], .cap = g_prompt_len[k] };
+    bool ok = true;
     char err[256];
-    if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
+    if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
         fprintf(stderr, "solo sync failed: %s\n", err);
         ok = false;
     }
@@ -154,7 +144,6 @@ static bool solo_stream(int k, int steps, int *stream, double *secs) {
         }
         if (secs) *secs = now_s() - t0;
     }
-    pulsar_tokens_free(&p);
     pulsar_session_free(s);
     return ok;
 }
@@ -177,34 +166,16 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
                       bool use_mixed, float *first_logits_out) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
-    if ((int)gpu_graph_bank_pool_count(g) < n) {
-        fprintf(stderr, "pool too small: %u < %d (set PULSAR_MSEQ_BANKS)\n",
-                gpu_graph_bank_pool_count(g), n);
-        pulsar_session_free(s);
-        return false;
-    }
+    if (!gate_pool_fits(s, (uint32_t)n)) { pulsar_session_free(s); return false; }
     const int vocab = (int)PULSAR_N_VOCAB;   /* the engine's logits row width */
     char err[256];
     bool ok = true;
-    for (int k = 0; k < n; k++) {
+    for (int k = 0; ok && k < n; k++) {
         if (flip_step) flip_step[k] = -1;
-        /* Repoint the graph's views at bank k, prefill THIS bank from zero
-         * through the classic path (invalidate: no prefix reuse across
-         * banks), and capture its frontier into the bank's ms counters. */
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p;
-        ok = make_prompt(k, &p);
-        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
-            fprintf(stderr, "populate bank %d failed: %s\n", k, err);
-            ok = false;
-        }
-        if (ok) {
-            gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            streams[k][0] = pulsar_session_argmax(s);
-        }
-        pulsar_tokens_free(&p);
+        /* Prefill THIS bank from zero through the classic path (no prefix reuse
+         * across banks) and capture its frontier into the bank's ms counters. */
+        ok = gate_populate_bank(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k],
+                                &streams[k][0], "populate");
     }
     float *logits = ok ? (float *)malloc((size_t)n * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
@@ -559,17 +530,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    size_t text_len = 0;
-    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
-    memset(&g_toks, 0, sizeof(g_toks));
-    pulsar_tokenize_text(g_e, text, &g_toks);
-    free(text);
     int need = 0;
     for (int k = 0; k < maxn; k++) {
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     }
-    if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d < %d)\n", g_toks.len, need); return 1; }
+    if (!gate_load_story(g_e, &g_toks, need)) return 1;
 
     /* Classic-decode solo references + the single-session baseline rate. */
     int *solo[GATE_MAX_N];
