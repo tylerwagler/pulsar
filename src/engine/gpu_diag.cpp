@@ -1663,11 +1663,29 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
      * lays decode rows strictly before the prefill run (a length-1 run appearing
      * AFTER a prefill run is not an inc-4 layout and would be treated as prefill —
      * documented, enforced by the row builder / gate). */
+    /* L146: a step whose WHOLE batch fits the M-neutral row cap is M-neutral in
+     * full, whatever its run structure.  The prefix scan below exists for the
+     * mixed step whose trailing run is a K-row prefill chunk (K up to the
+     * prefill cap) -- those rows want the tensor-core path.  A production
+     * verify batch -- three slots x (1 + draft depth) rows, no prefill run --
+     * has NO length-1 runs, so the scan armed nothing: every dense projection
+     * took cuBLASLt at grids of 4-32 CTAs (output_a 291 us where the grouped
+     * nt kernel takes ~150, output_b 266 vs ~155) and the MXFP4 MoE took the
+     * grouped path, padding 54 rows to ~7,000 (gather + swiglu-pack 3.1 ms per
+     * layer for ~1 MB of activations) -- L145.  At <= PULSAR_GPU_MNEUTRAL_ROWS_MAX
+     * rows there is no run the tensor-core path serves better, and the
+     * per-row-exact kernels are the ones the decode prefix already uses, so arm
+     * them all.  Every row's output is then independent of its batchmates --
+     * the property gate 4 asserts for decode rows, extended to draft rows. */
     uint32_t n_dec = 0;
-    for (uint32_t t = 0; t < n_rows; ) {
-        uint32_t rl = 1;
-        while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
-        if (rl == 1) { n_dec++; t++; } else break;
+    if (n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        n_dec = n_rows;
+    } else {
+        for (uint32_t t = 0; t < n_rows; ) {
+            uint32_t rl = 1;
+            while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
+            if (rl == 1) { n_dec++; t++; } else break;
+        }
     }
     pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
     return true;
