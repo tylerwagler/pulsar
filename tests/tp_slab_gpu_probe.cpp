@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include "tp/pulsar_tp.h"
+#include "tp/pulsar_tp_gpu.h"
 
 #define N_LAYER 43u
 #define N_EMBD 4096u
@@ -95,17 +96,11 @@ static int run_rank(pulsar_tp *tp, int rank) {
             return 2;
         }
     } else {
-        alloc_mode = "malloc+cudaHostRegister";
-        if (posix_memalign(&base, 4096, slab_bytes) != 0 || !base) {
-            std::fprintf(stderr, "rank %d: posix_memalign(%zu) failed\n",
-                         rank, slab_bytes);
-            return 2;
-        }
-        cudaError_t ce = cudaHostRegister(base, slab_bytes, cudaHostRegisterMapped);
-        if (ce != cudaSuccess) {
-            std::fprintf(stderr, "rank %d: cudaHostRegister(%zu) failed: %s\n",
-                         rank, slab_bytes, cudaGetErrorString(ce));
-            free(base);
+        alloc_mode = "host-pinned (pulsar_tp_gpu)";
+        char gerr[256];
+        if (!pulsar_tp_gpu_slab_alloc_hostpin(slab_bytes, &base,
+                                              gerr, sizeof(gerr))) {
+            std::fprintf(stderr, "rank %d: %s\n", rank, gerr);
             return 2;
         }
     }
@@ -170,7 +165,7 @@ static int run_rank(pulsar_tp *tp, int rank) {
     }
 
     pulsar_tp_free(tp);
-    if (hostpin) { cudaHostUnregister(base); free(base); } else cudaFree(base);
+    if (hostpin) pulsar_tp_gpu_slab_free_hostpin(base); else cudaFree(base);
     if (g_failures) {
         std::fprintf(stderr, "tp_slab_probe: rank %d: %d FAILURE(S)\n", rank, g_failures);
         return 1;
