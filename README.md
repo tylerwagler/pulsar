@@ -279,17 +279,20 @@ numeric tiers are **on by default** on this branch, each behind an `=0`
 opt-out and each gated by measured fidelity (suite-v1 teacher-forced KL and
 the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
 
-- `PULSAR_CUDA_ATTN_F16` — fp16 tensor-core prefill attention (all window,
-  indexed, banked and continued-prefill paths; reads the packed comp cache
-  directly).
+- fp16 tensor-core prefill attention (all window, indexed, banked and
+  continued-prefill paths; reads the packed comp cache directly). Default-on;
+  its `PULSAR_CUDA_ATTN_F16=0` opt-out was retired 2026-09-02 along with the
+  unfused cuBLAS two-GEMM arm it fell back to — there is no longer a second
+  multi-token attention path.
 - Block-scaled MXFP4 indexer scorer. Default-on; its opt-out switch
   (`PULSAR_CUDA_INDEXER_MXFP4`) was retired in the v0.5.0 switch audit and the
   packed indexer cache is now allocated unconditionally.
-- `PULSAR_CUDA_DECODE_SPLITKV` — split-KV decode attention with softmax merge
-  (8 row-splits; the small-batch decode walk no longer serializes on 8 blocks).
-  `=0` still opts out, and the engine says so on the startup line that
-  announces the tier. (The separate `PULSAR_SPLITKV_DEBUG` A/B switch, which
-  ran both walks per call, WAS retired in the v0.5.0 switch audit.)
+- Split-KV decode attention with softmax merge (8 row-splits up to 16 tokens
+  per launch; the small-batch decode walk no longer serializes on 8 blocks).
+  Its `PULSAR_CUDA_DECODE_SPLITKV=0` opt-out was retired 2026-09-02; the
+  single-walk kernel still serves launches above 16 tokens by size, not by
+  switch. (The separate `PULSAR_SPLITKV_DEBUG` A/B switch, which ran both
+  walks per call, was retired in the v0.5.0 switch audit.)
 
 | Context | Prefill (t/s, cold) | Decode plain (t/s) |
 | ---: | ---: | ---: |

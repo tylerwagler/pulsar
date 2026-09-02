@@ -806,13 +806,13 @@ static int check_multibank_decode_attention(void) {
              1,  8, -1,  5, 24,  3, 12,  2,
         };
         const mb_row idx_rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
-        /* Banked mode forces the generic indexed kernel (heads8 variants stay
-         * single-bank); pin the scalar reference to the same kernel. */
-        setenv("PULSAR_CUDA_NO_INDEXED_HEADS8", "1", 1);
-        const int idx_rc = mb_run_case("indexed-generic", idx_rows, 3, raw_slab, raw_cap,
+        /* Banked descriptors ride the heads8 / fp16 indexed kernels (the generic
+         * indexed kernel and the PULSAR_CUDA_NO_INDEXED_HEADS8 opt-out that
+         * pinned this case to it were deleted 2026-09-02).  Batch and the 3-row
+         * references take the same dispatch, so the byte comparison stands. */
+        const int idx_rc = mb_run_case("indexed", idx_rows, 3, raw_slab, raw_cap,
                                        comp_slab, comp_cap, 25, window, ratio, n_banks,
                                        sinks, n_head, head_dim, 1, topk_host, top_k);
-        unsetenv("PULSAR_CUDA_NO_INDEXED_HEADS8");
         if (idx_rc != 0) goto done;
     }
 

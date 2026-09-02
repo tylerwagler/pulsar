@@ -967,8 +967,9 @@ bool gpu_graph_encode_layer_attention_batch(
          * batch_q holds RAW q_b output and the normed+roped Q exists only
          * inside the attention kernel's registers, so there is nothing to
          * dump without computing it somewhere.  That at least lands on the
-         * FUSED kernel, which is a real fallback path (non-f16 hardware,
-         * PULSAR_CUDA_ATTN_F16=0), not a debug-only one. */
+         * FUSED kernel, which is a real fallback path (non-f16 hardware; the
+         * PULSAR_CUDA_ATTN_F16=0 opt-out is gone since 2026-09-02), not a
+         * debug-only one. */
         const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0) &&
                                      pulsar_gpu_attn_f16_tier_on();
         g->q_prep_active = 0;

@@ -109,17 +109,15 @@ __device__ __forceinline__ static void af16_mma(
 #endif
 
 /* Load a pair of ADJACENT stored-Q elements as one packed-f16 fragment word.
- * For f32 storage this converts; for __half storage the bytes are already the
- * fragment encoding, so it is a single aligned 4-byte load -- the old path
- * round-tripped half->float->half for nothing (L086 T7).  Alignment: callers
- * pass even element indices off 256-aligned row bases. */
+ * For __half storage the bytes are already the fragment encoding, so it is a
+ * single aligned 4-byte load -- the old path round-tripped half->float->half
+ * for nothing (L086 T7).  Alignment: callers pass even element indices off
+ * 256-aligned row bases.  (A <float> specialization that converted on load
+ * existed for the f32-Q instantiation; that instantiation's only reference was
+ * a smem grant, both deleted 2026-09-02.  A future Q width change adds its
+ * specialization here and the compiler names the site.) */
 template <typename QT>
 __device__ __forceinline__ static uint32_t af16_load_pair(const QT *p, uint32_t i);
-template <>
-__device__ __forceinline__ uint32_t af16_load_pair<float>(const float *p, uint32_t i) {
-    return (uint32_t)__half_as_ushort(__float2half(p[i])) |
-           ((uint32_t)__half_as_ushort(__float2half(p[i + 1u])) << 16);
-}
 template <>
 __device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint32_t i) {
     return *(const uint32_t *)(p + i);
@@ -779,18 +777,15 @@ static int af16_dynsmem_ok(void) {
         /* ⚠ THE GRANT IS PER-INSTANTIATION.  attn_f16_kernel is templated on
          * batch_q's element type (L045), and a missing grant does not fail
          * loudly at build time -- the launch gets 0 dynamic bytes and faults,
-         * exactly as the comment above warns.  So BOTH instantiations are
-         * granted: <pulsar_q_t> (= __half since the L045 flip) is what
-         * launches today, and the <float> grant is the safety net a future
-         * width change must not be able to forget.  (This sentence once said
-         * "<float> is launched today" -- it had drifted; L106 A4.) */
-        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<float>,
+         * exactly as the comment above warns.  Grant the instantiation that
+         * launches, named by the same typedef the launch sites use, so a
+         * future width change moves the grant with it.  (A second <float>
+         * grant used to sit here as a "safety net"; it was the only reference
+         * to that instantiation, i.e. a whole dead kernel kept alive by a
+         * comment -- deleted 2026-09-02.) */
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<pulsar_q_t>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 (int)AF16_DYNSMEM_BYTES);
-        cudaError_t e16 = cudaFuncSetAttribute(attn_f16_kernel<__half>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                (int)AF16_DYNSMEM_BYTES);
-        if (e == cudaSuccess && e16 != cudaSuccess) e = e16;
         state = (e == cudaSuccess) ? 1 : -1;
         if (state < 0)
             fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
@@ -800,8 +795,10 @@ static int af16_dynsmem_ok(void) {
 }
 
 int pulsar_gpu_attn_f16_tier_on(void) {
-    static const int env_on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16");
-    return env_on && af16_device_supported();
+    /* The PULSAR_CUDA_ATTN_F16=0 opt-out was retired 2026-09-02 (no caller;
+     * the cuBLAS two-GEMM arm it fell back to is gone).  The tier is a
+     * property of the device now. */
+    return af16_device_supported();
 }
 
 int pulsar_gpu_attention_f16_prefill_mx(

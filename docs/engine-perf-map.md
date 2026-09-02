@@ -170,7 +170,7 @@ the win has to come from the tensor-core dataflow removing the 8x shared-memory
 re-read (8 warps each pulling the whole 2 KB row), not from raw math.  2-3x on
 the attention kernels is the realistic target, i.e. 11-17% of prefill.
 
-#### Built: src/cuda/pulsar_cuda_attn_f16.cu (default-on since 2026-08-08; PULSAR_CUDA_ATTN_F16=0 opts out)
+#### Built: src/cuda/pulsar_cuda_attn_f16.cu (default-on since 2026-08-08; the PULSAR_CUDA_ATTN_F16=0 opt-out and the cuBLAS two-GEMM fallback were deleted 2026-09-02)
 
 fp16 chosen, kernel written, wired into both window launchers behind the env
 flag.  MEASURED in-engine, same workload:
@@ -296,9 +296,11 @@ emit (m, l, o) partials to static device scratch (graph-safe, 16.8 MiB);
 `attention_decode_split_merge_kernel` folds them log-sum-exp style and
 applies the sink once.  gridDim.z == 1 is bit-identical to the old walk and
 still serves n_tokens > 8.  All three heads8 sites route through one
-dispatcher; PULSAR_CUDA_DECODE_SPLITKV=0 opts out (bit-identical restore,
-verified 1e-26).  PULSAR_SPLITKV_DEBUG=1 used to A/B both walks per call; that
-debug switch was retired in the v0.5.0 switch audit and now does nothing.
+dispatcher; the single walk still serves launches above the 16-token cap by
+size (the PULSAR_CUDA_DECODE_SPLITKV=0 opt-out was retired 2026-09-02; the
+1e-26 bit-identical-restore check was done while it existed).
+PULSAR_SPLITKV_DEBUG=1 used to A/B both walks per call; that debug switch was
+retired in the v0.5.0 switch audit and now does nothing.
 
 Measured, locked clocks, v5mx4-mmqaligned (baseline -> split):
     2k  18.41 -> 20.72  (+12.5%, flips the last Entrpi-winning cell: 19.85)

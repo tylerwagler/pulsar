@@ -379,9 +379,10 @@ typedef struct {
     float beta_slow;       ///< YaRN ramp end, in rotations per context
 } pulsar_gpu_q_prep;
 
-/** True when the fp16 attention tier will take eligible batches (env tier on
- * AND the device has the MMA path) -- the engine uses it to decide whether to
- * defer Q norm+rope to the kernel or run the standalone kernel as before. */
+/** True when the fp16 attention tier will take eligible batches (the device
+ * has the MMA path; the env opt-out was retired 2026-09-02) -- the engine uses
+ * it to decide whether to defer Q norm+rope to the kernel or run the
+ * standalone kernel as before. */
 int pulsar_gpu_attn_f16_tier_on(void);
 
 /** Opaque packed-row carriers (L092).  The packed caches (384-B NVFP4
