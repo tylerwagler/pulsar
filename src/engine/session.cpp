@@ -1520,7 +1520,16 @@ void pulsar_session::rewind(int pos) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t want = (uint32_t)pos / 4u;
         const uint32_t start = 4u * (want - 1u);
-        if (start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi) {
+        const bool covered = start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi;
+        /* L154: one line per boundary-crossing rewind saying whether the value
+         * replay ran.  Diagnostic, read once (PULSAR_REWIND_TRACE); this is the
+         * witness the stage-0b measurement had to add to a throwaway build. */
+        static const int trace = getenv("PULSAR_REWIND_TRACE") != NULL;
+        if (trace)
+            fprintf(stderr, "pulsar: rewind replay %s: target %d needs [%u,%d) span [%u,%u) bank %u\n",
+                    covered ? "TAKEN" : "skipped", pos, start, pos,
+                    g->proj_ring_lo, g->proj_ring_hi, rw_bank);
+        if (covered) {
             pulsar_engine *e = s->engine;
             const pulsar_model *model = &e->model;
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

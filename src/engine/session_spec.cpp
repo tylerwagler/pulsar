@@ -1548,6 +1548,13 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         s->checkpoint.len = saved_len + 1 + commit;
         for (int m = 0; ok_state && m <= commit && m < (int)n_batch; m++)
             ok_state = dspark_seed_from_batch_row(s, row0 + (uint32_t)m);
+        /* L154 (pricing): the committed prefix is a commit point like the
+         * rollforward's; deposit it from the saved projections so the ring
+         * span stays contiguous across full-accept rounds.  Without this the
+         * served span never covered a decode-era rewind target. */
+        if (ok_state)
+            ok_state = gpu_graph_proj_ring_deposit_committed(g, (uint32_t)saved_len,
+                                                             (uint32_t)(1 + commit), row0);
     } else {
         /* Partial/zero accept: target state includes rejected positions.
          * Stage A: restore the pre-batch frontier and replay the committed

@@ -2371,6 +2371,11 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
                                  const pulsar_gpu_tensor *sc_row,
                                  bool indexer);
 void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos);
+/** L154: deposit a spec round's committed positions [pos0, pos0+n) from the
+ * verify batch's saved projections (save rows save_row0..) and note them, so
+ * full-accept rounds keep the ring span contiguous like partial ones do. */
+bool gpu_graph_proj_ring_deposit_committed(pulsar_gpu_graph *g, uint32_t pos0,
+                                           uint32_t n_positions, uint32_t save_row0);
 
 /** L124: save the CURRENT contents of layer il's ratio-128 state slot
  * (pos %% 128) into the undo lane row pos %% 32 -- call BEFORE the store.

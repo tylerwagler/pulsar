@@ -1358,6 +1358,46 @@ bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
            pulsar_gpu_tensor_copy_async(ds, off, sc_row, 0, row_bytes) != 0;
 }
 
+/* L154 (pricing option (b) of ONE-STATE-MODEL stage 3): deposit a spec
+ * round's COMMITTED positions from the projections the verify batch saved
+ * (spec_comp_*_save / spec_icomp_*_save, rows save_row0..), then advance the
+ * span.  Until this existed a FULL-accept round deposited nothing -- only the
+ * partial-accept rollforward did -- so the served ring's span broke at every
+ * full accept and rewind()'s contiguity test never passed on decode-era
+ * positions (0 replays taken, rows/L131.md).  Cost per round: 4 async row
+ * copies per committed position per ratio-4 layer, the same shape the
+ * rollforward already pays on partial rounds. */
+bool gpu_graph_proj_ring_deposit_committed(pulsar_gpu_graph *g, uint32_t pos0,
+                                           uint32_t n_positions, uint32_t save_row0) {
+    if (!g || n_positions == 0) return true;
+    if (save_row0 + n_positions > PULSAR_SPEC_LOGITS_ROWS + 1u) return false;
+    const uint32_t comp_width = 2u * PULSAR_N_HEAD_DIM;
+    const uint32_t index_width = 2u * PULSAR_N_INDEXER_HEAD_DIM;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (pulsar_layer_compress_ratio(il) != 4u) continue;
+        if (!g->layer_attn_proj_kv[il]) continue;          /* no ring on this layer */
+        if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) return false;
+        for (uint32_t t = 0; t < n_positions; t++) {
+            const uint32_t pos = pos0 + t;
+            pulsar_gpu_tensor *kv = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
+            pulsar_gpu_tensor *sc = gpu_graph_tensor_row_view(g->spec_comp_sc_save[il], save_row0 + t, comp_width);
+            bool ok = kv && sc && gpu_graph_proj_ring_deposit(g, il, pos, kv, sc, false);
+            pulsar_gpu_tensor_free(sc);
+            pulsar_gpu_tensor_free(kv);
+            if (ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il]) {
+                pulsar_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, index_width);
+                pulsar_gpu_tensor *isc = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, index_width);
+                ok = ikv && isc && gpu_graph_proj_ring_deposit(g, il, pos, ikv, isc, true);
+                pulsar_gpu_tensor_free(isc);
+                pulsar_gpu_tensor_free(ikv);
+            }
+            if (!ok) return false;
+        }
+    }
+    for (uint32_t t = 0; t < n_positions; t++) gpu_graph_proj_ring_note_pos(g, pos0 + t);
+    return true;
+}
+
 bool gpu_graph_r128_undo_capture(pulsar_gpu_graph *g, uint32_t il, uint32_t pos) {
     pulsar_gpu_tensor *uk = g->layer_r128_undo_kv[il];
     pulsar_gpu_tensor *us = g->layer_r128_undo_sc[il];
