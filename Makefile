@@ -253,6 +253,12 @@ cuda-regression: tests/cuda_long_context_smoke
 cuda-kv4-pack-gate: tests/kv4_pack_gate
 	./tests/kv4_pack_gate
 
+# L149: the device min-p prefilter must equal its host emulation bit-for-bit
+# (row max with the host's tie rule, candidate set and order, overflow report).
+# Needs a GPU, no model.
+cuda-minp-prefilter-gate: tests/minp_prefilter_gate
+	./tests/minp_prefilter_gate
+
 # fp16 attention correctness gates (standalone .cu, no model needed):
 # kernel-vs-f64 oracle, banked cross-sequence isolation (the KV-leak oracle
 # for the default-on fp16 tier), and split-KV decode merge vs the single-walk
@@ -377,7 +383,7 @@ tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting ATTN_PACK comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -893,7 +899,7 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
 #   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
-GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-chat-smoke-gate \
+GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-prefill-gate \
 	cuda-reference-gate \
                cuda-frontier-gate cuda-rewind-gate cuda-mseq-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
@@ -993,6 +999,9 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gp
 tests/kv4_pack_gate.o: tests/kv4_pack_gate.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/kv4_pack_gate.cpp
 
+tests/minp_prefilter_gate.o: tests/minp_prefilter_gate.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/minp_prefilter_gate.cpp
+
 tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.cpp
 
@@ -1078,6 +1087,9 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CU
 tests/kv4_pack_gate: tests/kv4_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/minp_prefilter_gate: tests/minp_prefilter_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -1140,7 +1152,7 @@ test: pulsar_test seam-check
 
 clean:
 	rm -rf .build
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

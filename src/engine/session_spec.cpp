@@ -591,6 +591,17 @@ static int spec_accept_walk(pulsar_session *s,
             }
             if (pend_sampled) {
                 pulsar_sample_dist qd;
+                const uint32_t qn = s->spec.dspark_pending_qn[commit];
+                if (qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP) {
+                    /* L149: q_X exactly as built at draft time (drafting loop) */
+                    memset(&qd, 0, sizeof(qd));
+                    qd.n = qn;
+                    qd.ids = (int *)xmalloc((size_t)qn * sizeof(int));
+                    qd.probs = (float *)xmalloc((size_t)qn * sizeof(float));
+                    memcpy(qd.ids, s->spec.dspark_pending_qids[commit], (size_t)qn * sizeof(int));
+                    memcpy(qd.probs, s->spec.dspark_pending_qprobs[commit],
+                           (size_t)qn * sizeof(float));
+                } else
                 pulsar_sample_dist_build(s->dspark_pending_qrows +
                                           (size_t)commit * PULSAR_N_VOCAB,
                                       PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
@@ -765,19 +776,65 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                              w->markov_w2->type == PULSAR_TENSOR_BF16);
         pulsar_gpu_tensor_free(base_row);
         if (!draft_ok || !sample_drafts) continue;
-        /* Read this position's refined logits back BEFORE the next markov step
-         * overwrites the single-row scratch, and keep the row: the residual
-         * needs the full q of whichever position rejects, which is not known
-         * until verify. (This full-vocab D2H per draft position is the
-         * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
-        float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
-        if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
-            draft_ok = false;
-            break;
-        }
+        /* Build this position's proposal q BEFORE the next markov step
+         * overwrites the single-row scratch, and keep it: the residual needs
+         * the q of whichever position rejects, which is not known until verify.
+         *
+         * L149: the production shape (top_k 0, top_p 1, min_p 0.05) needs only
+         * the candidates above the min-p floor, and the min-p cutoff is
+         * division-free (tokenizer.cpp), so the device prefilter hands back
+         * the few survivors instead of the 517 KB row -- the read shrinks to
+         * one small block and the host skips the 129k-expf normaliser pass
+         * that idled the GPU ~630 us per draft position. The built q is stored
+         * for the residual (dspark_pending_qn), so the walk skips the rebuild
+         * too. Any other shape, an overflowing candidate set or a refused build
+         * falls through to the full-row path, unchanged. */
         pulsar_sample_dist q;
-        pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
-                              &s->sample_scratch, &q);
+        bool q_built = false;
+        s->spec.dspark_pending_qn[pos] = 0;
+        if (top_k <= 0 && top_p == 1.0f && min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN &&
+            min_p <= 1.0f && vocab_size <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX &&
+            g->dspark_prefilter_sel) {
+            /* floor in logit units, a hair below T*ln(min_p): the host
+             * comparison decides membership, this only bounds the read */
+            const float delta = (float)((double)temperature * (log((double)min_p) - 1e-3));
+            int32_t sel[PULSAR_DSPARK_PREFILTER_ROW_I32];
+            if (pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, dspark_logits, 0, 1u,
+                                               vocab_size, vocab_size, delta,
+                                               PULSAR_DSPARK_PREFILTER_CAP) &&
+                pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel, sizeof(sel))) {
+                const uint32_t n_sel = (uint32_t)sel[0];
+                float max_logit;
+                memcpy(&max_logit, &sel[2], sizeof(max_logit));
+                if (n_sel > 0 && n_sel <= PULSAR_DSPARK_PREFILTER_CAP)
+                    q_built = pulsar_sample_dist_build_prefiltered(
+                                  sel + 3, (const float *)(sel + 3 + PULSAR_DSPARK_PREFILTER_CAP),
+                                  n_sel, max_logit, temperature, min_p,
+                                  &s->sample_scratch, &q) != 0;
+            }
+            if (q_built && q.n <= PULSAR_DSPARK_QDIST_CAP) {
+                s->spec.dspark_pending_qn[pos] = q.n;
+                memcpy(s->spec.dspark_pending_qids[pos], q.ids, (size_t)q.n * sizeof(int32_t));
+                memcpy(s->spec.dspark_pending_qprobs[pos], q.probs, (size_t)q.n * sizeof(float));
+            } else if (q_built) {
+                /* too wide to store: keep q, but the residual will need the row */
+                float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
+                if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+                    pulsar_sample_dist_free(&q);
+                    draft_ok = false;
+                    break;
+                }
+            }
+        }
+        if (!q_built) {
+            float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
+            if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+                draft_ok = false;
+                break;
+            }
+            pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
+                                  &s->sample_scratch, &q);
+        }
         const int drawn = pulsar_sample_dist_draw(&q, rng);
         refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
         s->spec.dspark_pending_q[pos] = pulsar_sample_dist_prob(&q, drawn);

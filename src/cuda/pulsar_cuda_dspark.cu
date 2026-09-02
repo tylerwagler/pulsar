@@ -587,3 +587,122 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce batch");
 }
+
+
+/* =====================================================================
+ * L149: min-p candidate prefilter (contract in pulsar_gpu.h).
+ *
+ * The sampled speculative path used to read the drafter's whole 517 KB
+ * logits row back per draft position and run the host sampler over it; the
+ * 129k host expf calls behind that read idled the GPU ~630 us per position
+ * (production profile, rows/L149.md). The host min-p cutoff is now
+ * division-free (tokenizer.cpp), so the sampler needs only the candidates
+ * at or above the floor: this kernel finds the row max exactly as the host
+ * scan does (first finite maximum, lowest id on ties) and emits every finite
+ * logit >= max + delta in ascending id order -- a superset of the survivors
+ * that pulsar_sample_dist_build_prefiltered trims with the host's own
+ * comparison. No expf on the device: membership is one float add and one
+ * compare, reproducible bit-for-bit on the host (tests/minp_prefilter_gate).
+ *
+ * One block per row, 1024 threads: a strided max reduce, then a contiguous
+ * chunk per thread so a block-wide scan places each thread's candidates at
+ * their index-ordered offsets. */
+__global__ static void minp_prefilter_rows_kernel(const float *__restrict__ logits,
+                                                  uint32_t row_stride, uint32_t n_vocab,
+                                                  float delta, uint32_t cap,
+                                                  int32_t *__restrict__ out, uint32_t out_stride) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+    __shared__ uint32_t sm_cnt[THREADS];
+    const float *x = logits + (size_t)blockIdx.x * row_stride;
+    int32_t *o = out + (size_t)blockIdx.x * out_stride;
+    const uint32_t tid = threadIdx.x;
+
+    /* 1. Row max: first finite maximum, lowest id on ties (the host's pass 1). */
+    float lv = 0.0f;
+    int32_t li = -1;
+    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
+        const float v = x[i];
+        if (!isfinite(v)) continue;
+        if (li < 0 || v > lv) { lv = v; li = (int32_t)i; }
+    }
+    sm_val[tid] = lv;
+    sm_idx[tid] = li;
+    __syncthreads();
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            const bool take_right = ir >= 0 && (il < 0 || vr > vl || (vr == vl && ir < il));
+            if (take_right) { sm_val[tid] = vr; sm_idx[tid] = ir; }
+        }
+        __syncthreads();
+    }
+    const float mx = sm_val[0];
+    const int32_t mi = sm_idx[0];
+    if (mi < 0) {
+        if (tid == 0) { o[0] = 0; o[1] = -1; o[2] = 0; }
+        return;
+    }
+    const float thr = mx + delta;
+
+    /* 2. Count per contiguous chunk, scan, then place -- ascending id overall. */
+    const uint32_t chunk = (n_vocab + THREADS - 1u) / THREADS;
+    const uint32_t lo = tid * chunk;
+    const uint32_t hi = min(lo + chunk, n_vocab);
+    uint32_t cnt = 0;
+    for (uint32_t i = lo; i < hi; i++) {
+        const float v = x[i];
+        if (isfinite(v) && v >= thr) cnt++;
+    }
+    sm_cnt[tid] = cnt;
+    __syncthreads();
+    for (uint32_t off = 1; off < THREADS; off <<= 1) {
+        const uint32_t t = tid >= off ? sm_cnt[tid - off] : 0u;
+        __syncthreads();
+        sm_cnt[tid] += t;
+        __syncthreads();
+    }
+    const uint32_t total = sm_cnt[THREADS - 1];
+    if (tid == 0) { o[0] = (int32_t)total; o[1] = mi; o[2] = __float_as_int(mx); }
+    if (total > cap) return;
+    uint32_t pos = sm_cnt[tid] - cnt;
+    int32_t *ids = o + 3;
+    float *vals = reinterpret_cast<float *>(o + 3 + cap);
+    for (uint32_t i = lo; i < hi; i++) {
+        const float v = x[i];
+        if (isfinite(v) && v >= thr) {
+            ids[pos] = (int32_t)i;
+            vals[pos] = v;
+            pos++;
+        }
+    }
+}
+
+int pulsar_gpu_minp_prefilter_rows(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *logits,
+        uint64_t                logits_offset_bytes,
+        uint32_t                n_rows,
+        uint32_t                row_stride_elems,
+        uint32_t                n_vocab,
+        float                   delta,
+        uint32_t                cap) {
+    const uint64_t out_stride = 3ull + 2ull * cap;
+    if (!out || !logits || n_rows == 0 || n_rows > 1024u || n_vocab == 0 || cap == 0 ||
+        row_stride_elems < n_vocab || !(delta <= 0.0f) ||
+        logits_offset_bytes > logits->bytes ||
+        (uint64_t)(n_rows - 1) * row_stride_elems * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
+            logits->bytes - logits_offset_bytes ||
+        out->bytes < (uint64_t)n_rows * out_stride * sizeof(int32_t)) {
+        return 0;
+    }
+    minp_prefilter_rows_kernel<<<n_rows, 1024>>>(
+        (const float *)((const char *)logits->ptr + logits_offset_bytes),
+        row_stride_elems, n_vocab, delta, cap,
+        (int32_t *)out->ptr, (uint32_t)out_stride);
+    return cuda_ok(cudaGetLastError(), "minp prefilter launch");
+}

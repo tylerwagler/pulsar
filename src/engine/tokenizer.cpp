@@ -1012,40 +1012,41 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
  * min-p prefilter threshold (shared by sample_full_vocab and
  * pulsar_sample_dist_build's full-vocab paths).
  *
- * The min-p cutoff both paths apply post-sort keeps candidate i (i > 0) iff
+ * The min-p cutoff every path applies post-sort keeps candidate i (i > 0) iff
  *
- *     fl(p_i / sum) >= min_prob,   min_prob = fl(fl(p_max / sum) * min_p)
+ *     fl(p_i) >= fl(p_max * min_p)
  *
- * where p_max = expf((max - max)/T) = expf(0.0f) == 1.0f EXACTLY. In exact
- * arithmetic the sum cancels and the condition is p_i >= min_p. In float,
- * each of the three roundings perturbs by at most one unit roundoff
- * u = 2^-24, so:
- *   - any candidate the cutoff CAN keep satisfies
- *         p_i >= min_p * (1-u)^2 / (1+u) > min_p * (1 - 3u);
- *   - any candidate with p_i < min_p * (1 - 3u) is cut for EVERY value of
- *     `sum`, i.e. regardless of summation order.
- * A logit-side prefilter that keeps p_i >= min_p * (1 - 4e-6) (~67u of
- * slack, which also absorbs the rounding of this threshold product itself)
- * therefore keeps a SUPERSET of whatever the exact cutoff keeps, under any
- * sum. Because probs are monotone in the logit, that superset is a PREFIX of
- * the descending sort — so the byte-exact cutoff loop, run unchanged over
- * the sorted survivors, walks exactly the candidates it would have walked
- * over the full sorted vocab and trims the boundary with the SAME float
- * comparisons as before. Membership is never decided by the prefilter.
+ * where p_max = expf((max - max)/T) = expf(0.0f) == 1.0f EXACTLY, so the
+ * threshold IS min_p and the decision depends on nothing but p_i.
+ *
+ * L149 (2026-09-02): until then the comparison was
+ *     fl(p_i / sum) >= fl(fl(p_max / sum) * min_p)
+ * with `sum` the full-vocab normaliser -- the same condition in exact
+ * arithmetic, but three roundings wide, and it made every min-p decision
+ * depend on a 129k-term sum that existed only to cancel out. On the sampled
+ * speculative path that sum was the 129k host expf calls the GPU idled
+ * behind for ~630 us per draft position. The division-free form decides the
+ * boundary from p_i alone, which is what lets a DEVICE prefilter hand the
+ * sampler the few candidates above the floor instead of the full row
+ * (pulsar_sample_dist_build_prefiltered). Rounding-level change: a candidate
+ * whose p_i sits within ~3 ulp of min_p could be classed differently than
+ * before; the emitted distribution is otherwise identical.
+ *
+ * A logit-side prefilter that keeps p_i >= min_p * (1 - 4e-6) keeps a
+ * SUPERSET of whatever the cutoff keeps. Because probs are monotone in the
+ * logit, that superset is a PREFIX of the descending sort -- so the cutoff
+ * loop, run unchanged over the sorted survivors, walks exactly the
+ * candidates it would have walked over the full sorted vocab and trims the
+ * boundary with the SAME float comparison. Membership is never decided by
+ * the prefilter.
  *
  * The max candidate is kept unconditionally (mirrors the loop's i > 0
  * exemption; also covers min_p > 1 and a NaN temperature poisoning p).
  *
- * DOMAIN: the one-roundoff-per-operation bound only holds while min_prob and
- * pr are NORMAL floats; if min_prob lands in the subnormals (min_p on the
- * order of 1e-38 * sum), ties-to-even at a few ulps can round the cutoff
- * below what the slack covers and the superset claim fails (review finding,
- * 2026-07-17: min_p = 13*2^-149, sum = 2.0, p_i = 12*2^-149 flips). min_p is
- * NOT range-checked server-side, so both paths take the prefilter only for
- * min_p > SAMPLE_MINP_PREFILTER_MIN and fall back to the exact full sort
- * below it: sum <= n_vocab <= ~1.3e5 keeps min_prob >= min_p/sum > 7e-36 —
- * normal, with ~650x margin over FLT_MIN — and boundary p_i ~ min_p are
- * normal too. Requests with 0 < min_p <= 1e-30 are absurd but stay correct. */
+ * DOMAIN: min_p is NOT range-checked server-side; both paths take the
+ * prefilter only for min_p > SAMPLE_MINP_PREFILTER_MIN and fall back to the
+ * exact full sort below it. Requests with 0 < min_p <= 1e-30 are absurd but
+ * stay correct. */
 #define SAMPLE_MINP_PREFILTER_SLACK (1.0f - 4e-6f)
 #define SAMPLE_MINP_PREFILTER_MIN 1e-30f
 
@@ -1216,12 +1217,12 @@ static int sample_full_vocab(
         free(tmp);
     }
     cand = sorted;
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    /* L149: division-free min-p (see the prefilter note above). */
+    const float min_e = cand[0].prob * (min_p > 0.0f ? min_p : 0.0f);
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && cand[i].prob < min_e) break;
         filtered_sum += cand[i].prob;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1444,13 +1445,13 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         out->n = 1;
         return 1;
     }
-    const float min_prob = (SC_PROB(0) / sum) * min_p;
+    /* L149: division-free min-p (see the prefilter note above). */
+    const float min_e = SC_PROB(0) * min_p;
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
         const float p = SC_PROB(i);
-        const float pr = p / sum;
-        if (i > 0 && pr < min_prob) break;
+        if (i > 0 && p < min_e) break;
         filtered_sum += p;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1466,6 +1467,77 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
     return 1;
 #undef SC_PROB
 #undef SC_ID
+}
+
+/* L149: the min-p prefilter path of pulsar_sample_dist_build, fed a
+ * device-selected candidate subset instead of the full row.
+ *
+ * CONTRACT (the caller's device kernel, pulsar_gpu_minp_prefilter_rows):
+ * `ids`/`vals` list, in ASCENDING id order, every finite logit v of the row
+ * with v >= max_logit + delta, where max_logit is the row's first finite
+ * maximum and delta <= T * ln(min_p) (a margin below the floor). That set is
+ * a superset of the min-p survivors {i : expf((v_i - max)/T) >= min_p} and
+ * contains the max, so -- probs being monotone in the logit -- the sorted
+ * survivors are a prefix of the sorted candidates and the cutoff loop below
+ * walks exactly what pulsar_sample_dist_build walks over the full row.
+ *
+ * Byte-identical to pulsar_sample_dist_build(row, n_vocab, T, 0, 1.0f, min_p)
+ * for min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN:
+ *   - same expf inputs (v - max)/T, same descending (logit, ascending id)
+ *     order via the same radix keys (the ordinal is monotone in id in both),
+ *     same min-p comparison (division-free, so no normaliser needed);
+ *   - top_p == 1.0f is redundant given the min-p floor: the full path's
+ *     `filtered_sum / sum >= 1.0f` can only fire once no further survivor
+ *     exists (sum >= filtered_sum + min_p while one does, and
+ *     min_p / filtered_sum > 2 ulp(1) for min_p >= the MIN and
+ *     filtered_sum <= PULSAR_N_VOCAB), and when it fires the next candidate
+ *     fails min-p anyway -- same `filtered`, same probs.
+ * Anything outside the contract returns 0 with `out` untouched and the
+ * caller reads the full row instead (pulsar_test --sampler pins the identity
+ * and its sensitivity). */
+int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
+                                         float max_logit, float temperature, float min_p,
+                                         pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
+    if (!ids || !vals || !scratch || !out || n_cand == 0 || !(temperature > 0.0f) ||
+        !isfinite(max_logit) || !(min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN) || !(min_p <= 1.0f))
+        return 0;
+    sample_scratch_reserve(scratch, n_cand);
+    sample_candidate *cand = scratch->cand;
+    uint64_t *keys = scratch->keys;
+    uint32_t n = 0;
+    for (uint32_t c = 0; c < n_cand; c++) {
+        const float v = vals[c];
+        if (!isfinite(v)) continue;
+        keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
+        cand[n] = (sample_candidate){
+            .id = (int)ids[c], .logit = v, .prob = expf((v - max_logit) / temperature)};
+        n++;
+    }
+    if (n == 0) return 0;
+    sample_radix_sort_desc(keys, scratch->tmp, n);
+    sample_candidate *sc = scratch->cand2;
+    for (uint32_t i = 0; i < n; i++) sc[i] = cand[(uint32_t)keys[i]];
+    /* The sorted head must be the max the caller named, or the list is not
+     * the superset the contract promises: refuse rather than sample from it. */
+    if (sc[0].logit != max_logit) return 0;
+    const float min_e = sc[0].prob * min_p;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i > 0 && sc[i].prob < min_e) break;
+        filtered_sum += sc[i].prob;
+        filtered++;
+    }
+    if (filtered == 0) filtered = 1;
+    memset(out, 0, sizeof(*out));
+    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
+    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
+    out->n = filtered;
+    for (uint32_t i = 0; i < filtered; i++) {
+        out->ids[i] = sc[i].id;
+        out->probs[i] = sc[i].prob / filtered_sum;
+    }
+    return 1;
 }
 
 void pulsar_sample_dist_free(pulsar_sample_dist *d) {
@@ -1648,12 +1720,12 @@ int sample_top_p_min_p(
     }
     if (sum <= 0.0f || !isfinite(sum)) return ids[0];
 
-    const float min_prob = (probs[0] / sum) * min_p;
+    /* L149: division-free min-p (see the prefilter note above). */
+    const float min_e = probs[0] * min_p;
     float filtered_sum = 0.0f;
     int filtered = 0;
     for (int i = 0; i < n; i++) {
-        float p = probs[i] / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && probs[i] < min_e) break;
         filtered_sum += probs[i];
         filtered++;
         if (filtered_sum / sum >= top_p) break;

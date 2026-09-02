@@ -994,6 +994,7 @@ typedef struct {
     pulsar_gpu_tensor *dspark_embed_tokens;  ///< [16] i32 draft ids for the embed upload (L104 fix B: was a cudaMalloc/free PER DRAFTER FORWARD in gpu_decode)
     pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
     pulsar_gpu_tensor *dspark_refined2_ids;  ///< [17] i32 runner-ups (DTree)
+    pulsar_gpu_tensor *dspark_prefilter_sel;  ///< L149: [16 x PULSAR_DSPARK_PREFILTER_ROW_I32] i32 min-p prefilter output rows
     pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
     pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
     pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
@@ -1482,6 +1483,16 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
  * Deliberately EXCLUDED: heap-backed state (checkpoint, logits,
  * dspark_pending_qrows) — those need deep copies with per-side ownership, so
  * they stay as explicit members of each struct. */
+/** L149: device min-p prefilter (pulsar_gpu_minp_prefilter_rows) output row:
+ * i32 [0] candidate count, [1] max id, [2] max logit bits, then
+ * PULSAR_DSPARK_PREFILTER_CAP ids and PULSAR_DSPARK_PREFILTER_CAP f32 logits
+ * (ascending id). A count above the cap means "too many survivors": the host
+ * reads the full row instead. Rows are stored back-to-back. */
+#define PULSAR_DSPARK_PREFILTER_CAP 2048u
+#define PULSAR_DSPARK_PREFILTER_ROW_I32 (3u + 2u * PULSAR_DSPARK_PREFILTER_CAP)
+/** L149: widest proposal distribution stored per pending draft position. */
+#define PULSAR_DSPARK_QDIST_CAP 256u
+
 typedef struct pulsar_spec_carry_state {
     /** Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
@@ -1575,6 +1586,15 @@ typedef struct pulsar_spec_carry_state {
     bool dspark_pending_sampled;
     /** q(pend[i]) at draft time — the accept denominator. */
     float dspark_pending_q[16];
+    /** L149: the proposal distribution q_i exactly as BUILT at draft time,
+     * kept for the residual draw. dspark_pending_qn[i] == 0 means "not
+     * stored": rebuild it from the full row in dspark_pending_qrows under the
+     * pending params, as before. When stored it IS that rebuild (same inputs,
+     * same params, deterministic build), so the walk skips both the 517 KB
+     * row read and the rebuild. Carried by value with the rest of the shadow. */
+    uint32_t dspark_pending_qn[16];
+    int32_t  dspark_pending_qids[16][PULSAR_DSPARK_QDIST_CAP];
+    float    dspark_pending_qprobs[16][PULSAR_DSPARK_QDIST_CAP];
     /** The sampling params the pendings were sampled under. TWO consumers, and
      * they are different in kind:
      *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
@@ -2706,6 +2726,22 @@ typedef struct {
 int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
+/** L149: smallest min_p the device-prefiltered build accepts. Below it the
+ * full path's top_p == 1.0f check is no longer provably redundant (it needs
+ * min_p / filtered_sum > 2 ulp(1.0f) with filtered_sum <= PULSAR_N_VOCAB);
+ * the production default is 0.05. */
+#define PULSAR_SAMPLE_SPARSE_MINP_MIN 0.02f
+/** ... and the widest vocab that bound was derived for (the caller refuses the
+ * sparse path above it; the shape's vocab is a runtime value). */
+#define PULSAR_SAMPLE_SPARSE_VOCAB_MAX 131072u
+static_assert(PULSAR_SAMPLE_SPARSE_MINP_MIN > 2.0f * 5.9604645e-8f * (float)PULSAR_SAMPLE_SPARSE_VOCAB_MAX,
+              "sparse min-p floor must dominate the top_p==1 rounding band over the vocab");
+/** Byte-identical to pulsar_sample_dist_build(row, PULSAR_N_VOCAB, temperature, 0,
+ * 1.0f, min_p) when fed the device prefilter's candidates (contract at the
+ * definition). Returns 0, `out` untouched, for anything outside it. */
+int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
+                                         float max_logit, float temperature, float min_p,
+                                         pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
 void pulsar_sample_dist_free(pulsar_sample_dist *d);
 float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token);
 int pulsar_sample_dist_accept(const pulsar_sample_dist *d, int token, uint64_t *rng);

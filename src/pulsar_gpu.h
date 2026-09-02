@@ -1941,6 +1941,29 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/** L149: min-p candidate prefilter over F32 logits rows. For each of n_rows
+ * rows (row r at logits + logits_offset_bytes + r*row_stride_elems floats,
+ * n_vocab wide) writes to out row r (int32, stride 3 + 2*cap):
+ *   [0] count of finite logits v with v >= max + delta (ALL of them counted,
+ *       even past cap), [1] id of the row max (first finite maximum, lowest id
+ *       on ties -- matches the host scan), [2] the max logit's float bits,
+ *   [3 .. 3+cap) the candidate ids in ascending id order,
+ *   [3+cap .. 3+2cap) their logits as float bits, same order.
+ * When count > cap the candidate arrays are not written. A row with no finite
+ * logit reports count 0. `delta` is the caller's floor below the max in logit
+ * units (T * ln(min_p) minus a margin); the compare is a single float add
+ * and compare, reproducible on the host. Non-blocking; runs on the engine
+ * stream. Returns 0 on bad arguments or launch failure. */
+int pulsar_gpu_minp_prefilter_rows(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *logits,
+        uint64_t                logits_offset_bytes,
+        uint32_t                n_rows,
+        uint32_t                row_stride_elems,
+        uint32_t                n_vocab,
+        float                   delta,
+        uint32_t                cap);
+
 /** DSpark Markov + confidence heads */
 
 int pulsar_gpu_dspark_markov_chain_model(

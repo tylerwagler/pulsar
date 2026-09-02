@@ -1448,12 +1448,11 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
         free(cand);
         return 1;
     }
-    const float min_prob = (cand[0].prob / sum) * min_p;
+    const float min_e = cand[0].prob * min_p;   /* L149: division-free min-p */
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float pr = cand[i].prob / sum;
-        if (i > 0 && pr < min_prob) break;
+        if (i > 0 && cand[i].prob < min_e) break;
         filtered_sum += cand[i].prob;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1566,12 +1565,11 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
         free(cand);
         return 1;
     }
-    const float min_prob = (cand[0].prob / sum) * min_p;
+    const float min_e = cand[0].prob * min_p;   /* L149: division-free min-p */
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float pr = cand[i].prob / sum;
-        if (i > 0 && pr < min_prob) break;
+        if (i > 0 && cand[i].prob < min_e) break;
         filtered_sum += cand[i].prob;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1674,12 +1672,11 @@ static int ref_full_vocab(
     }
 
     qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    const float min_e = cand[0].prob * (min_p > 0.0f ? min_p : 0.0f);   /* L149 */
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && cand[i].prob < min_e) break;
         filtered_sum += cand[i].prob;
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1746,12 +1743,11 @@ static int ref_top_p_min_p(
     }
     if (sum <= 0.0f || !isfinite(sum)) return ids[0];
 
-    const float min_prob = (probs[0] / sum) * min_p;
+    const float min_e = probs[0] * min_p;   /* L149: division-free min-p */
     float filtered_sum = 0.0f;
     int filtered = 0;
     for (int i = 0; i < n; i++) {
-        float p = probs[i] / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && probs[i] < min_e) break;
         filtered_sum += probs[i];
         filtered++;
         if (filtered_sum / sum >= top_p) break;
@@ -1880,8 +1876,8 @@ static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) 
     case 11: *name = "min-p exact boundary (p==min_p tie pair + 1ulp below)";
         /* Crafted so that at temp=1, min_p=0.5 the sum is EXACT (1+.5+.5
          * [+.5-1ulp] rounds identically in index and sorted order) and the
-         * tie pair sits exactly AT the min-p threshold: pr == min_prob
-         * bit-for-bit, so the `pr < min_prob` operator alone decides
+         * tie pair sits exactly AT the min-p threshold: p == min_e
+         * bit-for-bit, so the `p < min_e` operator alone decides
          * membership. The fourth candidate is 1ulp of prob below: a min-p
          * PREFILTER must keep it within slack yet the exact cutoff must trim
          * it. Logits are laid out in ascending-id descending-logit order so
@@ -1947,6 +1943,64 @@ static void sampler_warn_if_flush_to_zero(void) {
 #endif
 }
 
+/* L149: pulsar_sample_dist_build_prefiltered over a host emulation of the
+ * device min-p prefilter (tests/minp_prefilter_gate pins device == emulation)
+ * must equal the full-row build byte-for-byte -- and the check must be able
+ * to fail: dropping the last survivor from the candidate list has to change
+ * the result. Returns 1 when compared, 0 when the shape sits outside the
+ * sparse contract (no finite logit, or more candidates than the device cap). */
+static int samp_check_prefiltered(const float *logits, uint32_t n, const samp_cfg *cfg,
+                                  const pulsar_sample_dist *got, pulsar_sample_scratch *scratch,
+                                  const char *sname) {
+    float mx = 0.0f;
+    int32_t mi = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (mi < 0 || v > mx) { mx = v; mi = (int32_t)i; }
+    }
+    if (mi < 0) return 0;
+    const float delta = (float)((double)cfg->temp * (log((double)cfg->min_p) - 1e-3));
+    const float thr = mx + delta;
+    enum { CAP = 2048 };
+    static int32_t ids[CAP];
+    static float vals[CAP];
+    uint32_t nc = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float v = logits[i];
+        if (!(isfinite(v) && v >= thr)) continue;
+        if (nc < CAP) { ids[nc] = (int32_t)i; vals[nc] = v; }
+        nc++;
+    }
+    if (nc == 0 || nc > CAP) return 0;
+    pulsar_sample_dist sp;
+    TEST_ASSERT(pulsar_sample_dist_build_prefiltered(ids, vals, nc, mx, cfg->temp, cfg->min_p,
+                                                     scratch, &sp) == 1);
+    if (sp.n != got->n)
+        fprintf(stderr, "sampler/prefiltered: shape=%s cfg=%s n %u != %u\n",
+                sname, cfg->name, sp.n, got->n);
+    TEST_ASSERT(sp.n == got->n);
+    TEST_ASSERT(memcmp(sp.ids, got->ids, (size_t)sp.n * sizeof(int)) == 0);
+    TEST_ASSERT(memcmp(sp.probs, got->probs, (size_t)sp.n * sizeof(float)) == 0);
+    if (got->n > 1) {
+        /* sensitivity: without the last survivor the result must differ */
+        const int drop = got->ids[got->n - 1];
+        uint32_t m = 0;
+        for (uint32_t c = 0; c < nc; c++)
+            if (ids[c] != drop) { ids[m] = ids[c]; vals[m] = vals[c]; m++; }
+        TEST_ASSERT(m == nc - 1);
+        pulsar_sample_dist mut;
+        if (pulsar_sample_dist_build_prefiltered(ids, vals, m, mx, cfg->temp, cfg->min_p,
+                                                 scratch, &mut) == 1) {
+            TEST_ASSERT(mut.n != got->n ||
+                        memcmp(mut.ids, got->ids, (size_t)mut.n * sizeof(int)) != 0);
+            pulsar_sample_dist_free(&mut);
+        }
+    }
+    pulsar_sample_dist_free(&sp);
+    return 1;
+}
+
 static void test_sampler_dist_equivalence(void) {
     const uint32_t n = SAMP_N_VOCAB;
     float *logits = (float *)malloc((size_t)n * sizeof(float));
@@ -1960,6 +2014,9 @@ static void test_sampler_dist_equivalence(void) {
     memset(&plain_scratch, 0, sizeof(plain_scratch));
 
     int checked = 0;
+    int sparse_checked = 0;
+    pulsar_sample_scratch sparse_scratch;
+    memset(&sparse_scratch, 0, sizeof(sparse_scratch));
     for (int shape = 0; shape <= 11; shape++) {
         const char *sname = "?";
         samp_fill_shape(logits, n, shape, &sname);
@@ -1969,6 +2026,10 @@ static void test_sampler_dist_equivalence(void) {
             ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p, &ref);
             pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p,
                                   &scratch, &got);
+            /* L149: the device-prefiltered build must be the same distribution */
+            if (cfg->temp > 0.0f && cfg->top_k <= 0 && cfg->top_p == 1.0f &&
+                cfg->min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && cfg->min_p <= 1.0f)
+                sparse_checked += samp_check_prefiltered(logits, n, cfg, &got, &sparse_scratch, sname);
 
             /* (a) the distribution itself, bit-for-bit */
             if (ref.n != got.n)
@@ -2040,6 +2101,11 @@ static void test_sampler_dist_equivalence(void) {
         }
     }
 
+    /* L149: three of the configs are in the sparse contract; the degenerate
+     * shapes (all non-finite, flat past the cap) are the only legitimate skips */
+    TEST_ASSERT(sparse_checked >= 12);
+    pulsar_sample_scratch_free(&sparse_scratch);
+
     /* scratch reuse must be order-independent: a fresh scratch and a hot one
      * (already grown by a full-vocab call) must produce identical results. */
     {
@@ -2082,7 +2148,7 @@ static void test_sampler_dist_equivalence(void) {
  * rounding, characterized here and bounded at 1e-6 relative (measured
  * ~1e-7). Plus dedicated boundary teeth: a candidate
  * whose prob sits bit-exactly AT the min-p threshold must be INCLUDED
- * (`pr < min_prob` is the operator, so >= keeps), and a candidate 1 ulp
+ * (`p < min_e` is the operator, so >= keeps), and a candidate 1 ulp
  * below — which the prefilter's slack deliberately keeps for sorting —
  * must be trimmed by the exact cutoff. Constructed so index-order and
  * sorted-order sums are the same float sequence, isolating boundary
@@ -2200,7 +2266,7 @@ static void test_sampler_prefilter_equivalence(void) {
         /* an exact preimage of (0.5 - 1ulp) is not guaranteed to exist (its
          * rounding interval is ~1 x-ulp wide); 1..3 ulps below all work —
          * anything in [min_p*slack, min_p) that the exact cutoff rounds
-         * below min_prob, with the sum still rounding to 2.5 either order. */
+         * below min_e, with the sum still rounding to 2.5 either order. */
         int found_below = 0;
         for (int k = 1; k <= 3 && !found_below; k++) {
             p_below = 0.5f - (float)k * 0x1p-25f;
@@ -2216,7 +2282,7 @@ static void test_sampler_prefilter_equivalence(void) {
 
         /* Shape A: sum = 1.0+0.5+0.5 = 2.0 EXACT in any order, so
          * min_prob = (1.0/2.0)*0.5 = 0.25 exact and pr = 0.5/2.0 = 0.25
-         * exact: pr == min_prob, and `pr < min_prob` false must INCLUDE both
+         * exact: p == min_e, and `p < min_e` false must INCLUDE both
          * boundary candidates. Old semantics agree bit-for-bit here. */
         pulsar_sample_dist old, got;
         pulsar_sample_dist_build(logits, n, 1.0f, 0, 1.0f, 0.5f, &scratch, &got);
@@ -2232,7 +2298,7 @@ static void test_sampler_prefilter_equivalence(void) {
         /* Shape B: add prob = 0.5 - (1..3)ulp at id 400. sum = 2.5 exact both
          * orders; the boundary pair still sits exactly AT min_prob
          * (0.5/2.5 == (1.0/2.5)*0.5 bit-for-bit) and stays included, while
-         * id 400's pr rounds strictly below min_prob: the PREFILTER keeps it
+         * id 400's pr rounds strictly below min_e: the PREFILTER keeps it
          * (within slack) but the exact cutoff must trim it. n == 4 here
          * would mean prefilter slack leaked into membership. */
         logits[400] = L_below;
