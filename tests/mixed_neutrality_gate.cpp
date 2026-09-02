@@ -10,6 +10,10 @@
  *    prompts, same positions); per-bank isolation means a decode bank's output
  *    depends only on its own KV, so any divergence is a co-scheduling leak.
  *
+ *  GATE 5 (MULTI-RUN NEUTRALITY, L146): each decode bank issues a run of
+ *    3 rows (decode + 2 drafts, the production shape); a run's logits batched
+ *    with the other banks' runs == the same run alone, byte-identical.
+ *
  *  GATE 2 (PREFILL correctness in the mixed step): the fused step's prefill run
  *    last-position logits vs a classic RESUME — next-token EXACT and full-vocab
  *    rel-RMS = 0 (byte-identical KV => no corruption), same oracle as inc-3.
@@ -163,6 +167,66 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
 
 /* classic RESUME reference for the prefill bank: fresh session, prefill [0,C0)
  * then resume to [0,C0+K), copy last-position logits + next token. */
+/* GATE 5 helper (L146): the PRODUCTION row shape.  Every decode bank
+ * contributes a run of `rpb` consecutive rows (a decode row plus rpb-1 draft
+ * rows: 3 slots x (1 + 2 drafts) is what server_sched issues), no prefill run.
+ * With only_bank >= 0 just that bank's run is issued (the solo reference).
+ * Writes each issued run's LAST-row logits into out[bank].  Token ids beyond
+ * the first are arbitrary but identical between the solo and batched runs. */
+static bool multirun_step_logits(int rpb, int only_bank, float *out) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
+    const int vocab = (int)PULSAR_N_VOCAB;
+    bool ok = gpu_graph_bank_pool_count(g) >= (uint32_t)g_n_dec;
+    char err[256];
+    int argtok[N_DEC_MAX];
+    for (int k = 0; ok && k < g_n_dec; k++) {
+        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
+        pulsar_session_invalidate(s);
+        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
+        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+            fprintf(stderr, "multirun bank %d sync failed: %s\n", k, err); ok = false; break;
+        }
+        gpu_graph_bank_counters_capture(g, (uint32_t)k);
+        argtok[k] = pulsar_session_argmax(s);
+    }
+    const int n_banks_issued = only_bank >= 0 ? 1 : g_n_dec;
+    const uint32_t n_rows = (uint32_t)(n_banks_issued * rpb);
+    pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
+    float *logits = ok ? (float *)malloc((size_t)n_banks_issued * vocab * sizeof(float)) : NULL;
+    if (ok && (!reqs || !logits)) ok = false;
+    if (ok) {
+        uint32_t r = 0;
+        for (int k = 0; k < g_n_dec; k++) {
+            if (only_bank >= 0 && k != only_bank) continue;
+            for (int j = 0; j < rpb; j++, r++) {
+                reqs[r].bank = (uint32_t)k;
+                reqs[r].pos = g_len[k] + j;
+                reqs[r].token = j == 0 ? argtok[k] : g_toks.v[g_off[k] + j];
+            }
+        }
+        uint32_t n_runs = 0;
+        const int rc = pulsar_session_decode_mixed(s, reqs, n_rows, logits, (int)(n_banks_issued * vocab),
+                                                &n_runs, 0u, err, sizeof err);
+        if (rc != 0) { fprintf(stderr, "multirun decode_mixed(rpb=%d) failed rc=%d: %s\n", rpb, rc, err); ok = false; }
+        else if (n_runs != (uint32_t)n_banks_issued) {
+            fprintf(stderr, "multirun n_runs=%u expected %d\n", n_runs, n_banks_issued); ok = false;
+        }
+        if (ok) {
+            int slot = 0;
+            for (int k = 0; k < g_n_dec; k++) {
+                if (only_bank >= 0 && k != only_bank) continue;
+                memcpy(out + (size_t)k * vocab, logits + (size_t)slot * vocab, (size_t)vocab * sizeof(float));
+                slot++;
+            }
+        }
+    }
+    free(reqs); free(logits);
+    pulsar_session_free(s);
+    return ok;
+}
+
 static bool classic_resume(int K, float *out_lg, int *next_tok) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
@@ -247,6 +311,43 @@ int main(int argc, char **argv) {
                     "— skipping the prefill head perturbed a decode bank\n",
                     k, d, (lv1_dec + (size_t)k * vocab)[d], (ref_dec + (size_t)k * vocab)[d]);
             g_fail = 1;
+        }
+    }
+
+    /* GATE 5 (L146): MULTI-RUN NEUTRALITY -- the production row shape.  Each
+     * decode bank issues a run of RPB rows (decode + drafts); the run's last
+     * logits when all banks are batched must be BYTE-IDENTICAL to the same run
+     * issued alone.  This is gate 4's property for DRAFT rows, and the shape no
+     * other gate had: several multi-row runs, 6..16 rows, no prefill run.  On
+     * 57c0d28 it FAILS -- M-neutral was armed only for length-1 runs, so the
+     * batched step took cuBLASLt/grouped-MoE paths whose per-row values depend
+     * on M.  Asserted only while the batch fits the M-neutral row cap; above it
+     * the prefix scan is the documented behaviour and the leg is reported as
+     * skipped rather than failed. */
+    {
+        const int RPB = 3;
+        const int rows_total = g_n_dec * RPB;
+        if ((uint32_t)rows_total > PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+            printf("GATE 5 MULTI-RUN: skipped (%d rows > M-neutral cap %u)\n", rows_total, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        } else {
+            float *mr_all  = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));
+            float *mr_solo = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));
+            bool mr_ok = mr_all && mr_solo && multirun_step_logits(RPB, -1, mr_all);
+            for (int k = 0; mr_ok && k < g_n_dec; k++) mr_ok = multirun_step_logits(RPB, k, mr_solo);
+            if (!mr_ok) { fprintf(stderr, "GATE 5 FAIL: multi-run step failed\n"); g_fail = 1; }
+            for (int k = 0; mr_ok && k < g_n_dec; k++) {
+                const long d = first_diff(mr_all + (size_t)k * vocab, mr_solo + (size_t)k * vocab, vocab);
+                if (d < 0) {
+                    printf("GATE 5 MULTI-RUN: bank %d run of %d rows, batched (%d rows) == solo (%d rows) BYTE-IDENTICAL\n",
+                           k, RPB, rows_total, RPB);
+                } else {
+                    fprintf(stderr, "GATE 5 FAIL: bank %d run last-row logits DIFFER at float %ld (%.9g vs %.9g) -- "
+                            "a %d-row multi-run step is not M-neutral\n",
+                            k, d, (mr_all + (size_t)k * vocab)[d], (mr_solo + (size_t)k * vocab)[d], rows_total);
+                    g_fail = 1;
+                }
+            }
+            free(mr_all); free(mr_solo);
         }
     }
 
