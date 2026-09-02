@@ -180,10 +180,21 @@ static int run_shape(const char *name, const float *temps, int ticks) {
         float *ser_logits[NB] = {NULL, NULL, NULL};
         float *ser_hidden[NB] = {NULL, NULL, NULL};
         uint32_t ser_nd[NB] = {0, 0, 0};
+        /* L150 stage dump (diagnostic): with L150_DUMP_DIR set (and the engine's
+         * PULSAR_CUDA_GRAPH_DUMP_PREFIX/NAME/LAYER pointing at the dsp_ stages),
+         * tick 0's serialized forwards dump under <dir>/ser_b<b>_ and the
+         * batched one under <dir>/bat_, so the first differing stage can be
+         * read offline (tools/l150_dumpcmp.py). */
+        const char *dump_dir = getenv("L150_DUMP_DIR");
         for (int b = 0; b < g_nb; b++) {
             pulsar_spec_round *one = r[b];
             const uint32_t bank = (uint32_t)b;
             uint64_t *rp = &rng_a[b];
+            if (dump_dir) {
+                char pfx[512];
+                snprintf(pfx, sizeof(pfx), "%s/%s_ser_b%d", dump_dir, t == 0 ? "t0" : "tn", b);
+                setenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX", pfx, 1);
+            }
             if (pulsar_session_spec_redraft_batch(s, &one, &bank, &rp, 1, err, sizeof(err)) != 0)
                 CHECK(0, "%s: tick %d serialized redraft bank %d: %s", name, t, b, err);
             draft_result d;
@@ -204,6 +215,11 @@ static int run_shape(const char *name, const float *temps, int ticks) {
         {
             uint32_t banks[NB] = {0, 1, 2};
             uint64_t *rps[NB] = {&rng_b[0], &rng_b[1], &rng_b[2]};
+            if (dump_dir) {
+                char pfx[512];
+                snprintf(pfx, sizeof(pfx), "%s/%s_bat", dump_dir, t == 0 ? "t0" : "tn");
+                setenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX", pfx, 1);
+            }
             if (pulsar_session_spec_redraft_batch(s, r, banks, rps, g_nb, err, sizeof(err)) != 0)
                 CHECK(0, "%s: tick %d batched redraft: %s", name, t, err);
         }
