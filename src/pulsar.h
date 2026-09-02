@@ -86,6 +86,13 @@ typedef struct {
     float directional_steering_attn;        ///< steering scale on the attention stream
     float directional_steering_ffn;         ///< steering scale on the FFN stream
     bool inspect_only;           ///< load and report, then stop: no session/graph allocation
+    /** Two-rank tensor parallelism (branch tensor_parallel; docs/tensor-parallel-port.md).
+     * tp_role: 1 = leader (listens on tp_port), 2 = worker (dials tp_peer:tp_port);
+     * 0 = off.  pulsar_engine_open fails loudly for a nonzero role until the
+     * CUDA gate machinery (slice 4b) lands. */
+    int tp_role;
+    const char *tp_peer;
+    int tp_port;
 } pulsar_engine_options;
 
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);

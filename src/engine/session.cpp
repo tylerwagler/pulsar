@@ -292,6 +292,16 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->prefill_chunk = opt->prefill_chunk;
+    if (opt->tp_role != 0) {
+        fprintf(stderr, "pulsar: tensor parallelism (tp_role=%d): identity "
+                        "groundwork (4a) is in, but the CUDA gate machinery (4b) "
+                        "is not, so the pair cannot be armed yet; see "
+                        "docs/tensor-parallel-split.md\n",
+                opt->tp_role);
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     /* Default draft depth 3: the measured v5mx optimum (2026-07-17 k-sweep on
      * the shipped ds4flash build at the tau=0.25 conf-sched default, quench
      * disarmed, conf-sched trimming active). k=3 beats k=5 by +15% structured

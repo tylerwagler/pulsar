@@ -1582,6 +1582,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--expert-overlay")) {
             c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tp-role")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "leader")) c.engine.tp_role = 1;
+            else if (!strcmp(v, "worker")) c.engine.tp_role = 2;
+            else c.engine.tp_role = parse_int(v, arg) != 0 ? 1 : 0;
+        } else if (!strcmp(arg, "--tp-peer")) {
+            c.engine.tp_peer = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tp-port")) {
+            c.engine.tp_port = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

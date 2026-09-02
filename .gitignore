@@ -27,6 +27,16 @@ __pycache__/
 /pulsar_agent_test
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
+/tests/tp_core_test
+/tests/tp_transport_test
+/tests/tp_sched_test
+/tests/tp_identity_test
+/tests/tp_wide_test
+/tests/tp_fault_test
+/tests/tp_cmd_stress_test
+/tests/tp_verify_test
+/tests/tp_slab_gpu_probe
+/tests/tp_dmabuf_probe
 /tests/multiseq_frontier_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate

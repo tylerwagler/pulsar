@@ -123,6 +123,8 @@ __device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint
     return *(const uint32_t *)(p + i);
 }
 
+/* Not under PULSAR_ATTN_F16_MMA: the fused Q-prep pair builder below (L037)
+ * calls af16_pack from outside the MMA-only region. */
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half(lo)) |
            ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);

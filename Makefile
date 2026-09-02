@@ -184,7 +184,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -987,6 +987,9 @@ gates:
 src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
+src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+
 src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
@@ -1172,12 +1175,131 @@ pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o 
 pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
+# TP transport-core unit test (branch tensor_parallel, slice 1).  Host-only:
+# no CUDA, no sockets -- builds and runs with plain g++.  Pins the slab
+# layout + identity contract the transport lift builds on.
+tests/tp_core_test: tests/tp_core_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_core_test.cpp src/tp/pulsar_tp.cpp
+
+tp-core-test: tests/tp_core_test
+	./tests/tp_core_test
+
+# TP transport loopback test (branch tensor_parallel, slice 3).  Host-only:
+# no CUDA, no RDMA -- a forked leader/worker pair exchanges gate/batch/big
+# partials and one eval<->ack lockstep round over TCP 127.0.0.1 loopback,
+# built and run with plain g++.
+tests/tp_transport_test: tests/tp_transport_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_transport_test.cpp src/tp/pulsar_tp.cpp
+
+tp-transport-test: tests/tp_transport_test
+	./tests/tp_transport_test
+
+# TP gate-scheduler test (slice 4b): host half of the CUDA gate machinery,
+# driven over the transport's TCP loopback with hook stubs.  No CUDA, no RDMA.
+tests/tp_sched_test: tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
+
+tp-sched-test: tests/tp_sched_test
+	./tests/tp_sched_test
+
+# TP identity / hello-robustness test (branch tensor_parallel): the real-rank
+# model-mismatch matrix, the ctx-diff connect rule, the raw-peer leader
+# robustness set, and the worker dial-timeout -- all with per-child alarms so
+# a failure that turns into a hang FAILS instead of blocking the suite.
+# Host-only: no CUDA, no RDMA.
+tests/tp_identity_test: tests/tp_identity_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_identity_test.cpp src/tp/pulsar_tp.cpp
+
+tp-identity-test: tests/tp_identity_test
+	./tests/tp_identity_test
+
+# TP wide-embd + soak test (audit F4/F8 host half): the gate/batch/big
+# exchange and decode-slot reuse at n_embd 8192 (vec == 2*MSG, the RDMA
+# chunked-branch boundary) and 16384 (> 2*MSG, RDMA-registration reject size),
+# plus N decode tokens x 86 gates of slot-reuse soak.  Host-only: TCP loopback.
+tests/tp_wide_test: tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
+
+tp-wide-test: tests/tp_wide_test
+	./tests/tp_wide_test
+
+# TP peer-fault test (branch tensor_parallel): one rank dies mid-exchange and
+# the survivor must surface the failure (gate_exchange -> 0, wait_command_ack
+# -> 0 + failed() latch) instead of hanging in the blocking read.  Host-only:
+# TCP loopback, forked leader/worker, per-side alarm + bounded parent wait.
+tests/tp_fault_test: tests/tp_fault_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_fault_test.cpp src/tp/pulsar_tp.cpp
+
+tp-fault-test: tests/tp_fault_test
+	./tests/tp_fault_test
+
+# TP control-plane stress test (branch tensor_parallel): thousands of
+# randomized interleaved session commands (create/destroy churn, sync/eval/
+# rewind/invalidate, eval_batch, mixed_batch, verify+commit) against a worker
+# that mirrors the session ledger from the received frames -- a foreign,
+# dropped, or mis-acked command fails, and a stalled frame would be caught by
+# the per-side alarm.  Host-only: TCP loopback.
+tests/tp_cmd_stress_test: tests/tp_cmd_stress_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_cmd_stress_test.cpp src/tp/pulsar_tp.cpp
+
+tp-cmd-stress-test: tests/tp_cmd_stress_test
+	./tests/tp_cmd_stress_test
+
+# TP verify/commit reference-grading test (host half of slice 4e): the pure
+# decision rule (all-match vs first-mismatch stop) plus a few hundred leader
+# verify + commit rounds against a worker that mirrors the grade from the
+# drafts -- the grading+commit lockstep the real pair will run.  Host-only.
+tests/tp_verify_test: tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp_verify.h src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp.cpp
+
+tp-verify-test: tests/tp_verify_test
+	./tests/tp_verify_test
+
+# TP tiny-buffer regression (audit F9): the TCP fallback's alternating
+# write/read rounds must complete even when the socket buffers are clamped
+# small (PULSAR_TP_TEST_TINY_BUFFERS=1 -> 32K bufs) -- the conditition under
+# which the pair hosts once deadlocked (the old 2 MiB symmetric write-then-
+# read filled both send buffers; 64K rounds land inside the kernel's doubled
+# recv buffer, so both sides finish their write before draining reads).  Loop
+# the whole transport + a wide soak under the clamp so any return to a
+# symmetric-write or oversized-round shape fails the build instead of hanging
+# a GPU session.  Host-only; the timeout guards a regression that hangs.
+tp-tinybuf-test: tests/tp_transport_test tests/tp_wide_test
+	@set -e; \
+	for i in $$(seq 1 30); do \
+		PULSAR_TP_TEST_TINY_BUFFERS=1 timeout 60 ./tests/tp_transport_test >/dev/null 2>&1 \
+		  || { echo "tp-tinybuf: transport iteration $$i FAILED"; exit 1; }; \
+	done; \
+	PULSAR_TP_TEST_TINY_BUFFERS=1 PULSAR_TP_SOAK_TOKENS=4 timeout 120 ./tests/tp_wide_test >/dev/null 2>&1 \
+	  || { echo "tp-tinybuf: wide soak FAILED"; exit 1; }; \
+	echo "tp-tinybuf-test: ok (30x transport + wide soak under 32K clamped buffers)"
+
+# TP GPU-slab gate probe (bring-up step 4): nvcc-built so it can run on the
+# pair.  Compile-checked here (no GPU to run); run on the GB10 pair per
+# docs/tensor-parallel-bringup.md.
+tests/tp_slab_gpu_probe: tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(NVCC) $(NVCCFLAGS) -Isrc -o $@ tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp $(CUDA_LDLIBS)
+
+tp-slab-probe: tests/tp_slab_gpu_probe
+	@echo "built tests/tp_slab_gpu_probe; run on the pair per docs/tensor-parallel-bringup.md"
+
+# TP GPUDirect capability probe (slab-class verdict): the full dma-buf GDR
+# sequence -- VMM pinned alloc, CUDA-13 GPURDMA flag, export-to-posix-fd,
+# ibv_reg_dmabuf_mr.  Builds on any box with CUDA + libibverbs-dev; run on the
+# pair.  NEGATIVE on GB10/driver 610 (attrs 110/116 = 0; dma-buf import EINVAL)
+# -- see tests/tp_dmabuf_probe.cpp.  Recheck after any nvidia driver update.
+tests/tp_dmabuf_probe: tests/tp_dmabuf_probe.cpp
+	$(CXX) $(CXXFLAGS) -std=c++17 -I$(CUDA_HOME)/include -o $@ tests/tp_dmabuf_probe.cpp -L$(CUDA_HOME)/lib64/stubs -L$(CUDA_HOME)/lib64 -lcuda -l:libibverbs.so.1
+
+tp-dmabuf-probe: tests/tp_dmabuf_probe
+	@echo "built tests/tp_dmabuf_probe; run on the pair (GDR negative on GB10/610)"
+
 test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
 	rm -rf .build
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
