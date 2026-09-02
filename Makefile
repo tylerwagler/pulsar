@@ -1277,8 +1277,8 @@ tp-tinybuf-test: tests/tp_transport_test tests/tp_wide_test
 # TP GPU-slab gate probe (bring-up step 4): nvcc-built so it can run on the
 # pair.  Compile-checked here (no GPU to run); run on the GB10 pair per
 # docs/tensor-parallel-bringup.md.
-tests/tp_slab_gpu_probe: tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
-	$(NVCC) $(NVCCFLAGS) -Isrc -o $@ tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp $(CUDA_LDLIBS)
+tests/tp_slab_gpu_probe: tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h src/tp/pulsar_tp_gpu.cpp src/tp/pulsar_tp_gpu.h
+	$(NVCC) $(NVCCFLAGS) -Isrc -o $@ tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_gpu.cpp $(CUDA_LDLIBS)
 
 tp-slab-probe: tests/tp_slab_gpu_probe
 	@echo "built tests/tp_slab_gpu_probe; run on the pair per docs/tensor-parallel-bringup.md"

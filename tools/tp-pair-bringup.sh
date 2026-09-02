@@ -115,6 +115,8 @@ STAGE_SRCS=(
     tests/tp_slab_gpu_probe.cpp
     src/tp/pulsar_tp.cpp
     src/tp/pulsar_tp.h
+    src/tp/pulsar_tp_gpu.cpp
+    src/tp/pulsar_tp_gpu.h
 )
 
 pair_arch() { # `uname -m` of the pair (both ranks are the same box model)
