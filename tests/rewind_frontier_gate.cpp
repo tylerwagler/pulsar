@@ -71,13 +71,13 @@ static void check_frontiers(pulsar_session *s, int pos, const char *what) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t want = (uint32_t)pos / ratio;
-        CHECK(gpu_graph_n_comp(g, il) == want,
+        CHECK(gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) == want,
               "%s: layer %u n_comp %u want %u (pos %d ratio %u)",
-              what, il, gpu_graph_n_comp(g, il), want, pos, ratio);
+              what, il, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), want, pos, ratio);
         if (ratio == 4) {
-            CHECK(gpu_graph_n_index_comp(g, il) == want,
+            CHECK(gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) == want,
                   "%s: layer %u n_index_comp %u want %u (pos %d)",
-                  what, il, gpu_graph_n_index_comp(g, il), want, pos);
+                  what, il, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), want, pos);
         }
     }
 }
@@ -122,12 +122,12 @@ static uint64_t comp_rows_hash(pulsar_session *s) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 4) continue;
         for (uint32_t row = 34; row <= 36; row++) {
-            if (row >= gpu_graph_n_comp(g, il)) continue;
+            if (row >= gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)) continue;
             if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
                                       (uint64_t)row * attn_row, buf, attn_row) == 0)
                 return 0;
             for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
-            if (row >= gpu_graph_n_index_comp(g, il)) continue;
+            if (row >= gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)) continue;
             if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il],
                                       (uint64_t)row * idx_row, buf, idx_row) == 0)
                 return 0;
@@ -202,7 +202,7 @@ static uint64_t r128_row0_hash(pulsar_session *s) {
     uint8_t buf[8192];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (pulsar_layer_compress_ratio(il) != 128u) continue;
-        if (gpu_graph_n_comp(g, il) < 1u) continue;
+        if (gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) < 1u) continue;
         if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il], 0, buf, attn_row) == 0)
             return 0;
         for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }

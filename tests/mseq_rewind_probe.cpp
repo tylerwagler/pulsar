@@ -52,7 +52,7 @@ static void show(pulsar_session *s, const char *when, int pos) {
     /* ONE storage since the stage-1b collapse: the accessor and ms_n_comp[0]
      * are the same memory, so printing both would be theatre. Print the value
      * and whether it matches the position. */
-    const uint32_t have = gpu_graph_n_comp(g, il);
+    const uint32_t have = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
     printf("%-34s pos=%-5d want=%-5u n_comp=%-5u%s\n",
            when, pos, ratio ? (uint32_t)pos / ratio : 0u, have,
            (ratio && have != (uint32_t)pos / ratio) ? "   <-- NOT position-true" : "");
@@ -118,13 +118,13 @@ int main(int argc, char **argv) {
              * than left as decoration. What still has teeth is that the rewind
              * CLAMPED it: that is the L120 half which is live on every path,
              * and the L133 divergence is now unrepresentable by construction. */
-            CHECK(gpu_graph_n_comp(g, il) == want,
+            CHECK(gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) == want,
                   "layer %u n_comp %u want %u (bank %u)",
-                  il, gpu_graph_n_comp(g, il), want, b);
+                  il, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), want, b);
             if (ratio == 4) {
-                CHECK(gpu_graph_n_index_comp(g, il) == want,
+                CHECK(gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) == want,
                       "layer %u n_index_comp %u want %u (bank %u)",
-                      il, gpu_graph_n_index_comp(g, il), want, b);
+                      il, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), want, b);
             }
         }
     }
