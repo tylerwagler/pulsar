@@ -212,6 +212,13 @@ int pulsar_gpu_begin_commands(void);
 int pulsar_gpu_flush_commands(void);
 int pulsar_gpu_end_commands(void);
 int pulsar_gpu_synchronize(void);
+/** Record a completion marker on the per-thread stream (L142).  Returns a
+ *  handle, or -1 if the runtime could not record one -- callers treat -1 as
+ *  "already done" and fall back to whatever they did before. */
+int pulsar_gpu_marker_record(void);
+/** 1 when every op enqueued before the marker has completed (or the handle is
+ *  -1 / invalid), 0 while the GPU is still working towards it.  Never blocks. */
+int pulsar_gpu_marker_done(int marker);
 
 /** L119 segment capture-or-replay for round-invariant decode-sweep stretches
  * (plan 119 in pulsar-notes; supersedes the removed whole-sweep tape the

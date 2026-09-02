@@ -1613,6 +1613,45 @@ int pulsar_gpu_synchronize(void) {
 }
 
 
+/* L142: completion MARKERS.  The layer-major prefill used to drain the stream
+ * once per layer (pulsar_gpu_end_commands) for one reason -- to know the layer
+ * had finished so it could report progress.  That is 43 host<->GPU bubbles per
+ * chunk, each one the host encode of the next layer, with the GPU idle.  A
+ * marker is a timing-free event recorded on the per-thread stream; the
+ * producer polls it at a later boundary and reports the layer when it has
+ * ACTUALLY completed, without waiting.  Ring of PULSAR_GPU_MARKERS slots: a
+ * handle stays valid until that many more markers are recorded (the prefill
+ * polls within one chunk, 43 layers, well inside).  A reused slot can only
+ * delay a report, never advance it.  Worker-thread only, like every other
+ * per-thread-stream entry point here. */
+#define PULSAR_GPU_MARKERS 64u
+static cudaEvent_t g_marker[PULSAR_GPU_MARKERS];
+static uint32_t g_marker_next = 0;
+
+int pulsar_gpu_marker_record(void) {
+    const uint32_t i = g_marker_next % PULSAR_GPU_MARKERS;
+    if (!g_marker[i] &&
+        cudaEventCreateWithFlags(&g_marker[i], cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    if (cudaEventRecord(g_marker[i], cudaStreamPerThread) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    g_marker_next++;
+    return (int)i;
+}
+
+int pulsar_gpu_marker_done(int marker) {
+    if (marker < 0 || (uint32_t)marker >= PULSAR_GPU_MARKERS || !g_marker[marker]) return 1;
+    const cudaError_t err = cudaEventQuery(g_marker[marker]);
+    if (err == cudaErrorNotReady) return 0;
+    if (err != cudaSuccess) (void)cudaGetLastError();   /* a broken marker must not stall its poller */
+    return 1;
+}
+
+
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

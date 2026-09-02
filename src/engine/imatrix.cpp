@@ -502,6 +502,13 @@ static bool gpu_graph_prefill_layer_major_inner(
         return false;
     }
 
+    /* L142: per-layer completion is polled, not drained.  layer_marker[il] is
+     * the layer's marker (-1 = the branch drained the stream itself, so the
+     * layer is complete by construction); layers_reported walks them in order
+     * and fires the progress callbacks when a layer has actually finished. */
+    int layer_marker[PULSAR_MAX_LAYER];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) layer_marker[il] = -1;
+    uint32_t layers_reported = 0;
     for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
         if (split_profile) {
             const double t_attn0 = now_sec();
@@ -562,7 +569,14 @@ static bool gpu_graph_prefill_layer_major_inner(
                 fprintf(stderr, "pulsar: gpu layer-major prefill layer %u encode failed\n", il);
             }
             const double t_encoded = profile ? now_sec() : 0.0;
-            if (ok) ok = pulsar_gpu_end_commands() != 0;
+            /* L142: the layer's only host-side consumers are the imatrix
+             * collector (reads the layer's activations) and the profile timers.
+             * Without them there is nothing to wait for: leave the stream
+             * running, record a marker, and let the host encode the next layer
+             * while this one executes.  The drain here was 43 idle bubbles per
+             * prefill chunk, each the width of one layer's host encode. */
+            if (ok && (imatrix || profile)) ok = pulsar_gpu_end_commands() != 0;
+            else if (ok) layer_marker[il] = pulsar_gpu_marker_record();
             const double t_done = profile ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             if (profile) {
@@ -581,15 +595,24 @@ static bool gpu_graph_prefill_layer_major_inner(
             }
             return false;
         }
-        gpu_graph_report_prefill_display_progress(display_progress,
-                                                  display_progress_ud,
-                                                  start,
-                                                  n_tokens,
-                                                  il + 1,
-                                                  prompt->len);
-        if (show_progress) {
-            fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", il + 1, (uint32_t)PULSAR_N_LAYER);
-            fflush(stderr);
+        /* Report every layer, in order, whose marker says it has completed.
+         * Drained branches (marker -1) report at once; the polled ones lag the
+         * GPU by however far the host has run ahead, and the chunk driver's
+         * end-of-chunk report covers whatever is still in flight when the loop
+         * ends -- so a client sees true progress and the GPU never waits for it. */
+        while (layers_reported <= il &&
+               pulsar_gpu_marker_done(layer_marker[layers_reported])) {
+            layers_reported++;
+            gpu_graph_report_prefill_display_progress(display_progress,
+                                                      display_progress_ud,
+                                                      start,
+                                                      n_tokens,
+                                                      layers_reported,
+                                                      prompt->len);
+            if (show_progress) {
+                fprintf(stderr, "pulsar: gpu prefill layer %u/%u\r", layers_reported, (uint32_t)PULSAR_N_LAYER);
+                fflush(stderr);
+            }
         }
     }
     if (!ok) {
