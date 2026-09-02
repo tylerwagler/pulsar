@@ -227,6 +227,58 @@ static bool multirun_step_logits(int rpb, int only_bank, float *out) {
     return ok;
 }
 
+
+/* L152: the same step, but every ROW's logits come back (ALL_ROWS head) and
+ * the banks can be issued in reverse order, so a failing run can be read row
+ * by row and "bank 0" separated from "first in the batch". out has
+ * (only_bank >= 0 ? 1 : g_n_dec) * rpb rows of PULSAR_N_VOCAB floats, in
+ * ISSUE order; *issued lists the bank of each run in that order. */
+static bool multirun_step_rows(int rpb, int only_bank, bool reverse, float *out, int *issued) {
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
+    pulsar_gpu_graph *g = &s->graph;
+    const int vocab = (int)PULSAR_N_VOCAB;
+    bool ok = gpu_graph_bank_pool_count(g) >= (uint32_t)g_n_dec;
+    char err[256];
+    int argtok[N_DEC_MAX];
+    for (int k = 0; ok && k < g_n_dec; k++) {
+        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
+        pulsar_session_invalidate(s);
+        pulsar_tokens p = { .v = g_toks.v + g_off[k], .len = g_len[k], .cap = g_len[k] };
+        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+            fprintf(stderr, "multirun bank %d sync failed: %s\n", k, err); ok = false; break;
+        }
+        gpu_graph_bank_counters_capture(g, (uint32_t)k);
+        argtok[k] = pulsar_session_argmax(s);
+    }
+    const int n_banks_issued = only_bank >= 0 ? 1 : g_n_dec;
+    const uint32_t n_rows = (uint32_t)(n_banks_issued * rpb);
+    pulsar_multiseq_req *reqs = ok ? (pulsar_multiseq_req *)malloc((size_t)n_rows * sizeof(*reqs)) : NULL;
+    if (ok && !reqs) ok = false;
+    if (ok) {
+        uint32_t r = 0; int slot = 0;
+        for (int i = 0; i < g_n_dec; i++) {
+            const int k = reverse ? g_n_dec - 1 - i : i;
+            if (only_bank >= 0 && k != only_bank) continue;
+            issued[slot++] = k;
+            for (int j = 0; j < rpb; j++, r++) {
+                reqs[r].bank = (uint32_t)k;
+                reqs[r].pos = g_len[k] + j;
+                reqs[r].token = j == 0 ? argtok[k] : g_toks.v[g_off[k] + j];
+            }
+        }
+        uint32_t got = 0;
+        const int rc = pulsar_session_decode_mixed(s, reqs, n_rows, out, (int)(n_rows * (uint32_t)vocab),
+                                                &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err);
+        if (rc != 0 || got != n_rows) {
+            fprintf(stderr, "multirun ALL_ROWS decode_mixed(rpb=%d) rc=%d got=%u: %s\n", rpb, rc, got, err); ok = false;
+        }
+    }
+    free(reqs);
+    pulsar_session_free(s);
+    return ok;
+}
+
 static bool classic_resume(int K, float *out_lg, int *next_tok) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
@@ -312,6 +364,43 @@ int main(int argc, char **argv) {
                     k, d, (lv1_dec + (size_t)k * vocab)[d], (ref_dec + (size_t)k * vocab)[d]);
             g_fail = 1;
         }
+    }
+
+    /* L152 (diagnostic, argv[3] == "rows"): the multi-run step at argv[2] rows
+     * per bank with EVERY row's logits, batched vs solo, forward and reversed
+     * bank order. Prints, per bank and per row, whether the row is identical
+     * and the first differing float, so a failing run reads row by row. */
+    if (argc > 3 && strcmp(argv[3], "rows") == 0) {
+        const int RPB = argc > 2 ? atoi(argv[2]) : 5;
+        const uint32_t vocab = PULSAR_N_VOCAB;
+        for (int rev = 0; rev < 2; rev++) {
+            float *all = (float *)malloc((size_t)g_n_dec * RPB * vocab * sizeof(float));
+            float *solo = (float *)malloc((size_t)RPB * vocab * sizeof(float));
+            int issued[N_DEC_MAX], one[N_DEC_MAX];
+            if (!all || !solo || !multirun_step_rows(RPB, -1, rev != 0, all, issued)) {
+                fprintf(stderr, "GATE 5R: batched step failed\n"); g_fail = 1; free(all); free(solo); continue;
+            }
+            for (int slot = 0; slot < g_n_dec; slot++) {
+                const int k = issued[slot];
+                if (!multirun_step_rows(RPB, k, false, solo, one)) { fprintf(stderr, "GATE 5R: solo %d failed\n", k); g_fail = 1; break; }
+                for (int j = 0; j < RPB; j++) {
+                    const float *a = all + ((size_t)slot * RPB + j) * vocab;
+                    const float *b = solo + (size_t)j * vocab;
+                    long d = first_diff(a, b, (long)vocab);
+                    if (d < 0) printf("GATE 5R %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", rev ? "reversed" : "forward", k, slot, j, RPB);
+                    else {
+                        long nd = 0; float md = 0.f;
+                        for (long i = 0; i < (long)vocab; i++) if (a[i] != b[i]) { nd++; float x = fabsf(a[i] - b[i]); if (x > md) md = x; }
+                        printf("GATE 5R %s: bank %d (slot %d) row %d/%d: DIFFERS at float %ld (%.6g vs %.6g), %ld/%u floats, max |d| %.4g\n",
+                               rev ? "reversed" : "forward", k, slot, j, RPB, d, (double)a[d], (double)b[d], nd, vocab, (double)md);
+                    }
+                }
+            }
+            free(all); free(solo);
+        }
+        printf("GATE 5R done (diagnostic only)\n");
+        pulsar_engine_close(g_e);
+        return g_fail ? 1 : 0;
     }
 
     /* GATE 5 (L146): MULTI-RUN NEUTRALITY -- the production row shape.  Each
