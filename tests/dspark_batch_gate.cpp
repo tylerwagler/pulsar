@@ -45,6 +45,7 @@ static int g_fail;
     } while (0)
 
 enum { NB = 3, ROWS = 32 };
+static int g_nb = NB;   /* banks in play this run (argv[4], <= NB) */
 static const int g_prompt_off[NB] = {0, 401, 700};
 static const int g_prompt_len[NB] = {130, 258, 160};
 
@@ -106,7 +107,7 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
     pulsar_multiseq_req reqs[ROWS];
     uint32_t rows = 0;
     const int eos = pulsar_token_eos(g_e);
-    for (int b = 0; b < NB; b++) {
+    for (int b = 0; b < g_nb; b++) {
         if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) return -1;
         const int first = pulsar_session_spec_next_base(s, temps[b], 0, 1.0f, 0.05f, &rngs[b]);
         first_tok[b] = first;
@@ -130,7 +131,7 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         return -1;
     }
     int live = 0;
-    for (int b = 0; b < NB; b++) {
+    for (int b = 0; b < g_nb; b++) {
         if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) return -1;
         int accepted[17];
         const int na = pulsar_session_spec_round_end(s, r[b], first_tok[b], eos, temps[b], 0, 1.0f,
@@ -146,18 +147,18 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
 static int run_shape(const char *name, const float *temps, int ticks) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "%s: session create", name); return 0; }
-    if ((int)gpu_graph_bank_pool_count(&s->graph) < NB) {
+    if ((int)gpu_graph_bank_pool_count(&s->graph) < g_nb) {
         CHECK(0, "%s: pool has %u banks, need %d (PULSAR_MSEQ_BANKS)", name,
-              gpu_graph_bank_pool_count(&s->graph), NB);
+              gpu_graph_bank_pool_count(&s->graph), g_nb);
         pulsar_session_free(s);
         return 0;
     }
-    for (int b = 0; b < NB; b++)
+    for (int b = 0; b < g_nb; b++)
         if (!bank_prefill(s, b)) { CHECK(0, "%s: prefill bank %d", name, b); pulsar_session_free(s); return 0; }
     const int vocab = pulsar_engine_logits_width(g_e);
     float *logits = (float *)malloc((size_t)ROWS * (size_t)vocab * sizeof(float));
     pulsar_spec_round *r[NB];
-    for (int b = 0; b < NB; b++) r[b] = pulsar_spec_round_new();
+    for (int b = 0; b < g_nb; b++) r[b] = pulsar_spec_round_new();
     uint64_t rngs[NB] = {0x2545F4914F6CDD1Dull, 0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull};
     int compared = 0, deepest = 0, shallowest = 99;
     char err[256];
@@ -179,7 +180,7 @@ static int run_shape(const char *name, const float *temps, int ticks) {
         float *ser_logits[NB] = {NULL, NULL, NULL};
         float *ser_hidden[NB] = {NULL, NULL, NULL};
         uint32_t ser_nd[NB] = {0, 0, 0};
-        for (int b = 0; b < NB; b++) {
+        for (int b = 0; b < g_nb; b++) {
             pulsar_spec_round *one = r[b];
             const uint32_t bank = (uint32_t)b;
             uint64_t *rp = &rng_a[b];
@@ -197,29 +198,29 @@ static int run_shape(const char *name, const float *temps, int ticks) {
                                        (uint64_t)d.n_draft * PULSAR_N_EMBD * sizeof(float));
             }
         }
-        peek_all(r, NB, ser);
+        peek_all(r, g_nb, ser);
         /* (b) batched, from equal rng copies; the rounds still hold their
          * requests (peek does not consume them) */
         {
             uint32_t banks[NB] = {0, 1, 2};
             uint64_t *rps[NB] = {&rng_b[0], &rng_b[1], &rng_b[2]};
-            if (pulsar_session_spec_redraft_batch(s, r, banks, rps, NB, err, sizeof(err)) != 0)
+            if (pulsar_session_spec_redraft_batch(s, r, banks, rps, g_nb, err, sizeof(err)) != 0)
                 CHECK(0, "%s: tick %d batched redraft: %s", name, t, err);
         }
-        peek_all(r, NB, bat);
+        peek_all(r, g_nb, bat);
         /* stage comparison: batched rows sit at [base_row_b, +n_draft) with the
          * greedy banks first in bank order (all-greedy: bank order) */
         {
             float *bl = (float *)malloc((size_t)ROWS * (size_t)vocab * sizeof(float));
             float *bh = (float *)malloc((size_t)ROWS * PULSAR_N_EMBD * sizeof(float));
             uint32_t total = 0;
-            for (int b = 0; b < NB; b++) total += ser_nd[b];
+            for (int b = 0; b < g_nb; b++) total += ser_nd[b];
             pulsar_gpu_tensor_read(s->graph.spec_logits, 0, bl, (uint64_t)total * (uint64_t)vocab * sizeof(float));
             pulsar_gpu_tensor_read(s->graph.batch_ffn_cur, 0, bh, (uint64_t)total * PULSAR_N_EMBD * sizeof(float));
             /* row order: greedy banks (temps == 0) first, then sampled, each in bank order */
             uint32_t off = 0;
             for (int pass = 0; pass < 2; pass++)
-                for (int b = 0; b < NB; b++) {
+                for (int b = 0; b < g_nb; b++) {
                     if ((pass == 0) != (temps[b] <= 0.0f)) continue;
                     if (!ser_logits[b]) continue;
                     for (uint32_t k = 0; k < ser_nd[b]; k++) {
@@ -238,8 +239,8 @@ static int run_shape(const char *name, const float *temps, int ticks) {
                 }
             free(bl); free(bh);
         }
-        for (int b = 0; b < NB; b++) { free(ser_logits[b]); free(ser_hidden[b]); }
-        for (int b = 0; b < NB; b++) {
+        for (int b = 0; b < g_nb; b++) { free(ser_logits[b]); free(ser_hidden[b]); }
+        for (int b = 0; b < g_nb; b++) {
             CHECK(ser[b].present == bat[b].present, "%s: tick %d bank %d present %d vs %d", name, t, b,
                   ser[b].present, bat[b].present);
             if (!ser[b].present || !bat[b].present) continue;
@@ -261,7 +262,7 @@ static int run_shape(const char *name, const float *temps, int ticks) {
             if ((int)nd < shallowest) shallowest = (int)nd;
         }
         /* commit (b) under each bank's switch, as the server does */
-        for (int b = 0; b < NB; b++) {
+        for (int b = 0; b < g_nb; b++) {
             if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) { CHECK(0, "%s: restore %d", name, b); break; }
             pulsar_session_spec_redraft_commit(s, r[b]);
             pulsar_session_bank_state_save(s, (uint32_t)b);
@@ -271,16 +272,18 @@ static int run_shape(const char *name, const float *temps, int ticks) {
     printf("%s: %d bank-ticks compared, draft depth %d..%d%s\n", name, compared,
            compared ? shallowest : 0, compared ? deepest : 0,
            g_fail ? "  (see FAIL lines)" : "  IDENTICAL");
-    for (int b = 0; b < NB; b++) pulsar_spec_round_free(r[b]);
+    for (int b = 0; b < g_nb; b++) pulsar_spec_round_free(r[b]);
     free(logits);
     pulsar_session_free(s);
     return compared;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [DRAFT_DEPTH]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [DRAFT_DEPTH] [BANKS<=3]\n", argv[0]); return 2; }
     const int ticks = argc > 2 ? atoi(argv[2]) : 8;
     const int depth = argc > 3 ? atoi(argv[3]) : 0;
+    g_nb = argc > 4 ? atoi(argv[4]) : NB;
+    if (g_nb < 1 || g_nb > NB) { fprintf(stderr, "bad bank count\n"); return 2; }
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
@@ -303,7 +306,7 @@ int main(int argc, char **argv) {
     const int c1 = run_shape("greedy x3", greedy, ticks);
     const int c2 = run_shape("greedy + sampled x2", mixed, ticks);
     CHECK(c1 >= ticks && c2 >= ticks, "too few bank-ticks compared (%d, %d)", c1, c2);
-    printf("DSPARK BATCH GATE (depth %s): %s\n", depth ? "pinned" : "default", g_fail ? "FAIL" : "PASS");
+    printf("DSPARK BATCH GATE (depth %s, %d banks): %s\n", depth ? "pinned" : "default", g_nb, g_fail ? "FAIL" : "PASS");
     pulsar_tokens_free(&g_toks);
     pulsar_engine_close(g_e);
     return g_fail ? 1 : 0;

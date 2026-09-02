@@ -325,7 +325,10 @@ int main(int argc, char **argv) {
      * the prefix scan is the documented behaviour and the leg is reported as
      * skipped rather than failed. */
     {
-        const int RPB = 3;
+        /* L150 bisect: argv[2] overrides the rows per bank (default 3, the
+         * production run length) so the M-neutral claim can be checked at
+         * every total row count up to the cap, not only at 6. */
+        const int RPB = argc > 2 ? atoi(argv[2]) : 3;
         const int rows_total = g_n_dec * RPB;
         if ((uint32_t)rows_total > PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
             printf("GATE 5 MULTI-RUN: skipped (%d rows > M-neutral cap %u)\n", rows_total, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
