@@ -35,6 +35,7 @@ __pycache__/
 /tests/tp_cmd_stress_test
 /tests/tp_verify_test
 /tests/tp_slab_gpu_probe
+/tests/tp_dmabuf_probe
 /tests/multiseq_frontier_gate
 /tests/multiseq_decode_gate
 /tests/bank_spec_gate
