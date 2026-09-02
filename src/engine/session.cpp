@@ -1412,6 +1412,11 @@ void pulsar_session::invalidate() {
  * which threw away the whole live KV on every mid-block tool-call stop). */
 void pulsar_session::rewind(int pos) {
     auto *s = this;
+    const int len0 = s->checkpoint.len;
+    /* L154: PULSAR_REWIND_TRACE (read once) -- one line per rewind with the
+     * trimmed range and whether any ratio-4 counter was ahead, and one per
+     * boundary-crossing rewind saying whether the value replay ran. */
+    static const int trace = getenv("PULSAR_REWIND_TRACE") != NULL;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
@@ -1516,15 +1521,15 @@ void pulsar_session::rewind(int pos) {
      * CHECKs against the wanted counts. (A "served-shape leg" of
      * rewind_frontier_gate was written and mutation-killed twice -- it never
      * landed; this comment used to point at it.) */
+    if (trace)
+        fprintf(stderr, "pulsar: rewind: len %d -> %d bank %u ratio4_counter_ahead=%d span [%u,%u)\n",
+                len0, pos, rw_bank, any_ratio4_crossed ? 1 : 0,
+                s->graph.proj_ring_lo, s->graph.proj_ring_hi);
     if (any_ratio4_crossed && pos >= 4) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t want = (uint32_t)pos / 4u;
         const uint32_t start = 4u * (want - 1u);
         const bool covered = start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi;
-        /* L154: one line per boundary-crossing rewind saying whether the value
-         * replay ran.  Diagnostic, read once (PULSAR_REWIND_TRACE); this is the
-         * witness the stage-0b measurement had to add to a throwaway build. */
-        static const int trace = getenv("PULSAR_REWIND_TRACE") != NULL;
         if (trace)
             fprintf(stderr, "pulsar: rewind replay %s: target %d needs [%u,%d) span [%u,%u) bank %u\n",
                     covered ? "TAKEN" : "skipped", pos, start, pos,
