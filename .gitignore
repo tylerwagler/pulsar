@@ -32,6 +32,11 @@ __pycache__/
 /tests/bank_spec_gate
 /tests/accounting_gate
 /tests/prefill_bitexact_gate
+/tests/dense_cutlass_probe
+/tests/mseq_rewind_probe
+/tests/mseq_rowcost_probe
+/tests/resume_suffix_probe
+/tests/token_seam_gate
 /tests/spec_sampling_gate
 /gguf-tools/test_quants
 .claude/
