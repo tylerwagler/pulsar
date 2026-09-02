@@ -2061,6 +2061,15 @@ void cuda_fp8_weight_cache_clear(void) {
  * the decode prefix launch is LITERALLY the same nt<n_dec> a decode-only step
  * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
  * emits at that width. No kernel logic is duplicated. */
+/* THE UNARMED ROW CAP, defined once. Below or at this many rows an unarmed
+ * dense GEMM takes the M-independent nt kernel; above it, cuBLAS/cuBLASLt,
+ * whose result is batch-shape dependent. Raising it 4 -> 8 was tried and
+ * REVERTED on 2026-07-21 (the measurement lives at the mxfp8 dispatch below,
+ * which is the authority on the number). It was a bare `4` at three dispatch
+ * sites with a comment saying they must move together -- a rule with no
+ * mechanism (L069's defect shape); now there is one of it. The ARMED cap is
+ * PULSAR_GPU_MNEUTRAL_ROWS_MAX (pulsar_gpu.h), already single-sourced. */
+#define PULSAR_GEMV_NT_CAP 4u
 static int g_mneutral_rows = 0;
 void pulsar_gpu_matmul_set_batch_mneutral(int n) {
     /* The armed nt-caps cover PULSAR_GPU_MNEUTRAL_ROWS_MAX rows, and the engine
@@ -2201,7 +2210,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * this cap or the MoE kernel choice changes. Keep 4.
          * The width-6 verify win is real but belongs entirely to moe_gemv_cap
          * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
-        static const int gemv_max_n = 4;
+        static const int gemv_max_n = (int)PULSAR_GEMV_NT_CAP;
         /* inc 2: raise the custom-nt cap for a batched step so armed widths keep
          * the M-independent kernel instead of cuBLASLt. Default cap (gemv_max_n=4)
          * is unchanged for classic prefill (never armed) and for the decode-only
@@ -2684,7 +2693,7 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * and was the bug. */
     {
         const uint64_t nt_cap = (g_mneutral_rows > 0)
-                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : 4u;
+                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)PULSAR_GEMV_NT_CAP;
         if (n_tok >= 2 && n_tok <= nt_cap) {
             dim3 g((unsigned)out_dim);
             #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
@@ -3076,7 +3085,7 @@ int pulsar_gpu_attention_output_batch_tensor(
     /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
      * for the measurement).  It shared its cap with that gate, so the two
      * defaults must move together. */
-    static const int a_gemv_max_n = 4;
+    static const int a_gemv_max_n = (int)PULSAR_GEMV_NT_CAP;
     int a_done = 0;
     /* plan-34 inc 2: a batched multiseq/mixed step must NOT take the M-dependent
      * tensor-core (cuBLASLt) 'a' GEMM -- fall to launch_grouped_fp8mx_a, whose

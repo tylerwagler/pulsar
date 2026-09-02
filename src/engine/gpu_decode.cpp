@@ -528,9 +528,6 @@ bool gpu_graph_dspark_draft_forward(
     const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = PULSAR_N_LORA_O;
 
-    const int prev_comp = g->comp_ratio_override;
-    g->comp_ratio_override = 0;
-
     for (uint32_t li = 0; li < 3 && ok; li++) {
         const pulsar_layer_weights *layer = &w->layer[li];
         const uint32_t raw_cap = PULSAR_DSPARK_DRAFT_WINDOW;
@@ -737,8 +734,6 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor_free(hc_split_view);
         pulsar_gpu_tensor_free(ffn_cur_view);
     }
-
-    g->comp_ratio_override = prev_comp;
 
     /* Batch output head → N-token logits in g->spec_logits.  Use the DSpark
      * drafter's OWN hc_head + norm (dspark.2.*) with the shared vocab head, NOT

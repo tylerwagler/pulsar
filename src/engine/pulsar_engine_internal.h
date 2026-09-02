@@ -1021,10 +1021,6 @@ typedef struct {
     pulsar_gpu_tensor *dspark_raw_cache[3];  ///< the drafter's raw KV ring, one per draft layer
     uint32_t dspark_n_raw[3];                ///< positions held in each ring
 
-    /** Override compression ratio for DSpark draft layers (set to 0 before
-     * forwarding the draft model). */
-    int comp_ratio_override;
-
     uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry; sizes the batch tensors
     uint32_t raw_window;   ///< positions the raw (uncompressed) KV ring retains per layer
 

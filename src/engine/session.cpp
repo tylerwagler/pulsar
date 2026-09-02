@@ -1500,8 +1500,12 @@ void pulsar_session::rewind(int pos) {
      *
      * Covering decode would mean depositing under mseq and widening past
      * tail-8 -- a fidelity improvement to be priced, not a bug fix. See
-     * pulsar-notes/plans/ONE-STATE-MODEL-STAGE0B.md, and the SERVED-SHAPE leg
-     * in tests/rewind_frontier_gate.cpp which pins the clamp on this path. */
+     * pulsar-notes/plans/ONE-STATE-MODEL-STAGE0B.md. The served shape is
+     * pinned by cuda-mseq-rewind-gate (tests/mseq_rewind_probe.cpp): prefill,
+     * bank save, a 6-row mixed step, a ghost rewind, then per-layer frontier
+     * CHECKs against the wanted counts. (A "served-shape leg" of
+     * rewind_frontier_gate was written and mutation-killed twice -- it never
+     * landed; this comment used to point at it.) */
     if (any_ratio4_crossed && pos >= 4) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t want = (uint32_t)pos / 4u;
