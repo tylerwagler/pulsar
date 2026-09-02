@@ -1649,11 +1649,35 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
     }
 }
 
+/* L148: park the live bank before a batched quantum poisons the pool.
+ *
+ * A batched step invalidates the pool session's live checkpoint (decode_mixed
+ * sets checkpoint_valid = false) and the quantum then sets live_bank = -1. If
+ * the bank that was live is NOT in this batch -- a slot mid-prefill, or one
+ * that just finished and whose folded history sits only in the pool copy --
+ * nothing ever copies its checkpoint to its carry: the next bank_state_restore
+ * hands back the stale carry (the prompt, or nothing), pos() reads 0 or the
+ * prompt length while the bank's KV frontier is hundreds of rows ahead, and
+ * the next step is rejected ("first position 0 <= 0", "frontier not
+ * position-true"). Seen on the drafter-off lane with three repeat-prompt
+ * clients (rows/L148.md). Saving it here, while its checkpoint is still valid,
+ * is what bank_switch does on every hand-off; this is the hand-off the
+ * batched quanta skipped. */
+static void park_live_bank(server *s, session_slot **dec, int n, const session_slot *extra) {
+    if (s->live_bank < 0 || s->live_bank >= s->pool_banks) return;
+    for (int i = 0; i < n; i++)
+        if (dec[i] && (int)dec[i]->bank == s->live_bank) return;
+    if (extra && (int)extra->bank == s->live_bank) return;
+    s->slots[s->live_bank].committed_pos = pulsar_session_pos(s->sess);
+    pulsar_session_bank_state_save(s->sess, (uint32_t)s->live_bank);
+}
+
 void server::worker_batched_decode_quantum(session_slot **dec, int n) {
     auto *s = this;
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
     const int vocab = pulsar_engine_logits_width(s->engine);
+    park_live_bank(s, dec, n, NULL);
 
     /* Tier-2 2b: proactive-eviction guard — BEFORE the weight sweep grows the live
      * banks, spill LRU-idle banks if this quantum's projected growth would breach
@@ -1821,6 +1845,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
     pulsar_session *pool = s->sess;
     const int vocab = pulsar_engine_logits_width(s->engine);
     const int eos_token = pulsar_token_eos(s->engine);
+    park_live_bank(s, dec, n, NULL);
 
     s->guard_maybe_evict(dec, n);
 
@@ -2215,6 +2240,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
     pulsar_session *pool = s->sess;
     const int vocab = pulsar_engine_logits_width(s->engine);
+    park_live_bank(s, dec, n, pf);
     gen_state *pg = pf->gen;
     const pulsar_tokens *pp = pg->prompt_for_sync;
 
