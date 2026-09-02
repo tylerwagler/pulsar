@@ -2107,6 +2107,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             }
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
+            /* The round's base position -- NOT pulsar_session_pos() here: during
+             * the round the checkpoint already spans the verify batch. */
+            const int pos_before = pulsar_spec_round_saved_len(rounds[live_idx[q]]);
             const int na = pulsar_session_spec_round_end(pool, rounds[live_idx[q]],
                                                       first_tok[q], eos_token,
                                                       temp, top_k, top_p, min_p,
@@ -2120,6 +2123,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
+            /* L155 tripwire: the round must hand back exactly the positions it
+             * committed (the engine clamps commit at EOS and trims to the
+             * accepted count).  The ghost rewind below counts na - emitted and
+             * cannot see a frontier that ran ahead of na, so this is the only
+             * place that would notice; it says so if the invariant ever breaks. */
+            if (pulsar_session_pos(pool) != pos_before + na)
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: spec batched round bank %u: frontier %d != "
+                           "%d + %d accepted -- the bank carries tokens the client "
+                           "will not see (L155)",
+                           (unsigned)sl->bank, pulsar_session_pos(pool), pos_before, na);
             slot_writer_install(&g->writer);
             int done = 0;
             bool stopped = false;

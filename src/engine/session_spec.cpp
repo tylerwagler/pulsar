@@ -1594,12 +1594,27 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         if (pend[i] == (int32_t)eos_token) hit_eos = true;
     }
 
+    /* L155 guard: the committed frontier (saved_len + 1 + commit) must equal
+     * what the caller receives.  EOS is already handled -- the ghost-token
+     * guard above clamps commit at an accepted EOS, so no post-EOS draft is
+     * ever committed (I first read this as a live leak; it is not).  The one
+     * way the two can still differ is accepted_cap binding below 1 + commit,
+     * which no current caller does (the server passes its array size).  Enforce
+     * the invariant anyway, where both counts are known: rewind() clamps the
+     * compressor frontier, replays the straddled ratio-4 group when the ring
+     * covers it, and drops the carry and drafter window, which is right -- the
+     * carry was conditioned on positions that no longer exist.  The server's
+     * tripwire (server_sched.cpp) checks the same equality after every round. */
+    const int exposed_end = saved_len + n_accept;
+    const bool trimmed = exposed_end < s->checkpoint.len;
+    if (trimmed) s->rewind(exposed_end);
+
     /* The carry IS the next base (already correctly distributed). Persist it
      * so the next generate_speculative call forwards it as batch position 0;
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
     s->spec.spec_carry_token = (int32_t)carry_tok;
-    s->spec.spec_carry_valid = !hit_eos;
+    s->spec.spec_carry_valid = !hit_eos && !trimmed;
     s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
     s->spec.spec_carry_temp = temperature;
     s->spec.spec_carry_top_k = top_k;
@@ -1607,10 +1622,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_min_p = min_p;
     uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
+    if (hit_eos || trimmed || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
-         * generate_speculative call consumes before routing plain. */
+         * generate_speculative call consumes before routing plain.  (After an
+         * L155 trim there is no carry: the generation ended at the cap.) */
         if (dspark_stats && t0 > 0.0)
             fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);
@@ -2336,6 +2352,10 @@ uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t ban
     if (n > 16u) n = 16u;
     for (uint32_t i = 0; i < n; i++) out[i] = c->spec.dspark_pending_conf[i];
     return n;
+}
+
+int pulsar_spec_round_saved_len(const pulsar_spec_round *r) {
+    return r ? r->saved_len : -1;
 }
 
 uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {

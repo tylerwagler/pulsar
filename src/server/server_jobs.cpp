@@ -876,11 +876,30 @@ void server::gen_begin(session_slot *sl) {
         cached = (pm.prompt_cut > 0 && !trivial) ? pm.prompt_cut : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
-    if (cached == 0) {
+    /* L155 (2026-09-02): the thinking-visible resolution used to run only when
+     * the token match was ZERO.  For a thinking-chat continuation it never is:
+     * the rendered prompt shares the system and user turns with the live
+     * history and diverges at the assistant turn's think tag (the client
+     * replays visible content; the template renders a closed think block), so
+     * memory-token matched 27-odd tokens, won, and sync rewound the whole
+     * assistant turn -- discarding exactly the reasoning KV the binding exists
+     * to keep and re-prefilling the answer on every turn (30/30 continuations
+     * in the L154 witness, after the ROUTE had correctly chosen the slot on the
+     * binding).  The routing comment already says the token prefix "must not
+     * out-vote the binding"; now the resolution follows it: when the slot's
+     * binding matches, the live frontier is the continuation and it wins over
+     * a shorter token match.  Protocol-bound resolutions (Responses/Anthropic
+     * tool state) still take precedence -- only memory-token is out-voted. */
+    if (cached == 0 || !strcmp(cache_source, "memory-token")) {
         int thinking_cached =
             s->thinking_live_visible_prefix_prompt(sl, &j->req, old_pos,
                                                 &effective_prompt);
-        if (thinking_cached > 0) {
+        if (thinking_cached > cached) {
+            if (cached > 0)
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: thinking-visible continuation keeps live=%d "
+                           "over token match=%d",
+                           thinking_cached, cached);
             cached = thinking_cached;
             cache_source = "thinking-visible";
             thinking_live_continuation = true;
