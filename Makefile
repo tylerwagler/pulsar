@@ -545,6 +545,37 @@ tests/tp_fault_test: tests/tp_fault_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_
 tp-fault-test: tests/tp_fault_test
 	./tests/tp_fault_test
 
+# TP control-plane stress test (branch tensor_parallel): thousands of
+# randomized interleaved session commands (create/destroy churn, sync/eval/
+# rewind/invalidate, eval_batch, mixed_batch, verify+commit) against a worker
+# that mirrors the session ledger from the received frames -- a foreign,
+# dropped, or mis-acked command fails, and a stalled frame would be caught by
+# the per-side alarm.  Host-only: TCP loopback.
+tests/tp_cmd_stress_test: tests/tp_cmd_stress_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_cmd_stress_test.cpp src/tp/pulsar_tp.cpp
+
+tp-cmd-stress-test: tests/tp_cmd_stress_test
+	./tests/tp_cmd_stress_test
+
+# TP tiny-buffer regression (audit F9): the TCP fallback's alternating
+# write/read rounds must complete even when the socket buffers are clamped
+# small (PULSAR_TP_TEST_TINY_BUFFERS=1 -> 32K bufs) -- the conditition under
+# which the pair hosts once deadlocked (the old 2 MiB symmetric write-then-
+# read filled both send buffers; 64K rounds land inside the kernel's doubled
+# recv buffer, so both sides finish their write before draining reads).  Loop
+# the whole transport + a wide soak under the clamp so any return to a
+# symmetric-write or oversized-round shape fails the build instead of hanging
+# a GPU session.  Host-only; the timeout guards a regression that hangs.
+tp-tinybuf-test: tests/tp_transport_test tests/tp_wide_test
+	@set -e; \
+	for i in $$(seq 1 30); do \
+		PULSAR_TP_TEST_TINY_BUFFERS=1 timeout 60 ./tests/tp_transport_test >/dev/null 2>&1 \
+		  || { echo "tp-tinybuf: transport iteration $$i FAILED"; exit 1; }; \
+	done; \
+	PULSAR_TP_TEST_TINY_BUFFERS=1 PULSAR_TP_SOAK_TOKENS=4 timeout 120 ./tests/tp_wide_test >/dev/null 2>&1 \
+	  || { echo "tp-tinybuf: wide soak FAILED"; exit 1; }; \
+	echo "tp-tinybuf-test: ok (30x transport + wide soak under 32K clamped buffers)"
+
 # TP GPU-slab gate probe (bring-up step 4): nvcc-built so it can run on the
 # pair.  Compile-checked here (no GPU to run); run on the GB10 pair per
 # docs/tensor-parallel-bringup.md.
@@ -558,5 +589,5 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_identity_test tests/tp_wide_test tests/tp_fault_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_identity_test tests/tp_wide_test tests/tp_fault_test tests/tp_cmd_stress_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 
