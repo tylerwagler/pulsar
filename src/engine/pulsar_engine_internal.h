@@ -804,17 +804,10 @@ typedef struct {
      * logits after all 43 layers update their raw/compressed/indexer caches. */
     pulsar_gpu_tensor *cur_hc;    ///< the live HC residual carrier: token enters here, walks all layers
     pulsar_gpu_tensor *flat_hc;   ///< HC streams flattened for the mix GEMV
-    pulsar_gpu_tensor *hc_mix;    ///< output of the HC mix projection
     pulsar_gpu_tensor *hc_split;  ///< per-stream split of the mix, before recombination
-    pulsar_gpu_tensor *hc_pre;    ///< HC state entering the sublayer
     pulsar_gpu_tensor *hc_post;   ///< HC state leaving the sublayer
     pulsar_gpu_tensor *hc_comb;   ///< recombined HC streams written back to cur_hc
-    pulsar_gpu_tensor *attn_cur;  ///< attention sublayer input (embedding width)
     pulsar_gpu_tensor *attn_norm; ///< RMSNorm output feeding the projections
-    pulsar_gpu_tensor *qr;        ///< low-rank query latent (attn_q_a output)
-    pulsar_gpu_tensor *qr_norm;   ///< normalised query latent
-    pulsar_gpu_tensor *q;         ///< queries in head space (attn_q_b output)
-    pulsar_gpu_tensor *kv_raw;    ///< fused KV projection output, pre-norm
     pulsar_gpu_tensor *kv;        ///< KV latent after its RMSNorm; the row stored into the ring
 
     /** Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
@@ -935,8 +928,6 @@ typedef struct {
     /** Per-layer work tensors.  They are reused in place by every layer instead
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
-    pulsar_gpu_tensor *comp_kv_cur;      ///< this layer's freshly compressed KV rows
-    pulsar_gpu_tensor *comp_sc_cur;      ///< this layer's freshly compressed score rows
     pulsar_gpu_tensor *attn_comp_stage;  ///< staging the attention compressor writes through
     /** f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
@@ -944,31 +935,9 @@ typedef struct {
      * layer_index_comp_cache.  Also reused for session-save dequant and
      * session-load repack. */
     pulsar_gpu_tensor *idx_comp_stage;
-    pulsar_gpu_tensor *indexer_q;  ///< f32 rope staging, producer-internal (L090.4)
-    pulsar_gpu_tensor *indexer_qp;  ///< packed E2M1 Q rows -- what the scorers read
-    pulsar_gpu_tensor *indexer_weights;  ///< indexer gate weights per compressed row
     pulsar_gpu_tensor *indexer_scores;   ///< indexer relevance score per compressed row
     pulsar_gpu_tensor *comp_selected;    ///< top-k compressed row ids the attention will read
-    pulsar_gpu_tensor *heads;            ///< per-head attention output, pre-projection
-    pulsar_gpu_tensor *attn_low;         ///< attention output through the low-rank 'a' projection
-    pulsar_gpu_tensor *attn_out;         ///< attention output back at embedding width ('b' projection)
-    pulsar_gpu_tensor *after_attn_hc;    ///< HC residual after the attention sublayer
-    pulsar_gpu_tensor *ffn_cur;          ///< FFN sublayer input
     pulsar_gpu_tensor *ffn_norm;         ///< RMSNorm output feeding the FFN
-    pulsar_gpu_tensor *shared_gate;      ///< shared expert, gate branch
-    pulsar_gpu_tensor *shared_up;        ///< shared expert, up branch
-    pulsar_gpu_tensor *shared_mid;       ///< shared expert, SwiGLU(gate, up) product
-    pulsar_gpu_tensor *shared_out;       ///< shared expert, down projection output
-    pulsar_gpu_tensor *router_logits;    ///< per-expert routing logits
-    pulsar_gpu_tensor *router_probs;     ///< routing logits after softmax + bias
-    pulsar_gpu_tensor *router_selected;  ///< chosen expert ids, top-k per token
-    pulsar_gpu_tensor *router_weights;   ///< normalised mixing weight per chosen expert
-    pulsar_gpu_tensor *routed_up;        ///< routed experts, up branch (gate/up are fused on the MXFP4 path)
-    pulsar_gpu_tensor *routed_mid;       ///< routed experts, SwiGLU product staged for the down GEMM
-    pulsar_gpu_tensor *routed_down;      ///< routed experts, per-expert down output before pooling
-    pulsar_gpu_tensor *routed_out;       ///< routed experts summed by mixing weight
-    pulsar_gpu_tensor *ffn_out;          ///< shared + routed FFN output
-    pulsar_gpu_tensor *after_ffn_hc;     ///< HC residual after the FFN sublayer
     pulsar_gpu_tensor *output_pre;       ///< final HC mix output feeding the output head
     pulsar_gpu_tensor *output_weights;   ///< per-stream weights for the HC collapse
     pulsar_gpu_tensor *output_embd;      ///< collapsed embedding-width vector
@@ -2241,7 +2210,6 @@ void gpu_graph_debug_dump_i32_tensor(
         uint32_t          il,
         uint32_t          pos);
 bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t pos);
-bool gpu_graph_ensure_ffn_out(pulsar_gpu_graph *g);
 bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g);
 bool gpu_graph_alloc_raw_cap(
         pulsar_gpu_graph *g,

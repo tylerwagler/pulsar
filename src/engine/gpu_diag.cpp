@@ -249,15 +249,6 @@ bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t po
 
 
 
-bool gpu_graph_ensure_ffn_out(pulsar_gpu_graph *g) {
-    if (!g->ffn_out) {
-        g->ffn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    }
-    return g->ffn_out != NULL;
-}
-
-
-
 bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
     if (!g->batch_ffn_out) {
         g->batch_ffn_out = pulsar_gpu_tensor_alloc((uint64_t)g->prefill_cap * PULSAR_N_EMBD * sizeof(float));
@@ -378,8 +369,8 @@ static void gpu_graph_compute_dims(
  *
  * EXCLUSION LIST — intentionally unaccounted per-session allocations (each
  * negligible, absorbed by PULSAR_SERVER_MEM_FLOOR_BYTES; do not re-derive):
- *   - the lazy gpu_graph_ensure_ffn_out/gpu_graph_ensure_batch_ffn_out
- *     buffers (only allocated under steering/diagnostics);
+ *   - the lazy gpu_graph_ensure_batch_ffn_out buffer (only allocated under
+ *     steering/diagnostics);
  *   - directional-steering dirs (gpu_graph_load_directional_steering,
  *     ~PULSAR_N_LAYER*PULSAR_N_EMBD floats — these ARE inside the measured create
  *     delta, so they show up in reconciliation but never in this estimate);
@@ -447,32 +438,14 @@ uint64_t gpu_graph_session_bytes_banked(
     /* Single-token graph buffers. */
     total += dz.hc_dim * hc;                              /* cur_hc (carrier) */
     total += dz.hc_dim * f32;                             /* flat_hc (RMSNorm out, f32) */
-    total += 2ull * dz.mix_hc * f32;                      /* hc_mix, hc_split (views free) */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* attn_cur, attn_norm */
-    total += 2ull * dz.q_rank * f32;                      /* qr, qr_norm */
-    total += dz.q_dim * PULSAR_Q_ELT_SIZE;                /* q */
-    total += 2ull * PULSAR_N_HEAD_DIM * f32;                 /* kv_raw, kv */
-    total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
+    total += dz.mix_hc * f32;                             /* hc_split (views free) */
+    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* attn_norm */
+    total += (uint64_t)PULSAR_N_HEAD_DIM * f32;              /* kv */
     total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
     total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
-    total += dz.indexer_q_dim * f32;                      /* indexer_q (rope staging) */
-    total += (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES; /* indexer_qp (packed) */
-    total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
     total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
              pc * sizeof(uint32_t);                       /* comp_selected */
-    total += dz.q_dim * PULSAR_HEADS_ELT_SIZE;            /* heads (stored width; L106 K5) */
-    total += dz.low_dim * f32;                            /* attn_low */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* attn_out */
-    total += dz.hc_dim * hc;                              /* after_attn_hc (carrier) */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* ffn_cur, ffn_norm */
-    total += 3ull * dz.shared_dim * f32;                  /* shared_gate/up/mid */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* shared_out */
-    total += 2ull * PULSAR_N_EXPERT * f32;                   /* router_logits, router_probs */
-    total += (uint64_t)PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* router_selected/weights */
-    total += 2ull * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_up/mid */
-    total += (uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;     /* routed_down */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* routed_out */
-    total += dz.hc_dim * hc;                              /* after_ffn_hc (carrier) */
+    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* ffn_norm */
     total += 2ull * PULSAR_N_HC * f32;                       /* output_pre, output_weights */
     total += 2ull * PULSAR_N_EMBD * f32;                     /* output_embd, output_norm */
     total += dz.vocab_dim * f32;                          /* logits */
@@ -1902,21 +1875,14 @@ bool gpu_graph_alloc_raw_cap(
 
     g->cur_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier (BF16); task #62 */
     g->flat_hc = pulsar_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->hc_mix = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
     g->hc_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
-    g->hc_pre = pulsar_gpu_tensor_view(g->hc_split, 0, (uint64_t)PULSAR_N_HC * sizeof(float));
     g->hc_post = pulsar_gpu_tensor_view(g->hc_split,
                                        (uint64_t)PULSAR_N_HC * sizeof(float),
                                        (uint64_t)PULSAR_N_HC * sizeof(float));
     g->hc_comb = pulsar_gpu_tensor_view(g->hc_split,
                                        2ull * PULSAR_N_HC * sizeof(float),
                                        (uint64_t)PULSAR_N_HC * PULSAR_N_HC * sizeof(float));
-    g->attn_cur = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->attn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->qr = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->qr_norm = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->q = pulsar_gpu_tensor_alloc_elt(q_dim, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
-    g->kv_raw = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     g->kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     /* PULSAR_ATTN_PACK rows -- see the bank sizing above. */
@@ -2045,8 +2011,6 @@ bool gpu_graph_alloc_raw_cap(
             }
         }
     }
-    g->comp_kv_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    g->comp_sc_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
     /* f32 staging: the compressor writes real f32 rows here, then the commit
      * step packs them to the persistent packed comp cache. */
     g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
@@ -2066,10 +2030,6 @@ bool gpu_graph_alloc_raw_cap(
         g->idx_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                  PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     }
-    g->indexer_q = pulsar_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
-    g->indexer_qp = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD *
-                                            PULSAR_ENGINE_IDXFP4_ROWBYTES);
-    g->indexer_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD * sizeof(float));
     /* PULSAR_PREFILL_SLICE: these two are the only ctx-scaling f32 work buffers
      * with a prefill_cap token dimension; under slicing they only ever hold
      * one <=slice-token span at a time. */
@@ -2079,35 +2039,7 @@ bool gpu_graph_alloc_raw_cap(
     g->indexer_scores = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
-    g->heads = pulsar_gpu_tensor_alloc_elt(q_dim, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);   /* same authority */
-    g->attn_low = pulsar_gpu_tensor_alloc(low_dim * sizeof(float));
-    g->attn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_attn_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
-    g->ffn_cur = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->shared_gate = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_up = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_mid = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->router_logits = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT * sizeof(float));
-    g->router_probs = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT * sizeof(float));
-    g->router_selected = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(int));
-    g->router_weights = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(float));
-    /* NOTE (task #64): these look debug-only — the routed-expert gate/up stores
-     * are read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
-     * routed_moe_*_impl rejects NULL gate/up (`if (!gate_w || !up_w || !down_w)
-     * return 0;`, four sites in moe.cu). Keep them allocated unconditionally.
-     *
-     * The second reason given here was that the batch path reused gate->ptr as
-     * cuda_block_q8_K staging for quantized mid.  That is gone: the int8
-     * activation arms went with the E4M3 campaign and cuda_block_q8_K itself was
-     * deleted 2026-08-18 with zero references left.  The NULL check above is now
-     * the whole justification, and it is sufficient on its own. */
-    g->routed_up = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_mid = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_down = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
-    g->routed_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_ffn_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
     g->output_pre = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_embd = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
@@ -2199,22 +2131,13 @@ bool gpu_graph_alloc_raw_cap(
     }
 
     const bool ok = state_init_ok && layer_cache_ok &&
-                    g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
-                    g->hc_pre && g->hc_post && g->hc_comb &&
-                    g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
-                    g->q && g->kv_raw && g->kv &&
-                    g->comp_kv_cur && g->comp_sc_cur &&
+                    g->cur_hc && g->flat_hc && g->hc_split &&
+                    g->hc_post && g->hc_comb &&
+                    g->attn_norm && g->kv &&
                     g->attn_comp_stage &&
-                    g->indexer_q && g->indexer_qp && g->indexer_weights && g->indexer_scores &&
+                    g->indexer_scores &&
                     g->comp_selected &&
-                    g->heads && g->attn_low && g->attn_out &&
-                    g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
-                    g->shared_gate && g->shared_up && g->shared_mid &&
-                    g->shared_out &&
-                    g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
-                    g->routed_up && g->routed_mid &&
-                    g->routed_down && g->routed_out &&
-                    g->after_ffn_hc &&
+                    g->ffn_norm &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
                     g->prefill_tokens && g->spec_logits &&
