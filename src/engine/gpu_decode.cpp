@@ -547,11 +547,27 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_draft * PULSAR_N_EMBD * sizeof(float));
         ok = hc_mix_view && hc_split_view && ffn_cur_view;
-        /* RMS norm: flat HC from batch_cur_hc */
+        /* RMS norm: flat HC from batch_cur_hc.
+         *
+         * The consumer below (hc_attn_fn, a BF16-weight GEMM through the shared
+         * bf16 core) takes the producer-emitted BF16 copy when the slot for
+         * (batch_flat_hc, n_draft, hc_dim) is noted valid -- the same slot the
+         * drafter's output head notes at the SAME key one pass earlier. So this
+         * producer must acquire the slot (which resets that note) and emit its
+         * own copy, exactly as the batch layer encoder does; a producer that
+         * skips the slot would leave the head's stale note standing and the
+         * GEMM would read last pass's rows. (As cherry-picked, de459a8 also
+         * passed NULL as the OUTPUT here and the flat buffer as the bf16 slot:
+         * the wrapper refused, every drafter forward failed, and the drafter
+         * was silently dead on dev from a5208ca until this fix -- no gate in
+         * that landing batch looked at drafts. rows/L150.md.) */
+        void *flat_b = NULL;
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_draft, hc_dim, &flat_b))
+            flat_b = NULL;
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
-            /*out_b=*/NULL,
-            g->batch_flat_hc, g->batch_cur_hc,
+            g->batch_flat_hc, flat_b, g->batch_cur_hc,
             (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS) != 0;
+        if (ok && flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_draft, hc_dim);
         /* HC → mix projection */
         if (ok) ok = gpu_graph_matmul_plain_tensor(
             hc_mix_view, dspark_model,
