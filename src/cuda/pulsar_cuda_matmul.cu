@@ -243,16 +243,10 @@ template <typename T>
 __device__ __forceinline__ static void stage_x_block32(const T *xr, float *xb);
 
 template <>
-__device__ __forceinline__ void stage_x_block32<float>(const float *xr, float *xb) {
-#pragma unroll
-    for (int k = 0; k < 8; k++)
-        *(float4 *)&xb[k * 4] = *(const float4 *)&xr[(uint32_t)k * 4u];
-}
-
-template <>
 __device__ __forceinline__ void stage_x_block32<__nv_bfloat16>(const __nv_bfloat16 *xr, float *xb) {
-    /* 8 bf16 is 16 B, the same 128-bit transaction the f32 arm issues -- four
-     * of them rather than eight, not a narrower access pattern. */
+    /* 8 bf16 is 16 B: four 128-bit transactions per 32-wide block.  The f32
+     * arm (eight of them) went with the last f32-activation caller; the primary
+     * template is declared only, so a new width fails to link, not silently. */
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         const uint4 raw = *(const uint4 *)&xr[(uint32_t)k * 8u];
