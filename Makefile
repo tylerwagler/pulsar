@@ -514,6 +514,37 @@ tests/tp_sched_test: tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/p
 tp-sched-test: tests/tp_sched_test
 	./tests/tp_sched_test
 
+# TP identity / hello-robustness test (branch tensor_parallel): the real-rank
+# model-mismatch matrix, the ctx-diff connect rule, the raw-peer leader
+# robustness set, and the worker dial-timeout -- all with per-child alarms so
+# a failure that turns into a hang FAILS instead of blocking the suite.
+# Host-only: no CUDA, no RDMA.
+tests/tp_identity_test: tests/tp_identity_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_identity_test.cpp src/tp/pulsar_tp.cpp
+
+tp-identity-test: tests/tp_identity_test
+	./tests/tp_identity_test
+
+# TP wide-embd + soak test (audit F4/F8 host half): the gate/batch/big
+# exchange and decode-slot reuse at n_embd 8192 (vec == 2*MSG, the RDMA
+# chunked-branch boundary) and 16384 (> 2*MSG, RDMA-registration reject size),
+# plus N decode tokens x 86 gates of slot-reuse soak.  Host-only: TCP loopback.
+tests/tp_wide_test: tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
+
+tp-wide-test: tests/tp_wide_test
+	./tests/tp_wide_test
+
+# TP peer-fault test (branch tensor_parallel): one rank dies mid-exchange and
+# the survivor must surface the failure (gate_exchange -> 0, wait_command_ack
+# -> 0 + failed() latch) instead of hanging in the blocking read.  Host-only:
+# TCP loopback, forked leader/worker, per-side alarm + bounded parent wait.
+tests/tp_fault_test: tests/tp_fault_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_fault_test.cpp src/tp/pulsar_tp.cpp
+
+tp-fault-test: tests/tp_fault_test
+	./tests/tp_fault_test
+
 # TP GPU-slab gate probe (bring-up step 4): nvcc-built so it can run on the
 # pair.  Compile-checked here (no GPU to run); run on the GB10 pair per
 # docs/tensor-parallel-bringup.md.
@@ -527,5 +558,5 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
+	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/tp_core_test tests/tp_transport_test tests/tp_sched_test tests/tp_identity_test tests/tp_wide_test tests/tp_fault_test tests/tp_slab_gpu_probe tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test
 

@@ -1841,7 +1841,18 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate, uint64
         { tp->slab + out_off, tp->vec_bytes },
     };
     size_t want = sizeof(h) + tp->vec_bytes;
+    /* sendmsg(MSG_NOSIGNAL) not writev(): if the peer dies mid-exchange the
+     * survivor must get a gate failure (0), not be killed by SIGPIPE --
+     * SO_NOSIGPIPE is BSD-only and a no-op on Linux, so an unprotected writev
+     * to a closed socket terminates the rank silently (tp_fault_test). */
+    struct msghdr mh = {};
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 2;
+#ifdef MSG_NOSIGNAL
+    ssize_t w = sendmsg(tp->data_fd, &mh, MSG_NOSIGNAL);
+#else
     ssize_t w = writev(tp->data_fd, iov, 2);
+#endif
     if (w < 0 || (size_t)w != want) {
         /* Short writev: finish with the plain path. */
         if (w < 0) return 0;
