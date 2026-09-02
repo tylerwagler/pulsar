@@ -836,6 +836,30 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
         prompt->len >= s->checkpoint.len &&
         pulsar_tokens_starts_with(prompt, &s->checkpoint))
     {
+        /* L148 self-heal.  The checkpoint says the installed bank holds
+         * checkpoint.len tokens; the bank's compressed frontier says how far
+         * its KV actually reached.  A frontier AHEAD of the checkpoint means
+         * the bank kept decoding after this checkpoint was recorded and the
+         * history was never folded back (the plain batched lane keeps
+         * generated tokens server-side and folds them late; the spec lane
+         * appends per round).  Trusting the checkpoint then either returns
+         * early (suffix 0 -- the L148 repro: a 32-token repeat prompt on a
+         * bank at 288, "frontier not position-true ... n_comp 72 want 8") or
+         * prefills a suffix onto rows the frontier already counts.  A counter
+         * can only be AHEAD of a position it must be rewound to, so rewind to
+         * the checkpoint first: L120's clamp, applied where the stale copy is
+         * consumed.  Cost: one host loop over the layers per sync. */
+        {
+            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            bool ahead = false;
+            for (uint32_t il = 0; il < PULSAR_N_LAYER && !ahead; il++) {
+                const uint32_t ratio = pulsar_layer_compress_ratio(il);
+                if (ratio == 0) continue;
+                if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / ratio)
+                    ahead = true;
+            }
+            if (ahead) s->rewind(s->checkpoint.len);
+        }
         const int suffix = prompt->len - s->checkpoint.len;
         if (suffix > 0) {
             bool cancelled = false;
