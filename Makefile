@@ -494,7 +494,7 @@ cuda-session-payload-gate: tests/session_payload_gate
 # boundary) so a co-scheduled big prefill (inc 4) cannot perturb it. MODEL-DEPENDENT,
 # needs PULSAR_MSEQ_BANKS>=8. Run pack on/off + idx-fp4 on/off under GPU discipline.
 cuda-algo-stability-gate: tests/algo_stability_gate
-	PULSAR_MSEQ_BANKS=8 ./tests/algo_stability_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=16 ./tests/algo_stability_gate $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 3: K-row single-bank prefill through the mixed entry —
 # coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.

@@ -184,7 +184,7 @@ static int run_shape(const char *name, const float *temps, int ticks) {
          * PULSAR_CUDA_GRAPH_DUMP_PREFIX/NAME/LAYER pointing at the dsp_ stages),
          * tick 0's serialized forwards dump under <dir>/ser_b<b>_ and the
          * batched one under <dir>/bat_, so the first differing stage can be
-         * read offline (tools/l150_dumpcmp.py). */
+         * read offline (tools/dumpcmp_rows.py DIR n0 n1 n2 --batched t0_bat --solo 't0_ser_b{k}'). */
         const char *dump_dir = getenv("L150_DUMP_DIR");
         for (int b = 0; b < g_nb; b++) {
             pulsar_spec_round *one = r[b];

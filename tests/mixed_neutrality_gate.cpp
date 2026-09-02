@@ -47,7 +47,7 @@ static int g_n_dec = 2;
  * PULSAR_CUDA_GRAPH_DUMP_NAME/LAYER pointing at the batched-step stages), each
  * GATE 5R step dumps under <dir>/<tag>_ -- bat_f / bat_r for the batched step,
  * solo<k> for bank k alone -- and the per-bank re-prefills that build the
- * fixture under <dir>/skip_ (delete those).  tools/l152_dumpcmp.py reads them. */
+ * fixture under <dir>/skip_ (delete those).  tools/dumpcmp_rows.py reads them. */
 static const char *g_dump_dir = NULL;
 static const char *g_dump_tag = NULL;
 static void dump_prefix(const char *tag) {
@@ -334,7 +334,7 @@ static long first_diff(const float *a, const float *b, long n) {
  * 3 rows per bank, the "wide" target skips GATE 5 above the 16-row cap, and
  * the L152 defect (rows 2-4 of one bank off by whole logits at 10 rows,
  * byte-identical at 8) lived exactly there.  Dumps per step under
- * L152_DUMP_DIR when set (tools/l152_dumpcmp.py). */
+ * L152_DUMP_DIR when set (tools/dumpcmp_rows.py). */
 static void gate5r_run(const char *spec, bool fatal) {
     int rpb_of[N_DEC_MAX];
     for (int k = 0; k < N_DEC_MAX; k++) rpb_of[k] = 5;

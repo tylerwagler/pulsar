@@ -11,7 +11,7 @@
  * METHOD: bank 0 is the fixed TARGET. Populate banks 0..M-1 from distinct prompts
  * (per-bank isolation means bank 0's output depends only on bank 0's KV), then run
  * ONE batched step through pulsar_session_decode_mixed at width M and capture bank 0's
- * logit row. Repeat for M in {1,2,4,5,8} on a FRESH session each time (no
+ * logit row. Repeat for M in {1,2,4,5,8,12,16} on a FRESH session each time (no
  * idempotency/poisoning artifacts). Bank 0's prompt/pos/token are identical every
  * time; only M (and which OTHER banks pad the batch) changes.
  *
@@ -25,8 +25,8 @@
  * divergence (large, systematic) is never hidden behind a pass/fail bit.
  *
  * The comp caches have one format each (packed attn / MXFP4 indexer).
- * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=8. Run under GPU discipline.
- *   usage: PULSAR_MSEQ_BANKS=8 ./tests/algo_stability_gate MODEL
+ * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=16. Run under GPU discipline.
+ *   usage: PULSAR_MSEQ_BANKS=16 ./tests/algo_stability_gate MODEL
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -35,13 +35,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GATE_MAX_N 8
+/* 16 = PULSAR_GPU_MNEUTRAL_ROWS_MAX: the whole armed M-neutral range.  The
+ * sweep stopped at 8 until 2026-09-02 (L152/L153) -- the same blind spot every
+ * other gate had, and where the 8-vs-9-row MoE cap defect lived. */
+#define GATE_MAX_N 16
 static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
 static int g_fail;
 
-static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 499};
-static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158};
+static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 499,
+                                             1301, 1499, 1201, 1601, 1109, 1705, 1401, 1000};
+static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158,
+                                             177, 233, 140, 201, 169, 150, 120, 205};
 
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
@@ -128,9 +133,11 @@ int main(int argc, char **argv) {
     if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d<%d)\n", g_toks.len, need); return 1; }
 
     const int vocab = (int)PULSAR_N_VOCAB;
-    const int widths[] = {1, 2, 4, 5, 8};
+    /* 12 and 16 added 2026-09-02: the armed range above 8 rows had no width
+     * sweep in the battery (L152 lived at 9..16). */
+    const int widths[] = {1, 2, 4, 5, 8, 12, 16};
     const int nW = (int)(sizeof(widths) / sizeof(widths[0]));
-    float *row[8]; memset(row, 0, sizeof row);
+    float *row[GATE_MAX_N]; memset(row, 0, sizeof row);
     for (int wi = 0; wi < nW; wi++) {
         row[wi] = (float *)malloc((size_t)vocab * sizeof(float));
         if (!bank0_logits_at_width(widths[wi], row[wi])) {
