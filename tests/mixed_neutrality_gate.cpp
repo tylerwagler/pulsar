@@ -326,6 +326,82 @@ static long first_diff(const float *a, const float *b, long n) {
     return -1;
 }
 
+/* GATE 5R (L152): the multi-run step's EVERY row, batched vs solo, in both bank
+ * orders.  `spec` is one run length for every bank or a comma list per bank
+ * ("5,5" = two banks of 5 rows).  fatal => a differing row fails the gate;
+ * otherwise it is reported (the bisect mode).  This is the check the battery
+ * lacked between 9 and 16 rows: GATE 5 compares only each run's LAST row at
+ * 3 rows per bank, the "wide" target skips GATE 5 above the 16-row cap, and
+ * the L152 defect (rows 2-4 of one bank off by whole logits at 10 rows,
+ * byte-identical at 8) lived exactly there.  Dumps per step under
+ * L152_DUMP_DIR when set (tools/l152_dumpcmp.py). */
+static void gate5r_run(const char *spec, bool fatal) {
+    int rpb_of[N_DEC_MAX];
+    for (int k = 0; k < N_DEC_MAX; k++) rpb_of[k] = 5;
+    if (spec && spec[0]) {
+        const char *q = spec;
+        for (int k = 0; k < g_n_dec && *q; k++) {
+            rpb_of[k] = atoi(q);
+            const char *c = strchr(q, ',');
+            if (!c) { for (int m = k + 1; m < g_n_dec; m++) rpb_of[m] = rpb_of[k]; break; }
+            q = c + 1;
+        }
+    }
+    int total = 0, rmax = 0;
+    for (int k = 0; k < g_n_dec; k++) { total += rpb_of[k]; if (rpb_of[k] > rmax) rmax = rpb_of[k]; }
+    const char *tag = "GATE 5R";
+    printf("%s: run lengths per bank:", tag); for (int k = 0; k < g_n_dec; k++) printf(" %d", rpb_of[k]);
+    printf(" (total %d rows%s)\n", total, fatal ? ", fatal" : ", diagnostic");
+    if ((uint32_t)total > PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        printf("%s: skipped (%d rows > M-neutral cap %u)\n", tag, total, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        return;
+    }
+    const uint32_t vocab = PULSAR_N_VOCAB;
+    g_dump_dir = getenv("L152_DUMP_DIR");
+    for (int rev = 0; rev < 2; rev++) {
+        float *all = (float *)malloc((size_t)total * vocab * sizeof(float));
+        float *solo = (float *)malloc((size_t)rmax * vocab * sizeof(float));
+        int issued[N_DEC_MAX], one[N_DEC_MAX];
+        char solo_tag[32];
+        g_dump_tag = rev ? "bat_r" : "bat_f";
+        if (!all || !solo || !multirun_step_rows(rpb_of, -1, rev != 0, all, issued)) {
+            fprintf(stderr, "%s: batched step failed\n", tag); g_fail = 1; free(all); free(solo); continue;
+        }
+        size_t row_off = 0;
+        for (int slot = 0; slot < g_n_dec; slot++) {
+            const int k = issued[slot];
+            const int RPB = rpb_of[k];
+            snprintf(solo_tag, sizeof(solo_tag), "solo%d", k);
+            g_dump_tag = solo_tag;
+            if (!multirun_step_rows(rpb_of, k, false, solo, one)) { fprintf(stderr, "%s: solo %d failed\n", tag, k); g_fail = 1; break; }
+            int bad = 0;
+            for (int j = 0; j < RPB; j++) {
+                const float *a = all + (row_off + (size_t)j) * vocab;
+                const float *b = solo + (size_t)j * vocab;
+                long d = first_diff(a, b, (long)vocab);
+                if (d < 0) {
+                    if (!fatal) printf("%s %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", tag, rev ? "reversed" : "forward", k, slot, j, RPB);
+                } else {
+                    long nd = 0; float md = 0.f;
+                    for (long i = 0; i < (long)vocab; i++) if (a[i] != b[i]) { nd++; float x = fabsf(a[i] - b[i]); if (x > md) md = x; }
+                    fprintf(fatal ? stderr : stdout,
+                            "%s%s %s: bank %d (slot %d) row %d/%d: DIFFERS at float %ld (%.6g vs %.6g), %ld/%u floats, max |d| %.4g\n",
+                            fatal ? "GATE 5R FAIL: " : "", tag, rev ? "reversed" : "forward", k, slot, j, RPB,
+                            d, (double)a[d], (double)b[d], nd, vocab, (double)md);
+                    bad++;
+                }
+            }
+            if (fatal) {
+                if (bad) g_fail = 1;
+                else printf("%s %s: bank %d (slot %d) all %d rows batched (%d) == solo BYTE-IDENTICAL\n",
+                            tag, rev ? "reversed" : "forward", k, slot, RPB, total);
+            }
+            row_off += (size_t)RPB;
+        }
+        free(all); free(solo);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     pulsar_engine_options o; memset(&o, 0, sizeof o);
@@ -387,60 +463,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* L152 (diagnostic, argv[3] == "rows"): the multi-run step at argv[2] rows
-     * per bank with EVERY row's logits, batched vs solo, forward and reversed
-     * bank order. Prints, per bank and per row, whether the row is identical
-     * and the first differing float, so a failing run reads row by row. */
+    /* L152 (diagnostic, argv[3] == "rows"): every row of the multi-run step at
+     * argv[2] rows per bank, batched vs solo, forward and reversed bank order.
+     * Reports only; the battery's fatal form is PULSAR_GATE_ROWS_FATAL below. */
     if (argc > 3 && strcmp(argv[3], "rows") == 0) {
-        /* argv[2]: one run length for every bank, or a comma list per bank */
-        int rpb_of[N_DEC_MAX];
-        for (int k = 0; k < N_DEC_MAX; k++) rpb_of[k] = 5;
-        if (argc > 2) {
-            const char *q = argv[2];
-            for (int k = 0; k < g_n_dec && *q; k++) {
-                rpb_of[k] = atoi(q);
-                const char *c = strchr(q, ',');
-                if (!c) { for (int m = k + 1; m < g_n_dec; m++) rpb_of[m] = rpb_of[k]; break; }
-                q = c + 1;
-            }
-        }
-        int total = 0, rmax = 0;
-        for (int k = 0; k < g_n_dec; k++) { total += rpb_of[k]; if (rpb_of[k] > rmax) rmax = rpb_of[k]; }
-        printf("GATE 5R: run lengths per bank:"); for (int k = 0; k < g_n_dec; k++) printf(" %d", rpb_of[k]); printf(" (total %d rows)\n", total);
-        const uint32_t vocab = PULSAR_N_VOCAB;
-        g_dump_dir = getenv("L152_DUMP_DIR");
-        for (int rev = 0; rev < 2; rev++) {
-            float *all = (float *)malloc((size_t)total * vocab * sizeof(float));
-            float *solo = (float *)malloc((size_t)rmax * vocab * sizeof(float));
-            int issued[N_DEC_MAX], one[N_DEC_MAX];
-            char solo_tag[32];
-            g_dump_tag = rev ? "bat_r" : "bat_f";
-            if (!all || !solo || !multirun_step_rows(rpb_of, -1, rev != 0, all, issued)) {
-                fprintf(stderr, "GATE 5R: batched step failed\n"); g_fail = 1; free(all); free(solo); continue;
-            }
-            size_t row_off = 0;
-            for (int slot = 0; slot < g_n_dec; slot++) {
-                const int k = issued[slot];
-                const int RPB = rpb_of[k];
-                snprintf(solo_tag, sizeof(solo_tag), "solo%d", k);
-                g_dump_tag = solo_tag;
-                if (!multirun_step_rows(rpb_of, k, false, solo, one)) { fprintf(stderr, "GATE 5R: solo %d failed\n", k); g_fail = 1; break; }
-                for (int j = 0; j < RPB; j++) {
-                    const float *a = all + (row_off + (size_t)j) * vocab;
-                    const float *b = solo + (size_t)j * vocab;
-                    long d = first_diff(a, b, (long)vocab);
-                    if (d < 0) printf("GATE 5R %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", rev ? "reversed" : "forward", k, slot, j, RPB);
-                    else {
-                        long nd = 0; float md = 0.f;
-                        for (long i = 0; i < (long)vocab; i++) if (a[i] != b[i]) { nd++; float x = fabsf(a[i] - b[i]); if (x > md) md = x; }
-                        printf("GATE 5R %s: bank %d (slot %d) row %d/%d: DIFFERS at float %ld (%.6g vs %.6g), %ld/%u floats, max |d| %.4g\n",
-                               rev ? "reversed" : "forward", k, slot, j, RPB, d, (double)a[d], (double)b[d], nd, vocab, (double)md);
-                    }
-                }
-                row_off += (size_t)RPB;
-            }
-            free(all); free(solo);
-        }
+        gate5r_run(argc > 2 ? argv[2] : "5", false);
         printf("GATE 5R done (diagnostic only)\n");
         pulsar_engine_close(g_e);
         return g_fail ? 1 : 0;
@@ -484,6 +511,16 @@ int main(int argc, char **argv) {
             }
             free(mr_all); free(mr_solo);
         }
+    }
+
+    /* GATE 5R fatal (L152/L153): PULSAR_GATE_ROWS_FATAL lists per-bank run
+     * lengths, space-separated ("5,5 8,8" = 10 and 16 rows with two decode
+     * banks); every row of every bank must match its solo run byte for byte.
+     * The battery sets it; the default run without it is unchanged. */
+    if (const char *specs = getenv("PULSAR_GATE_ROWS_FATAL")) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s", specs);
+        for (char *tok = strtok(buf, " ;"); tok; tok = strtok(NULL, " ;")) gate5r_run(tok, true);
     }
 
     /* GATE 2: prefill run last-position logits vs classic-resume. */

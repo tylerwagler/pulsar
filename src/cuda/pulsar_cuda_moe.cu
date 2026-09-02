@@ -1952,11 +1952,13 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * fallback, so it is deliberately NOT flagged here. */
         {
             static int gemv_batch_logged = 0;
-            /* L152: an ARMED step of any width <= moe_gemv_cap falling through
-             * is a neutrality break (the rows would take the other kernel), so
-             * it is announced at every armed width, not only 2..4. */
-            const uint32_t warn_cap = pulsar_gpu_matmul_batch_mneutral() ? moe_gemv_cap : 4u;
-            if (n_tokens >= 1u && n_tokens <= warn_cap && !gemv_batch_logged) {
+            /* L152/L153: any width <= moe_gemv_cap falling through is the GEMV
+             * path declining (buffers too small) -- for an ARMED step that is a
+             * neutrality break (the rows take the other kernel), for an unarmed
+             * one a silent slow path -- so it is announced at every width the
+             * GEMV should have taken.  One cap, the GEMV's own, not a second
+             * literal that drifts from it (this said 4 while the cap was 8). */
+            if (n_tokens >= 1u && n_tokens <= moe_gemv_cap && !gemv_batch_logged) {
                 gemv_batch_logged = 1;
                 fprintf(stderr,
                         "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",

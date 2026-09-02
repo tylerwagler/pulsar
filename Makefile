@@ -513,8 +513,12 @@ cuda-reap-router-audit:
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
+# PULSAR_GATE_ROWS_FATAL (L152/L153): every row of a 10- and a 16-row multi-run
+# step must match its solo run byte for byte.  GATE 5 alone checks last rows at
+# 6 total, and the wide variant skips GATE 5 above the cap -- the 9..16-row
+# range where L152 lived had no battery gate until this.
 cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 PULSAR_GATE_ROWS_FATAL="5,5 8,8" ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # Wide variant: 12 decode banks exercises the armed M-neutral kernel range past
 # 8 (the l048-ntcap-16 coverage) — NT instantiations 9..16 and the MoE

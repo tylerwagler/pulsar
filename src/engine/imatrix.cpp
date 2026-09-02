@@ -33,6 +33,20 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
 
 
 
+/* PULSAR_CUDA_GRAPH_OUTPUT_ROW (diagnostic): read the head off a row other than
+ * the chunk's last.  One parser for the two batched prefill entries -- they
+ * carried identical copies (L153 survey), and a diagnostic knob parsed twice is
+ * two places that must agree with nothing enforcing it. */
+static uint32_t graph_output_row_override(uint32_t output_row, uint32_t n_tokens) {
+    const char *env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v < (unsigned long)n_tokens) output_row = (uint32_t)v;
+    }
+    return output_row;
+}
+
 static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
     return c->gate_up_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
 }
@@ -470,14 +484,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
         const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        const char *output_row_env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
-        if (output_row_env && output_row_env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(output_row_env, &end, 10);
-            if (end != output_row_env && v < (unsigned long)n_tokens) {
-                output_row = (uint32_t)v;
-            }
-        }
+        output_row = graph_output_row_override(output_row, n_tokens);
         pulsar_gpu_tensor *saved_cur = g->cur_hc;
         pulsar_gpu_tensor *last_hc = NULL;
         if (ok && logits) {
@@ -703,14 +710,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
-    if (output_row_env && output_row_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(output_row_env, &end, 10);
-        if (end != output_row_env && v < (unsigned long)n_tokens) {
-            output_row = (uint32_t)v;
-        }
-    }
+    output_row = graph_output_row_override(output_row, n_tokens);
     pulsar_gpu_tensor *saved_cur = g->cur_hc;
     pulsar_gpu_tensor *last_hc = NULL;
 
