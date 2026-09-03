@@ -76,20 +76,30 @@ __device__ __forceinline__ static float pulsar_at_load(const __nv_bfloat16 *x, u
  * than a bool template: the pointer type IS the contract, so a mismatched
  * width cannot be passed silently (which is exactly how the embed kernels came
  * to read an f16 table as f32 on 2026-08-15). */
-template <int NT, typename WT, typename AT = float>
+template <int NT, int R, typename WT, typename AT = float>
 __global__ static void matmul_nt_kernel(
         float *out,
         const WT *w,
         const AT *x,
         uint64_t in_dim,
         uint64_t out_dim) {
-    uint64_t row = (uint64_t)blockIdx.x;
-    if (row >= out_dim) return;
+    /* L151-D (2026-09-03): R output rows per block.  One block per row
+     * re-read the whole [NT][in_dim] activation tile from L2 for every output
+     * row (the 1 GB head at NT=16: 129280 rows x 128 KB = 16 GB of L2 traffic
+     * per call, +0.5 ms per row in the L151 sweep).  With R rows per block the
+     * per-token activation loads are issued once and applied to R weight rows.
+     * R is a per-shape constant (out_dim), never the batch; the per-(row,
+     * token) FMA sequence and the 256-wide tree reduction below are exactly
+     * the R=1 kernel's, so every output is bit-identical at every M. */
+    const uint64_t row0 = (uint64_t)blockIdx.x * R;
+    if (row0 >= out_dim) return;
 
-    float sum[NT];
+    float sum[R][NT];
     #pragma unroll
-    for (int t = 0; t < NT; t++) sum[t] = 0.0f;
-    const WT *wr = w + row * in_dim;
+    for (int r = 0; r < R; r++) {
+        #pragma unroll
+        for (int t = 0; t < NT; t++) sum[r][t] = 0.0f;
+    }
     /* L144: the same per-thread walk (i = tid, tid + 256, ...) and the same
      * FMA sequence per accumulator, but the loads of U consecutive strides are
      * issued before any of their FMAs.  As one dependent load per FMA the
@@ -101,38 +111,72 @@ __global__ static void matmul_nt_kernel(
     const uint64_t stride = blockDim.x;
     uint64_t i = threadIdx.x;
     for (; i + (uint64_t)(U - 1) * stride < in_dim; i += (uint64_t)U * stride) {
-        float wv[U];
         float xv[U][NT];
         #pragma unroll
         for (int u = 0; u < U; u++) {
-            wv[u] = pulsar_wt_load(wr, i + (uint64_t)u * stride);
             #pragma unroll
             for (int t = 0; t < NT; t++) xv[u][t] = pulsar_at_load(x, t * in_dim + i + (uint64_t)u * stride);
         }
         #pragma unroll
-        for (int u = 0; u < U; u++) {
+        for (int r = 0; r < R; r++) {
+            const uint64_t row = row0 + r;
+            if (row >= out_dim) break;
+            const WT *wr = w + row * in_dim;
+            float wv[U];
             #pragma unroll
-            for (int t = 0; t < NT; t++) sum[t] += wv[u] * xv[u][t];
+            for (int u = 0; u < U; u++) wv[u] = pulsar_wt_load(wr, i + (uint64_t)u * stride);
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                #pragma unroll
+                for (int t = 0; t < NT; t++) sum[r][t] += wv[u] * xv[u][t];
+            }
         }
     }
     for (; i < in_dim; i += stride) {
-        const float wv = pulsar_wt_load(wr, i);
+        float xv[NT];
         #pragma unroll
-        for (int t = 0; t < NT; t++) sum[t] += wv * pulsar_at_load(x, t * in_dim + i);
+        for (int t = 0; t < NT; t++) xv[t] = pulsar_at_load(x, t * in_dim + i);
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint64_t row = row0 + r;
+            if (row >= out_dim) break;
+            const float wv = pulsar_wt_load(w + row * in_dim, i);
+            #pragma unroll
+            for (int t = 0; t < NT; t++) sum[r][t] += wv * xv[t];
+        }
     }
 
-    __shared__ float partial[256];
+    /* NT trees per row, in lockstep: the same partial[tid] += partial[tid +
+     * stride] sequence per (row, token) as before, one __syncthreads per
+     * level for all NT of them. */
+    __shared__ float partial[NT][256];
     #pragma unroll
-    for (int t = 0; t < NT; t++) {
-        partial[threadIdx.x] = sum[t];
+    for (int r = 0; r < R; r++) {
+        const uint64_t row = row0 + r;
+        #pragma unroll
+        for (int t = 0; t < NT; t++) partial[t][threadIdx.x] = sum[r][t];
         __syncthreads();
-        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        for (uint32_t st = blockDim.x >> 1; st > 0; st >>= 1) {
+            if (threadIdx.x < st) {
+                #pragma unroll
+                for (int t = 0; t < NT; t++) partial[t][threadIdx.x] += partial[t][threadIdx.x + st];
+            }
             __syncthreads();
         }
-        if (threadIdx.x == 0) out[t * out_dim + row] = partial[0];
+        if (threadIdx.x < NT && row < out_dim) out[threadIdx.x * out_dim + row] = partial[threadIdx.x][0];
         __syncthreads();
     }
+}
+
+/* L151-D: rows per block for the generic nt kernel -- same rule and same
+ * neutrality argument as nt_a8_rows_per_warp: R never changes a (row, token)
+ * accumulator's sequence, so it may follow the row count.  1 up to 4 rows
+ * (roofline already), 2 up to 8, 4 above; capped by out_dim (the 1 GB head
+ * takes 4, N >= 8192 takes 2, small shapes stay 1). */
+static int nt_rows_per_block(int NT, uint64_t out_dim) {
+    const int by_rows = NT <= 4 ? 1 : (NT <= 8 ? 2 : 4);
+    const int by_shape = out_dim >= 65536 ? 4 : out_dim >= 8192 ? 2 : 1;
+    return by_rows < by_shape ? by_rows : by_shape;
 }
 
 
@@ -2707,10 +2751,14 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
         const uint64_t nt_cap = (g_mneutral_rows > 0)
                 ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)PULSAR_GEMV_NT_CAP;
         if (n_tok >= 2 && n_tok <= nt_cap) {
-            dim3 g((unsigned)out_dim);
-            #define PULSAR_NT_LAUNCH(N) matmul_nt_kernel<N, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
+            #define PULSAR_NT_LAUNCH_R(N, RR) matmul_nt_kernel<N, RR, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
                     (float *)out->ptr, (const __nv_bfloat16 *)w,                        \
                     xb16, in_dim, out_dim)
+            #define PULSAR_NT_LAUNCH(N) do { const int R = nt_rows_per_block(N, out_dim); \
+                                             dim3 g(((unsigned)out_dim + (unsigned)R - 1u) / (unsigned)R); \
+                                             if (R == 4) PULSAR_NT_LAUNCH_R(N, 4); \
+                                             else if (R == 2) PULSAR_NT_LAUNCH_R(N, 2); \
+                                             else PULSAR_NT_LAUNCH_R(N, 1); } while (0)
             switch (n_tok) {
             case 2: PULSAR_NT_LAUNCH(2); break;
             case 3: PULSAR_NT_LAUNCH(3); break;
@@ -2729,6 +2777,7 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
             default: PULSAR_NT_LAUNCH(16); break;  ///< n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX
             }
             #undef PULSAR_NT_LAUNCH
+            #undef PULSAR_NT_LAUNCH_R
             return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
         }
     }

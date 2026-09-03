@@ -129,6 +129,19 @@ int main(int argc, char **argv) {
         c.out = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.out_dim * sizeof(float));
         if (!c.x || !c.out) { fprintf(stderr, "alloc failed for %s\n", shapes[si].name); return 1; }
         fill_rand(c.x, (uint64_t)MMAX * c.in_dim, 7u + (uint32_t)si);
+        /* L151-D (2026-09-03): arm the E4M3 activation slot and let one
+         * unarmed 16-row call quantise into it, exactly as the engine's
+         * producers do.  Without this the armed column ran the f32 nt kernel
+         * (no slot -> mxfp8_mmvq_deint_nt_kernel), NOT the A8 twin production
+         * runs -- the instrument measured a kernel the served lane never
+         * executes.  The engine announces "verify-batch GEMV W8A8" once per
+         * shape when the A8 arm fires; the run script greps for it. */
+        pulsar_gpu_mxfp8_act_cache_arm(c.x, MMAX, c.in_dim);
+        pulsar_gpu_matmul_set_batch_mneutral(0);
+        if (!gemm_launch(&c, MMAX) || !pulsar_gpu_end_commands()) {
+            fprintf(stderr, "warm call failed for %s\n", shapes[si].name);
+            return 1;
+        }
         const double wbytes = (double)c.in_dim * (double)c.out_dim *
                               (w->type == PULSAR_TENSOR_BF16 ? 2.0 : 1.03);
         for (int mi = 0; mi < NM; mi++) {
@@ -142,6 +155,7 @@ int main(int argc, char **argv) {
                    M, tu, ta, tu > 0 && ta > 0 ? tu / ta : 0.0, ta > 0 ? wbytes / ta / 1e3 : 0.0,
                    M <= 4 ? "   (both nt: repeatability)" : "");
         }
+        pulsar_gpu_mxfp8_act_cache_disarm();
         pulsar_gpu_tensor_free(c.x);
         pulsar_gpu_tensor_free(c.out);
         printf("\n");
