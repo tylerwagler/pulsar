@@ -242,7 +242,7 @@ int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 
 
 
-/* PULSAR_CUDA_WEIGHT_CACHE_VERBOSE: load-time diagnostics, read ONCE.  Nine
+/** PULSAR_CUDA_WEIGHT_CACHE_VERBOSE: load-time diagnostics, read ONCE.  Nine
  * call sites used to re-scan the environment for it (L153 survey); one of them
  * (cuda_model_load_progress_enabled) is behaviour, not a log line -- verbose
  * mode replaces the progress meter -- so the answer must be the same at every

@@ -33,7 +33,7 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
 
 
 
-/* PULSAR_CUDA_GRAPH_OUTPUT_ROW (diagnostic): read the head off a row other than
+/** PULSAR_CUDA_GRAPH_OUTPUT_ROW (diagnostic): read the head off a row other than
  * the chunk's last.  One parser for the two batched prefill entries -- they
  * carried identical copies (L153 survey), and a diagnostic knob parsed twice is
  * two places that must agree with nothing enforcing it. */

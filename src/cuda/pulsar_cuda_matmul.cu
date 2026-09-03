@@ -1264,7 +1264,7 @@ void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     }
 }
 
-/* L157: the same declaration for a buffer that was never arm()ed -- the
+/** L157: the same declaration for a buffer that was never arm()ed -- the
  * hidden-carrier norm has no E4M3 consumer, so it holds only a bf16 slot and
  * g_act_cur points at whatever was armed last.  Name the slot by its key. */
 void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
