@@ -2363,9 +2363,31 @@ pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, ui
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank);
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
 
+/** ONE-STATE-MODEL stage 3 (resolved as option (a), 2026-09-03): the ONE
+ * owner of "does this KV store commit the position, so the rewind
+ * bookkeeping must ride with it".  Rewind bookkeeping = the ratio-4
+ * projection-ring deposit (gpu_graph_proj_ring_deposit, L120 value-half) and
+ * the ratio-128 undo capture (gpu_graph_r128_undo_capture, L124).  A store
+ * commits when it lands on the single live sequence (not a banked/mseq
+ * candidate row -- banks own their state through capture/install) and no
+ * spec save is armed (spec_comp_save_n != 0 means the row is a CANDIDATE
+ * written to the save slots; its committed prefix is deposited later by
+ * gpu_graph_dspark_compressor_rollforward, the batched lane's deposit point).
+ *
+ * What is NOT covered, by decision (L154, priced -1.3% at 3 clients for no
+ * served rewind that reaches it): a fully accepted spec round has no
+ * rollforward and deposits nothing, so a rewind whose replay span crosses
+ * those positions finds the ring short and pulsar_session::rewind takes the
+ * recompute path instead of the replay.  Correct, slower, and the only gap.
+ * Every deposit site in the tree tests THIS predicate; do not re-derive it. */
+static inline bool gpu_graph_store_commits(const pulsar_gpu_graph *g, bool banked) {
+    return !banked && g->spec_comp_save_n == 0;
+}
+
 /** L120 value-half: deposit one COMMITTED position's compressor projection
  * row (width-256 f32) into the ratio-4 projection ring; note_pos advances
- * the deposited span once per position (after every layer deposited). */
+ * the deposited span once per position (after every layer deposited).
+ * Callers decide "committed" with gpu_graph_store_commits, never inline. */
 bool gpu_graph_proj_ring_deposit(pulsar_gpu_graph *g, uint32_t il, uint32_t pos,
                                  const pulsar_gpu_tensor *kv_row,
                                  const pulsar_gpu_tensor *sc_row,

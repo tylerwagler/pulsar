@@ -1310,7 +1310,7 @@ bool gpu_graph_encode_layer_attention_batch(
                  * write would land on cur_bank's real row and clobber it. The
                  * banked arm publishes per bank at 1438, so skip it here. */
                 if (!mseq) gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
-                if (!mseq && !g->spec_comp_save_n && ratio == 4)
+                if (gpu_graph_store_commits(g, mseq) && ratio == 4)
                     ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                           comp_width, false);
                 for (uint32_t t = 0; t < n_tokens; t++) {
@@ -1438,7 +1438,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok) {
                     if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
                     else        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)    = comp_before + comp_chunk;
-                    if (!banked && !g->spec_comp_save_n && ratio == 4)
+                    if (gpu_graph_store_commits(g, banked) && ratio == 4)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               comp_width, false);
                     if (comp_counts) {
@@ -1503,7 +1503,7 @@ bool gpu_graph_encode_layer_attention_batch(
                      * note_pos for this path rides the same per-position
                      * hook decode uses (encode_token_raw_swa) when the row
                      * is the token eval; the chunked sync path notes below. */
-                    if (ok && !mseq && !g->spec_comp_save_n && ratio == 128u) {
+                    if (ok && gpu_graph_store_commits(g, mseq) && ratio == 128u) {
                         ok = gpu_graph_r128_undo_capture(g, il, pos);
                         g->r128_perrow_chunk = true;
                     }
@@ -1539,7 +1539,7 @@ bool gpu_graph_encode_layer_attention_batch(
                      * (classic block eval) and mseq candidate rows never
                      * deposit — their committed positions are banked by the
                      * Stage A replay / Stage B rollforward instead. */
-                    if (ok && !mseq && !g->spec_comp_save_n && ratio == 4)
+                    if (ok && gpu_graph_store_commits(g, mseq) && ratio == 4)
                         ok = gpu_graph_proj_ring_deposit(g, il, pos, kv_view,
                                                          sc_view, false);
                     if (ok && emit) {
@@ -1739,7 +1739,7 @@ bool gpu_graph_encode_layer_attention_batch(
                      * mseq this was the read-only superset; the banked arm
                      * publishes per bank at 1829. */
                     if (!mseq) gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
-                    if (!mseq && !g->spec_comp_save_n)
+                    if (gpu_graph_store_commits(g, mseq))
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               index_width, true);
                     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -1850,7 +1850,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) {
                         if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
                         else        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)    = index_before + index_chunk;
-                        if (!banked && !g->spec_comp_save_n)
+                        if (gpu_graph_store_commits(g, banked))
                             ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                                   index_width, true);
                         if (index_counts) {
@@ -1894,7 +1894,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         /* L120 value-half: same commit-time deposit rule as
                          * the attn per-row loop above. */
-                        if (!mseq && !g->spec_comp_save_n &&
+                        if (gpu_graph_store_commits(g, mseq) &&
                             !gpu_graph_proj_ring_deposit(g, il, pos, kv_view,
                                                          sc_view, true)) {
                             pulsar_gpu_tensor_free(sc_view);
@@ -2866,7 +2866,7 @@ bool gpu_graph_encode_layer_batch(
      * non-spec-armed) chunk, every ratio-4 layer has banked the chunk's
      * tail-8 projections — advance the deposited span once per position. */
     if (ok && il + 1u == PULSAR_N_LAYER &&
-        !g->batch_multiseq && !g->spec_comp_save_n) {
+        gpu_graph_store_commits(g, g->batch_multiseq != 0)) {
         const uint32_t tail = n_tokens < 8u ? n_tokens : 8u;
         for (uint32_t k = 0; k < tail; k++)
             gpu_graph_proj_ring_note_pos(g, pos0 + n_tokens - tail + k);
@@ -2988,8 +2988,10 @@ bool gpu_graph_dspark_compressor_rollforward(
                         PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                         PULSAR_RMS_EPS) != 0;
             /* L120 value-half: rollforward positions are the round's
-             * COMMITTED prefix -- the canonical deposit point for the
-             * batched lane. */
+             * COMMITTED prefix -- the batched lane's deposit point (the
+             * ONE-STATE-MODEL stage 3 contract at gpu_graph_store_commits
+             * names it; a fully accepted round has no rollforward and
+             * deposits nothing, by decision). */
             if (ok && ratio == 4)
                 ok = gpu_graph_proj_ring_deposit(g, il, pos, kv_view, sc_view, false);
             pulsar_gpu_tensor_free(sc_view);
