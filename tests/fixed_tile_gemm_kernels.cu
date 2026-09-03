@@ -223,19 +223,28 @@ extern "C" void ft_release(ft_ctx *c) {
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 
+/* Stage 0.4b: the 64x{64,128}x32 / 4-stage tile measured 170 GB/s on the 1 GB
+ * head against cuBLAS's 224 (rows/L151.md).  The sm120 TMA builder refuses
+ * bf16 (f8f6f4 elements only), so the lever is the sm80-style tile itself:
+ * "64" now means 64x128x64 / 4 stages, "128" means 128x128x64 / 3 stages. */
+template <int TN> struct FBShape;
+template <> struct FBShape<64>  { static constexpr int TM = 64,  TN_ = 128, TK = 64, ST = 4; };
+template <> struct FBShape<128> { static constexpr int TM = 128, TN_ = 128, TK = 64, ST = 3; };
+
 template <int TN>
 struct FB {
+    using S = FBShape<TN>;
     using Gemm = cutlass::gemm::device::GemmUniversal<
         cutlass::bfloat16_t, cutlass::layout::RowMajor,
         cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
         float, cutlass::layout::RowMajor, float,
         cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-        cutlass::gemm::GemmShape<64, TN, 32>,
-        cutlass::gemm::GemmShape<32, TN / 2, 32>,
+        cutlass::gemm::GemmShape<S::TM, S::TN_, S::TK>,
+        cutlass::gemm::GemmShape<S::TM / 2, S::TN_ / 2, S::TK>,
         cutlass::gemm::GemmShape<16, 8, 16>,
         cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-        4 /* stages */, 8 /* AlignA */, 8 /* AlignB */>;
+        S::ST, 8 /* AlignA */, 8 /* AlignB */>;
 };
 
 __global__ static void fb_f32_to_bf16(uint16_t *out, const float *x, uint64_t n) {
