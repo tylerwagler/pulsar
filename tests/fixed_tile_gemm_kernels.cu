@@ -116,10 +116,14 @@ struct ft_ctx {
     ElementSF *B_sf;          // CUTLASS-layout SFB
     uint8_t *A_data;          // [16, K] e4m3
     ElementSF *A_sf;          // SFA for up to 128 rows
-    void *ws64, *ws128;
-    size_t ws64_bytes, ws128_bytes;
+    void *ws; size_t ws_bytes;
     unsigned long long sfb_mismatch;
 };
+
+/* MXFP8 tile variants: index -> TN.  TN=32 exists for the small-N shapes
+ * (output_b N=4096: 64 CTAs at TN=64 is 1.3 waves on 48 SMs). */
+extern "C" int ft_nvariants(void) { return 3; }
+extern "C" const char *ft_variant_name(int v) { static const char *n[] = {"128x32x128", "128x64x128", "128x128x128"}; return v >= 0 && v < 3 ? n[v] : "?"; }
 
 static int ft_check(cudaError_t e, const char *what) {
     if (e == cudaSuccess) return 0;
@@ -145,7 +149,8 @@ extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_l
     auto lSFB = FT<128>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
     auto lSFB64 = FT<64>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
     const size_t sfb_bytes = (size_t)cosize(lSFB);
-    if ((size_t)cosize(lSFB64) != sfb_bytes) { fprintf(stderr, "fixed-tile probe: SFB cosize differs between TN variants\n"); return nullptr; }
+    auto lSFB32 = FT<32>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
+    if ((size_t)cosize(lSFB64) != sfb_bytes || (size_t)cosize(lSFB32) != sfb_bytes) { fprintf(stderr, "fixed-tile probe: SFB cosize differs between TN variants\n"); return nullptr; }
     if (ft_check(cudaMalloc(&c->B_sf, sfb_bytes), "malloc SFB") ||
         ft_check(cudaMemset(c->B_sf, 0, sfb_bytes), "zero SFB")) return nullptr;
     unsigned long long *d_mis = nullptr;
@@ -164,16 +169,14 @@ extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_l
     if (ft_check(cudaMalloc(&c->A_data, (size_t)16 * K), "malloc A") ||
         ft_check(cudaMalloc(&c->A_sf, (size_t)cosize(lSFA)), "malloc SFA") ||
         ft_check(cudaMemset(c->A_sf, 0, (size_t)cosize(lSFA)), "zero SFA")) return nullptr;
-    /* workspaces: max over M <= 16 */
+    /* workspace: max over M <= 16 and variants */
     for (int M = 1; M <= 16; M++) {
-        auto a64 = FT<64>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
-        auto a128 = FT<128>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
-        const size_t w64 = FT<64>::Gemm::get_workspace_size(a64), w128 = FT<128>::Gemm::get_workspace_size(a128);
-        if (w64 > c->ws64_bytes) c->ws64_bytes = w64;
-        if (w128 > c->ws128_bytes) c->ws128_bytes = w128;
+        size_t w;
+        w = FT<32>::Gemm::get_workspace_size(FT<32>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
+        w = FT<64>::Gemm::get_workspace_size(FT<64>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
+        w = FT<128>::Gemm::get_workspace_size(FT<128>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
     }
-    if (c->ws64_bytes && ft_check(cudaMalloc(&c->ws64, c->ws64_bytes), "malloc ws64")) return nullptr;
-    if (c->ws128_bytes && ft_check(cudaMalloc(&c->ws128, c->ws128_bytes), "malloc ws128")) return nullptr;
+    if (c->ws_bytes && ft_check(cudaMalloc(&c->ws, c->ws_bytes), "malloc ws")) return nullptr;
     return c;
 }
 
@@ -191,16 +194,21 @@ static int ft_run_tn(ft_ctx *c, const float *x_dev, int M, float *D_dev) {
         if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
         checked[M] = true;
     }
-    if (gemm.initialize(a, TN == 64 ? c->ws64 : c->ws128) != cutlass::Status::kSuccess) return 2;
+    if (gemm.initialize(a, c->ws) != cutlass::Status::kSuccess) return 2;
     return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
-extern "C" int ft_run(ft_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
+extern "C" int ft_run(ft_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
     if (!c || !x || !D || M < 1 || M > 16) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
     const float *x_dev = (const float *)x->ptr;
     float *D_dev = (float *)D->ptr;
-    return tn == 64 ? ft_run_tn<64>(c, x_dev, M, D_dev) : ft_run_tn<128>(c, x_dev, M, D_dev);
+    switch (variant) {
+    case 0: return ft_run_tn<32>(c, x_dev, M, D_dev);
+    case 1: return ft_run_tn<64>(c, x_dev, M, D_dev);
+    case 2: return ft_run_tn<128>(c, x_dev, M, D_dev);
+    default: return 6;
+    }
 }
 
 extern "C" int ft_sync(void) { return ft_check(cudaDeviceSynchronize(), "sync"); }
@@ -208,8 +216,7 @@ extern "C" int ft_sync(void) { return ft_check(cudaDeviceSynchronize(), "sync");
 extern "C" void ft_release(ft_ctx *c) {
     if (!c) return;
     cudaFree(c->B_data); cudaFree(c->lt_scale); cudaFree(c->B_sf); cudaFree(c->A_data); cudaFree(c->A_sf);
-    if (c->ws64) cudaFree(c->ws64);
-    if (c->ws128) cudaFree(c->ws128);
+    if (c->ws) cudaFree(c->ws);
     delete c;
 }
 
@@ -227,13 +234,17 @@ extern "C" void ft_release(ft_ctx *c) {
  * head against cuBLAS's 224 (rows/L151.md).  The sm120 TMA builder refuses
  * bf16 (f8f6f4 elements only), so the lever is the sm80-style tile itself:
  * "64" now means 64x128x64 / 4 stages, "128" means 128x128x64 / 3 stages. */
-template <int TN> struct FBShape;
-template <> struct FBShape<64>  { static constexpr int TM = 64,  TN_ = 128, TK = 64, ST = 4; };
-template <> struct FBShape<128> { static constexpr int TM = 128, TN_ = 128, TK = 64, ST = 3; };
+template <int V> struct FBShape;
+template <> struct FBShape<0> { static constexpr int TM = 64, TN_ = 128, TK = 64, ST = 4; };   // stage-0.4b winner
+template <> struct FBShape<1> { static constexpr int TM = 64, TN_ = 64,  TK = 64, ST = 3; };   // smaller smem -> more CTAs/SM
+template <> struct FBShape<2> { static constexpr int TM = 32, TN_ = 128, TK = 64, ST = 3; };   // 32-row tile
+template <> struct FBShape<3> { static constexpr int TM = 64, TN_ = 128, TK = 64, ST = 2; };   // fewer stages -> more CTAs/SM
+extern "C" int fb_nvariants(void) { return 4; }
+extern "C" const char *fb_variant_name(int v) { static const char *n[] = {"64x128x64/4", "64x64x64/3", "32x128x64/3", "64x128x64/2"}; return v >= 0 && v < 4 ? n[v] : "?"; }
 
-template <int TN>
+template <int V>
 struct FB {
-    using S = FBShape<TN>;
+    using S = FBShape<V>;
     using Gemm = cutlass::gemm::device::GemmUniversal<
         cutlass::bfloat16_t, cutlass::layout::RowMajor,
         cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
@@ -259,13 +270,12 @@ struct fb_ctx {
     int N, K;
     uint16_t *W;      // bf16 [N][K]
     uint16_t *A;      // bf16 [16][K]
-    void *ws64, *ws128;
-    size_t ws64_bytes, ws128_bytes;
+    void *ws; size_t ws_bytes;
 };
 
-template <int TN>
-static typename FB<TN>::Gemm::Arguments fb_args(fb_ctx *c, const uint16_t *A, int M, float *D) {
-    return typename FB<TN>::Gemm::Arguments(
+template <int V>
+static typename FB<V>::Gemm::Arguments fb_args(fb_ctx *c, const uint16_t *A, int M, float *D) {
+    return typename FB<V>::Gemm::Arguments(
         cutlass::gemm::GemmUniversalMode::kGemm, {M, c->N, c->K}, 1, {1.0f, 0.0f},
         A, c->W, D, D,
         0, 0, 0, 0,
@@ -282,43 +292,48 @@ extern "C" fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K) {
         ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "copy W bf16") ||
         ft_check(cudaMalloc(&c->A, (size_t)16 * K * 2), "malloc A bf16")) return nullptr;
     for (int M = 1; M <= 16; M++) {
-        const size_t w64 = FB<64>::Gemm::get_workspace_size(fb_args<64>(c, nullptr, M, nullptr));
-        const size_t w128 = FB<128>::Gemm::get_workspace_size(fb_args<128>(c, nullptr, M, nullptr));
-        if (w64 > c->ws64_bytes) c->ws64_bytes = w64;
-        if (w128 > c->ws128_bytes) c->ws128_bytes = w128;
+        size_t w;
+        w = FB<0>::Gemm::get_workspace_size(fb_args<0>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
+        w = FB<1>::Gemm::get_workspace_size(fb_args<1>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
+        w = FB<2>::Gemm::get_workspace_size(fb_args<2>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
+        w = FB<3>::Gemm::get_workspace_size(fb_args<3>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
     }
-    if (c->ws64_bytes && ft_check(cudaMalloc(&c->ws64, c->ws64_bytes), "malloc ws64 bf16")) return nullptr;
-    if (c->ws128_bytes && ft_check(cudaMalloc(&c->ws128, c->ws128_bytes), "malloc ws128 bf16")) return nullptr;
+    if (c->ws_bytes && ft_check(cudaMalloc(&c->ws, c->ws_bytes), "malloc ws bf16")) return nullptr;
     return c;
 }
 
-template <int TN>
+template <int V>
 static int fb_run_tn(fb_ctx *c, const float *x_dev, int M, float *D_dev) {
     const uint64_t n = (uint64_t)M * c->K;
     fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, x_dev, n);
     if (cudaGetLastError() != cudaSuccess) return 10;
-    typename FB<TN>::Gemm gemm;
-    auto a = fb_args<TN>(c, c->A, M, D_dev);
+    typename FB<V>::Gemm gemm;
+    auto a = fb_args<V>(c, c->A, M, D_dev);
     static bool checked[17] = {};
     if (!checked[M]) {
         if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
         checked[M] = true;
     }
-    if (gemm.initialize(a, TN == 64 ? c->ws64 : c->ws128) != cutlass::Status::kSuccess) return 2;
+    if (gemm.initialize(a, c->ws) != cutlass::Status::kSuccess) return 2;
     return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
-extern "C" int fb_run(fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
+extern "C" int fb_run(fb_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
     if (!c || !x || !D || M < 1 || M > 16) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
-    return tn == 64 ? fb_run_tn<64>(c, (const float *)x->ptr, M, (float *)D->ptr)
-                    : fb_run_tn<128>(c, (const float *)x->ptr, M, (float *)D->ptr);
+    const float *x_dev = (const float *)x->ptr; float *D_dev = (float *)D->ptr;
+    switch (variant) {
+    case 0: return fb_run_tn<0>(c, x_dev, M, D_dev);
+    case 1: return fb_run_tn<1>(c, x_dev, M, D_dev);
+    case 2: return fb_run_tn<2>(c, x_dev, M, D_dev);
+    case 3: return fb_run_tn<3>(c, x_dev, M, D_dev);
+    default: return 6;
+    }
 }
 
 extern "C" void fb_release(fb_ctx *c) {
     if (!c) return;
     cudaFree(c->W); cudaFree(c->A);
-    if (c->ws64) cudaFree(c->ws64);
-    if (c->ws128) cudaFree(c->ws128);
+    if (c->ws) cudaFree(c->ws);
     delete c;
 }

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static double now_us(void) {
@@ -146,14 +147,17 @@ int main(int argc, char **argv) {
                    shapes[si].name, K, N, wbytes / 1e6, sfb_mismatch, (unsigned long long)N * (K / 32),
                    sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
         }
-        printf("  %5s | %9s %9s | %9s %9s | %8s %8s | %10s %10s | %s\n", "M", "unarmed", "armed", "ft64", "ft128",
-               "ft64GB/s", "ft128GBs", "|ft64-un|", "|ft64-arm|", "neutral(ft64/ft128: rows==M16)");
-        /* neutrality references: the 16-row ft outputs */
-        std::vector<float> ref64, ref128, cur, ref_un, ref_arm;
-        for (int tn = 64; tn <= 128; tn += 64) {
-            c.tn = tn;
-            if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "ft%d at M=16 failed for %s\n", tn, shapes[si].name); rc = 1; break; }
-            if (!read_out(c.out, tn == 64 ? ref64 : ref128, (uint64_t)16 * N)) { rc = 1; break; }
+        const int NV = is_bf16 ? fb_nvariants() : ft_nvariants();
+        printf("  %5s | %9s %9s |", "M", "unarmed", "armed");
+        for (int v = 0; v < NV; v++) printf(" %12s", is_bf16 ? fb_variant_name(v) : ft_variant_name(v));
+        printf(" | %10s %10s | neutral per variant (rows == M16 rows)\n", "|v0-un|", "|v0-arm|");
+        /* neutrality references: each variant's 16-row output */
+        std::vector<std::vector<float>> refs(NV);
+        std::vector<float> cur, ref_un, ref_arm;
+        for (int v = 0; v < NV && !rc; v++) {
+            c.tn = v;
+            if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "variant %d at M=16 failed for %s\n", v, shapes[si].name); rc = 1; break; }
+            if (!read_out(c.out, refs[v], (uint64_t)16 * N)) { rc = 1; break; }
         }
         if (rc) break;
         for (int mi = 0; mi < NM; mi++) {
@@ -165,23 +169,23 @@ int main(int argc, char **argv) {
             const double ta = time_launches(engine_launch, &c, M, reps);
             if (!read_out(c.out, ref_arm, (uint64_t)M * N)) { rc = 1; break; }
             pulsar_gpu_matmul_set_batch_mneutral(0);
-            double tf[2] = {-1, -1}, dun = 0, darm = 0;
-            uint64_t bad[2] = {0, 0};
-            for (int ti = 0; ti < 2; ti++) {
-                c.tn = ti == 0 ? 64 : 128;
-                tf[ti] = time_launches(ft_launch, &c, M, reps);
-                if (tf[ti] < 0) { fprintf(stderr, "ft%d failed at M=%u for %s\n", c.tn, M, shapes[si].name); rc = 1; break; }
+            printf("  %5u | %9.1f %9.1f |", M, tu, ta);
+            double dun = 0, darm = 0;
+            std::string flags;
+            for (int v = 0; v < NV; v++) {
+                c.tn = v;
+                const double tf = time_launches(ft_launch, &c, M, reps);
+                if (tf < 0) { fprintf(stderr, "variant %d failed at M=%u for %s\n", v, M, shapes[si].name); rc = 1; break; }
                 if (!read_out(c.out, cur, (uint64_t)M * N)) { rc = 1; break; }
-                const std::vector<float> &ref = ti == 0 ? ref64 : ref128;
+                uint64_t bad = 0;
                 for (uint64_t i = 0; i < (uint64_t)M * N; i++)
-                    if (memcmp(&cur[i], &ref[i], sizeof(float)) != 0) bad[ti]++;
-                if (ti == 0) { dun = max_abs_diff(cur, ref_un, (uint64_t)M * N); darm = max_abs_diff(cur, ref_arm, (uint64_t)M * N); }
+                    if (memcmp(&cur[i], &refs[v][i], sizeof(float)) != 0) bad++;
+                flags += bad == 0 ? " Y" : " N";
+                if (v == 0) { dun = max_abs_diff(cur, ref_un, (uint64_t)M * N); darm = max_abs_diff(cur, ref_arm, (uint64_t)M * N); }
+                printf(" %7.1f(%3.0f)", tf, wbytes / tf / 1e3);
             }
             if (rc) break;
-            printf("  %5u | %9.1f %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e %10.3e | %s / %s%s\n", M, tu, ta, tf[0], tf[1],
-                   tf[0] > 0 ? wbytes / tf[0] / 1e3 : 0.0, tf[1] > 0 ? wbytes / tf[1] / 1e3 : 0.0, dun, darm,
-                   bad[0] == 0 ? "YES" : "NO", bad[1] == 0 ? "YES" : "NO",
-                   (bad[0] || bad[1]) ? "  <-- rows differ from the 16-row call" : "");
+            printf(" | %10.3e %10.3e |%s\n", dun, darm, flags.c_str());
         }
         printf("\n");
         if (c.ft) ft_release(c.ft);
