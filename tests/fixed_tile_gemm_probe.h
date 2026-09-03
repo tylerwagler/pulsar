@@ -21,6 +21,14 @@ struct ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_sc
 int ft_run(struct ft_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
 int ft_sync(void);
 void ft_release(struct ft_ctx *c);
+
+/** Stage 0.4, the bf16 family: upload a bf16 [N][K] weight (host pointer
+ * into the mmap) and run a fixed 64 x tn x 32 mma.sync tile GEMM on the
+ * engine's bf16-rounded activations.  Same return codes as ft_run. */
+struct fb_ctx;
+struct fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K);
+int fb_run(struct fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+void fb_release(struct fb_ctx *c);
 #ifdef __cplusplus
 }
 #endif

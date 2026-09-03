@@ -212,3 +212,104 @@ extern "C" void ft_release(ft_ctx *c) {
     if (c->ws128) cudaFree(c->ws128);
     delete c;
 }
+
+/* ---- stage 0.4: the bf16 family (router, output head) --------------------
+ * A plain (non-block-scaled) tensor-core GEMM with a fixed 64 x TN x 32 tile,
+ * sm80-style mma.sync m16n8k16 through cutlass::gemm::device::GemmUniversal
+ * (no split-K, identity swizzle: fixed reduction order, M never consulted).
+ * A = activations rounded f32 -> bf16 with the engine's RNE (f32_to_bf16_kernel),
+ * B = the bf16 weight [N][K] straight from the mmap (K-major == ColumnMajor). */
+#include "cutlass/gemm/device/gemm_universal.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
+
+template <int TN>
+struct FB {
+    using Gemm = cutlass::gemm::device::GemmUniversal<
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,
+        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
+        float, cutlass::layout::RowMajor, float,
+        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, TN, 32>,
+        cutlass::gemm::GemmShape<32, TN / 2, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<float, 4, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4 /* stages */, 8 /* AlignA */, 8 /* AlignB */>;
+};
+
+__global__ static void fb_f32_to_bf16(uint16_t *out, const float *x, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const uint32_t u = __float_as_uint(x[i]);
+        out[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+}
+
+struct fb_ctx {
+    int N, K;
+    uint16_t *W;      // bf16 [N][K]
+    uint16_t *A;      // bf16 [16][K]
+    void *ws64, *ws128;
+    size_t ws64_bytes, ws128_bytes;
+};
+
+template <int TN>
+static typename FB<TN>::Gemm::Arguments fb_args(fb_ctx *c, const uint16_t *A, int M, float *D) {
+    return typename FB<TN>::Gemm::Arguments(
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, c->N, c->K}, 1, {1.0f, 0.0f},
+        A, c->W, D, D,
+        0, 0, 0, 0,
+        (int64_t)c->K, (int64_t)c->K, (int64_t)c->N, (int64_t)c->N);
+}
+
+extern "C" fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K) {
+    if (K % 8 != 0 || N % 8 != 0) { fprintf(stderr, "fixed-tile probe (bf16): N=%d K=%d not multiples of 8\n", N, K); return nullptr; }
+    fb_ctx *c = new fb_ctx();
+    memset(c, 0, sizeof *c);
+    c->N = N; c->K = K;
+    const size_t wbytes = (size_t)N * K * 2;
+    if (ft_check(cudaMalloc(&c->W, wbytes), "malloc W bf16") ||
+        ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "copy W bf16") ||
+        ft_check(cudaMalloc(&c->A, (size_t)16 * K * 2), "malloc A bf16")) return nullptr;
+    for (int M = 1; M <= 16; M++) {
+        const size_t w64 = FB<64>::Gemm::get_workspace_size(fb_args<64>(c, nullptr, M, nullptr));
+        const size_t w128 = FB<128>::Gemm::get_workspace_size(fb_args<128>(c, nullptr, M, nullptr));
+        if (w64 > c->ws64_bytes) c->ws64_bytes = w64;
+        if (w128 > c->ws128_bytes) c->ws128_bytes = w128;
+    }
+    if (c->ws64_bytes && ft_check(cudaMalloc(&c->ws64, c->ws64_bytes), "malloc ws64 bf16")) return nullptr;
+    if (c->ws128_bytes && ft_check(cudaMalloc(&c->ws128, c->ws128_bytes), "malloc ws128 bf16")) return nullptr;
+    return c;
+}
+
+template <int TN>
+static int fb_run_tn(fb_ctx *c, const float *x_dev, int M, float *D_dev) {
+    const uint64_t n = (uint64_t)M * c->K;
+    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, x_dev, n);
+    if (cudaGetLastError() != cudaSuccess) return 10;
+    typename FB<TN>::Gemm gemm;
+    auto a = fb_args<TN>(c, c->A, M, D_dev);
+    static bool checked[17] = {};
+    if (!checked[M]) {
+        if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
+        checked[M] = true;
+    }
+    if (gemm.initialize(a, TN == 64 ? c->ws64 : c->ws128) != cutlass::Status::kSuccess) return 2;
+    return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+}
+
+extern "C" int fb_run(fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
+    if (!c || !x || !D || M < 1 || M > 16) return 4;
+    if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
+    return tn == 64 ? fb_run_tn<64>(c, (const float *)x->ptr, M, (float *)D->ptr)
+                    : fb_run_tn<128>(c, (const float *)x->ptr, M, (float *)D->ptr);
+}
+
+extern "C" void fb_release(fb_ctx *c) {
+    if (!c) return;
+    cudaFree(c->W); cudaFree(c->A);
+    if (c->ws64) cudaFree(c->ws64);
+    if (c->ws128) cudaFree(c->ws128);
+    delete c;
+}

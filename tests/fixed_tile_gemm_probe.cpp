@@ -49,17 +49,22 @@ typedef struct {
     const pulsar_tensor *w;
     pulsar_gpu_tensor *x, *out;
     uint64_t in_dim, out_dim;
-    ft_ctx *ft;
+    ft_ctx *ft;     /* MXFP8 arm */
+    fb_ctx *fb;     /* bf16 arm */
     int tn;
 } ctx_t;
 
 static bool engine_launch(void *v, uint32_t M) {
     ctx_t *c = (ctx_t *)v;
+    if (c->w->type == PULSAR_TENSOR_BF16)
+        return pulsar_gpu_matmul_bf16_tensor(c->out, c->e->model.map, c->e->model.size,
+                                             c->w->abs_offset, c->in_dim, c->out_dim, c->x, M) != 0;
     return pulsar_gpu_matmul_mxfp8_tensor(c->out, c->e->model.map, c->e->model.size,
                                           c->w->abs_offset, c->in_dim, c->out_dim, c->x, M) != 0;
 }
 static bool ft_launch(void *v, uint32_t M) {
     ctx_t *c = (ctx_t *)v;
+    if (c->fb) return fb_run(c->fb, c->tn, c->x, (int)M, c->out) == 0;
     return ft_run(c->ft, c->tn, c->x, (int)M, c->out) == 0;
 }
 
@@ -94,13 +99,15 @@ int main(int argc, char **argv) {
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     const pulsar_layer_weights *L = &e->weights.layer[il];
-    if (il >= PULSAR_N_LAYER || !L->attn_q_b || !L->attn_output_b || !L->ffn_gate_shexp || !L->attn_q_a) {
+    if (il >= PULSAR_N_LAYER || !L->attn_q_b || !L->attn_output_b || !L->ffn_gate_shexp || !L->attn_q_a ||
+        !L->ffn_gate_inp || !e->weights.output) {
         fprintf(stderr, "layer %u lacks a needed tensor\n", il);
         return 1;
     }
     struct { const char *name; const pulsar_tensor *w; } shapes[] = {
         {"attn_q_b", L->attn_q_b}, {"attn_output_b", L->attn_output_b},
         {"ffn_gate_shexp", L->ffn_gate_shexp}, {"attn_q_a", L->attn_q_a},
+        {"router (bf16)", L->ffn_gate_inp}, {"output head (bf16)", e->weights.output},
     };
     const uint32_t Ms[] = {1, 2, 4, 5, 8, 9, 12, 16};
     const int NM = (int)(sizeof(Ms) / sizeof(Ms[0]));
@@ -108,11 +115,13 @@ int main(int argc, char **argv) {
     const int reps = 40;
     int rc = 0;
     printf("layer %u; us per call (%d launches + 1 sync). unarmed = default dispatch (nt <= 4, cuBLASLt above); "
-           "armed = M-neutral nt; ft64/ft128 = fixed 128xTNx128 CUTLASS tile\n\n", il, reps);
+           "armed = M-neutral nt; ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; bf16: 64xTNx32 mma.sync)\n\n", il, reps);
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         const pulsar_tensor *w = shapes[si].w;
-        if (w->type != PULSAR_TENSOR_MXFP8_LT) { printf("%s: type %u is not MXFP8_LT, skipped\n\n", shapes[si].name, (unsigned)w->type); continue; }
+        const bool is_bf16 = w->type == PULSAR_TENSOR_BF16;
+        if (!is_bf16 && w->type != PULSAR_TENSOR_MXFP8_LT) { printf("%s: type %u is neither MXFP8_LT nor BF16, skipped\n\n", shapes[si].name, (unsigned)w->type); continue; }
         ctx_t c;
+        memset(&c, 0, sizeof c);
         c.e = e; c.w = w; c.in_dim = w->dim[0]; c.out_dim = w->dim[1];
         const int K = (int)c.in_dim, N = (int)c.out_dim;
         c.x = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.in_dim * sizeof(float));
@@ -123,12 +132,20 @@ int main(int argc, char **argv) {
         const uint8_t *host = (const uint8_t *)e->model.map + w->abs_offset;
         const size_t data_bytes = (size_t)N * K;
         unsigned long long sfb_mismatch = 0;
-        c.ft = ft_prepare(host, host + data_bytes, N, K, &sfb_mismatch);
-        if (!c.ft) { fprintf(stderr, "ft_prepare failed for %s\n", shapes[si].name); return 1; }
-        const double wbytes = (double)K * (double)N * 1.03;
-        printf("%s  K=%d N=%d  (%.1f MB)   SFB layout vs LT slab: %llu of %llu scale bytes at a different offset%s\n",
-               shapes[si].name, K, N, wbytes / 1e6, sfb_mismatch, (unsigned long long)N * (K / 32),
-               sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
+        double wbytes;
+        if (is_bf16) {
+            c.fb = fb_prepare(host, N, K);
+            if (!c.fb) { fprintf(stderr, "fb_prepare failed for %s\n", shapes[si].name); return 1; }
+            wbytes = (double)K * (double)N * 2.0;
+            printf("%s  K=%d N=%d  (%.1f MB bf16)\n", shapes[si].name, K, N, wbytes / 1e6);
+        } else {
+            c.ft = ft_prepare(host, host + data_bytes, N, K, &sfb_mismatch);
+            if (!c.ft) { fprintf(stderr, "ft_prepare failed for %s\n", shapes[si].name); return 1; }
+            wbytes = (double)K * (double)N * 1.03;
+            printf("%s  K=%d N=%d  (%.1f MB)   SFB layout vs LT slab: %llu of %llu scale bytes at a different offset%s\n",
+                   shapes[si].name, K, N, wbytes / 1e6, sfb_mismatch, (unsigned long long)N * (K / 32),
+                   sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
+        }
         printf("  %5s | %9s %9s | %9s %9s | %8s %8s | %10s %10s | %s\n", "M", "unarmed", "armed", "ft64", "ft128",
                "ft64GB/s", "ft128GBs", "|ft64-un|", "|ft64-arm|", "neutral(ft64/ft128: rows==M16)");
         /* neutrality references: the 16-row ft outputs */
@@ -167,7 +184,8 @@ int main(int argc, char **argv) {
                    (bad[0] || bad[1]) ? "  <-- rows differ from the 16-row call" : "");
         }
         printf("\n");
-        ft_release(c.ft);
+        if (c.ft) ft_release(c.ft);
+        if (c.fb) fb_release(c.fb);
         pulsar_gpu_tensor_free(c.x);
         pulsar_gpu_tensor_free(c.out);
         if (rc) break;
