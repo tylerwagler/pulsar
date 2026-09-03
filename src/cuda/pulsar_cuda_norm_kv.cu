@@ -1087,6 +1087,35 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
+int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
+                                              const void *model_map, uint64_t model_size,
+                                              uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
+                                              void *out_q, void *out_sf, int out_kbp, int w_bf16) {
+    /* L158: the rows twin of pulsar_gpu_rms_norm_weight_mx_tensor -- the same
+     * kernel, `rows` blocks, with the E4M3 epilogue the drafter's per-row
+     * norms (attn_norm, q_a_norm) needed so their GEMVs read a slot instead
+     * of f32.  Same fail-loud rule as the single-row variant. */
+    const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
+    if (!out || !x || !model_map || rows == 0 || weight_offset > model_size ||
+        model_size - weight_offset < w_bytes ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
+    if (!w) return 0;
+    if (out_q && (n % 256u) != 0u) {
+        fprintf(stderr, "pulsar: rms_norm_weight (rows) cannot emit MX for n=%u "
+                        "(needs a multiple of 256)\n", n);
+        return 0;
+    }
+    if (w_bf16)
+        rms_norm_weight_kernel<true><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                              (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
+    else
+        rms_norm_weight_kernel<false><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                              (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight rows mx launch");
+}
+
 
 int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         pulsar_gpu_tensor       *q_out,

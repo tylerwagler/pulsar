@@ -128,6 +128,17 @@ int main(int argc, char **argv) {
         c.out = pulsar_gpu_tensor_alloc((uint64_t)MMAX * c.out_dim * sizeof(float));
         if (!c.x || !c.out) { fprintf(stderr, "alloc failed for %s\n", shapes[si].name); return 1; }
         fill_rand(c.x, (uint64_t)MMAX * c.in_dim, 7u + (uint32_t)si);
+        /* L158: arm the E4M3 slot and let one unarmed 16-row call quantise into
+         * it, as the engine's producers do -- the dense GEMM no longer has an
+         * f32 fallback for an unarmed activation (one format or an error). */
+        if (!is_bf16) {
+            pulsar_gpu_mxfp8_act_cache_arm(c.x, MMAX, c.in_dim);
+            pulsar_gpu_matmul_set_batch_mneutral(0);
+            if (!engine_launch(&c, MMAX) || !pulsar_gpu_end_commands()) {
+                fprintf(stderr, "warm call failed for %s\n", shapes[si].name);
+                return 1;
+            }
+        }
         /* LT slabs straight from the mmap: [data N*K][scale rup(N,128)*rup(K/32,4)] */
         const uint8_t *host = (const uint8_t *)e->model.map + w->abs_offset;
         const size_t data_bytes = (size_t)N * K;

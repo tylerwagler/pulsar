@@ -1179,6 +1179,33 @@ static bool act_slot_a8_declared_short(const void *ptr, uint64_t need, uint64_t 
     return false;
 }
 
+/* L158 (2026-09-03): NO E4M3 encoding exists for this activation and none was
+ * declared.  Until today this case fell through to an f32-activation kernel --
+ * a second activation format reachable only by callers that skipped the arm
+ * (tools) or by an allocation failure: W8A32 on a path the served lane never
+ * runs, with no announce line, and it measured a phantom for weeks when the
+ * row sweep tool took it (rows/L151.md).  Producers arm the slot; the cuBLASLt
+ * arm quantises for itself; here it is one format or an error. */
+static int act_a8_missing_fail(const char *what, uint64_t need,
+                               uint64_t in_dim, uint64_t out_dim) {
+    static uint64_t seen[16] = {0};
+    static int n_seen = 0;
+    const uint64_t key = (in_dim << 32) ^ out_dim;
+    int known = 0;
+    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
+    if (!known && n_seen < 16) {
+        seen[n_seen++] = key;
+        fprintf(stderr,
+                "pulsar: NO E4M3 ENCODING for the activation of %s (in_dim=%llu out_dim=%llu "
+                "n_tok=%llu) -- no producer armed the slot.  The f32 fallback was deleted "
+                "(L158): arm the activation (pulsar_gpu_mxfp8_act_cache_arm) or take the "
+                "tensor-core arm, which quantises for itself.  Refusing.\n",
+                what ? what : "?", (unsigned long long)in_dim,
+                (unsigned long long)out_dim, (unsigned long long)need);
+    }
+    return 0;
+}
+
 /* Report it once per (in,out) shape and fail.  Keyed on the pair for the reason
  * the W8A8 announcements are: several decode GEMVs share in_dim 4096, so an
  * in_dim-only key would report one and hide the rest. */
@@ -1862,40 +1889,6 @@ static int cuda_attention_output_a_mx_gemm(
 
 
 
-/* Native FP8 decode (mmvq): read the MXFP8 weight 8-bit and dot with the f32
- * activation (single token). One warp per output row; lane L covers in-dim
- * positions {L, 32+L, ...}. No f16 expansion -> no decode bandwidth regression
- * vs the removed Q8_0 path. Used when MXFP8 tensor-cores don't apply (n_tok==1). */
-
-
-/* Decode mmvq over the DE-INTERLEAVED cached weight (contiguous E4M3 data[out,in]
- * + swizzled E8M0 scale), the same buffers the prefill tensor-core path builds via
- * cuda_fp8_mx_weight(). Reading contiguous fp8 lets each lane pull a uint32 (4 E4M3)
- * per step -> 128-wide coalesced loads vs the raw 33B-interleaved kernel's misaligned
- * 1-byte/thread reads. Numerically identical (same fp8 bytes, same raw E8M0 scale byte).
- * Requires in_dim % 128 == 0 (all MLA/shared/head dims qualify); else fall back to raw. */
-template <typename OT>
-__global__ static void mxfp8_mmvq_deint_kernel(OT *out, const __nv_fp8_e4m3 *data,
-                                               const unsigned char *scale, const float *x,
-                                               int in_dim, int out_dim, int KBp) {
-    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    int lane = threadIdx.x & 31;
-    if (o >= out_dim) return;
-    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
-    float acc = 0.f;
-    for (int base = 0; base < in_dim; base += 128) {
-        int k = base + lane * 4;  ///< this lane's 4 in-positions
-        uint32_t packed = *(const uint32_t *)(row + k);
-        int kb = k >> 5;  ///< 32-elem block for these 4
-        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);  ///< 2^(e-127), no SFU
-        const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
-        const float *xk = x + k;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc += __half2float((__half)q[j]) * sc * xk[j];
-    }
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
-    if (lane == 0) q_store<OT>(out, o, acc);
-}
 
 
 /* W8A8 twin of the de-interleaved mmvq: the activation arrives as E4M3 + a
@@ -1952,44 +1945,6 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *
 
 
 
-/* Small-batch (2..4 token) variant of the de-interleaved mmvq for the spec-decode
- * verify forward. One weight-row read serves all NT tokens (per-token accumulators),
- * vs the tensor-core tile path (latency-bound at 2-4 rows) or NT GEMV relaunches
- * (NT x weight traffic). Per-token multiply/accumulate order matches
- * mxfp8_mmvq_deint_kernel exactly, so each token's output is bit-identical to the
- * n=1 kernel run on that token alone. */
-template <int NT, typename OT>
-__global__ static void mxfp8_mmvq_deint_nt_kernel(OT *out, const __nv_fp8_e4m3 *data,
-                                                  const unsigned char *scale, const float *x,
-                                                  int in_dim, int out_dim, int KBp) {
-    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    int lane = threadIdx.x & 31;
-    if (o >= out_dim) return;
-    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
-    float acc[NT];
-    #pragma unroll
-    for (int t = 0; t < NT; t++) acc[t] = 0.f;
-    for (int base = 0; base < in_dim; base += 128) {
-        int k = base + lane * 4;
-        uint32_t packed = *(const uint32_t *)(row + k);
-        int kb = k >> 5;
-        float sc = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
-        const __nv_fp8_e4m3 *q = (const __nv_fp8_e4m3 *)&packed;
-        const float *xk = x + k;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const float wj = __half2float((__half)q[j]) * sc;
-                #pragma unroll
-            for (int t = 0; t < NT; t++) acc[t] += wj * xk[(size_t)t * in_dim + j];
-        }
-    }
-    #pragma unroll
-    for (int t = 0; t < NT; t++) {
-        float a = acc[t];
-        for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
-        if (lane == 0) q_store<OT>(out, (size_t)t * out_dim + o, a);
-    }
-}
 
 
 /* A8 twin of the NT batched GEMV.  Restores the invariant the comment above
@@ -2004,9 +1959,9 @@ __global__ static void mxfp8_mmvq_deint_nt_kernel(OT *out, const __nv_fp8_e4m3 *
  * cost 6.6 points of acceptance in the MoE (L056) before ea86645 closed it.
  *
  * Multiply order is copied from the n==1 A8 kernel and must stay that way:
- * qw[j] * qa[j] * s, with s = sw*sa hoisted, NOT (qw*sw)*(qa*sa).  The f32 NT
- * kernel hoists wj = w*sc for the same reason -- matching the arm it must agree
- * with is worth more than a saved multiply.
+ * qw[j] * qa[j] * s, with s = sw*sa hoisted, NOT (qw*sw)*(qa*sa) -- matching
+ * the arm it must agree with is worth more than a saved multiply.  (The f32 NT
+ * twin that hoisted wj = w*sc was deleted 2026-09-03, L158.)
  *
  * The activation cache is row-major [rows, K] (mxfp8_quant_act_kernel stores at
  * row*K + k), so a lane's 4 elements stay contiguous per token and the scale row
@@ -2244,10 +2199,10 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * tensor-core tile path which is latency-bound at these shapes (the
          * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
          * token). Bit-identical per token to the n=1 kernel, so verify logits match
-         * the decode path's numerics -- and that holds WITHIN an activation
-         * format, not across: the A8 twin above pairs with
-         * mxfp8_mmvq_deint_a8_kernel, this f32 one with mxfp8_mmvq_deint_kernel.
-         * The claim was silently false from the day A8 converted n==1 and left
+         * the decode path's numerics.  (Until L158, 2026-09-03, an f32-activation
+         * twin of each kernel sat behind this arm for the no-slot case; the pair
+         * of f32 kernels is deleted and the no-slot case refuses.)  The claim
+         * was silently false from the day A8 converted n==1 and left
          * this arm on f32 until 0a60a1a converted it too.  (A sentence ended
          * here describing an env override that dispatched tensor-core for all
          * n_tok>1; the override is gone and the sentence had been truncated
@@ -2334,28 +2289,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     #undef PULSAR_FP8_NT_A8
                     return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
                 }
-                #define PULSAR_FP8_NT(N, OT) mxfp8_mmvq_deint_nt_kernel<N, OT><<<grid, wpb * 32>>>( \
-                        (OT *)out->ptr, bw->data, bw->scale, (const float *)x->ptr, \
-                        (int)in_dim, (int)out_dim, KBp)
-                switch (n_tok) {
-                case 2: if (out_f16) PULSAR_FP8_NT(2, __half); else PULSAR_FP8_NT(2, float); break;
-                case 3: if (out_f16) PULSAR_FP8_NT(3, __half); else PULSAR_FP8_NT(3, float); break;
-                case 4: if (out_f16) PULSAR_FP8_NT(4, __half); else PULSAR_FP8_NT(4, float); break;
-                case 5: if (out_f16) PULSAR_FP8_NT(5, __half); else PULSAR_FP8_NT(5, float); break;
-                case 6: if (out_f16) PULSAR_FP8_NT(6, __half); else PULSAR_FP8_NT(6, float); break;
-                case 7: if (out_f16) PULSAR_FP8_NT(7, __half); else PULSAR_FP8_NT(7, float); break;
-                case 8: if (out_f16) PULSAR_FP8_NT(8, __half); else PULSAR_FP8_NT(8, float); break;
-                case 9: if (out_f16) PULSAR_FP8_NT(9, __half); else PULSAR_FP8_NT(9, float); break;
-                case 10: if (out_f16) PULSAR_FP8_NT(10, __half); else PULSAR_FP8_NT(10, float); break;
-                case 11: if (out_f16) PULSAR_FP8_NT(11, __half); else PULSAR_FP8_NT(11, float); break;
-                case 12: if (out_f16) PULSAR_FP8_NT(12, __half); else PULSAR_FP8_NT(12, float); break;
-                case 13: if (out_f16) PULSAR_FP8_NT(13, __half); else PULSAR_FP8_NT(13, float); break;
-                case 14: if (out_f16) PULSAR_FP8_NT(14, __half); else PULSAR_FP8_NT(14, float); break;
-                case 15: if (out_f16) PULSAR_FP8_NT(15, __half); else PULSAR_FP8_NT(15, float); break;
-                default: if (out_f16) PULSAR_FP8_NT(16, __half); else PULSAR_FP8_NT(16, float); break;  ///< n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX
-                }
-                #undef PULSAR_FP8_NT
-                return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt");
+                /* L158: no E4M3 encoding and none declared -- refuse (the f32
+                 * fallback that stood here is gone; see act_a8_missing_fail). */
+                return act_a8_missing_fail("verify-batch GEMV", n_tok, in_dim, out_dim);
             }
         }
         /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
@@ -2437,17 +2373,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 }
                 return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint a8");
             }
-            for (uint64_t t = 0; t < n_tok; t++) {
-                if (out_f16)
-                    mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((__half *)out->ptr + t * out_dim,
-                            w->data, w->scale, (const float *)x->ptr + t * in_dim,
-                            (int)in_dim, (int)out_dim, KBp);
-                else
-                    mxfp8_mmvq_deint_kernel<<<grid, wpb * 32>>>((float *)out->ptr + t * out_dim,
-                            w->data, w->scale, (const float *)x->ptr + t * in_dim,
-                            (int)in_dim, (int)out_dim, KBp);
-            }
-            return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint");
+            /* L158: no E4M3 encoding and none declared -- refuse (the per-token
+             * f32 GEMV that stood here is gone; see act_a8_missing_fail). */
+            return act_a8_missing_fail("decode GEMV", n_tok, in_dim, out_dim);
         }
         /* No raw arm any more.  It read 33B-interleaved blocks for plain
          * type-38 weights; the artifact is 390/390 pre-stored MXFP8_LT and the

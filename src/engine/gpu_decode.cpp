@@ -334,14 +334,29 @@ bool gpu_graph_dspark_project_main_x(
     pulsar_gpu_tensor *proj_out = g->dspark_proj_out;
     if (!target_concat || !proj_out) return false;
 
+    /* L158 (2026-09-03): this was the ONE dense GEMV in the served lane still
+     * multiplying f32 activations.  Three tensor copies built an f32 concat,
+     * nothing armed a slot, and the GEMV fell to the f32 kernel -- W8A32 on
+     * the drafter's projection while every other projection ran W8A8 (found
+     * the day the f32 fallback was deleted: four spec gates refused here).
+     * A8 is producer-side: the concat is now emitted as E4M3 straight into
+     * the slot, the f32 concat is never written, and the GEMV reads the
+     * encoding.  No slot means no GEMV -- one format or an error. */
     bool ok = true;
-    for (int i = 0; i < 3; i++) {
-        ok = pulsar_gpu_tensor_copy(target_concat, (uint64_t)i * E * sizeof(float),
-                                 g->dspark_target_h[i], 0, E * sizeof(float)) != 0;
-        if (!ok) break;
+    void *cq = NULL, *csf = NULL;
+    int ckbp = 0;
+    pulsar_gpu_mxfp8_act_cache_arm(target_concat, 1, concat_dim);
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(target_concat, 1, concat_dim, &cq, &csf, &ckbp)) {
+        static int said = 0;
+        if (!said) { said = 1; fprintf(stderr, "pulsar: dspark main-x concat: no E4M3 slot -- refusing\n"); }
+        ok = false;
     }
-
+    if (ok) ok = pulsar_gpu_dspark_concat3_e4m3(cq, csf, ckbp,
+                                                g->dspark_target_h[0], g->dspark_target_h[1],
+                                                g->dspark_target_h[2], (uint32_t)E) != 0;
     if (ok) {
+        pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        pulsar_gpu_mxfp8_act_cache_note_f32_skipped(1u);
         ok = pulsar_gpu_matmul_mxfp8_tensor(proj_out,
                                           dspark_model->map,
                                           dspark_model->size,
@@ -349,16 +364,32 @@ bool gpu_graph_dspark_project_main_x(
                                           concat_dim, E,
                                           target_concat, 1) != 0;
     }
+    pulsar_gpu_mxfp8_act_cache_disarm();
 
+    /* L158: main_x feeds the seed-KV GEMVs (gpu_graph_dspark_seed_draft_kv,
+     * called right after this) -- another dense projection that read f32.  The
+     * norm emits E4M3 into main_x's slot and leaves it ARMED for the seed; the
+     * f32 store stays (the spec dump reads it).  The seed disarms when done. */
+    void *mx_q = NULL, *mx_sf = NULL; int mx_kbp = 0;
+    if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_main_x, 1, E, &mx_q, &mx_sf, &mx_kbp)) {
+        static int said = 0;
+        if (!said) { said = 1; fprintf(stderr, "pulsar: dspark main-x norm: no E4M3 slot -- refusing\n"); }
+        ok = false;
+    }
     if (ok) {
-        ok = pulsar_gpu_rms_norm_weight_tensor(g->dspark_main_x,
-                                            proj_out,
-                                            dspark_model->map,
-                                            dspark_model->size,
-                                            w->main_norm->abs_offset,
-                                            (uint32_t)E,
-                                            PULSAR_RMS_EPS,
+        ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->dspark_main_x,
+                                               proj_out,
+                                               dspark_model->map,
+                                               dspark_model->size,
+                                               w->main_norm->abs_offset,
+                                               (uint32_t)E,
+                                               PULSAR_RMS_EPS,
+                                               mx_q, mx_sf, mx_kbp,
         w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
+    }
+    if (ok) {
+        pulsar_gpu_mxfp8_act_cache_arm(g->dspark_main_x, 1, E);
+        pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     }
 
     return ok;
@@ -460,6 +491,8 @@ void gpu_graph_dspark_seed_draft_kv(
             g->dspark_n_raw[li]++;
         }
     }
+    /* L158: last consumer of main_x's E4M3 encoding (armed by the projection). */
+    pulsar_gpu_mxfp8_act_cache_disarm();
     if (!seeded) {
         g->dspark_n_raw[0] = n_raw_entry[0];
         g->dspark_n_raw[1] = n_raw_entry[1];
@@ -671,22 +704,30 @@ bool gpu_graph_dspark_draft_forward_banks(
             hc_mix_view, dspark_model,
             layer->hc_attn_fn,
             hc_dim, mix_hc, g->batch_flat_hc, n_draft);
-        /* HC split + weighted sum → attn_cur (E-dim) */
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(
-            ffn_cur_view, hc_split_view, hc_mix_view,
-            g->batch_cur_hc,
+        /* HC split + weighted sum + input RMS norm -> batch_attn_norm, with the
+         * E4M3 encoding emitted at the producer (L158, 2026-09-03).  Until today
+         * this was a split-sum kernel plus a plain f32 norm, and the two GEMVs
+         * below read f32 -- the drafter's attention ran W8A32 while the target's
+         * ran W8A8 (the f32 GEMV arms were deleted in L158 and refused here).
+         * Same fused producer the target's batch layer uses (gpu_prefill.cpp);
+         * the pre-norm carrier still lands in ffn_cur_view. */
+        void *dn_q = NULL, *dn_sf = NULL; int dn_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_attn_norm, n_draft, PULSAR_N_EMBD,
+                                                        &dn_q, &dn_sf, &dn_kbp)) {
+            fprintf(stderr, "pulsar: drafter attn_norm: no E4M3 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+            ffn_cur_view, g->batch_attn_norm, dn_q, dn_sf, dn_kbp,
+            NULL /* no bf16 consumer in the drafter */, 0u /* keep the f32 store */,
+            hc_split_view, hc_mix_view, g->batch_cur_hc,
             dspark_model->map, dspark_model->size,
             layer->hc_attn_scale->abs_offset,
             layer->hc_attn_base->abs_offset,
-            PULSAR_N_EMBD, PULSAR_N_HC,
-            PULSAR_N_HC_SINKHORN_ITER, PULSAR_HC_EPS) != 0;
-        /* Input RMS norm → batch_attn_norm */
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
-            g->batch_attn_norm, ffn_cur_view,
-            dspark_model->map, dspark_model->size,
             layer->attn_norm->abs_offset,
-            PULSAR_N_EMBD, n_draft, PULSAR_RMS_EPS,
-        layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
+            n_draft, PULSAR_N_EMBD, PULSAR_N_HC,
+            PULSAR_N_HC_SINKHORN_ITER, PULSAR_HC_EPS, PULSAR_RMS_EPS,
+            layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
@@ -698,17 +739,28 @@ bool gpu_graph_dspark_draft_forward_banks(
          * (same encoder, same bytes), one encode instead of two. */
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_attn_norm, n_draft,
                                                PULSAR_N_EMBD);
+        if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();   /* L158: the fused norm emitted it */
         /* --- Q projection --- */
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_qr, dspark_model->map, dspark_model->size,
             layer->attn_q_a->abs_offset,
             PULSAR_N_EMBD, q_rank, g->batch_attn_norm, n_draft) != 0;
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
+        /* L158: q_a_norm emits E4M3 for the q_b GEMV (was f32 -> W8A32). */
+        void *dq_q = NULL, *dq_sf = NULL; int dq_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_qr_norm, n_draft, q_rank,
+                                                        &dq_q, &dq_sf, &dq_kbp)) {
+            fprintf(stderr, "pulsar: drafter q_a_norm: no E4M3 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_mx_tensor(
             g->batch_qr_norm, g->batch_qr,
             dspark_model->map, dspark_model->size,
             layer->attn_q_a_norm->abs_offset,
             q_rank, n_draft, PULSAR_RMS_EPS,
-        layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+            dq_q, dq_sf, dq_kbp,
+            layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_draft, q_rank);
+        if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
         if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
             g->batch_q, dspark_model->map, dspark_model->size,
             layer->attn_q_b->abs_offset,
@@ -932,26 +984,42 @@ bool gpu_graph_encode_output_head(
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc", g->output_embd, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
-    if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                  g->output_embd,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->output_norm->abs_offset,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_RMS_EPS,
+    /* L158: an MXFP8 head (the drafter's) reads its activation from the E4M3
+     * slot, so the output norm emits it; a bf16 head (the target's) takes the
+     * bf16 core, which converts elementwise -- same bytes whichever side does
+     * it, so no slot is needed there. */
+    const bool head_mx = weights->output->type != PULSAR_TENSOR_BF16;
+    void *hn_q = NULL, *hn_sf = NULL; int hn_kbp = 0;
+    if (ok && head_mx && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->output_norm, 1, PULSAR_N_EMBD,
+                                                              &hn_q, &hn_sf, &hn_kbp)) {
+        fprintf(stderr, "pulsar: output norm: no E4M3 slot for the MXFP8 head -- refusing\n");
+        ok = false;
+    }
+    if (ok) ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->output_norm,
+                                                     g->output_embd,
+                                                     model->map,
+                                                     model->size,
+                                                     weights->output_norm->abs_offset,
+                                                     PULSAR_N_EMBD,
+                                                     PULSAR_RMS_EPS,
+                                                     hn_q, hn_sf, hn_kbp,
         weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
     if (ok) {
-        if (weights->output->type == PULSAR_TENSOR_BF16)
+        if (!head_mx) {
             ok = pulsar_gpu_matmul_bf16_tensor(g->logits, model->map, model->size,
                                             weights->output->abs_offset, PULSAR_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
-        else
+        } else {
+            pulsar_gpu_mxfp8_act_cache_arm(g->output_norm, 1, PULSAR_N_EMBD);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
             ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
                                             weights->output->abs_offset, PULSAR_N_EMBD,
                                             vocab_dim, g->output_norm, 1) != 0;
+            pulsar_gpu_mxfp8_act_cache_disarm();
+        }
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, PULSAR_N_LAYER, 0);

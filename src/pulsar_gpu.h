@@ -712,6 +712,16 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
 void pulsar_gpu_mxfp8_gact_note(void);
 void pulsar_gpu_mxfp8_gact_disarm(void);
 
+/** L158: the drafter's concat of three target hidden states, emitted as E4M3
+ * straight into the activation slot (producer-side A8; the f32 concat is never
+ * written).  slot_data/slot_scale/sf_pitch come from
+ * pulsar_gpu_mxfp8_act_cache_e4m3_slot for the concat tensor at (1 row,
+ * 3*n_embd); the caller notes the encoding current and the f32 store skipped.
+ * @return 1 on success, 0 on a bad argument or launch failure. */
+int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pitch,
+                                   const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                   const pulsar_gpu_tensor *h2, uint32_t n_embd);
+
 /** Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 
@@ -808,6 +818,17 @@ int pulsar_gpu_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps,
         int                     w_bf16);
+
+/** L158: the rows twin of pulsar_gpu_rms_norm_weight_mx_tensor -- `rows`
+ * independent rows normalised with the same weight, each row's E4M3 encoding
+ * and UE8M0 block scales emitted into out_q/out_sf (pass NULLs for f32 only).
+ * Used by the drafter's per-row norms so its GEMVs read a slot, not f32.
+ * n must be a multiple of 256 when out_q is set (fails loudly otherwise).
+ * @return 0 on success. */
+int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
+                                              const void *model_map, uint64_t model_size,
+                                              uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
+                                              void *out_q, void *out_sf, int out_kbp, int w_bf16);
 
 int pulsar_gpu_rms_norm_weight_rows_tensor(
         pulsar_gpu_tensor       *out,

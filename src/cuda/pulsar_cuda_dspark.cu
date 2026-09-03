@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"   /* L158: pulsar_mx_emit_block for the producer-side E4M3 concat */
 
 
 /*
@@ -1146,4 +1147,43 @@ int pulsar_gpu_dspark_markov_step_banks_model(
                                       dspark_model_size, markov_w1_offset, markov_w2_offset,
                                       n_banks, pos, 1u, prev_dev, vocab_size, embed_dim,
                                       w1_bf16, w2_bf16);
+}
+
+
+/* ---- L158 (2026-09-03): the drafter's concat of three target hidden states,
+ * emitted as E4M3 at the PRODUCER -----------------------------------------
+ *
+ * The concat [h0 | h1 | h2] (3 x N_EMBD f32) fed main_proj through the dense
+ * GEMV as an f32 activation for the whole A8 campaign: three tensor copies
+ * built the f32 row, nothing armed a slot, and the GEMV fell to the f32
+ * kernel deleted in L158 -- the one W8A32 projection left in the served lane,
+ * on the drafter.  A8 is producer-side: this kernel writes the E4M3 data and
+ * UE8M0 block scales straight into the activation slot with the shared
+ * pulsar_mx_emit_block (same encoder, same bytes every other producer emits),
+ * one warp per 32-block; N_EMBD is a multiple of 32, so no block straddles two
+ * sources.  The f32 concat is never written -- the caller declares the f32
+ * store skipped and the GEMV reads the slot. */
+__global__ static void dspark_concat3_e4m3_kernel(const float *h0, const float *h1, const float *h2,
+                                                  uint32_t E, __nv_fp8_e4m3 *data,
+                                                  unsigned char *scale, int KBp) {
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = warp * 32u + lane;
+    if (col >= 3u * E) return;
+    const uint32_t src = col / E, off = col - src * E;
+    const float v = src == 0 ? h0[off] : src == 1 ? h1[off] : h2[off];
+    pulsar_mx_emit_block(v, col, 0u, 3u * E, KBp, data, scale);
+}
+
+int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pitch,
+                                   const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                   const pulsar_gpu_tensor *h2, uint32_t n_embd) {
+    if (!slot_data || !slot_scale || !h0 || !h1 || !h2 || n_embd == 0 || n_embd % 32u != 0) return 0;
+    const uint64_t need = (uint64_t)n_embd * sizeof(float);
+    if (h0->bytes < need || h1->bytes < need || h2->bytes < need) return 0;
+    const uint32_t warps = 3u * n_embd / 32u;
+    dspark_concat3_e4m3_kernel<<<(warps * 32u + 255u) / 256u, 256>>>(
+        (const float *)h0->ptr, (const float *)h1->ptr, (const float *)h2->ptr, n_embd,
+        (__nv_fp8_e4m3 *)slot_data, (unsigned char *)slot_scale, sf_pitch);
+    return cuda_ok(cudaGetLastError(), "dspark concat3 e4m3");
 }
