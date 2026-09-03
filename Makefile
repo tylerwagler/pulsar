@@ -918,7 +918,15 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
 #   make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
-GATE_TARGETS = cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
+# The unit suite (make test) runs INSIDE the battery since 2026-09-03: it was
+# the one test set a landing could skip, and L156 found a golden in it that had
+# been failing since May because nobody ran it.  Same model as the frontier
+# gates so one FRONTIER_MODEL= names the artifact for everything.
+unit-test-gate: pulsar_test seam-check
+	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test
+
+GATE_TARGETS = unit-test-gate \
+	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-prefill-gate \
 	cuda-reference-gate \
                cuda-frontier-gate cuda-rewind-gate cuda-mseq-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \

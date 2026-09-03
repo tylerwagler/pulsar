@@ -27,7 +27,8 @@ and any non-default flags for every manual run.
 ## 2. Core Regression Tests
 
 - Run the default suite:
-  `make test`.
+  `make test` (also the first entry of `make gates`, as `unit-test-gate`,
+  since 2026-09-03 -- a battery run covers it).
 - Run the CUDA smoke regression:
   `make cuda-regression`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
