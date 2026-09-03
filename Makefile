@@ -1154,6 +1154,16 @@ tests/dspark_batch_gate: tests/dspark_batch_gate.o src/lib/pulsar_help.o $(CORE_
 tests/nt_crossover_sweep: tests/nt_crossover_sweep.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# L151-C stage 0: fixed-tile CUTLASS GEMM probe (pricing only, not engine code).
+tests/fixed_tile_gemm_kernels.o: tests/fixed_tile_gemm_kernels.cu tests/fixed_tile_gemm_probe.h src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh $(CUDA_FLAG_STAMP) | cutlass-check
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda -Itests $(CUTLASS_INC) -c -o $@ tests/fixed_tile_gemm_kernels.cu
+tests/fixed_tile_gemm_probe.o: tests/fixed_tile_gemm_probe.cpp tests/fixed_tile_gemm_probe.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -Itests -c -o $@ tests/fixed_tile_gemm_probe.cpp
+tests/fixed_tile_gemm_probe: tests/fixed_tile_gemm_probe.o tests/fixed_tile_gemm_kernels.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
+	./tests/fixed_tile_gemm_probe $(FRONTIER_MODEL)
+
 tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
