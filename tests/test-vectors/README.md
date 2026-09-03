@@ -10,9 +10,6 @@ Files:
 - `prompts/*.txt`: exact user prompts.
 - `official/*.official.json`: official API continuations and top-logprobs.
 - `official.vec`: compact C-test fixture generated from the official JSON.
-- `local-golden.vec`: local top-k/logit fixture captured from a known-sane DS4
-  Flash run. It is used to catch substantial backend drift that can keep the
-  same greedy token while damaging the logits distribution.
 
 Regenerate official vectors:
 
@@ -28,11 +25,10 @@ The C runner consumes `official.vec` directly:
 ./pulsar_test --logprob-vectors
 ```
 
-It also consumes the local golden fixture:
-
-```sh
-./pulsar_test --local-golden-vectors
-```
+(The `local-golden.vec` fixture and `--local-golden-vectors` were deleted
+2026-09-02, L156: a May-2026 Metal capture of a different quantization that
+had been red since this fork's first format change; fidelity to the source is
+graded by `cuda-reference-gate` against the B300 capture instead.)
 
 The `--logprob-vectors` runner opens the normal non-quality path with
 accelerator-specific fast routes disabled and pins `PULSAR_CUDA_PREFILL_CHUNK=2048`

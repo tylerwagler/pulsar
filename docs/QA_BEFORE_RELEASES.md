@@ -33,7 +33,9 @@ and any non-default flags for every manual run.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
   `./pulsar_test --logprob-vectors`
-  and `./pulsar_test --local-golden-vectors`.
+  (the local golden-vector leg was retired 2026-09-02, L156; the reference
+  gate `make cuda-reference-gate` with `PULSAR_REF_DIR` set is the fidelity
+  oracle).
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
   `./pulsar_test --server`.
