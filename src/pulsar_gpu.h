@@ -706,6 +706,9 @@ int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t 
  * current.  Engine producers emit from their epilogues and must not call this;
  * no consumer quantises any more. @return 1 on success. */
 int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+/** bf16 twin for a synthesised activation (probes/tests): fills x's bf16 plane
+ * by RNE from the f32 rows and notes it.  No engine producer calls this. */
+int pulsar_gpu_bf16_act_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
 
 /** L158: PRODUCER-side grouped encode of the attention output heads for an
  * attention producer without an E4M3 epilogue (the drafter's raw batch

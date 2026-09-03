@@ -1277,6 +1277,23 @@ int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t 
  * kernel has no epilogue (the MoE's SwiGLU output).  Epilogue producers emit
  * directly and do not call this.  Arms the slot, encodes with the one
  * standalone encoder, notes it. */
+/* Producer-side bf16 encode for a SYNTHESISED activation (probes and tests
+ * that build x themselves): fill x's bf16 plane by RNE from the f32 rows and
+ * note it, the way the fused norms do for the engine's own producers.  The
+ * dense bf16 core refuses an activation without a plane; no engine producer
+ * calls this. */
+int pulsar_gpu_bf16_act_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
+    void *xb = NULL;
+    if (!x || n_tok == 0 || in_dim == 0) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    if (!pulsar_gpu_bf16_act_slot(x, n_tok, in_dim, &xb)) return 0;
+    const uint64_t n = n_tok * in_dim;
+    f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>((uint16_t *)xb, (const float *)x->ptr, n);
+    if (!cuda_ok(cudaGetLastError(), "bf16 act encode f32")) return 0;
+    pulsar_gpu_bf16_act_note(x, n_tok, in_dim);
+    return 1;
+}
+
 int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     void *q = NULL, *sf = NULL; int kbp = 0;
     if (!x || n_tok == 0 || in_dim % 32 != 0) return 0;

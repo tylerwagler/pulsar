@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static double now_us(void) {
@@ -134,8 +135,9 @@ int main(int argc, char **argv) {
         /* L158: arm the E4M3 slot and let one unarmed 16-row call quantise into
          * it, as the engine's producers do -- the dense GEMM no longer has an
          * f32 fallback for an unarmed activation (one format or an error). */
-        if (!is_bf16 &&
-            (!pulsar_gpu_mxfp8_act_cache_encode_f32(c.x, MMAX, c.in_dim) || !pulsar_gpu_end_commands())) {
+        if (!(is_bf16 ? pulsar_gpu_bf16_act_encode_f32(c.x, MMAX, c.in_dim)
+                      : pulsar_gpu_mxfp8_act_cache_encode_f32(c.x, MMAX, c.in_dim)) ||
+            !pulsar_gpu_end_commands()) {
             fprintf(stderr, "activation encode failed for %s\n", shapes[si].name);
             return 1;
         }
@@ -157,39 +159,43 @@ int main(int argc, char **argv) {
                    shapes[si].name, K, N, wbytes / 1e6, sfb_mismatch, (unsigned long long)N * (K / 32),
                    sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
         }
-        printf("  %5s | %9s | %9s %9s | %8s %8s | %10s | %s\n", "M", "engine", "ft64", "ft128",
-               "ft64GB/s", "ft128GBs", "|ft64-eng|", "neutral(ft64/ft128: rows==M16)");
-        /* neutrality references: the 16-row ft outputs */
-        std::vector<float> ref64, ref128, cur, ref_eng;
-        for (int tn = 64; tn <= 128; tn += 64) {
-            c.tn = tn;
-            if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "ft%d at M=16 failed for %s\n", tn, shapes[si].name); rc = 1; break; }
-            if (!read_out(c.out, tn == 64 ? ref64 : ref128, (uint64_t)16 * N)) { rc = 1; break; }
+        const int NV = is_bf16 ? fb_nvariants() : ft_nvariants();
+        printf("  %5s | %9s |", "M", "engine");
+        for (int v = 0; v < NV; v++) printf(" %12s", is_bf16 ? fb_variant_name(v) : ft_variant_name(v));
+        printf(" | %10s | neutral per variant (rows == M16 rows)\n", "|v0-eng|");
+        /* neutrality references: each variant's 16-row output */
+        std::vector<std::vector<float>> refs(NV);
+        std::vector<float> cur, ref_eng;
+        for (int v = 0; v < NV && !rc; v++) {
+            c.tn = v;
+            if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "variant %d at M=16 failed for %s\n", v, shapes[si].name); rc = 1; break; }
+            if (!read_out(c.out, refs[v], (uint64_t)16 * N)) { rc = 1; break; }
         }
         if (rc) break;
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
+            /* the engine's own dispatch for M decode-kind rows (L167: row kind chooses) */
             if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) { rc = 1; break; }
             const double te = time_launches(engine_launch, &c, M, reps);
             (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
             if (!read_out(c.out, ref_eng, (uint64_t)M * N)) { rc = 1; break; }
-            double tf[2] = {-1, -1}, deng = 0;
-            uint64_t bad[2] = {0, 0};
-            for (int ti = 0; ti < 2; ti++) {
-                c.tn = ti == 0 ? 64 : 128;
-                tf[ti] = time_launches(ft_launch, &c, M, reps);
-                if (tf[ti] < 0) { fprintf(stderr, "ft%d failed at M=%u for %s\n", c.tn, M, shapes[si].name); rc = 1; break; }
+            printf("  %5u | %9.1f |", M, te);
+            double deng = 0;
+            std::string flags;
+            for (int v = 0; v < NV; v++) {
+                c.tn = v;
+                const double tf = time_launches(ft_launch, &c, M, reps);
+                if (tf < 0) { fprintf(stderr, "variant %d failed at M=%u for %s\n", v, M, shapes[si].name); rc = 1; break; }
                 if (!read_out(c.out, cur, (uint64_t)M * N)) { rc = 1; break; }
-                const std::vector<float> &ref = ti == 0 ? ref64 : ref128;
+                uint64_t bad = 0;
                 for (uint64_t i = 0; i < (uint64_t)M * N; i++)
-                    if (memcmp(&cur[i], &ref[i], sizeof(float)) != 0) bad[ti]++;
-                if (ti == 0) deng = max_abs_diff(cur, ref_eng, (uint64_t)M * N);
+                    if (memcmp(&cur[i], &refs[v][i], sizeof(float)) != 0) bad++;
+                flags += bad == 0 ? " Y" : " N";
+                if (v == 0) deng = max_abs_diff(cur, ref_eng, (uint64_t)M * N);
+                printf(" %7.1f(%3.0f)", tf, wbytes / tf / 1e3);
             }
             if (rc) break;
-            printf("  %5u | %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e | %s / %s%s\n", M, te, tf[0], tf[1],
-                   tf[0] > 0 ? wbytes / tf[0] / 1e3 : 0.0, tf[1] > 0 ? wbytes / tf[1] / 1e3 : 0.0, deng,
-                   bad[0] == 0 ? "YES" : "NO", bad[1] == 0 ? "YES" : "NO",
-                   (bad[0] || bad[1]) ? "  <-- rows differ from the 16-row call" : "");
+            printf(" | %10.3e |%s\n", deng, flags.c_str());
         }
         printf("\n");
         if (c.ft) ft_release(c.ft);

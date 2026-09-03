@@ -18,7 +18,9 @@ struct ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_sc
 /** Quantise x[M,K] f32 (device) to the engine's E4M3 bytes and run the
  * fixed-tile GEMM with tile N = tn (64 or 128) into D[M,N] f32 (device).
  * Returns 0 on success, 1 = can_implement refused, 2/3 = init/run failed. */
-int ft_run(struct ft_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+int ft_run(struct ft_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+int ft_nvariants(void);
+const char *ft_variant_name(int v);
 int ft_sync(void);
 void ft_release(struct ft_ctx *c);
 
@@ -27,7 +29,9 @@ void ft_release(struct ft_ctx *c);
  * engine's bf16-rounded activations.  Same return codes as ft_run. */
 struct fb_ctx;
 struct fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K);
-int fb_run(struct fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+int fb_run(struct fb_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+int fb_nvariants(void);
+const char *fb_variant_name(int v);
 void fb_release(struct fb_ctx *c);
 #ifdef __cplusplus
 }
