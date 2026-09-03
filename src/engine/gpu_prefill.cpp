@@ -743,16 +743,39 @@ bool gpu_graph_encode_layer_attention_batch(
                     n_tokens, (uint32_t)hc_dim);
         }
     }
+    /* L157: the f32 rows of batch_flat_hc are a dead store when the bf16 copy
+     * exists -- their only consumer is hc_attn_fn's GEMM, which runs the shared
+     * bf16 core (L079/L087) and reads the slot.  d967327 (2026-08-14) skipped
+     * exactly this store for a measured, bit-exact +4.0% prefill; the F32
+     * detour of 08-16 made it impossible (cuBLAS SGEMM needed the f32) and it
+     * was deleted with the F16 sweep; the bf16-core migration made it legal
+     * again and nobody put it back.  Same predicate family as attn_norm's skip:
+     * the mixed-batch split's offset views read f32 and key no slot, and dumps
+     * read f32.  Declared to the cache so a slot miss refuses, never converts
+     * unwritten bytes. */
+    const bool flat_skip_f32 = flat_hc_b &&
+                               pulsar_gpu_matmul_batch_mneutral() == 0 &&
+                               !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
+                                                      PULSAR_RMS_EPS,
+                                                      flat_skip_f32 ? 1 : 0) != 0;
     /* note() only after the kernel SUCCEEDED -- validity must not outlive a
      * failed launch, or the consumer reads a slot that was never written. */
     if (ok && flat_hc_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
                                                   (uint64_t)hc_dim);
+    if (ok && flat_skip_f32) {
+        pulsar_gpu_act_note_f32_skipped_for(g->batch_flat_hc, n_tokens, (uint64_t)hc_dim, 0u);
+        static int announced_fhs = 0;
+        if (!announced_fhs) {
+            announced_fhs = 1;
+            fprintf(stderr, "pulsar: flat_hc f32 store SKIPPED (n_tok=%u, %.1f MiB/layer x2)\n",
+                    n_tokens, (double)n_tokens * hc_dim * sizeof(float) / (1024.0 * 1024.0));
+        }
+    }
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_attn_fn,
@@ -2455,14 +2478,22 @@ bool gpu_graph_encode_layer_ffn_batch(
                                         (uint64_t)hc_dim, &flat_hc_b_ffn)) {
         flat_hc_b_ffn = NULL;
     }
+    /* L157: same dead-store skip as the attention-side flat_hc norm, same
+     * predicate; the consumer is hc_ffn_fn's GEMM on the shared bf16 core. */
+    const bool flat_skip_f32_ffn = flat_hc_b_ffn &&
+                                   pulsar_gpu_matmul_batch_mneutral() == 0 &&
+                                   !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b_ffn,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
+                                                      PULSAR_RMS_EPS,
+                                                      flat_skip_f32_ffn ? 1 : 0) != 0;
     if (ok && flat_hc_b_ffn) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
                                                       (uint64_t)hc_dim);
+    if (ok && flat_skip_f32_ffn)
+        pulsar_gpu_act_note_f32_skipped_for(g->batch_flat_hc, n_tokens, (uint64_t)hc_dim, 0u);
     if (ok) ok = gpu_graph_matmul_plain_tensor(hc_mix_view,
                                               model,
                                               layer->hc_ffn_fn,

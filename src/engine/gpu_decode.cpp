@@ -664,7 +664,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             flat_b = NULL;
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
             g->batch_flat_hc, flat_b, g->batch_cur_hc,
-            (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS) != 0;
+            (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS, 0) != 0;
         if (ok && flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_draft, hc_dim);
         /* HC → mix projection */
         if (ok) ok = gpu_graph_matmul_plain_tensor(
@@ -1066,7 +1066,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
+                                                      PULSAR_RMS_EPS, 0) != 0;
     if (ok && out_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
                                                    (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
@@ -1154,7 +1154,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
         dsp_flat_b = NULL;
     }
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
-                                                     (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS) != 0;
+                                                     (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
     if (ok && dsp_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
                                                    (uint64_t)hc_dim);
     if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,

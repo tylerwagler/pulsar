@@ -1264,6 +1264,18 @@ void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     }
 }
 
+/* L157: the same declaration for a buffer that was never arm()ed -- the
+ * hidden-carrier norm has no E4M3 consumer, so it holds only a bf16 slot and
+ * g_act_cur points at whatever was armed last.  Name the slot by its key. */
+void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
+                                         uint64_t in_dim, uint32_t keep_from) {
+    mxfp8_act_cache_t *s = x ? act_slot_find(x->ptr, n_tok, in_dim) : NULL;
+    if (s) {
+        s->f32_absent    = 1;
+        s->f32_keep_from = keep_from;
+    }
+}
+
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
  * a growth cannot pull the old pointer out from under an in-flight kernel. */
 static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const char *what) {

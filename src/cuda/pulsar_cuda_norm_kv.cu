@@ -39,7 +39,11 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const pulsar_hc_t *xr = x + (uint64_t)row * n;
-    float *orow = out + (uint64_t)row * n;
+    /* `out` may be NULL (L157): when the only consumer is the bf16 GEMM core and
+     * no dump wants the f32, the f32 row is a dead store -- 64 KB of the row's
+     * 160 KB of traffic at hc_dim.  The launcher passes NULL only with out_b
+     * set and the skip declared to the activation cache (fail-loud on a miss). */
+    float *orow = out ? out + (uint64_t)row * n : nullptr;
     /* Optional producer-side BF16 copy (L086 T3).  The consumer of this buffer
      * is a BF16 GEMM (pulsar_gpu_matmul_f32_tensor runs the shared bf16 core),
      * so emitting here deletes its convert pass rather than moving it: the
@@ -75,13 +79,13 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
         #pragma unroll
         for (uint32_t u = 0; u < UNROLL; u++) {
             const float o = v[u] * scale;
-            orow[i + u * BLK] = o;
+            if (orow) orow[i + u * BLK] = o;
             if (brow) brow[i + u * BLK] = pulsar_f32_to_bf16_rne(o);
         }
     }
     for (; i < n; i += BLK) {
         const float o = pulsar_hc_load(xr, i) * scale;
-        orow[i] = o;
+        if (orow) orow[i] = o;
         if (brow) brow[i] = pulsar_f32_to_bf16_rne(o);
     }
 }
@@ -1012,9 +1016,14 @@ int pulsar_gpu_rms_norm_plain_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_te
 }
 
 
-int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
+int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps,
+                                          int skip_f32) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
+    /* L157: the f32 rows may be skipped only when the bf16 copy replaces them;
+     * a skip with nothing to read instead would leave the consumer converting
+     * unwritten bytes, which the bf16 core refuses loudly -- refuse it here too. */
+    if (skip_f32 && !out_b) return 0;
     /* The F16 destination that used to sit here went out with the last F16
      * weight (2026-08-16) -- every caller passed NULL, so it could never fire.
      * `out_b` is its BF16 successor and is NOT the same thing: the consumer
@@ -1022,7 +1031,7 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, c
      * BF16, and BF16 is the right 16-bit format here -- 8 exponent bits keep
      * f32's range, where F16's 5 never did.  NULL is still valid and still
      * emits nothing. */
-    rms_norm_plain_kernel<256, 8><<<rows, 256>>>((float *)out->ptr,
+    rms_norm_plain_kernel<256, 8><<<rows, 256>>>(skip_f32 ? nullptr : (float *)out->ptr,
                                                  (uint16_t *)out_b,
                                                  (const pulsar_hc_t *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");

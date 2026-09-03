@@ -758,7 +758,19 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
         const pulsar_gpu_tensor *x,
         uint32_t                n,
         uint32_t                rows,
-        float                   eps);
+        float                   eps,
+        /** L157: nonzero skips the f32 rows entirely (requires out_b).  Legal
+         *  only when every consumer reads the bf16 copy -- the caller must also
+         *  declare it with pulsar_gpu_act_note_f32_skipped_for() so a
+         *  consumer that misses the bf16 slot refuses instead of converting
+         *  unwritten bytes.  At hc_dim the f32 rows are 40% of this kernel's
+         *  traffic (64 of 160 KB per row). */
+        int                     skip_f32);
+
+/** L157: declare that rows [keep_from, n_tok) of x's f32 store were skipped,
+ * for a buffer that was never arm()ed (bf16 slot only), keyed like the slot. */
+void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
+                                         uint64_t in_dim, uint32_t keep_from);
 
 /** As below, but also emits the E4M3 + ue8m0 encoding into the activation-cache
  * slots, so a GEMV consuming this norm multiplies in the source's format.
