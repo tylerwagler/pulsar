@@ -127,8 +127,8 @@ SERVER_SRCS = $(wildcard src/server/*.cpp)
 SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
-CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
-CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
+CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o src/cuda/pulsar_fixed_tile.o
+CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu src/cuda/pulsar_fixed_tile.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
 # Vendored llama.cpp MMQ (plan 41b, see src/cuda/mmq/VENDOR.md).  The wildcard is
 # empty unless the tree has actually been vendored, in which case PULSAR_HAVE_MMQ
@@ -1116,6 +1116,10 @@ src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
 src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP) | cutlass-check
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
+
+# L151-C: fixed-tile GEMMs for the M-neutral dense step (same CUTLASS build recipe).
+src/cuda/pulsar_fixed_tile.o: src/cuda/pulsar_fixed_tile.cu src/cuda/pulsar_fixed_tile.h src/cuda/pulsar_cuda_mx.cuh src/pulsar_gpu.h $(CUDA_FLAG_STAMP) | cutlass-check
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc -Isrc/cuda $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_fixed_tile.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

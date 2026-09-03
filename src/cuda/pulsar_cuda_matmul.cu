@@ -1,5 +1,6 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
+#include "pulsar_fixed_tile.h"   /* L151-C: fixed-tile GEMMs for the armed dense step */
 
 
 
@@ -1563,6 +1564,29 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
         if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
         if (ac) ac->valid = 1;
     }
+    /* L151-C stage 1: an ARMED step sends the two 34 MB projections to the
+     * fixed tensor-core tile (pulsar_fixed_tile.h) instead of cuBLASLt -- the
+     * same xq/sx and the same LT slabs, only the kernel differs, and its bits
+     * equal cuBLASLt's at M >= 5 (stage-0 probe).  Hosted here because this
+     * function already owns weight resolution, the E4M3 slot and the output
+     * type; the dispatch above routes armed n_tok 1..16 of these shapes in. */
+    if (pulsar_gpu_matmul_batch_mneutral() > 0 && ntok <= (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX &&
+        pulsar_ft_mxfp8_shape_ok(in_dim, out_dim)) {
+        static uint64_t seen_ft[8]; static int n_seen_ft = 0;
+        const uint64_t key = (in_dim << 32) ^ out_dim;
+        int known = 0;
+        for (int i = 0; i < n_seen_ft; i++) if (seen_ft[i] == key) { known = 1; break; }
+        if (!known && n_seen_ft < 8) {
+            seen_ft[n_seen_ft++] = key;
+            fprintf(stderr, "pulsar: dense '%s' (in=%llu out=%llu) armed -> FIXED TILE "
+                            "(M-neutral tensor core, first seen at n_tok=%d, out_f16=%d)\n",
+                    label ? label : "?", (unsigned long long)in_dim,
+                    (unsigned long long)out_dim, ntok, out_f16);
+        }
+        return pulsar_ft_mxfp8(out->ptr, out_f16, (const uint8_t *)xq, sx,
+                               (const uint8_t *)w->data, w->scale,
+                               ntok, (int)out_dim, (int)in_dim, ws, wz);
+    }
     /* Shape-keyed handle cache: the desc/layout/preference build plus the
      * heuristic query cost ~100us of host time PER GEMM and only the two
      * scale pointers change between calls of the same (in,out,ntok) shape.
@@ -2233,6 +2257,16 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)gemv_max_n;
         /* nt_cap is 4 or MNEUTRAL_ROWS_MAX, so <= nt_cap already bounds the
          * row count; the explicit MNEUTRAL conjunct here was provably true (K13). */
+        /* L151-C stage 1: on an ARMED step the two 34 MB projections take the
+         * fixed tensor-core tile at EVERY row count 1..16 -- one kernel across
+         * M is what keeps a row's bytes M-independent -- via the cuBLASLt arm,
+         * which hosts it.  Everything else in the armed range stays on nt (the
+         * small-N shapes hit a CTA-count floor at M = 1; rows/L151.md). */
+        if (pulsar_gpu_matmul_batch_mneutral() > 0 &&
+            n_tok <= (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX &&
+            pulsar_ft_mxfp8_shape_ok(in_dim, out_dim))
+            return cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size, weight_offset,
+                                                     in_dim, out_dim, x, n_tok, label);
         if (n_tok >= 2 && n_tok <= nt_cap && in_dim % 128 == 0) {
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
@@ -2696,6 +2730,23 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
         if (hb) hb->valid_b = 1;
     }
     const __nv_bfloat16 *xb16 = xbb;
+    /* L151-C stage 1: the ARMED head (the only >= 512 MiB bf16 weight) takes
+     * the fixed 64x128x64 tile at every row count 1..16 -- flat where nt grows
+     * 0.5 ms per row, bits equal to cuBLAS's at M >= 5 (stage-0 probe).  The
+     * router stays on nt.  Same bf16 activation bytes as every other arm. */
+    if (pulsar_gpu_matmul_batch_mneutral() > 0 && n_tok <= (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX &&
+        pulsar_ft_bf16_shape_ok(in_dim, out_dim)) {
+        static int said_ft_bf16 = 0;
+        if (!said_ft_bf16) {
+            said_ft_bf16 = 1;
+            fprintf(stderr, "pulsar: bf16 GEMM (in=%llu out=%llu) armed -> FIXED TILE "
+                            "(M-neutral tensor core, first seen at n_tok=%llu)\n",
+                    (unsigned long long)in_dim, (unsigned long long)out_dim,
+                    (unsigned long long)n_tok);
+        }
+        return pulsar_ft_bf16((float *)out->ptr, (const uint16_t *)xb16, w,
+                              (int)n_tok, (int)out_dim, (int)in_dim, NULL, 0);
+    }
     /* M-independence, same contract as the f16 and f32 arms.  All three arms now
      * read the SAME bf16 activation buffer built above, so they cannot disagree
      * on the operand at all and the only cross-arm difference left is

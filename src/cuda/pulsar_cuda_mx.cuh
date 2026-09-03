@@ -45,7 +45,7 @@ __host__ __device__ __forceinline__ static int pulsar_mx_rup(int x, int n) {
     return (x + n - 1) / n * n;
 }
 
-__device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
+__host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {   /* host too: the fixed-tile unit asserts it against CUTLASS's SF layout */
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
 }
