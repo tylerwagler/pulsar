@@ -110,13 +110,9 @@ int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
  * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
  * 0 restores the historical full-chunk buffers. */
 uint32_t gpu_graph_prefill_slice(void) {
-    static long cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("PULSAR_PREFILL_SLICE");
-        long v = (e && e[0]) ? strtol(e, NULL, 10) : 512;
-        cached = v > 0 ? v : 0;
-    }
-    return (uint32_t)cached;
+    /* The prefill score slice, in rows.  The env override had no caller
+     * (L159 inc 4); one number, one place. */
+    return 512u;
 }
 
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
@@ -240,22 +236,7 @@ void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t) {
 /* Encode one DS4 decode layer on GPU.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
-bool gpu_graph_indexer_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        uint32_t    n_comp,
-        double     *stage_t0);
 
-
-bool gpu_graph_layer_stage_profile_boundary(
-        const char *part,
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0);
 
 
 

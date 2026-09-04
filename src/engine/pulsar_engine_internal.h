@@ -973,7 +973,6 @@ typedef struct {
     pulsar_gpu_tensor *dspark_conf_tokens;  ///< [16] i32 refined draft ids
     pulsar_gpu_tensor *dspark_embed_tokens;  ///< [16] i32 draft ids for the embed upload (L104 fix B: was a cudaMalloc/free PER DRAFTER FORWARD in gpu_decode)
     pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
-    pulsar_gpu_tensor *dspark_refined2_ids;  ///< [17] i32 runner-ups (DTree)
     pulsar_gpu_tensor *dspark_prefilter_sel;  ///< L149: [16 x PULSAR_DSPARK_PREFILTER_ROW_I32] i32 min-p prefilter output rows
     pulsar_gpu_tensor *dspark_bank_meta;      ///< L150: [2 x PULSAR_DSPARK_BANKS_MAX] i32: per-bank base row, per-bank sampled prev token
     pulsar_gpu_tensor *dspark_row_meta;       ///< L150: [7 x PULSAR_SPEC_LOGITS_ROWS] i32 per-row rope/visibility positions per layer + bank id for the banked drafter forward
@@ -1544,15 +1543,9 @@ typedef struct pulsar_spec_carry_state {
     float spec_carry_top_p;  ///< top-p the carry was drawn under
     float spec_carry_min_p;  ///< min-p the carry was drawn under
     int spec_carry_top_k;    ///< top-k the carry was drawn under; a change voids the carry
-    /** DTree Phase 0 (PULSAR_DTREE_STATS): the drafter #2 token for each
-     * pending draft, carried from the drafting step to the verify step so a
-     * rejection can be scored p2 = P(target correction == drafter #2 | #1
-     * rejected), bucketed by conf. Measurement-only. */
-    int32_t dspark_pending_alt[16];
     /** Confidence-head score per pending draft, carried draft->verify. Stored
      * UNCONDITIONALLY (-1 when the head didn't run): the L107 adaptive-depth
-     * controller reads the verified chain's tail confidence in round_end, and
-     * DTREE_V reuses it under PULSAR_DTREE_STATS. */
+     * controller reads the verified chain's tail confidence in round_end. */
     float   dspark_pending_conf[16];
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
@@ -2068,8 +2061,6 @@ void pulsar_die_errno(const char *what, const char *path);
 bool pulsar_streq(pulsar_str s, const char *z);
 bool pulsar_str_eq(pulsar_str a, pulsar_str b);
 uint64_t hash_bytes(const void *ptr, uint64_t len);
-void pulsar_alloc_guard_begin(const char *phase);
-void pulsar_alloc_guard_end(void);
 void *xcalloc(size_t n, size_t size);
 void *xmalloc(size_t size);
 char *pulsar_strdup(const char *s);
@@ -2188,6 +2179,7 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
 /** True when PULSAR_CUDA_GRAPH_DUMP_PREFIX is set (cached). Graph allocation
  * uses this to skip buffers that exist only to be dumped. */
 bool gpu_graph_debug_dump_enabled(void);
+const char *gpu_graph_debug_dump_prefix(void);
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
 /** The predicate every f32 store-skip must use: true when EITHER observer (the
  * dump or the range sweep) will read the bytes.  See the definition's comment
@@ -2613,20 +2605,6 @@ bool gpu_graph_warmup_prefill_kernels(
         const pulsar_model   *model,
         const pulsar_weights *weights,
         uint32_t           n_tokens);
-bool gpu_graph_indexer_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        uint32_t    n_comp,
-        double     *stage_t0);
-bool gpu_graph_layer_stage_profile_boundary(
-        const char *part,
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0);
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,

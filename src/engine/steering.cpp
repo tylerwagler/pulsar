@@ -124,33 +124,45 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
  * MoE gate/up staging slabs are written by the routed-expert kernels and read by
  * nothing except gpu_graph_debug_dump_tensor, yet cost ~400 MB per session at
  * the default prefill_cap and ~2-4 MB/token of pointless device writes. */
-bool gpu_graph_debug_dump_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
+/* The graph-dump knobs, parsed ONCE (L159 inc 4).  The filters used to be
+ * re-read from the environment on every dump call -- three getenv scans per
+ * tensor per layer whenever dumping was armed.  One struct, one parse. */
+struct gpu_graph_dump_cfg {
+    int         enabled;      ///< PULSAR_CUDA_GRAPH_DUMP_PREFIX set
+    const char *prefix;       ///< file prefix
+    const char *name;         ///< PULSAR_CUDA_GRAPH_DUMP_NAME substring filter, or NULL
+    long        layer;        ///< PULSAR_CUDA_GRAPH_DUMP_LAYER, -1 = all
+    long        pos;          ///< PULSAR_CUDA_GRAPH_DUMP_POS, -1 = all
+};
+static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
+    static gpu_graph_dump_cfg cfg;
+    static int parsed = 0;
+    if (!parsed) {
+        parsed = 1;
         const char *p = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
-        enabled = (p && p[0]) ? 1 : 0;
+        cfg.enabled = (p && p[0]) ? 1 : 0;
+        cfg.prefix = cfg.enabled ? p : NULL;
+        const char *n = getenv("PULSAR_CUDA_GRAPH_DUMP_NAME");
+        cfg.name = (n && n[0]) ? n : NULL;
+        const char *l = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
+        cfg.layer = (l && l[0] && strcmp(l, "all") != 0) ? (long)strtoul(l, NULL, 10) : -1;
+        const char *q = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
+        cfg.pos = (q && q[0]) ? (long)strtoul(q, NULL, 10) : -1;
     }
-    return enabled != 0;
+    return &cfg;
 }
-
+bool gpu_graph_debug_dump_enabled(void) {
+    return gpu_graph_dump_cfg_get()->enabled != 0;
+}
+const char *gpu_graph_debug_dump_prefix(void) {
+    return gpu_graph_dump_cfg_get()->prefix;
+}
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    /* Called ~60x/layer x 43 layers/token on the release decode path, where it
-     * is a no-op unless dumping is enabled.  Cache the enabled flag so the
-     * common (disabled) case costs one branch, not a linear environ scan per
-     * call.  The dump env vars are read once at process start like every other
-     * flag; caching does not change runtime behavior. */
-    if (!gpu_graph_debug_dump_enabled()) return false;
-
-    const char *name_env = getenv("PULSAR_CUDA_GRAPH_DUMP_NAME");
-    if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
-
-    const char *layer_env = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
-    if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
-        (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
-
-    const char *pos_env = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
-    if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
-
+    const gpu_graph_dump_cfg *c = gpu_graph_dump_cfg_get();
+    if (!c->enabled) return false;
+    if (c->name && strstr(c->name, name) == NULL) return false;
+    if (c->layer >= 0 && (uint32_t)c->layer != il) return false;
+    if (c->pos >= 0 && (uint32_t)c->pos != pos) return false;
     return true;
 }
 

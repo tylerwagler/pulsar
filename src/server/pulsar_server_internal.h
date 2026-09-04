@@ -1292,7 +1292,6 @@ struct server {
      * The 2026-08-09 TEB investigation measured +-10 final points of history
      * dependence on identical requests at temperature 0; this flag is how an
      * eval pins behavior WITHOUT changing production defaults. */
-    bool         eval_pin;
     uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
     uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
     uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)

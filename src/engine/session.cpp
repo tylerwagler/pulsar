@@ -503,14 +503,6 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     l->ffn_down_exps->type == PULSAR_TENSOR_CUTLASS_MXFP4) n_grouped++;
                 else n_tiled++;
             }
-            if (getenv("PULSAR_DUMP_MOE_TYPES")) {
-                for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                    const pulsar_layer_weights *l = &e->weights.layer[il];
-                    if (!l->ffn_gate_exps || !l->ffn_down_exps) continue;
-                    fprintf(stderr, "MOETYPES layer %u gate=%u down=%u\n",
-                            il, l->ffn_gate_exps->type, l->ffn_down_exps->type);
-                }
-            }
             if (ml) {
                 const uint32_t gt = ml->ffn_gate_exps->type;
                 const uint32_t dt = ml->ffn_down_exps->type;
@@ -1320,7 +1312,6 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
      * above already establishes that the counters were this bank's truth on
      * entry. Both conditions are required; neither alone is enough. Nothing
      * here weakens pulsar_session_decode_mixed's contract for its own callers. */
-    pulsar_alloc_guard_begin("decode");
     int     ms_tok[1]  = { token };
     int32_t ms_pos[1]  = { (int32_t)s->checkpoint.len };
     int32_t ms_bank[1] = { (int32_t)(s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u) };
@@ -1330,7 +1321,6 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
                                                       s->logits, NULL, 0u,
                                                       /*capture_cur=*/true);
     const bool decode_ok = (ms_rc == 1);
-    pulsar_alloc_guard_end();
     if (!decode_ok) {
         snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
         s->checkpoint_valid = false;

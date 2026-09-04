@@ -1742,38 +1742,6 @@ int sample_top_p_min_p(
 
 
 
-static void print_top_logits(
-        FILE          * fp,
-        const char    * label,
-        const pulsar_vocab * vocab,
-        const float   * logits,
-        uint32_t        n_vocab,
-        int             k) {
-    int best[16];
-    if (k > 16) k = 16;
-    for (int i = 0; i < k; i++) best[i] = -1;
-
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        for (int j = 0; j < k; j++) {
-            if (best[j] < 0 || logits[i] > logits[best[j]]) {
-                for (int l = k - 1; l > j; l--) best[l] = best[l - 1];
-                best[j] = (int)i;
-                break;
-            }
-        }
-    }
-
-    fprintf(fp, "pulsar: top logits %s:\n", label);
-    for (int i = 0; i < k && best[i] >= 0; i++) {
-        const int id = best[i];
-        fprintf(fp, "  %2d %7d % .9g  ", i, id, logits[id]);
-        if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%.*s", (int)vocab->token[id].len, vocab->token[id].ptr);
-        }
-        fputc('\n', fp);
-    }
-}
-
 
 
 
@@ -1828,12 +1796,8 @@ int generate_gpu_graph_raw_swa(
         gpu_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("PULSAR_CUDA_MEMORY_REPORT") != NULL;
-    if (memory_report) pulsar_gpu_print_memory_report("after graph alloc");
 
     float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
-    const bool trace_top = getenv("PULSAR_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("PULSAR_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -1849,21 +1813,11 @@ int generate_gpu_graph_raw_swa(
                                          NULL, NULL, NULL);
     }
     const double t_prefill1 = now_sec();
-    if (memory_report) pulsar_gpu_print_memory_report("after prefill");
 
     if (!ok) {
         free(logits);
         gpu_graph_free(&g);
         return 1;
-    }
-    const char *dump_prefill_logits = getenv("PULSAR_CUDA_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, PULSAR_N_VOCAB)) {
-            free(logits);
-            gpu_graph_free(&g);
-            return 1;
-        }
-        fprintf(stderr, "pulsar: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
     int pos = prompt->len;
@@ -1871,11 +1825,6 @@ int generate_gpu_graph_raw_swa(
     int n_decode_eval = 0;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, PULSAR_N_VOCAB, 10);
-        }
 
         int token = sample_argmax(logits, PULSAR_N_VOCAB);
         if (token == vocab->eos_id) break;
@@ -1888,7 +1837,6 @@ int generate_gpu_graph_raw_swa(
             break;
         }
 
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
         /* ONE LANE (L131).  This used to call gpu_graph_eval_token_raw_swa --
          * the separate single-token graph encoder -- while the server decoded
          * through gpu_graph_decode_multiseq_batch.  Two encoders meant this
@@ -1909,10 +1857,6 @@ int generate_gpu_graph_raw_swa(
                                              logits, NULL, 0u,
                                              /*capture_cur=*/true) == 1;
         if (!ok) break;
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "pulsar: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
         n_decode_eval++;
         pos++;
     }
@@ -1927,7 +1871,6 @@ int generate_gpu_graph_raw_swa(
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
-    if (memory_report) pulsar_gpu_print_memory_report("before graph free");
     free(logits);
     gpu_graph_free(&g);
     return ok ? 0 : 1;

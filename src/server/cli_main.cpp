@@ -5,124 +5,6 @@
 #include <malloc.h>
 
 
-/* =========================================================================
- * F1 memory diagnostics (env-gated sampler).
- *
- * PULSAR_SERVER_MEMDIAG=<path>|1|stderr — read ONCE at startup (no-hot-path-
- * flags rule) — starts a low-rate (200 ms) sampler thread that emits one
- * line per sample: process RSS/HWM/swap, system MemAvailable/Free/Cached/
- * Dirty/Writeback, CUDA free/total, the live pulsar_gpu tensor byte counter,
- * the admission ledger, and the glibc heap footprint (mallinfo2).  All
- * values in MiB.  Purely observational: it takes s->mu only to read the
- * ledger, exactly like the scheduler's own logging.
- * ========================================================================= */
-
-/** Background memory-diagnostic sampler: polls the process's memory figures on
- * its own thread and writes them to `out`. Diagnostic-only, off by default. */
-typedef struct {
-    server *s;         ///< the server being sampled
-    FILE   *out;       ///< where samples are written
-    pthread_t thread;  ///< the sampling thread
-    bool    running;   ///< clear to ask the thread to exit
-} memdiag;
-
-/* Sum of the given keys' kB values from a /proc status-style file; keys[i]
- * match line prefixes ("VmRSS:").  Values land in out_kib[i] (0 if absent). */
-static void memdiag_scan_kib(const char *path, const char *const *keys,
-                             uint64_t *out_kib, int n) {
-    for (int i = 0; i < n; i++) out_kib[i] = 0;
-    FILE *fp = fopen(path, "r");
-    if (!fp) return;
-    char line[256];
-    while (fgets(line, sizeof(line), fp)) {
-        for (int i = 0; i < n; i++) {
-            const size_t klen = strlen(keys[i]);
-            if (!strncmp(line, keys[i], klen)) {
-                unsigned long long v = 0;
-                if (sscanf(line + klen, " %llu kB", &v) == 1) out_kib[i] = v;
-            }
-        }
-    }
-    fclose(fp);
-}
-
-static void *memdiag_main(void *ud) {
-    memdiag *d = (memdiag *)ud;
-    server *s = d->s;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    const double MIB = 1024.0 * 1024.0;
-    for (;;) {
-        pthread_mutex_lock(&s->mu);
-        const bool stop = s->stopping;
-        const uint64_t ledger = s->kv_committed_bytes;
-        pthread_mutex_unlock(&s->mu);
-        if (stop) break;
-
-        static const char *const skeys[] = {"VmRSS:", "VmHWM:", "VmSwap:"};
-        static const char *const mkeys[] = {"MemAvailable:", "MemFree:",
-                                            "Cached:", "Dirty:", "Writeback:"};
-        uint64_t sv[3], mv[5];
-        memdiag_scan_kib("/proc/self/status", skeys, sv, 3);
-        memdiag_scan_kib("/proc/meminfo", mkeys, mv, 5);
-        uint64_t cuda_free = 0, cuda_total = 0;
-        pulsar_gpu_mem_info(&cuda_free, &cuda_total);
-        struct mallinfo2 mi = mallinfo2();
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 +
-                          (t1.tv_nsec - t0.tv_nsec) / 1e6;
-        fprintf(d->out,
-                "memdiag ms=%.0f rss=%.1f hwm=%.1f swap=%.1f "
-                "avail=%.1f memfree=%.1f cached=%.1f dirty=%.1f wb=%.1f "
-                "cudafree=%.1f cudatotal=%.1f gputensor=%.1f ledger=%.1f "
-                "heap=%.1f heapmmap=%.1f heapused=%.1f\n",
-                ms, sv[0] / 1024.0, sv[1] / 1024.0, sv[2] / 1024.0,
-                mv[0] / 1024.0, mv[1] / 1024.0, mv[2] / 1024.0,
-                mv[3] / 1024.0, mv[4] / 1024.0,
-                (double)cuda_free / MIB, (double)cuda_total / MIB,
-                (double)pulsar_gpu_tensor_alloc_bytes_current() / MIB,
-                (double)ledger / MIB,
-                (double)mi.arena / MIB, (double)mi.hblkhd / MIB,
-                (double)mi.uordblks / MIB);
-        fflush(d->out);
-        struct timespec nap = {0, 200 * 1000 * 1000};
-        nanosleep(&nap, NULL);
-    }
-    if (d->out != stderr) fclose(d->out);
-    return NULL;
-}
-
-/* Env is read here, once, before any request runs; returns false when the
- * diagnostic is off.  Caller joins d->thread at shutdown iff d->running. */
-static bool memdiag_start(memdiag *d, server *s) {
-    memset(d, 0, sizeof(*d));
-    const char *v = getenv("PULSAR_SERVER_MEMDIAG");
-    if (!v || !v[0]) return false;
-    d->s = s;
-    d->out = stderr;
-    if (strcmp(v, "1") != 0 && strcmp(v, "stderr") != 0) {
-        d->out = fopen(v, "w");
-        if (!d->out) {
-            server_log(PULSAR_LOG_WARNING,
-                       "pulsar-server: PULSAR_SERVER_MEMDIAG: cannot open %s: %s "
-                       "(sampling to stderr)", v, strerror(errno));
-            d->out = stderr;
-        }
-    }
-    if (pthread_create(&d->thread, NULL, memdiag_main, d) != 0) {
-        server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: PULSAR_SERVER_MEMDIAG: sampler thread failed to start");
-        if (d->out != stderr) fclose(d->out);
-        return false;
-    }
-    d->running = true;
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: memory diagnostics sampler on (%s)",
-               d->out == stderr ? "stderr" : v);
-    return true;
-}
-
-
 
 /* =========================================================================
  * Startup warmup generation (F1 unledgered-spike fix, task #32).
@@ -294,18 +176,6 @@ static bool server_overcommit_enabled(void) {
     return !(v[0] == '0' || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
 
-/* Optional per-bank touched-KV reservation for the overcommit fit: the ctx whose
- * demand-paged comp/index cost is charged per bank at admission (headroom so a
- * bank that grows to this depth was pre-admitted). Default 0 => pure overcommit
- * (charge only the eager floor). Clamped to non-negative; garbage => 0. */
-static int server_overcommit_reserve_ctx(void) {
-    const char *v = getenv("PULSAR_OVERCOMMIT_RESERVE_CTX");
-    if (!v || !v[0]) return 0;
-    char *end = NULL;
-    long n = strtol(v, &end, 10);
-    if (end == v || (end && *end != '\0') || n < 0 || n > INT_MAX) return 0;
-    return (int)n;
-}
 
 
 
@@ -698,7 +568,7 @@ int main(int argc, char **argv) {
      * LRU-idle eviction before the physical budget is breached; see
      * server_overcommit_enabled). PULSAR_OVERCOMMIT=0 reverts to full-charge N=1. */
     const bool overcommit = server_overcommit_enabled();
-    uint64_t oc_shared = 0, oc_eager_pb = 0, oc_expect_pb = 0, oc_demand_pb = 0;
+    uint64_t oc_shared = 0, oc_eager_pb = 0, oc_demand_pb = 0;
     if (overcommit) {
         const uint64_t banked1 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 1);
         const uint64_t banked2 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 2);
@@ -706,9 +576,6 @@ int main(int argc, char **argv) {
         oc_demand_pb = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
         oc_eager_pb = marginal > oc_demand_pb ? marginal - oc_demand_pb : 0;
         oc_shared = banked1 > marginal ? banked1 - marginal : 0;
-        const int reserve_ctx = server_overcommit_reserve_ctx();
-        oc_expect_pb = reserve_ctx > 0
-            ? pulsar_engine_demand_paged_bytes_per_bank(engine, reserve_ctx) : 0;
     }
 
     int pool_pinned = 0;
@@ -753,7 +620,7 @@ int main(int argc, char **argv) {
         int chosen = 1;
         if (overcommit) {
             for (int N = pool_auto_max; N >= 1; N--) {
-                const uint64_t cost = oc_shared + (uint64_t)N * (oc_eager_pb + oc_expect_pb);
+                const uint64_t cost = oc_shared + (uint64_t)N * oc_eager_pb;
                 if (server_kv_admits(kv_budget, 0, cost)) { chosen = N; break; }
             }
         } else {
@@ -767,13 +634,13 @@ int main(int argc, char **argv) {
         if (overcommit) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: Tier-2 OVERCOMMIT auto-sized to %d bank(s) for --ctx %d: "
-                       "eager floor %.2f GiB/bank + reserve %.2f GiB/bank charged; "
+                       "eager floor %.2f GiB/bank charged; "
                        "demand-paged VA %.2f GiB/bank reserved (physical on touch, NOT "
                        "charged); shared %.2f GiB; admission est %.2f GiB (batching %s)",
                        chosen, cfg.ctx_size,
-                       (double)oc_eager_pb / gib, (double)oc_expect_pb / gib,
+                       (double)oc_eager_pb / gib,
                        (double)oc_demand_pb / gib, (double)oc_shared / gib,
-                       (double)(oc_shared + (uint64_t)chosen * (oc_eager_pb + oc_expect_pb)) / gib,
+                       (double)(oc_shared + (uint64_t)chosen * oc_eager_pb) / gib,
                        chosen > 1 ? "ON" : "OFF");
         } else {
             server_log(PULSAR_LOG_DEFAULT,
@@ -792,7 +659,7 @@ int main(int argc, char **argv) {
     uint64_t overcommit_admission_est = 0;
     if (overcommit) {
         const long finalN = (long)pulsar_engine_bank_pool(NULL);
-        overcommit_admission_est = oc_shared + (uint64_t)finalN * (oc_eager_pb + oc_expect_pb);
+        overcommit_admission_est = oc_shared + (uint64_t)finalN * oc_eager_pb;
     }
     const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;
     server_log(PULSAR_LOG_DEFAULT,
@@ -957,13 +824,8 @@ int main(int argc, char **argv) {
         const char *mb = getenv("PULSAR_MIXED_BATCH");
         s.mixed_batch_enabled = s.pool_banks > 0 &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
-        const char *mc = getenv("PULSAR_MIXED_CHUNK");
-        int kc = mc ? atoi(mc) : 8;
-        if (kc < 1) kc = 1;
-        s.mixed_chunk_tokens = kc;
-        const char *mg = getenv("PULSAR_MIXED_DEEP_GUARD_ROWS");
-        s.mixed_deep_guard_rows = mg ? atoi(mg) : 16384;
-        if (s.mixed_deep_guard_rows < 0) s.mixed_deep_guard_rows = 0;
+        s.mixed_chunk_tokens = 8;          /* the env knobs for these had no caller (L159 inc 4) */
+        s.mixed_deep_guard_rows = 16384;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: fused mixed-batch lane %s (chunk=%d/step, deep guard=%d rows)",
                    s.mixed_batch_enabled ? "ENABLED (default; opt out with PULSAR_MIXED_BATCH=0)"
@@ -989,13 +851,6 @@ int main(int argc, char **argv) {
         }
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm-fork routing %s (partial-min %d)",
                    s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
-        const char *ep = getenv("PULSAR_EVAL_PIN");
-        s.eval_pin = ep && ep[0] == '1' && ep[1] == '\0';
-        if (s.eval_pin)
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: EVAL PIN active (PULSAR_EVAL_PIN=1): "
-                       "thinking-bind, warm-fork and prefix continuation OFF; "
-                       "every request cold-prefills (reproducible, slower)");
     }
     s.n_slots = 1;
     s.kv_budget_bytes = kv_budget_final;
@@ -1037,31 +892,10 @@ int main(int argc, char **argv) {
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
         uint64_t budget = kv_budget_final;
-        const char *ov = getenv("PULSAR_SERVER_KV_BUDGET_OVERRIDE");
-        if (ov && ov[0]) {
-            unsigned long long b = strtoull(ov, NULL, 10);
-            if (b > 0) { budget = (uint64_t)b;
-                server_log(PULSAR_LOG_WARNING,
-                    "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test hook)",
-                    (double)budget / (1024.0*1024.0*1024.0)); }
-        }
         s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
         s.guard_touched_budget = budget > s.guard_eager_bytes
                                ? budget - s.guard_eager_bytes : 0;
-        /* Direct touched-budget override (bytes) for the memory-safety smoke: sets
-         * the resident demand-paged-KV ceiling the guard keeps under, so it fires
-         * at a precise modest fill while the box stays far from real OOM. */
-        const char *tb = getenv("PULSAR_SERVER_GUARD_TOUCHED_BUDGET");
-        if (tb && tb[0]) {
-            unsigned long long b = strtoull(tb, NULL, 10);
-            if (b > 0) { s.guard_touched_budget = (uint64_t)b;
-                server_log(PULSAR_LOG_WARNING,
-                    "pulsar-server: guard: touched budget OVERRIDDEN to %.3f GiB (test hook)",
-                    (double)s.guard_touched_budget / (1024.0*1024.0*1024.0)); }
-        }
-        const char *sd = getenv("PULSAR_SERVER_SPILL_DIR");
-        snprintf(s.spill_dir, sizeof s.spill_dir, "%s",
-                 (sd && sd[0]) ? sd : "./ds4-spill");
+        snprintf(s.spill_dir, sizeof s.spill_dir, "%s", "./ds4-spill");
         (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */
         /* Reclaim orphaned spill temporaries.  spill_bank writes
          * "spill-bank-<n>.kv.tmp.<pid>" and renames it into place, so a tmp file
@@ -1190,9 +1024,6 @@ int main(int argc, char **argv) {
      * engine access. */
     s.publish_metrics_snapshot();
 
-    memdiag mdiag;
-    const bool mdiag_on = memdiag_start(&mdiag, &s);
-
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
@@ -1204,7 +1035,6 @@ int main(int argc, char **argv) {
         pthread_cond_broadcast(&s.cv);
         pthread_mutex_unlock(&s.mu);
         pthread_join(worker, NULL);
-        if (mdiag_on) pthread_join(mdiag.thread, NULL);
         s.close_resources();
         return 1;
     }
@@ -1261,7 +1091,6 @@ int main(int argc, char **argv) {
     pthread_cond_broadcast(&s.cv);
     pthread_mutex_unlock(&s.mu);
     pthread_join(worker, NULL);
-    if (mdiag_on) pthread_join(mdiag.thread, NULL);
     {
         pulsar::ScopedLock lk(&s.mu);
         while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);

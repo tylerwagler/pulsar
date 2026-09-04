@@ -21,44 +21,6 @@ uint64_t argmax_f32(const float *x, uint64_t n) {
 
 
 
-/* ---- f16-viability range sweep (diagnostic) -----------------------------
- *
- * PULSAR_CUDA_RANGE_SWEEP=1 turns every debug-dump point into a range probe
- * instead of a file dump, so one prefill answers "can this f32 staging buffer
- * be f16?" for every named tensor at every layer.  Env is read once. */
-namespace {
-struct range_acc {
-    double amax = 0.0, amin = 0.0;
-    double n_over = 0, n_sub = 0, n_inf = 0, n_nan = 0;
-    unsigned long long calls = 0;
-    unsigned long long n_elem = 0;   /* elements per call (the buffer's live extent) */
-    double int8_vs_e4m3 = -1.0;      /* relative L2, our int8 acts vs the source's E4M3 */
-};
-std::map<std::string, range_acc> g_range;
-
-bool range_sweep_on(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("PULSAR_CUDA_RANGE_SWEEP"); on = (e && e[0] == '1') ? 1 : 0; }
-    return on != 0;
-}
-
-void range_sweep_report(void) {
-    fprintf(stderr, "\n=== f16 RANGE SWEEP (f16 max 65504, min normal 6.1035e-05) ===\n");
-    fprintf(stderr, "%-26s %12s %12s %10s %12s %10s %8s %6s\n",
-            "tensor", "max|v|", "min|v|!=0", "n>65504", "n<6.1e-5", "n_inf", "n_NaN", "calls");
-    fprintf(stderr, "%-26s %12s %10s\n", "", "MiB/call", "elems");
-    for (const auto &kv : g_range) {
-        const range_acc &a = kv.second;
-        fprintf(stderr, "%-26s %12.4g %12.4g %10.0f %12.0f %10.0f %8.0f %6llu%s\n",
-                kv.first.c_str(), a.amax, a.amin, a.n_over, a.n_sub, a.n_inf, a.n_nan, a.calls,
-                (a.n_over > 0 || a.n_nan > 0) ? "   <-- F16 UNSAFE" : "");
-        fprintf(stderr, "%-26s %12.2f %10llu   int8-vs-E4M3 relL2 %7.3f%%\n", "",
-                (double)a.n_elem * 4.0 / (1024.0 * 1024.0), a.n_elem,
-                a.int8_vs_e4m3 >= 0.0 ? 100.0 * a.int8_vs_e4m3 : -1.0);
-    }
-    fprintf(stderr, "=== END RANGE SWEEP ===\n");
-}
-}  /* namespace */
 
 /* "Will anything OBSERVE these f32 bytes?" -- the question every f32
  * store-skip actually has to ask, which is NOT the same question as "should
@@ -75,11 +37,11 @@ void range_sweep_report(void) {
  * Named for the invariant rather than for either observer, so adding a third
  * observer is one edit here instead of a hunt through the skip sites. */
 bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos) {
-    return range_sweep_on() || gpu_graph_debug_wants(name, il, pos);
+    return gpu_graph_debug_wants(name, il, pos);
 }
 
 bool gpu_graph_f32_store_observed_any(void) {
-    return range_sweep_on() || gpu_graph_debug_dump_enabled();
+    return gpu_graph_debug_dump_enabled();
 }
 
 
@@ -89,24 +51,8 @@ void gpu_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    if (range_sweep_on()) {
-        if (!t || n_f32 == 0) return;
-        double s5[6] = {0,0,0,0,0,0};
-        if (!pulsar_gpu_tensor_range_stats(t, n_f32, s5)) return;
-        static bool hooked = false;
-        if (!hooked) { atexit(range_sweep_report); hooked = true; }
-        range_acc &a = g_range[name];
-        a.n_elem = n_f32;
-        const double dv = pulsar_gpu_tensor_int8_vs_e4m3(t, n_f32);
-        if (dv >= 0.0 && dv > a.int8_vs_e4m3) a.int8_vs_e4m3 = dv;
-        if (s5[0] > a.amax) a.amax = s5[0];
-        if (s5[1] > 0.0 && (a.amin == 0.0 || s5[1] < a.amin)) a.amin = s5[1];
-        a.n_over += s5[2]; a.n_sub += s5[3]; a.n_inf += s5[4]; a.n_nan += s5[5];
-        a.calls++;
-        return;
-    }
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -143,7 +89,7 @@ void gpu_graph_debug_dump_hc_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -180,7 +126,7 @@ void gpu_graph_debug_dump_q_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -214,7 +160,7 @@ void gpu_graph_debug_dump_i32_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -545,39 +491,6 @@ uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
 
 
 
-/* PULSAR_KV_MANAGED: measurement override for the managed-vs-device placement of
- * the PERSISTENT KV caches (raw ring + attn/index comp caches), for the
- * multi-session UVM over-provisioning design (plan addendum 2026-07-14 —
- * first-touch fault cost must be measured before committing to
- * always-managed slot KV). Unset/empty → the size-based policy
- * (pulsar_gpu_should_use_managed_kv_cache) decides, as before. "1"/"on" →
- * force cudaMallocManaged; "0"/"off"/"false" → force device cudaMalloc.
- * Read once per process (static cache) and consulted only at graph
- * allocation (session create) — never on a token/layer path. */
-static int gpu_graph_kv_managed_override(void) {
-    static int cached = -2;
-    if (cached == -2) {
-        const char *v = getenv("PULSAR_KV_MANAGED");
-        if (!v || !v[0]) {
-            cached = -1;
-        } else if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
-                   strcasecmp(v, "false") == 0) {
-            cached = 0;
-        } else if (strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
-                   strcasecmp(v, "true") == 0) {
-            cached = 1;
-        } else {
-            /* Unrecognized values fall back to the size policy instead of
-             * silently force-flipping a measurement flag (a typo'd "of[f]"
-             * must not force-manage the KV of a 128 GB box). */
-            fprintf(stderr,
-                    "pulsar: PULSAR_KV_MANAGED=\"%s\" not recognized "
-                    "(want 1/on/true or 0/off/false); using size policy\n", v);
-            cached = -1;
-        }
-    }
-    return cached;
-}
 
 
 
@@ -1803,20 +1716,8 @@ bool gpu_graph_alloc_raw_cap(
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         gpu_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
-    const int managed_override = gpu_graph_kv_managed_override();
-    const bool managed_kv_cache = managed_override >= 0
-        ? managed_override != 0
-        : pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
-    if (managed_override >= 0) {
-        fprintf(stderr,
-                "pulsar: PULSAR_KV_MANAGED override: KV caches use %s allocation "
-                "(measurement flag; policy would have chosen %s)\n",
-                managed_kv_cache ? "MANAGED (cudaMallocManaged)"
-                                 : "DEVICE (cudaMalloc)",
-                pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes,
-                                                    context_bytes) != 0
-                    ? "managed" : "device");
-    }
+    const bool managed_kv_cache =
+        pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -2303,7 +2204,6 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         ok = ok && g->dspark_bank_meta;
         g->dspark_embed_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
         g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
-        g->dspark_refined2_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
         g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
             16ull * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
         g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
@@ -2316,7 +2216,7 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
              g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&
-             g->dspark_refined_ids && g->dspark_refined2_ids && g->dspark_prefilter_sel;
+             g->dspark_refined_ids && g->dspark_prefilter_sel;
     }
     /* spec_logits is NOT allocated here: it is the shared multi-row logits
      * slab, allocated unconditionally by gpu_graph_alloc_raw_cap (the batched

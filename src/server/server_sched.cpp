@@ -226,7 +226,6 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
     out->live_cut = 0;
     out->prompt_cut = 0;
     out->seamed = false;
-    if (s->eval_pin) return;     /* choke point: no prefix reuse, ever */
     if (!sl || !sl->provisioned) return;
     if (s->pool_banks > 0)
         pulsar_session_bank_prefix_match(s->sess, sl->bank, prompt, out);

@@ -33,20 +33,6 @@ void imatrix_collector_free(pulsar_imatrix_collector *c) {
 
 
 
-/** PULSAR_CUDA_GRAPH_OUTPUT_ROW (diagnostic): read the head off a row other than
- * the chunk's last.  One parser for the two batched prefill entries -- they
- * carried identical copies (L153 survey), and a diagnostic knob parsed twice is
- * two places that must agree with nothing enforcing it. */
-static uint32_t graph_output_row_override(uint32_t output_row, uint32_t n_tokens) {
-    const char *env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && v < (unsigned long)n_tokens) output_row = (uint32_t)v;
-    }
-    return output_row;
-}
-
 static float *imatrix_gate_up_ptr(pulsar_imatrix_collector *c, uint32_t il, uint32_t expert) {
     return c->gate_up_sum2 + ((size_t)il * PULSAR_N_EXPERT + expert) * PULSAR_N_EMBD;
 }
@@ -432,7 +418,6 @@ static bool gpu_graph_prefill_layer_major_inner(
      * by gpu_graph_prefill_chunked_range after the chunk syncs. */
     g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
 
-    const bool split_profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy for a long time. Split
      * non-tiny prefills when a frontend asked for display progress: completed
@@ -445,12 +430,7 @@ static bool gpu_graph_prefill_layer_major_inner(
      * so per-layer progress drains the async launch pipeline 43x/chunk. Chunk-
      * level progress (gpu_graph_prefill_chunked_range) still fires; intra-chunk
      * progress is dropped in favor of throughput. */
-    const bool split_commands = split_profile ||
-                                n_tokens > 2048 || imatrix != NULL;
-    const bool profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
-    const double t0 = profile ? now_sec() : 0.0;
-    double encode_s = 0.0;
-    double execute_s = 0.0;
+    const bool split_commands = n_tokens > 2048 || imatrix != NULL;
 
     if (!split_commands) {
         ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -483,7 +463,6 @@ static bool gpu_graph_prefill_layer_major_inner(
 
         const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        output_row = graph_output_row_override(output_row, n_tokens);
         pulsar_gpu_tensor *saved_cur = g->cur_hc;
         pulsar_gpu_tensor *last_hc = NULL;
         if (ok && logits) {
@@ -496,9 +475,7 @@ static bool gpu_graph_prefill_layer_major_inner(
             g->cur_hc = saved_cur;
         }
 
-        const double t_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = pulsar_gpu_end_commands() != 0;
-        const double t_done = profile ? now_sec() : 0.0;
         g->cur_hc = saved_cur;
         if (last_hc) pulsar_gpu_tensor_free(last_hc);
         if (!ok) {
@@ -508,24 +485,12 @@ static bool gpu_graph_prefill_layer_major_inner(
             return false;
         }
 
-        const double t_before_read = profile ? now_sec() : 0.0;
         if (logits) {
             ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-        }
-        if (profile) {
-            const double t_read = now_sec();
-            fprintf(stderr,
-                    "pulsar: gpu graph prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
-                    n_tokens,
-                    (t_encoded - t0) * 1000.0,
-                    (t_done - t_encoded) * 1000.0,
-                    (t_read - t_before_read) * 1000.0,
-                    (t_read - t0) * 1000.0);
         }
         return ok;
     }
 
-    double t_layer0 = profile ? now_sec() : 0.0;
     ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                  g->prefill_tokens,
                                                  model,
@@ -533,18 +498,6 @@ static bool gpu_graph_prefill_layer_major_inner(
                                                  prompt,
                                                  start,
                                                  n_tokens);
-    const double t_embed_encoded = profile ? now_sec() : 0.0;
-    const double t_embed_done = profile ? now_sec() : 0.0;
-    if (profile) {
-        encode_s += t_embed_encoded - t_layer0;
-        execute_s += t_embed_done - t_embed_encoded;
-        if (split_profile) {
-            fprintf(stderr,
-                    "pulsar: GPU layer-major prefill embed encode=%.3f ms execute=%.3f ms\n",
-                    (t_embed_encoded - t_layer0) * 1000.0,
-                    (t_embed_done - t_embed_encoded) * 1000.0);
-        }
-    }
     if (!ok) {
         if (pulsar_gpu_synchronize() == 0) {
             fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill embed failure also failed\n");
@@ -560,54 +513,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) layer_marker[il] = -1;
     uint32_t layers_reported = 0;
     for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-        if (split_profile) {
-            const double t_attn0 = now_sec();
-            ok = pulsar_gpu_begin_commands() != 0;
-            if (ok) ok = gpu_graph_encode_layer_attention_batch(g,
-                                                                  model,
-                                                                  &weights->layer[il],
-                                                                  il,
-                                                                  start,
-                                                                  n_tokens);
-            if (!ok) {
-                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u attention encode failed\n", il);
-            }
-            const double t_attn_encoded = now_sec();
-            if (ok) ok = pulsar_gpu_end_commands() != 0;
-            const double t_attn_done = now_sec();
-
-            const double t_ffn0 = now_sec();
-            if (ok) ok = pulsar_gpu_begin_commands() != 0;
-            if (ok) ok = gpu_graph_encode_layer_ffn_batch(g,
-                                                            model,
-                                                            &weights->layer[il],
-                                                            il,
-                                                            start,
-                                                            n_tokens);
-            if (!ok) {
-                fprintf(stderr, "pulsar: gpu layer-major prefill layer %u ffn encode failed\n", il);
-            }
-            if (ok) {
-                pulsar_gpu_tensor *tmp = g->batch_cur_hc;
-                g->batch_cur_hc = g->batch_next_hc;
-                g->batch_next_hc = tmp;
-            }
-            const double t_ffn_encoded = now_sec();
-            if (ok) ok = pulsar_gpu_end_commands() != 0;
-            const double t_ffn_done = now_sec();
-            if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
-
-            encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
-            execute_s += (t_attn_done - t_attn_encoded) + (t_ffn_done - t_ffn_encoded);
-            fprintf(stderr,
-                    "pulsar: GPU layer-major prefill layer %u attn encode=%.3f execute=%.3f ms ffn encode=%.3f execute=%.3f ms\n",
-                    il,
-                    (t_attn_encoded - t_attn0) * 1000.0,
-                    (t_attn_done - t_attn_encoded) * 1000.0,
-                    (t_ffn_encoded - t_ffn0) * 1000.0,
-                    (t_ffn_done - t_ffn_encoded) * 1000.0);
-        } else {
-            const double t_chunk0 = profile ? now_sec() : 0.0;
+        {
             ok = pulsar_gpu_begin_commands() != 0;
             if (ok) ok = gpu_graph_encode_layer_batch(g,
                                                         model,
@@ -618,26 +524,15 @@ static bool gpu_graph_prefill_layer_major_inner(
             if (!ok) {
                 fprintf(stderr, "pulsar: gpu layer-major prefill layer %u encode failed\n", il);
             }
-            const double t_encoded = profile ? now_sec() : 0.0;
             /* L142: the layer's only host-side consumers are the imatrix
              * collector (reads the layer's activations) and the profile timers.
              * Without them there is nothing to wait for: leave the stream
              * running, record a marker, and let the host encode the next layer
              * while this one executes.  The drain here was 43 idle bubbles per
              * prefill chunk, each the width of one layer's host encode. */
-            if (ok && (imatrix || profile)) ok = pulsar_gpu_end_commands() != 0;
+            if (ok && imatrix) ok = pulsar_gpu_end_commands() != 0;
             else if (ok) layer_marker[il] = pulsar_gpu_marker_record();
-            const double t_done = profile ? now_sec() : 0.0;
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
-            if (profile) {
-                encode_s += t_encoded - t_chunk0;
-                execute_s += t_done - t_encoded;
-                fprintf(stderr,
-                        "pulsar: gpu layer-major prefill layer %u encode=%.3f ms execute=%.3f ms\n",
-                        il,
-                        (t_encoded - t_chunk0) * 1000.0,
-                        (t_done - t_encoded) * 1000.0);
-            }
         }
         if (!ok) {
             if (pulsar_gpu_synchronize() == 0) {
@@ -709,11 +604,9 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    output_row = graph_output_row_override(output_row, n_tokens);
     pulsar_gpu_tensor *saved_cur = g->cur_hc;
     pulsar_gpu_tensor *last_hc = NULL;
 
-    const double t_head0 = profile ? now_sec() : 0.0;
     if (logits) {
         last_hc = gpu_graph_hc_row_view(g->batch_cur_hc,
                                           output_row,
@@ -725,34 +618,13 @@ static bool gpu_graph_prefill_layer_major_inner(
         ok = pulsar_gpu_begin_commands() != 0;
     }
     if (ok && logits) ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = pulsar_gpu_end_commands() != 0;
-    const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
     if (last_hc) pulsar_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
-    const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
         ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (profile) {
-        const double t_read = now_sec();
-        encode_s += t_head_encoded - t_head0;
-        execute_s += t_head_done - t_head_encoded;
-        if (split_profile) {
-            fprintf(stderr,
-                    "pulsar: gpu layer-major prefill head encode=%.3f ms execute=%.3f ms\n",
-                    (t_head_encoded - t_head0) * 1000.0,
-                    (t_head_done - t_head_encoded) * 1000.0);
-        }
-        fprintf(stderr,
-                "pulsar: gpu layer-major prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
-                n_tokens,
-                encode_s * 1000.0,
-                execute_s * 1000.0,
-                (t_read - t_before_read) * 1000.0,
-                (t_read - t0) * 1000.0);
     }
     return ok;
 }
@@ -835,8 +707,6 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    const bool profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_PROFILE") != NULL;
-    const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
 
     if (progress) {
@@ -916,15 +786,6 @@ bool gpu_graph_prefill_chunked_range(
         pos0 = chunk_end;
     }
     if (show_progress) fputc('\n', stderr);
-    if (profile) {
-        const double t_read = now_sec();
-        fprintf(stderr,
-                "pulsar: gpu chunked prefill start=%u tokens=%u chunk=%u total=%.3f ms\n",
-                start,
-                n_tokens,
-                chunk_cap,
-                (t_read - t0) * 1000.0);
-    }
     return true;
 }
 
@@ -996,12 +857,6 @@ bool gpu_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
-    /* Diagnostic flag: read the environment once per process (C has no
-     * static-initializer form for this, so use the repo's -1 sentinel idiom). */
-    static int timing_env = -1;
-    if (timing_env < 0) timing_env = getenv("PULSAR_SPEC_VERIFY_TIMING") != NULL;
-    const bool timing = timing_env != 0;
-    const double t0 = timing ? now_sec() : 0.0;
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
@@ -1010,11 +865,9 @@ bool gpu_graph_verify_suffix_tops(
                                                          prompt,
                                                          start,
                                                          n_tokens);
-    const double t_uploaded = timing ? now_sec() : 0.0;
     if (!ok) return false;
 
 
-    const double t_layers_encode0 = timing ? now_sec() : 0.0;
     ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
         ok = gpu_graph_encode_layer_batch(g,
@@ -1024,16 +877,13 @@ bool gpu_graph_verify_suffix_tops(
                                             start,
                                             n_tokens);
     }
-    const double t_layers_encoded = timing ? now_sec() : 0.0;
     if (ok) {
         ok = pulsar_gpu_end_commands() != 0;
     } else {
         (void)pulsar_gpu_synchronize();
     }
-    const double t_layers_done = timing ? now_sec() : 0.0;
     if (!ok) return false;
 
-    const double t_head_encode0 = timing ? now_sec() : 0.0;
     ok = pulsar_gpu_begin_commands() != 0;
     if (ok) ok = gpu_graph_encode_output_head_batch(g,
                                                       model,
@@ -1070,14 +920,11 @@ bool gpu_graph_verify_suffix_tops(
             }
         }
     }
-    const double t_head_encoded = timing ? now_sec() : 0.0;
     if (ok) {
         ok = pulsar_gpu_end_commands() != 0;
     } else {
         (void)pulsar_gpu_synchronize();
     }
-    const double t_head_done = timing ? now_sec() : 0.0;
-    const double t_read0 = timing ? now_sec() : 0.0;
     if (ok && top_rows) {
         ok = pulsar_gpu_tensor_read(g->comp_selected,
                                    0,
@@ -1089,21 +936,6 @@ bool gpu_graph_verify_suffix_tops(
                                    0,
                                    row_logits,
                                    (uint64_t)n_tokens * PULSAR_N_VOCAB * sizeof(row_logits[0])) != 0;
-    }
-    if (timing) {
-        const double t_done = now_sec();
-        fprintf(stderr,
-                "pulsar: spec verify suffix tokens=%u start=%u upload=%.3f ms layers_encode=%.3f ms layers_execute=%.3f ms head_encode=%.3f ms head_execute=%.3f ms read=%.3f ms total=%.3f ms ok=%d\n",
-                n_tokens,
-                start,
-                (t_uploaded - t0) * 1000.0,
-                (t_layers_encoded - t_layers_encode0) * 1000.0,
-                (t_layers_done - t_layers_encoded) * 1000.0,
-                (t_head_encoded - t_head_encode0) * 1000.0,
-                (t_head_done - t_head_encoded) * 1000.0,
-                (t_done - t_read0) * 1000.0,
-                (t_done - t0) * 1000.0,
-                ok ? 1 : 0);
     }
     return ok;
 }
@@ -1189,20 +1021,6 @@ int gpu_graph_decode_multiseq_batch(
      * write we do not make. */
     /* inc 3: heap the row-indexed token copy (was [PULSAR_MSEQ_MAX]) so a K-row
      * prefill chunk fits. n_active <= prefill_cap. */
-    /* Decode phase timing (PULSAR_MSEQ_PROFILE).  Read ONCE into a static:
-     * this runs per decode step, so a getenv here would be a per-step libc
-     * lookup for a switch that cannot change after start.  Every now_sec()
-     * below is behind the flag, so an unset build makes no clock calls.
-     *
-     * Exists because the batched lane had NO encode/execute split while the
-     * old single-token encoder did, which meant the two could only ever be
-     * compared by inference.  That cost two wrong root-cause hypotheses (L131).
-     * When decode looks slow, this is the first thing to run. */
-    static int ms_prof_env = -1;
-    if (ms_prof_env < 0) ms_prof_env = getenv("PULSAR_MSEQ_PROFILE") ? 1 : 0;
-    const bool ms_prof = ms_prof_env == 1;
-    const double t_enter = ms_prof ? now_sec() : 0.0;
-
     int *cur_tokens = (int *)xmalloc((size_t)n_active * sizeof(int));
     memcpy(cur_tokens, tokens, (size_t)n_active * sizeof(cur_tokens[0]));
     token_vec cur;
@@ -1221,9 +1039,7 @@ int gpu_graph_decode_multiseq_batch(
 
     /* Arm the banked step (validates the driver contract; a rejection here
      * leaves the graph untouched — recoverable). */
-    const double t_gathered = ms_prof ? now_sec() : 0.0;
     if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur)) return 0;
-    const double t_armed = ms_prof ? now_sec() : 0.0;
 
     /* plan-34 inc 3: emit logits only for the LAST ROW OF EACH per-bank RUN.
      * A K-row prefill run advances the KV by K but only its last row's logits
@@ -1276,7 +1092,6 @@ int gpu_graph_decode_multiseq_batch(
      * 2026-09-01: ~32 ms encode against ~25 ms of GPU). Under the served
      * config -- several banks, drafter on -- the GPU is 95-97% busy and this
      * is hidden. See the decode-is-host-encode-bound note. */
-    const double t_layers_encoded = ms_prof ? now_sec() : 0.0;
     if (head_single_block) {
         /* Hot path: the emitted runs are the leading identity rows [0,head_runs)
          * (all length-1) — head in the SAME block, no gather, no extra synchronize.
@@ -1308,7 +1123,6 @@ int gpu_graph_decode_multiseq_batch(
     /* Disarm + per-bank frontier self-check even when the sweep failed. The
      * step_end check covers EVERY bank (incl. a prefill run whose head we skipped),
      * so a skipped-head run's KV frontier is still validated. */
-    const double t_executed = ms_prof ? now_sec() : 0.0;
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
 
@@ -1328,19 +1142,6 @@ int gpu_graph_decode_multiseq_batch(
         g->spec_compact_rows = 0;
         ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
                                  (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (ms_prof) {
-        const double t_done = now_sec();
-        fprintf(stderr,
-                "pulsar: mseq step n=%u rows=%u  gather=%.3f arm=%.3f "
-                "encode=%.3f exec=%.3f read=%.3f  total=%.3f ms\n",
-                n_active, head_runs,
-                (t_gathered - t_enter) * 1000.0,
-                (t_armed - t_gathered) * 1000.0,
-                (t_layers_encoded - t_armed) * 1000.0,
-                (t_executed - t_layers_encoded) * 1000.0,
-                (t_done - t_executed) * 1000.0,
-                (t_done - t_enter) * 1000.0);
     }
     /* The banks' KV/frontiers committed correctly (step_end passed); a
      * readback failure still leaves the caller without this step's logits,
@@ -1402,17 +1203,6 @@ uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-    const char *env = getenv("PULSAR_CUDA_GRAPH_RAW_CAP");
-    if (env && env[0]) {
-        char *endp = NULL;
-        const long v = strtol(env, &endp, 10);
-        if (endp != env && v > 0) {
-            raw_cap = (uint32_t)v;
-            if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
-            if (raw_cap > 8192u) raw_cap = 8192u;
-            if (raw_cap < raw_window) raw_cap = raw_window;
-        }
-    }
 
     return raw_cap;
 }

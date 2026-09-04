@@ -730,7 +730,6 @@ int server::live_text_prefix_prompt(session_slot *sl, const request *req,
     auto *s = this;
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (s->eval_pin) return 0;   /* choke point: no live-text continuation */
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
@@ -882,7 +881,6 @@ int server::thinking_live_visible_prefix_prompt(session_slot *sl,
                                                pulsar_tokens *effective_prompt) {
     auto *s = this;
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (s->eval_pin) return 0;   /* choke point: no thinking-visible resume */
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
     const size_t prompt_len = strlen(req->prompt_text);
@@ -926,7 +924,6 @@ size_t server::thinking_live_binds_prompt(session_slot *sl,
                                   const request *req, int live_pos) {
     auto *s = this;
     if (!s || !sl || !req || !req->prompt_text) return 0;
-    if (s->eval_pin) return 0;   /* choke point: no live-KV thinking binds */
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
     const size_t prompt_len = strlen(req->prompt_text);

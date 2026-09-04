@@ -86,7 +86,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_conf_tokens);
     pulsar_gpu_tensor_free(g->dspark_embed_tokens);
     pulsar_gpu_tensor_free(g->dspark_refined_ids);
-    pulsar_gpu_tensor_free(g->dspark_refined2_ids);
     pulsar_gpu_tensor_free(g->dspark_prefilter_sel);
     pulsar_gpu_tensor_free(g->dspark_row_meta);
     pulsar_gpu_tensor_free(g->dspark_bank_meta);

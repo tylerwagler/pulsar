@@ -222,17 +222,9 @@ bool gpu_graph_upload_prompt_embeddings_hc(
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
-    static long gpu_min_cached = -1;
-    if (gpu_min_cached < 0) {
-        gpu_min_cached = 512;
-        const char *gpu_min_env = getenv("PULSAR_CUDA_GPU_BATCH_EMBED_MIN");
-        if (gpu_min_env && gpu_min_env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(gpu_min_env, &end, 10);
-            if (end != gpu_min_env && v <= UINT32_MAX) gpu_min_cached = (long)v;
-        }
-    }
-    const uint32_t gpu_min = (uint32_t)gpu_min_cached;
+    /* Prompts shorter than this are embedded on the host; the device gather
+     * only pays off once the launch amortises over enough rows. */
+    const uint32_t gpu_min = 512;
 
     if (tokens && n_tokens >= gpu_min) {
         return pulsar_gpu_embed_tokens_hc_tensor(out_hc,
@@ -304,102 +296,15 @@ bool gpu_graph_warmup_prefill_kernels(
 
 
 
-/* Encode the batched prefill attention half for one layer.  It mirrors the CPU
- * layer-major path: HC pre/norm, Q/KV, cache/compression, prefix attention. */
-bool gpu_graph_indexer_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        uint32_t    n_comp,
-        double     *stage_t0) {
-    if (pulsar_gpu_end_commands() == 0) return false;
-    const double now = now_sec();
-    if (stage != NULL) {
-        fprintf(stderr,
-                "pulsar: GPU indexer stage layer=%u pos=%u tokens=%u comp=%u %s=%.3f ms\n",
-                il,
-                pos0,
-                n_tokens,
-                n_comp,
-                stage,
-                (now - *stage_t0) * 1000.0);
-    }
-    *stage_t0 = now;
-    return pulsar_gpu_begin_commands() != 0;
-}
-
-
-
-static bool gpu_graph_profile_layer_env_match(const char *env_name, uint32_t il) {
-    const char *layer_env = getenv(env_name);
-    if (!layer_env || !layer_env[0]) return true;
-
-    char *end = NULL;
-    const unsigned long layer = strtoul(layer_env, &end, 10);
-    return end != layer_env &&
-           *end == '\0' &&
-           layer <= UINT32_MAX &&
-           (uint32_t)layer == il;
-}
-
-
-
-static bool gpu_graph_layer_stage_profile_enabled(uint32_t il) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_LAYER_STAGE_PROFILE", &cache) &&
-           gpu_graph_profile_layer_env_match("PULSAR_CUDA_LAYER_STAGE_PROFILE_LAYER", il);
-}
 
 
 
 
 
-/* Optional prefill stage profiler. It intentionally ends the current GPU
- * command buffer and waits, so the printed number includes encoding plus GPU
- * execution for the stage just emitted. This is disabled by default because it
- * adds synchronization points and changes scheduling. */
-bool gpu_graph_layer_stage_profile_boundary(
-        const char *part,
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0) {
-    if (pulsar_gpu_end_commands() == 0) return false;
-    const double now = now_sec();
-    fprintf(stderr,
-            "pulsar: GPU layer stage part=%s layer=%u pos=%u tokens=%u %s=%.3f ms\n",
-            part,
-            il,
-            pos0,
-            n_tokens,
-            stage,
-            (now - *stage_t0) * 1000.0);
-    *stage_t0 = now;
-    return pulsar_gpu_begin_commands() != 0;
-}
 
 
 
-static bool gpu_graph_q_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0) {
-    if (pulsar_gpu_end_commands() == 0) return false;
-    const double now = now_sec();
-    fprintf(stderr,
-            "pulsar: GPU Q path stage layer=%u pos=%u tokens=%u %s=%.3f ms\n",
-            il,
-            pos0,
-            n_tokens,
-            stage,
-            (now - *stage_t0) * 1000.0);
-    *stage_t0 = now;
-    return pulsar_gpu_begin_commands() != 0;
-}
+
 
 
 
@@ -438,10 +343,7 @@ static bool gpu_graph_indexed_attention_span(
         float                       index_scale,
         uint32_t                    n_raw,
         uint32_t                    raw_start,
-        const struct gpu_graph_span_ops *op,
-        bool                        stage_profile,
-        bool                        pre_boundary,
-        double                     *stage_t0) {
+        const struct gpu_graph_span_ops *op) {
     /* Q is the producer's PACKED rows now (L090.4): per-token stride is
      * n_head packed rows, in BYTES -- the element-size trap the sq_view
      * comment below warns about, avoided by construction. */
@@ -474,9 +376,6 @@ static bool gpu_graph_indexed_attention_span(
     bool ok = iq_view && iw_view && sq_view && sh_view &&
               (!op->mseq || (sp_view && ss_view));
 
-    if (ok && stage_profile && pre_boundary) {
-        ok = gpu_graph_indexer_stage_profile_boundary(NULL, il, spos0, sn, n_comp, stage_t0);
-    }
     /* L121: banked multi-row spans used to run the generic per-(comp,row)
      * score kernel -- rows x depth-linear, 26 ms/layer at depth 24.5k vs the
      * 0.2 ms indexed attention it feeds, the 6x deep-decode regression of the
@@ -540,9 +439,6 @@ static bool gpu_graph_indexed_attention_span(
                                                           op->comp_cap,
                                                           op->n_banks) != 0;
     }
-    if (ok && stage_profile) {
-        ok = gpu_graph_indexer_stage_profile_boundary("score", il, spos0, sn, n_comp, stage_t0);
-    }
     if (ok) {
         gpu_graph_debug_dump_tensor("indexer_scores", g->indexer_scores,
                                       (uint64_t)n_comp * sn, il, spos0);
@@ -553,9 +449,6 @@ static bool gpu_graph_indexed_attention_span(
                                            n_comp,
                                            sn,
                                            PULSAR_N_INDEXER_TOP_K) != 0;
-        if (ok && stage_profile) {
-            ok = gpu_graph_indexer_stage_profile_boundary("topk", il, spos0, sn, n_comp, stage_t0);
-        }
         if (ok) {
             gpu_graph_debug_dump_i32_tensor("indexer_topk", g->comp_selected,
                                               (uint64_t)sn * PULSAR_N_INDEXER_TOP_K, il, spos0);
@@ -586,9 +479,6 @@ static bool gpu_graph_indexed_attention_span(
                                                                   op->comp_cap,
                                                                   op->n_banks,
                                           g->q_prep_active ? &g->q_prep : NULL) != 0;
-        if (ok && stage_profile) {
-            ok = gpu_graph_indexer_stage_profile_boundary("attention", il, spos0, sn, n_comp, stage_t0);
-        }
     }
     pulsar_gpu_tensor_free(ss_view);
     pulsar_gpu_tensor_free(sp_view);
@@ -668,22 +558,6 @@ bool gpu_graph_encode_layer_attention_batch(
      * off that path at small batch.  Caught by multiseq_frontier_gate S1
      * populate-order invariance. */
     pulsar_gpu_mxfp8_gact_disarm();
-    static int index_stage_env = -1, q_stage_env = -1;
-    const bool index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
-    const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
-    const bool q_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_Q_STAGE_PROFILE", &q_stage_env);
-    double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
-    double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
-#define PULSAR_CUDA_PROFILE_ATTN_STAGE(name) do { \
-        if (ok && layer_stage_profile) { \
-            ok = gpu_graph_layer_stage_profile_boundary("attn", (name), il, pos0, n_tokens, &layer_stage_t0); \
-        } \
-    } while (0)
-#define PULSAR_CUDA_PROFILE_Q_STAGE(name) do { \
-        if (ok && q_stage_profile) { \
-            ok = gpu_graph_q_stage_profile_boundary((name), il, pos0, n_tokens, &q_stage_t0); \
-        } \
-    } while (0)
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = compressed && PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
@@ -847,7 +721,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("hc_attn_pre", g->batch_attn_cur,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("hc_pre");
     if (ok) {
         gpu_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
@@ -865,8 +738,6 @@ bool gpu_graph_encode_layer_attention_batch(
     if (ok && attn_norm_q) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     if (ok && attn_norm_b) pulsar_gpu_bf16_act_note(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD);
     if (ok && attn_norm_keep_from) pulsar_gpu_mxfp8_act_cache_note_f32_skipped(attn_norm_keep_from);
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("norm");
-    PULSAR_CUDA_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
@@ -881,7 +752,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_Q_STAGE("q_a");
     {
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_kv",
                                                           il,
@@ -958,7 +828,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("KVnorm", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_Q_STAGE("q_a_norm");
     {
         if (ok) ok = gpu_graph_matmul_mxfp8_named_tensor("attn_q_b",
                                                           il,
@@ -974,7 +843,6 @@ bool gpu_graph_encode_layer_attention_batch(
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
-        PULSAR_CUDA_PROFILE_Q_STAGE("q_b");
         /* Deferring norm+rope into the attention Q load leaves batch_q RAW,
          * so a "Qcur" dump -- the only Q dump left -- still forces the fused
          * kernel: the normed+roped Q otherwise exists only inside the
@@ -1040,14 +908,11 @@ bool gpu_graph_encode_layer_attention_batch(
                             "norm+rope path -- refusing rather than leaving Q unnormalised\n");
             ok = false;
         }
-        PULSAR_CUDA_PROFILE_Q_STAGE("head_norm");
         if (ok) {
             gpu_graph_debug_dump_q_tensor("Qcur", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
-        PULSAR_CUDA_PROFILE_Q_STAGE("rope");
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("q_path");
     if (ok) ok = pulsar_gpu_rope_tail_tensor(g->batch_kv,
                                             n_tokens,
                                             PULSAR_N_HEAD_KV,
@@ -1101,7 +966,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("kv_path");
     /*
      * Static graph order is q, kv, cpy_k(raw SWA), then attention. For a
      * zero-prefix batch it is safe to store the whole batch at once: attention
@@ -1593,7 +1457,6 @@ bool gpu_graph_encode_layer_attention_batch(
                 n_comp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
             }
         }
-        PULSAR_CUDA_PROFILE_ATTN_STAGE("compressor");
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * PULSAR_N_INDEXER_HEAD_DIM;
@@ -1964,7 +1827,6 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
             }
         }
-        if (ratio == 4) PULSAR_CUDA_PROFILE_ATTN_STAGE("indexer_setup");
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos0, n_tokens);
@@ -1973,7 +1835,6 @@ bool gpu_graph_encode_layer_attention_batch(
             const uint32_t raw_start = gpu_graph_raw_start_for_span(g,
                                                                       pos0 + n_tokens - 1u,
                                                                       n_raw);
-            double index_stage_t0 = 0.0;
 
             ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(mseq ? gpu_graph_bank_raw_pool(g, il)
                                                         : g->layer_raw_cache[il],
@@ -2027,7 +1888,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     ok = gpu_graph_indexed_attention_span(g, model, layer, il,
                             s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                             mseq ? 0u : s_n_raw, mseq ? 0u : s_raw_start,
-                            &sop, index_stage_profile, true, &index_stage_t0);
+                            &sop);
                 }
             } else if (ok) {
                 ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
@@ -2063,15 +1924,6 @@ bool gpu_graph_encode_layer_attention_batch(
         const bool topk_prefill_needed = ratio == 4 && n_comp > PULSAR_N_INDEXER_TOP_K;
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
             const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
-            double index_stage_t0 = 0.0;
-            if (index_stage_profile) {
-                ok = gpu_graph_indexer_stage_profile_boundary(NULL,
-                                                                il,
-                                                                pos0,
-                                                                n_tokens,
-                                                                n_comp,
-                                                                &index_stage_t0);
-            }
             /* PULSAR_PREFILL_SLICE: same span loop as the chunked branch.  The
              * zero-prefix case is the decode-batch entry with pos0 == 0
              * (zero_prefix means pos0 == 0, same launcher, causal), so a span at
@@ -2099,7 +1951,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 ok = gpu_graph_indexed_attention_span(g, model, layer, il,
                         s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                         s0 + sn, 0u,
-                        &zsop, index_stage_profile, false, &index_stage_t0);
+                        &zsop);
             }
             if (ok) batch_attention_done = true;
         }
@@ -2324,7 +2176,6 @@ bool gpu_graph_encode_layer_attention_batch(
             }
         }
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("attention");
 
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_out", g->batch_heads,
@@ -2364,7 +2215,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("inv_rope");
     if (ok) {
         ok = pulsar_gpu_attention_output_batch_tensor(g->batch_attn_out,
                                                    g->batch_attn_low,
@@ -2389,7 +2239,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_tensor("attn_out", g->batch_attn_out,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("output_proj");
     if (ok && gpu_graph_directional_steering_attn_enabled(g)) {
         ok = gpu_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
@@ -2405,7 +2254,6 @@ bool gpu_graph_encode_layer_attention_batch(
         gpu_graph_debug_dump_hc_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_ATTN_STAGE("hc_post");
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor_free(after_attn_hc_view);
     pulsar_gpu_tensor_free(attn_cur_view);
@@ -2413,8 +2261,6 @@ bool gpu_graph_encode_layer_attention_batch(
     pulsar_gpu_tensor_free(hc_mix_view);
     free(index_counts);
     free(comp_counts);
-#undef PULSAR_CUDA_PROFILE_ATTN_STAGE
-#undef PULSAR_CUDA_PROFILE_Q_STAGE
     return ok;
 }
 
@@ -2450,14 +2296,6 @@ bool gpu_graph_encode_layer_ffn_batch(
                                         &down_expert_bytes, &down_row_bytes)) {
         return false;
     }
-    const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
-    double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
-#define PULSAR_CUDA_PROFILE_FFN_STAGE(name) do { \
-        if (ok && layer_stage_profile) { \
-            ok = gpu_graph_layer_stage_profile_boundary("ffn", (name), il, pos0, n_tokens, &layer_stage_t0); \
-        } \
-    } while (0)
-
     pulsar_gpu_tensor *hc_mix_view = pulsar_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
@@ -2591,12 +2429,10 @@ bool gpu_graph_encode_layer_ffn_batch(
         gpu_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_FFN_STAGE("hc_pre");
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_FFN_STAGE("norm");
     /* Attention is finished for this layer, so re-keying the single-slot
      * activation cache onto ffn_norm cannot strand a live attn_norm encoding. */
     if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD);
@@ -2640,7 +2476,6 @@ bool gpu_graph_encode_layer_ffn_batch(
         gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
                                       (uint64_t)n_tokens * PULSAR_N_EXPERT_USED, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_FFN_STAGE("router");
 
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos0);
 
@@ -2665,7 +2500,6 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           shared_dim, \
                                                           g->batch_ffn_norm, \
                                                           n_tokens); \
-        PULSAR_CUDA_PROFILE_FFN_STAGE("shared_gate_up"); \
         void *shmid_q = NULL, *shmid_sf = NULL; int shmid_kbp = 0; \
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
                                                         (uint64_t)shared_dim, \
@@ -2720,7 +2554,6 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                               PULSAR_N_EMBD, \
                                                                               g->batch_shared_mid, \
                                                                               n_tokens); \
-        PULSAR_CUDA_PROFILE_FFN_STAGE("shared_down"); \
         if (ok) { \
             gpu_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out, \
                                           (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0); \
@@ -2777,7 +2610,6 @@ bool gpu_graph_encode_layer_ffn_batch(
         gpu_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * PULSAR_N_EMBD, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_FFN_STAGE("routed_moe");
     PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT();
 #undef PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
 
@@ -2816,7 +2648,6 @@ bool gpu_graph_encode_layer_ffn_batch(
         gpu_graph_debug_dump_hc_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
-    PULSAR_CUDA_PROFILE_FFN_STAGE("hc_post");
     /* Mirror the attention encode's disarm.  The activation cache is keyed only
      * on (ptr, n_tok, in_dim), and the batch output heads REUSE batch_ffn_norm
      * as their output_norm scratch at the same n_tok and in_dim -- so an armed
@@ -2828,7 +2659,6 @@ bool gpu_graph_encode_layer_ffn_batch(
     pulsar_gpu_tensor_free(ffn_cur_view);
     pulsar_gpu_tensor_free(hc_split_view);
     pulsar_gpu_tensor_free(hc_mix_view);
-#undef PULSAR_CUDA_PROFILE_FFN_STAGE
     return ok;
 }
 

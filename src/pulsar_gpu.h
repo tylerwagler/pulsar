@@ -1833,16 +1833,15 @@ int pulsar_gpu_minp_prefilter_rows(
 /** L150: bank-batched markov refine. One launch per draft position serves
  * n_banks banks (one markov_w2 stream shared across them); byte-exact per
  * bank with the single-bank kernels. Layouts: refined_logits [n_banks][vocab]
- * f32; ids_dev/ids2_dev [n_banks][ids_stride] i32 with [b][0] seeded by the
- * caller (chain) and winners written to [b][pos+1]; the bank's base logits row
+ * f32; ids_dev [n_banks][ids_stride] i32 with [b][0] seeded by the caller
+ * (chain) and winners written to [b][pos+1]; the bank's base logits row
  * for position pos is base_logits row (base_row_dev[b] + pos), rows
  * base_row_stride_bytes apart. The chain runs positions 0..n_draft-1 with the
  * device feed; the single step takes the previous token per bank from prev_dev
  * ([n_banks] i32, caller-written -- the sampled path's host draw). */
 #define PULSAR_DSPARK_BANKS_MAX 8u
 int pulsar_gpu_dspark_markov_chain_banks_model(
-        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
-        pulsar_gpu_tensor *ids2_dev, uint32_t ids_stride,
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
@@ -1850,8 +1849,7 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_bf16);
 int pulsar_gpu_dspark_markov_step_banks_model(
-        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
-        pulsar_gpu_tensor *ids2_dev, uint32_t ids_stride,
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
         const void *dspark_model_map, uint64_t dspark_model_size,
@@ -1863,8 +1861,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
 
 int pulsar_gpu_dspark_markov_chain_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
-        pulsar_gpu_tensor *ids2_dev, const pulsar_gpu_tensor *base_logits,
-        uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
@@ -1872,7 +1869,6 @@ int pulsar_gpu_dspark_markov_chain_model(
 int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,
-        int32_t               *refined_id2_dst,
         const pulsar_gpu_tensor *base_logits,
         const void             *dspark_model_map,
         uint64_t                dspark_model_size,

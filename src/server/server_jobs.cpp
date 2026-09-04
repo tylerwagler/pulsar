@@ -688,12 +688,6 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * The env is read ONCE (project rule: no per-token getenv). */
 bool gen_client_disconnected(int fd) {
     if (fd < 0) return false;
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("PULSAR_ABORT_ON_DISCONNECT");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-    }
-    if (!enabled) return false;
     struct pollfd p;
     p.fd = fd;
     p.events = POLLRDHUP;

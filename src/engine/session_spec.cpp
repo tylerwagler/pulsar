@@ -63,8 +63,7 @@ static int spec_dump_active(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *a = getenv("PULSAR_DSPARK_DUMP");
-        const char *b = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
-        cached = (a && a[0]) || (b && b[0]) ? 1 : 0;
+        cached = (a && a[0]) ? 1 : 0;
     }
     return cached;
 }
@@ -260,22 +259,6 @@ void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quench_ewma = 0.0f;
     s->spec.spec_quench_steps = 0;
     s->spec.spec_quenched = false;
-}
-
-/* Test-only (identity gates): PULSAR_QUENCH_FORCE_STEP=<N> latches the quench
- * unconditionally once N fused spec steps have run, and disables the policy
- * decision. The check runs inside the fused step after steps++, so the
- * earliest possible latch is after step 1 completes: N=0 behaves like N=1
- * (a request that must be fully plain wants dspark_disable, not this hook).
- * Read once; absent in production. */
-static int spec_quench_force_step(void) {
-    static int cached = -2;
-    if (cached == -2) {
-        const char *fs = getenv("PULSAR_QUENCH_FORCE_STEP");
-        cached = fs && fs[0] ? atoi(fs) : -1;
-        if (cached < -1) cached = -1;
-    }
-    return cached;
 }
 
 static void spec_frontier_free(pulsar_spec_frontier *f) {
@@ -664,7 +647,6 @@ static bool spec_row_read_classic(void *ud, uint32_t row, float *out) {
  * in here. */
 static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                    bool main_x_ready,
-                                   uint32_t n_batch, int commit,
                                    float temperature, int top_k, float top_p,
                                    float min_p, uint64_t *rng) {
     pulsar_engine *e = s->engine;
@@ -677,8 +659,6 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     const uint64_t dsize = e->dspark_model.size;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
     if (n_draft == 0u) return 0;
@@ -705,15 +685,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
     if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return 0;
     int32_t refined[17];
-    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
-     * are sampled: this is the runner-up to the markov ARGMAX, which is no
-     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
-     * longer means "target's correction == drafter's #2 given #1 rejected" —
-     * the p2 table in memory was measured under argmax drafting. Diagnostic
-     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
-    int32_t refined2[17];
     refined[0] = (int32_t)next_base;
-    refined2[0] = -1;
     /* Temperature-matched draft sampling: draw each draft from the refined
      * logits filtered at the REQUEST's params (q) instead of taking the
      * drafter's argmax, so the verify walk can use min(1, p/q) — whose
@@ -755,7 +727,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * launch the chain + conf scoring and DEFER the readback to the next
      * consumer (pulsar_session_spec_chain_harvest) -- the caller's token
      * emission then overlaps the drafter's GPU time. */
-    const bool defer_harvest = !sample_drafts && !dtree_stats && !spec_dump_active();
+    const bool defer_harvest = !sample_drafts && !spec_dump_active();
     if (!sample_drafts) {
         /* L108 P1: the greedy walk chains ON DEVICE.  The old loop did a
          * blocking 8-byte read per position purely to hand the next step a
@@ -772,7 +744,6 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                     sizeof(int32_t)) &&
             pulsar_gpu_dspark_markov_chain_model(dspark_logits,
                                               g->dspark_refined_ids,
-                                              g->dspark_refined2_ids,
                                               g->spec_logits, spec_row_bytes,
                                               dmap, dsize,
                                               w->markov_w1->abs_offset,
@@ -781,18 +752,14 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                               w->markov_w1->type == PULSAR_TENSOR_BF16,
                                               w->markov_w2->type == PULSAR_TENSOR_BF16) &&
             (defer_harvest ||
-             (pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t),
-                                     &refined[1], (uint64_t)n_draft * sizeof(int32_t)) &&
-              (!dtree_stats ||
-               pulsar_gpu_tensor_read(g->dspark_refined2_ids, sizeof(int32_t),
-                                      &refined2[1], (uint64_t)n_draft * sizeof(int32_t)))));
+             pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t),
+                                    &refined[1], (uint64_t)n_draft * sizeof(int32_t)));
     } else
     for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
         pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
             g->spec_logits, (uint64_t)pos * spec_row_bytes, vocab_bytes);
         draft_ok = base_row &&
             pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
-                                             dtree_stats ? &refined2[pos + 1] : NULL,
                                              base_row, dmap, dsize,
                                              w->markov_w1->abs_offset,
                                              w->markov_w2->abs_offset,
@@ -882,107 +849,14 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * hidden rows the confidence kernel consumes. */
     dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
 
-    /* On-policy trajectory dump (PULSAR_DSPARK_DUMP_ONPOLICY=<max steps>,
-     * _PATH=<file>): self-contained per-step records for teacher-forcing the
-     * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
-     * "remaining acceptance gap is on-policy distribution" (torch matches the
-     * engine's level on identical data) from "engine draft-forward middle is
-     * numerically wrong" (torch scores much higher). Record: {pos, next_base,
-     * n_draft, n_batch, commit, refined[n_draft+1], th[n_batch][3][4096] f32};
-     * batch row m holds the anchor hiddens of position pos-1-commit+m; rows
-     * 0..commit are the committed positions, row commit the drafting anchor. */
-    {
-        static int opsteps = -1;
-        if (opsteps < 0) {
-            const char *e2 = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
-            opsteps = e2 && e2[0] ? atoi(e2) : 0;
-        }
-        static int opdone = 0;
-        /* Read once, and only if the already-cached step budget says this dump
-         * is live at all — the previous form called getenv every spec step even
-         * when opsteps was 0, i.e. always, for everyone. */
-        static const char *oppath = NULL;
-        static int oppath_read = 0;
-        if (opsteps > 0 && !oppath_read) {
-            oppath_read = 1;
-            const char *p = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
-            oppath = (p && p[0]) ? p : NULL;
-        }
-        if (opdone < opsteps && oppath) {
-            FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
-            if (f2) {
-                int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
-                                    (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
-                fwrite(hdr2, sizeof(int32_t), 5, f2);
-                fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
-                float *row2 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
-                for (uint32_t m2 = 0; m2 < n_batch; m2++) {
-                    for (int sl = 0; sl < 3; sl++) {
-                        memset(row2, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-                        (void)pulsar_gpu_tensor_read(g->dspark_target_h_batch[sl],
-                                                  (uint64_t)m2 * PULSAR_N_EMBD * sizeof(float),
-                                                  row2,
-                                                  (uint64_t)PULSAR_N_EMBD * sizeof(float));
-                        fwrite(row2, sizeof(float), PULSAR_N_EMBD, f2);
-                    }
-                }
-                free(row2);
-                /* Bug-#4 localization payload (PULSAR_DSPARK_DUMP_RING=1): the
-                 * drafter's context-KV ring + counters as the NEXT draft
-                 * forward will read them (post-seeding for this step's
-                 * commits), plus this step's block outputs (cur_hc rows).
-                 * Lets the torch reference attend over the ENGINE'S OWN ring
-                 * to split "seed rows wrong" from "block compute wrong". */
-                static int dump_ring = -1;
-                if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
-                if (dump_ring) {
-                    /* The drafter ring is PULSAR_ATTN_PACK rows (584 B) as of
-                     * 157cd1d, not f32.  This asked for DRAFT_WINDOW*head_dim
-                     * floats -- more bytes than the ring now holds -- and the
-                     * read is (void)-cast, so it would have written a block of
-                     * ZEROS to the dump and looked like an empty ring.  It now
-                     * dumps the packed bytes, so the record is the ring's real
-                     * contents; a reader decodes nope as e4m3 * 2^(e8-127) and
-                     * rope as bf16, per PULSAR_ATTN_PACK_ROWBYTES. */
-                    const uint64_t ring_bytes =
-                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-                    uint8_t *ring = (uint8_t *)xmalloc(ring_bytes);
-                    for (int li2 = 0; li2 < 3; li2++) {
-                        int32_t nr = (int32_t)g->dspark_n_raw[li2];
-                        fwrite(&nr, sizeof(int32_t), 1, f2);
-                        memset(ring, 0, ring_bytes);
-                        if (!pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes))
-                            fprintf(stderr, "pulsar: DSPARK_DUMP_RING read failed for layer %d\n", li2);
-                        fwrite(ring, 1, ring_bytes, f2);
-                    }
-                    free(ring);
-                    const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-                    float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
-                    for (uint32_t p2 = 0; p2 < n_draft; p2++) {
-                        memset(hcrow, 0, hcw2 * sizeof(float));
-                        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
-                                                      hcrow, hcw2);
-                        fwrite(hcrow, sizeof(float), hcw2, f2);
-                    }
-                    free(hcrow);
-                }
-                fclose(f2);
-                opdone++;
-            }
-        }
-    }
-
-    /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
-     * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
-     * can bucket by the actual confidence at every drafted position (collect
-     * with PULSAR_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
+    /* Confidence-scheduled pending length (P1 head; keep the confident prefix). */
     uint32_t keep = n_draft;
     float conf[16];
     bool have_conf = false;
     bool conf_deferred = false;
     {
         const float tau = dspark_conf_sched_tau();
-        if (tau > 0.0f || dtree_stats) {
+        if (tau > 0.0f) {
             /* Persistent graph-owned scratch (n_draft is clamped to 16 above):
              * the alloc/free pair here ran every fused spec step and each
              * cudaMalloc/cudaFree serializes the device, which is exactly the
@@ -1047,27 +921,6 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     s->spec.dspark_pending_min_p = min_p;
     for (uint32_t i = 0; i < keep; i++)   /* L107: controller reads these in round_end */
         s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
-    if (dtree_stats)
-        for (uint32_t i = 0; i < keep; i++)
-            s->spec.dspark_pending_alt[i] = refined2[i + 1];
-
-    /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
-     * position whose confidence lands in the ~[0.25,0.65] split band (where a
-     * confidence-gated sibling row could pay), and where the first such split
-     * point falls. next_base sits at abs position s->checkpoint.len; drafted
-     * position pos is next_base+1+pos. */
-    if (dtree_stats && have_conf) {
-        int firstmid = -1;
-        for (uint32_t i = 0; i < n_draft; i++)
-            if (conf[i] >= 0.25f && conf[i] <= 0.65f) { firstmid = (int)i; break; }
-        char cbuf[160];
-        int off = 0;
-        for (uint32_t i = 0; i < n_draft && off < (int)sizeof(cbuf) - 8; i++)
-            off += snprintf(cbuf + off, sizeof(cbuf) - off, "%s%.3f",
-                            i ? "," : "", (double)conf[i]);
-        fprintf(stderr, "DTREE_MID base_pos=%d nd=%u firstmid=%d conf=[%s]\n",
-                (int)s->checkpoint.len, n_draft, firstmid, cbuf);
-    }
 
     return keep;
 }
@@ -1135,7 +988,6 @@ typedef struct {
     uint32_t keep;
     bool     have_conf;
     int32_t  refined[17];
-    int32_t  refined2[17];
     float    conf[16];
     float    q_drawn[16];                                  ///< q(pend[i]) per position (sampled)
     uint32_t qn[16];                                       ///< stored proposal dist size (0 = row fallback)
@@ -1150,7 +1002,6 @@ typedef struct pulsar_spec_round {
     int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
     bool pend_sampled;      ///< the pendings below were sampled rather than left from a prior round
     int32_t pend[16];       ///< the drafted token ids, in draft order
-    int32_t pend_alt[16];   ///< runner-up per draft position, for the DTree branch
     float pend_conf[16];    ///< confidence head's score per draft position
     int row_tops[16];       ///< the target's argmax per verify row; the accept comparison
     /** Frontier snapshot taken before the drafter touched anything, so a
@@ -1175,8 +1026,6 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     const pulsar_dspark_weights *w = &e->dspark_weights;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     {
         /* the round is reused across rounds; its redraft record's lazily-owned
          * fallback rows (L150) survive the reset, everything else is cleared */
@@ -1209,10 +1058,9 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     int &saved_len = r->saved_len;
     bool &pend_sampled = r->pend_sampled;
     int32_t (&pend)[16] = r->pend;
-    int32_t (&pend_alt)[16] = r->pend_alt;
     float (&pend_conf)[16] = r->pend_conf;
     pulsar_spec_frontier &frontier = r->frontier;
-    (void)pend_alt; (void)pend_conf; (void)pend_sampled; (void)n_batch;
+    (void)pend_conf; (void)pend_sampled; (void)n_batch;
     /* Pending drafts continue from the greedy base we predicted last step; if
      * the caller committed something else (tool injection, sampling change),
      * they are stale. */
@@ -1256,10 +1104,8 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
     for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.dspark_pending[i];
-    /* Conf carried unconditionally (L107 controller); drafter #2 is DTree-only. */
+    /* Conf carried unconditionally (L107 controller). */
     for (uint32_t i = 0; i < K; i++) pend_conf[i] = s->spec.dspark_pending_conf[i];
-    if (dtree_stats)
-        for (uint32_t i = 0; i < K; i++) pend_alt[i] = s->spec.dspark_pending_alt[i];
     pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     n_batch = 1u + K;
@@ -1328,19 +1174,16 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     pulsar_gpu_graph *g = &s->graph;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     int n_accept = 0;
     const uint32_t K = r->K;
     const uint32_t n_batch = r->n_batch;
     const int saved_len = r->saved_len;
     const bool pend_sampled = r->pend_sampled;
     int32_t (&pend)[16] = r->pend;
-    int32_t (&pend_alt)[16] = r->pend_alt;
     float (&pend_conf)[16] = r->pend_conf;
     int (&row_tops)[16] = r->row_tops;
     pulsar_spec_frontier &frontier = r->frontier;
-    (void)pend_alt; (void)pend_conf; (void)t0; (void)dspark_stats;
+    (void)pend_conf; (void)t0; (void)dspark_stats;
     /* Accept the longest prefix the target agrees with. Greedy: row i's
      * argmax must equal pend[i]. Sampled: exact speculative sampling under the
      * request's FILTERED target distribution p_i, with the rule matched to how
@@ -1464,11 +1307,8 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * distribution, so quenching changes speed, never marginals. */
     if (!s->spec.spec_quenched) {
         s->spec.spec_quench_steps++;
-        const int force = spec_quench_force_step();
         bool fire = false;
-        if (force >= 0) {
-            fire = s->spec.spec_quench_steps >= (uint32_t)force;
-        } else if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
+        if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
                                  spec_quench_guard(n_batch, saved_len);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
@@ -1485,27 +1325,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                     "-> plain decode for request remainder%s\n",
                     saved_len + 1 + commit, s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
-                    force >= 0 ? " (forced)" : "");
+                    "");
         }
     }
-
-    /* DTree Phase 0 (§6): emit one record per ON-POLICY verified position — the
-     * accepted prefix 0..commit-1 plus the split (first rejected draft) at
-     * commit. Each carries that position's drafter confidence, whether the
-     * chain #1 was accepted (acc), and — at the split — whether the target's
-     * corrected token equals the drafter's #2 (alt_hit). This yields both the
-     * accept-rate-by-conf a(c) and the p2-by-conf table the go/no-go gate needs
-     * (the sibling row's marginal yield at a split is (1-a(c))*p2(c)). Positions
-     * past commit are off-policy (conditioned on a rejected token) and skipped. */
-    if (dtree_stats)
-        for (int i = 0; i <= commit && i < (int)K; i++) {
-            const int acc = (i < commit) ? 1 : 0;
-            const int alt_hit = acc ? -1 : (row_tops[i] == pend_alt[i] ? 1 : 0);
-            fprintf(stderr,
-                    "DTREE_V pos=%d k=%d conf=%.4f acc=%d alt_hit=%d r1=%d r2=%d tgt=%d nb=%u\n",
-                    saved_len + 1 + i, i, (double)pend_conf[i], acc, alt_hit,
-                    (int)pend[i], pend_alt[i], row_tops[i], n_batch);
-        }
 
     /* Refresh s->logits to the last committed position's distribution. */
     if (!read_row(read_ud, (uint32_t)commit, s->logits)) {
@@ -1653,7 +1475,6 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         return n_accept;
     }
     const uint32_t keep = spec_round_redraft(s, next_base, main_x_ready,
-                                             n_batch, commit,
                                              temperature, top_k, top_p, min_p, rng);
     /* t0 == 0 marks a lane whose forward ran outside this round (the batched
      * lane) -- step_ms would print the epoch, so skip the line there. */
@@ -1970,8 +1791,6 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     int n_g = 0;
     for (int j = 0; j < n_sel; j++) if (!rounds[order[j]]->redraft.sample_drafts) n_g++;
     const int n_s = n_sel - n_g;
@@ -2000,8 +1819,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
         if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
         else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
         q->refined[0] = q->next_base;
-        q->refined2[0] = -1;
-        for (int k = 1; k < 17; k++) { q->refined[k] = 0; q->refined2[k] = -1; }
+        for (int k = 1; k < 17; k++) q->refined[k] = 0;
         for (int k = 0; k < 16; k++) { q->qn[k] = 0; q->q_drawn[k] = 0.0f; q->conf[k] = -1.0f; }
         q->have_conf = false;
         q->keep = q->n_draft;
@@ -2046,7 +1864,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     /* greedy banks: the whole chain on device, ids read back once */
     if (n_g > 0) {
         if (!pulsar_gpu_dspark_markov_chain_banks_model(
-                g->dspark_markov_logits, g->dspark_refined_ids, g->dspark_refined2_ids, 17u,
+                g->dspark_markov_logits, g->dspark_refined_ids, 17u,
                 g->spec_logits, spec_row_bytes, g->dspark_bank_meta,
                 dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
                 (uint32_t)n_g, max_draft_g, vocab_size, embed_dim, w1_bf16, w2_bf16)) {
@@ -2060,14 +1878,12 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             g->dspark_markov_logits, (uint64_t)n_g * vocab_bytes, (uint64_t)n_s * vocab_bytes);
         pulsar_gpu_tensor *ids_s = pulsar_gpu_tensor_view(
             g->dspark_refined_ids, (uint64_t)n_g * 17 * sizeof(int32_t), (uint64_t)n_s * 17 * sizeof(int32_t));
-        pulsar_gpu_tensor *ids2_s = pulsar_gpu_tensor_view(
-            g->dspark_refined2_ids, (uint64_t)n_g * 17 * sizeof(int32_t), (uint64_t)n_s * 17 * sizeof(int32_t));
         pulsar_gpu_tensor *base_s = pulsar_gpu_tensor_view(
             g->dspark_bank_meta, (uint64_t)n_g * sizeof(int32_t), (uint64_t)n_s * sizeof(int32_t));
         pulsar_gpu_tensor *prev_s = pulsar_gpu_tensor_view(
             g->dspark_bank_meta, (uint64_t)PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t),
             (uint64_t)n_s * sizeof(int32_t));
-        bool ok = refined_s && ids_s && ids2_s && base_s && prev_s;
+        bool ok = refined_s && ids_s && base_s && prev_s;
         /* the most permissive floor across the sampled banks: a superset for each */
         float delta = 0.0f;
         bool all_sparse = true;
@@ -2086,7 +1902,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             for (int j = n_g; j < n_sel; j++) prev[j - n_g] = rounds[order[j]]->redraft.refined[pos];
             ok = pulsar_gpu_tensor_write(prev_s, 0, prev, (uint64_t)n_s * sizeof(int32_t)) &&
                  pulsar_gpu_dspark_markov_step_banks_model(
-                     refined_s, ids_s, ids2_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
+                     refined_s, ids_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
                      dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
                      (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_bf16);
             bool have_sel = false;
@@ -2137,7 +1953,6 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
         free(sel);
         pulsar_gpu_tensor_free(refined_s);
         pulsar_gpu_tensor_free(ids_s);
-        pulsar_gpu_tensor_free(ids2_s);
         pulsar_gpu_tensor_free(base_s);
         pulsar_gpu_tensor_free(prev_s);
         if (!ok) {
@@ -2145,11 +1960,10 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             return -1;
         }
     }
-    /* greedy ids (and everyone's runner-ups) come back in one read each */
-    if (n_g > 0 || dtree_stats) {
-        int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17], ids2_all[PULSAR_DSPARK_BANKS_MAX * 17];
-        if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_sel * 17 * sizeof(int32_t)) ||
-            !pulsar_gpu_tensor_read(g->dspark_refined2_ids, 0, ids2_all, (uint64_t)n_sel * 17 * sizeof(int32_t))) {
+    /* greedy ids come back in one read */
+    if (n_g > 0) {
+        int32_t ids_all[PULSAR_DSPARK_BANKS_MAX * 17];
+        if (!pulsar_gpu_tensor_read(g->dspark_refined_ids, 0, ids_all, (uint64_t)n_sel * 17 * sizeof(int32_t))) {
             snprintf(err, errlen, "redraft batch: ids readback failed");
             return -1;
         }
@@ -2157,14 +1971,13 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
             spec_redraft_req *q = &rounds[order[j]]->redraft;
             for (uint32_t k = 1; k <= q->n_draft; k++) {
                 if (j < n_g) q->refined[k] = ids_all[j * 17 + k];
-                q->refined2[k] = ids2_all[j * 17 + k];
             }
         }
     }
     /* confidence over every row: tok row (b,k) = refined_b[k], as the
      * single-bank path feeds it (tok_dev <- refined[0..n_draft)) */
     const float tau = dspark_conf_sched_tau();
-    if (tau > 0.0f || dtree_stats) {
+    if (tau > 0.0f) {
         int32_t toks[PULSAR_SPEC_LOGITS_ROWS];
         float confs[PULSAR_SPEC_LOGITS_ROWS];
         for (int j = 0; j < n_sel; j++) {
@@ -2226,7 +2039,7 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
     const pulsar_dspark_weights *w = &e->dspark_weights;
     const uint32_t vocab_size = w->vocab_size;
     if (!rounds || !banks || !rngs || n <= 0) return 0;
-    if (!g->dspark_markov_logits || !g->dspark_refined_ids || !g->dspark_refined2_ids ||
+    if (!g->dspark_markov_logits || !g->dspark_refined_ids ||
         !g->dspark_bank_meta || !g->dspark_conf_scores || !g->dspark_conf_tokens ||
         !g->dspark_prefilter_sel || g->banks.n_banks == 0) {
         snprintf(err, errlen, "redraft batch: drafter scratch missing");
@@ -2280,8 +2093,6 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {
     spec_redraft_req *q = &r->redraft;
     if (!q->valid || !q->done) return;
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     s->spec.dspark_pending_base = q->next_base;
     s->spec.dspark_chain_unharvested = false;
     s->spec.dspark_n_pending = q->keep;
@@ -2294,8 +2105,6 @@ void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r)
     s->spec.dspark_pending_min_p = q->min_p;
     for (uint32_t i = 0; i < q->keep; i++)
         s->spec.dspark_pending_conf[i] = q->have_conf ? q->conf[i] : -1.0f;
-    if (dtree_stats)
-        for (uint32_t i = 0; i < q->keep; i++) s->spec.dspark_pending_alt[i] = q->refined2[i + 1];
     if (q->sample_drafts) {
         bool need_rows = false;
         for (uint32_t i = 0; i < q->n_draft; i++) {

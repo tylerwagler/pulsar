@@ -596,16 +596,8 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 
 
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
-    uint64_t mb = 1024;
-    const char *env = getenv("PULSAR_CUDA_WEIGHT_PRELOAD_SPAN_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 64) mb = 64;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
+    /* 1 GiB spans; the env override had no caller (L159 inc 4). */
+    return 1024ull * 1048576ull;
 }
 
 

@@ -141,7 +141,6 @@ static uint64_t cuda_model_cache_limit_bytes(void);
 static uint64_t cuda_model_local_model_limit_bytes(void);
 
 
-static int cuda_model_cache_limit_explicit(void);
 
 
 /* ---------------------------------------------------------------------------
@@ -242,15 +241,6 @@ int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 
 
 
-/** PULSAR_CUDA_WEIGHT_CACHE_VERBOSE: load-time diagnostics, read ONCE.  Nine
- * call sites used to re-scan the environment for it (L153 survey); one of them
- * (cuda_model_load_progress_enabled) is behaviour, not a log line -- verbose
- * mode replaces the progress meter -- so the answer must be the same at every
- * site, which one cached read guarantees and nine scans only usually do. */
-static int cuda_weight_cache_verbose(void) {
-    static const int on = getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE") != NULL;
-    return on;
-}
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
@@ -265,12 +255,6 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (cuda_weight_cache_verbose()) {
-            fprintf(stderr, "pulsar: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
         return NULL;
     }
 
@@ -324,12 +308,6 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    if (cuda_weight_cache_verbose()) {
-        fprintf(stderr, "pulsar: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
     return (const char *)dev;
 }
 
@@ -462,7 +440,6 @@ static double cuda_wall_sec(void) {
 
 
 static int cuda_model_load_progress_enabled(void) {
-    if (cuda_weight_cache_verbose()) return 0;
     return 1;
 }
 
@@ -540,16 +517,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
-    uint64_t mb = 64;
-    const char *env = getenv("PULSAR_CUDA_MODEL_COPY_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 16) mb = 16;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
+    return 64ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
 }
 
 
@@ -692,9 +660,6 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (cuda_weight_cache_verbose()) {
-                    fprintf(stderr, "pulsar: CUDA direct model read disabled: %s\n", strerror(direct_errno));
-                }
                 (void)close(g_model_direct_fd);
                 g_model_direct_fd = -1;
                 g_model_direct_align = 1;
@@ -711,51 +676,26 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
-    uint64_t gb = 0;
-    const char *env = getenv("PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
-        return gb * 1073741824ull;
-    }
     /* One Spark can run the IQ2 model (~81 GiB) and larger mixed models
-     * (~91 GiB) via the old startup tensor cache.  Keep enough headroom for
+     * (~91 GiB) via the startup tensor cache.  Keep enough headroom for
      * scratch and KV; anything bigger is rejected at load so the model stays
-     * fully resident, unless the operator opts into a larger cache budget
-     * explicitly. */
+     * fully resident.  (The env override had no caller; L159 inc 4.) */
     return 96ull * 1073741824ull;
 }
 
 
 
 static uint64_t cuda_model_local_model_limit_bytes(void) {
-    const uint64_t default_limit = 96ull * 1073741824ull;
-    if (!cuda_model_cache_limit_explicit()) return default_limit;
-    const uint64_t explicit_limit = cuda_model_cache_limit_bytes();
-    return explicit_limit > default_limit ? explicit_limit : default_limit;
+    return cuda_model_cache_limit_bytes();
 }
 
 
 
-static int cuda_model_cache_limit_explicit(void) {
-    const char *env = getenv("PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB");
-    return env && env[0];
-}
 
 
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
-    const char *env = getenv("PULSAR_CUDA_WEIGHT_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 256) mb = 256;
-    if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
+    uint64_t bytes = 1792ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
     if (need > bytes / 2u) {
         const uint64_t align = 64ull * 1048576ull;
         return (need + align - 1u) & ~(align - 1u);
@@ -800,13 +740,6 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         return NULL;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
-    if (cuda_weight_cache_verbose()) {
-        uint64_t arena_bytes = 0;
-        for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "pulsar: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
-                (double)chunk / 1048576.0,
-                (double)arena_bytes / 1073741824.0);
-    }
     return (char *)dev;
 }
 
@@ -833,12 +766,6 @@ static const char *cuda_model_range_ptr_from_fd(
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (cuda_weight_cache_verbose()) {
-            fprintf(stderr, "pulsar: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
 
@@ -910,12 +837,6 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
-    if (cuda_weight_cache_verbose()) {
-        fprintf(stderr, "pulsar: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
     return (const char *)dev;
 }
 
@@ -1708,7 +1629,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         fprintf(stderr, "pulsar: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         const uint64_t limit = cuda_model_local_model_limit_bytes();
-        if (!cuda_model_cache_limit_explicit() && model_size > limit) {
+        if (model_size > limit) {
             fprintf(stderr,
                     "pulsar: CUDA model %.2f GiB exceeds the default single-GPU "
                     "startup cache budget %.2f GiB; set "
@@ -1760,12 +1681,6 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
-                if (cuda_weight_cache_verbose()) {
-                    fprintf(stderr, "pulsar: CUDA model direct I/O enabled (align=%llu)\n",
-                            (unsigned long long)g_model_direct_align);
-                }
-            } else if (cuda_weight_cache_verbose()) {
-                fprintf(stderr, "pulsar: CUDA model direct I/O unavailable: %s\n", strerror(errno));
             }
         }
 #endif

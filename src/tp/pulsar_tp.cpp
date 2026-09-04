@@ -480,7 +480,6 @@ typedef struct {
     union tp_ibv_gid gid;
     int gid_index;
     uint32_t max_inline;
-    bool rc_mode;               /* PULSAR_TP_RDMA_RC set: RC QP (bring-up A/B) */
     pulsar_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
@@ -922,8 +921,7 @@ static int tp_rdma_open(pulsar_tp *tp, char *err, size_t errlen) {
     (void)memset(&qia, 0, sizeof(qia));
     qia.send_cq = (decltype(qia.send_cq))r->cq;
     qia.recv_cq = (decltype(qia.recv_cq))r->cq;
-    r->rc_mode = getenv("PULSAR_TP_RDMA_RC") != NULL;
-    qia.qp_type = r->rc_mode ? TP_IBV_QPT_RC : TP_IBV_QPT_UC;
+    qia.qp_type = TP_IBV_QPT_UC;   /* the RC bring-up A/B knob is gone (L159): UC is the transport */
     qia.cap.max_send_wr = 256;
     qia.cap.max_recv_wr = 64;
     qia.cap.max_send_sge = 1;
@@ -1049,30 +1047,16 @@ static int tp_rdma_register_and_exchange(pulsar_tp *tp, char *err,
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
-    if (r->rc_mode) {
-        a.max_dest_rd_atomic = 1;   /* RC reaches RTR only with these set */
-        a.min_rnr_timer = 12;       /* (bisected on the pair with rtr_probe) */
-    }
     if (r->api.modify_qp(r->qp, &a,
             TP_IBV_QP_STATE | TP_IBV_QP_AV | TP_IBV_QP_PATH_MTU |
-            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN |
-            (r->rc_mode ? TP_IBV_QP_MAX_DEST_RD_ATOMIC |
-                         TP_IBV_QP_MIN_RNR_TIMER : 0)) != 0) {
+            TP_IBV_QP_DEST_QPN | TP_IBV_QP_RQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
     (void)memset(&a, 0, sizeof(a));
     a.qp_state = TP_IBV_QPS_RTS;
     a.sq_psn = mine.psn;
-    if (r->rc_mode) {
-        a.timeout = 14;      /* ~ 3.6 ms * 4^14: finite, generous */
-        a.retry_cnt = 7;     /* 7 = retry forever; both ranks on the pair */
-        a.rnr_retry = 7;     /* 7 = no limit on RNR backoff */
-        a.max_rd_atomic = 1;
-    }
-    if (r->api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN |
-            (r->rc_mode ? TP_IBV_QP_TIMEOUT | TP_IBV_QP_RETRY_CNT |
-                         TP_IBV_QP_RNR_RETRY | TP_IBV_QP_MAX_QP_RD_ATOMIC : 0)) != 0) {
+    if (r->api.modify_qp(r->qp, &a, TP_IBV_QP_STATE | TP_IBV_QP_SQ_PSN) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
@@ -1118,10 +1102,6 @@ static int tp_rdma_drain_cq(pulsar_tp *tp) {
     int n = r->api.poll_cq(r->cq, 16, wc);
     if (n < 0) return 0;
     for (int i = 0; i < n; i++) {
-        if (getenv("PULSAR_TP_GATE_TRACE"))
-            fprintf(stderr, "pulsar-tp: CQ wr_id=%llu status=%d opcode=%d len=%u\n",
-                    (unsigned long long)wc[i].wr_id, (int)wc[i].status,
-                    (int)wc[i].opcode, wc[i].byte_len);
         if (wc[i].status != TP_IBV_WC_SUCCESS) {
             fprintf(stderr, "pulsar-tp: rdma completion error: %s (wr_id %llu)\n",
                     tp_wc_status_str(wc[i].status),
@@ -1146,11 +1126,6 @@ static int tp_rdma_post_gate_recv(pulsar_tp *tp, uint64_t seq) {
     const uintptr_t base =
         (uintptr_t)(tp->slab + tp->layout.in_off +
                     (uint64_t)slot * tp->vec_bytes);
-    if (getenv("PULSAR_TP_GATE_TRACE"))
-        fprintf(stderr, "pulsar-tp: recv seq=%llu slot=%u addr=%llx\n",
-                (unsigned long long)seq, slot,
-                (unsigned long long)(tp->layout.in_off +
-                                     (uint64_t)slot * tp->vec_bytes));
     /* Vectors above the driver's 16KB message cap ride as two chunks landing
      * contiguously in the slot.  Both sides post/send strictly in seq order,
      * so the k'th send always matches the k'th recv; only the FINAL chunk
@@ -1188,10 +1163,6 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                                  uint64_t seq) {
     pulsar_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * PULSAR_TP_GATES_PER_LAYER + gate;
-    if (getenv("PULSAR_TP_GATE_TRACE")) {
-        fprintf(stderr, "pulsar-tp: gate trace l=%u g=%u seq=%llu want_slot=%u\n",
-                layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
-    }
     if (slot != tp_gate_slot(tp, seq)) {
         fprintf(stderr, "pulsar-tp: gate order broke: layer %u gate %u vs seq %llu\n",
                 layer, gate, (unsigned long long)seq);
@@ -1200,11 +1171,6 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->layout.out_off +
                     (uint64_t)slot * tp->vec_bytes);
-    if (getenv("PULSAR_TP_GATE_TRACE"))
-        fprintf(stderr, "pulsar-tp: send seq=%llu slot=%u addr=%llx\n",
-                (unsigned long long)seq, slot,
-                (unsigned long long)(tp->layout.out_off +
-                                     (uint64_t)slot * tp->vec_bytes));
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
     if (!r->recv_window_active) {
@@ -1235,12 +1201,6 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
         sge.addr = send_base + off;
         sge.length = (uint32_t)len;
         sge.lkey = TP_LKEY(r->mr);
-        if (getenv("PULSAR_TP_GATE_TRACE") && off == 0) {
-            const float *p0 = (const float *)(uintptr_t)(send_base + off);
-            fprintf(stderr, "pulsar-tp: TX seq=%llu addr=%llx f0=%g f1=%g\n",
-                    (unsigned long long)seq,
-                    (unsigned long long)(send_base + off), p0[0], p0[1]);
-        }
         wr.wr_id = seq;
         wr.sg_list = &sge;
         wr.num_sge = 1;
@@ -1341,10 +1301,6 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
             return 0;
         }
         for (int i = 0; i < n; i++) {
-            if (getenv("PULSAR_TP_BULK_TRACE"))
-                fprintf(stderr, "pulsar-tp: drain CQ wr_id=%llu status=%d opcode=%d recv_done=%u\n",
-                        (unsigned long long)wc[i].wr_id, (int)wc[i].status,
-                        (int)wc[i].opcode, recv_done);
             if (wc[i].status != TP_IBV_WC_SUCCESS) {
                 fprintf(stderr, "pulsar-tp: rdma receive-window drain: %s\n",
                         tp_wc_status_str(wc[i].status));
@@ -1386,10 +1342,6 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
 static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
                                      uint64_t bytes) {
     pulsar_tp_rdma *r = &tp->rdma;
-    if (getenv("PULSAR_TP_BULK_TRACE"))
-        fprintf(stderr, "pulsar-tp: bulk entry bytes=%llu capable=%d "
-                "window_active=%d\n", (unsigned long long)bytes,
-                tp_rdma_big_gate_capable(tp), (int)r->recv_window_active);
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
 
     /* Payloads already inside the registered slab (verify batches) can ride
@@ -1443,9 +1395,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
             recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
         }
         struct tp_ibv_recv_wr *bad_recv = NULL;
-        if (getenv("PULSAR_TP_BULK_TRACE"))
-            fprintf(stderr, "pulsar-tp: bulk round off=%llu chunks=%u posting\n",
-                    (unsigned long long)off, chunks);
         if (r->api.post_recv(r->qp, recv_wr, &bad_recv) != 0) {
             fprintf(stderr, "pulsar-tp: bulk rdma post_recv: %s\n",
                     strerror(errno));
@@ -1500,10 +1449,6 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, const void *out, void *in,
                                    (int)(PULSAR_TP_RDMA_BULK_SLOTS + 1u), wc);
             if (n < 0) return 0;
             for (int i = 0; i < n; i++) {
-                if (getenv("PULSAR_TP_BULK_TRACE"))
-                    fprintf(stderr, "pulsar-tp: bulk CQ wr_id=%llu status=%d opcode=%d len=%u\n",
-                            (unsigned long long)wc[i].wr_id, (int)wc[i].status,
-                            (int)wc[i].opcode, wc[i].byte_len);
                 if (wc[i].status != TP_IBV_WC_SUCCESS) {
                     fprintf(stderr,
                             "pulsar-tp: bulk rdma completion error: %s\n",
@@ -1892,18 +1837,11 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer,
                                 (uint16_t)rows, seq };
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (getenv("PULSAR_TP_BULK_TRACE"))
-            fprintf(stderr, "pulsar-tp: batch rma: header hdr l=%u rows=%u seq=%llu bytes=%llu\n",
-                    layer, rows, (unsigned long long)seq, (unsigned long long)bytes);
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) {
-            if (getenv("PULSAR_TP_BULK_TRACE"))
-                fprintf(stderr, "pulsar-tp: batch rma: header WRITE failed\n");
             return 0;
         }
         pulsar_tp_gate_header ph;
         if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) {
-            if (getenv("PULSAR_TP_BULK_TRACE"))
-                fprintf(stderr, "pulsar-tp: batch rma: header READ failed\n");
             return 0;
         }
         if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
@@ -1982,14 +1920,6 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
         if (!tp_write_full(tp->data_fd, static_cast<const char *>(out) + off, n)) return 0;
         if (!tp_read_full(tp->data_fd, static_cast<char *>(in) + off, n)) return 0;
         off += n;
-    }
-    if (getenv("PULSAR_TP_GLM_DEBUG")) {
-        const float *o = static_cast<const float *>(out);
-        const float *i = static_cast<const float *>(in);
-        fprintf(stderr,
-                "pulsar-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
-                layer, (unsigned long long)seq,
-                o[0], o[1], o[2], o[3], i[0], i[1], i[2], i[3]);
     }
     return 1;
 }

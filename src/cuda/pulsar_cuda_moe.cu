@@ -651,54 +651,6 @@ static int routed_moe_launch_mixed40(
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
     if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
-    /* PULSAR_MOE_OVERLAP: expert-set overlap probe (read-only diagnostic).
-     *
-     * Three spec levers died on "wider spec batches don't amortize on our
-     * bandwidth-bound decode" (BlockV #1, DTree #33, HybridLC #74). The ledger
-     * blames verify running the prefill batch path, but that path is the
-     * bandwidth-FAVOURABLE one -- it reads each dense weight once for all rows.
-     * The likelier wall is MoE expert-set growth: M rows route to up to M*top_k
-     * DISTINCT experts, and routed experts dominate model bytes.
-     *
-     * This measures it directly. `counts[e]` already holds rows-per-expert, so
-     * SUM = pair_count = rows * top_k, and UNION = #{e : counts[e] > 0}. If
-     * union is far below sum, drafts already share experts and the ceiling for
-     * "expert-coherent drafting" is low; if union tracks sum, each extra verify
-     * row really does drag in its own expert weights and there is headroom.
-     *
-     * Costs a sync + copy, so it is OFF unless asked for and never on a
-     * measured path. Changes no computation. */
-    static int overlap_env = -1;
-    if (overlap_env < 0) overlap_env = getenv("PULSAR_MOE_OVERLAP") != NULL;
-    if (ok && overlap_env && n_tokens > 0) {
-        uint32_t *h_counts = (uint32_t *)malloc((size_t)n_total_expert * sizeof(uint32_t));
-        if (h_counts) {
-            if (cudaMemcpy(h_counts, counts,
-                           (size_t)n_total_expert * sizeof(uint32_t),
-                           cudaMemcpyDeviceToHost) == cudaSuccess) {
-                uint32_t distinct = 0, maxc = 0;
-                uint64_t total = 0;
-                for (uint32_t e = 0; e < n_total_expert; e++) {
-                    if (h_counts[e]) { distinct++; total += h_counts[e]; }
-                    if (h_counts[e] > maxc) maxc = h_counts[e];
-                }
-                /* saturation = distinct / min(sum, n_total_expert): 1.0 means
-                 * every routed slot pulled a different expert (no sharing). */
-                const uint32_t ceil_distinct =
-                        (uint64_t)pair_count < (uint64_t)n_total_expert
-                        ? pair_count : n_total_expert;
-                fprintf(stderr,
-                        "pulsar: MOE-OVERLAP rows=%u top_k=%u sum=%u "
-                        "distinct=%u of %u experts (saturation %.3f of the "
-                        "%u reachable) max_rows_per_expert=%u\n",
-                        n_tokens, n_expert, pair_count, distinct,
-                        n_total_expert,
-                        ceil_distinct ? (double)distinct / (double)ceil_distinct : 0.0,
-                        ceil_distinct, maxc);
-            }
-            free(h_counts);
-        }
-    }
     if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
     if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
@@ -1186,34 +1138,6 @@ static int routed_moe_launch(
      * exists.  `down` is still the per-pair output buffer, sized by the caller
      * checks above. */
     {
-        /* Read once (no-hot-path-flags): this runs on every MoE launch, i.e.
-         * every layer of every decode token, for a switch fixed at start.
-         * Same cached-static idiom the rest of this file already uses. */
-        static int profile_moe_env = -1;
-        if (profile_moe_env < 0) profile_moe_env = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
-        const uint32_t profile_moe = (uint32_t)profile_moe_env;
-        /* Six boundaries, not seven. The seventh bracketed the sorted-pair /
-         * expert-tile build, which was deleted when nothing was found to read
-         * it -- but its cudaEventRecord went with the kernels while the
-         * teardown kept calling cudaEventElapsedTime on it. That returns
-         * cudaErrorInvalidResourceHandle, and because the result was discarded
-         * with (void) it became the sticky last error, which the NEXT launch
-         * check reported as "CUDA swiglu launch failed: invalid resource
-         * handle". So turning the profiler on killed the run one layer after
-         * the first profiled MoE -- a diagnostic that destroyed the thing it
-         * was measuring, and printed xq=0.000 sort=0.000 (the two intervals
-         * touching the dead event) as its only warning. */
-        cudaEvent_t prof_ev[5] = {NULL, NULL, NULL, NULL, NULL};
-        if (profile_moe) {
-            for (uint32_t i = 0; i < 5u; i++) {
-                if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
-                    for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
-                    memset(prof_ev, 0, sizeof(prof_ev));
-                    break;
-                }
-            }
-            if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
-        }
         /* One release configuration (the tuned production values from the old
          * PULSAR_CUDA_MOE_* env matrix): expert-major sorted pair tiles, 16-row
          * down tiles + row-span kernels for big prefill batches, LUT gate for
@@ -1222,7 +1146,6 @@ static int routed_moe_launch(
          * on any down path -- every output element is written by exactly one
          * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
          * precisely why these stages are bit-exact and re-tileable.) */
-        const uint32_t pair_count = n_tokens * n_expert;
         /* EVERY batch size takes the batch arm, n_tokens==1 included.  This was
          * `n_tokens > 1u`, and that comparison was the last size-thresholded
          * activation-format split in the engine: n>=2 reached the D2R arm with
@@ -1260,7 +1183,6 @@ static int routed_moe_launch(
          * the shape signal the batch arms are gated on".  A shape signal does
          * not need six kernels to compute.
          * (The CUTLASS dispatchers above build their own and DO read them.) */
-        if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         /* MMQ is now the ONLY reader here: this function is type-43-on-both-
          * sides, and the dp4a chains that used to follow each arm are gone with
          * the types that fed them.  So "MMQ declined" is terminal -- there is
@@ -1291,7 +1213,6 @@ static int routed_moe_launch(
         (void)mmq_done;
         return 0;   /* no MMQ build -> type 43 is unreadable; rejected at the door */
 #endif
-        if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
         /* L158 inc 5: the MoE stage emits mid's E4M3 once; the MMQ down reads
          * that encoding.  (Until today MMQ encoded mid from f32 for itself --
          * and this comment still said "q8_1", a format that died weeks ago.) */
@@ -1324,7 +1245,6 @@ static int routed_moe_launch(
             ok = 0;
         }
 #endif
-        if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         /* The MMQ arms write PER-PAIR results, so the fixed-order reduction is
          * always owed; the arms above are fail-closed, so reaching here with ok
          * set means one of them ran. */
@@ -1332,31 +1252,6 @@ static int routed_moe_launch(
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
-        }
-        if (prof_ev[4]) {
-            (void)cudaEventRecord(prof_ev[4], 0);
-            if (cudaEventSynchronize(prof_ev[4]) == cudaSuccess) {
-                float ms_pre = 0.0f, ms_gate = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
-                /* Checked, not discarded: swallowing these with (void) is what
-                 * let a dead event poison the next launch's error check. */
-                cudaError_t te = cudaSuccess;
-                te = cudaEventElapsedTime(&ms_pre,   prof_ev[0], prof_ev[1]) != cudaSuccess ? cudaGetLastError() : te;
-                te = cudaEventElapsedTime(&ms_gate,  prof_ev[1], prof_ev[2]) != cudaSuccess ? cudaGetLastError() : te;
-                te = cudaEventElapsedTime(&ms_down,  prof_ev[2], prof_ev[3]) != cudaSuccess ? cudaGetLastError() : te;
-                te = cudaEventElapsedTime(&ms_sum,   prof_ev[3], prof_ev[4]) != cudaSuccess ? cudaGetLastError() : te;
-                te = cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[4]) != cudaSuccess ? cudaGetLastError() : te;
-                if (te != cudaSuccess) {
-                    fprintf(stderr, "pulsar: MoE profile timing unavailable (%s) -- "
-                                    "numbers below are incomplete\n", cudaGetErrorString(te));
-                }
-                fprintf(stderr,
-                        "pulsar: CUDA MoE profile tokens=%u pairs=%u pre=%.3f gateup=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
-                        n_tokens, pair_count, ms_pre, ms_gate, ms_down, ms_sum, ms_total);
-            }
-            for (uint32_t i = 0; i < 5u; i++) (void)cudaEventDestroy(prof_ev[i]);
-            /* Clear anything the teardown itself raised, so a diagnostic can
-             * never be mistaken for a kernel failure by the caller's check. */
-            (void)cudaGetLastError();
         }
         return ok;
     }
@@ -1430,13 +1325,6 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             return (r1 && r2) ? 1 : 0;
         }
     }
-    {
-        static int entry_log = -1;
-        if (entry_log < 0) entry_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 200 : 0;
-        if (entry_log > 0) { entry_log--;
-            fprintf(stderr, "pulsar: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
-                    layer_index, gate_type, down_type, n_tokens); }
-    }
     if (gate_type == 40u && down_type == 40u) {
         /* Small batches (spec-decode verify, n_tokens 2..4): direct fp4 GEMV over the
          * packed expert weights -- 4 launches per layer (act-roundtrip + gate/up+swiglu
@@ -1449,18 +1337,6 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
          * removing the per-rich-layer host sync from the verify path (CUDA-graph
          * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
          */
-        static int path_log = -1;
-        if (path_log < 0) path_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 400 : 0;
-        if (path_log > 0) {
-            path_log--;
-            fprintf(stderr,
-                    "pulsar: moe40 layer=%u n_tok=%u n_total=%u stride=%llu split=%llu mid=%d down=%d midb=%llu need=%llu\n",
-                    layer_index, n_tokens, n_total_expert,
-                    (unsigned long long)gate_expert_bytes, (unsigned long long)gate_row_bytes,
-                    mid && mid->ptr ? 1 : 0, down && down->ptr ? 1 : 0,
-                    (unsigned long long)(mid ? mid->bytes : 0),
-                    (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
-        }
         /* inc 2 (2026-07): raised the M-independent GEMV cap to what was then
          * PULSAR_MSEQ_MAX (8) for a batched step so 5..8 kept the per-token
          * path instead of the grouped GEMM.  MSEQ_MAX is 16 now, and L152
@@ -1558,10 +1434,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
                     (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             if (!cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 0;
-            if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> gemv\n", layer_index);
             return 1;
         }
-        if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> grouped\n", layer_index);
         return routed_moe_launch_cutlass_dispatch(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,
@@ -1588,45 +1462,6 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                              layer_index, n_tokens);
 }
 
-/* ---- Per-format MoE prefill timing (PULSAR_MOE_TIME=1). Buckets each batch MoE call's GPU time
- * by (gate_type,down_type) via a CUDA-event pair around the impl, and dumps a table at exit.
- * The event sync perturbs host wall-time but the measured per-call GPU interval is accurate;
- * this is a diagnostic-only path (one getenv read, no per-token flag branching in production). */
-/** One (gate_type, down_type) row of the MoE timing table -- see the note
- * above for how it is measured and why it is diagnostic-only. */
-struct moe_time_bucket {
-    uint32_t gate_type,  ///< quant type of the gate/up weights
-             down_type;  ///< quant type of the down weights
-    double ms;           ///< accumulated GPU time for this format pair
-    uint64_t calls;      ///< calls counted into `ms`
-};
-static moe_time_bucket g_moe_time[64];
-static int g_moe_time_n = 0;
-static void moe_time_dump(void){
-    if (g_moe_time_n == 0) return;
-    double tot = 0; for (int i = 0; i < g_moe_time_n; i++) tot += g_moe_time[i].ms;
-    fprintf(stderr, "\n=== PULSAR_MOE_TIME per-format MoE batch GPU time (total %.2f ms over all calls) ===\n", tot);
-    for (int i = 0; i < g_moe_time_n; i++) {
-        moe_time_bucket *b = &g_moe_time[i];
-        fprintf(stderr, "  gate_type=%2u down_type=%2u : %9.2f ms  (%5.1f%%)  calls=%llu  avg=%.3f ms\n",
-                b->gate_type, b->down_type, b->ms, tot > 0 ? 100.0 * b->ms / tot : 0.0,
-                (unsigned long long)b->calls, b->calls ? b->ms / (double)b->calls : 0.0);
-    }
-    fprintf(stderr, "=== end PULSAR_MOE_TIME ===\n");
-}
-static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
-    for (int i = 0; i < g_moe_time_n; i++)
-        if (g_moe_time[i].gate_type == gt && g_moe_time[i].down_type == dt) {
-            g_moe_time[i].ms += ms; g_moe_time[i].calls++; return;
-        }
-    if (g_moe_time_n < 64) {
-        static int registered = 0;
-        if (!registered) { registered = 1; atexit(moe_time_dump); }
-        g_moe_time[g_moe_time_n].gate_type = gt; g_moe_time[g_moe_time_n].down_type = dt;
-        g_moe_time[g_moe_time_n].ms = ms; g_moe_time[g_moe_time_n].calls = 1; g_moe_time_n++;
-    }
-}
-
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was
@@ -1640,28 +1475,10 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
         fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
         return 0;
     }
-    static int time_moe = -1;
-    if (time_moe < 0) time_moe = getenv("PULSAR_MOE_TIME") != NULL ? 1 : 0;
-    if (!time_moe) {
-        return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
+    return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_type, down_type,
                 gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim, selected, weights,
                 n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
-    }
-    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s, 0);
-    int r = routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
-            gate_offset, up_offset, down_offset, gate_type, down_type,
-            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-            n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
-    cudaEventRecord(e, 0);
-    if (cudaEventSynchronize(e) == cudaSuccess) {
-        float ms = 0; cudaEventElapsedTime(&ms, s, e);
-        moe_time_accum(gate_type, down_type, (double)ms);
-    }
-    cudaEventDestroy(s); cudaEventDestroy(e);
-    return r;
 }
 

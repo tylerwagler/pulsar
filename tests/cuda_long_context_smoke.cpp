@@ -345,7 +345,7 @@ static int check_dspark_markov_head(void) {
         int32_t id = prev_tokens[0];
         for (uint32_t step = 0; step < n_draft; step++) {
             int32_t gpu_id = 0;
-            if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, NULL, base,
+            if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, base,
                                                   map_host, 2 * w_bytes,
                                                   0, w_bytes,
                                                   id, vocab_size, embed_dim,
