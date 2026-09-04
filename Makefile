@@ -428,9 +428,10 @@ cuda-mseq-rewind-gate: tests/mseq_rewind_probe
 cuda-seam-gate: tests/token_seam_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/token_seam_gate $(FRONTIER_MODEL)
 
-# Multiseq-vs-solo token-stream gate + first aggregate-throughput measurement
-# (see the header of tests/multiseq_decode_gate.c).  MODEL-DEPENDENT — run
-# manually on the GB10 with the same memory discipline as the frontier gate.
+# Tier-2 multiseq gate: co-scheduling neutrality, mixed-entry byte identity,
+# ALL_ROWS head mode, stale-classic guard (see the header of
+# tests/multiseq_decode_gate.cpp).  MODEL-DEPENDENT — run manually on the GB10
+# with the same memory discipline as the frontier gate.
 cuda-multiseq-gate: tests/multiseq_decode_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
 
