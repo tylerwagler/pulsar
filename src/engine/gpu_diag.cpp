@@ -1891,7 +1891,6 @@ bool gpu_graph_alloc_raw_cap(
     const bool banked = g->banks.n_banks != 0;
 
     g->cur_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier (BF16); task #62 */
-    g->flat_hc = pulsar_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->hc_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
     g->hc_post = pulsar_gpu_tensor_view(g->hc_split,
                                        (uint64_t)PULSAR_N_HC * sizeof(float),
@@ -2148,7 +2147,7 @@ bool gpu_graph_alloc_raw_cap(
     }
 
     const bool ok = state_init_ok && layer_cache_ok &&
-                    g->cur_hc && g->flat_hc && g->hc_split &&
+                    g->cur_hc && g->hc_split &&
                     g->hc_post && g->hc_comb &&
                     g->attn_norm && g->kv &&
                     g->attn_comp_stage &&

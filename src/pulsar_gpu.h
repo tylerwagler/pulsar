@@ -656,12 +656,6 @@ int pulsar_gpu_matmul_f32_tensor(
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-int pulsar_gpu_rms_norm_plain_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *x,
-        uint32_t                n,
-        float                   eps);
-
 /** Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
  * i.e. how far our int8 activations sit from the source's own format.  <0 on
  * failure. */
@@ -687,12 +681,16 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
  * epilogue and the separate quantize pass disappears.  Returns 0 on failure. */
 /** Producer-side BF16 activation slot (L086 T3): reserve the bf16 copy's
  * storage for (x, n_tok, in_dim) so an epilogue can write it, then note() to
- * mark it valid once the kernel succeeded.  matmul_bf16_tensor then skips its
- * convert-on-miss for this exact key. */
+ * mark it valid once the kernel succeeded.  The bf16 GEMM core reads this plane
+ * (any row window of it, so offset views and mixed-batch suffixes hit); there is
+ * NO convert-on-miss -- a bf16-weight GEMM whose activation has no producer-
+ * emitted plane refuses (L159).  pulsar_gpu_act_slot_drop forgets every plane
+ * keyed on a buffer that is about to be freed. */
 int pulsar_gpu_bf16_act_slot(const pulsar_gpu_tensor *x,
                              uint64_t n_tok, uint64_t in_dim, void **xb_out);
 void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
                               uint64_t n_tok, uint64_t in_dim);
+void pulsar_gpu_act_slot_drop(const pulsar_gpu_tensor *x);
 
 int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          uint64_t n_tok, uint64_t in_dim,
@@ -818,6 +816,9 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
  * @param out_q          E4M3 activation-cache slot, or NULL for plain behaviour
  * @param out_sf         matching ue8m0 scale slot, or NULL
  * @param out_kbp        scale-table stride: k-blocks per row
+ * @param out_b          bf16 activation-cache plane (pulsar_gpu_bf16_act_slot) for a
+ *                       bf16-weight consumer, or NULL.  L159: the bf16 GEMM core
+ *                       reads this plane and never converts f32 itself.
  * @param w_bf16         1 when this norm weight is stored bf16 (source format)
  *                       rather than f32. Storage only -- the value is promoted
  *                       to f32 before it multiplies, so an f32 tensor stays
@@ -829,6 +830,7 @@ int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
         uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp,
+        void *out_b,
         int w_bf16);
 
 int pulsar_gpu_rms_norm_weight_tensor(
@@ -850,7 +852,7 @@ int pulsar_gpu_rms_norm_weight_tensor(
 int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
                                               const void *model_map, uint64_t model_size,
                                               uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
-                                              void *out_q, void *out_sf, int out_kbp, int w_bf16);
+                                              void *out_q, void *out_sf, int out_kbp, void *out_b, int w_bf16);
 
 int pulsar_gpu_rms_norm_weight_rows_tensor(
         pulsar_gpu_tensor       *out,
@@ -861,6 +863,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps,
+        void                   *out_b,     ///< bf16 plane for a bf16-weight consumer, or NULL (L159)
         int                     w_bf16);
 
 /** As below, but the Q half's E4M3 + E8M0 block-scale encoding is emitted from
@@ -1884,7 +1887,8 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 
 
 /** Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
- * rms_norm_plain_tensor() followed by the matmul for `w_type`; see the kernel
+ * a one-row plain RMSNorm (pulsar_gpu_rms_norm_plain_rows_tensor) followed by the
+ * matmul for `w_type`; see the kernel
  * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
  * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32.
  *

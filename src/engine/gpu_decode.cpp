@@ -288,10 +288,10 @@ bool gpu_graph_matmul_plain_tensor(
  * it exists because that pair ran a 1-block kernel and then a 24-block kernel
  * with a 64 KB f32 scratch round trip between them, for ~5.4% of decode.
  * src_hc is an HC residual carrier (BF16 under task #62); the fused kernel
- * reads it via pulsar_hc_load, exactly as rms_norm_plain_tensor does.
- * Non-F16 mix weights keep the original two-kernel path. */
+ * reads it via pulsar_hc_load, exactly as pulsar_gpu_rms_norm_plain_rows_tensor does.
+ * L159: the unfused norm -> plain-GEMM arm for other weight formats was a
+ * fallback nothing ran (hc_*_fn is bf16); it is deleted, other formats refuse. */
 static bool gpu_graph_norm_mix_plain(
-        pulsar_gpu_graph        *g,
         const pulsar_model      *model,
         const pulsar_tensor     *w,
         uint64_t              hc_dim,
@@ -301,15 +301,15 @@ static bool gpu_graph_norm_mix_plain(
     /* Any storage the fused kernel can read takes the fusion; only an fp8 mix
      * weight still needs the unfused pair. Was F16-only, which quietly dropped
      * the fusion -- and its ~5.4% of decode -- as soon as hc_*_fn moved. */
-    if (w->type == PULSAR_TENSOR_BF16 ||
-        w->type == PULSAR_TENSOR_F32) {
-        return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
-                                              w->abs_offset, hc_dim, out_dim,
-                                              src_hc, PULSAR_RMS_EPS,
-                                              w->type) != 0;
+    if (w->type != PULSAR_TENSOR_BF16 && w->type != PULSAR_TENSOR_F32) {
+        fprintf(stderr, "pulsar: hc mix weight type %d has no fused norm+mix kernel -- refusing\n",
+                (int)w->type);
+        return false;
     }
-    if (!pulsar_gpu_rms_norm_plain_tensor(g->flat_hc, src_hc, (uint32_t)hc_dim, PULSAR_RMS_EPS)) return false;
-    return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, g->flat_hc, 1);
+    return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
+                                          w->abs_offset, hc_dim, out_dim,
+                                          src_hc, PULSAR_RMS_EPS,
+                                          w->type) != 0;
 }
 
 
@@ -385,6 +385,7 @@ bool gpu_graph_dspark_project_main_x(
                                                (uint32_t)E,
                                                PULSAR_RMS_EPS,
                                                mx_q, mx_sf, mx_kbp,
+        NULL,
         w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
     }
     if (ok) {
@@ -693,8 +694,10 @@ bool gpu_graph_dspark_draft_forward_banks(
          * was silently dead on dev from a5208ca until this fix -- no gate in
          * that landing batch looked at drafts. rows/L150.md.) */
         void *flat_b = NULL;
-        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_draft, hc_dim, &flat_b))
-            flat_b = NULL;
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_draft, hc_dim, &flat_b)) {
+            fprintf(stderr, "pulsar: drafter flat_hc: no bf16 slot -- refusing (L159)\n");
+            ok = false;
+        }
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
             g->batch_flat_hc, flat_b, g->batch_cur_hc,
             (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS, 0) != 0;
@@ -758,6 +761,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             layer->attn_q_a_norm->abs_offset,
             q_rank, n_draft, PULSAR_RMS_EPS,
             dq_q, dq_sf, dq_kbp,
+            NULL,
             layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_draft, q_rank);
         if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
@@ -790,6 +794,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             dspark_model->map, dspark_model->size,
             layer->attn_kv_a_norm->abs_offset,
             PULSAR_N_HEAD_DIM, n_draft, PULSAR_RMS_EPS,
+        NULL,
         layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_kv, n_draft,
@@ -966,7 +971,7 @@ bool gpu_graph_encode_output_head(
         const pulsar_weights     *weights,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    bool ok = gpu_graph_norm_mix_plain(g, (const pulsar_model *)model, weights->output_hc_fn,
+    bool ok = gpu_graph_norm_mix_plain((const pulsar_model *)model, weights->output_hc_fn,
                                        hc_dim, PULSAR_N_HC, g->cur_hc, g->output_pre);
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc_pre", g->output_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
@@ -1001,6 +1006,14 @@ bool gpu_graph_encode_output_head(
         fprintf(stderr, "pulsar: output norm: no E4M3 slot for the MXFP8 head -- refusing\n");
         ok = false;
     }
+    /* L159: a bf16 head reads the producer's bf16 plane; the GEMM core no
+     * longer converts f32 on a miss.  Same slot as the E4M3 half: one key, two
+     * planes, the head fills the one its weight format needs. */
+    void *hn_b = NULL;
+    if (ok && !head_mx && !pulsar_gpu_bf16_act_slot(g->output_norm, 1, PULSAR_N_EMBD, &hn_b)) {
+        fprintf(stderr, "pulsar: output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
     if (ok) ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->output_norm,
                                                      g->output_embd,
                                                      model->map,
@@ -1009,10 +1022,12 @@ bool gpu_graph_encode_output_head(
                                                      PULSAR_N_EMBD,
                                                      PULSAR_RMS_EPS,
                                                      hn_q, hn_sf, hn_kbp,
+        hn_b,
         weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
+    if (ok && hn_b) pulsar_gpu_bf16_act_note(g->output_norm, 1, PULSAR_N_EMBD);
     if (ok) {
         if (!head_mx) {
             ok = pulsar_gpu_matmul_bf16_tensor(g->logits, model->map, model->size,
@@ -1134,7 +1149,8 @@ static bool gpu_graph_encode_output_head_batch_impl(
     void *out_flat_b = NULL;
     if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
                                         (uint64_t)hc_dim, &out_flat_b)) {
-        out_flat_b = NULL;
+        fprintf(stderr, "pulsar: verify head flat_hc: no bf16 slot -- refusing (L159)\n");
+        ok = false;
     }
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, out_flat_b,
                                                       g->batch_cur_hc,
@@ -1163,6 +1179,12 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                                   output_weights,
                                                   PULSAR_N_EMBD,
                                                   PULSAR_N_HC) != 0;
+    void *on_b = NULL;
+    if (ok && weights->output->type == PULSAR_TENSOR_BF16 &&
+        !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &on_b)) {
+        fprintf(stderr, "pulsar: verify output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                        output_embd,
                                                        model->map,
@@ -1171,7 +1193,9 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                                        PULSAR_N_EMBD,
                                                        n_tokens,
                                                        PULSAR_RMS_EPS,
+        on_b,
         weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
+    if (ok && on_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
     if (ok) {
         if (weights->output->type == PULSAR_TENSOR_BF16)
             ok = pulsar_gpu_matmul_bf16_tensor(logits, model->map, model->size,
@@ -1183,6 +1207,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                             vocab_dim, output_norm, n_tokens) != 0;
     }
 
+    pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
@@ -1225,7 +1250,8 @@ bool gpu_graph_encode_dspark_output_head_batch(
     void *dsp_flat_b = NULL;
     if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
                                         (uint64_t)hc_dim, &dsp_flat_b)) {
-        dsp_flat_b = NULL;
+        fprintf(stderr, "pulsar: dspark head flat_hc: no bf16 slot -- refusing (L159)\n");
+        ok = false;
     }
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
                                                      (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
@@ -1240,11 +1266,19 @@ bool gpu_graph_encode_dspark_output_head_batch(
                                                   PULSAR_N_HC, PULSAR_HC_EPS) != 0;
     if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, output_weights,
                                                 PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+    void *dn_b = NULL;
+    if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&
+        !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &dn_b)) {
+        fprintf(stderr, "pulsar: dspark output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
                                                      dspark_model->map, dspark_model->size,
                                                      dw->final_norm->abs_offset,
                                                      PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS,
+        dn_b,
         dw->final_norm->type == PULSAR_TENSOR_BF16) != 0;
+    if (ok && dn_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
     if (ok) {
         if (bw->output->type == PULSAR_TENSOR_BF16)
             ok = pulsar_gpu_matmul_bf16_tensor(logits, base_model->map, base_model->size,
@@ -1255,6 +1289,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
                                              bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
                                              output_norm, n_tokens) != 0;
     }
+    pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);

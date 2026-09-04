@@ -803,7 +803,6 @@ typedef struct {
      * session; a generated token enters as an embedding in cur_hc and leaves as
      * logits after all 43 layers update their raw/compressed/indexer caches. */
     pulsar_gpu_tensor *cur_hc;    ///< the live HC residual carrier: token enters here, walks all layers
-    pulsar_gpu_tensor *flat_hc;   ///< HC streams flattened for the mix GEMV
     pulsar_gpu_tensor *hc_split;  ///< per-stream split of the mix, before recombination
     pulsar_gpu_tensor *hc_post;   ///< HC state leaving the sublayer
     pulsar_gpu_tensor *hc_comb;   ///< recombined HC streams written back to cur_hc

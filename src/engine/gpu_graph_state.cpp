@@ -186,7 +186,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->hc_comb);
     pulsar_gpu_tensor_free(g->hc_post);
     pulsar_gpu_tensor_free(g->hc_split);
-    pulsar_gpu_tensor_free(g->flat_hc);
     pulsar_gpu_tensor_free(g->cur_hc);
     memset(g, 0, sizeof(*g));
 }

@@ -864,9 +864,9 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
  *
  * TWO ENCODINGS, ONE ARMING.  The same activation also feeds BF16 GEMMs (the
  * steering/plain matmul arm), and that conversion is likewise pure, so the
- * slot carries a bf16 copy (valid_b / xb -- see f32_to_bf16_kernel) alongside
- * the E4M3 one and both fill lazily: a layer pays for only the encodings it
- * actually uses.  (This paragraph once described an F16 copy for "F16 cuBLAS
+ * slot carries a bf16 plane (valid_b / xb, written by the producer's epilogue
+ * via pulsar_gpu_bf16_act_slot) alongside the E4M3 one; a producer fills only
+ * the planes its consumers read.  (This paragraph once described an F16 copy for "F16 cuBLAS
  * GEMMs" and was truncated mid-clause; the last F16 weight left the model and
  * the field is __nv_bfloat16 *xb -- rewritten by L106 V8.) */
 /* MULTI-SLOT.  One armed buffer sufficed while only batch_attn_norm and
@@ -990,6 +990,32 @@ static mxfp8_act_cache_t *act_slot_find_rows(const void *ptr, uint64_t need, uin
         }
     }
     if (best) best->lru = ++g_act_clock;
+    return best;
+}
+
+/* L159: the bf16 consumer's lookup.  A bf16 plane is elementwise and row-major,
+ * so ANY row window of a valid plane is byte-identical to a plane produced for
+ * exactly that window -- the same argument act_slot_find_rows makes for a
+ * prefix, extended to an offset: the compressor's 4-row tail view of attn_norm
+ * and the mixed-batch suffix both hand this a pointer INSIDE the producer's
+ * buffer.  Returns the slot and the first row of the window. */
+static mxfp8_act_cache_t *act_slot_find_window(const void *ptr, uint64_t need, uint64_t in_dim,
+                                               uint64_t *row0_out) {
+    if (!ptr || need == 0 || in_dim == 0) return NULL;
+    const uint64_t rowb = in_dim * sizeof(float);
+    mxfp8_act_cache_t *best = NULL; uint64_t best_row0 = 0;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (!s->key_ptr || s->key_in_dim != in_dim) continue;
+        const char *b = (const char *)s->key_ptr, *p = (const char *)ptr;
+        if (p < b) continue;
+        const uint64_t off = (uint64_t)(p - b);
+        if (off % rowb) continue;
+        const uint64_t row0 = off / rowb;
+        if (row0 + need > s->key_ntok) continue;
+        if (!best || s->key_ntok < best->key_ntok) { best = s; best_row0 = row0; }
+    }
+    if (best) { best->lru = ++g_act_clock; *row0_out = best_row0; }
     return best;
 }
 
@@ -1270,6 +1296,20 @@ void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
                               uint64_t n_tok, uint64_t in_dim) {
     mxfp8_act_cache_t *s = x ? act_slot_find(x->ptr, n_tok, in_dim) : NULL;
     if (s) s->valid_b = 1;
+}
+
+/* L159: forget every plane keyed on a buffer that is about to be freed.  A
+ * per-call scratch tensor (the verify heads' output_norm) can be re-allocated
+ * at the same address for a different buffer; a valid_b left behind would
+ * then satisfy a window lookup with last call's rows. */
+void pulsar_gpu_act_slot_drop(const pulsar_gpu_tensor *x) {
+    if (!x || !x->ptr) return;
+    for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
+        mxfp8_act_cache_t *s = &g_act_slots[i];
+        if (s->key_ptr != x->ptr) continue;
+        if (g_act_cur == s) g_act_cur = NULL;
+        s->key_ptr = NULL; s->valid = 0; s->valid_b = 0; s->f32_absent = 0; s->lru = 0;
+    }
 }
 
 /* GROUPED activation cache -- the attn-output "a" projection only.
@@ -2498,100 +2538,33 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
 
-    /* ONE bf16 activation for the whole call, produced before the arm is
-     * chosen.  Every arm below reads these exact bytes, so "which kernel ran"
-     * can no longer change the activation operand -- the failure mode this file
-     * has now hit three times (the cuBLAS-rounds/nt-does-not split, the MoE
-     * n==1 q8_1 split, and the A8 cache key).  It also replaces per-warp
-     * rounding with one pass: a GEMV gives every out_dim/8 warps the whole
-     * activation row, so narrowing at the load re-converted the same values
-     * hundreds of times per launch and measured +2.9% step time.
-     *
-     * Caching stays on the EXACT key, unlike the A8 lookup next door.  It does
-     * not need to be prefix-tolerant to be M-independent: bf16 conversion is
-     * elementwise, so a cache miss converts exactly the rows this call owns and
-     * gets byte-identical bytes to any other width that covers them.  A miss
-     * costs one pass, never a different answer -- which is the property the A8
-     * cache lacked, because there a miss changed the ARM and therefore the
-     * arithmetic. */
-    const uint64_t xb_count = n_tok * in_dim;
-    /* Prefix-tolerant READ first -- the same move (and the same safety
-     * argument) as the A8 consumer's act_slot_find_rows: the bf16 encoding is
-     * elementwise and xb is row-major contiguous, so rows [0, n_tok) of a
-     * WIDER valid block are byte-identical to a block staged at exactly
-     * n_tok.  Not a rare case: the mixed-batch prefix split hands this
-     * function the SAME base pointer at n_dec rows while the producer armed
-     * the full batch width, so the exact-key lookup made every split prefix a
-     * guaranteed miss (the T3 census showed them as the surviving
-     * n_tok=1..8 converts). */
-    __nv_bfloat16 *xb_pre = NULL;
-    {
-        mxfp8_act_cache_t *hw = act_slot_find_rows(x->ptr, n_tok, in_dim);
-        if (hw && hw->valid_b && hw->xb) xb_pre = hw->xb;
-    }
-    mxfp8_act_cache_t *hb = xb_pre ? NULL : act_slot_find(x->ptr, n_tok, in_dim);
-    if (hb && !mxfp8_act_cache_reserve((void **)&hb->xb, &hb->xb_cap,
-                                       xb_count * sizeof(__nv_bfloat16), "act bf16")) {
-        hb = NULL;
-    }
-    __nv_bfloat16 *xbb = xb_pre ? xb_pre
-                       : hb     ? hb->xb
-                                : (__nv_bfloat16 *)cuda_tmp_alloc(xb_count * sizeof(__nv_bfloat16),
-                                                                  "bf16 activations");
-    if (!xbb) return 0;
-    /* The mxfp8 arms have carried this backstop since the f32 skips landed;
-     * the bf16 arm converts FROM f32 and had none, so a skipped store plus an
-     * unexpected miss here would convert unwritten bytes in silence. */
-    if (!xb_pre && (!hb || !hb->valid_b) &&
-        act_f32_absent_hazard(x->ptr, n_tok, in_dim)) {
-        fprintf(stderr, "pulsar: bf16 activation convert would read a SKIPPED f32 "
-                        "store (n_tok=%llu in_dim=%llu) -- refusing\n",
-                (unsigned long long)n_tok, (unsigned long long)in_dim);
+    /* ONE bf16 activation for the whole call, READ before the arm is chosen.
+     * Every arm below reads these exact bytes, so "which kernel ran" cannot
+     * change the activation operand -- the failure mode this file hit three
+     * times (the cuBLAS-rounds/nt-does-not split, the MoE n==1 q8_1 split, the
+     * A8 cache key).  L159: the bytes come from the PRODUCER's epilogue
+     * (pulsar_gpu_bf16_act_slot / note), through any row window of its plane.
+     * The convert-on-miss that used to sit here (f32_to_bf16_kernel over
+     * x->ptr, exact-key cached) was the last consumer-side activation
+     * conversion in the engine and ran on the served lane for the output head
+     * at every verify width and for the prefill warmup; it is deleted.  A miss
+     * is a producer that did not emit, and that is an error, once, loudly. */
+    uint64_t row0 = 0;
+    const mxfp8_act_cache_t *hw = act_slot_find_window(x->ptr, n_tok, in_dim, &row0);
+    if (!hw || !hw->valid_b || !hw->xb) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "pulsar: NO bf16 ENCODING for the activation of a bf16-weight GEMM "
+                            "(n_tok=%llu in_dim=%llu) -- no producer emitted it; the f32->bf16 "
+                            "convert was deleted (L159).  Refusing.\n",
+                    (unsigned long long)n_tok, (unsigned long long)in_dim);
+        }
         return 0;
     }
-    if (!xb_pre && (!hb || !hb->valid_b)) {
-        /** Shape census for L086 T3 (producer-emits-bf16): each unique
-         * (n_tok, in_dim) prints once, so the 169 convert launches the D1
-         * profile counted become attributable to producers without a rerun.
-         * Same announce discipline as the skip/tier prints in this file. */
-        static uint64_t seen_shapes[8];
-        static int n_seen = 0;
-        const uint64_t shape_key = (n_tok << 32) | in_dim;
-        int known = 0;
-        for (int i = 0; i < n_seen; i++) if (seen_shapes[i] == shape_key) { known = 1; break; }
-        if (!known && n_seen < 8) {
-            seen_shapes[n_seen++] = shape_key;
-            /* WHY did this convert run?  The T3b prefix-read should have
-             * served base-pointer prefixes from the producer's entry, yet the
-             * census shapes survived the nibble run unchanged -- so name the
-             * miss instead of theorizing: does ANY slot cover this pointer,
-             * and if one does, which half of the validity failed? */
-            const mxfp8_act_cache_t *cov = act_slot_find_rows(x->ptr, n_tok, in_dim);
-            int contained = 0;
-            for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
-                const mxfp8_act_cache_t *sl = &g_act_slots[i];
-                if (!sl->key_ptr) continue;
-                const char *b = (const char *)sl->key_ptr;
-                if ((const char *)x->ptr >= b &&
-                    (const char *)x->ptr < b + sl->key_ntok * sl->key_in_dim * sizeof(float)) {
-                    contained = 1;
-                    break;
-                }
-            }
-            fprintf(stderr, "pulsar: bf16 act convert shape n_tok=%llu in_dim=%llu "
-                            "(T3 census: cover=%d valid_b=%d xb=%d contained=%d)\n",
-                    (unsigned long long)n_tok, (unsigned long long)in_dim,
-                    cov != NULL, cov ? cov->valid_b : 0, cov ? (cov->xb != NULL) : 0,
-                    contained);
-        }
-        f32_to_bf16_kernel<<<(xb_count + 255) / 256, 256>>>((uint16_t *)xbb,
-                                                            (const float *)x->ptr, xb_count);
-        if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
-        if (hb) hb->valid_b = 1;
-    }
-    const __nv_bfloat16 *xb16 = xbb;
+    const __nv_bfloat16 *xb16 = hw->xb + row0 * in_dim;
     /* M-independence, same contract as the f16 and f32 arms.  All three arms now
-     * read the SAME bf16 activation buffer built above, so they cannot disagree
+     * read the SAME bf16 activation plane read above, so they cannot disagree
      * on the operand at all and the only cross-arm difference left is
      * accumulation ORDER.  This comment read "the cuBLAS path below additionally
      * ROUNDS the activations to bf16, so its disagreement with the n=1 kernel is

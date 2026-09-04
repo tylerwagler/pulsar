@@ -275,6 +275,14 @@ bool gpu_graph_warmup_prefill_kernels(
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
 
     bool ok = pulsar_gpu_begin_commands() != 0;
+    /* L159: the bf16 core reads the norm's bf16 plane and refuses without one,
+     * so the warmup runs the same producer the graph runs, on the same buffers
+     * (their contents are scratch here; the output is overwritten). */
+    void *warm_b = NULL;
+    if (ok) ok = pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens, hc_dim, &warm_b) != 0;
+    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, warm_b, g->batch_cur_hc,
+                                                      (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
+    if (ok) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
     if (ok) {
         ok = gpu_graph_matmul_plain_tensor(g->batch_hc_mix,
                                              model,
@@ -729,19 +737,9 @@ bool gpu_graph_encode_layer_attention_batch(
     void *flat_hc_b = NULL;
     if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
                                         (uint64_t)hc_dim, &flat_hc_b)) {
-        flat_hc_b = NULL;   /* no slot: the consumer converts, as before */
-        /* Name the miss once per n_tok.  A reservation failure is invisible
-         * otherwise -- the consumer just converts, exactly as it did before
-         * this change, so the census cannot distinguish "not wired" from
-         * "wired but refused a slot". */
-        static uint32_t seen_n[8]; static int n_seen_n = 0;
-        int known_n = 0;
-        for (int i = 0; i < n_seen_n; i++) if (seen_n[i] == n_tokens) { known_n = 1; break; }
-        if (!known_n && n_seen_n < 8) {
-            seen_n[n_seen_n++] = n_tokens;
-            fprintf(stderr, "pulsar: flat_hc bf16 slot REFUSED (n_tok=%u hc_dim=%u)\n",
-                    n_tokens, (uint32_t)hc_dim);
-        }
+        fprintf(stderr, "pulsar: flat_hc: no bf16 slot (n_tok=%u hc_dim=%u) -- refusing (L159)\n",
+                n_tokens, (uint32_t)hc_dim);
+        ok = false;
     }
     /* L157: the f32 rows of batch_flat_hc are a dead store when the bf16 copy
      * exists -- their only consumer is hc_attn_fn's GEMM, which runs the shared
@@ -796,7 +794,8 @@ bool gpu_graph_encode_layer_attention_batch(
          * compressors and indexer_proj, which staged their own convert. */
         if (ok && !pulsar_gpu_bf16_act_slot(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD,
                                             &attn_norm_b)) {
-            attn_norm_b = NULL;
+            fprintf(stderr, "pulsar: attn_norm: no bf16 slot -- refusing (L159)\n");
+            ok = false;
         }
         /* Same predicate family as shmid_skip_f32, same 7b6448b lesson: the
          * mixed-batch split's offset views read f32 and key no cache slot, so
@@ -2482,7 +2481,8 @@ bool gpu_graph_encode_layer_ffn_batch(
     void *flat_hc_b_ffn = NULL;
     if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
                                         (uint64_t)hc_dim, &flat_hc_b_ffn)) {
-        flat_hc_b_ffn = NULL;
+        fprintf(stderr, "pulsar: ffn flat_hc: no bf16 slot -- refusing (L159)\n");
+        ok = false;
     }
     /* L157: same dead-store skip as the attention-side flat_hc norm, same
      * predicate; the consumer is hc_ffn_fn's GEMM on the shared bf16 core. */
@@ -2520,7 +2520,8 @@ bool gpu_graph_encode_layer_ffn_batch(
         /* ...and the bf16 copy for the router's BF16 GEMM (ffn_gate_inp). */
         if (ok && !pulsar_gpu_bf16_act_slot(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD,
                                             &ffn_norm_b)) {
-            ffn_norm_b = NULL;
+            fprintf(stderr, "pulsar: ffn_norm: no bf16 slot -- refusing (L159)\n");
+            ok = false;
         }
         /* ffn_norm keeps NO f32 rows under the skip: its one offset reuse --
          * the output head's scratch view (the L035 site) -- WRITES its rows
