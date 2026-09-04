@@ -12,7 +12,8 @@
  *   2. save_snapshot(bank 0)   — the D2H KV snapshot (server: kv_cache "evict").
  *   3. repoint to bank 1       — bank 0 is now idle (free_physical refuses cur).
  *   4. free_physical(bank 0)   — DIRECT cudaFree of bank 0's split comp/index;
- *      assert cudaMemGetInfo free ROSE (physical returned), is_evicted==true.
+ *      assert is_evicted==true.  The cudaMemGetInfo delta is PRINTED, not
+ *      asserted: cuda-accounting-gate owns the physical-reclaim assertion.
  *   5. alloc_physical(bank 0)  — fresh cudaMallocManaged + base-table rebuild;
  *      assert the rebuilt comp_bases[0] entry == the new comp[il][0] ptr.
  *   6. repoint to bank 0; load_snapshot — H2D reload (server: kv_cache_try_load).
@@ -160,11 +161,14 @@ int main(int argc, char **argv) {
     CHECK(pulsar_session_bank_is_evicted(s, 0), "bank 0 not marked evicted after free");
     fprintf(stderr, "evict_restore_gate: free[GiB] prefill=%.3f repoint=%.3f afterfree=%.3f reclaimed=%.3f (touched=%.3f)\n",
             (double)f_prefill/GIB, (double)f_repoint/GIB, (double)f_free/GIB, (double)reclaimed/GIB, (double)touched0/GIB);
-    /* Reclaim must be POSITIVE (physical returned; refutes #50). The exact amount
-     * is unreliable — cudaMemGetInfo is coarse/laggy on driver-610 UVM (under-
-     * reports small managed frees; 2a saw a clean 0.264 GiB at 65k). The guard
-     * decides on the deterministic touched accounting, never this gauge. */
-    CHECK(reclaimed > 0, "free_physical reclaimed <= 0 (arena-pool regression?)");
+    /* Printed, not asserted.  At this L the bank holds ~56 MB and
+     * cudaMemGetInfo moves by a few MB either way on the GB10's unified memory
+     * (25 passing batteries read 5-7 MB "reclaimed" for 56 MB freed; one read
+     * -3 MB) -- below the gauge's resolution, so a sign test here measures
+     * noise.  The physical-reclaim assertion is cuda-accounting-gate's: it
+     * frees the same per-bank comp/index slabs at ~0.15 GiB touched and checks
+     * the reclaim against touched with a tolerance.  The guard itself decides
+     * on the deterministic touched accounting, never this gauge. */
 
     /* 5-6. Restore bank 0 from disk: alloc_physical + base-table rebuild + counter
      * reinstall + H2D reload, all inside kv_load (leaves bank 0 installed). */
