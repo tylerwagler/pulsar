@@ -1,12 +1,40 @@
-// tests/fixed_tile_gemm_kernels.cu -- L151-C stage 0: the CUTLASS side of the
-// fixed-tile probe.  A block-scaled MXFP8 x MXFP8 GEMM on sm120 with ONE tile
-// configuration (128 x TN x 128, TN in {64,128}) regardless of M, fed the SAME
-// E4M3 operands the engine's dense path uses: activations quantised with the
-// shared pulsar_mx_* helpers (bit-identical bytes to mxfp8_quant_act_kernel),
-// weights = the MXFP8_LT slabs straight from the mmap (data reused as CUTLASS
-// K-major B; the E8M0 scale byte re-laid into CUTLASS's SFB layout).  Plain C
-// interface so the driver (fixed_tile_gemm_probe.cpp) can stay a C++23 engine
-// client while this unit compiles as the CUTLASS unit does (nvcc, C++17).
+// tests/fixed_tile_gemm_kernels.cu -- L151-C stage 0 / L169: the CUTLASS side
+// of the fixed-tile probe.  A block-scaled MXFP8 x MXFP8 GEMM on sm120 with ONE
+// tile configuration (128 x 128 x 128) regardless of M, fed the SAME E4M3
+// operands the engine's dense path uses: activations quantised with the shared
+// pulsar_mx_* helpers (bit-identical bytes to mxfp8_quant_act_kernel), weights
+// = the MXFP8_LT slabs straight from the mmap (data reused as CUTLASS K-major
+// B; the E8M0 scale byte re-laid into CUTLASS's SFB layout).
+//
+// L169 ("Try split-K"): the same mainloop and epilogue are instantiated twice --
+// once under CUTLASS's default persistent scheduler (the stage-0 kernel, one CTA
+// per 128-column output tile, no reduction) and once under its stream-K
+// scheduler (cutlass::gemm::StreamKScheduler -> PersistentTileSchedulerSm100StreamK
+// on sm120), which the probe drives in two modes:
+//   split-K  S in {2,4,8}: DecompositionMode::SplitK, splits = S.  K's tile
+//            count is cut into S contiguous slices (k_tiles / S each, the first
+//            k_tiles % S slices one tile longer -- set_params_basic), one CTA
+//            per (output tile, slice).  ReductionMode::Deterministic: slice 0
+//            stores its f32 partial to the workspace, slice s waits on a per-
+//            tile barrier until exactly the k-tiles of slices 0..s-1 have
+//            arrived, then adds its partial IN PLACE (workspace += partial), and
+//            the last slice adds the workspace into its own accumulator and
+//            runs the epilogue (sm90_tile_scheduler_stream_k.hpp fixup_helper).
+//            The sum is therefore (((p0 + p1) + p2) + ...) + p_{S-1} in a fixed
+//            order for every element, every launch: M-independent by
+//            construction, and a DIFFERENT number from the unsplit tile's
+//            single-accumulator sum (the probe reports that distance).
+//   stream-K: DecompositionMode::StreamK, splits = 1.  Units = the persistent
+//            grid (sm_count CTAs); each unit walks a fixed, contiguous span of
+//            the (tile, k-tile) iteration space, so the peer set and the
+//            reduction order per output tile are again a function of (N, K,
+//            sm_count) only, not of M (M <= 128 is one row of tiles).
+// Both are driven with hw_info.sm_count fixed from the device so the
+// decomposition cannot drift with a query; the probe reads the decomposition
+// back (ft_plan_decomp) and asserts it is the same at every M.
+//
+// Plain C interface so the driver (fixed_tile_gemm_probe.cpp) can stay a C++23
+// engine client while this unit compiles as the CUTLASS unit does (nvcc, C++17).
 //
 // PRICING ONLY.  Nothing here is reachable from the engine.
 #include <cuda_runtime.h>
@@ -22,6 +50,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
@@ -39,41 +68,75 @@ using LayoutC    = cutlass::layout::RowMajor;
 constexpr int AlignA = 32, AlignB = 32;
 constexpr int AlignC = 128 / cutlass::sizeof_bits<float>::value;
 
-template <int TN>
-struct FT {
-    using TileShape    = Shape<_128, Int<TN>, _128>;   /* 128 rows: the SF atom is 128x4; a 64-row tile cannot describe its TMA load */
-    using ClusterShape = Shape<_1, _1, _1>;
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
-        TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAcc, ElementAcc, float, LayoutC, AlignC, float, LayoutC, AlignC,
-        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
-        ElementA, LayoutA, AlignA, ElementB, LayoutB, AlignB, ElementAcc,
-        TileShape, ClusterShape,
-        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, void>;
-    using Gemm       = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-    using BlkCfg     = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+using TileShape    = Shape<_128, _128, _128>;   /* 128 rows: the SF atom is 128x4; a 64-row tile cannot describe its TMA load */
+using ClusterShape = Shape<_1, _1, _1>;
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+    TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAcc, ElementAcc, float, LayoutC, AlignC, float, LayoutC, AlignC,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+    ElementA, LayoutA, AlignA, ElementB, LayoutB, AlignB, ElementAcc,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using BlkCfg = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
 
-    static typename Gemm::Arguments args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
-                                         const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K) {
+/* One mainloop + epilogue, two tile schedulers (the 4th GemmUniversal parameter). */
+template <class SchedTag>
+struct FT {
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, SchedTag>;
+    using Gemm       = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    using Arguments  = typename Gemm::Arguments;
+
+    static Arguments args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
+                          const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K, int sm_count) {
         auto strideA = cutlass::make_cute_packed_stride(typename GemmKernel::StrideA{}, {M, K, 1});
         auto strideB = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N, K, 1});
         auto strideC = cutlass::make_cute_packed_stride(typename GemmKernel::StrideC{}, {M, N, 1});
         auto strideD = cutlass::make_cute_packed_stride(typename GemmKernel::StrideD{}, {M, N, 1});
         auto lSFA = BlkCfg::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
         auto lSFB = BlkCfg::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
-        return typename Gemm::Arguments{
+        Arguments a{
             cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
             { reinterpret_cast<const typename ElementA::DataType *>(A_data), strideA,
               reinterpret_cast<const typename ElementB::DataType *>(B_data), strideB,
               A_sf, lSFA, B_sf, lSFB },
             { {1.0f, 0.0f}, D, strideC, D, strideD } };
+        a.hw_info.device_id = 0;
+        a.hw_info.sm_count = sm_count;   /* fixed: no per-call device query, no decomposition drift */
+        return a;
     }
 };
+using FT1 = FT<void>;                              /* stage-0 kernel: one CTA per output tile */
+using FTK = FT<cutlass::gemm::StreamKScheduler>;   /* split-K / stream-K: adds the fixup reduction */
+using SKArgs   = typename FTK::GemmKernel::TileSchedulerArguments;
+using SKDecomp = decltype(SKArgs::decomposition_mode);
+using SKReduce = decltype(SKArgs::reduction_mode);
+
+/* Variants: index -> (kernel, split count).  splits 1 + StreamK mode is the
+ * stream-K variant; splits 1 on FT1 is the plain tile. */
+enum { V_S1 = 0, V_S2, V_S4, V_S8, V_SK, V_N };
+static const int         ft_splits[V_N] = {1, 2, 4, 8, 1};
+static const char *const ft_names[V_N]  = {"128^3 S=1", "S=2", "S=4", "S=8", "streamK"};
+extern "C" int ft_nvariants(void) { return V_N; }
+extern "C" const char *ft_variant_name(int v) { return v >= 0 && v < V_N ? ft_names[v] : "?"; }
+
+static int ft_check(cudaError_t e, const char *what) {
+    if (e == cudaSuccess) return 0;
+    fprintf(stderr, "fixed-tile probe: %s: %s\n", what, cudaGetErrorString(e));
+    return 1;
+}
+
+extern "C" int ft_device_info(int *sm_count, unsigned long long *l2_bytes) {
+    int sm = 0, l2 = 0;
+    if (ft_check(cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0), "sm count") ||
+        ft_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0), "l2 size")) return 1;
+    if (sm_count) *sm_count = sm;
+    if (l2_bytes) *l2_bytes = (unsigned long long)l2;
+    return 0;
+}
 
 /* Activation pack: one warp per (m, kb); identical bytes to the engine's
  * mxfp8_quant_act_kernel (same helpers, fmax is order-free), SF written through
@@ -109,32 +172,25 @@ __global__ static void ft_relayout_sfb(TSFB tSFB, const uint8_t *sfb_base, const
     if (ct_off != lt_off) atomicAdd(n_mismatch, 1ull);
 }
 
-struct ft_ctx {
+struct ft_weight {
     int N, K, KB, KBp;
     uint8_t *B_data;          // LT data slab, device
     uint8_t *lt_scale;        // LT swizzled scale slab, device
     ElementSF *B_sf;          // CUTLASS-layout SFB
-    uint8_t *A_data;          // [16, K] e4m3
-    ElementSF *A_sf;          // SFA for up to 128 rows
-    void *ws; size_t ws_bytes;
     unsigned long long sfb_mismatch;
 };
 
-/* MXFP8 tile variants: index -> TN.  TN=32 exists for the small-N shapes
- * (output_b N=4096: 64 CTAs at TN=64 is 1.3 waves on 48 SMs). */
-extern "C" int ft_nvariants(void) { return 3; }
-extern "C" const char *ft_variant_name(int v) { static const char *n[] = {"128x32x128", "128x64x128", "128x128x128"}; return v >= 0 && v < 3 ? n[v] : "?"; }
+struct ft_act {
+    int N, K, KB, sm_count;
+    uint8_t *A_data;          // [16, K] e4m3
+    ElementSF *A_sf;          // SFA for up to 128 rows
+    void *ws; size_t ws_bytes;   // one workspace: launches are serial on one stream
+};
 
-static int ft_check(cudaError_t e, const char *what) {
-    if (e == cudaSuccess) return 0;
-    fprintf(stderr, "fixed-tile probe: %s: %s\n", what, cudaGetErrorString(e));
-    return 1;
-}
-
-extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_scale, int N, int K,
-                              unsigned long long *sfb_mismatch_out) {
+extern "C" ft_weight *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_scale, int N, int K,
+                                 unsigned long long *sfb_mismatch_out) {
     if (K % 128 != 0 || K < 128) { fprintf(stderr, "fixed-tile probe: K=%d not a multiple of 128\n", K); return nullptr; }
-    ft_ctx *c = new ft_ctx();
+    ft_weight *c = new ft_weight();
     memset(c, 0, sizeof *c);
     c->N = N; c->K = K; c->KB = K / 32; c->KBp = pulsar_mx_rup(c->KB, 4);
     const size_t data_bytes = (size_t)N * K;
@@ -144,13 +200,9 @@ extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_l
         ft_check(cudaMemcpy(c->B_data, host_lt_data, data_bytes, cudaMemcpyHostToDevice), "copy B") ||
         ft_check(cudaMemcpy(c->lt_scale, host_lt_scale, lt_scale_bytes, cudaMemcpyHostToDevice), "copy scale"))
         return nullptr;
-    /* SFB layout: same block-scaled config for both tile widths (SF vector 32,
-     * 128x4 atoms); take TN=128's and assert TN=64's has the same cosize. */
-    auto lSFB = FT<128>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
-    auto lSFB64 = FT<64>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
+    /* SFB layout: one block-scaled config for both kernels (same mainloop type). */
+    auto lSFB = BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
     const size_t sfb_bytes = (size_t)cosize(lSFB);
-    auto lSFB32 = FT<32>::BlkCfg::tile_atom_to_shape_SFB(make_shape(128, N, K, 1));
-    if ((size_t)cosize(lSFB64) != sfb_bytes || (size_t)cosize(lSFB32) != sfb_bytes) { fprintf(stderr, "fixed-tile probe: SFB cosize differs between TN variants\n"); return nullptr; }
     if (ft_check(cudaMalloc(&c->B_sf, sfb_bytes), "malloc SFB") ||
         ft_check(cudaMemset(c->B_sf, 0, sfb_bytes), "zero SFB")) return nullptr;
     unsigned long long *d_mis = nullptr;
@@ -164,66 +216,136 @@ extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_l
         cudaFree(d_mis);
     }
     if (sfb_mismatch_out) *sfb_mismatch_out = c->sfb_mismatch;
-    /* A side: 16 rows of data, SFA sized for the 128-row atom. */
-    auto lSFA = FT<128>::BlkCfg::tile_atom_to_shape_SFA(make_shape(128, N, K, 1));
-    if (ft_check(cudaMalloc(&c->A_data, (size_t)16 * K), "malloc A") ||
-        ft_check(cudaMalloc(&c->A_sf, (size_t)cosize(lSFA)), "malloc SFA") ||
-        ft_check(cudaMemset(c->A_sf, 0, (size_t)cosize(lSFA)), "zero SFA")) return nullptr;
-    /* workspace: max over M <= 16 and variants */
-    for (int M = 1; M <= 16; M++) {
-        size_t w;
-        w = FT<32>::Gemm::get_workspace_size(FT<32>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
-        w = FT<64>::Gemm::get_workspace_size(FT<64>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
-        w = FT<128>::Gemm::get_workspace_size(FT<128>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K)); if (w > c->ws_bytes) c->ws_bytes = w;
-    }
-    if (c->ws_bytes && ft_check(cudaMalloc(&c->ws, c->ws_bytes), "malloc ws")) return nullptr;
     return c;
 }
 
-template <int TN>
-static int ft_run_tn(ft_ctx *c, const float *x_dev, int M, float *D_dev) {
-    auto lSFA = FT<TN>::BlkCfg::tile_atom_to_shape_SFA(make_shape(M, c->N, c->K, 1));
-    auto tSFA = make_tensor(make_gmem_ptr(c->A_sf), lSFA);
-    const long warps = (long)M * c->KB;
-    ft_pack_a<<<(unsigned)((warps * 32 + 255) / 256), 256>>>(c->A_data, tSFA, x_dev, M, c->K);
-    if (cudaGetLastError() != cudaSuccess) return 10;
-    auto a = FT<TN>::args(D_dev, c->A_data, c->A_sf, c->B_data, c->B_sf, M, c->N, c->K);
-    typename FT<TN>::Gemm gemm;
-    static bool checked[17] = {};
-    if (!checked[M]) {
-        if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
-        checked[M] = true;
-    }
-    if (gemm.initialize(a, c->ws) != cutlass::Status::kSuccess) return 2;
-    return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+/* The scheduler arguments of a variant on the stream-K kernel. */
+static void ft_sk_args(SKArgs &s, int variant) {
+    s.splits = ft_splits[variant];
+    s.decomposition_mode = ft_splits[variant] > 1 ? SKDecomp::SplitK : SKDecomp::StreamK;
+    s.reduction_mode = SKReduce::Deterministic;
 }
 
-extern "C" int ft_run(ft_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
-    if (!c || !x || !D || M < 1 || M > 16) return 4;
-    if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
-    const float *x_dev = (const float *)x->ptr;
-    float *D_dev = (float *)D->ptr;
-    switch (variant) {
-    case 0: return ft_run_tn<32>(c, x_dev, M, D_dev);
-    case 1: return ft_run_tn<64>(c, x_dev, M, D_dev);
-    case 2: return ft_run_tn<128>(c, x_dev, M, D_dev);
-    default: return 6;
+extern "C" ft_act *ft_act_prepare(int N, int K) {
+    if (K % 128 != 0 || K < 128) { fprintf(stderr, "fixed-tile probe: K=%d not a multiple of 128\n", K); return nullptr; }
+    ft_act *a = new ft_act();
+    memset(a, 0, sizeof *a);
+    a->N = N; a->K = K; a->KB = K / 32;
+    if (ft_device_info(&a->sm_count, nullptr)) return nullptr;
+    auto lSFA = BlkCfg::tile_atom_to_shape_SFA(make_shape(128, N, K, 1));
+    if (ft_check(cudaMalloc(&a->A_data, (size_t)16 * K), "malloc A") ||
+        ft_check(cudaMalloc(&a->A_sf, (size_t)cosize(lSFA)), "malloc SFA") ||
+        ft_check(cudaMemset(a->A_sf, 0, (size_t)cosize(lSFA)), "zero SFA")) return nullptr;
+    /* workspace: max over M <= 16 and variants (split-K partials + barriers) */
+    for (int M = 1; M <= 16; M++) {
+        size_t w = FT1::Gemm::get_workspace_size(FT1::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, a->sm_count));
+        if (w > a->ws_bytes) a->ws_bytes = w;
+        for (int v = V_S2; v < V_N; v++) {
+            auto ak = FTK::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, a->sm_count);
+            ft_sk_args(ak.scheduler, v);
+            w = FTK::Gemm::get_workspace_size(ak);
+            if (w > a->ws_bytes) a->ws_bytes = w;
+        }
     }
+    if (a->ws_bytes && ft_check(cudaMalloc(&a->ws, a->ws_bytes), "malloc ws")) return nullptr;
+    return a;
 }
+
+extern "C" int ft_pack(ft_act *a, const pulsar_gpu_tensor *x, int M) {
+    if (!a || !x || M < 1 || M > 16) return 4;
+    if (x->bytes < (uint64_t)M * a->K * sizeof(float)) return 5;
+    auto lSFA = BlkCfg::tile_atom_to_shape_SFA(make_shape(M, a->N, a->K, 1));
+    auto tSFA = make_tensor(make_gmem_ptr(a->A_sf), lSFA);
+    const long warps = (long)M * a->KB;
+    ft_pack_a<<<(unsigned)((warps * 32 + 255) / 256), 256>>>(a->A_data, tSFA, (const float *)x->ptr, M, a->K);
+    return ft_check(cudaGetLastError(), "pack launch") ? 10 : 0;
+}
+
+struct ft_plan {
+    int variant;
+    void *ws;
+    FT1::Gemm g1; FT1::Arguments a1;
+    FTK::Gemm gk; FTK::Arguments ak;
+};
+
+template <class F>
+static int ft_plan_init(typename F::Gemm &g, typename F::Arguments &a, void *ws) {
+    if (F::Gemm::can_implement(a) != cutlass::Status::kSuccess) return 1;
+    return g.initialize(a, ws) == cutlass::Status::kSuccess ? 0 : 2;   /* TMA descriptors, scheduler params, smem attribute */
+}
+
+extern "C" int ft_plan_make(ft_weight *w, ft_act *a, int variant, int M, pulsar_gpu_tensor *D, ft_plan **out) {
+    if (!w || !a || !D || !out || M < 1 || M > 16 || w->N != a->N || w->K != a->K) return 4;
+    if (D->bytes < (uint64_t)M * w->N * sizeof(float)) return 5;
+    if (variant < 0 || variant >= V_N) return 6;
+    ft_plan *p = new ft_plan();
+    p->variant = variant; p->ws = a->ws;
+    int rc;
+    if (variant == V_S1) {
+        p->a1 = FT1::args((float *)D->ptr, a->A_data, a->A_sf, w->B_data, w->B_sf, M, w->N, w->K, a->sm_count);
+        rc = ft_plan_init<FT1>(p->g1, p->a1, a->ws);
+    } else {
+        p->ak = FTK::args((float *)D->ptr, a->A_data, a->A_sf, w->B_data, w->B_sf, M, w->N, w->K, a->sm_count);
+        ft_sk_args(p->ak.scheduler, variant);
+        rc = ft_plan_init<FTK>(p->gk, p->ak, a->ws);
+    }
+    if (rc) { delete p; return rc; }
+    *out = p;
+    return 0;
+}
+
+/* Per launch: the barrier workspace back to zero (split-K/stream-K arrivals
+ * are counters; a no-op for the plain tile) and the kernel.  Both on the
+ * per-thread default stream, like the engine's launches. */
+extern "C" int ft_plan_run(ft_plan *p) {
+    if (!p) return 4;
+    if (p->variant == V_S1) {
+        if (FT1::GemmKernel::initialize_workspace(p->a1, p->ws) != cutlass::Status::kSuccess) return 3;
+        return p->g1.run() == cutlass::Status::kSuccess ? 0 : 3;
+    }
+    if (FTK::GemmKernel::initialize_workspace(p->ak, p->ws) != cutlass::Status::kSuccess) return 3;
+    return p->gk.run() == cutlass::Status::kSuccess ? 0 : 3;
+}
+
+extern "C" void ft_plan_decomp(const ft_plan *p, ft_decomp *d) {
+    memset(d, 0, sizeof *d);
+    if (!p) return;
+    if (p->variant == V_S1) {
+        const dim3 g = FT1::Gemm::get_grid_shape(p->g1.params());
+        d->splits = 1; d->ctas = g.x * g.y * g.z;
+        return;
+    }
+    const auto &prm = p->gk.params();
+    const auto &sk = prm.scheduler.sk_params_;
+    d->splits    = sk.divmod_splits_.divisor;   /* EFFECTIVE (after adjust_split_count) */
+    d->sk_units  = sk.sk_units_;
+    d->sk_tiles  = sk.sk_tiles_;
+    d->big_units = sk.big_units_;
+    const dim3 g = FTK::Gemm::get_grid_shape(prm);
+    d->ctas = g.x * g.y * g.z;
+}
+
+extern "C" void ft_plan_release(ft_plan *p) { delete p; }
 
 extern "C" int ft_sync(void) { return ft_check(cudaDeviceSynchronize(), "sync"); }
 
-extern "C" void ft_release(ft_ctx *c) {
+extern "C" void ft_release(ft_weight *c) {
     if (!c) return;
-    cudaFree(c->B_data); cudaFree(c->lt_scale); cudaFree(c->B_sf); cudaFree(c->A_data); cudaFree(c->A_sf);
-    if (c->ws) cudaFree(c->ws);
+    cudaFree(c->B_data); cudaFree(c->lt_scale); cudaFree(c->B_sf);
     delete c;
 }
 
+extern "C" void ft_act_release(ft_act *a) {
+    if (!a) return;
+    cudaFree(a->A_data); cudaFree(a->A_sf);
+    if (a->ws) cudaFree(a->ws);
+    delete a;
+}
+
 /* ---- stage 0.4: the bf16 family (router, output head) --------------------
- * A plain (non-block-scaled) tensor-core GEMM with a fixed 64 x TN x 32 tile,
- * sm80-style mma.sync m16n8k16 through cutlass::gemm::device::GemmUniversal
- * (no split-K, identity swizzle: fixed reduction order, M never consulted).
+ * A plain (non-block-scaled) tensor-core GEMM with a fixed tile, sm80-style
+ * mma.sync m16n8k16 through cutlass::gemm::device::GemmUniversal (no split-K,
+ * identity swizzle: fixed reduction order, M never consulted).
  * A = activations rounded f32 -> bf16 with the engine's RNE (f32_to_bf16_kernel),
  * B = the bf16 weight [N][K] straight from the mmap (K-major == ColumnMajor). */
 #include "cutlass/gemm/device/gemm_universal.h"
@@ -266,74 +388,108 @@ __global__ static void fb_f32_to_bf16(uint16_t *out, const float *x, uint64_t n)
     }
 }
 
-struct fb_ctx {
-    int N, K;
-    uint16_t *W;      // bf16 [N][K]
-    uint16_t *A;      // bf16 [16][K]
-    void *ws; size_t ws_bytes;
-};
+struct fb_weight { int N, K; uint16_t *W; };                       // bf16 [N][K]
+struct fb_act    { int N, K; uint16_t *A; void *ws; size_t ws_bytes; };   // bf16 [16][K]
 
 template <int V>
-static typename FB<V>::Gemm::Arguments fb_args(fb_ctx *c, const uint16_t *A, int M, float *D) {
+static typename FB<V>::Gemm::Arguments fb_args(int N, int K, const uint16_t *A, const uint16_t *W, int M, float *D) {
     return typename FB<V>::Gemm::Arguments(
-        cutlass::gemm::GemmUniversalMode::kGemm, {M, c->N, c->K}, 1, {1.0f, 0.0f},
-        A, c->W, D, D,
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K}, 1, {1.0f, 0.0f},
+        A, W, D, D,
         0, 0, 0, 0,
-        (int64_t)c->K, (int64_t)c->K, (int64_t)c->N, (int64_t)c->N);
+        (int64_t)K, (int64_t)K, (int64_t)N, (int64_t)N);
 }
 
-extern "C" fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K) {
+extern "C" fb_weight *fb_prepare(const uint8_t *host_w_bf16, int N, int K) {
     if (K % 8 != 0 || N % 8 != 0) { fprintf(stderr, "fixed-tile probe (bf16): N=%d K=%d not multiples of 8\n", N, K); return nullptr; }
-    fb_ctx *c = new fb_ctx();
+    fb_weight *c = new fb_weight();
     memset(c, 0, sizeof *c);
     c->N = N; c->K = K;
     const size_t wbytes = (size_t)N * K * 2;
     if (ft_check(cudaMalloc(&c->W, wbytes), "malloc W bf16") ||
-        ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "copy W bf16") ||
-        ft_check(cudaMalloc(&c->A, (size_t)16 * K * 2), "malloc A bf16")) return nullptr;
-    for (int M = 1; M <= 16; M++) {
-        size_t w;
-        w = FB<0>::Gemm::get_workspace_size(fb_args<0>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
-        w = FB<1>::Gemm::get_workspace_size(fb_args<1>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
-        w = FB<2>::Gemm::get_workspace_size(fb_args<2>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
-        w = FB<3>::Gemm::get_workspace_size(fb_args<3>(c, nullptr, M, nullptr)); if (w > c->ws_bytes) c->ws_bytes = w;
-    }
-    if (c->ws_bytes && ft_check(cudaMalloc(&c->ws, c->ws_bytes), "malloc ws bf16")) return nullptr;
+        ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "copy W bf16")) return nullptr;
     return c;
 }
 
+extern "C" fb_act *fb_act_prepare(int N, int K) {
+    if (K % 8 != 0 || N % 8 != 0) { fprintf(stderr, "fixed-tile probe (bf16): N=%d K=%d not multiples of 8\n", N, K); return nullptr; }
+    fb_act *a = new fb_act();
+    memset(a, 0, sizeof *a);
+    a->N = N; a->K = K;
+    if (ft_check(cudaMalloc(&a->A, (size_t)16 * K * 2), "malloc A bf16")) return nullptr;
+    for (int M = 1; M <= 16; M++) {
+        size_t w;
+        w = FB<0>::Gemm::get_workspace_size(fb_args<0>(N, K, nullptr, nullptr, M, nullptr)); if (w > a->ws_bytes) a->ws_bytes = w;
+        w = FB<1>::Gemm::get_workspace_size(fb_args<1>(N, K, nullptr, nullptr, M, nullptr)); if (w > a->ws_bytes) a->ws_bytes = w;
+        w = FB<2>::Gemm::get_workspace_size(fb_args<2>(N, K, nullptr, nullptr, M, nullptr)); if (w > a->ws_bytes) a->ws_bytes = w;
+        w = FB<3>::Gemm::get_workspace_size(fb_args<3>(N, K, nullptr, nullptr, M, nullptr)); if (w > a->ws_bytes) a->ws_bytes = w;
+    }
+    if (a->ws_bytes && ft_check(cudaMalloc(&a->ws, a->ws_bytes), "malloc ws bf16")) return nullptr;
+    return a;
+}
+
+extern "C" int fb_pack(fb_act *a, const pulsar_gpu_tensor *x, int M) {
+    if (!a || !x || M < 1 || M > 16) return 4;
+    if (x->bytes < (uint64_t)M * a->K * sizeof(float)) return 5;
+    const uint64_t n = (uint64_t)M * a->K;
+    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(a->A, (const float *)x->ptr, n);
+    return ft_check(cudaGetLastError(), "bf16 pack launch") ? 10 : 0;
+}
+
+struct fb_plan {
+    int variant;
+    FB<0>::Gemm g0; FB<1>::Gemm g1; FB<2>::Gemm g2; FB<3>::Gemm g3;
+};
+
 template <int V>
-static int fb_run_tn(fb_ctx *c, const float *x_dev, int M, float *D_dev) {
-    const uint64_t n = (uint64_t)M * c->K;
-    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, x_dev, n);
-    if (cudaGetLastError() != cudaSuccess) return 10;
-    typename FB<V>::Gemm gemm;
-    auto a = fb_args<V>(c, c->A, M, D_dev);
-    static bool checked[17] = {};
-    if (!checked[M]) {
-        if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
-        checked[M] = true;
-    }
-    if (gemm.initialize(a, c->ws) != cutlass::Status::kSuccess) return 2;
-    return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+static int fb_plan_init(typename FB<V>::Gemm &g, fb_weight *w, fb_act *a, int M, float *D) {
+    auto args = fb_args<V>(w->N, w->K, a->A, w->W, M, D);
+    if (FB<V>::Gemm::can_implement(args) != cutlass::Status::kSuccess) return 1;
+    return g.initialize(args, a->ws) == cutlass::Status::kSuccess ? 0 : 2;
 }
 
-extern "C" int fb_run(fb_ctx *c, int variant, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
-    if (!c || !x || !D || M < 1 || M > 16) return 4;
-    if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
-    const float *x_dev = (const float *)x->ptr; float *D_dev = (float *)D->ptr;
+extern "C" int fb_plan_make(fb_weight *w, fb_act *a, int variant, int M, pulsar_gpu_tensor *D, fb_plan **out) {
+    if (!w || !a || !D || !out || M < 1 || M > 16 || w->N != a->N || w->K != a->K) return 4;
+    if (D->bytes < (uint64_t)M * w->N * sizeof(float)) return 5;
+    if (variant < 0 || variant > 3) return 6;
+    fb_plan *p = new fb_plan();
+    p->variant = variant;
+    float *Dp = (float *)D->ptr;
+    int rc;
     switch (variant) {
-    case 0: return fb_run_tn<0>(c, x_dev, M, D_dev);
-    case 1: return fb_run_tn<1>(c, x_dev, M, D_dev);
-    case 2: return fb_run_tn<2>(c, x_dev, M, D_dev);
-    case 3: return fb_run_tn<3>(c, x_dev, M, D_dev);
-    default: return 6;
+    case 0:  rc = fb_plan_init<0>(p->g0, w, a, M, Dp); break;
+    case 1:  rc = fb_plan_init<1>(p->g1, w, a, M, Dp); break;
+    case 2:  rc = fb_plan_init<2>(p->g2, w, a, M, Dp); break;
+    default: rc = fb_plan_init<3>(p->g3, w, a, M, Dp); break;
     }
+    if (rc) { delete p; return rc; }
+    *out = p;
+    return 0;
 }
 
-extern "C" void fb_release(fb_ctx *c) {
+extern "C" int fb_plan_run(fb_plan *p) {
+    if (!p) return 4;
+    cutlass::Status s;
+    switch (p->variant) {
+    case 0:  s = p->g0.run(); break;
+    case 1:  s = p->g1.run(); break;
+    case 2:  s = p->g2.run(); break;
+    default: s = p->g3.run(); break;
+    }
+    return s == cutlass::Status::kSuccess ? 0 : 3;
+}
+
+extern "C" void fb_plan_release(fb_plan *p) { delete p; }
+
+extern "C" void fb_release(fb_weight *c) {
     if (!c) return;
-    cudaFree(c->W); cudaFree(c->A);
-    if (c->ws) cudaFree(c->ws);
+    cudaFree(c->W);
     delete c;
+}
+
+extern "C" void fb_act_release(fb_act *a) {
+    if (!a) return;
+    cudaFree(a->A);
+    if (a->ws) cudaFree(a->ws);
+    delete a;
 }
