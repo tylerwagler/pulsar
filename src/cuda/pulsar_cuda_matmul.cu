@@ -1084,8 +1084,8 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
     mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
     if (!s) return 0;
     const int ntok = (int)n_tok;
-    const int KBp  = mx_rup((int)(in_dim / 32), 4);
-    const size_t sx_bytes = (size_t)mx_rup(ntok, 128) * (size_t)KBp;
+    const int KBp  = pulsar_mx_kbp((int)in_dim);
+    const size_t sx_bytes = pulsar_mx_sf_slab_bytes(ntok, KBp);
     if (!mxfp8_act_cache_reserve((void **)&s->xq, &s->xq_cap,
                                  (size_t)(n_tok * in_dim), "act data") ||
         !mxfp8_act_cache_reserve((void **)&s->sx, &s->sx_cap,
@@ -1220,8 +1220,8 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
         !data_out || !scale_out || !sf_pitch || !scale_slab) {
         return 0;
     }
-    const int KBp = mx_rup((int)(group_dim / 32), 4);
-    const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
+    const int KBp = pulsar_mx_kbp((int)group_dim);
+    const size_t slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
     const size_t data_bytes  = (size_t)n_tokens * n_groups * group_dim;
     const size_t scale_bytes = (size_t)n_groups * slab;
     if (!mxfp8_act_cache_reserve((void **)&g_gact.xq, &g_gact.xq_cap, data_bytes, "gact data") ||
@@ -1273,8 +1273,8 @@ int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t 
     if (!x_full || !x_view || rows == 0 || in_dim % 32 != 0) return 0;
     mxfp8_act_cache_t *src = act_slot_find_rows(x_full->ptr, row0 + rows, in_dim);
     if (!src || !src->valid || !src->xq || !src->sx) return 0;
-    const int KBp = mx_rup((int)(in_dim / 32), 4);
-    const size_t sx_bytes = (size_t)mx_rup((int)rows, 128) * KBp;
+    const int KBp = pulsar_mx_kbp((int)in_dim);
+    const size_t sx_bytes = pulsar_mx_sf_slab_bytes((int)rows, KBp);
     /* keep the source's buffers: acquire may evict an LRU slot, never the one
      * we are reading from (it was just touched by the lookup). */
     __nv_fp8_e4m3 *src_q = src->xq; unsigned char *src_sf = src->sx;
@@ -1355,7 +1355,7 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
     if (!s || !s->valid || !s->xq || !s->sx) return 0;
     *data  = s->xq;
     *scale = s->sx;
-    *kbp   = mx_rup((int)(in_dim / 32), 4);
+    *kbp   = pulsar_mx_kbp((int)in_dim);
     return 1;
 }
 
@@ -1392,7 +1392,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
-    size_t sx_bytes = (size_t)mx_rup(ntok, 128) * KBp;
+    size_t sx_bytes = pulsar_mx_sf_slab_bytes(ntok, KBp);
     size_t wz = 32u << 20;
     /* xq, sx and the cuBLASLt workspace must be DISTINCT buffers, but
      * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
@@ -1558,7 +1558,7 @@ static int cuda_attention_output_a_mx_gemm(
                                                 group_dim, low_dim, "attn_out_a");
     if (!w) return 0;
     const int KBp = mx_rup((int)KB, 4);
-    size_t x_scale_slab = (size_t)mx_rup((int)n_tokens, 128) * KBp;
+    size_t x_scale_slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
     const size_t w_scale_slab = ((size_t)rank / 128) * (size_t)KBp * 128;
     const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
     size_t wz = 32u << 20;
@@ -2039,7 +2039,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
             if (bw) {
-                const int KBp = mx_rup((int)(in_dim / 32), 4);
+                const int KBp = pulsar_mx_kbp((int)in_dim);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
                 /* A8 first, for the same reason the n==1 path takes it: the
@@ -2051,7 +2051,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 if (!ac8nt && act_slot_a8_declared_short(x->ptr, n_tok, in_dim))
                     return act_a8_contract_fail("verify-batch GEMV", n_tok, in_dim, out_dim);
                 if (ac8nt && ac8nt->valid) {
-                    const int xKBp = mx_rup((int)(in_dim / 32), 4);
+                    const int xKBp = pulsar_mx_kbp((int)in_dim);
                     {
                         /* Keyed on the (in,out) pair and announced once per
                          * shape, exactly like the n==1 twin: a gate PASS cannot
@@ -2112,7 +2112,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 ? cuda_fp8_mx_weight(model_map, weight_offset, fbytes, in_dim, out_dim, label)
                 : NULL;
         if (w) {
-            const int KBp = mx_rup((int)(in_dim / 32), 4);
+            const int KBp = pulsar_mx_kbp((int)in_dim);
             /* A8: if the producer already emitted this activation as E4M3 +
              * ue8m0, multiply in that format rather than against f32.  This is
              * the decode/spec path -- the ONLY place W8A32 still existed -- and
@@ -2152,7 +2152,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                                 (unsigned long long)in_dim, (unsigned long long)out_dim);
                     }
                 }
-                const int xKBp = mx_rup((int)(in_dim / 32), 4);
+                const int xKBp = pulsar_mx_kbp((int)in_dim);
                 /* The GEMV arms were the NINTH element-type defect, and the
                  * one that broke SERVING while every gate stayed green: both
                  * kernels are templated on OT, but these launches hardcoded
@@ -2492,7 +2492,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
      * keeps the 4-row geometry. */
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
-    const int KBp = mx_rup((int)(group_dim / 32), 4);
+    const int KBp = pulsar_mx_kbp((int)group_dim);
 
     /* A8: multiply the attn-output "a" projection in E4M3 rather than against
      * f32 heads. This is the largest byte consumer in the model and was the
@@ -2516,7 +2516,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
      * once for all rows (grouped_fp8mx_a_nt_a8_kernel). */
     if (dw &&   /* dw != NULL implies group_dim%32==0 (K13) */
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
-        const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
+        const size_t slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
         /* L106 K1: consume the producer-emitted grouped encoding when it is
          * current, exactly as the tensor-core arm does.  Before this probe,
          * only that arm consulted the cache, so the "a" activation was

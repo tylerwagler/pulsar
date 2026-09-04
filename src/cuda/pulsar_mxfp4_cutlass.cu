@@ -123,168 +123,6 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 // i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
 // (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
 
-/* Vectorized twin (2026-07-26): the scalar kernel above is one thread per 32-block
- * doing 32 serial scalar LDG.32 for the amax + 32 scalar STG.8 — issue/latency
- * bound (the roofline named it 444 ms = 6.6% of prefill, the biggest dense/MLA
- * sub-cost). This reads the block as 8x float4 (LDG.128) and writes as 2x int4
- * (STG.128). BIT-EXACT to the scalar kernel: one thread still owns the whole
- * 32-block, the amax folds in the SAME sequential order 0..31 (.x/.y/.z/.w per
- * float4), and each element's `cutlass::float_e4m3_t(v*inv)` encode is byte-for-
- * byte the same conversion on the same float. Only the load/store WIDTH changes.
- * Alignment: per-expert K is a 128-multiple, kb*32 floats = 128 B, so
- * act+m*K+kb*32 is 16-B aligned (float4) and the e4m3 out is 16-B aligned (int4).
- * Also the fallback when K is not a 128-multiple (see can_warp). */
-template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
-  int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
-  int m=(int)(idx/nblk), kb=(int)(idx%nblk);
-  const float4 *x4=reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb*32);
-  float4 v[8];
-  #pragma unroll
-  for(int i=0;i<8;i++) v[i]=x4[i];
-  float mx=0.f;
-  #pragma unroll
-  for(int i=0;i<8;i++){ mx=fmaxf(mx,fabsf(v[i].x)); mx=fmaxf(mx,fabsf(v[i].y));
-                        mx=fmaxf(mx,fabsf(v[i].z)); mx=fmaxf(mx,fabsf(v[i].w)); }
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
-  float inv=exp2f((float)-se);
-  cutlass::float_e4m3_t ob[32];
-  #pragma unroll
-  for(int i=0;i<8;i++){ ob[i*4+0]=cutlass::float_e4m3_t(v[i].x*inv);
-                        ob[i*4+1]=cutlass::float_e4m3_t(v[i].y*inv);
-                        ob[i*4+2]=cutlass::float_e4m3_t(v[i].z*inv);
-                        ob[i*4+3]=cutlass::float_e4m3_t(v[i].w*inv); }
-  int4 *outp=reinterpret_cast<int4*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32);
-  const int4 *obp=reinterpret_cast<const int4*>(ob);
-  outp[0]=obp[0]; outp[1]=obp[1];
-  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
-}
-/* Warp-per-4-blocks twin (2026-08-08).  The vec kernel above still gives one
- * THREAD the whole 32-block, so a lane reads 128 contiguous bytes while its
- * neighbour starts 128 B away: each of its 8 LDG.128 spans 4 KB across the warp
- * and lands in 32 separate sectors, and every sector gets requested twice (a
- * 32 B sector holds two of the thread's consecutive float4).  Measured on a
- * real prefill: 57344 blocks x 128 threads x 32 elem = 235 M elements, 1.18 GB
- * moved in 7.72 ms = 154 GB/s against ~273 GB/s of bandwidth.
- *
- * Here a WARP owns four consecutive 32-blocks: lane L takes elements 4L..4L+3
- * as one float4, so the warp's load is 512 B of contiguous memory in a single
- * coalesced access, and the store is 128 B the same way.  The amax for a block
- * is then a shuffle across the eight lanes that span it rather than a serial
- * scan.  (Same restructuring as idx_pack_q_kernel in the indexer scorer, which
- * this pattern came from.)
- *
- * STILL BIT-EXACT to both twins.  fmaxf is associative AND commutative on this
- * data, so folding the amax by shuffle instead of in index order 0..31 cannot
- * change it -- unlike a sum, a max reassociates exactly.  NaN does not break
- * that either: fabsf(NaN) is NaN and fmaxf(x, NaN) returns x, so a NaN is
- * skipped in any order.  Each element's encode is the same
- * cutlass::float_e4m3_t(v*inv) on the same float; only the load/store width and
- * the reduction order change.
- *
- * Requires K/32 divisible by 4 (i.e. K a 128-multiple) so a warp's four blocks
- * never straddle a row; pack_activation checks that and falls back if not. */
-template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor_warp(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
-  const int nblk = K/32;
-  const long total_blk = (long)M*nblk;
-  const int lane = threadIdx.x & 31;
-  const long grp = ((long)blockIdx.x*blockDim.x + threadIdx.x) >> 5;  // group of 4 blocks
-  const long blk0 = grp*4;
-  if (blk0 >= total_blk) return;
-  const int m = (int)(blk0 / nblk), kb0 = (int)(blk0 % nblk);
-
-  const float4 v = reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb0*32)[lane];
-  float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
-  // lanes 8b..8b+7 span block b: xor over the low three lane bits reduces within it
-  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
-  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
-  mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
-
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
-  const float inv=exp2f((float)-se);
-
-  cutlass::float_e4m3_t ob[4];
-  ob[0]=cutlass::float_e4m3_t(v.x*inv); ob[1]=cutlass::float_e4m3_t(v.y*inv);
-  ob[2]=cutlass::float_e4m3_t(v.z*inv); ob[3]=cutlass::float_e4m3_t(v.w*inv);
-  reinterpret_cast<uint32_t*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)
-                              +(size_t)m*K+(size_t)kb0*32)[lane]
-      = *reinterpret_cast<const uint32_t*>(ob);
-  if((lane & 7)==0) tSFA(m, (kb0+(lane>>3))*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
-}
-
-// LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
-__device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-// mid = silu(clamp(gate)) * clamp(up) * routing_weight.
-// TWIN of swiglu_kernel in pulsar_cuda_hc_router.cu, and deliberately a
-// separate copy: this TU deliberately does not take pulsar_cuda_internal.h
-// (it is the one CUTLASS-including TU and keeps its include surface minimal),
-// so the two cannot share a definition without coupling them. They MUST agree on the arithmetic above.
-// Two differences that are intentional, not drift: the routing weight is a
-// per-row array here and a scalar there, and the engine's twin carries an
-// E4M3 + E8M0 epilogue that this one does not.  Since L158 every CUTLASS down
-// arm reads mid's E4M3 from the engine's activation cache (or, for the small
-// fused FFN, from its own swizzled pack of the same values); nothing here
-// re-derives an encoding from f32.
-// This cited `pulsar_cuda.cu:10827-10835` until 2026-08-17 to assert the
-// agreement. That file does not exist -- the engine was split up long ago --
-// so the reference had been unfollowable, and the invariant uncheckable,
-// for however long it took anyone to look.
-/* ONE definition of the per-element math, shared by the scalar and vector
- * kernels below so the two can never drift.  fminf/fmaxf form, matching the
- * hc_router twin EXACTLY: identical to the if-chain on finite inputs, but
- * agrees on NaN too (fminf(NaN,c)=c, where the if-chain left NaN) -- the
- * twins must not diverge on any input. */
-__device__ __forceinline__ static float swiglu_elem(float g, float u, float wv, float clamp){
-  if(clamp>1.0e-6f){ g=fminf(g,clamp); u=fminf(fmaxf(u,-clamp),clamp); }
-  const float s=g/(1.f+expf(-g));
-  return s*u*wv;
-}
-
-__global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
-  long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
-  mid[i]=swiglu_elem(gate[i], up[i], w[i/mid_dim], clamp);
-}
-
-/* Vector-4 twin (L128).  ncu on the decode path measured this kernel at
- * 47.3% SM with a long-scoreboard stall ratio of 13.1 -- occupancy was fine
- * (80%), it was simply waiting on memory: one element per thread means three
- * 4-byte global accesses and a 64-bit divide per output float.  Four elements
- * per thread turns those into 16-byte transactions and amortises the divide.
- * BIT-EXACT by construction: same swiglu_elem per element, elementwise with
- * no reduction, so nothing reassociates -- only the access granularity and
- * the thread mapping change.  Taken only when mid_dim and n are multiples of
- * 4 and all three pointers are 16-byte aligned; otherwise the scalar kernel
- * runs unchanged. */
-__global__ void swiglu_v4_kernel(float4 *mid, const float4 *gate, const float4 *up, const float *w, float clamp, int mid_dim_q, long quads){
-  long q=(long)blockIdx.x*blockDim.x+threadIdx.x; if(q>=quads) return;
-  const float4 g=gate[q], u=up[q];
-  const float wv=w[q/mid_dim_q];   /* all four share a pair when mid_dim%4==0 */
-  float4 o;
-  o.x=swiglu_elem(g.x,u.x,wv,clamp);
-  o.y=swiglu_elem(g.y,u.y,wv,clamp);
-  o.z=swiglu_elem(g.z,u.z,wv,clamp);
-  o.w=swiglu_elem(g.w,u.w,wv,clamp);
-  mid[q]=o;
-}
-
-/* Dispatch: vector when the shape and alignment allow, scalar otherwise. */
-static inline bool swiglu_v4_ok(const void *a, const void *b, const void *c, int mid_dim, long n){
-  return (mid_dim % 4)==0 && (n % 4)==0 &&
-         ((uintptr_t)a % 16)==0 && ((uintptr_t)b % 16)==0 && ((uintptr_t)c % 16)==0;
-}
-static inline void swiglu_launch(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
-  const int t=256;
-  if(swiglu_v4_ok(mid,gate,up,mid_dim,n)){
-    const long quads=n/4; const long b=(quads+t-1)/t;
-    swiglu_v4_kernel<<<(unsigned)b,t>>>((float4*)mid,(const float4*)gate,(const float4*)up,w,clamp,mid_dim/4,quads);
-  } else {
-    const long b=(n+t-1)/t;
-    swiglu_kernel<<<(unsigned)b,t>>>(mid,gate,up,w,clamp,mid_dim,n);
-  }
-}
 
 /* L129 lever 1 — SwiGLU WITH the E4M3+E8M0 epilogue its hc_router twin has.
  *
@@ -321,10 +159,10 @@ __global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TS
   const float4 u = reinterpret_cast<const float4*>(up+base)[lane];
   const float wv = w[m];              /* row weight: i/mid_dim == m when K==mid_dim */
   float4 v;
-  v.x = swiglu_elem(g.x,u.x,wv,clamp);
-  v.y = swiglu_elem(g.y,u.y,wv,clamp);
-  v.z = swiglu_elem(g.z,u.z,wv,clamp);
-  v.w = swiglu_elem(g.w,u.w,wv,clamp);
+  v.x = pulsar_swiglu_elem(g.x,u.x,wv,clamp);
+  v.y = pulsar_swiglu_elem(g.y,u.y,wv,clamp);
+  v.z = pulsar_swiglu_elem(g.z,u.z,wv,clamp);
+  v.w = pulsar_swiglu_elem(g.w,u.w,wv,clamp);
   if (mid_f32) reinterpret_cast<float4*>(mid_f32+base)[lane] = v;
 
   float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
@@ -345,37 +183,22 @@ __global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TS
 }
 
 
-// A_data is E4M3: M*K bytes (1 byte/elem), NOT M*K/2. SFA via the CUTLASS tile-atom layout.
-static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, int M, int K){
-  auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
-  auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
-  int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  /* The warp kernel gives a warp four consecutive 32-blocks, so they must not
-   * straddle a row.  Fall back rather than mis-index if K is ever not a
-   * 128-multiple (per-expert K is, but this is the only thing guaranteeing it). */
-  const int can_warp = ((K/32) % 4) == 0;
-  if (!can_warp) pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
-  else {
-    const long groups = (long)M*(K/32)/4;          /* one warp per group */
-    const long thr = groups*32, bw = (thr+t-1)/t;
-    pack_act_e4m3_rowmajor_warp<<<(unsigned)bw,t>>>(A_data, tSFA, x, M, K);
-  }
-}
-
 /* L129 lever 1: swiglu straight into the E4M3 staging the down GEMM reads.
  * Falls back to the unfused pair whenever the warp packer's own shape rule
  * (K a 128-multiple) or 16-byte alignment does not hold, so the fast path
  * adds no constraint the old pair did not already have. */
-static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A_sf,
-                                   const float *gate, const float *up, const float *w,
-                                   float clamp, int M, int K){
+static int swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A_sf,
+                                  const float *gate, const float *up, const float *w,
+                                  float clamp, int M, int K){
   const bool shape_ok = ((K/32) % 4) == 0;
   const bool align_ok = ((uintptr_t)gate % 16)==0 && ((uintptr_t)up % 16)==0 &&
                         ((uintptr_t)mid_f32 % 16)==0;
   if (!shape_ok || !align_ok) {
-    swiglu_launch(mid_f32, gate, up, w, clamp, K, (long)M*K);
-    pack_activation(A_data, A_sf, mid_f32, M, K);
-    return;
+    /* L159 inc 2: the unfused swiglu -> f32 mid -> pack pair that stood here
+     * was a fallback (a second encoder of the same values); it is gone, and a
+     * shape the fused packer cannot take is an error. */
+    fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3: K=%d not a 128-multiple or operands unaligned -- refusing\n", K);
+    return 1;
   }
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
@@ -387,8 +210,7 @@ static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A
    * E4M3 staging -- and `mid` is CUTLASS-local scratch, never registered in
    * the activation cache, so no consumer can look it up and no
    * act_f32_absent_hazard applies.  Same move the hc_router twin and qr_norm
-   * already make, with the same announce discipline.  The unfused fallback
-   * above still writes it, because pack_activation reads it back. */
+   * already make, with the same announce discipline. */
   static int announced = 0;
   if (!announced) {
     announced = 1;
@@ -397,6 +219,7 @@ static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A
             (double)((size_t)M * K * sizeof(float)) / 1048576.0, M, K);
   }
   swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(nullptr, A_data, tSFA, gate, up, w, clamp, M, K);
+  return 0;
 }
 
 /* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
@@ -754,7 +577,7 @@ int pulsar_cutlass_grouped_moe(
       up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
-  swiglu_pack_activation(mid, midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim);
+  if (swiglu_pack_activation(mid, midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
       down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
@@ -1045,12 +868,12 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   const int   x_nblk_row = (int)(in_dim / 32u);
   const int   x_kbp      = pulsar_mx_rup(x_nblk_row, 4);
   const size_t xq_elems  = (size_t)n_tokens * in_dim;
-  const size_t xsf_bytes = (size_t)((n_tokens + 127u) / 128u) * (size_t)(x_kbp / 4) * 512u;
+  const size_t xsf_bytes = pulsar_mx_sf_slab_bytes(n_tokens, x_kbp);
   const size_t xq_bytes  = xq_elems + xsf_bytes;
   const size_t midq_elems = (size_t)n_slots * mid_dim;
   const int   mid_nblk_row = (int)(mid_dim / 32u);
   const int   mid_kbp      = pulsar_mx_rup(mid_nblk_row, 4);
-  const size_t midsf_bytes = (size_t)((n_slots + 127u) / 128u) * (size_t)(mid_kbp / 4) * 512u;
+  const size_t midsf_bytes = pulsar_mx_sf_slab_bytes(n_slots, mid_kbp);
   const size_t midq_bytes = midq_elems + midsf_bytes;
   const size_t need = (xq_bytes + 3u) / 4u + (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
@@ -1076,7 +899,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
    * ⚠ THE HIT IS ONLY VALID BECAUSE BOTH SIDES ARE THE SWIZZLE, and that was
    * checked on both ends rather than assumed: the producer writes through
    * pulsar_mx_emit_block -> pulsar_mx_sfoff, and expert_gemv_gu_swiglu_kernel
-   * reads through pulsar_mx_sfoff, with act_kbp = mx_rup(in_dim/32,4) = the
+   * reads through pulsar_mx_sfoff, with act_kbp = pulsar_mx_kbp(in_dim) = the
    * x_kbp computed here.  Handing a swizzled reader a linear plane compiles
    * clean and computes a well-formed WRONG answer; the reverse assumption --
    * that nothing needed the swizzle -- is what broke the engine in 7df3b75. */

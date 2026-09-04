@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
 
@@ -487,9 +488,7 @@ __global__ static void moe_swiglu_gathered_kernel(
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_rows * mid_dim;
     if (i >= n) return;
-    float g = gate_g[i], u = up_g[i];
-    if (clamp > 1.0e-6f) { if (g > clamp) g = clamp; if (u > clamp) u = clamp; if (u < -clamp) u = -clamp; }
-    mid_g[i] = (g / (1.0f + expf(-g))) * u * w_g[i / mid_dim];   /* SwiGLU order matches the other MoE gate/up paths */
+    mid_g[i] = pulsar_swiglu_elem(gate_g[i], up_g[i], w_g[i / mid_dim], clamp);
 }
 
 
@@ -781,7 +780,7 @@ static int routed_moe_launch_mixed40(
                         expert_in_dim, n_tokens);
                 ok = 0;
             }
-            if (pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
+            if (ok && pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     gq, gsf, gkbp) != 0) ok = 0;
@@ -928,17 +927,6 @@ static int routed_moe_launch_mixed40(
  * existed purely to satisfy the link.  That path went with the mmvq half in
  * ledger L066 step 2, so the stub has no caller and no reason to exist. */
 
-/* ONE definition of the per-element math, shared by the scalar and vector
- * kernels so they cannot drift.  clamp semantics match the swiglu gate/up
- * path above. */
-__device__ __forceinline__ static float moe_fold_elem(float g, float u, float wv, float clamp) {
-    if (clamp > 1.0e-6f) {
-        if (g > clamp) g = clamp;
-        if (u > clamp) u = clamp;
-        if (u < -clamp) u = -clamp;
-    }
-    return (g / (1.0f + expf(-g))) * u * wv;
-}
 
 __global__ static void moe_mmq_swiglu_fold_kernel(
         float *mid_out,
@@ -950,7 +938,7 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
         float clamp) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    mid_out[idx] = moe_fold_elem(gate_raw[idx], up_raw[idx],
+    mid_out[idx] = pulsar_swiglu_elem(gate_raw[idx], up_raw[idx],
                                  weights[idx / (uint64_t)expert_mid_dim], clamp);
 }
 
@@ -974,10 +962,10 @@ __global__ static void moe_mmq_swiglu_fold_v4_kernel(
     const float4 g = gate_raw[q], u = up_raw[q];
     const float wv = weights[q / (uint64_t)expert_mid_dim_q];
     float4 o;
-    o.x = moe_fold_elem(g.x, u.x, wv, clamp);
-    o.y = moe_fold_elem(g.y, u.y, wv, clamp);
-    o.z = moe_fold_elem(g.z, u.z, wv, clamp);
-    o.w = moe_fold_elem(g.w, u.w, wv, clamp);
+    o.x = pulsar_swiglu_elem(g.x, u.x, wv, clamp);
+    o.y = pulsar_swiglu_elem(g.y, u.y, wv, clamp);
+    o.z = pulsar_swiglu_elem(g.z, u.z, wv, clamp);
+    o.w = pulsar_swiglu_elem(g.w, u.w, wv, clamp);
     mid_out[q] = o;
 }
 
@@ -1544,8 +1532,16 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                         expert_in_dim, n_tokens);
                 return 0;
             }
-            if (gate_w && up_w && down_w &&
-                pulsar_cutlass_expert_ffn_gemv_small(
+            if (!(gate_w && up_w && down_w)) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN: expert weight range unmapped -- refusing\n");
+                return 0;
+            }
+            /* L159 inc 2: this arm either runs or refuses.  It used to fall
+             * through to the grouped dispatch on any failure -- for an armed
+             * step a neutrality break (the rows took the other kernel), for an
+             * unarmed one a silent slow path -- with a WARNING line as the only
+             * witness.  A failure here is a failure. */
+            if (pulsar_cutlass_expert_ffn_gemv_small(
                         (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
                         (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
@@ -1553,38 +1549,19 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,
                         (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                        hq, hsf, hkbp) == 0) {
-                const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
-                moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) {
-                    if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> gemv\n", layer_index);
-                    return 1;
-                }
+                        hq, hsf, hkbp) != 0) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN (n_tok=%u) failed -- no fallback; refusing\n",
+                        n_tokens);
+                return 0;
             }
-            /* any failure: fall through to the grouped CUTLASS path */
+            const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
+            moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            if (!cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 0;
+            if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> gemv\n", layer_index);
+            return 1;
         }
         if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> grouped\n", layer_index);
-        /* A small verify batch (n_tokens 2..4) that was ELIGIBLE for the fp4
-         * GEMV fast path but fell through is a genuine (if minor) silent
-         * fallback -- announce once, unconditionally.  n_tokens>4 (prefill)
-         * routing to the grouped dispatch is the intended fast path, not a
-         * fallback, so it is deliberately NOT flagged here. */
-        {
-            static int gemv_batch_logged = 0;
-            /* L152/L153: any width <= moe_gemv_cap falling through is the GEMV
-             * path declining (buffers too small) -- for an ARMED step that is a
-             * neutrality break (the rows take the other kernel), for an unarmed
-             * one a silent slow path -- so it is announced at every width the
-             * GEMV should have taken.  One cap, the GEMV's own, not a second
-             * literal that drifts from it (this said 4 while the cap was 8). */
-            if (n_tokens >= 1u && n_tokens <= moe_gemv_cap && !gemv_batch_logged) {
-                gemv_batch_logged = 1;
-                fprintf(stderr,
-                        "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
-                        n_tokens);
-            }
-        }
         return routed_moe_launch_cutlass_dispatch(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, gate_row_bytes,

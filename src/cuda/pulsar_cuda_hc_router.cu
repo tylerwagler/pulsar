@@ -484,14 +484,7 @@ __global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, u
                                      __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = swiglu_act_load(gate, i);
-    float u = swiglu_act_load(up, i);
-    if (clamp > 1.0e-6f) {
-        g = fminf(g, clamp);
-        u = fminf(fmaxf(u, -clamp), clamp);
-    }
-    float s = g / (1.0f + expf(-g));
-    const float v = s * u * weight;
+    const float v = pulsar_swiglu_elem(swiglu_act_load(gate, i), swiglu_act_load(up, i), weight, clamp);
     /* `out` is NULL when the launcher was told the f32 store is dead -- the
      * MXFP8 consumer reads the encoding below instead.  The branch is uniform
      * across the whole launch, so it costs nothing in a bandwidth-bound

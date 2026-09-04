@@ -680,10 +680,10 @@ int main(int argc, char **argv) {
      * the default: the bank count is DERIVED from --ctx so a moderate ctx yields
      * a multi-bank pool while a huge ctx (e.g. 1M) correctly yields N=1 (exact
      * classic behavior, no startup failure). PULSAR_MSEQ_BANKS, when set, PINS the
-     * count and skips auto-sizing. This runs BEFORE the first
-     * pulsar_engine_session_cost_bytes call (gpu_graph_bank_pool_n caches
-     * PULSAR_MSEQ_BANKS on first read); the fit probe uses the _banked cost variant,
-     * which prices an explicit N without touching that cache. */
+     * count and skips auto-sizing.  The engine owns the number: the server asks
+     * it (pulsar_engine_bank_pool) and, when it derives N itself, sets it
+     * (pulsar_engine_set_bank_pool) -- L159 retired the setenv round trip.  The
+     * fit probe uses the _banked cost variant, which prices an explicit N. */
     const int pool_auto_max = PULSAR_SESSION_POOL_AUTO_MAX; /* fast-lane boundary */
 
     /* Tier-2 overcommit (task #55, increment 1). Precompute the per-bank split of
@@ -711,7 +711,9 @@ int main(int argc, char **argv) {
             ? pulsar_engine_demand_paged_bytes_per_bank(engine, reserve_ctx) : 0;
     }
 
-    if (getenv("PULSAR_MSEQ_BANKS")) {
+    int pool_pinned = 0;
+    (void)pulsar_engine_bank_pool(&pool_pinned);
+    if (pool_pinned) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 pool: PULSAR_MSEQ_BANKS pinned by operator "
                    "(auto-sizing skipped)");
@@ -761,9 +763,7 @@ int main(int argc, char **argv) {
                 if (c > 0 && server_kv_admits(kv_budget, 0, c)) { chosen = N; break; }
             }
         }
-        char banks[8];
-        snprintf(banks, sizeof(banks), "%d", chosen);
-        setenv("PULSAR_MSEQ_BANKS", banks, 1);
+        pulsar_engine_set_bank_pool((uint32_t)chosen);
         if (overcommit) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: Tier-2 OVERCOMMIT auto-sized to %d bank(s) for --ctx %d: "
@@ -791,9 +791,7 @@ int main(int argc, char **argv) {
     const uint64_t full_banked_est = pulsar_engine_session_cost_bytes(engine, cfg.ctx_size);
     uint64_t overcommit_admission_est = 0;
     if (overcommit) {
-        const char *nb = getenv("PULSAR_MSEQ_BANKS");
-        long finalN = nb && nb[0] ? strtol(nb, NULL, 10) : 1;
-        if (finalN < 1) finalN = 1;
+        const long finalN = (long)pulsar_engine_bank_pool(NULL);
         overcommit_admission_est = oc_shared + (uint64_t)finalN * (oc_eager_pb + oc_expect_pb);
     }
     const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;

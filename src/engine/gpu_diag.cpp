@@ -585,11 +585,24 @@ static int gpu_graph_kv_managed_override(void) {
  * 1 (default) keeps the classic single-session cache layout; 2..PULSAR_MSEQ_MAX
  * allocates the fixed per-bank slabs (pulsar_bank_slabs) and installs bank-0
  * views, so every existing single-session path runs unmodified against
- * bank 0.  Read once per process at graph allocation — never on a
- * token/layer path.  Interim wiring: later increments make the server pass
- * the pool size explicitly instead. */
+ * bank 0.  ONE owner of the number (L159 inc 5): this reader parses the
+ * variable once per process (never on a token/layer path); a caller that
+ * derives the size itself (the server's auto-sizing) SETS it through
+ * gpu_graph_bank_pool_set instead of writing the environment for this
+ * function to read back, and asks through the same accessor. */
+static long g_bank_pool_cached = -1;
+static int  g_bank_pool_env_pinned = 0;
+void gpu_graph_bank_pool_set(uint32_t n) {
+    if (n < 1u) n = 1u;
+    if (n > PULSAR_MSEQ_MAX) n = PULSAR_MSEQ_MAX;
+    g_bank_pool_cached = (long)n;
+}
+int gpu_graph_bank_pool_env_pinned(void) {
+    (void)gpu_graph_bank_pool_n();
+    return g_bank_pool_env_pinned;
+}
 uint32_t gpu_graph_bank_pool_n(void) {
-    static long cached = -1;
+    long &cached = g_bank_pool_cached;
     if (cached < 0) {
         const char *v = getenv("PULSAR_MSEQ_BANKS");
         long n = 1;
@@ -605,9 +618,12 @@ uint32_t gpu_graph_bank_pool_n(void) {
                         "bank pool disabled\n", v, PULSAR_MSEQ_MAX);
                 n = 1;
             } else if (n > (long)PULSAR_MSEQ_MAX) {
+                g_bank_pool_env_pinned = 1;
                 fprintf(stderr, "pulsar: PULSAR_MSEQ_BANKS=%ld clamped to %u\n",
                         n, PULSAR_MSEQ_MAX);
                 n = (long)PULSAR_MSEQ_MAX;
+            } else {
+                g_bank_pool_env_pinned = 1;
             }
         }
         cached = n;
@@ -1767,13 +1783,6 @@ bool gpu_graph_alloc_raw_cap(
                 "unset PULSAR_ATTN_MX\n");
         return false;
     }
-    if (PULSAR_N_ROT != 64u || ((PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % 64u) != 0u) {
-        fprintf(stderr,
-                "pulsar: the packed comp cache requires n_rot 64 and 64-aligned nope dims "
-                "(head_dim %u / n_rot %u)\n",
-                (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT);
-        return false;
-    }
     g->comp_cap = dz.comp_cap;
     g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -1826,38 +1835,20 @@ bool gpu_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
-    /* ROW GEOMETRY AGREEMENT, checked once, before anything is sized by it.
-     *
-     * The packed KV row and the indexer FP4 row are each defined twice -- once
-     * here and once in the backend -- because head_dim is a runtime shape that
-     * neither side can name across the seam.  Until now the two were kept in
-     * step by a comment.  Every cache stride, every session-payload span and
-     * every attention read is derived from these numbers, so a divergence is not
-     * a subtle bug: it is out-of-bounds reads at a wrong stride, which is
-     * exactly how the f32/packed mixup produced NaNs from a clean compile.
-     *
-     * Ask the backend and refuse to start if it disagrees.  This is cheap (two
-     * calls per graph) and it converts a silent divergence into a startup
-     * failure that names both numbers. */
-    {
-        const uint64_t eng_attn = (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-        const uint64_t gpu_attn = pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM);
-        const uint64_t eng_idx  = (uint64_t)PULSAR_ENGINE_IDXFP4_ROWBYTES;
-        const uint64_t gpu_idx  = pulsar_gpu_mxkv_fp4_rowbytes(PULSAR_N_INDEXER_HEAD_DIM);
-        if (eng_attn != gpu_attn || eng_idx != gpu_idx) {
-            fprintf(stderr,
-                    "pulsar: KV row geometry disagrees across the backend seam -- "
-                    "attn engine=%llu gpu=%llu (head_dim %u), "
-                    "index engine=%llu gpu=%llu (head_dim %u). "
-                    "PULSAR_ENGINE_ATTN_PACK_ROWBYTES / PULSAR_ENGINE_IDXFP4_ROWBYTES "
-                    "must match PULSAR_ATTN_PACK_ROWBYTES / PULSAR_MXKV_FP4_ROWBYTES.\n",
-                    (unsigned long long)eng_attn, (unsigned long long)gpu_attn,
-                    (unsigned)PULSAR_N_HEAD_DIM,
-                    (unsigned long long)eng_idx, (unsigned long long)gpu_idx,
-                    (unsigned)PULSAR_N_INDEXER_HEAD_DIM);
-            gpu_graph_free(g);
-            return false;
-        }
+    /* ROW GEOMETRY: one definition now (src/pulsar_gpu.h, L159 inc 5), so the
+     * only thing left to check is that this model's shape fits the row the
+     * kernels index: n_rot must be the packed row's rope width and the nope
+     * width a whole number of E4M3 scale blocks.  Refuse before anything is
+     * sized by the row. */
+    if ((uint32_t)PULSAR_N_ROT != PULSAR_ATTN_PACK_NROT ||
+        (PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % PULSAR_ATTN_PACK_NOPE_ALIGN != 0u) {
+        fprintf(stderr,
+                "pulsar: model shape does not fit the packed KV row (head_dim %u, n_rot %u; "
+                "the row holds n_rot %u and nope widths in multiples of %u) -- refusing\n",
+                (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT,
+                (unsigned)PULSAR_ATTN_PACK_NROT, (unsigned)PULSAR_ATTN_PACK_NOPE_ALIGN);
+        gpu_graph_free(g);
+        return false;
     }
 
     /* One KV row format since the L111 unification.  Name it once in the log

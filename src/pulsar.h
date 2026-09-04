@@ -207,6 +207,12 @@ uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
  * NOT charge at admission (only the eager floor is charged). 0 if no session
  * could be priced. */
 uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size);
+/** The bank-pool size the next session will be created with, and whether the
+ * operator pinned it (PULSAR_MSEQ_BANKS).  A server that derives the size
+ * itself SETS it here -- the engine owns the number; nothing else parses the
+ * variable and nothing writes the environment to talk to the engine (L159). */
+uint32_t pulsar_engine_bank_pool(int *pinned_by_env);
+void     pulsar_engine_set_bank_pool(uint32_t n_banks);
 /** Tier-2 overcommit (task #55): EXACT touched (physically resident) demand-paged
  * KV bytes across the pool, summed from the per-bank compressor frontier
  * (deterministic; no MemAvailable). The eviction guard triggers on this; the

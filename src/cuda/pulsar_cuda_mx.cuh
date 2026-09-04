@@ -45,6 +45,15 @@ __host__ __device__ __forceinline__ static int pulsar_mx_rup(int x, int n) {
     return (x + n - 1) / n * n;
 }
 
+/* The slab geometry as two functions, so no call site spells it (L159 inc 5):
+ * blocks-per-row padded to 4, rows padded to 128, one E8M0 byte per (row, kb). */
+__host__ __device__ __forceinline__ static int pulsar_mx_kbp(int in_dim) {
+    return pulsar_mx_rup(in_dim / 32, 4);
+}
+__host__ __device__ __forceinline__ static size_t pulsar_mx_sf_slab_bytes(int rows, int KBp) {
+    return (size_t)pulsar_mx_rup(rows, 128) * (size_t)KBp;
+}
+
 __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
@@ -90,6 +99,19 @@ __device__ __forceinline__ static void pulsar_mx_emit_block(
     if ((threadIdx.x & 31u) == 0u) {
         scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
     }
+}
+
+/* ONE SwiGLU element for every gate/up path (L159 inc 2): the hc-router
+ * shared-expert kernel, the CUTLASS grouped/GEMV packers and the routed MoE's
+ * gathered and MMQ-fold kernels each carried their own copy, and two forms had
+ * already drifted on NaN (fminf/fmaxf returns the finite operand, an if-chain
+ * keeps the NaN).  Identical on every finite input to all five copies:
+ * clamp g from above and u both ways, s = g / (1 + exp(-g)), s * u * w in that
+ * order -- the multiply order is part of the definition. */
+__device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, float wv, float clamp) {
+    if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
+    const float s = g / (1.0f + expf(-g));
+    return s * u * wv;
 }
 
 #endif /* PULSAR_CUDA_MX_CUH */

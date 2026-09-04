@@ -64,9 +64,6 @@ enum {
  * This is the CUTLASS-consumable layout (float_ue8m0_t scales, block 32); the
  * GEMM path re-tiles the scales into CUTLASS's swizzled SF layout at use time.
  */
-#define PULSAR_MXKV_BLOCK 32u
-#define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
-#define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
 /* There was a format SELECTOR here (NONE/FP4 plus a rowbytes switch) from when
  * the indexer cache could be f32 or FP4.  It cannot: the cache is FP4, every
  * reader decodes it in place, and the f32 arm had no caller left. */
@@ -87,18 +84,11 @@ enum {
  * ⚠ Quantize EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
  * misrounds ~33%% of blocks.  Every later move is a byte move.  There is no
  * other KV row format and no conversion path from the retired e4m3 row --
- * stale payloads refuse.  Must stay in sync with
- * PULSAR_ENGINE_ATTN_PACK_ROWBYTES.  Bumping this layout MUST bump
- * PULSAR_SESSION_PAYLOAD_VERSION (done for the unification: v7).
+ * stale payloads refuse.  The geometry macros (PULSAR_ATTN_PACK_*,
+ * PULSAR_KV4_NV_*, PULSAR_MXKV_*) live in src/pulsar_gpu.h, the one
+ * definition both sides of the seam read (L159 inc 5).  Bumping this layout
+ * MUST bump PULSAR_SESSION_PAYLOAD_VERSION (done for the unification: v7).
  */
-#define PULSAR_ATTN_PACK_NROT 64u
-#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
-#define PULSAR_ATTN_PACK_NIB(HD)  (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
-#define PULSAR_KV4_NV_BLOCK      16u
-#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
-#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
  * __half since the L045 flip. */

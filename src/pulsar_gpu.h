@@ -937,23 +937,38 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
  * snapshots refuse loudly and re-prefill; there is deliberately no
  * conversion loader (an FP4 re-encode misrounds ~33%% of blocks; bytes are
  * the values).  Requires n_rot == 64 and (head_dim - n_rot) %% 16 == 0. */
-/** THE BACKEND'S OWN ROW GEOMETRY, so the engine can check its copy against it.
+/** THE KV ROW GEOMETRY -- one definition, used by the kernels that index the
+ * rows and by the engine that sizes the caches and payload spans (L159 inc 5).
+ * It was defined twice, once per side of this seam, kept in step by a comment
+ * and a start-up check that asked the backend for its number; both sides now
+ * read these macros, and the check is a tautology that no longer exists.
  *
- * The packed KV row is defined TWICE -- PULSAR_ATTN_PACK_ROWBYTES(HD) in
- * src/cuda/pulsar_cuda_internal.h and PULSAR_ENGINE_ATTN_PACK_ROWBYTES in
- * src/engine/pulsar_engine_internal.h -- because head_dim is a RUNTIME shape
- * behind this seam, so neither side can name the other's constant.  They were
- * kept in step by a comment saying "must stay in sync", which is the same
- * enforcement mechanism that has failed twice in one day elsewhere in this tree.
- * The engine copies also hardcode the block sizes (16 for the attn row's E4M3
- * scale codes, 32 for the indexer's) where the backend uses
- * PULSAR_KV4_NV_BLOCK and PULSAR_MXKV_BLOCK, so changing a block size
- * diverges them silently.
- *
- * These two entries let the engine ASK rather than assume; it does so once at
- * graph alloc and refuses to start on a mismatch.  A wrong row size is not a
- * subtle bug: every cache stride, every session payload span and every
- * attention read is derived from it. */
+ * Packed attention KV row (NVFP4, L111 unification): per row
+ *   [n_nope/2 E2M1 nibbles][n_nope/16 E4M3 block scales][f32 row scale]
+ *   [n_rot bf16 rope]  = 384 B at head_dim 512 / n_rot 64.
+ * Requires n_rot == PULSAR_ATTN_PACK_NROT and (head_dim - n_rot) a multiple
+ * of PULSAR_KV4_NV_BLOCK; the graph alloc refuses any other shape.  Quantise
+ * EXACTLY ONCE (attn_pack_store_kernel); every later move is a byte move, and
+ * there is no conversion path from any other row format.  Bumping this layout
+ * MUST bump PULSAR_SESSION_PAYLOAD_VERSION and PULSAR_BANK_KV_VERSION. */
+#define PULSAR_ATTN_PACK_NROT 64u
+#define PULSAR_ATTN_PACK_NOPE_ALIGN 64u   /* the kernels walk the nope dims in 64-wide lanes */
+#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
+#define PULSAR_ATTN_PACK_NIB(HD)  (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
+#define PULSAR_KV4_NV_BLOCK      16u
+#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
+#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
+    ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
+     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
+/** Microscaling compressed-KV row (the indexer's FP4 cache): one E8M0 scale
+ * byte per 32 elements, [HD/2 E2M1 nibble bytes][NBLK scale bytes]
+ * (HD=128 -> 68 B/row).  CUTLASS-consumable layout; the GEMM re-tiles the
+ * scales into its swizzled SF layout at use time. */
+#define PULSAR_MXKV_BLOCK 32u
+#define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
+#define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
+/** Accessors over the two macros for callers that hold head_dim as a runtime
+ * value (tests, the engine's comp-row helper).  Same expression, one authority. */
 uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
 uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 

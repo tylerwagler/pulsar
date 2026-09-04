@@ -165,11 +165,10 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
 
 
 
-/** MXKV FP4 row bytes for the indexer compressed cache (head_dim 128):
- * 64 nibble-pair bytes + 4 E8M0 block-32 scale bytes = 68 B (vs 512 f32). */
+/** MXKV FP4 row bytes for the indexer compressed cache: the shared
+ * definition at this model's indexer head_dim (68 B at 128). */
 #define PULSAR_ENGINE_IDXFP4_ROWBYTES \
-    (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 1u) / 2u + \
-     (((uint64_t)PULSAR_N_INDEXER_HEAD_DIM + 31u) / 32u))
+    ((uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM))
 
 /** THE packed KV row (NVFP4, L111 unification 2026-08-27): one row format for
  * every KV buffer -- raw ring, comp pool, drafter ring, MTP cache, current
@@ -178,12 +177,11 @@ static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
  * a lossy re-quantization of the QAT e4m3 values (measured verdict in
  * rows/L111.md); rope is bf16 verbatim.  The retired 584 B e4m3 row has no
  * decode path and no conversion loader -- stale payloads refuse by stride and
- * version.  Must stay in sync with PULSAR_ATTN_PACK_ROWBYTES in
- * src/cuda/pulsar_cuda_internal.h (the graph-alloc seam check enforces it). */
+ * version.  The shared definition (src/pulsar_gpu.h) at this model's head_dim;
+ * the graph alloc refuses a shape whose n_rot or nope width the row cannot
+ * hold, which is the only check the geometry still needs (L159 inc 5). */
 #define PULSAR_ENGINE_ATTN_PACK_ROWBYTES \
-    ((uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 2u + \
-     (uint64_t)(PULSAR_N_HEAD_DIM - PULSAR_N_ROT) / 16u + 4u + \
-     (uint64_t)PULSAR_N_ROT * 2u)
+    ((uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM))
 
 
 /** =========================================================================
@@ -2231,10 +2229,12 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_spec);
-/** Bank-pool size the next gpu_graph_alloc_raw_cap will use (PULSAR_MSEQ_BANKS,
- * read once, clamped to [1, PULSAR_MSEQ_MAX]; 1 = pool disabled).  Interim
- * wiring: later increments make the server pass the pool size explicitly. */
+/** Bank-pool size the next gpu_graph_alloc_raw_cap will use: PULSAR_MSEQ_BANKS
+ * parsed once (clamped to [1, PULSAR_MSEQ_MAX]; 1 = pool disabled), or the value
+ * a caller set.  The one owner of the number (L159 inc 5). */
 uint32_t gpu_graph_bank_pool_n(void);
+void     gpu_graph_bank_pool_set(uint32_t n);
+int      gpu_graph_bank_pool_env_pinned(void);   /* 1 when the operator's variable set it */
 /** Re-install the graph's per-layer cache views onto `bank` (pool mode only).
  * Contract: call only between fully synchronized forwards — the previous
  * bank's enqueued work must be complete, because the graph pointers change

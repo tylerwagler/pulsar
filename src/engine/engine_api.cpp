@@ -188,6 +188,8 @@ int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)P
 bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { return e ? e->session_cost_bytes(ctx_size) : 0; }
 uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) { return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : 0; }
+uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinned_by_env = gpu_graph_bank_pool_env_pinned(); return gpu_graph_bank_pool_n(); }
+void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
 uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { return e ? e->demand_paged_bytes_per_bank(ctx_size) : 0; }
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return e ? e->weights_resident_bytes() : 0; }
 int pulsar_engine_generate_argmax(pulsar_engine *e, const pulsar_tokens *prompt,
