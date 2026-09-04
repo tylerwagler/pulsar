@@ -39,6 +39,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,7 +77,8 @@ static bool pieces_match_bytes(pulsar_engine *e, const pulsar_tokens *p,
     return off == len;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
     pulsar_engine *e = NULL;
@@ -84,21 +86,23 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
-    size_t text_len = 0;
-    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     pulsar_tokens canon;
     memset(&canon, 0, sizeof(canon));
+    pulsar_tokens split;
+    memset(&split, 0, sizeof(split));
+    int *live = NULL;
+    int rc = 1;
+    {
+    size_t text_len = 0;
+    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); goto done; }
     pulsar_tokenize_text(e, text, &canon);
     free(text);
-    if (canon.len < 800) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (canon.len < 800) { fprintf(stderr, "prompt too short\n"); goto done; }
 
     /* ---- discover a seam pair: canon[k] whose text re-tokenizes split ---- */
     int k = -1;
-    pulsar_tokens split;
-    memset(&split, 0, sizeof(split));
     for (int i = 64; i < 190 && k < 0; i++) {
         size_t tl = 0;
         const char *tt = pulsar_token_text(e, canon.v[i], &tl);
@@ -131,11 +135,11 @@ int main(int argc, char **argv) {
         pulsar_tokens_free(&pb);
     }
     CHECK(k >= 0, "no discoverable seam pair in vocab (scan window 64..190)");
-    if (k < 0) { fprintf(stderr, "SEAM GATE: FAIL\n"); return 1; }
+    if (k < 0) { fprintf(stderr, "SEAM GATE: FAIL\n"); goto done; }
 
     /* live variant = canon with canon[k] replaced by its split pieces */
     const int live_len = canon.len - 1 + split.len;
-    int *live = (int *)malloc(sizeof(int) * (size_t)live_len);
+    live = (int *)malloc(sizeof(int) * (size_t)live_len);
     memcpy(live, canon.v, sizeof(int) * (size_t)k);
     memcpy(live + k, split.v, sizeof(int) * (size_t)split.len);
     memcpy(live + k + split.len, canon.v + k + 1,
@@ -158,7 +162,7 @@ int main(int argc, char **argv) {
     /* ---- leg 2: sync seam-rescue keeps the live KV ---- */
     {
         pulsar_session *s = NULL;
-        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
         char err[256];
         /* Build the session with the SAMPLED boundaries: live[0..k+split+8) */
         const int l1 = k + split.len + 8;
@@ -204,7 +208,7 @@ int main(int argc, char **argv) {
      * rewound and stitched rather than rebuilt. */
     {
         pulsar_session *s = NULL;
-        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
         char err[256];
         const int l1 = k + split.len + 8;      /* shared region, live boundaries */
         const int tail = 30;                   /* "generated reasoning", stripped */
@@ -268,7 +272,7 @@ int main(int argc, char **argv) {
      * because the checkpoint labels the KV that was cloned. */
     {
         pulsar_session *s = NULL;
-        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
         if (pulsar_session_bank_count(s) < 2) {
             fprintf(stderr, "leg4 SKIPPED: needs PULSAR_MSEQ_BANKS>=2\n");
         } else {
@@ -302,10 +306,14 @@ int main(int argc, char **argv) {
         pulsar_session_free(s);
     }
 
+    rc = 0;
+    }
+done:
     free(live);
     free(split.v);
     pulsar_tokens_free(&canon);
-    pulsar_engine_close(e);
+    gate_engine_close(e);
+    if (rc != 0) return rc;
 
     if (g_fail) { fprintf(stderr, "SEAM GATE: FAIL\n"); return 1; }
     printf("SEAM GATE: PASS\n");

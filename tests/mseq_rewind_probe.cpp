@@ -35,6 +35,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,28 +59,32 @@ static void show(pulsar_session *s, const char *when, int pos) {
            (ratio && have != (uint32_t)pos / ratio) ? "   <-- NOT position-true" : "");
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     pulsar_engine *e = NULL;
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0 || !e) {
+    if (gate_engine_open(&e, &opt) != 0 || !e) {
         fprintf(stderr, "engine open failed\n"); return 2;
     }
     pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 2; }
+    if (pulsar_session_create(&s, e, 4096) != 0) {
+        fprintf(stderr, "session create failed\n"); gate_engine_close(e); return 2;
+    }
 
     /* deterministic token stream */
-    static int toks[800];
+    int toks[800];
     for (int i = 0; i < 800; i++) toks[i] = 1000 + (i % 97);
     pulsar_tokens p;
     memset(&p, 0, sizeof(p));
     p.v = toks; p.len = p.cap = 600;
     char err[256];
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
-        fprintf(stderr, "sync failed: %s\n", err); return 2;
+        fprintf(stderr, "sync failed: %s\n", err);
+        pulsar_session_free(s); gate_engine_close(e); return 2;
     }
     show(s, "after prefill(600)", pulsar_session_pos(s));
 
@@ -87,7 +92,7 @@ int main(int argc, char **argv) {
     pulsar_session_bank_state_save(s, 0u);
     show(s, "after bank_state_save(0)", pulsar_session_pos(s));
 
-    static float *logits = (float *)malloc(sizeof(float) * (size_t)PULSAR_N_VOCAB);
+    float *logits = (float *)malloc(sizeof(float) * (size_t)PULSAR_N_VOCAB);
     /* round 1: decode 6 rows through the SERVED entry, one row on bank 0 */
     for (int k = 0; k < 6; k++) {
         pulsar_multiseq_req req;
@@ -96,7 +101,10 @@ int main(int argc, char **argv) {
         const int rc = pulsar_session_decode_mixed(s, &req, 1u, logits,
                                                    (int)PULSAR_N_VOCAB, &got, 0u,
                                                    err, sizeof err);
-        if (rc != 0) { printf("round1 step %d REJECTED rc=%d: %s\n", k, rc, err); return 1; }
+        if (rc != 0) {
+            printf("round1 step %d REJECTED rc=%d: %s\n", k, rc, err);
+            free(logits); pulsar_session_free(s); gate_engine_close(e); return 1;
+        }
         pulsar_session_note_committed_tokens(s, &toks[600 + k], 1);
     }
     show(s, "after mseq round 1 (6 rows)", pulsar_session_pos(s));
@@ -142,8 +150,9 @@ int main(int argc, char **argv) {
     CHECK(rc2 == 0, "step on a rewound bank rejected (L120's production shape): %s",
           rc2 != 0 ? err : "");
 
+    free(logits);
     pulsar_session_free(s);
-    pulsar_engine_close(e);
+    gate_engine_close(e);
     if (g_fail) { fprintf(stderr, "MSEQ-REWIND GATE: FAIL\n"); return 1; }
     printf("MSEQ-REWIND GATE: PASS\n");
     return 0;

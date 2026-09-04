@@ -16,6 +16,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,7 +100,9 @@ static void decode_stream_greedy(pulsar_session *s, uint32_t bank, int *toks,
     }
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_seed7 = 7;
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [N_CACHED L]\n", argv[0]); return 2; }
     /* ORACLE VALIDITY: n_cached must be a multiple of the PREFILL CHUNK (4096
      * default; also of 128 = LCM of compress ratios). A resumed prefill aligns
@@ -111,8 +114,18 @@ int main(int argc, char **argv) {
      * last-ulp GEMM differences then propagate to every later row — that is the
      * engine's existing warm-continuation numerics, NOT a fork bug, and it
      * breaks the byte oracle spuriously. */
-    const int n_cached = argc > 2 ? atoi(argv[2]) : 12288;
-    const int L = argc > 3 ? atoi(argv[3]) : 20480;
+    /* Default shape (L163): the identity must hold at any length, so the
+     * length buys boundary coverage, not strength.  The source must be whole
+     * prefill chunks (checked below: the oracle's premise is that the suffix
+     * on the forked bank and the cold run chunk at the same edges), so it is
+     * one chunk; the total, 8601, puts a chunk edge (8192) inside both the
+     * suffix and the cold run, wraps the raw ring (window 128) many times
+     * over, and sits off every grid the caches are laid out on (8601 % 4 =
+     * 1, % 128 = 25).  The 12288/20480 shape this replaced was 3 and 5 whole
+     * chunks and a multiple of 128 -- aligned everywhere -- at 2.4x the
+     * tokens. */
+    const int n_cached = argc > 2 ? atoi(argv[2]) : 4096;
+    const int L = argc > 3 ? atoi(argv[3]) : 8601;
     if ((n_cached % 4096) != 0) {
         fprintf(stderr, "n_cached %d must be a multiple of the prefill chunk (4096) "
                         "for the byte-identity oracle (see header comment)\n", n_cached);
@@ -123,21 +136,23 @@ int main(int argc, char **argv) {
 
     pulsar_engine *e = NULL; pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
-    size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
-    if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     pulsar_tokens base; memset(&base, 0, sizeof base);
-    pulsar_tokenize_text(e, text, &base); free(text);
-    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
-
     pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    int *toks = NULL;
+    int rc = 1;
+    {
+    size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
+    if (!text) { fprintf(stderr, "prompt read failed\n"); goto done; }
+    pulsar_tokenize_text(e, text, &base); free(text);
+    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); goto done; }
+
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "fork_gate: pool banks=%u ctx=%d n_cached=%d L=%d\n", pool, ctx, n_cached, L);
-    if (pool < 3) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=3\n"); return 1; }
+    if (pool < 3) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=3\n"); goto done; }
 
-    int *toks = (int *)malloc((size_t)L * sizeof(int));
+    toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];
 
     /* 1. SRC = bank 0 prefilled to the shared prefix [0, n_cached). */
@@ -531,7 +546,13 @@ int main(int argc, char **argv) {
         free(toks6);
     }
 
-    free(toks);
     fprintf(stderr, "BANK-FORK GATE: %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail ? 1 : 0;
+    rc = g_fail ? 1 : 0;
+    }
+done:
+    free(toks);
+    pulsar_session_free(s);
+    pulsar_tokens_free(&base);
+    gate_engine_close(e);
+    return rc;
 }

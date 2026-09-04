@@ -32,6 +32,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_fixture.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,17 +82,20 @@ static bool bank0_logits_at_width(int M, float *row0_out) {
     return ok;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof g_toks);
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats)\n");
 
     int need = 0;
     for (int k = 0; k < GATE_MAX_N; k++)
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
-    if (!gate_load_story(g_e, &g_toks, need)) return 1;
+    if (!gate_load_story(g_e, &g_toks, need)) { pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1; }
 
     const int vocab = (int)PULSAR_N_VOCAB;
     /* 12 and 16 added 2026-09-02: the armed range above 8 rows had no width
@@ -132,7 +136,8 @@ int main(int argc, char **argv) {
 
 done:
     for (int wi = 0; wi < nW; wi++) free(row[wi]);
-    pulsar_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "ALGO-STABILITY GATE: FAIL\n"); return 1; }
     printf("ALGO-STABILITY GATE: PASS\n");
     return 0;

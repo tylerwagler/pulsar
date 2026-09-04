@@ -35,6 +35,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +58,7 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [L1 L2 L3 ...]\n", argv[0]); return 2; }
 
     /* Fill levels (ascending). */
@@ -81,28 +82,30 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    pulsar_tokens base;
+    memset(&base, 0, sizeof(base));
+    pulsar_session *s = NULL;
+    int *toks = NULL;
+    int rc = 1;
+    {
     /* Base tokens to tile the long fill from (content is irrelevant to the
      * comp/index physical footprint — the frontier is position-driven). */
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
-    pulsar_tokens base;
-    memset(&base, 0, sizeof(base));
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); goto done; }
     pulsar_tokenize_text(e, text, &base);
     free(text);
-    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); goto done; }
 
     /* The price is the allocator run dry: it must equal what the create took,
      * to the byte, at this pool size and context. */
     const uint64_t priced = pulsar_engine_session_cost_bytes(e, ctx);
-    pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
     if (priced == 0 || priced != pulsar_session_resident_bytes(s)) {
         fprintf(stderr, "accounting_gate: FAIL session priced %" PRIu64 " B, create allocated %" PRIu64 " B\n",
                 priced, pulsar_session_resident_bytes(s));
-        return 1;
+        goto done;
     }
     fprintf(stderr, "accounting_gate: session price == allocation (%.3f GiB)\n",
             (double)priced / (1024.0 * 1024.0 * 1024.0));
@@ -118,8 +121,8 @@ int main(int argc, char **argv) {
     }
 
     /* A tiled token buffer of `peak` tokens, prefixes reused as we grow. */
-    int *toks = (int *)malloc((size_t)peak * sizeof(int));
-    if (!toks) { fprintf(stderr, "oom\n"); return 1; }
+    toks = (int *)malloc((size_t)peak * sizeof(int));
+    if (!toks) { fprintf(stderr, "oom\n"); goto done; }
     for (int i = 0; i < peak; i++) toks[i] = base.v[i % base.len];
 
     /* WARMUP: the FIRST prefill materializes the one-time lazy working set — not
@@ -130,7 +133,7 @@ int main(int argc, char **argv) {
      * increment. Warm up with the ENTIRE first level (multiple full-width chunks),
      * measure the baseline there, and assert on the subsequent increments — each
      * is then pure demand-paged comp/index growth. */
-    if (n_levels < 2) { fprintf(stderr, "accounting_gate: need >=2 fill levels\n"); return 2; }
+    if (n_levels < 2) { fprintf(stderr, "accounting_gate: need >=2 fill levels\n"); rc = 2; goto done; }
     {
         const int warm = levels[0];
         pulsar_tokens p;
@@ -140,7 +143,7 @@ int main(int argc, char **argv) {
         char err[256];
         if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "accounting_gate: warmup sync to %d failed: %s\n", warm, err);
-            return 1;
+            goto done;
         }
         gpu_graph_bank_counters_capture(&s->graph, s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0);
         (void)pulsar_gpu_synchronize();
@@ -285,7 +288,13 @@ int main(int argc, char **argv) {
                 reclaim_ok ? "OK (physical returned)" : "FAIL (no reclaim)");
     }
 
-    free(toks);
     fprintf(stderr, "accounting_gate: %s\n", fail ? "FAIL" : "PASS");
-    return fail ? 1 : 0;
+    rc = fail ? 1 : 0;
+    }
+done:
+    free(toks);
+    pulsar_session_free(s);
+    pulsar_tokens_free(&base);
+    gate_engine_close(e);
+    return rc;
 }

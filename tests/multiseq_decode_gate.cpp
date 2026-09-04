@@ -58,6 +58,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_fixture.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -348,7 +349,12 @@ static bool check_all_rows_head_mode(pulsar_session *s) {
     return ok;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_fail = 0;
+    memset(g_snap, 0, sizeof(g_snap));
+    memset(g_first_tok, 0, sizeof(g_first_tok));
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
         return 2;
@@ -377,29 +383,31 @@ int main(int argc, char **argv) {
         printf("CONFIG: DSpark DISABLED (dspark_disable=1) -- the driver must "
                "work with no speculation machinery allocated\n");
     }
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
         fprintf(stderr, "MULTISEQ GATE FAIL: PULSAR_GATE_NO_DSPARK set but the "
                         "engine still reports a drafter -- the no-dspark case "
                         "is not actually being exercised\n");
+        gate_engine_close(g_e);
         return 1;
     }
-
+    pulsar_session *s = NULL;
+    int rc = 1;
+    {
     int need = 0;
     for (int k = 0; k < maxn; k++) {
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     }
-    if (!gate_load_story(g_e, &g_toks, need)) return 1;
+    if (!gate_load_story(g_e, &g_toks, need)) goto done;
 
-    pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, g_e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
-    if (!gate_pool_fits(s, (uint32_t)maxn)) return 1;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
+    if (!gate_pool_fits(s, (uint32_t)maxn)) goto done;
 
     /* The cold prefills: prompt k into bank k, snapshotted. */
     {
         const double t0 = now_s();
         for (int k = 0; k < maxn; k++) {
-            if (!bank_prefill_and_snapshot(s, k)) { fprintf(stderr, "prefill %d failed\n", k); return 1; }
+            if (!bank_prefill_and_snapshot(s, k)) { fprintf(stderr, "prefill %d failed\n", k); goto done; }
         }
         printf("prefilled %d prompts (%d tokens) in %.1fs; every later populate is a "
                "snapshot load\n", maxn, need, now_s() - t0);
@@ -494,9 +502,14 @@ int main(int argc, char **argv) {
     for (int n = 0; n < GATE_MAX_N; n++) free(ref_l1[n]);
     for (int n = 0; n < GATE_MAX_N; n++)
         for (int k = 0; k < GATE_MAX_N; k++) free(multi[n][k]);
-    for (int k = 0; k < maxn; k++) pulsar_session_snapshot_free(&g_snap[k]);
+    rc = 0;
+    }
+done:
+    for (int k = 0; k < GATE_MAX_N; k++) pulsar_session_snapshot_free(&g_snap[k]);
     pulsar_session_free(s);
-    pulsar_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
+    if (rc != 0) return rc;
     if (g_fail) { fprintf(stderr, "MULTISEQ DECODE GATE: FAIL\n"); return 1; }
     printf("MULTISEQ DECODE GATE: PASS\n");
     return 0;

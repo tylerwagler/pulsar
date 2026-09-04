@@ -29,6 +29,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,7 +143,10 @@ static int streams_first_diff(const int *a, const int *b, int n) {
     return -1;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [STEPS]\n", argv[0]); return 2; }
     const int steps = argc > 2 ? atoi(argv[2]) : 128;
     if (steps < 1 || steps > GATE_MAX_STEPS) { fprintf(stderr, "bad STEPS\n"); return 2; }
@@ -151,17 +155,17 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     if (!pulsar_engine_has_dspark(g_e)) {
         fprintf(stderr, "BANK-SPEC GATE: model has no drafter — this gate needs "
                         "speculation (use the drafter-merged FRONTIER_MODEL)\n");
-        pulsar_engine_close(g_e);
+        gate_engine_close(g_e);
         return 1;
     }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); gate_engine_close(g_e); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
@@ -171,7 +175,8 @@ int main(int argc, char **argv) {
     uint64_t solo_acc[2], solo_drf[2];
     for (int k = 0; k < 2; k++) {
         if (!solo_spec(k, steps, solo[k], &solo_acc[k], &solo_drf[k])) {
-            fprintf(stderr, "solo spec %d failed\n", k); return 1;
+            fprintf(stderr, "solo spec %d failed\n", k);
+            pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1;
         }
         printf("solo[%d]: %d spec tokens, accept %.1f%% (%llu/%llu)\n", k, steps,
                solo_drf[k] ? 100.0 * (double)solo_acc[k] / (double)solo_drf[k] : 0.0,
@@ -316,7 +321,7 @@ int main(int argc, char **argv) {
 
 done:
     pulsar_tokens_free(&g_toks);
-    pulsar_engine_close(g_e);
+    gate_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "BANK-SPEC GATE: FAIL\n"); return 1; }
     printf("BANK-SPEC GATE: PASS\n");
     return 0;

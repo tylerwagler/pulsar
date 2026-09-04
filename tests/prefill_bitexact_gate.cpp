@@ -181,6 +181,7 @@
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
  */
 #include "pulsar.h"
+#include "gate_entry.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -287,7 +288,8 @@ static int env_kept(const char *name) {
     return 0;
 }
 
-static void scrub_one(const char *name, const char *value) {
+/* 0, or 2 when the knob could not be unset (the caller refuses to run). */
+static int scrub_one(const char *name, const char *value) {
     fprintf(stderr,
             "PREFILL GATE: ignoring %s=%s from the environment — this gate only "
             "certifies the DEFAULT configuration (a knob set identically on both "
@@ -298,8 +300,9 @@ static void scrub_one(const char *name, const char *value) {
          * exists to prevent; never continue past it. */
         fprintf(stderr, "PREFILL GATE FAIL: unsetenv(%s) failed — refusing to run "
                         "with a numerics knob still set\n", name);
-        exit(2);
+        return 2;
     }
+    return 0;
 }
 
 /* Diagnostic opt-in: PULSAR_GATE_DIAGNOSTIC_DUMPS=1 keeps the four graph-dump
@@ -330,7 +333,14 @@ static int env_kept_diag(const char *name) {
     return 0;
 }
 
-static void scrub_numerics_env(void) {
+/* Returns 0, or 2 when the environment could not be proven clean (the caller
+ * returns that as its exit status).
+ *
+ * RUNNER ORDER: this scrub unsets every PULSAR_* variable for the rest of the
+ * PROCESS, not just this gate.  In tests/gates_runner.cpp this gate therefore
+ * runs LAST -- any gate after it would see an environment with no
+ * PULSAR_MSEQ_BANKS, no PULSAR_GATE_* knobs, nothing. */
+static int scrub_numerics_env(void) {
     if (diagnostic_dumps_on())
         fprintf(stderr,
                 "PREFILL GATE: *** DIAGNOSTIC RUN — graph dumps kept; this run "
@@ -340,7 +350,7 @@ static void scrub_numerics_env(void) {
     const size_t cap = sizeof(names) / sizeof(names[0]);
     size_t n = 0;
     for (char **e = environ; *e; e++) {
-        if (strncmp(*e, "PULSAR_", 4) != 0) continue;
+        if (strncmp(*e, "PULSAR_", 7) != 0) continue;
         const char *eq = strchr(*e, '=');
         if (!eq) continue;
         const size_t len = (size_t)(eq - *e);
@@ -354,7 +364,8 @@ static void scrub_numerics_env(void) {
                     "environment — the scrub list is full, so the remainder would "
                     "stay SET and silently steer the numerics this gate claims to "
                     "certify.  Raise the cap in scrub_numerics_env().\n", cap);
-            exit(2);
+            for (size_t i = 0; i < n; i++) free(names[i]);
+            return 2;
         }
         char *nm = (char *)malloc(len + 1);
         if (!nm) {
@@ -362,22 +373,26 @@ static void scrub_numerics_env(void) {
                     "PREFILL GATE FAIL: out of memory collecting the env scrub list "
                     "at '%.*s' — cannot prove it is unset, refusing to run\n",
                     (int)len, *e);
-            exit(2);
+            for (size_t i = 0; i < n; i++) free(names[i]);
+            return 2;
         }
         memcpy(nm, *e, len);
         nm[len] = '\0';
         if (env_kept(nm) || env_kept_diag(nm)) { free(nm); continue; }
         names[n++] = nm;
     }
+    int status = 0;
     for (size_t i = 0; i < n; i++) {
-        scrub_one(names[i], getenv(names[i]));
+        if (status == 0) status = scrub_one(names[i], getenv(names[i]));
         free(names[i]);
     }
+    if (status != 0) return status;
     /* Named explicitly: these are not PULSAR_* and the sweep above cannot see them. */
     for (size_t i = 0; i < sizeof(g_env_scrub_foreign) / sizeof(g_env_scrub_foreign[0]); i++) {
         const char *v = getenv(g_env_scrub_foreign[i]);
-        if (v) scrub_one(g_env_scrub_foreign[i], v);
+        if (v && scrub_one(g_env_scrub_foreign[i], v) != 0) return 2;
     }
+    return 0;
 }
 
 /* A row that is degenerate (all-equal, or non-finite) would byte-match another
@@ -785,14 +800,20 @@ static int run_check_reference(const char *model, const char *ref_path,
     opt.backend = PULSAR_BACKEND_CUDA;
     opt.prefill_chunk = 4096;   /* production parity, as in the byte gate */
     opt.dspark_disable = true;
-    if (pulsar_engine_open(&g_e, &opt) != 0) {
+    if (gate_engine_open(&g_e, &opt) != 0) {
         fprintf(stderr, "engine open failed\n");
         free(tok_raw);
         free(ref_rows);
         return 1;
     }
     const int width = pulsar_engine_logits_width(g_e);
-    if (width <= 0) { fprintf(stderr, "bad logits width %d\n", width); return 1; }
+    if (width <= 0) {
+        fprintf(stderr, "bad logits width %d\n", width);
+        free(tok_raw);
+        free(ref_rows);
+        gate_engine_close(g_e);
+        return 1;
+    }
     const int ncmp = (int)rh.width < width ? (int)rh.width : width;
 
     memset(&g_toks, 0, sizeof(g_toks));
@@ -810,7 +831,13 @@ static int run_check_reference(const char *model, const char *ref_path,
            enforce ? "ENFORCING" : "report-only (no tolerance enforced)");
 
     float *row = (float *)calloc((size_t)width, sizeof(float));
-    if (!row) { fprintf(stderr, "oom\n"); return 1; }
+    if (!row) {
+        fprintf(stderr, "oom\n");
+        free(ref_rows);
+        pulsar_tokens_free(&g_toks);   /* owns tok_raw */
+        gate_engine_close(g_e);
+        return 1;
+    }
     int fail = 0;
     for (uint32_t i = 0; i < rh.n_depths; i++) {
         const float *ref_row = ref_rows + (size_t)i * (size_t)rh.width;
@@ -823,7 +850,13 @@ static int run_check_reference(const char *model, const char *ref_path,
             fail = 1;
             continue;
         }
-        if (!prefill_logits_ctx(rh.depths[i], row, width, ref_ctx)) return 1;
+        if (!prefill_logits_ctx(rh.depths[i], row, width, ref_ctx)) {
+            free(row);
+            free(ref_rows);
+            pulsar_tokens_free(&g_toks);
+            gate_engine_close(g_e);
+            return 1;
+        }
         if (!row_is_sane(row, width, rh.depths[i])) { fail = 1; continue; }
         const int kh = depth_in_list(rh.depths[i], known_high, n_known_high);
         const int kf = depth_in_list(rh.depths[i], known_flip, n_known_flip);
@@ -934,7 +967,14 @@ static int run_check_reference(const char *model, const char *ref_path,
     }
     if (kl_dump_path && n_kl_out > 0) {
         FILE *kf2 = fopen(kl_dump_path, "w");
-        if (!kf2) { fprintf(stderr, "cannot write %s\n", kl_dump_path); return 1; }
+        if (!kf2) {
+            fprintf(stderr, "cannot write %s\n", kl_dump_path);
+            free(row);
+            free(ref_rows);
+            pulsar_tokens_free(&g_toks);
+            gate_engine_close(g_e);
+            return 1;
+        }
         fprintf(kf2, "# depth kl   (recorded %s)\n", ref_path);
         for (int k = 0; k < n_kl_out; k++)
             fprintf(kf2, "%u %.17g\n", kl_out[k].depth, kl_out[k].kl);
@@ -947,7 +987,7 @@ static int run_check_reference(const char *model, const char *ref_path,
     free(row);
     free(ref_rows);
     pulsar_tokens_free(&g_toks);
-    pulsar_engine_close(g_e);
+    gate_engine_close(g_e);
     return fail ? 1 : 0;
 }
 
@@ -1072,7 +1112,9 @@ static int load_baseline(const char *path, const char *expect_ref,
     return 1;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
     if (argc < 4 || (strcmp(argv[2], "--dump") && strcmp(argv[2], "--check") &&
                      strcmp(argv[2], "--check-fidelity") &&
                      strcmp(argv[2], "--check-reference"))) {
@@ -1141,7 +1183,7 @@ int main(int argc, char **argv) {
                 enforce = 1;
             }
         }
-        scrub_numerics_env();
+        if (scrub_numerics_env() != 0) return 2;
         printf("prefill reference gate: this binary built from ref '%s'\n",
                PULSAR_GATE_BUILD_REF);
         if (n_known_high) {
@@ -1211,7 +1253,7 @@ int main(int argc, char **argv) {
         if (fidelity && argc >= 6) kl_tol = atof(argv[5]);
     }
 
-    scrub_numerics_env();
+    if (scrub_numerics_env() != 0) return 2;
     /* One KV format since the L111 unification -- the scrub leaves nothing to
      * pin: the baseline is anchored to a commit running the same unified
      * NVFP4 rows this binary runs. */
@@ -1230,14 +1272,16 @@ int main(int argc, char **argv) {
     opt.prefill_chunk = 4096;
     /* The drafter cannot affect prefill logits and only costs memory here. */
     opt.dspark_disable = true;
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    float *rows = NULL, *again = NULL, *base = NULL;
+    int rc = 1;
+    {
     const int width = pulsar_engine_logits_width(g_e);
-    if (width <= 0) { fprintf(stderr, "bad logits width %d\n", width); return 1; }
+    if (width <= 0) { fprintf(stderr, "bad logits width %d\n", width); goto done; }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed (run from the repo root)\n"); return 1; }
+    if (!text) { fprintf(stderr, "prompt file read failed (run from the repo root)\n"); goto done; }
     memset(&g_toks, 0, sizeof(g_toks));
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
@@ -1245,7 +1289,7 @@ int main(int argc, char **argv) {
     const uint32_t deepest = g_depths[N_DEPTHS - 1];
     if (g_toks.len < (int)deepest) {
         fprintf(stderr, "prompt too short: %d tokens, need %u\n", g_toks.len, deepest);
-        return 1;
+        goto done;
     }
 
     blob_header hdr;
@@ -1258,7 +1302,7 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < N_DEPTHS; i++) hdr.depths[i] = g_depths[i];
     if (strlen(PULSAR_GATE_BUILD_REF) >= REF_LEN) {
         fprintf(stderr, "build ref '%s' too long (max %u)\n", PULSAR_GATE_BUILD_REF, REF_LEN - 1u);
-        return 1;
+        goto done;
     }
     snprintf(hdr.build_ref, REF_LEN, "%s", PULSAR_GATE_BUILD_REF);
 
@@ -1267,22 +1311,21 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < N_DEPTHS; i++) printf("%s%u", i ? "," : "", g_depths[i]);
     printf("\n");
 
-    float *rows = (float *)calloc((size_t)N_DEPTHS * (size_t)width, sizeof(float));
-    float *again = (float *)calloc((size_t)width, sizeof(float));
-    if (!rows || !again) { fprintf(stderr, "oom\n"); return 1; }
+    rows = (float *)calloc((size_t)N_DEPTHS * (size_t)width, sizeof(float));
+    again = (float *)calloc((size_t)width, sizeof(float));
+    if (!rows || !again) { fprintf(stderr, "oom\n"); goto done; }
 
     /* Validate and load the baseline BEFORE prefilling: a stale blob, a wrong
      * model or a self-baseline should cost seconds, not three minutes of GPU. */
-    float *base = NULL;
-    if (!dumping && !load_baseline(blob_path, expect_ref, &hdr, width, &base)) return 1;
+    if (!dumping && !load_baseline(blob_path, expect_ref, &hdr, width, &base)) goto done;
 
     int fail = 0;
     for (uint32_t i = 0; i < N_DEPTHS; i++) {
         float *row = rows + (size_t)i * (size_t)width;
-        if (!prefill_logits(g_depths[i], row, width)) return 1;
+        if (!prefill_logits(g_depths[i], row, width)) goto done;
         if (!row_is_sane(row, width, g_depths[i])) { fail = 1; continue; }
         /* (c) run-to-run determinism — a fresh session, same depth. */
-        if (!prefill_logits(g_depths[i], again, width)) return 1;
+        if (!prefill_logits(g_depths[i], again, width)) goto done;
         if (memcmp(row, again, (size_t)width * sizeof(float)) != 0) {
             fprintf(stderr,
                     "PREFILL GATE FAIL: depth %u is NOT run-to-run deterministic "
@@ -1296,27 +1339,24 @@ int main(int argc, char **argv) {
     }
     if (fail) {
         fprintf(stderr, "\nPREFILL GATE: FAIL (determinism/sanity)\n");
-        return 1;
+        goto done;
     }
 
     if (dumping) {
         FILE *fp = fopen(blob_path, "wb");
-        if (!fp) { fprintf(stderr, "cannot write %s\n", blob_path); return 1; }
+        if (!fp) { fprintf(stderr, "cannot write %s\n", blob_path); goto done; }
         if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1 ||
             fwrite(rows, sizeof(float), (size_t)N_DEPTHS * (size_t)width, fp)
                 != (size_t)N_DEPTHS * (size_t)width) {
             fprintf(stderr, "short write to %s\n", blob_path);
             fclose(fp);
-            return 1;
+            goto done;
         }
         fclose(fp);
         printf("\nPREFILL GATE: baseline written to %s (%u depths x %d logits)\n",
                blob_path, N_DEPTHS, width);
-        free(again);
-        free(rows);
-        pulsar_tokens_free(&g_toks);
-        pulsar_engine_close(g_e);
-        return 0;
+        rc = 0;
+        goto done;
     }
 
     /* ---- --check-fidelity: tolerance compare (top-1 + KL + logit RMS) ---- */
@@ -1329,12 +1369,8 @@ int main(int argc, char **argv) {
             if (!fidelity_row(rows + off, base + off, width, g_depths[i], kl_tol, 0, 0, NULL)) fail = 1;
         }
         printf("\nPREFILL FIDELITY GATE: %s\n", fail ? "FAIL" : "PASS");
-        free(base);
-        free(again);
-        free(rows);
-        pulsar_tokens_free(&g_toks);
-        pulsar_engine_close(g_e);
-        return fail ? 1 : 0;
+        rc = fail ? 1 : 0;
+        goto done;
     }
 
     /* ---- --check: the byte-compare (the header was validated up front) ---- */
@@ -1352,10 +1388,13 @@ int main(int argc, char **argv) {
     }
 
     printf("\nPREFILL GATE: %s\n", fail ? "FAIL" : "PASS");
+    rc = fail ? 1 : 0;
+    }
+done:
     free(base);
     free(again);
     free(rows);
     pulsar_tokens_free(&g_toks);
-    pulsar_engine_close(g_e);
-    return fail ? 1 : 0;
+    gate_engine_close(g_e);
+    return rc;
 }

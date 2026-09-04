@@ -516,6 +516,10 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
+    /* This engine reads PULSAR_CUDA_PREFILL_CHUNK at open, so it cannot be the
+     * shared one -- and the instance lock allows one live engine per process,
+     * so the shared one goes first. */
+    test_close_engines();
     char *saved_prefill_chunk = test_save_env("PULSAR_CUDA_PREFILL_CHUNK");
     setenv("PULSAR_CUDA_PREFILL_CHUNK", "2048", 1);
     pulsar_engine *engine = test_open_engine();
@@ -1110,7 +1114,6 @@ static void test_tool_call_quality_one(void) {
 static void test_tool_call_quality(void) {
     fprintf(stderr, "pulsar-test: tool-call DSML emission\n");
     test_tool_call_quality_one();
-    test_close_engines();
 }
 
 
@@ -2576,16 +2579,20 @@ typedef struct {
 
 static const pulsar_test_entry test_entries[] = {
 #ifndef PULSAR_NO_GPU
+    /* Order matters for the engine: every test that shares test_engine runs
+     * first, so the model loads once for all of them; the two that must open
+     * their own engine (logprob-vectors reads PULSAR_CUDA_PREFILL_CHUNK at
+     * open; tensor-equivalence asserts across engine instances) run last. */
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "complete tool call recovered from unclosed reasoning", test_think_tool_recovery},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
-    {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
     {"--api-logprobs-parse", "api-logprobs-parse", "logprobs/top_logprobs parse: out-of-domain rejects, never clamps", test_api_logprobs_parse_validation},
     {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
+    {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},

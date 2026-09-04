@@ -95,3 +95,6 @@ gguf-tools/libds4q_reflow.so
 /cutlass
 docs/api/
 /tests/idx_mxfp4_kernel_test
+tests/gates_runner
+tests/runner/
+tests/dspark_batch_gate

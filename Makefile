@@ -184,7 +184,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate cuda-row-neutrality-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate cuda-row-neutrality-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -912,6 +912,31 @@ cuda-row-neutrality-gate: tests/mseq_short_ctx_probe
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
 
+# L163: every model-dependent gate as a function in one binary.  Each gate
+# source is compiled a second time with its entry renamed (GATE_ENTRY) and the
+# engine calls routed to the runner's broker (PULSAR_GATE_RUNNER); the
+# standalone binaries above are the same sources built without those defines.
+RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe token_seam_gate \
+               multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
+               bank_evict_restore_gate bank_fork_gate algo_stability_gate mixed_prefill_gate \
+               mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate
+RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
+tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h
+	@mkdir -p tests/runner
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
+		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
+tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/gates_runner.cpp
+tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# The runner receives exactly what the individual targets passed: the prefill
+# baseline blob and its ref, the reference-capture dir (skips loudly when
+# unset), the tolerance and the KL budgets (passed only when present).
+cuda-runner-gate: tests/gates_runner
+	./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
+		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) --ref-dir "$(PULSAR_REF_DIR)" \
+		--ref-tol $(PULSAR_REF_TOL) --kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE)
+
 # Every release-blocking gate, in one command.
 #
 # WHY THIS EXISTS: gates are separate make targets, and a gate nobody invokes is
@@ -933,16 +958,14 @@ cuda-spec-sampling-gate: tests/spec_sampling_gate
 unit-test-gate: pulsar_test seam-check
 	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test
 
+# The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
+# tests/gates_runner.cpp) -- one 86 GB model load per engine configuration
+# instead of one per gate.  Their individual targets below remain for
+# iterating on one gate; the battery is the runner.
 GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-prefill-gate \
-	cuda-reference-gate \
-               cuda-frontier-gate cuda-rewind-gate cuda-mseq-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark \
-               cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate \
-               cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
-               cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide \
-               cuda-spec-sampling-gate \
-               cuda-row-neutrality-gate
+	cuda-attn-gates \
+	cuda-runner-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1334,7 +1357,8 @@ test: pulsar_test seam-check
 
 clean:
 	rm -rf .build
-	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+	rm -rf tests/runner
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

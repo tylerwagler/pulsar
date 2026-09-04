@@ -27,6 +27,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,7 +98,8 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     return h;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [L]\n", argv[0]); return 2; }
     const int L = argc > 2 ? atoi(argv[2]) : 24576;
     const int ctx = L + 4096;
@@ -105,26 +107,28 @@ int main(int argc, char **argv) {
     pulsar_engine *e = NULL;
     pulsar_engine_options opt; memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
-    size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
-    if (!text) { fprintf(stderr, "prompt read failed\n"); return 1; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     pulsar_tokens base; memset(&base, 0, sizeof(base));
-    pulsar_tokenize_text(e, text, &base); free(text);
-    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
-
     pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    int *toks = NULL;
+    int rc = 1;
+    {
+    size_t tl = 0; char *text = read_file("tests/long_context_story_prompt.txt", &tl);
+    if (!text) { fprintf(stderr, "prompt read failed\n"); goto done; }
+    pulsar_tokenize_text(e, text, &base); free(text);
+    if (base.len < 256) { fprintf(stderr, "prompt too short\n"); goto done; }
+
+    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "evict_restore_gate: pool banks=%u ctx=%d L=%d\n", pool, ctx, L);
-    if (pool < 2) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=2\n"); return 1; }
+    if (pool < 2) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=2\n"); goto done; }
 
     /* 1. Prefill bank 0 (cur=0), capture its frontier, checksum its KV. */
-    int *toks = (int *)malloc((size_t)L * sizeof(int));
+    toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];
     pulsar_tokens p; memset(&p, 0, sizeof(p)); p.v = toks; p.len = p.cap = L;
     char err[256];
-    if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); return 1; }
+    if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) { fprintf(stderr, "sync failed: %s\n", err); goto done; }
     gpu_graph_bank_counters_capture(&s->graph, 0);
     (void)pulsar_gpu_synchronize();
     const uint64_t sum_before = checksum_bank_kv(s, 0);
@@ -273,7 +277,13 @@ finding3_done:
     remove(cpath);
 
     remove(snap_path);
-    free(toks);
     fprintf(stderr, "EVICT-RESTORE GATE: %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail ? 1 : 0;
+    rc = g_fail ? 1 : 0;
+    }
+done:
+    free(toks);
+    pulsar_session_free(s);
+    pulsar_tokens_free(&base);
+    gate_engine_close(e);
+    return rc;
 }

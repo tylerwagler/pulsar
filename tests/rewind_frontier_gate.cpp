@@ -41,6 +41,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,7 +260,8 @@ static uint64_t r128_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
     return h;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
     pulsar_engine *e = NULL;
@@ -267,24 +269,25 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-
-    size_t text_len = 0;
-    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     pulsar_tokens toks;
     memset(&toks, 0, sizeof(toks));
+    pulsar_session *s = NULL;
+    int rc = 1;
+    {
+    size_t text_len = 0;
+    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); goto done; }
     pulsar_tokenize_text(e, text, &toks);
     free(text);
-    if (toks.len < 300) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (toks.len < 300) { fprintf(stderr, "prompt too short\n"); goto done; }
 
-    pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
 
     /* 1. Frontier past several ratio-4 boundaries AND one ratio-128 boundary,
      * on a boundary-interior position so the very first rewind crosses. */
     const int top = 130;
-    if (!sync_prefix(s, &toks, top)) return 1;
+    if (!sync_prefix(s, &toks, top)) goto done;
     check_frontiers(s, top, "post-prefill baseline");
 
     /* 2. Walk the frontier down one token at a time: eight rewinds cover
@@ -304,7 +307,7 @@ int main(int argc, char **argv) {
      * frontier.  On the unfixed binary the walk above already failed, and
      * this leg fails too (stale base + incremental emits). */
     const int cont = 199;
-    if (!sync_prefix(s, &toks, cont)) return 1;
+    if (!sync_prefix(s, &toks, cont)) goto done;
     check_frontiers(s, cont, "post-continuation");
 
     /* One more boundary-crossing rewind after the continuation, then a
@@ -312,10 +315,11 @@ int main(int argc, char **argv) {
      * repeated cycles, not just once from a fresh prefill. */
     pulsar_session_rewind(s, cont - 4);
     check_frontiers(s, cont - 4, "second rewind");
-    if (!sync_prefix(s, &toks, 260)) return 1;
+    if (!sync_prefix(s, &toks, 260)) goto done;
     check_frontiers(s, 260, "second continuation");
 
     pulsar_session_free(s);
+    s = NULL;
 
     /* ---- 4. VALUE leg (L120 value-half): the comp rows a ghost rewind
      * re-emits must be byte-identical to a session that never saw the
@@ -364,7 +368,13 @@ int main(int argc, char **argv) {
           "into comp row 0 (ctl=%llx vic=%llx)",
           (unsigned long long)rctl, (unsigned long long)rvic);
 
-    pulsar_engine_close(e);
+    rc = 0;
+    }
+done:
+    pulsar_session_free(s);
+    pulsar_tokens_free(&toks);
+    gate_engine_close(e);
+    if (rc != 0) return rc;
 
     if (g_fail) { fprintf(stderr, "REWIND GATE: FAIL\n"); return 1; }
     printf("REWIND GATE: PASS\n");

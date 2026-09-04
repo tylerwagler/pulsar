@@ -20,6 +20,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_entry.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,17 +112,18 @@ static bool classic_prefill_time(int c0, int K, double *secs){
 
 static int firstdiff(const int*a,const int*b,int n){ for(int i=0;i<n;i++) if(a[i]!=b[i]) return i; return -1; }
 
-int main(int argc,char**argv){
+int GATE_ENTRY(int argc,char**argv){
+    g_e=NULL; memset(&g_toks,0,sizeof g_toks); g_fail=0;
     if(argc<2){ fprintf(stderr,"usage: %s MODEL\n",argv[0]); return 2; }
     pulsar_engine_options o; memset(&o,0,sizeof o); o.model_path=argv[1]; o.backend=PULSAR_BACKEND_CUDA;
-    if(pulsar_engine_open(&g_e,&o)!=0){ fprintf(stderr,"engine open failed\n"); return 1; }
+    if(gate_engine_open(&g_e,&o)!=0){ fprintf(stderr,"engine open failed\n"); return 1; }
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats)\n");
     size_t tl=0; char*txt=read_file("tests/long_context_story_prompt.txt",&tl);
-    if(!txt){ fprintf(stderr,"prompt read failed\n"); return 1; }
+    if(!txt){ fprintf(stderr,"prompt read failed\n"); gate_engine_close(g_e); return 1; }
     memset(&g_toks,0,sizeof g_toks); pulsar_tokenize_text(g_e,txt,&g_toks); free(txt);
 
     const int K1=512;                 /* gates 1&2: spans many ratio-4 (and ratio-128) groups */
-    if(C0+K1+NGEN > g_toks.len){ fprintf(stderr,"prompt too short (%d)\n",g_toks.len); return 1; }
+    if(C0+K1+NGEN > g_toks.len){ fprintf(stderr,"prompt too short (%d)\n",g_toks.len); pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1; }
 
     /* GATE 1 (rigorous oracle) + GATE 2 (K>ratio boundary). K1 spans >1 ratio-4/128
      * group; step_end self-check runs inside decode_mixed (rc=-1 on a frontier miss).
@@ -178,7 +180,8 @@ int main(int argc,char**argv){
     }
 
 done:
-    pulsar_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
     if(g_fail){ fprintf(stderr,"MIXED-PREFILL GATE: FAIL\n"); return 1; }
     printf("MIXED-PREFILL GATE: PASS\n"); return 0;
 }

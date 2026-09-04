@@ -26,6 +26,7 @@
  * a wrong drafter. Only the drafts themselves can. */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_entry.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -294,7 +295,11 @@ static int run_shape(const char *name, const float *temps, int ticks) {
     return compared;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_fail = 0;
+    g_nb = NB;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [DRAFT_DEPTH] [BANKS<=3]\n", argv[0]); return 2; }
     const int ticks = argc > 2 ? atoi(argv[2]) : 8;
     const int depth = argc > 3 ? atoi(argv[3]) : 0;
@@ -305,14 +310,14 @@ int main(int argc, char **argv) {
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     opt.dspark_draft_tokens = depth;
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     if (!pulsar_engine_has_dspark(g_e)) {
         fprintf(stderr, "DSPARK-BATCH GATE: model has no drafter\n");
-        pulsar_engine_close(g_e);
+        gate_engine_close(g_e);
         return 1;
     }
     char *text = read_file("tests/long_context_story_prompt.txt");
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); gate_engine_close(g_e); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
@@ -324,6 +329,6 @@ int main(int argc, char **argv) {
     CHECK(c1 >= ticks && c2 >= ticks, "too few bank-ticks compared (%d, %d)", c1, c2);
     printf("DSPARK BATCH GATE (depth %s, %d banks): %s\n", depth ? "pinned" : "default", g_nb, g_fail ? "FAIL" : "PASS");
     pulsar_tokens_free(&g_toks);
-    pulsar_engine_close(g_e);
+    gate_engine_close(g_e);
     return g_fail ? 1 : 0;
 }

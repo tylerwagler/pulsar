@@ -92,6 +92,7 @@
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -579,22 +580,28 @@ static bool mixed_scenario(int a_bank, int a_len, int b_bank, int b_len,
                                 check_a_untouched, 0);
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
 
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
 
     size_t text_len = 0;
     char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
+    if (!text) { fprintf(stderr, "prompt file read failed\n"); gate_engine_close(g_e); return 1; }
     memset(&g_toks, 0, sizeof(g_toks));
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
-    if (g_toks.len < 1200) { fprintf(stderr, "prompt too short\n"); return 1; }
+    if (g_toks.len < 1200) {
+        fprintf(stderr, "prompt too short\n");
+        pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1;
+    }
 
     /* ---- S1: both banks emit in ONE step, different pre-frontiers ---- */
     {
@@ -833,7 +840,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    pulsar_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "FRONTIER GATE: FAIL\n"); return 1; }
     printf("FRONTIER GATE: PASS\n");
     return 0;

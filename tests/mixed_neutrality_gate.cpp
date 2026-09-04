@@ -30,6 +30,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_fixture.h"
+#include "gate_entry.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -75,13 +76,14 @@ static int g_fail;
 static int g_off[N_DEC_MAX] = {0, 401};
 static int g_len[N_DEC_MAX] = {130, 258};
 
-static void init_banks(void) {
+/* 0, or 2 when PULSAR_GATE_NDEC is out of range (the caller returns it). */
+static int init_banks(void) {
     const char *e = getenv("PULSAR_GATE_NDEC");
     if (e && *e) {
         int v = atoi(e);
         if (v < 2 || v > N_DEC_MAX) {
             fprintf(stderr, "PULSAR_GATE_NDEC=%d out of range [2,%d]\n", v, N_DEC_MAX);
-            exit(2);
+            return 2;
         }
         g_n_dec = v;
     }
@@ -89,6 +91,7 @@ static void init_banks(void) {
         g_off[k] = (k * 137) % 450;            /* distinct-ish regions; overlap is */
         g_len[k] = 100 + (k * 37) % 140;       /* harmless (per-bank KV isolation) */
     }
+    return 0;
 }
 
 /* Populate decode banks + (if K>0) the prefill bank on a FRESH session, run ONE
@@ -353,18 +356,24 @@ static void gate5r_run(const char *spec, bool fatal) {
     }
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof g_toks);
+    g_fail = 0;
+    g_n_dec = 2;
+    g_dump_dir = NULL;
+    g_dump_tag = NULL;
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     pulsar_engine_options o; memset(&o, 0, sizeof o);
     o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
-    if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    init_banks();
+    if (gate_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (init_banks() != 0) { gate_engine_close(g_e); return 2; }
     printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only "
            "formats)  (n_dec=%d K=%d)\n", g_n_dec, K_PRE);
 
     int need = PBASE + C0 + K_PRE + 1;
     for (int k = 0; k < g_n_dec; k++) if (g_off[k] + g_len[k] > need) need = g_off[k] + g_len[k];
-    if (!gate_load_story(g_e, &g_toks, need)) return 1;
+    if (!gate_load_story(g_e, &g_toks, need)) { pulsar_tokens_free(&g_toks); gate_engine_close(g_e); return 1; }
 
     const int vocab = (int)PULSAR_N_VOCAB;
     float *ref_dec = (float *)malloc((size_t)g_n_dec * vocab * sizeof(float));   /* decode-only M=N_DEC */
@@ -416,7 +425,9 @@ int main(int argc, char **argv) {
     if (argc > 3 && strcmp(argv[3], "rows") == 0) {
         gate5r_run(argc > 2 ? argv[2] : "5", false);
         printf("GATE 5R done (diagnostic only)\n");
-        pulsar_engine_close(g_e);
+        free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);
+        pulsar_tokens_free(&g_toks);
+        gate_engine_close(g_e);
         return g_fail ? 1 : 0;
     }
 
@@ -492,7 +503,8 @@ int main(int argc, char **argv) {
 
 done:
     free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);
-    pulsar_engine_close(g_e);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
     if (g_fail) { fprintf(stderr, "MIXED-NEUTRALITY GATE: FAIL\n"); return 1; }
     printf("MIXED-NEUTRALITY GATE: PASS\n");
     return 0;
