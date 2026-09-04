@@ -1,5 +1,10 @@
 # Contributing
 
+Read `ENGINEERING-RULES.md` in this directory first: one path or an error (no
+fallbacks), no dead code kept, producers emit and consumers never convert,
+zero build warnings, and a landing is one squashed commit gated by the full
+battery. Those rules apply to every change on `dev`.
+
 Pulsar changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
