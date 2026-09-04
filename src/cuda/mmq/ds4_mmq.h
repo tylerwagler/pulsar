@@ -127,7 +127,11 @@ int ds4_mmq_iq2_xxs_moe_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    /* L158 inc 5: the producer's E4M3 encoding of X_f32 (+ ue8m0 plane, pitch); required */
+    const void    * act_q,
+    const void    * act_sf,
+    int             act_kbp);
 
 #ifdef __cplusplus
 } // extern "C"

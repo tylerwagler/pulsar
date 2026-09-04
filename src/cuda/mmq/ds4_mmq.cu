@@ -304,7 +304,13 @@ int ds4_mmq_moe_impl(
         /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
          * when every consumer sanitizes at read (the routed-MoE swiglu/sum
          * kernels do). */
-        bool            sanitize_out = true) {
+        bool            sanitize_out = true,
+        /* L158 inc 5: the producer's E4M3 encoding of X_f32 (+ ue8m0 plane and
+         * its blocks-per-row pitch).  REQUIRED: the encode-from-f32 staging is
+         * gone; X_f32 is kept only for shape/stride bookkeeping. */
+        const void    * act_q      = NULL,
+        const void    * act_sf     = NULL,
+        int             act_kbp    = 0) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -460,9 +466,15 @@ int ds4_mmq_moe_impl(
                 tag, (const void *)x_soa, (int)K, (int)(K % 256), d2r_iq2s_avail);
         return -1;
     }
+    if (!act_q || !act_sf) {
+        fprintf(stderr, "%s: no producer E4M3 for the activation (K=%d rows=%lld) -- the "
+                        "encode-from-f32 staging was deleted (L158); refusing\n",
+                tag, (int)K, (long long)ne_get_rows);
+        return -1;
+    }
     cudaMemsetAsync(src1_e4m3_p, 0, nbytes_src1_act, stream);
-    ds4_quantize_mmq_e4m3_cuda(
-        X_f32, ids_src1, (void *)src1_e4m3_p,
+    ds4_gather_mmq_e4m3_cuda(
+        act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3_p,
         /*ne00=*/K, s11_src, s12_src, s13_src,
         /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
         /*n_expert_used=*/0, /*scatter=*/false, stream);
@@ -712,26 +724,18 @@ int ds4_mmq_moe_pair_impl(
          * activations got their E4M3 is provenance worth seeing once, and it is
          * the difference between "this made no difference" and "this never
          * ran". */
-        static int staging_announced = 0;
-        if (!staging_announced) {
-            staging_announced = 1;
-            fprintf(stderr, "pulsar: MoE gate/up E4M3 staging = %s\n",
-                    (act_q && act_sf) ? "gathered from the producer's encoding"
-                                      : "encoded from f32 (no cached encoding)");
+        /* L158 inc 5: the producer's encoding or nothing; the encode-from-f32
+         * branch is gone. */
+        if (!act_q || !act_sf) {
+            fprintf(stderr, "%s: no producer E4M3 for the activation (K=%d rows=%lld) -- refusing\n",
+                    tag, (int)K, (long long)ne_get_rows);
+            return -1;
         }
-        if (act_q && act_sf) {
-            ds4_gather_mmq_e4m3_cuda(
-                act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3,
-                /*ne00=*/K, s11_src, s12_src, s13_src,
-                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-                /*n_expert_used=*/0, /*scatter=*/false, stream);
-        } else {
-            ds4_quantize_mmq_e4m3_cuda(
-                X_f32, ids_src1, (void *)src1_e4m3,
-                /*ne00=*/K, s11_src, s12_src, s13_src,
-                /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
-                /*n_expert_used=*/0, /*scatter=*/false, stream);
-        }
+        ds4_gather_mmq_e4m3_cuda(
+            act_q, act_sf, act_kbp, ids_src1, (void *)src1_e4m3,
+            /*ne00=*/K, s11_src, s12_src, s13_src,
+            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            /*n_expert_used=*/0, /*scatter=*/false, stream);
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -868,7 +872,8 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
 extern "C" int ds4_mmq_iq2_xxs_moe_soa(
         const void * W_soa, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        const void * act_q, const void * act_sf, int act_kbp) {
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_iq2_xxs_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
@@ -877,5 +882,6 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe_soa", W_soa, X, ids, out,
                                                M, K, n_tokens, n_experts, n_expert_used, stream,
                                                (const char *)W_soa, nblk,
-                                               /*sanitize_out=*/true);
+                                               /*sanitize_out=*/true,
+                                               act_q, act_sf, act_kbp);
 }

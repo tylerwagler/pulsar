@@ -1168,15 +1168,6 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
     return 0;
 }
 
-/* Do rows [0, n_tok) of this buffer have their f32 stores present?  Returns
- * the first PRESENT row (0 = all present).  For gather-style consumers that
- * read arbitrary rows, ANY nonzero return is fatal -- they must be served by
- * an encoding instead.  Exported for the MoE tiers (L089 FFN half). */
-uint32_t pulsar_gpu_act_f32_first_present_row(const void *ptr, uint64_t n_tok,
-                                              uint64_t in_dim) {
-    mxfp8_act_cache_t *s = act_slot_find_rows(ptr, n_tok, in_dim);
-    return (s && s->f32_absent) ? s->f32_keep_from : 0u;
-}
 
 void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     if (g_act_cur) {
@@ -1394,6 +1385,38 @@ void pulsar_gpu_mxfp8_gact_note(void) {
 void pulsar_gpu_mxfp8_gact_disarm(void) {
     g_gact.key_ptr = NULL;
     g_gact.valid   = 0;
+}
+
+/* L158 inc 5: a slot for an OFFSET VIEW of an encoded activation.  The mixed-
+ * batch prefix split hands its prefill suffix to consumers as row views, and a
+ * view pointer keys no slot -- the reason every suffix used to be re-quantised
+ * from f32.  This gives the view its own slot filled from the producer's:
+ * data by a byte copy of rows [row0, row0+rows), scales re-based into a fresh
+ * VEC32 slab (a re-layout, not a quantise; the bytes are the producer's).
+ * Consumers then find the view's encoding by their ordinary lookup.  Refuses
+ * when the full activation carries no valid encoding. */
+int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t row0, uint64_t rows,
+                                      uint64_t in_dim, const pulsar_gpu_tensor *x_view) {
+    if (!x_full || !x_view || rows == 0 || in_dim % 32 != 0) return 0;
+    mxfp8_act_cache_t *src = act_slot_find_rows(x_full->ptr, row0 + rows, in_dim);
+    if (!src || !src->valid || !src->xq || !src->sx) return 0;
+    const int KBp = mx_rup((int)(in_dim / 32), 4);
+    const size_t sx_bytes = (size_t)mx_rup((int)rows, 128) * KBp;
+    /* keep the source's buffers: acquire may evict an LRU slot, never the one
+     * we are reading from (it was just touched by the lookup). */
+    __nv_fp8_e4m3 *src_q = src->xq; unsigned char *src_sf = src->sx;
+    mxfp8_act_cache_t *dst = act_slot_acquire(x_view->ptr, rows, in_dim);
+    if (!dst || dst == src) return 0;
+    if (!mxfp8_act_cache_reserve((void **)&dst->xq, &dst->xq_cap, rows * in_dim, "act window data") ||
+        !mxfp8_act_cache_reserve((void **)&dst->sx, &dst->sx_cap, sx_bytes, "act window scale")) return 0;
+    if (cudaMemcpyAsync(dst->xq, src_q + row0 * in_dim, rows * in_dim, cudaMemcpyDeviceToDevice, 0) != cudaSuccess) return 0;
+    cudaMemsetAsync(dst->sx, 0, sx_bytes, 0);
+    const long n_pairs = (long)rows * KBp;
+    mx_scale_rebase_kernel<<<(unsigned)((n_pairs + 255) / 256), 256>>>(dst->sx, src_sf, (int)row0, (int)rows, KBp, 1,
+                                                                        sx_bytes, sx_bytes);
+    if (!cuda_ok(cudaGetLastError(), "act window rebase")) return 0;
+    dst->valid = 1;
+    return 1;
 }
 
 /* L158 inc 4: PRODUCER-side encode of an f32 activation the caller itself

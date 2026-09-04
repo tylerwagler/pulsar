@@ -722,6 +722,14 @@ int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pit
                                    const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
                                    const pulsar_gpu_tensor *h2, uint32_t n_embd);
 
+/** L158: give an OFFSET ROW VIEW of an encoded activation its own slot, filled
+ * from the producer's encoding (byte copy + scale re-base; no quantise).  Used
+ * by the mixed-batch prefix splits for their prefill suffix views so every
+ * consumer finds the encoding by its ordinary lookup.  0 = no valid encoding
+ * on the full activation (the caller refuses). */
+int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t row0, uint64_t rows,
+                                      uint64_t in_dim, const pulsar_gpu_tensor *x_view);
+
 /** L158: PRODUCER-side encode of an f32 activation the caller itself produced
  * and owns -- for tests and tools that synthesise an activation.  Arms the
  * slot for (x, n_tok, in_dim), encodes with the engine's quantiser, notes it
@@ -1636,34 +1644,6 @@ int pulsar_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens);
 
-/** CUTLASS Sm120 block-scaled MXFP4 grouped-expert FFN (PULSAR_TENSOR_CUTLASS_MXFP4, type 40).
- * out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T for T tokens ALL ROUTED TO ONE EXPERT
- * (the caller gathers per-expert rows via sorted_pairs before calling this, and scatters the
- * result back). Wg/Wu/Wd are that expert's CUTLASS-packed [data, then SF] blob pointers, sliced
- * by the caller from cutlass_mxfp4_expert_layout()'s stride/split-point. `scratch` must be at
- * least pulsar_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes; size once for the
- * layer's shape at the largest T a single expert can see and reuse across every expert and
- * every CUTLASS-typed layer sharing that shape -- this function does no allocation and no
- * synchronization (the malloc+synchronize convenience wrapper that once sat beside it had no
- * caller and is gone, L142). */
-size_t pulsar_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim);
-int pulsar_cutlass_expert_ffn_scratch(
-        float          *out,
-        const float    *x,
-        const uint8_t  *Wg_d,
-        const uint8_t  *Wg_sf,
-        const uint8_t  *Wu_d,
-        const uint8_t  *Wu_sf,
-        const uint8_t  *Wd_d,
-        const uint8_t  *Wd_sf,
-        const float    *weights,
-        float           clamp,
-        int             T,
-        int             in_dim,
-        int             mid_dim,
-        int             out_dim,
-        uint8_t        *scratch,
-        size_t          scratch_bytes);
 
 /** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
  * fp4-weight GEMV: one gate+up+swiglu launch and one down launch over all (token,expert)
@@ -1794,9 +1774,12 @@ int pulsar_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *select
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp);
-int pulsar_cutlass_gemv_down(float *down_out, const float *mid, const int32_t *selected,
+/** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
+ * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
+int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,
         const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
-        int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim);
+        int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
+        const void *mid_q, const void *mid_sf, int mid_kbp);
 
 /** Swizzled ue8m0 scale-factor element count for a CUTLASS B weight of shape (N,K);
  * used by the offline repack CLI alongside pulsar_cutlass_pack_source. */

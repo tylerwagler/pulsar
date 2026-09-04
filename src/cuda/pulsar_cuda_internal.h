@@ -125,9 +125,6 @@ static_assert(PULSAR_Q_ELT_FMT == PULSAR_ELT_F16 &&
 static_assert(sizeof(pulsar_q_t) == PULSAR_Q_ELT_SIZE,
               "pulsar_q_t and PULSAR_Q_ELT_SIZE state the same width; move both or neither");
 
-uint32_t pulsar_gpu_act_f32_first_present_row(const void *ptr, uint64_t n_tok,
-                                              uint64_t in_dim);
-
 /* The cudaDataType the stored Q presents to cuBLAS.  Derived from pulsar_q_t
  * rather than written out, so a GEMM's operand type can never drift from the
  * buffer it reads -- that failure mode is a silent wrong answer, not a fault.
