@@ -311,35 +311,6 @@ __device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
 }
 
 
-/* Stage one 32-element activation block into registers from whatever width the
- * activation is STORED at (L033).
- *
- * T=float keeps the exact eight-float4 sequence the two grouped-"a" GEMVs had
- * before they were templated -- same instructions, same order -- so their f32
- * arms stay bit-identical.  A narrowed T issues four 128-bit loads of eight
- * elements each and widens on the way into the block; the dot helpers below
- * still see f32, so no arithmetic depends on the storage width.
- *
- * Both grouped-"a" GEMVs staged this with the same copy-pasted loop.  One
- * helper now, so a future width lands in one place instead of two that have to
- * be kept agreeing by hand. */
-template <typename T>
-__device__ __forceinline__ static void stage_x_block32(const T *xr, float *xb);
-
-template <>
-__device__ __forceinline__ void stage_x_block32<__nv_bfloat16>(const __nv_bfloat16 *xr, float *xb) {
-    /* 8 bf16 is 16 B: four 128-bit transactions per 32-wide block.  The f32
-     * arm (eight of them) went with the last f32-activation caller; the primary
-     * template is declared only, so a new width fails to link, not silently. */
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const uint4 raw = *(const uint4 *)&xr[(uint32_t)k * 8u];
-        const __nv_bfloat16 *h = (const __nv_bfloat16 *)&raw;
-#pragma unroll
-        for (int j = 0; j < 8; j++) xb[k * 8 + j] = __bfloat162float(h[j]);
-    }
-}
-
 /* T is the activation's STORED type, deduced from the pointer.  Callers on f32
  * buffers are unchanged; (float)x[i] is the identity for T=float. */
 template <typename T>
@@ -516,74 +487,6 @@ __global__ static void matmul_fp8mx_hc_expand_warp8_kernel(
 
 
 
-/* XT is the activation's STORED element type (L033); f32 instantiation is the
- * pre-template code exactly. */
-template<bool DEINT, typename XT>
-__global__ static void grouped_fp8mx_a_warp8_kernel(
-        float *low,
-        const unsigned char *w,
-        const __nv_fp8_e4m3 *wdata,
-        const unsigned char *wscale,
-        int KBp,
-        const XT *x,
-        uint64_t group_dim,
-        uint64_t rank,
-        uint32_t n_groups,
-        uint32_t n_tokens,
-        uint64_t blocks) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
-    const uint64_t tok = (uint64_t)blockIdx.y;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint64_t low_dim = (uint64_t)n_groups * rank;
-    if (row0 >= low_dim || tok >= n_tokens) return;
-    const uint32_t nr = low_dim - row0 < PULSAR_FP8MX_ROWS ? (uint32_t)(low_dim - row0)
-                                                        : (uint32_t)PULSAR_FP8MX_ROWS;
-    const unsigned char *wr = w + row0 * blocks * 33u;
-    const uint64_t group = row0 / rank;
-    float acc[PULSAR_FP8MX_ROWS] = {};
-
-    if ((row0 + nr - 1) / rank == group) {
-        /* Common case (rank % PULSAR_FP8MX_ROWS == 0): all rows share the
-         * group's activation row, so its blocks are loaded once per warp. */
-        const XT *xr = x + (tok * (uint64_t)n_groups + group) * group_dim;
-        for (uint64_t b = lane; b < blocks; b += 32u) {
-            const uint64_t i0 = b * 32;
-            const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
-            if (bn == 32u) {
-                float xb[32];
-                stage_x_block32<XT>(xr + i0, xb);
-#pragma unroll
-                for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
-                    if (r >= nr) continue;
-                    if (DEINT) {
-                        const uint32_t rw = (uint32_t)(row0 + r);
-                        acc[r] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
-                                                            wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)], xb);
-                    } else {
-                        acc[r] += dev_dot_fp8mx_xreg_block(wr + (r * blocks + b) * 33u, xb);
-                    }
-                }
-            } else {
-                for (uint32_t r = 0; r < nr; r++) {
-                    acc[r] += dev_dot_fp8mx_f32_block(wr + (r * blocks + b) * 33u, xr + i0, bn);
-                }
-            }
-        }
-    } else {
-        for (uint32_t r = 0; r < nr; r++) {
-            const XT *xr = x + (tok * (uint64_t)n_groups + (row0 + r) / rank) * group_dim;
-            for (uint64_t b = lane; b < blocks; b += 32u) {
-                const uint64_t i0 = b * 32;
-                const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
-                acc[r] += dev_dot_fp8mx_f32_block(wr + (r * blocks + b) * 33u, xr + i0, bn);
-            }
-        }
-    }
-    for (uint32_t r = 0; r < nr; r++) {
-        const float red = warp_sum_f32(acc[r]);
-        if (lane == 0) low[tok * low_dim + row0 + r] = red;
-    }
-}
 
 
 /* A8 twin of grouped_fp8mx_a_warp8_kernel: both operands E4M3 with their own
@@ -616,6 +519,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         uint64_t rank,
         uint32_t n_groups,
         uint32_t n_tokens,
+        uint32_t x_tok_stride,   ///< rows per group in the ENCODING (the slot's row count, >= n_tokens)
         uint64_t blocks) {
     const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS_A8;
     const uint64_t tok = (uint64_t)blockIdx.y;
@@ -627,7 +531,7 @@ __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
     const uint64_t group = row0 / rank;
     float acc[PULSAR_FP8MX_ROWS_A8] = {};
 
-    const __nv_fp8_e4m3 *xr = xdata + (group * (uint64_t)n_tokens + tok) * group_dim;
+    const __nv_fp8_e4m3 *xr = xdata + (group * (uint64_t)x_tok_stride + tok) * group_dim;
     const unsigned char *xs = xscale + group * scale_slab;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
@@ -677,6 +581,7 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
         uint64_t rank,
         uint32_t n_groups,
         uint32_t n_tokens,
+        uint32_t x_tok_stride,
         uint64_t blocks) {
     const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS_A8;
     const uint32_t lane = threadIdx.x & 31u;
@@ -692,7 +597,7 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
         for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
 
     /* token t's activation row sits at xg + t * group_dim (group-major). */
-    const __nv_fp8_e4m3 *xg = xdata + group * (uint64_t)n_tokens * group_dim;
+    const __nv_fp8_e4m3 *xg = xdata + group * (uint64_t)x_tok_stride * group_dim;
     const unsigned char *xs = xscale + group * scale_slab;
     for (uint64_t b = lane; b < blocks; b += 32u) {
         const uint64_t i0 = b * 32;
@@ -726,61 +631,6 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
 }
 
 
-/* Small-batch (2..4 token) variant of the grouped o_a GEMV: one launch whose
- * weight blocks are read once and served from L1 across the NT tokens' dots,
- * replacing the per-group block-scaled tensor-core GEMMs that dominated the
- * spec-verify launch storm (8 GEMMs/layer at 2-4 rows each). Per-(row,token)
- * block order and dot helper match grouped_fp8mx_a_warp8_kernel's DEINT fast
- * path exactly, so each token's output is bit-identical to the n=1 kernel.
- * Caller guarantees: deint weight available, rank % PULSAR_FP8MX_ROWS_A8 == 0 (row
- * quads never straddle a group), group_dim % 32 == 0 (whole blocks). */
-template <int NT, typename XT>
-__global__ static void grouped_fp8mx_a_nt_kernel(
-        float *low,
-        const __nv_fp8_e4m3 *wdata,
-        const unsigned char *wscale,
-        int KBp,
-        const XT *x,
-        uint64_t group_dim,
-        uint64_t rank,
-        uint32_t n_groups,
-        uint64_t blocks) {
-    const uint64_t row0 = ((uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u)) * PULSAR_FP8MX_ROWS;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint64_t low_dim = (uint64_t)n_groups * rank;
-    if (row0 >= low_dim) return;
-    const uint64_t group = row0 / rank;
-    float acc[PULSAR_FP8MX_ROWS][NT];
-#pragma unroll
-    for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++)
-#pragma unroll
-        for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
-    const XT *xg = x + group * group_dim;
-    const uint64_t tok_stride = (uint64_t)n_groups * group_dim;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32;
-#pragma unroll
-        for (int t = 0; t < NT; t++) {
-            float xb[32];
-            const XT *xr = xg + (uint64_t)t * tok_stride + i0;
-            stage_x_block32<XT>(xr, xb);
-#pragma unroll
-            for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
-                const uint32_t rw = (uint32_t)(row0 + r);
-                acc[r][t] += dev_dot_fp8mx_deint_block(wdata + (uint64_t)rw * group_dim + i0,
-                                                       wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)], xb);
-            }
-        }
-    }
-#pragma unroll
-    for (uint32_t r = 0; r < PULSAR_FP8MX_ROWS; r++) {
-#pragma unroll
-        for (int t = 0; t < NT; t++) {
-            const float red = warp_sum_f32(acc[r][t]);
-            if (lane == 0) low[(uint64_t)t * low_dim + row0 + r] = red;
-        }
-    }
-}
 
 
 
@@ -1462,13 +1312,39 @@ struct mxfp8_gact_cache_t {
 };
 static thread_local mxfp8_gact_cache_t g_gact;
 
-static mxfp8_gact_cache_t *gact_find(const void *ptr, uint32_t ntok,
-                                     uint32_t ngroups, uint64_t gdim) {
-    if (!ptr || g_gact.key_ptr != ptr || g_gact.key_ntok != ntok ||
+/* Consumer lookup for the grouped slot, prefix-tolerant like act_slot_find_rows:
+ * the producer armed the FULL batch, a mixed-step prefix asks for fewer rows.
+ * The encoding is row-local per group (data [g][tok][gdim], scales
+ * sfoff(tok, kb)), so rows [0, need) of a wider block are the same bytes --
+ * provided the consumer strides groups by the SLOT's row count (x_tok_stride),
+ * not its own. */
+static mxfp8_gact_cache_t *gact_find_rows(const void *ptr, uint32_t need,
+                                          uint32_t ngroups, uint64_t gdim) {
+    if (!ptr || g_gact.key_ptr != ptr || g_gact.key_ntok < need ||
         g_gact.key_ngroups != ngroups || g_gact.key_gdim != gdim) {
         return NULL;
     }
     return &g_gact;
+}
+
+/* L158 inc 4: re-base a VEC32 scale slab to a row window.  The mixed-batch
+ * prefix split hands its prefill SUFFIX (rows [row0, row0+rows) of the
+ * producer's full-width encoding) to cuBLASLt, whose scale pointer must
+ * describe a slab starting at row 0; pulsar_mx_sfoff(row, ...) is not a
+ * pointer offset for row0 % 128 != 0, so the bytes are COPIED into a fresh
+ * slab (rows x KBp bytes per group -- a re-layout, not a quantise; the values
+ * are the producer's).  Groups: n_groups slabs of src_slab / dst_slab bytes. */
+__global__ static void mx_scale_rebase_kernel(unsigned char *dst, const unsigned char *src,
+                                              int row0, int rows, int KBp, int n_groups,
+                                              size_t dst_slab, size_t src_slab) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long per_group = (long)rows * KBp;
+    if (idx >= per_group * n_groups) return;
+    const int g = (int)(idx / per_group);
+    const int rem = (int)(idx % per_group);
+    const int r = rem / KBp, kb = rem % KBp;
+    dst[(size_t)g * dst_slab + pulsar_mx_sfoff(r, kb, KBp)] =
+        src[(size_t)g * src_slab + pulsar_mx_sfoff(row0 + r, kb, KBp)];
 }
 
 int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
@@ -1520,6 +1396,41 @@ void pulsar_gpu_mxfp8_gact_disarm(void) {
     g_gact.valid   = 0;
 }
 
+/* L158 inc 4: PRODUCER-side encode of an f32 activation the caller itself
+ * produced and owns (tests and tools that synthesise x; the engine's producers
+ * emit from their epilogues and must not call this).  Arms the slot, encodes
+ * with the same kernel the cuBLASLt arm used to run for itself, notes it. */
+int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
+    void *q = NULL, *sf = NULL; int kbp = 0;
+    if (!x || n_tok == 0 || in_dim % 32 != 0) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(x, n_tok, in_dim, &q, &sf, &kbp)) return 0;
+    const int warps = (int)n_tok * (int)(in_dim / 32);
+    mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, (int)n_tok, (int)in_dim, kbp,
+                                                             (__nv_fp8_e4m3 *)q, (unsigned char *)sf);
+    if (!cuda_ok(cudaGetLastError(), "act encode f32")) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(x, n_tok, in_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+    return 1;
+}
+
+/* L158 inc 4: PRODUCER-side grouped encode of the attention output for a
+ * producer whose attention kernel has no E4M3 epilogue (today: the drafter's
+ * raw batch attention).  Run right after the inverse rope tail, before the
+ * attn-out projection; disarm with pulsar_gpu_mxfp8_gact_disarm after it. */
+int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                                     uint32_t n_groups, uint64_t group_dim) {
+    void *q = NULL, *sf = NULL; int kbp = 0; uint64_t slab = 0;
+    if (!pulsar_gpu_mxfp8_gact_slot(heads, n_tokens, n_groups, group_dim, &q, &sf, &kbp, &slab)) return 0;
+    const int warps = (int)n_tokens * (int)n_groups * (int)(group_dim / 32);
+    mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
+            (const pulsar_heads_t *)heads->ptr, (int)n_tokens, (int)n_groups, (int)group_dim, kbp,
+            (__nv_fp8_e4m3 *)q, (unsigned char *)sf, (size_t)slab);
+    if (!cuda_ok(cudaGetLastError(), "gact emit heads")) return 0;
+    pulsar_gpu_mxfp8_gact_note();
+    return 1;
+}
+
 /* Declare the E4M3 encoding current (producer filled the slots above). */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
     if (g_act_cur && g_act_cur->key_ptr) g_act_cur->valid = 1;
@@ -1563,9 +1474,15 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
 
 
 
-static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
+/* L158 inc 4: the tensor-core dense arm over a ROW WINDOW of full tensors --
+ * rows [row0, row0 + n_tok) of x and out.  row0 = 0 is the ordinary call; the
+ * mixed-batch prefix split uses row0 = n_dec for its prefill suffix, so the
+ * suffix reads the producer's full-width E4M3 slot (data by pointer offset,
+ * scales re-based by mx_scale_rebase_kernel) instead of quantising an offset
+ * f32 view -- the last way an f32 activation reached this GEMM. */
+static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
-        uint64_t n_tok, const char *label) {
+        uint64_t row0, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
     /* Derived from the destination, never passed in: the two cannot
      * disagree if only one of them exists. */
@@ -1574,7 +1491,8 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const size_t out_esz = out_f16 ? sizeof(__half) : sizeof(float);
-    if (x->bytes < n_tok * in_dim * sizeof(float) || out->bytes < n_tok * out_dim * out_esz) return 0;
+    const uint64_t rows_total = row0 + n_tok;
+    if (x->bytes < rows_total * in_dim * sizeof(float) || out->bytes < rows_total * out_dim * out_esz) return 0;
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
@@ -1586,54 +1504,34 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     /* Armed activation cache (see mxfp8_act_cache_t above): reuse the E4M3 data
      * and E8M0 scales this activation was already quantized into, and take only
      * the cuBLASLt workspace from the shared tmp region. */
-    mxfp8_act_cache_t *ac = act_slot_find(x->ptr, n_tok, in_dim);
-    if (ac) {
-        if (!mxfp8_act_cache_reserve((void **)&ac->xq, &ac->xq_cap,
-                                     in_dim * (size_t)ntok, "act data") ||
-            !mxfp8_act_cache_reserve((void **)&ac->sx, &ac->sx_cap,
-                                     sx_bytes, "act scale")) {
-            ac->valid = 0;  ///< fall back to the per-GEMM quantization
-            ac = NULL;
-        }
-    }
-    __nv_fp8_e4m3 *xq;
+    /* The activation MUST already carry its E4M3 encoding: the producer emitted
+     * it (norm epilogues, the attention epilogue, the drafter's producers) and
+     * armed the slot for the full batch.  Until L158 this arm quantised f32 for
+     * itself when no slot covered the rows -- the path every unarmed caller and
+     * every mixed-batch suffix took.  One format or an error. */
+    mxfp8_act_cache_t *ac = act_slot_find_rows(x->ptr, rows_total, in_dim);
+    if (!ac || !ac->valid || !ac->xq || !ac->sx)
+        return act_a8_missing_fail(label ? label : "tensor-core GEMM", n_tok, in_dim, out_dim);
+    __nv_fp8_e4m3 *xq = ac->xq + row0 * in_dim;
     unsigned char *sx;
     void *ws;
     cuda_arena ar;
-    if (ac) {
-        /* Cache armed: the E4M3 data and its E8M0 scales already exist, so the
-         * arena reserves the cuBLASLt workspace and nothing else. */
+    if (row0 == 0) {
         if (!cuda_arena_begin(&ar, wz, "fp8_mx scratch")) return 0;
-        xq = ac->xq;
         sx = ac->sx;
-        ws = cuda_arena_take(&ar, wz, 256);
-        if (!ws) return 0;
     } else {
-        const size_t xq_bytes = in_dim * (size_t)ntok;
-        if (!cuda_arena_begin(&ar, mx_a256(xq_bytes) + mx_a256(sx_bytes) + wz,
-                              "fp8_mx scratch")) return 0;
-        xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, xq_bytes, 256);
+        if (!cuda_arena_begin(&ar, mx_a256(sx_bytes) + wz, "fp8_mx scratch")) return 0;
         sx = (unsigned char *)cuda_arena_take(&ar, sx_bytes, 256);
-        ws = cuda_arena_take(&ar, wz, 256);
-        if (!ws) return 0;  ///< take() latches: one check covers all three
-    }
-    if (!ac || !ac->valid) {
-        /* About to quantize FROM f32.  If that store was skipped, these bytes
-         * are whatever the last call left behind -- stop instead of computing a
-         * well-formed wrong answer.  (Reached when the outer dispatch was
-         * bypassed, or when the slot went invalid between arm and use.) */
-        if (act_f32_absent_hazard(x->ptr, n_tok, in_dim)) {
-            fprintf(stderr, "pulsar: fp8_mx '%s' quantizing from an f32 activation whose store "
-                            "was SKIPPED (in_dim=%llu n_tok=%llu) -- refusing.\n",
-                    label ? label : "?", (unsigned long long)in_dim, (unsigned long long)n_tok);
-            return 0;
-        }
+        if (!sx) return 0;
         cudaMemsetAsync(sx, 0, sx_bytes, 0);
-        int warps = ntok * (int)KB;
-        mxfp8_quant_act_kernel<<<(warps * 32 + 255) / 256, 256>>>((const float *)x->ptr, ntok, (int)in_dim, KBp, xq, sx);
-        if (!cuda_ok(cudaGetLastError(), "fp8_mx act quant")) return 0;
-        if (ac) ac->valid = 1;
+        const long n_pairs = (long)ntok * KBp;
+        mx_scale_rebase_kernel<<<(unsigned)((n_pairs + 255) / 256), 256>>>(sx, ac->sx, (int)row0, ntok, KBp, 1,
+                                                                            sx_bytes, sx_bytes /* unused for 1 group */);
+        if (!cuda_ok(cudaGetLastError(), "fp8_mx scale rebase")) return 0;
     }
+    ws = cuda_arena_take(&ar, wz, 256);
+    if (!ws) return 0;
+    void *optr = (char *)out->ptr + row0 * out_dim * out_esz;
     /* Shape-keyed handle cache: the desc/layout/preference build plus the
      * heuristic query cost ~100us of host time PER GEMM and only the two
      * scale pointers change between calls of the same (in,out,ntok) shape.
@@ -1716,12 +1614,18 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
     if (ws) {
         float al = 1.f, be = 0.f;
         cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, w->data, e->la, xq, e->lb, &be,
-                                           out->ptr, e->ld, out->ptr, e->ld, &e->h.algo, ws, wz,
+                                           optr, e->ld, optr, e->ld, &e->h.algo, ws, wz,
                                            cudaStreamPerThread);
         ok = (st == CUBLAS_STATUS_SUCCESS);
         if (!ok) fprintf(stderr, "pulsar: cuBLASLt MXFP8 matmul failed: status %d\n", (int)st);
     }
     return ok;
+}
+
+static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
+        uint64_t n_tok, const char *label) {
+    return cuda_matmul_fp8_mx_window(out, model_map, model_size, weight_offset, in_dim, out_dim, x, 0, n_tok, label);
 }
 
 
@@ -1747,7 +1651,8 @@ static int cuda_attention_output_a_mx_gemm(
         uint64_t rank,
         uint32_t n_groups,
         const pulsar_gpu_tensor *heads,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t row0) {   ///< L158 inc 4: rows [row0, row0+n_tokens) of a FULL-width heads encoding
     if (group_dim % 32 != 0 || rank % 128 != 0 || !cublaslt_ensure()) return 0;
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     const uint64_t KB = group_dim / 32;
@@ -1757,9 +1662,8 @@ static int cuda_attention_output_a_mx_gemm(
                                                 group_dim, low_dim, "attn_out_a");
     if (!w) return 0;
     const int KBp = mx_rup((int)KB, 4);
-    const size_t x_scale_slab = (size_t)mx_rup((int)n_tokens, 128) * KBp;
+    size_t x_scale_slab = (size_t)mx_rup((int)n_tokens, 128) * KBp;
     const size_t w_scale_slab = ((size_t)rank / 128) * (size_t)KBp * 128;
-    const size_t data_bytes = (size_t)n_tokens * n_groups * group_dim;
     const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
     size_t wz = 32u << 20;
     __nv_fp8_e4m3 *xq;
@@ -1770,38 +1674,37 @@ static int cuda_attention_output_a_mx_gemm(
      * quantize pass is not moved, it is skipped entirely.  The slab geometry
      * the producers wrote must match what this GEMM is about to describe to
      * cuBLASLt, so check it rather than trust the key. */
-    mxfp8_gact_cache_t *gc = gact_find(heads->ptr, n_tokens, n_groups, group_dim);
-    if (gc && gc->valid && gc->kbp == KBp && gc->scale_slab == x_scale_slab) {
-        /* Announce once per process, like the attention tier line.  Whether
-         * this path is TAKEN is the whole question for the fusion's value: it
-         * needs raw_prefix_tokens == n_tokens, and long prefills with
-         * compressed KV go through the per-token indexed loop instead.  A
-         * silent fallback is indistinguishable from a working fusion in every
-         * measurement except a kernel-count profile, so say so. */
-        static int announced_gact = 0;
-        if (!announced_gact) {
-            announced_gact = 1;
-            fprintf(stderr, "pulsar: attn-out 'a' activation = producer-emitted E4M3 "
-                            "(grouped quantise pass skipped)\n");
+    mxfp8_gact_cache_t *gc = gact_find_rows(heads->ptr, row0 + n_tokens, n_groups, group_dim);
+    if (!gc || !gc->valid || gc->kbp != KBp) {
+        static int said_ga = 0;
+        if (!said_ga) {
+            said_ga = 1;
+            fprintf(stderr, "pulsar: NO grouped E4M3 ENCODING for attn-out 'a' (tensor-core arm, "
+                            "n_tokens=%u row0=%u) -- the attention producer did not emit it; the "
+                            "f32 quantise fallback was deleted (L158).  Refusing.\n", n_tokens, row0);
         }
-        xq = gc->xq;
+        return 0;
+    }
+    /* group-major encoding: group g's rows start at g * key_ntok (the SLOT's
+     * row count, not this call's) -- see gact_find_rows. */
+    const uint64_t x_gstride = (uint64_t)gc->key_ntok * group_dim;
+    xq = gc->xq + (size_t)row0 * group_dim;
+    if (row0 == 0) {
+        x_scale_slab = gc->scale_slab;
         sx = gc->sx;
         if (!cuda_arena_begin(&ar, wz, "attn_out_a mx scratch")) return 0;
         ws = cuda_arena_take(&ar, wz, 256);
         if (!ws) return 0;
     } else {
-        if (!cuda_arena_begin(&ar, mx_a256(data_bytes) + mx_a256(scale_bytes) + wz,
-                              "attn_out_a mx scratch")) return 0;
-        xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, data_bytes, 256);
+        if (!cuda_arena_begin(&ar, mx_a256(scale_bytes) + wz, "attn_out_a mx scratch")) return 0;
         sx = (unsigned char *)cuda_arena_take(&ar, scale_bytes, 256);
         ws = cuda_arena_take(&ar, wz, 256);
-        if (!ws) return 0;  ///< take() latches: one check covers all three
+        if (!ws) return 0;
         cudaMemsetAsync(sx, 0, scale_bytes, 0);
-        int warps = (int)n_tokens * (int)n_groups * (int)KB;
-        mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
-                (const pulsar_heads_t *)heads->ptr, (int)n_tokens, (int)n_groups,
-                (int)group_dim, KBp, xq, sx, x_scale_slab);
-        if (!cuda_ok(cudaGetLastError(), "attn_out_a act quant")) return 0;
+        const long n_pairs = (long)n_tokens * KBp * n_groups;
+        mx_scale_rebase_kernel<<<(unsigned)((n_pairs + 255) / 256), 256>>>(sx, gc->sx, (int)row0, (int)n_tokens, KBp,
+                                                                            (int)n_groups, x_scale_slab, gc->scale_slab);
+        if (!cuda_ok(cudaGetLastError(), "attn_out_a scale rebase")) return 0;
     }
     /* Same shape-keyed handle/algo cache as the main MXFP8 GEMM above (and
      * the same gotcha: the heuristic must see scale pointers on the desc or
@@ -1871,7 +1774,7 @@ static int cuda_attention_output_a_mx_gemm(
         for (uint32_t g = 0; g < n_groups && ok; g++) {
             const __nv_fp8_e4m3 *ag = w->data + (size_t)g * rank * group_dim;
             const unsigned char *as = w->scale + (size_t)g * w_scale_slab;
-            const __nv_fp8_e4m3 *bg = xq + (size_t)g * n_tokens * group_dim;
+            const __nv_fp8_e4m3 *bg = xq + (size_t)g * x_gstride;
             const unsigned char *bs = sx + (size_t)g * x_scale_slab;
             float *dg = (float *)low->ptr + (size_t)g * rank;
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &as, sizeof(as));
@@ -2175,8 +2078,12 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
                     weight_offset, in_dim, out_dim, &x_pre, n_dec, label);
             g_mneutral_rows = 0;  ///< prefill suffix: tensor-core
-            int r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size,
-                    weight_offset, in_dim, out_dim, &x_suf, n_tok - n_dec, label);
+            /* L158 inc 4: the suffix reads the producer's full-width slot
+             * through a row window; an offset f32 view keyed no slot and used
+             * to be quantised here -- that path is gone. */
+            (void)out_suf; (void)x_suf;
+            int r2 = cuda_matmul_fp8_mx_window(out, model_map, model_size,
+                    weight_offset, in_dim, out_dim, x, n_dec, n_tok - n_dec, label);
             g_mneutral_rows = saved;
             return r1 && r2;
         }
@@ -2514,20 +2421,12 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
             return cuda_ok(cudaGetLastError(), "fp8_hc_expand a8 launch");
         }
     }
-    if (dw) {
-        matmul_fp8mx_hc_expand_warp8_kernel<true><<<hg, 256>>>(
-                (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
-                (const unsigned char *)wptr, dw->data, dw->scale, KBp, (const float *)x->ptr,
-                in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
-    } else {
-        matmul_fp8mx_hc_expand_warp8_kernel<false><<<hg, 256>>>(
-                (pulsar_hc_t *)out_hc->ptr, (float *)block_out->ptr, ba,
-                (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
-                (const unsigned char *)wptr, (const __nv_fp8_e4m3 *)NULL, (const unsigned char *)NULL, 0,
-                (const float *)x->ptr, in_dim, out_dim, n_embd, n_hc, blocks, block_add ? 1 : 0);
-    }
-    return cuda_ok(cudaGetLastError(), "matmul_fp8_hc_expand launch");
+    /* L158 inc 4: no encoding for attn_low (or no de-interleaved weight) ->
+     * refuse.  The f32 arms that stood here read the raw f32 activation into
+     * the same projection -- "a fallback, not a second format", the comment
+     * said; it was a second format.  The 'a' projection emits `low` on every
+     * path, so a miss here is a producer bug, and now it says so. */
+    return act_a8_missing_fail("attn-out 'b' hc-expand", 1, in_dim, out_dim);
 }
 
 
@@ -2834,17 +2733,17 @@ static_assert(PULSAR_GPU_MNEUTRAL_ROWS_MAX == 16u,
 static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, int KBp,
         const __nv_fp8_e4m3 *xq, const unsigned char *sx, int xKBp, uint64_t slab,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint32_t n_tokens,
-        uint64_t blocks, uint64_t low_dim, const char *what) {
+        uint64_t blocks, uint64_t low_dim, const char *what, uint32_t x_tok_stride) {
     const unsigned gx = ((unsigned)low_dim + PULSAR_FP8MX_ROWS_A8_PER_BLOCK - 1u)
                         / PULSAR_FP8MX_ROWS_A8_PER_BLOCK;
     #define PULSAR_OA_NT(N) grouped_fp8mx_a_nt_a8_kernel<N><<<dim3(gx, 1, 1), 256>>>( \
             low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab,                        \
-            group_dim, rank, n_groups, n_tokens, blocks)
+            group_dim, rank, n_groups, n_tokens, x_tok_stride, blocks)
     switch (n_tokens) {
     case 1:
         grouped_fp8mx_a_warp8_a8_kernel<<<dim3(gx, 1, 1), 256>>>(
                 low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab,
-                group_dim, rank, n_groups, n_tokens, blocks);
+                group_dim, rank, n_groups, n_tokens, x_tok_stride, blocks);
         break;
     case 2: PULSAR_OA_NT(2); break;
     case 3: PULSAR_OA_NT(3); break;
@@ -2864,7 +2763,7 @@ static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, i
     default:
         grouped_fp8mx_a_warp8_a8_kernel<<<dim3(gx, n_tokens, 1), 256>>>(
                 low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab,
-                group_dim, rank, n_groups, n_tokens, blocks);
+                group_dim, rank, n_groups, n_tokens, x_tok_stride, blocks);
         break;
     }
     #undef PULSAR_OA_NT
@@ -2907,9 +2806,6 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
     if (dw &&   /* dw != NULL implies group_dim%32==0 (K13) */
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
         const size_t slab = (size_t)mx_rup((int)n_tokens, 128) * (size_t)KBp;
-        const size_t data_n  = (size_t)n_tokens * n_groups * group_dim;
-        const size_t scale_n = (size_t)n_groups * slab;
-        const size_t data_bytes_a8 = data_n * sizeof(__nv_fp8_e4m3);
         /* L106 K1: consume the producer-emitted grouped encoding when it is
          * current, exactly as the tensor-core arm does.  Before this probe,
          * only that arm consulted the cache, so the "a" activation was
@@ -2921,83 +2817,67 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
          * every n now multiplies the same bytes the producer emitted, and the
          * quantise below remains only for buffers with no producer encoding
          * (decode g->heads, the drafter). */
-        mxfp8_gact_cache_t *gc = gact_find(heads, n_tokens, n_groups, group_dim);
-        if (gc && gc->valid && gc->kbp == KBp && gc->scale_slab == slab) {
+        mxfp8_gact_cache_t *gc = gact_find_rows(heads, n_tokens, n_groups, group_dim);
+        if (gc && gc->valid && gc->kbp == KBp) {
             static int announced_gact_gemv = 0;
             if (!announced_gact_gemv) {
                 announced_gact_gemv = 1;
-                fprintf(stderr, "pulsar: attn-out 'a' GEMV = producer-emitted E4M3 "
-                                "(grouped quantise pass skipped)\n");
+                fprintf(stderr, "pulsar: attn-out 'a' GEMV = producer-emitted E4M3\n");
             }
             return launch_grouped_fp8mx_a_a8_rows(low, dw, KBp,
                     gc->xq, gc->sx, gc->kbp, (uint64_t)gc->scale_slab,
                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
-                    "attention_output_a a8 launch (gact)");
+                    "attention_output_a a8 launch (gact)", gc->key_ntok);
         }
-        /** Soft failure on purpose: this path falls through to f32 rather than
-         * failing the call, and the arena latches, so a refused reservation
-         * arrives as a NULL take below and needs no separate branch. */
-        cuda_arena ar;
-        (void)cuda_arena_begin(&ar, mx_a256(data_bytes_a8) + mx_a256(scale_n),
-                               "attn_out_a a8 acts");
-        __nv_fp8_e4m3 *xq = (__nv_fp8_e4m3 *)cuda_arena_take(&ar, data_bytes_a8, 256);
-        unsigned char *sx = (unsigned char *)cuda_arena_take(&ar, scale_n, 256);
-        if (sx) {   /* take() latches, so sx != NULL implies xq != NULL */
-            /* pulsar_mx_sfoff leaves holes; the GEMV reads only the (tok, kb) pairs the
-             * quantiser fills, but zero the slab so a hole can never carry a
-             * stale byte from a previous call's larger shape. */
-            cudaMemsetAsync(sx, 0, scale_n, cudaStreamPerThread);
-            const int warps = (int)n_tokens * (int)n_groups * (int)(group_dim / 32);
-            mxfp8_quant_act_grouped_kernel<<<(warps * 32 + 255) / 256, 256>>>(
-                    heads, (int)n_tokens, (int)n_groups, (int)group_dim, KBp, xq, sx, slab);
-            if (cudaGetLastError() == cudaSuccess) {
-                static int announced_oa8 = 0;
-                if (!announced_oa8) {
-                    announced_oa8 = 1;
-                    fprintf(stderr, "pulsar: attn-out 'a' GEMV = W8A8 (E4M3 acts) for "
-                                    "group_dim=%llu rank=%llu\n",
-                            (unsigned long long)group_dim, (unsigned long long)rank);
-                }
-                return launch_grouped_fp8mx_a_a8_rows(low, dw, KBp, xq, sx, KBp, (uint64_t)slab,
-                        group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
-                        "attention_output_a a8 launch");
-            }
-            /* Quantise failed: fall through to f32 rather than run on a partly
-             * written buffer. */
+        /* L158 inc 4: no producer encoding -> refuse.  The quantise-from-heads
+         * fallback, the heads-typed nt kernels and the warp8 f32 twin that stood
+         * here were three more activation formats for the same projection,
+         * chosen by cache state.  One format or an error. */
+        static int said_gg = 0;
+        if (!said_gg) {
+            said_gg = 1;
+            fprintf(stderr, "pulsar: NO grouped E4M3 ENCODING for attn-out 'a' (GEMV arm, n_tokens=%u "
+                            "group_dim=%llu) -- the attention producer did not emit it "
+                            "(pulsar_gpu_mxfp8_gact_emit_heads for producers without an epilogue).  "
+                            "Refusing.\n", n_tokens, (unsigned long long)group_dim);
         }
-    }
-    /* Small verify batches: one nt launch, weight blocks L1-shared across tokens;
-     * per-token bit-identical to the n=1 DEINT kernel below. */
-    if (dw && n_tokens >= 2u && n_tokens <= 4u &&
-        rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
-        const dim3 g(((unsigned)low_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK);
-        switch (n_tokens) {
-        case 2: grouped_fp8mx_a_nt_kernel<2, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
-                heads, group_dim, rank, n_groups, blocks_a); break;
-        case 3: grouped_fp8mx_a_nt_kernel<3, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
-                heads, group_dim, rank, n_groups, blocks_a); break;
-        default: grouped_fp8mx_a_nt_kernel<4, pulsar_heads_t><<<g, 256>>>(low, dw->data, dw->scale, KBp,
-                heads, group_dim, rank, n_groups, blocks_a); break;
-        }
-        return cuda_ok(cudaGetLastError(), "attention_output_a nt launch");
+        return 0;
     }
     if (!dw) {
-        /* L106 K3: this used to soft-fall to the raw-33B DEINT=false arm.  A
-         * NULL resolver here means the pre-stored MXFP8_LT weight failed to
-         * resolve -- a should-never-happen path whose fallback silently ran a
-         * different kernel on the same call: the dense dispatcher made the
-         * twin case TERMINAL (L083 C3, "refuse-loud"), and this entry now
-         * follows the same rule.  A loud failure beats a quiet arm change. */
         fprintf(stderr, "pulsar: attn-out 'a' weight did not resolve (deint) -- refusing "
-                        "the raw fallback (group_dim=%llu rank=%llu)\n",
+                        "(group_dim=%llu rank=%llu)\n",
                 (unsigned long long)group_dim, (unsigned long long)rank);
         return 0;
     }
-    grouped_fp8mx_a_warp8_kernel<true, pulsar_heads_t><<<grid_a, 256>>>(low, out_a, dw->data, dw->scale, KBp,
-            heads, group_dim, rank, n_groups, n_tokens, blocks_a);
-    return cuda_ok(cudaGetLastError(), "attention_output_a launch");
+    fprintf(stderr, "pulsar: attn-out 'a' shape (rank=%llu low_dim=%llu) not a multiple of %d -- refusing\n",
+            (unsigned long long)rank, (unsigned long long)low_dim, (int)PULSAR_FP8MX_ROWS);
+    (void)out_a; (void)grid_a;
+    return 0;
 }
 
+
+/* The "a" projection's output `low` is the "b" projection's activation; emit
+ * its E4M3 encoding here, at the producer stage, so "b" reads a slot.  Done as
+ * a pass after "a" rather than in "a"'s epilogue because the warp that reduces
+ * a row does not hold that row's block neighbours.  A slot failure is an ERROR
+ * now (L158): "b" has no f32 arm to fall back to. */
+static int emit_low_e4m3(pulsar_gpu_tensor *low, uint32_t n_tokens, uint64_t low_dim) {
+    if (low_dim % 256 != 0) {
+        fprintf(stderr, "pulsar: attn-out low_dim=%llu cannot carry an E4M3 encoding (needs a multiple of 256) -- refusing\n",
+                (unsigned long long)low_dim);
+        return 0;
+    }
+    void *lq = NULL, *lsf = NULL; int lkbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, n_tokens, low_dim, &lq, &lsf, &lkbp)) return 0;
+    const int lwarps = (int)n_tokens * (int)(low_dim / 32);
+    mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
+            (const float *)low->ptr, (int)n_tokens, (int)low_dim, lkbp,
+            (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
+    if (!cuda_ok(cudaGetLastError(), "attn-out low e4m3 emit")) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(low, n_tokens, low_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+    return 1;
+}
 
 int pulsar_gpu_attention_output_batch_tensor(
         pulsar_gpu_tensor       *out,
@@ -3041,9 +2921,18 @@ int pulsar_gpu_attention_output_batch_tensor(
                     model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
                     out_dim, &hd_pre, (uint32_t)n_dec);
             g_mneutral_rows = 0;
-            int r2 = pulsar_gpu_attention_output_batch_tensor(&out_suf, &low_suf, model_map,
-                    model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
-                    out_dim, &hd_suf, n_tokens - (uint32_t)n_dec);
+            /* L158 inc 4: the suffix's 'a' reads the producer's full-width
+             * grouped encoding through a row window (tensor-core arm at any
+             * width); its `low` is then emitted and consumed as its own
+             * producer/consumer pair, as before.  An offset heads view keyed
+             * no encoding and used to be quantised -- that path is gone. */
+            (void)hd_suf;
+            const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
+            int r2 = cuda_attention_output_a_mx_gemm(&low_suf, model_map, model_size, out_a_offset,
+                                                     group_dim, rank, n_groups, heads, n_suf, (uint32_t)n_dec);
+            if (r2) r2 = emit_low_e4m3(&low_suf, n_suf, low_dim);
+            if (r2) r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size, out_b_offset,
+                                                          low_dim, out_dim, &low_suf, n_suf, "attn_output_b");
             g_mneutral_rows = saved;
             return r1 && r2;
         }
@@ -3083,7 +2972,7 @@ int pulsar_gpu_attention_output_batch_tensor(
      * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
     if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
-                                                 group_dim, rank, n_groups, heads, n_tokens);
+                                                 group_dim, rank, n_groups, heads, n_tokens, 0);
     }
     if (!a_done) {
         const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
@@ -3099,19 +2988,7 @@ int pulsar_gpu_attention_output_batch_tensor(
      * attention_output_low_tensor -- so emitting only there converted the
      * benchmark and left production on f32. The bench has no drafter, so it
      * could not have shown that. */
-    if (low_dim % 256 == 0) {
-        void *lq = NULL, *lsf = NULL; int lkbp = 0;
-        if (pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, n_tokens, low_dim, &lq, &lsf, &lkbp)) {
-            const int lwarps = (int)n_tokens * (int)(low_dim / 32);
-            mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
-                    (const float *)low->ptr, (int)n_tokens, (int)low_dim, lkbp,
-                    (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
-            if (cudaGetLastError() == cudaSuccess) {
-                pulsar_gpu_mxfp8_act_cache_arm(low, n_tokens, low_dim);
-                pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-            }
-        }
-    }
+    if (!emit_low_e4m3(low, n_tokens, low_dim)) return 0;
 
     return cuda_matmul_mxfp8_tensor_labeled(out,
                                            model_map,
@@ -3164,19 +3041,6 @@ int pulsar_gpu_attention_output_low_tensor(
      * hc_expand's A8 branch reads this slot, and the non-fused
      * cuda_matmul_mxfp8_tensor_labeled finds it on its own. A failure to get a
      * slot is not an error: "b" falls back to f32. */
-    if (low_dim % 256 == 0) {
-        void *lq = NULL, *lsf = NULL; int lkbp = 0;
-        if (pulsar_gpu_mxfp8_act_cache_e4m3_slot(low, 1, low_dim, &lq, &lsf, &lkbp)) {
-            const int lwarps = (int)(low_dim / 32);
-            mxfp8_quant_act_kernel<<<(lwarps * 32 + 255) / 256, 256>>>(
-                    (const float *)low->ptr, 1, (int)low_dim, lkbp,
-                    (__nv_fp8_e4m3 *)lq, (unsigned char *)lsf);
-            if (cudaGetLastError() == cudaSuccess) {
-                pulsar_gpu_mxfp8_act_cache_arm(low, 1, low_dim);
-                pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-            }
-        }
-    }
-    return 1;
+    return emit_low_e4m3(low, 1, low_dim);
 }
 

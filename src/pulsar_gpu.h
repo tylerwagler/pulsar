@@ -722,6 +722,20 @@ int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pit
                                    const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
                                    const pulsar_gpu_tensor *h2, uint32_t n_embd);
 
+/** L158: PRODUCER-side encode of an f32 activation the caller itself produced
+ * and owns -- for tests and tools that synthesise an activation.  Arms the
+ * slot for (x, n_tok, in_dim), encodes with the engine's quantiser, notes it
+ * current.  Engine producers emit from their epilogues and must not call this;
+ * no consumer quantises any more. @return 1 on success. */
+int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim);
+
+/** L158: PRODUCER-side grouped encode of the attention output heads for an
+ * attention producer without an E4M3 epilogue (the drafter's raw batch
+ * attention).  Call right after the inverse rope tail and before the attn-out
+ * projection; pulsar_gpu_mxfp8_gact_disarm after it. @return 1 on success. */
+int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
+                                     uint32_t n_groups, uint64_t group_dim);
+
 /** Declare the E4M3 encoding current after a producer filled those slots. */
 void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void);
 

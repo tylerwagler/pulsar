@@ -136,10 +136,11 @@ int main(int argc, char **argv) {
          * runs -- the instrument measured a kernel the served lane never
          * executes.  The engine announces "verify-batch GEMV W8A8" once per
          * shape when the A8 arm fires; the run script greps for it. */
-        pulsar_gpu_mxfp8_act_cache_arm(c.x, MMAX, c.in_dim);
-        pulsar_gpu_matmul_set_batch_mneutral(0);
-        if (!gemm_launch(&c, MMAX) || !pulsar_gpu_end_commands()) {
-            fprintf(stderr, "warm call failed for %s\n", shapes[si].name);
+        /* L158 inc 4: this tool is x's PRODUCER, so it encodes x itself; the
+         * GEMMs no longer quantise for anyone. */
+        if (w->type != PULSAR_TENSOR_BF16 &&
+            (!pulsar_gpu_mxfp8_act_cache_encode_f32(c.x, MMAX, c.in_dim) || !pulsar_gpu_end_commands())) {
+            fprintf(stderr, "activation encode failed for %s\n", shapes[si].name);
             return 1;
         }
         const double wbytes = (double)c.in_dim * (double)c.out_dim *

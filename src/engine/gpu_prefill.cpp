@@ -2361,6 +2361,12 @@ bool gpu_graph_encode_layer_attention_batch(
     /* BOTH producers have now run: the encoding is complete and the "a" GEMM
      * may consume it instead of running its own quantise pass. */
     if (ok && gact_data) pulsar_gpu_mxfp8_gact_note();
+    /* L158 inc 4: the attention arms without the E4M3 epilogue (the indexed
+     * per-token span path, a raw prefix with an indexed remainder) leave no
+     * grouped encoding.  The attention STAGE emits it here, after the inverse
+     * rope, so the 'a' projection reads the same encoding on every arm; the
+     * consumer's quantise-from-heads fallback is gone. */
+    if (ok && !gact_data) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_tokens, n_groups, group_dim) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);

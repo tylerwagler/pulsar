@@ -880,6 +880,11 @@ bool gpu_graph_dspark_draft_forward_banks(
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
             banked ? meta_rope[li] : NULL) != 0;
+        /* L158 inc 4: the drafter's raw attention has no E4M3 epilogue, so the
+         * attention stage emits the grouped encoding here, after the inverse
+         * rope, and the attn-out 'a' projection reads it -- the consumer's
+         * quantise-from-heads fallback is gone. */
+        if (ok) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_draft, n_groups, group_dim) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
         if (ok) ok = pulsar_gpu_attention_output_batch_tensor(
             g->batch_attn_out, g->batch_attn_low,
@@ -888,6 +893,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             layer->attn_output_b->abs_offset,
             group_dim, rank, n_groups, PULSAR_N_EMBD,
             g->batch_heads, n_draft) != 0;
+        pulsar_gpu_mxfp8_gact_disarm();
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_out", g->batch_attn_out,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
 
