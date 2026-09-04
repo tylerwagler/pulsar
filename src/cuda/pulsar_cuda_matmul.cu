@@ -352,8 +352,8 @@ __device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
  *
  * Only the common case: the caller guarantees a de-interleaved weight,
  * rank % PULSAR_FP8MX_ROWS == 0 (a row quad never straddles a group) and
- * group_dim % 32 == 0 (whole blocks, so bn is always 32). Anything else keeps
- * the f32 path, which is a FALLBACK not a format choice -- see the launcher. */
+ * group_dim % 32 == 0 (whole blocks, so bn is always 32). Anything else is
+ * refused by the launcher (launch_grouped_fp8mx_a). */
 
 __global__ static void grouped_fp8mx_a_warp8_a8_kernel(
         float *low,
@@ -852,32 +852,17 @@ static mxfp8_act_cache_t *act_slot_find_window(const void *ptr, uint64_t need, u
     return best;
 }
 
-/* D3: tell a LEGITIMATE miss from a BROKEN one.
+/* Two different misses on the activation slot, two different refusals:
  *
- * Every consumer below reads the cache and, on a miss, quietly multiplies
- * against f32 instead.  That makes the activation FORMAT a function of cache
- * state rather than of what the engine meant -- W8A8 and W8A32 chosen by a
- * lookup, with silence as the only signal.  The per-shape "W8A8" announcements
- * do not close this: they fire when A8 DOES run, so the failure mode is a line
- * that never appears, and nobody watches for an absent log line.
+ *   NO SLOT AT ALL -- no producer armed this buffer.  act_a8_missing_fail.
  *
- * The two misses are not the same event:
+ *   A SLOT EXISTS AND IS VALID BUT COVERS FEWER ROWS THAN ASKED -- the producer
+ *     declared E4M3 for this buffer and this consumer cannot use the
+ *     declaration (armed at full batch width, consumed at the decode prefix).
+ *     act_a8_contract_fail.
  *
- *   NO SLOT AT ALL -- the producer never armed this buffer, so it never claimed
- *     to have emitted E4M3.  f32 is the correct and intended answer (the
- *     drafter's own forwards are the live example).  Not an error.
- *
- *   A SLOT EXISTS AND IS VALID, BUT COVERS FEWER ROWS THAN ASKED -- the
- *     producer DID declare E4M3 for this buffer and this consumer cannot use
- *     the declaration.  There is no correct f32 answer here: the rows past
- *     key_ntok were never encoded, so falling back silently changes the format
- *     of an operand the engine believes is E4M3.  This is exactly the shape
- *     that failed GATE 4 on 2026-08-17 (arm at full batch width, consume at the
- *     decode prefix) and the shape act_slot_find_rows exists to prevent.
- *
- * So the second case is a defect, and it now says so and fails the launch
- * rather than returning a differently-typed number.  Fail closed, one format or
- * an error -- the same stance routed_moe_launch takes for a declined MMQ. */
+ * Neither returns a number from a different computation: one format or an
+ * error. */
 static bool act_slot_a8_declared_short(const void *ptr, uint64_t need, uint64_t in_dim) {
     if (!ptr || need == 0) return false;
     for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
@@ -888,13 +873,8 @@ static bool act_slot_a8_declared_short(const void *ptr, uint64_t need, uint64_t 
     return false;
 }
 
-/* L158 (2026-09-03): NO E4M3 encoding exists for this activation and none was
- * declared.  Until today this case fell through to an f32-activation kernel --
- * a second activation format reachable only by callers that skipped the arm
- * (tools) or by an allocation failure: W8A32 on a path the served lane never
- * runs, with no announce line, and it measured a phantom for weeks when the
- * row sweep tool took it (rows/L151.md).  Producers arm the slot; the cuBLASLt
- * arm quantises for itself; here it is one format or an error. */
+/* NO E4M3 encoding exists for this activation and none was declared: refuse,
+ * once per (in,out) shape. */
 static int act_a8_missing_fail(const char *what, uint64_t need,
                                uint64_t in_dim, uint64_t out_dim) {
     static uint64_t seen[16] = {0};
@@ -906,9 +886,9 @@ static int act_a8_missing_fail(const char *what, uint64_t need,
         seen[n_seen++] = key;
         fprintf(stderr,
                 "pulsar: NO E4M3 ENCODING for the activation of %s (in_dim=%llu out_dim=%llu "
-                "n_tok=%llu) -- no producer armed the slot.  The f32 fallback was deleted "
-                "(L158): arm the activation (pulsar_gpu_mxfp8_act_cache_arm) or take the "
-                "tensor-core arm, which quantises for itself.  Refusing.\n",
+                "n_tok=%llu) -- no producer armed the slot.  Arm the activation "
+                "(pulsar_gpu_mxfp8_act_cache_arm) and have its producer emit E4M3 "
+                "(pulsar_gpu_mxfp8_act_cache_encode_f32 for a synthesised x).  Refusing.\n",
                 what ? what : "?", (unsigned long long)in_dim,
                 (unsigned long long)out_dim, (unsigned long long)need);
     }
@@ -1292,10 +1272,11 @@ int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t 
     return 1;
 }
 
-/* L158 inc 4: PRODUCER-side encode of an f32 activation the caller itself
- * produced and owns (tests and tools that synthesise x; the engine's producers
- * emit from their epilogues and must not call this).  Arms the slot, encodes
- * with the same kernel the cuBLASLt arm used to run for itself, notes it. */
+/* PRODUCER-side encode of an f32 activation the caller itself produced and
+ * owns: tests and tools that synthesise x, and the engine producers whose
+ * kernel has no epilogue (the MoE's SwiGLU output).  Epilogue producers emit
+ * directly and do not call this.  Arms the slot, encodes with the one
+ * standalone encoder, notes it. */
 int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     void *q = NULL, *sf = NULL; int kbp = 0;
     if (!x || n_tok == 0 || in_dim % 32 != 0) return 0;
@@ -1402,9 +1383,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * the cuBLASLt workspace from the shared tmp region. */
     /* The activation MUST already carry its E4M3 encoding: the producer emitted
      * it (norm epilogues, the attention epilogue, the drafter's producers) and
-     * armed the slot for the full batch.  Until L158 this arm quantised f32 for
-     * itself when no slot covered the rows -- the path every unarmed caller and
-     * every mixed-batch suffix took.  One format or an error. */
+     * armed the slot for the full batch.  One format or an error. */
     mxfp8_act_cache_t *ac = act_slot_find_rows(x->ptr, rows_total, in_dim);
     if (!ac || !ac->valid || !ac->xq || !ac->sx)
         return act_a8_missing_fail(label ? label : "tensor-core GEMM", n_tok, in_dim, out_dim);
@@ -2097,11 +2076,21 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 return act_a8_missing_fail("verify-batch GEMV", n_tok, in_dim, out_dim);
             }
         }
-        /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
-         * through to the per-token mmvq kernel below. */
-        if (n_tok > 1 &&
-                cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
-                weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+        /* Prefill (n_tok > 1) is the cuBLASLt MX tensor-core GEMM, and only
+         * that: a failure inside it (handle, workspace arena, heuristic, the
+         * matmul itself) is reported and refused here.  Until L164 it fell
+         * through to the per-token GEMV loop below -- a different kernel with a
+         * different accumulation order, taken exactly when something upstream
+         * had gone wrong, with no message.  The loop is the n_tok == 1 arm. */
+        if (n_tok > 1) {
+            if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
+                    weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+            fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (n_tok=%llu in_dim=%llu "
+                            "out_dim=%llu) -- refusing to fall through to the per-token GEMV\n",
+                    label ? label : "weights", (unsigned long long)n_tok,
+                    (unsigned long long)in_dim, (unsigned long long)out_dim);
+            return 0;
+        }
         const unsigned wpb = 8;  ///< output rows per block
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -2482,52 +2471,22 @@ static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, i
 }
 
 static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t out_a_offset,
-        uint64_t out_a_bytes, const unsigned char *out_a, uint64_t group_dim, uint64_t rank,
+        uint64_t out_a_bytes, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
         const pulsar_heads_t *heads, const char *label) {
-    const dim3 grid_a(((unsigned)low_dim + PULSAR_FP8MX_ROWS_PER_BLOCK - 1u) / PULSAR_FP8MX_ROWS_PER_BLOCK, (unsigned)n_tokens, 1);
-    /* The A8 kernels carry PULSAR_FP8MX_ROWS_A8 rows per warp, not
-     * PULSAR_FP8MX_ROWS, so they take their own grid (built in
-     * launch_grouped_fp8mx_a_a8_rows) -- grid_a serves the f32 twin below and
-     * keeps the 4-row geometry. */
     const fp8_mx_weight *dw = (group_dim % 32 == 0)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = pulsar_mx_kbp((int)group_dim);
 
-    /* A8: multiply the attn-output "a" projection in E4M3 rather than against
-     * f32 heads. This is the largest byte consumer in the model and was the
-     * last big decode GEMV still on W8A32.
-     *
-     * The encoding is made HERE rather than in the attention epilogue. Prefill
-     * splits it across two producers (attn_f16 owns the nope blocks, rope_tail
-     * the tail it rewrites) to avoid a separate pass over a
-     * [n_tok x n_head x head_dim] tensor -- worth it at 4096 tokens. This path
-     * only ever serves small n (decode, verify batches, mixed steps), where the
-     * same tensor is ~128 KB and one quantise pass is noise next to the weight
-     * traffic the GEMV is about to do. Doing it after the inverse rope also
-     * means ONE producer owns the whole range, so there is no half-emitted
-     * encoding to get wrong.
-     *
-     * Covers EVERY n this function serves, not just n==1: converting the n==1
-     * kernel and leaving the 2..4 nt fusion on f32 would be a size-thresholded
-     * activation format -- the exact defect removed from the mmvq pair path and
-     * refused by name in the MoE down path. Format beats fusion -- and since
-     * L141 the fusion is back IN the format: n >= 2 stages each weight block
-     * once for all rows (grouped_fp8mx_a_nt_a8_kernel). */
+    /* W8A8 attn-output "a" projection: both operands E4M3 with their own ue8m0
+     * block scales.  The activation is the grouped encoding the attention
+     * producer emitted (its epilogue, or pulsar_gpu_mxfp8_gact_emit_heads for
+     * a producer without one), read from the grouped cache for EVERY n this
+     * function serves -- one activation format across row counts, no size
+     * threshold.  n >= 2 stages each weight block once for all rows
+     * (grouped_fp8mx_a_nt_a8_kernel). */
     if (dw &&   /* dw != NULL implies group_dim%32==0 (K13) */
         rank % PULSAR_FP8MX_ROWS == 0 && low_dim % PULSAR_FP8MX_ROWS == 0) {
-        const size_t slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
-        /* L106 K1: consume the producer-emitted grouped encoding when it is
-         * current, exactly as the tensor-core arm does.  Before this probe,
-         * only that arm consulted the cache, so the "a" activation was
-         * f32->E4M3 above the gemv cap and f32->bf16->E4M3 at or below it --
-         * a SIZE-THRESHOLDED ACTIVATION FORMAT, the defect this file refuses
-         * by name two functions up, live on every spec verify with K <= 3.
-         * The producer encodes from the attention accumulator registers; this
-         * quantiser reads the bf16 heads store.  One probe removes the split:
-         * every n now multiplies the same bytes the producer emitted, and the
-         * quantise below remains only for buffers with no producer encoding
-         * (decode g->heads, the drafter). */
         mxfp8_gact_cache_t *gc = gact_find_rows(heads, n_tokens, n_groups, group_dim);
         if (gc && gc->valid && gc->kbp == KBp) {
             static int announced_gact_gemv = 0;
@@ -2540,10 +2499,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
                     "attention_output_a a8 launch (gact)", gc->key_ntok);
         }
-        /* L158 inc 4: no producer encoding -> refuse.  The quantise-from-heads
-         * fallback, the heads-typed nt kernels and the warp8 f32 twin that stood
-         * here were three more activation formats for the same projection,
-         * chosen by cache state.  One format or an error. */
+        /* No producer encoding -> refuse; there is no quantiser here. */
         static int said_gg = 0;
         if (!said_gg) {
             said_gg = 1;
@@ -2562,7 +2518,6 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
     }
     fprintf(stderr, "pulsar: attn-out 'a' shape (rank=%llu low_dim=%llu) not a multiple of %d -- refusing\n",
             (unsigned long long)rank, (unsigned long long)low_dim, (int)PULSAR_FP8MX_ROWS);
-    (void)out_a; (void)grid_a;
     return 0;
 }
 
@@ -2686,10 +2641,7 @@ int pulsar_gpu_attention_output_batch_tensor(
                                                  group_dim, rank, n_groups, heads, n_tokens, 0);
     }
     if (!a_done) {
-        const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
-                cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a"));
-        if (!out_a) return 0;
-        if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes, out_a,
+        if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
                                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
                                     (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;
     }

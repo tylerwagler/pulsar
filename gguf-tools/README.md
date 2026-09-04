@@ -97,16 +97,12 @@ is the load-bearing check that the dims were read correctly.
 
 `verify_iq2_mmq_model.py` checks the header (same size, same offsets, only
 16 -> 43) and byte-compares every region the repack was not supposed to touch,
-then writes a manifest of the converted spans.  The GPU-side verifiers, which
-need `nvcc` and the vendored adapter in `src/cuda/mmq`:
+then writes a manifest of the converted spans.  There is no GPU-side
+verifier: the raw-block kernels the SoA kernels were once checked against went
+with the runtime repack cache, so the comparison has nothing to compare.
 
-```sh
-verify_iq2_mmq_kernel_equiv.cu # do the SoA kernels return the same f32 as the
-                               # raw-block kernels on the same weights?
-```
-
-**Measured caveat, and it is a real one.**  `verify_iq2_mmq_kernel_equiv.cu`
-shows that on this adapter `ds4_mmq_iq2_xxs_moe_soa(aligned)` is *bit-identical*
+**Measured caveat, and it is a real one** (taken while the raw-block kernels
+still existed).  On this adapter `ds4_mmq_iq2_xxs_moe_soa(aligned)` is *bit-identical*
 to `ds4_mmq_iq2_xxs_moe(raw)` and to `ds4_mmq_iq2_xxs_moe_pair(raw)`, but
 `ds4_mmq_iq2_xxs_moe_pair_soa(aligned)` is **not** — it differs from all three
 by up to 1.43e-06 absolute on ~74% of outputs at the production shape.  Since

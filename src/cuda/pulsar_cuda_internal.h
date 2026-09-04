@@ -42,12 +42,8 @@
 #define CUDA_QK_K 256
 
 enum {
-    /* attention_decode_mixed_kernel stores raw-window scores plus visible
-     * compressed scores in shared memory.  The host routes larger unmasked
-     * decode calls to the online attention kernel so this fixed buffer never
-     * becomes an out-of-bounds write at long context.  11712 fits under the
-     * GB10 48 KB shared-memory limit. */
-    PULSAR_CUDA_ATTENTION_SCORE_CAP = 11712u,
+    /* The decode kernels' per-token raw-row scratch: a raw window wider than
+     * this is refused at the descriptor check (attention.cu). */
     PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
     PULSAR_CUDA_TOPK_MERGE_GROUP = 8u
 };
@@ -452,7 +448,6 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 
 #include "pulsar_cuda_scratch.h"   /* cuda_tmp_alloc + the slotted bump arena */
 void cuda_fp8_weight_cache_clear(void);
-int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);

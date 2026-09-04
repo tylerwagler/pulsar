@@ -79,7 +79,6 @@ gguf-tools/libds4q_reflow.so
 /tests/attn_f16_kernel_test
 /tests/attn_f16_banked_test
 /tests/attn_decode_split_test
-/tests/e4m3_staging_probe
 /tests/mxfp8_mma_probe
 /tests/attn_mma_probe
 /tests/fp16_fold_probe

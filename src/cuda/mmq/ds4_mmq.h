@@ -54,7 +54,10 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 // n_expert_used dimension (moe_mmq_swiglu_fold / moe_sum in moe.cu).
 //
 // Layouts:
-//   X_f32:   device pointer, [n_tokens, K] F32 row-major (K innermost).
+//   act_q/act_sf/act_kbp: the producer's E4M3 activation, [n_tokens, K]
+//            row-major (K innermost), plus its ue8m0 plane in the
+//            pulsar_mx_sfoff swizzle with act_kbp blocks per row.  Every
+//            activation stride is derived from K.
 //   ids:     device pointer, [n_tokens, n_expert_used] int32_t row-major.
 //            ids[t*n_expert_used + s] is the expert id for token t's
 //            s-th routing slot.  Values must be in [0, n_experts).
@@ -73,8 +76,7 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 // raw tensor byte order (expert-major, then row, then block).
 //
 // Activation staging is E4M3 + ue8m0 (block_mx_act_mmq; ds4_act_block.cuh),
-// built once per call -- there has been no q8_1 activation since the D2R
-// E4M3 arm became the only arm.
+// gathered once per call from the producer's encoding.
 //
 // K must be a multiple of 256.  n_expert_used must be one of the values
 // the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
@@ -95,7 +97,6 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 int ds4_mmq_iq2_xxs_moe_pair_soa(
     const void    * Wa_soa,
     const void    * Wb_soa,
-    const float   * X_f32,
     const int32_t * ids,
     float         * out_a,
     float         * out_b,
@@ -105,10 +106,8 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    /* Optional pre-encoded activation: the E4M3 + ue8m0 the producing norm
-     * already wrote for X_f32, with act_kbp blocks per row. Supplying it makes
-     * the input staging a gather instead of a re-encode -- identical bytes,
-     * 1 B/element read instead of 4. Pass NULL/NULL/0 to encode from X_f32. */
+    /* The producer's E4M3 activation + ue8m0 plane (act_kbp blocks per row);
+     * required -- the call refuses without it. */
     const void    * act_q,
     const void    * act_sf,
     int             act_kbp);
@@ -119,7 +118,6 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * Same contract as the pair entry at one weight/one output. */
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
-    const float   * X_f32,
     const int32_t * ids,
     float         * out_f32,
     int             M,
@@ -128,7 +126,7 @@ int ds4_mmq_iq2_xxs_moe_soa(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    /* L158 inc 5: the producer's E4M3 encoding of X_f32 (+ ue8m0 plane, pitch); required */
+    /* The producer's E4M3 activation + ue8m0 plane (act_kbp blocks per row); required */
     const void    * act_q,
     const void    * act_sf,
     int             act_kbp);

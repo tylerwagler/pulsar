@@ -235,9 +235,6 @@ static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
 
 
 
-int cuda_attention_score_buffer_fits(uint32_t n_comp) {
-    return n_comp <= PULSAR_CUDA_ATTENTION_SCORE_CAP - PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP;
-}
 
 
 

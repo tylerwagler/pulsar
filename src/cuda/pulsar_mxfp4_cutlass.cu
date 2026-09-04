@@ -1,8 +1,7 @@
 // pulsar_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
-// quantized to E4M3 (+ue8m0 block scales) on-device -- W4A8, matching the source model's
-// activation format.  Path: pack/roundtrip(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
-// (This header claimed "activations packed to MXFP4" from the pre-W4A8 era until 2026-08-22.)
+// E4M3 (+ue8m0 block scales) -- W4A8, matching the source model's activation format.
+// Path: gather the producer's E4M3 x -> gate/up GEMM -> fused SwiGLU + E4M3 pack -> down GEMM.
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -124,26 +123,14 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 // (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
 
 
-/* L129 lever 1 — SwiGLU WITH the E4M3+E8M0 epilogue its hc_router twin has.
- *
- * The comment below this kernel has named the gap for months: the CUTLASS
- * down path re-quantises `mid` precisely because this TU's swiglu lacked the
- * epilogue.  The profile priced it: pack_act_e4m3_rowmajor_warp is 3.5% of
- * decode at an 85 long-scoreboard stall ratio, and it exists only to read
- * back f32 values this kernel just wrote.  Fusing removes the whole
- * round-trip -- one launch and one full pass over `mid` per FFN.
- *
- * Structure is pack_act_e4m3_rowmajor_warp's exactly (one warp = four
- * consecutive 32-blocks of one row, xor-shuffle amax within each block), with
- * the loads replaced by gate/up and swiglu_elem applied first.  BIT-EXACT vs
- * swiglu-then-pack: the packer re-read f32 values that were stored exactly,
- * so the in-register values are the same floats, the same per-block amax over
- * the same set, and the same cutlass::float_e4m3_t(v*inv) encode.
- *
- * `mid_f32` is still written (NULL to skip) because dumps and the non-fused
- * fallback read it; the epilogue is additive. */
+/* SwiGLU with the E4M3+E8M0 epilogue: one warp = four consecutive 32-blocks
+ * of one row of `mid`; the gate/up products are combined in registers,
+ * xor-shuffle amax within each block, then encoded straight into the down
+ * GEMM's A operand (data + tile-atom SFA).  `mid` never touches memory as f32.
+ * Same per-block amax, same shared exponent and the same
+ * cutlass::float_e4m3_t(v*inv) encode as the other E4M3 producers. */
 template<class TSFA>
-__global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TSFA tSFA,
+__global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
                                              const float *gate, const float *up,
                                              const float *w, float clamp, int M, int K){
   const int nblk = K/32;
@@ -163,7 +150,6 @@ __global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TS
   v.y = pulsar_swiglu_elem(g.y,u.y,wv,clamp);
   v.z = pulsar_swiglu_elem(g.z,u.z,wv,clamp);
   v.w = pulsar_swiglu_elem(g.w,u.w,wv,clamp);
-  if (mid_f32) reinterpret_cast<float4*>(mid_f32+base)[lane] = v;
 
   float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
@@ -183,20 +169,15 @@ __global__ void swiglu_pack_e4m3_warp_kernel(float *mid_f32, uint8_t *A_data, TS
 }
 
 
-/* L129 lever 1: swiglu straight into the E4M3 staging the down GEMM reads.
- * Falls back to the unfused pair whenever the warp packer's own shape rule
- * (K a 128-multiple) or 16-byte alignment does not hold, so the fast path
- * adds no constraint the old pair did not already have. */
-static int swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A_sf,
+/* SwiGLU straight into the E4M3 staging the down GEMM reads.  The warp packer
+ * needs K a 128-multiple and 16-byte-aligned gate/up rows; any other shape is
+ * refused -- there is no unfused pair behind it. */
+static int swiglu_pack_activation(uint8_t *A_data, ElementSF *A_sf,
                                   const float *gate, const float *up, const float *w,
                                   float clamp, int M, int K){
   const bool shape_ok = ((K/32) % 4) == 0;
-  const bool align_ok = ((uintptr_t)gate % 16)==0 && ((uintptr_t)up % 16)==0 &&
-                        ((uintptr_t)mid_f32 % 16)==0;
+  const bool align_ok = ((uintptr_t)gate % 16)==0 && ((uintptr_t)up % 16)==0;
   if (!shape_ok || !align_ok) {
-    /* L159 inc 2: the unfused swiglu -> f32 mid -> pack pair that stood here
-     * was a fallback (a second encoder of the same values); it is gone, and a
-     * shape the fused packer cannot take is an error. */
     fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3: K=%d not a 128-multiple or operands unaligned -- refusing\n", K);
     return 1;
   }
@@ -205,20 +186,12 @@ static int swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A_
   const int t = 128;
   const long groups = (long)M*(K/32)/4;
   const long thr = groups*32, bw = (thr+t-1)/t;
-  /* The f32 mid store is DEAD on this path and is skipped.  Both callers
-   * consume only (A_data, A_sf) after this returns -- the down GEMM reads the
-   * E4M3 staging -- and `mid` is CUTLASS-local scratch, never registered in
-   * the activation cache, so no consumer can look it up and no
-   * act_f32_absent_hazard applies.  Same move the hc_router twin and qr_norm
-   * already make, with the same announce discipline. */
   static int announced = 0;
   if (!announced) {
     announced = 1;
-    fprintf(stderr, "pulsar: swiglu->E4M3 fused; mid f32 store SKIPPED "
-                    "(%.1f MiB/call at M=%d K=%d)\n",
-            (double)((size_t)M * K * sizeof(float)) / 1048576.0, M, K);
+    fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3 fused (M=%d K=%d)\n", M, K);
   }
-  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(nullptr, A_data, tSFA, gate, up, w, clamp, M, K);
+  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(A_data, tSFA, gate, up, w, clamp, M, K);
   return 0;
 }
 
@@ -478,7 +451,6 @@ struct pulsar_grouped_scratch_layout {
          xSF_off,      ///< scale factors for xA
          gate_off,     ///< gate GEMM float output
          up_off,       ///< up GEMM float output
-         mid_off,      ///< SwiGLU product, f32
          midA_off,     ///< packed E4M3 SwiGLU product, input to the down GEMM
          midSF_off;    ///< scale factors for midA
   size_t gu_arr_off,   ///< GArrays table for the fused gate/up grouped GEMM
@@ -502,7 +474,6 @@ static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, in
   L.xSF_off = off; off = align_up_bytes(off + L.xSF_bytes, a);
   L.gate_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.up_off   = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
-  L.mid_off  = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.midA_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim, a);   /* E4M3: 1 byte/elem */
   L.midSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(mid_dim) * sizeof(ElementSF);
   L.midSF_off = off; off = align_up_bytes(off + L.midSF_bytes, a);
@@ -540,7 +511,6 @@ int pulsar_cutlass_grouped_moe(
   ElementSF *xSF  = reinterpret_cast<ElementSF*>(scratch + L.xSF_off);
   float     *gate = reinterpret_cast<float*>(scratch + L.gate_off);
   float     *up   = reinterpret_cast<float*>(scratch + L.up_off);
-  float     *mid  = reinterpret_cast<float*>(scratch + L.mid_off);
   uint8_t   *midA = scratch + L.midA_off;
   ElementSF *midSF= reinterpret_cast<ElementSF*>(scratch + L.midSF_off);
   GArrays gu = g_arrays_place(scratch + L.gu_arr_off, n_total_expert);
@@ -552,8 +522,8 @@ int pulsar_cutlass_grouped_moe(
   cudaMemsetAsync(midSF, 0, L.midSF_bytes);
 
   // Fill the whole padded A operand once (one global SF layout; per-group slices below).
-  // Preferred: move the E4M3 the producing norm already emitted. Fall back to
-  // encoding the gathered f32 when no cached encoding was handed over.
+  // The A operand is the E4M3 the producing norm emitted, permuted into the
+  // padded layout; without a producer encoding the call refuses.
   if (!(act_q && act_sf && row_src_tok)) {
     static int said = 0;
     if (!said) { said = 1; fprintf(stderr, "pulsar: grouped MoE: no producer E4M3 for x (in_dim=%d padded=%d; act_q=%d act_sf=%d row_src=%d) -- refusing\n", in_dim, padded_total, act_q != nullptr, act_sf != nullptr, row_src_tok != nullptr); }
@@ -577,7 +547,7 @@ int pulsar_cutlass_grouped_moe(
       up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
-  if (swiglu_pack_activation(mid, midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
+  if (swiglu_pack_activation(midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
       down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
@@ -660,9 +630,9 @@ int pulsar_cutlass_grouped_proj(
 // The grouped CUTLASS path costs ~2.8 ms per rich layer at n_tokens=3: per-expert GEMM
 // launches at M<=3 run far off roofline, behind a blocking per-layer offsets readback.
 // These GEMVs read the packed weights directly: one launch for gate+up+swiglu, one for
-// down, no readback, no sort.  Activations are E4M3 (the A8 arms; the producer's grouped
-// encoding when armed, an on-the-spot roundtrip otherwise) -- the SAME format the GEMM
-// path quantizes to, so the two paths differ in launch shape, not operand numerics.
+// down, no readback, no sort.  Activations are the producer's E4M3 + swizzled E8M0 -- the
+// SAME operand format the GEMM path reads, so the two paths differ in launch shape, not
+// operand numerics.
 // Data layout (the converter's pack step): B is ColumnMajor packed E2M1 -- logical
 // (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
 // (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
@@ -693,13 +663,11 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 /* Reads the activation as the E4M3 + swizzled-E8M0 pair the producing norm
  * emitted: (float)e4m3 * s with s the block's shared scale.  A lane's 8
  * consecutive k start at a multiple of 8 and so never straddle a 32-element
- * block, which is what lets one scale serve the inner unroll.  (The f32
- * round-trip arm this once mirrored is gone, L158.) */
-template <class SFL, bool A8 = false>
+ * block, which is what lets one scale serve the inner unroll. */
+template <class SFL>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N]
-    const float *xq,          // [n_tokens, K] f32 activations (A8=false)
-    const __nv_fp8_e4m3 *xq8, // [n_tokens, K] E4M3 activations (A8=true)
+    const __nv_fp8_e4m3 *xq8, // [n_tokens, K] E4M3 activations
     const uint8_t *xsf, int xkbp,
     const int32_t *sel,       // [n_slots] expert ids
     const float *rw,          // [n_slots] routing weights
@@ -723,18 +691,17 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   const uint8_t *gsf = ge + data_bytes;
   const uint8_t *usf = ue + data_bytes;
   const int xrow = slot / n_expert;
-  const float *xt = A8 ? nullptr : xq + (size_t)xrow * K;
-  const __nv_fp8_e4m3 *xt8 = A8 ? xq8 + (size_t)xrow * K : nullptr;
+  const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
   float g = 0.f, u = 0.f;
   for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
     const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
     const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
     const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
     const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
-    const float sa = A8 ? gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]) : 0.f;
+    const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
     #pragma unroll
     for (int j = 0; j < 8; j++) {
-      const float xv = A8 ? (__half2float((__half)xt8[k0 + j]) * sa) : xt[k0 + j];
+      const float xv = __half2float((__half)xt8[k0 + j]) * sa;
       g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
       u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
     }
@@ -757,11 +724,10 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
 /* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
  * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the small fused FFN's
  * own pack below): 1 byte read per element, the source's own format. */
-template <class SFL, bool A8 = false>
+template <class SFL>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
-    const float *midq,        // [n_slots, K] f32 mid (A8=false)
-    const uint8_t *midq8,     // [n_slots, K] E4M3 mid (A8=true)
+    const uint8_t *midq8,     // [n_slots, K] E4M3 mid
     const uint8_t *midsf,     // E8M0 in the VEC32 swizzle (pulsar_mx_sfoff(slot, kb, xkbp))
     int xkbp,                 // blocks-per-row pitch of that swizzle
     const int32_t *sel,       // [n_slots] expert ids
@@ -781,18 +747,15 @@ __global__ static void expert_gemv_down_kernel(
   const uint8_t *de = down_base + (size_t)e * stride;
   const uint8_t *dd = de + (size_t)n * (K / 2);
   const uint8_t *dsf = de + data_bytes;
-  const float *xt = A8 ? nullptr : midq + (size_t)slot * K;
-  const uint8_t *xt8 = A8 ? midq8 + (size_t)slot * K : nullptr;
-  const uint8_t *xsf = A8 ? midsf : nullptr;
+  const uint8_t *xt8 = midq8 + (size_t)slot * K;
   float a = 0.f;
   for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
     const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));
     const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
-    const float sa = A8 ? gemv_sf_val(xsf[pulsar_mx_sfoff(slot, k0 >> 5, xkbp)]) : 0.f;
+    const float sa = gemv_sf_val(midsf[pulsar_mx_sfoff(slot, k0 >> 5, xkbp)]);
     #pragma unroll
     for (int j = 0; j < 8; j++) {
-      const float xv = A8 ? (__half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[k0 + j]) * sa)
-                          : xt[k0 + j];
+      const float xv = __half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[k0 + j]) * sa;
       a += lut[(w >> (4 * j)) & 0xFu] * sc * xv;
     }
   }
@@ -833,9 +796,8 @@ __global__ static void e4m3_act_pack_swizzled_kernel(uint8_t *q, uint8_t *sf,
   }
 }
 
-/* Persistent activation round-trip buffers, grown on demand and reused across
- * layers/calls -- single GPU-submission thread, same convention as the other
- * static caches. */
+/* Persistent E4M3 staging for the small FFN's mid, grown on demand and reused
+ * across layers/calls. */
 /* thread_local: one GPU-submitting thread owns its own scratch; a second
  * decode thread must not share this grow/free/realloc buffer (double-free +
  * silent overwrite). Matches the g_act_slots / DsparkReduceBufs convention. */
@@ -846,7 +808,7 @@ static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 // down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
 // n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
 int pulsar_cutlass_expert_ffn_gemv_small(
-    float *down_out, float *mid_scratch, const float *x,
+    float *down_out, float *mid_scratch,
     const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
     uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -857,25 +819,21 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  /* BOTH legs are native-format now.  The gate/up leg reads its scale plane
-   * through pulsar_mx_sfoff's swizzle, and so does the down leg; both are fed
-   * by e4m3_act_pack_swizzled_kernel.  Sizes are in BYTES (payload + scales)
-   * expressed in the buffer's float units.
+  /* Both legs read their scale plane through pulsar_mx_sfoff's swizzle: the
+   * gate/up leg from the producer's plane, the down leg from the one
+   * e4m3_act_pack_swizzled_kernel writes below.  Staging sizes are in BYTES
+   * (payload + scales) expressed in the buffer's float units.
    *
    * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
    * into 512-byte groups, so it needs ceil(rows/128) * (kbp/4) * 512 and must be
    * ZEROED (the tiling leaves holes the GEMM still reads). */
-  const int   x_nblk_row = (int)(in_dim / 32u);
-  const int   x_kbp      = pulsar_mx_rup(x_nblk_row, 4);
-  const size_t xq_elems  = (size_t)n_tokens * in_dim;
-  const size_t xsf_bytes = pulsar_mx_sf_slab_bytes(n_tokens, x_kbp);
-  const size_t xq_bytes  = xq_elems + xsf_bytes;
+  const int   x_kbp      = pulsar_mx_rup((int)(in_dim / 32u), 4);
   const size_t midq_elems = (size_t)n_slots * mid_dim;
   const int   mid_nblk_row = (int)(mid_dim / 32u);
   const int   mid_kbp      = pulsar_mx_rup(mid_nblk_row, 4);
   const size_t midsf_bytes = pulsar_mx_sf_slab_bytes(n_slots, mid_kbp);
   const size_t midq_bytes = midq_elems + midsf_bytes;
-  const size_t need = (xq_bytes + 3u) / 4u + (midq_bytes + 3u) / 4u;
+  const size_t need = (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
     if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free(); cudaFree(g_fp4_gemv_actbuf); }
     g_fp4_gemv_actbuf = nullptr;
@@ -885,39 +843,27 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     }
     g_fp4_gemv_actbuf_floats = need;
   }
-  uint8_t *xq8   = (uint8_t *)g_fp4_gemv_actbuf;
-  uint8_t *midq8 = xq8 + ((xq_bytes + 3u) & ~(size_t)3u);
+  uint8_t *midq8 = (uint8_t *)g_fp4_gemv_actbuf;
   uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  /* HANDOVER (L089): when the producing norm already emitted this x as E4M3 +
-   * ue8m0, read THOSE bytes and do not pack.  x is then never dereferenced by
-   * this call -- which is the whole point.  This arm's read of the raw f32 was
-   * L089's "sixth reader", the lone consumer sitting outside every moe.cu
-   * guard, and the reason the ffn f32 store-skip is still cut at n<=8.
-   *
-   * ⚠ THE HIT IS ONLY VALID BECAUSE BOTH SIDES ARE THE SWIZZLE, and that was
-   * checked on both ends rather than assumed: the producer writes through
-   * pulsar_mx_emit_block -> pulsar_mx_sfoff, and expert_gemv_gu_swiglu_kernel
-   * reads through pulsar_mx_sfoff, with act_kbp = pulsar_mx_kbp(in_dim) = the
-   * x_kbp computed here.  Handing a swizzled reader a linear plane compiles
-   * clean and computes a well-formed WRONG answer; the reverse assumption --
-   * that nothing needed the swizzle -- is what broke the engine in 7df3b75. */
-  /* L158 inc 5: the activation is the producer's E4M3 or nothing.  The
-   * pack-from-f32 on a handover miss is gone -- one encoder site per
-   * activation, no format chosen by cache state. */
+  /* x is the producer's E4M3 + ue8m0 or nothing.  Both sides are the
+   * pulsar_mx_sfoff swizzle: the producer writes through pulsar_mx_emit_block,
+   * expert_gemv_gu_swiglu_kernel reads through pulsar_mx_sfoff, and the
+   * producer's act_kbp must equal the x_kbp computed here -- a swizzled reader
+   * handed a linear plane computes a well-formed WRONG answer, so a pitch
+   * mismatch refuses like a missing encoding does. */
   if (act_q == nullptr || act_sf == nullptr || act_kbp != x_kbp) {
     static int said = 0;
     if (!said) { said = 1; fprintf(stderr, "pulsar: small-batch FFN GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d kbp %d vs %d) -- refusing\n", in_dim, n_tokens, act_kbp, x_kbp); }
     return 1;
   }
-  (void)xsf_bytes; (void)xq_elems;
   const __nv_fp8_e4m3 *gu_q  = (const __nv_fp8_e4m3 *)act_q;
   const uint8_t       *gu_sf = (const uint8_t *)act_sf;
   {
     dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
-        mid_scratch, nullptr, gu_q, gu_sf, x_kbp, selected, rweights,
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu)><<<g, 256>>>(
+        mid_scratch, gu_q, gu_sf, x_kbp, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
         n_expert, n_total_expert, in_dim, mid_dim);
   }
@@ -930,8 +876,8 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-    expert_gemv_down_kernel<decltype(sfl_dn), true><<<g, 256>>>(
-        down_out, nullptr, midq8, midsf, mid_kbp, selected,
+    expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
         down_w, down_stride, down_data_bytes, sfl_dn,
         n_total_expert, mid_dim, out_dim);
   }
@@ -941,7 +887,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
 
 /* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
 int pulsar_cutlass_gemv_gateup(
-    float *mid, const float *x, const int32_t *selected, const float *rweights,
+    float *mid, const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp) {
@@ -950,32 +896,24 @@ int pulsar_cutlass_gemv_gateup(
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
 
-  /* Preferred: read the E4M3 the producing norm already emitted. The fallback
-   * derives the same encoding here and dequantises it straight back to f32 --
-   * correct, and pure waste when the bytes already exist. A miss is not an
-   * error; it means no cached encoding was handed over. */
-  if (act_q && act_sf) {
-    /* Say it once. A bit-exactness check cannot tell "the A8 arm ran and agrees"
-     * from "the A8 arm never ran", and a silently-missed cache lookup produces
-     * exactly the second -- the failure this file's sibling diagnostics were
-     * added for on 2026-08-17. */
-    static int announced_gemv_a8 = 0;
-    if (!announced_gemv_a8) {
-      announced_gemv_a8 = 1;
-      fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
-                      "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
-    }
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
-        mid, nullptr, (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
-        selected, rweights, gate_w, up_w,
-        gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
-    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+  /* The activation is the E4M3 the producing norm emitted, or the call refuses. */
+  if (!act_q || !act_sf) {
+    static int said_gu = 0;
+    if (!said_gu) { said_gu = 1; fprintf(stderr, "pulsar: fp4 decode gate/up GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d) -- refusing\n", in_dim, n_tokens); }
+    return 3;
   }
-  /* L158 inc 5: no producer encoding -> refuse.  The f32 round-trip arm
-   * that stood here was the fp4 decode GEMV's second activation format. */
-  static int said_gu = 0;
-  if (!said_gu) { said_gu = 1; fprintf(stderr, "pulsar: fp4 decode gate/up GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d) -- refusing\n", in_dim, n_tokens); }
-  return 3;
+  /* Say it once: the announce is the evidence this lane ran. */
+  static int announced_gemv_a8 = 0;
+  if (!announced_gemv_a8) {
+    announced_gemv_a8 = 1;
+    fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
+                    "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
+  }
+  expert_gemv_gu_swiglu_kernel<decltype(sfl_gu)><<<g, 256>>>(
+      mid, (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+      selected, rweights, gate_w, up_w,
+      gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
+  return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
 int pulsar_cutlass_gemv_down(
@@ -985,8 +923,8 @@ int pulsar_cutlass_gemv_down(
     const void *mid_q, const void *mid_sf, int mid_kbp) {
   if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u)) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  /* L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (slot rows = pair
-   * slots, VEC32 swizzle); this GEMV no longer packs f32 for itself. */
+  /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
+   * VEC32 swizzle), or the call refuses. */
   if (!mid_q || !mid_sf || mid_kbp != pulsar_mx_rup(mid_dim / 32, 4)) {
     static int said = 0;
     if (!said) { said = 1; fprintf(stderr, "pulsar: fp4 down GEMV: no producer E4M3 for mid (mid_dim=%d n_slots=%u) -- refusing\n", mid_dim, n_slots); }
@@ -994,8 +932,8 @@ int pulsar_cutlass_gemv_down(
   }
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
   dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-  expert_gemv_down_kernel<decltype(sfl_dn), true><<<g, 256>>>(
-      down_out, nullptr, (const uint8_t *)mid_q, (const uint8_t *)mid_sf, mid_kbp, selected, down_w,
+  expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+      down_out, (const uint8_t *)mid_q, (const uint8_t *)mid_sf, mid_kbp, selected, down_w,
       down_stride, down_data_bytes, sfl_dn, n_total_expert, mid_dim, out_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }

@@ -702,12 +702,8 @@ bool gpu_graph_dspark_draft_forward_banks(
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
-        /* L106 K2b: batch_attn_norm feeds TWO MXFP8 GEMMs (attn_q_a, attn_kv).
-         * Unarmed, each independently re-quantised the same values from f32 --
-         * the duplicate encode the act-cache design note called "the sanctioned
-         * miss", per layer per draft.  Arming makes the first GEMM's quantise
-         * land in the slot and the second hit it; bit-identical either way
-         * (same encoder, same bytes), one encode instead of two. */
+        /* batch_attn_norm feeds TWO MXFP8 GEMMs (attn_q_a, attn_kv).  The fused
+         * norm emitted its E4M3 into the armed slot once; both GEMMs read it. */
         if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_attn_norm, n_draft,
                                                PULSAR_N_EMBD);
         if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();   /* L158: the fused norm emitted it */

@@ -288,7 +288,6 @@ template <ggml_type type>
 int ds4_mmq_moe_impl(
         const char    * tag,
         const void    * W,
-        const float   * X_f32,
         const int32_t * ids,
         float         * out_f32,
         int             M,
@@ -305,14 +304,14 @@ int ds4_mmq_moe_impl(
          * when every consumer sanitizes at read (the routed-MoE swiglu/sum
          * kernels do). */
         bool            sanitize_out = true,
-        /* L158 inc 5: the producer's E4M3 encoding of X_f32 (+ ue8m0 plane and
-         * its blocks-per-row pitch).  REQUIRED: the encode-from-f32 staging is
-         * gone; X_f32 is kept only for shape/stride bookkeeping. */
+        /* The activation: the producer's E4M3 [n_tokens, K] plus its ue8m0
+         * plane (pulsar_mx_sfoff swizzle, act_kbp blocks per row).  Required;
+         * every activation stride below is derived from K. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
         int             act_kbp    = 0) {
 
-    if (!W || !X_f32 || !ids || !out_f32) {
+    if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -481,7 +480,7 @@ int ds4_mmq_moe_impl(
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "%s: ds4_quantize_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        fprintf(stderr, "%s: ds4_gather_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
 
@@ -552,7 +551,6 @@ int ds4_mmq_moe_pair_impl(
         const char    * tag,
         const void    * W_a,
         const void    * W_b,
-        const float   * X_f32,
         const int32_t * ids,
         float         * out_a,
         float         * out_b,
@@ -569,15 +567,13 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        /* Optional: the E4M3 encoding of X_f32 that its producing norm already
-         * emitted, plus the ue8m0 plane and its blocks-per-row pitch. When
-         * present the staging gathers these bytes instead of re-encoding the
-         * f32 -- same output, a quarter of the read. NULL = encode from f32. */
+        /* The activation, as in ds4_mmq_moe_impl: the producer's E4M3 plus
+         * its ue8m0 plane and pitch.  Required. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
         int             act_kbp    = 0) {
 
-    if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
+    if (!W_a || !W_b || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -731,7 +727,7 @@ int ds4_mmq_moe_pair_impl(
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "%s: ds4_quantize_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
+            fprintf(stderr, "%s: ds4_gather_mmq_e4m3_cuda failed: %s\n", tag, cudaGetErrorString(err));
             return -3;
         }
     }
@@ -814,7 +810,7 @@ int ds4_mmq_moe_pair_impl(
  * ds4_mmq_q2_K_moe_soa. */
 extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         const void * Wa_soa, const void * Wb_soa,
-        const float * X, const int32_t * ids, float * out_a, float * out_b,
+        const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
@@ -825,7 +821,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
     /* sanitize_out=false: see ds4_mmq_q2_K_moe_soa. */
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
-        "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
+        "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
         /*sanitize_out=*/false, act_q, act_sf, act_kbp);
@@ -862,7 +858,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
  * IQ2 block count from ds4_mmq_iq2_xxs_moe_pair_soa (blocks, not row-pairs),
  * and keeps sanitize_out=true so semantics match the raw entry it replaces. */
 extern "C" int ds4_mmq_iq2_xxs_moe_soa(
-        const void * W_soa, const float * X, const int32_t * ids, float * out,
+        const void * W_soa, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
         cudaStream_t stream,
         const void * act_q, const void * act_sf, int act_kbp) {
@@ -871,7 +867,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe_soa", W_soa, X, ids, out,
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe_soa", W_soa, ids, out,
                                                M, K, n_tokens, n_experts, n_expert_used, stream,
                                                (const char *)W_soa, nblk,
                                                /*sanitize_out=*/true,

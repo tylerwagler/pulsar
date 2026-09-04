@@ -2421,6 +2421,9 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
              * harm the co-scheduled decode banks: stop folding this prefill (route it
              * classic via no_fuse) and retry this step DECODE-ONLY. */
             pf_giveup = true; pg->no_fuse = true;
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
+                       "from now on; the %d decode bank(s) retry this step alone", err, m);
             if (m > 0) {
                 rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
                         (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);

@@ -101,7 +101,7 @@ cleanup:
     return rc;
 }
 
-static int check_decode_attention_overflow_path(void) {
+static int check_decode_attention_f32_shape(void) {
     const uint32_t n_head = 8;
     const uint32_t head_dim = 512;
     const uint32_t n_raw = 128;
@@ -142,19 +142,13 @@ static int check_decode_attention_overflow_path(void) {
         pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp, 0, n_comp,
                                                    head_dim, SMOKE_ATTN_NROT,
                                                    /*keep_f32=*/true) &&
-        pulsar_gpu_attention_decode_heads_tensor(heads,
-                                              sinks,
-                                              n_head * sizeof(float),
-                                              0,
-                                              q,
-                                              raw,
-                                              n_raw,
-                                              n_raw,
-                                              0,
-                                              comp,
-                                              n_comp,
-                                              n_head,
-                                              head_dim) &&
+        /* n_head 8 is outside the fp16 tier (needs a multiple of 32), so this
+         * one-row batch is served by the f32 split-KV kernel, at any n_comp. */
+        pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads, sinks, n_head * sizeof(float), 0,
+                                                             q, raw, comp,
+                                                             1, 0, n_raw, n_raw, 0, n_comp,
+                                                             0, 0, n_head, head_dim,
+                                                             0, NULL, NULL, NULL, 0, 1, NULL) &&
         pulsar_gpu_synchronize() &&
         pulsar_gpu_tensor_read_f32(heads, 0, heads_host, q_count)) {
         rc = 0;
@@ -1273,7 +1267,7 @@ int main(void) {
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
-    if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_decode_attention_f32_shape() != 0) rc = 1;
     if (check_multibank_decode_attention() != 0) rc = 1;
     if (check_multibank_indexer() != 0) rc = 1;
     if (check_multibank_raw_store() != 0) rc = 1;

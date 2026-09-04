@@ -318,7 +318,7 @@ ATTN_GATE_ARCH ?= sm_120f
 IDX_PROBE_GENCODE ?= -gencode arch=compute_121a,code=sm_121a
 
 PROBES = tests/attn_mma_probe tests/fp16_fold_probe tests/mxfp8_mma_probe \
-         tests/e4m3_staging_probe tests/idx_mxfp4_probe tests/idx_mma_issue_bench \
+         tests/idx_mxfp4_probe tests/idx_mma_issue_bench \
          tests/idx_mxfp4_kernel_test
 
 .PHONY: probes
@@ -334,10 +334,6 @@ tests/fp16_fold_probe: tests/fp16_fold_probe.cu Makefile
 
 tests/mxfp8_mma_probe: tests/mxfp8_mma_probe.cu Makefile \
                             src/cuda/mmq/ds4_mxfp8_mma.cuh
-	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda/mmq -o $@ $<
-
-tests/e4m3_staging_probe: tests/e4m3_staging_probe.cu Makefile \
-                            src/cuda/mmq/ds4_quantize_e4m3.cu src/cuda/mmq/ds4_act_block.cuh
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda/mmq -o $@ $<
 
 tests/idx_mxfp4_probe: tests/idx_mxfp4_probe.cu Makefile

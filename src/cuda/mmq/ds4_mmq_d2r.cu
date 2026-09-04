@@ -20,15 +20,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-/* The MoE input staging now follows this selector (ds4_mmq.cu picks
- * ds4_quantize_mmq_e4m3_cuda when the arm is 1), so the arm is usable.  The
- * macro stays as the interlock: if the staging is ever decoupled from the
- * selector again, set it back to 0 so the arm REFUSES rather than reading int8
- * bytes as e4m3 -- which would be silently wrong, since every shape still
- * fits. */
-
-
-
 /* Lifted verbatim from the vendored vecdotq.cuh (upstream llama.cpp).
  *
  * Eight lines of bit twiddling with no dependencies, and this file is its only
@@ -621,7 +612,7 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
  *          m16n8k32 the B fragment's 8 columns map one per 4-lane group, so
  *          lane group g carries column g's scale.  Using the c0/c1 pair here
  *          would hand the MMA a well-formed scale for the WRONG column.
- * The ue8m0 byte is stored as a float by ds4_quantize_mmq_e4m3 (which reuses
+ * The ue8m0 byte is stored as a float by ds4_gather_mmq_e4m3 (which reuses
  * block_mx_act_mmq's d4 slot to keep the staging layout identical), hence the
  * cast back on read.
  *

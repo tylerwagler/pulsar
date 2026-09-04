@@ -434,8 +434,7 @@ static int routed_moe_launch_cutlass_grouped(
     return cuda_ok(cudaGetLastError(), "moe_grouped padded sum launch");
 }
 
-/* Grouped single-launch path, with the legacy per-expert loop kept as the
- * fallback when it fails. Same result, bit-exact. */
+/* Grouped single-launch path; a failed grouped call is a failed MoE step. */
 static int routed_moe_launch_cutlass_dispatch(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -444,10 +443,8 @@ static int routed_moe_launch_cutlass_dispatch(
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    /* L158 inc 5: the grouped GEMM is THE path for this shape.  The per-expert
-     * loop that used to catch a failed grouped call ("safety net", ~4x slower)
-     * hid a refusing grouped MoE behind 21 green gates in one battery; it is
-     * deleted.  A failure here is a failure. */
+    /* The grouped GEMM is the only path for this shape.  A failure here is a
+     * failure. */
     const int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
@@ -471,17 +468,16 @@ static int routed_moe_launch_cutlass_dispatch(
  * device-built ptr-array, NO host readback, NO per-expert sync -- the same machinery the uniform
  * grouped path uses. The MMQ side stays in the per-(token,expert) pair layout; padded gather/scatter
  * bridge the two:
- *   Case A (gate/up type-40, down type-43): padded-gather x -> grouped W4A8 gate & up GEMMs -> swiglu
- *     (+routing weight) on the gathered rows -> padded-scatter mid into pair layout -> MMQ down per
- *     pair (takes mid as f32, does its own q8_1) -> moe_sum.
+ *   Case A (gate/up type-40, down type-43): gather the producer's E4M3 x -> grouped W4A8 gate & up
+ *     GEMMs -> swiglu (+routing weight) on the gathered rows -> padded-scatter mid into pair layout
+ *     -> the MoE stage emits mid's E4M3 once -> MMQ down per pair reads that encoding -> moe_sum.
  *   Case B (gate/up type-43, down type-40): MMQ gate/up per pair (fused swiglu) -> padded-gather mid
  *     -> grouped W4A8 down GEMM -> padded-scatter into pair layout -> moe_sum.
  * The grouped CUTLASS projection is bit-identical to the per-expert single-proj path it replaces
  * (same pack + same g_build_arrays gather order + same GEMM, just batched). No cross-contamination:
  * each projection reads only its own weight/SF and its own activation quant.
  *
- * Both MMQ arms fail closed if MMQ declines: the dp4a kernels that used to back them up are gone
- * with types 16/42/39/10, and no other reader understands the aligned layout. */
+ * Both MMQ arms fail closed if MMQ declines; no other reader understands the aligned layout. */
 __global__ static void moe_swiglu_gathered_kernel(
         float *mid_g, const float *gate_g, const float *up_g, const float *w_g,
         float clamp, uint32_t mid_dim, uint32_t n_rows) {
@@ -501,7 +497,7 @@ static int routed_moe_try_mmq_gate_up(float *mid_out, float *gate_scratch,
                                       uint32_t expert_in_dim, uint32_t expert_mid_dim,
                                       uint32_t n_total_expert, uint32_t n_expert,
                                       uint32_t n_tokens, float clamp);
-static int routed_moe_try_mmq_down(float *down_out, const float *mid_f32,
+static int routed_moe_try_mmq_down(float *down_out,
                                    const char *down_w, const int32_t *selected_ptr,
                                    uint32_t down_type, uint32_t expert_mid_dim,
                                    uint32_t out_dim, uint32_t n_total_expert,
@@ -665,13 +661,10 @@ static int routed_moe_launch_mixed40(
         float *up_g   = up_g_buf;
         float *mid_g  = mid_g_buf;
         if (use_grouped) {
-            /* grouped: padded-gather x -> grouped GEMMs -> swiglu(padded) -> padded-scatter. */
-            /* HANDOVER (L089 item a): grouped_proj now HAS a pre-encoded entry,
-             * so the mixed-type layers stop being the one tier that gathers raw
-             * f32.  On a hit the f32 x is never gathered or read; the E4M3 is
-             * permuted straight into the CUTLASS layout, riding the row
-             * permutation that had to happen anyway.  A miss keeps the f32
-             * gather, under the guard. */
+            /* grouped: gather the producer's E4M3 x straight into the CUTLASS
+             * layout (riding the row permutation that happens anyway) ->
+             * grouped GEMMs -> swiglu(padded) -> padded-scatter.  No producer
+             * encoding: refuse. */
             const void *mq = NULL, *msf = NULL; int mkbp = 0;
             if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &mq, &msf, &mkbp)) {
                 mq = NULL; msf = NULL; mkbp = 0;
@@ -732,19 +725,15 @@ static int routed_moe_launch_mixed40(
                         expert_in_dim, n_tokens);
                 ok = 0;
             }
-            if (ok && pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
+            if (ok && pulsar_cutlass_gemv_gateup(mid_flat, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
                     gq, gsf, gkbp) != 0) ok = 0;
         }
         /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
-         * layers).  MMQ takes mid_flat as f32 directly and does its own q8_1,
-         * which is why no midq quantize remains here. */
-        /* L158 inc 5: the SwiGLU output is an activation like any other -- the
-         * MoE stage emits its E4M3 ONCE here (slot rows = (token, slot) pairs),
-         * and every down arm consumes that encoding.  Three consumers used to
-         * encode it for themselves (MMQ down, fp4 down GEMV, CUTLASS grouped
-         * down pack); those encoders are gone. */
+         * layers).  The SwiGLU output is an activation like any other: the MoE
+         * stage emits its E4M3 ONCE here (slot rows = (token, slot) pairs) and
+         * every down arm consumes that encoding. */
         const void *mq = NULL, *msf = NULL; int mkbp = 0;
         if (ok && !pulsar_gpu_mxfp8_act_cache_encode_f32(mid, pair_count, expert_mid_dim)) {
             fprintf(stderr, "pulsar: routed MoE: could not emit the mid E4M3 (pairs=%llu mid=%u) -- refusing\n",
@@ -758,26 +747,23 @@ static int routed_moe_launch_mixed40(
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
-            mmq_down_done = routed_moe_try_mmq_down(down_flat, mid_flat, down_w, selected_ptr,
+            mmq_down_done = routed_moe_try_mmq_down(down_flat, down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
                                                     n_total_expert, (uint64_t)pair_count, mq, msf, mkbp);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "mixed40A mmq down");
         }
 #endif
-        /* Fail closed: the dp4a chain that used to follow is gone with Q2_K and
-         * type 16, so a declined MMQ has nothing left to fall through to. */
+        /* Fail closed: a declined MMQ has no other arm. */
         if (ok && !mmq_down_done) {
             fprintf(stderr, "pulsar: mixed40 type-43 down but MMQ declined and no fallback exists\n");
             ok = 0;
         }
     } else {
-        /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat.  The Q8_K
-         * quantize of x that used to run here fed the dp4a kernels; MMQ takes x
-         * as f32 and does its own q8_1, so it was pure waste once they went. */
+        /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat, reading the
+         * producer's E4M3 x. */
         float *out_g = out_g_buf;
         /* Type-43 gate/up against a type-40 down (3 of the artifact's layers).
-         * `up` is pair-sized and was only read by the deleted qwarp32 branch, so
-         * it serves as MMQ's raw gate buffer -- no arena change needed. */
+         * `up` is pair-sized and serves as MMQ's raw gate buffer. */
         int mmq_gu_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
@@ -944,9 +930,8 @@ static int routed_moe_try_mmq_gate_up(
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
     if (gate_type != 43u) return 0;   /* PULSAR_TENSOR_IQ2_XXS_MMQ, the only one */
-    /* One-shot: the adapter allocates its persistent q8_1 scratch here.  Without
-     * it every call falls back to per-call async allocation, which cost 6x
-     * (78 vs 477 t/s) the first time this was wired.  One-shot, not per-token. */
+    /* One-shot: ds4_mmq_init selects the device and populates the ggml
+     * device-info singleton the MMQ launchers read. */
     static int mmq_ready = -1;
     if (mmq_ready < 0) {
         int dev = 0;
@@ -973,10 +958,9 @@ static int routed_moe_try_mmq_gate_up(
      * entry.  There is no raw arm and no repack. */
     float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
     float *up_raw = mid_out;          /* folded in place below */
-    /* x_f32 is ffn_norm, whose fused norm already emitted its E4M3 + ue8m0 into
-     * the activation cache. Hand that over and the input staging gathers the
-     * codes instead of encoding them again from f32. A miss just means the
-     * staging encodes, which is what it did before -- same bytes either way. */
+    /* x_f32 is ffn_norm, whose fused norm emitted its E4M3 + ue8m0 into the
+     * activation cache; the input staging gathers those codes.  No encoding:
+     * refuse (below). */
     const void *act_q = NULL, *act_sf = NULL;
     int act_kbp = 0;
     if (!pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(x_f32, n_tokens, expert_in_dim,
@@ -989,7 +973,7 @@ static int routed_moe_try_mmq_gate_up(
         return 0;
     }
     const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
-        gate_w, up_w, x_f32, selected_ptr, gate_raw, up_raw,
+        gate_w, up_w, selected_ptr, gate_raw, up_raw,
         (int)expert_mid_dim, (int)expert_in_dim,
         (int)n_tokens, (int)n_total_expert,
         (int)n_expert, cudaStreamPerThread,
@@ -1031,12 +1015,11 @@ static int routed_moe_try_mmq_gate_up(
  *     n_tokens'      = n_tokens * n_expert     (one row per pair)
  *     n_expert_used' = 1
  * Output is per-pair, which is what the existing fixed-order moe_sum_kernel
- * already consumes -- so the bit-exact reduction is untouched.  This also skips
- * the mid -> midq q8_K quantize entirely (MMQ does its own q8_1).
+ * already consumes -- so the bit-exact reduction is untouched.  The down MMQ
+ * reads mid as the MoE stage's E4M3 encoding (mid_q/mid_sf/mid_kbp).
  */
 static int routed_moe_try_mmq_down(
         float *down_out,
-        const float *mid_f32,
         const char *down_w,
         const int32_t *selected_ptr,
         uint32_t down_type,
@@ -1052,7 +1035,7 @@ static int routed_moe_try_mmq_down(
      * runtime cache could never afford -- letting down compete for a 22.9 GiB
      * budget just starved late layers of gate/up (measured 566.46 vs 590.77).
      * With the layout on disk there is no budget to compete for. */
-    return ds4_mmq_iq2_xxs_moe_soa(down_w, mid_f32, selected_ptr, down_out,
+    return ds4_mmq_iq2_xxs_moe_soa(down_w, selected_ptr, down_out,
                                    (int)out_dim, (int)expert_mid_dim,
                                    (int)pairs, (int)n_total_expert, 1,
                                    cudaStreamPerThread, mid_q, mid_sf, mid_kbp) == 0;
@@ -1229,7 +1212,6 @@ static int routed_moe_launch(
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
-                                                    (const float *)mid->ptr,
                                                     down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
                                                     n_total_expert,
@@ -1418,7 +1400,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
              * unarmed one a silent slow path -- with a WARNING line as the only
              * witness.  A failure here is a failure. */
             if (pulsar_cutlass_expert_ffn_gemv_small(
-                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
+                        (float *)down->ptr, (float *)mid->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
                         (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
                         gate_expert_bytes, gate_row_bytes,

@@ -23,19 +23,11 @@ uint64_t argmax_f32(const float *x, uint64_t n) {
 
 
 /* "Will anything OBSERVE these f32 bytes?" -- the question every f32
- * store-skip actually has to ask, which is NOT the same question as "should
- * this tensor be written to a dump file".
- *
- * There are TWO observers, and only one of them is the file dump:
- * gpu_graph_debug_dump_tensor's FIRST branch (below) is the range sweep, and
- * it reads the tensor and returns BEFORE gpu_graph_debug_wants is ever
- * consulted.  So a skip gated on debug_wants alone hands the sweep dead bytes
- * -- including its int8_vs_e4m3 column, which is the metric narrowing
- * decisions are made from, and which has already been wrong once (1836c39).
- *
- * Every store-skip gates on THESE, never on the dump predicates directly.
- * Named for the invariant rather than for either observer, so adding a third
- * observer is one edit here instead of a hunt through the skip sites. */
+ * store-skip has to ask.  The observer is the file dump
+ * (gpu_graph_debug_dump_tensor, gated by gpu_graph_debug_wants).  Every
+ * store-skip gates on THESE two predicates rather than on the dump predicates
+ * directly, so adding another observer is one edit here instead of a hunt
+ * through the skip sites. */
 bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos) {
     return gpu_graph_debug_wants(name, il, pos);
 }

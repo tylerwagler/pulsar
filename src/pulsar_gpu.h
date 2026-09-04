@@ -614,15 +614,6 @@ int pulsar_gpu_matmul_f32_tensor(
         const pulsar_gpu_tensor *x,
         uint64_t                n_tok);
 
-/** Diagnostic: relative L2 of q8_1-int8 vs E4M3 quantization of this tensor,
- * i.e. how far our int8 activations sit from the source's own format.  <0 on
- * failure. */
-double pulsar_gpu_tensor_int8_vs_e4m3(const pulsar_gpu_tensor *t, uint64_t n);
-
-/** Diagnostic: max|v|, min nonzero |v|, and counts outside f16's range, reduced
- * on-device.  out5 = {amax, amin, n>65504, n_subnormal, n_nonfinite}. */
-int pulsar_gpu_tensor_range_stats(const pulsar_gpu_tensor *t, uint64_t n, double *out5);
-
 /** Read n ELEMENTS of t to the host as f32, whatever width they are stored at.
  *
  * pulsar_gpu_tensor_read copies BYTES, so a caller that wants floats has to
@@ -1258,21 +1249,6 @@ int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0);
 
-int pulsar_gpu_attention_decode_heads_tensor(
-        pulsar_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const pulsar_gpu_tensor *q,
-        const pulsar_gpu_tensor *raw_kv,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        const pulsar_gpu_tensor *comp_kv,
-        uint32_t                n_comp,
-        uint32_t                n_head,
-        uint32_t                head_dim);
-
 /** As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if
  * that tier actually ran and slots were supplied -- any other tier leaves it 0,
@@ -1542,15 +1518,15 @@ int pulsar_gpu_routed_moe_batch_tensor(
 
 /** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
  * fp4-weight GEMV: one gate+up+swiglu launch and one down launch over all (token,expert)
- * slots, no sort, no host readback.  Activations are E4M3 (producer encoding when armed,
- * roundtripped from the f32 x otherwise) -- the same W4A8 operands as the grouped GEMM. down_out gets one pre-weighted FFN result
- * per slot at [slot*out_dim]; the caller sums the n_expert slices per token (moe_sum).
+ * slots, no sort, no host readback.  The activation is the producer's E4M3 (act_q/act_sf/act_kbp)
+ * -- the same W4A8 operands as the grouped GEMM; without it the call refuses. down_out gets one
+ * pre-weighted FFN result per slot at [slot*out_dim]; the caller sums the n_expert slices per
+ * token (moe_sum).
  * mid_scratch must hold n_tokens*n_expert*mid_dim floats. selected/rweights are the
  * device [n_tokens,n_expert] routing outputs. Returns 0 on success. */
 int pulsar_cutlass_expert_ffn_gemv_small(
         float          *down_out,
         float          *mid_scratch,
-        const float    *x,
         const int32_t  *selected,
         const float    *rweights,
         const uint8_t  *gate_w,
@@ -1665,7 +1641,7 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
 /** Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
  * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
-int pulsar_cutlass_gemv_gateup(float *mid, const float *x, const int32_t *selected, const float *rweights,
+int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float *rweights,
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
     const void *act_q, const void *act_sf, int act_kbp);
