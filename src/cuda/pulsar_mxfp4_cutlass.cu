@@ -660,13 +660,31 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 // indexed with the same layout object the packers use (SF sections of both
 // packers agree byte-for-byte).
 
-/* Reads the activation as the E4M3 + swizzled-E8M0 pair the producing norm
+/* One CTA = one slot x 32 consecutive output columns (one MX block of mid).
+ * 8 warps; warp w owns columns n0+w, n0+w+8, n0+w+16, n0+w+24 in turn.  Within
+ * a column the lane->k mapping (lane l takes k = l*8 + 256*t, 8 at a time) and
+ * the xor-shuffle tree are the dot product; the column loop only sequences
+ * them, so a column's f32 result does not depend on which columns share its
+ * CTA.
+ *
+ * Reads the activation as the E4M3 + swizzled-E8M0 pair the producing norm
  * emitted: (float)e4m3 * s with s the block's shared scale.  A lane's 8
  * consecutive k start at a multiple of 8 and so never straddle a 32-element
- * block, which is what lets one scale serve the inner unroll. */
-template <class SFL>
+ * block, which is what lets one scale serve the inner unroll.
+ *
+ * Epilogue, chosen by the consumer's format:
+ *   EMIT_E4M3 -- the 32 SwiGLU results are deposited in shared memory and
+ *     warp 0 encodes the block with pulsar_mx_emit_block into (midq, midsf) at
+ *     pulsar_mx_sfoff(slot, n0/32, mid_kbp): the small FFN's down GEMV reads
+ *     that pair.  Requires N % 32 == 0 (every CTA is a whole block).
+ *   !EMIT_E4M3 -- lane 0 stores the f32 to mid[slot][n]; the MoE stage encodes
+ *     it (pulsar_cutlass_gemv_gateup).  Tolerates N % 8 == 0. */
+template <class SFL, bool EMIT_E4M3>
 __global__ static void expert_gemv_gu_swiglu_kernel(
-    float *mid,               // [n_slots, N]
+    float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
+    uint8_t *midq,            // [n_slots, N] E4M3 out            (EMIT_E4M3)
+    uint8_t *midsf,           // ue8m0 plane, pulsar_mx_sfoff     (EMIT_E4M3)
+    int mid_kbp,              // its blocks-per-row pitch         (EMIT_E4M3)
     const __nv_fp8_e4m3 *xq8, // [n_tokens, K] E4M3 activations
     const uint8_t *xsf, int xkbp,
     const int32_t *sel,       // [n_slots] expert ids
@@ -675,55 +693,72 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     uint64_t stride, uint64_t data_bytes, SFL sfl, float clampv,
     int n_expert, unsigned n_total, int K, int N) {
   __shared__ float lut[16];
+  __shared__ float vblk[32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
   __syncthreads();
   const int slot = (int)blockIdx.y;
   const int lane = (int)(threadIdx.x & 31u);
-  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
-  if (n >= N) return;
+  const int warp = (int)(threadIdx.x >> 5);
+  const int n0 = (int)(blockIdx.x * 32u);
   const int e = sel[slot];
-  float *m = mid + (size_t)slot * N;
-  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) m[n] = 0.f; return; }
-  const uint8_t *ge = gate_base + (size_t)e * stride;
-  const uint8_t *ue = up_base + (size_t)e * stride;
-  const uint8_t *gd = ge + (size_t)n * (K / 2);
-  const uint8_t *ud = ue + (size_t)n * (K / 2);
-  const uint8_t *gsf = ge + data_bytes;
-  const uint8_t *usf = ue + data_bytes;
+  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  const uint8_t *ge = valid ? gate_base + (size_t)e * stride : nullptr;
+  const uint8_t *ue = valid ? up_base + (size_t)e * stride : nullptr;
   const int xrow = slot / n_expert;
   const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
-  float g = 0.f, u = 0.f;
-  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
-    const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
-    const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
-    const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
-    const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
-    const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
-    #pragma unroll
-    for (int j = 0; j < 8; j++) {
-      const float xv = __half2float((__half)xt8[k0 + j]) * sa;
-      g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
-      u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+  for (int i = 0; i < 4; i++) {
+    const int n = n0 + i * 8 + warp;
+    if (n >= N) break;                 /* N % 8 == 0: uniform across the CTA */
+    float v = 0.f;                     /* an invalid expert contributes zero */
+    if (valid) {
+      const uint8_t *gd = ge + (size_t)n * (K / 2);
+      const uint8_t *ud = ue + (size_t)n * (K / 2);
+      const uint8_t *gsf = ge + data_bytes;
+      const uint8_t *usf = ue + data_bytes;
+      float g = 0.f, u = 0.f;
+      for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+        const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
+        const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
+        const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
+        const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
+        const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float xv = __half2float((__half)xt8[k0 + j]) * sa;
+          g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
+          u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+        }
+      }
+      for (int sh = 16; sh > 0; sh >>= 1) {
+        g += __shfl_xor_sync(0xffffffffu, g, sh);
+        u += __shfl_xor_sync(0xffffffffu, u, sh);
+      }
+      /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
+      if (clampv > 1.0e-6f) {
+        if (g > clampv) g = clampv;
+        if (u > clampv) u = clampv;
+        if (u < -clampv) u = -clampv;
+      }
+      v = (g / (1.f + expf(-g))) * u * rw[slot];
+    }
+    if constexpr (EMIT_E4M3) {
+      if (lane == 0) vblk[n - n0] = v;
+    } else {
+      if (lane == 0) mid[(size_t)slot * N + n] = v;
     }
   }
-  for (int sh = 16; sh > 0; sh >>= 1) {
-    g += __shfl_xor_sync(0xffffffffu, g, sh);
-    u += __shfl_xor_sync(0xffffffffu, u, sh);
-  }
-  if (lane == 0) {
-    /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
-    if (clampv > 1.0e-6f) {
-      if (g > clampv) g = clampv;
-      if (u > clampv) u = clampv;
-      if (u < -clampv) u = -clampv;
+  if constexpr (EMIT_E4M3) {
+    __syncthreads();
+    if (warp == 0) {
+      pulsar_mx_emit_block(vblk[lane], (uint32_t)(n0 + lane), (uint32_t)slot, (uint32_t)N,
+                           mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
     }
-    m[n] = (g / (1.f + expf(-g))) * u * rw[slot];
   }
 }
 
 /* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
- * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the small fused FFN's
- * own pack below): 1 byte read per element, the source's own format. */
+ * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the gate/up epilogue
+ * above in the small FFN): 1 byte read per element, the source's own format. */
 template <class SFL>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
@@ -766,36 +801,6 @@ __global__ static void expert_gemv_down_kernel(
 
 
 
-/* The E4M3 + swizzled-E8M0 packer for the small fused FFN's internal mid:
- * the same per-32 amax, shared exponent and encode as pulsar_mx_emit_block,
- * with the scale byte at pulsar_mx_sfoff(row, kb, kbp) -- the ONE scale-plane
- * layout every A8 reader in this file uses (the linear packer and the reader
- * that wanted it went with L158).
- *
- * ⚠ THE SCALE SLAB MUST BE ZEROED BEFORE THIS RUNS.  mx_sfoff leaves holes
- * whenever rows or blocks are not multiples of 128/4, and the GEMM reads those
- * slots; the producer-side cache zeroes for exactly this reason. */
-__global__ static void e4m3_act_pack_swizzled_kernel(uint8_t *q, uint8_t *sf,
-                                                     const float *x,
-                                                     int nblk_per_row, int kbp,
-                                                     long nblk32) {
-  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= nblk32) return;
-  const int row = (int)(b / nblk_per_row);
-  const int kb  = (int)(b % nblk_per_row);
-  const float *src = x + b * 32;
-  uint8_t *dq = q + b * 32;
-  float mx = 0.f;
-  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
-  const int se = pulsar_mx_shared_exp(mx);
-  const float inv = exp2f((float)-se);
-  sf[pulsar_mx_sfoff(row, kb, kbp)] = pulsar_mx_scale_byte(se);
-  for (int i = 0; i < 32; i++) {
-    const cutlass::float_e4m3_t e = (cutlass::float_e4m3_t)(src[i] * inv);
-    dq[i] = *(const uint8_t *)&e;
-  }
-}
-
 /* Persistent E4M3 staging for the small FFN's mid, grown on demand and reused
  * across layers/calls. */
 /* thread_local: one GPU-submitting thread owns its own scratch; a second
@@ -805,10 +810,11 @@ static thread_local float *g_fp4_gemv_actbuf = nullptr;
 static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
-// down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
-// n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
+// gate/up GEMV emits mid as E4M3 + ue8m0 from its epilogue; the down GEMV reads that
+// pair.  down_out gets one pre-weighted FFN result per (token, slot); the caller sums
+// the n_expert slices per token (moe_sum_kernel).
 int pulsar_cutlass_expert_ffn_gemv_small(
-    float *down_out, float *mid_scratch,
+    float *down_out,
     const int32_t *selected, const float *rweights,
     const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
     uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -820,17 +826,19 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* Both legs read their scale plane through pulsar_mx_sfoff's swizzle: the
-   * gate/up leg from the producer's plane, the down leg from the one
-   * e4m3_act_pack_swizzled_kernel writes below.  Staging sizes are in BYTES
-   * (payload + scales) expressed in the buffer's float units.
+   * gate/up leg from the producer's plane, the down leg from the one the
+   * gate/up epilogue writes.  Staging sizes are in BYTES (payload + scales)
+   * expressed in the buffer's float units.
    *
    * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
-   * into 512-byte groups, so it needs ceil(rows/128) * (kbp/4) * 512 and must be
-   * ZEROED (the tiling leaves holes the GEMM still reads). */
+   * into 512-byte groups, so it is sized ceil(rows/128) * (kbp/4) * 512.  The
+   * tiling leaves holes past n_slots rows, and they are never read: the down
+   * GEMV indexes (slot < n_slots, kb < mid_dim/32) only, and mid_dim % 256 == 0
+   * makes mid_kbp == mid_dim/32, so the epilogue writes every position it
+   * reads.  No memset. */
   const int   x_kbp      = pulsar_mx_rup((int)(in_dim / 32u), 4);
   const size_t midq_elems = (size_t)n_slots * mid_dim;
-  const int   mid_nblk_row = (int)(mid_dim / 32u);
-  const int   mid_kbp      = pulsar_mx_rup(mid_nblk_row, 4);
+  const int   mid_kbp      = pulsar_mx_rup((int)(mid_dim / 32u), 4);
   const size_t midsf_bytes = pulsar_mx_sf_slab_bytes(n_slots, mid_kbp);
   const size_t midq_bytes = midq_elems + midsf_bytes;
   const size_t need = (midq_bytes + 3u) / 4u;
@@ -858,21 +866,19 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     if (!said) { said = 1; fprintf(stderr, "pulsar: small-batch FFN GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d kbp %d vs %d) -- refusing\n", in_dim, n_tokens, act_kbp, x_kbp); }
     return 1;
   }
-  const __nv_fp8_e4m3 *gu_q  = (const __nv_fp8_e4m3 *)act_q;
-  const uint8_t       *gu_sf = (const uint8_t *)act_sf;
-  {
-    dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu)><<<g, 256>>>(
-        mid_scratch, gu_q, gu_sf, x_kbp, selected, rweights,
-        gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
-        n_expert, n_total_expert, in_dim, mid_dim);
+  static int announced = 0;
+  if (!announced) {
+    announced = 1;
+    fprintf(stderr, "pulsar: fp4 small-batch FFN: gate/up emits E4M3 mid from the epilogue "
+                    "(mid_dim=%d n_slots=%u)\n", mid_dim, n_slots);
   }
   {
-    /* mid is produced and consumed inside this call: encode it once, in the
-     * same swizzle every other E4M3 activation uses. */
-    const long nb = (long)(midq_elems / 32);
-    if (cudaMemsetAsync(midsf, 0, midsf_bytes) != cudaSuccess) return 1;
-    e4m3_act_pack_swizzled_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq8, midsf, mid_scratch, mid_nblk_row, mid_kbp, nb);
+    dim3 g((unsigned)(mid_dim / 32), n_slots);
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, in_dim, mid_dim);
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
@@ -894,7 +900,7 @@ int pulsar_cutlass_gemv_gateup(
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
-  dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
+  dim3 g((unsigned)((mid_dim + 31) / 32), n_slots);
 
   /* The activation is the E4M3 the producing norm emitted, or the call refuses. */
   if (!act_q || !act_sf) {
@@ -909,8 +915,9 @@ int pulsar_cutlass_gemv_gateup(
     fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
                     "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
   }
-  expert_gemv_gu_swiglu_kernel<decltype(sfl_gu)><<<g, 256>>>(
-      mid, (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+  expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
+      mid, nullptr, nullptr, 0,
+      (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
       selected, rweights, gate_w, up_w,
       gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;

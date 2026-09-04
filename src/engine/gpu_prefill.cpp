@@ -665,29 +665,23 @@ bool gpu_graph_encode_layer_attention_batch(
             fprintf(stderr, "pulsar: attn_norm: no bf16 slot -- refusing (L159)\n");
             ok = false;
         }
-        /* Same predicate family as shmid_skip_f32, same 7b6448b lesson: the
-         * mixed-batch split's offset views read f32 and key no cache slot, so
-         * the skip requires the split disarmed.  Dumps read f32 too.  The
-         * LAST FOUR rows stay f32 either way: the ratio-4 compressor rebuild
-         * reads them through an offset view (gpu_prefill.cpp:143). */
+        /* Every consumer of batch_attn_norm is a GEMM reading the E4M3 or the
+         * bf16 plane -- the ratio-4 compressor's last-four-rows view included:
+         * it goes through the bf16 core, which finds the plane's window by row
+         * offset (act_slot_find_window), so the f32 bytes under the view are
+         * never read.  The rows are stored only when a dump wants them, or
+         * when the mixed-batch split is armed (its offset views key no slot). */
         attn_norm_keep_from = 0u;
-        /* RE-ENABLED 2026-08-22 after the L089 direct-consumer census: every
-         * batch_attn_norm consumer resolves to a GEMM arm (served by the
-         * E4M3/bf16 encodings or hazard-checked) plus the kept-row tail view.
-         * The corrupting first flight had BOTH skips on; the direct-kernel
-         * reader that caused it is on the FFN side (routed MoE reads
-         * batch_ffn_norm raw), whose skip stays parked below. */
         if (attn_norm_q && attn_norm_b &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
-            !gpu_graph_f32_store_observed_any() && n_tokens >= 4u) {
-            attn_norm_keep_from = n_tokens - 4u;
+            !gpu_graph_f32_store_observed_any()) {
+            attn_norm_keep_from = n_tokens;
             static int announced_ans = 0;
             if (!announced_ans) {
                 announced_ans = 1;
-                fprintf(stderr, "pulsar: attn_norm f32 store SKIPPED except last 4 rows "
-                                "(n_tok=%u, %.1f MiB/layer)\n", n_tokens,
-                        (double)attn_norm_keep_from * PULSAR_N_EMBD * sizeof(float) /
-                        (1024.0 * 1024.0));
+                fprintf(stderr, "pulsar: attn_norm f32 store SKIPPED (n_tok=%u, %.1f MiB/layer)\n",
+                        n_tokens,
+                        (double)n_tokens * PULSAR_N_EMBD * sizeof(float) / (1024.0 * 1024.0));
             }
         }
         /* The pre-norm carrier is a dead store unless a dump wants it -- see
@@ -2360,25 +2354,14 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the output head's scratch view (the L035 site) -- WRITES its rows
          * before reading them, so it never sees ours. */
         ffn_norm_keep_from = 0u;
-        /* RE-ENABLED 2026-08-22 behind the L089 fail-loud guards: every MoE
-         * tier that gathers or stages from raw f32 now REFUSES when the
-         * store was skipped (PULSAR_MOE_F32_GUARD, moe.cu).  The corrupting
-         * reader class can no longer answer wrong -- it can only fail loud,
-         * and the gate decides which tiers are warm. */
-        /* PER-LAYER (L089): the mixed-type MoE tier (gate type != down type,
-         * 7 of 43 layers) gathers from raw f32 and has no cached-act path --
-         * its guard fired by name on the first flight.  Matching-type layers
-         * (grouped 40/40, MMQ 43/43) are served by the exact-key E4M3
-         * handover, so the skip applies there and the f32 store stays on the
-         * mixed layers until their gather learns the encoding.  The moe.cu
-         * guards remain as the permanent backstop either way. */
-        const int ffn_moe_served = layer->ffn_gate_exps && layer->ffn_down_exps &&
-                                   layer->ffn_gate_exps->type == layer->ffn_down_exps->type;
-        /* No cut on n_tokens: every MoE consumer of ffn_norm (the small-batch
-         * FFN GEMV included) reads the producer's E4M3 and refuses without it,
-         * so nothing dereferences the f32 rows once the slot is armed.  Keeping
-         * them would be ~128 MiB/prefill of dead stores. */
-        if (ffn_norm_q && ffn_norm_b && ffn_moe_served &&
+        /* Every MoE tier -- grouped, mixed-type, MMQ, the small-batch FFN GEMV
+         * -- reads the producer's E4M3 for x and refuses without it, so once
+         * the slot is armed nothing dereferences the f32 rows: ~128 MiB per
+         * prefill of dead stores unless kept.  Two readers still want them
+         * and say so: a dump, and the imatrix collector, which sums x^2 over
+         * the f32 rows on the host (imatrix.cpp) and marks the graph while it
+         * runs. */
+        if (ffn_norm_q && ffn_norm_b && !g->imatrix_f32_rows &&
             pulsar_gpu_matmul_batch_mneutral() == 0 &&
             !gpu_graph_f32_store_observed_any()) {
             ffn_norm_keep_from = n_tokens;

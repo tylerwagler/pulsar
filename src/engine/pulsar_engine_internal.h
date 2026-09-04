@@ -1027,6 +1027,10 @@ typedef struct {
      * Set per layer at the Q-path norm decision in gpu_prefill. */
     pulsar_gpu_q_prep q_prep;
     int q_prep_active;  ///< the fused norm+rope Q path is armed for this layer
+    /** Set by the imatrix collector around its prefill: it reads the f32
+     * ffn_norm rows on the host, so the norm keeps them; every other consumer
+     * reads the producer's E4M3 and the rows are not stored. */
+    int imatrix_f32_rows;
     pulsar_gpu_tensor *batch_kv_raw;                ///< batched twin: fused KV projection output, pre-norm
     pulsar_gpu_tensor *batch_kv;                    ///< batched twin: KV latent after its RMSNorm
     /** The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.
@@ -2189,6 +2193,9 @@ bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
  * alone is not the question.  _any() is the coarse, per-name-less twin. */
 bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos);
 bool gpu_graph_f32_store_observed_any(void);
+/** PULSAR_DSPARK_DUMP is set (parsed once): the drafter's f32 rows the dump
+ * reads are stored; otherwise the drafter emits E4M3 only. */
+int  gpu_graph_spec_dump_active(void);
 void gpu_graph_debug_dump_hc_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,

@@ -1400,7 +1400,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
              * unarmed one a silent slow path -- with a WARNING line as the only
              * witness.  A failure here is a failure. */
             if (pulsar_cutlass_expert_ffn_gemv_small(
-                        (float *)down->ptr, (float *)mid->ptr,
+                        (float *)down->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
                         (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
                         gate_expert_bytes, gate_row_bytes,

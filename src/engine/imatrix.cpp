@@ -379,11 +379,15 @@ bool gpu_graph_prefill_layer_major(
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    /* The collector reads each layer's f32 ffn_norm rows on the host; the
+     * norm stores them only while this is set. */
+    g->imatrix_f32_rows = imatrix != NULL;
     const bool ok = gpu_graph_prefill_layer_major_inner(g, model, weights, prompt,
                                                         start, n_tokens, logits,
                                                         show_progress, imatrix,
                                                         display_progress,
                                                         display_progress_ud);
+    g->imatrix_f32_rows = 0;
     dspark_bulk_drain(g, prompt, start, n_tokens, ok);
     return ok;
 }

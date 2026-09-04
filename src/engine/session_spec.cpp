@@ -57,9 +57,11 @@ static uint32_t spec_cur_depth(const pulsar_session *s) {
     return (uint32_t)d;
 }
 
-/* L108 P2: any offline dump mode needs the refined ids on the host at draft
- * time, which forces the immediate (non-deferred) harvest path. Read once. */
-static int spec_dump_active(void) {
+/* PULSAR_DSPARK_DUMP set: the offline dump wants the refined ids on the host
+ * at draft time (the immediate harvest path) and the drafter's f32 rows
+ * (main_x, target_h) written -- gpu_decode keeps those rows only when this
+ * says so.  Read once per process. */
+int gpu_graph_spec_dump_active(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *a = getenv("PULSAR_DSPARK_DUMP");
@@ -727,7 +729,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * launch the chain + conf scoring and DEFER the readback to the next
      * consumer (pulsar_session_spec_chain_harvest) -- the caller's token
      * emission then overlaps the drafter's GPU time. */
-    const bool defer_harvest = !sample_drafts && !spec_dump_active();
+    const bool defer_harvest = !sample_drafts && !gpu_graph_spec_dump_active();
     if (!sample_drafts) {
         /* L108 P1: the greedy walk chains ON DEVICE.  The old loop did a
          * blocking 8-byte read per position purely to hand the next step a

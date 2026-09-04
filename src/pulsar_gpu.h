@@ -794,7 +794,7 @@ int pulsar_gpu_rms_norm_weight_tensor(
 
 /** L158: the rows twin of pulsar_gpu_rms_norm_weight_mx_tensor -- `rows`
  * independent rows normalised with the same weight, each row's E4M3 encoding
- * and UE8M0 block scales emitted into out_q/out_sf (pass NULLs for f32 only).
+ * and UE8M0 block scales emitted into out_q/out_sf (pass NULLs for f32 only; `out` may be NULL when out_q or out_b is set -- no f32 row is stored then).
  * Used by the drafter's per-row norms so its GEMVs read a slot, not f32.
  * n must be a multiple of 256 when out_q is set (fails loudly otherwise).
  * @return 0 on success. */
@@ -1516,17 +1516,18 @@ int pulsar_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens);
 
 
-/** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights via direct
- * fp4-weight GEMV: one gate+up+swiglu launch and one down launch over all (token,expert)
- * slots, no sort, no host readback.  The activation is the producer's E4M3 (act_q/act_sf/act_kbp)
- * -- the same W4A8 operands as the grouped GEMM; without it the call refuses. down_out gets one
- * pre-weighted FFN result per slot at [slot*out_dim]; the caller sums the n_expert slices per
- * token (moe_sum).
- * mid_scratch must hold n_tokens*n_expert*mid_dim floats. selected/rweights are the
- * device [n_tokens,n_expert] routing outputs. Returns 0 on success. */
+/** Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS MXFP4 weights:
+ * direct GEMVs, one launch for gate+up+SwiGLU and one for down, per (token, slot)
+ * slots, no sort, no host readback.  The activation is the producer's E4M3
+ * (act_q/act_sf/act_kbp, act_sf in the pulsar_mx_sfoff SWIZZLE with act_kbp blocks per
+ * row); without it, or with a pitch that does not match this call's geometry, the call
+ * refuses.  The gate/up GEMV emits mid as E4M3 + ue8m0 from its epilogue and the down
+ * GEMV reads that pair -- no f32 mid exists.  down_out gets one pre-weighted FFN result
+ * per slot at [slot*out_dim]; the caller sums the n_expert slices per token (moe_sum).
+ * selected/rweights are the device [n_tokens,n_expert] routing outputs.  Returns 0 on
+ * success. */
 int pulsar_cutlass_expert_ffn_gemv_small(
         float          *down_out,
-        float          *mid_scratch,
         const int32_t  *selected,
         const float    *rweights,
         const uint8_t  *gate_w,
@@ -1543,15 +1544,6 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         int             in_dim,
         int             mid_dim,
         int             out_dim,
-        /* Producer handover (L089): the E4M3 + ue8m0 the producing norm already
-         * emitted for x, with act_kbp blocks per row.  When supplied AND
-         * act_kbp matches this call's geometry, x is NOT READ AT ALL -- which is
-         * the point: this arm's raw-f32 read of x was L089's "sixth reader", the
-         * one consumer outside all the moe.cu guards.  Pass NULL/NULL/0 to pack
-         * from x instead (the miss path, which announces itself once).
-         * ⚠ act_sf must be in the pulsar_mx_sfoff SWIZZLE, not a linear plane:
-         * the gate/up arm indexes it that way and a linear plane would compute
-         * a well-formed wrong answer. */
         const void     *act_q,
         const void     *act_sf,
         int             act_kbp);

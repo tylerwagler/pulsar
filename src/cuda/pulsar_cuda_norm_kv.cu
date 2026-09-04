@@ -107,7 +107,7 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float *xr = x + (uint64_t)row * n;
-    float *orow = out + (uint64_t)row * n;
+    float *orow = out ? out + (uint64_t)row * n : NULL;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         float v = xr[i];
@@ -123,7 +123,7 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = xr[i] * scale * pulsar_w_load_f32_or_bf16<WBF16>(w, i);
-        orow[i] = v;
+        if (orow) orow[i] = v;
         if (out_q) pulsar_mx_emit_block(v, i, row, n, out_kbp, out_q, out_sf);
         /* L159: the bf16 plane for a bf16-weight consumer (the output head),
          * RNE from the same f32 the row stores -- the consumer no longer
@@ -1040,11 +1040,13 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, c
 
 int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps,
         void *out_q, void *out_sf, int out_kbp, void *out_b, int w_bf16) {
-    /* The weight is sized by ITS storage; out/x are f32 buffers regardless. */
+    /* The weight is sized by ITS storage; x is an f32 buffer.  out may be NULL
+     * when an E4M3 or bf16 plane is requested: the f32 row is then not stored
+     * (its only readers are dumps, and the caller passes out only for them). */
     const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
-    if (!out || !x || !model_map || weight_offset > model_size ||
+    if ((!out && !out_q && !out_b) || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
-        out->bytes < (uint64_t)n * sizeof(float) ||
+        (out && out->bytes < (uint64_t)n * sizeof(float)) ||
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
     if (!w) return 0;
@@ -1057,11 +1059,11 @@ int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gp
         return 0;
     }
     if (w_bf16)
-        rms_norm_weight_kernel<true><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+        rms_norm_weight_kernel<true><<<1, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, 1, eps,
                                            (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp,
                                               (__nv_bfloat16 *)out_b);
     else
-        rms_norm_weight_kernel<false><<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+        rms_norm_weight_kernel<false><<<1, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, 1, eps,
                                            (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp,
                                               (__nv_bfloat16 *)out_b);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
@@ -1081,10 +1083,10 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
     if (!w) return 0;
     if (w_bf16)
-        rms_norm_weight_kernel<true><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+        rms_norm_weight_kernel<true><<<rows, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, rows, eps,
                                               NULL, NULL, 0, (__nv_bfloat16 *)out_b);
     else
-        rms_norm_weight_kernel<false><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+        rms_norm_weight_kernel<false><<<rows, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, rows, eps,
                                               NULL, NULL, 0, (__nv_bfloat16 *)out_b);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
@@ -1098,9 +1100,9 @@ int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const puls
      * norms (attn_norm, q_a_norm) needed so their GEMVs read a slot instead
      * of f32.  Same fail-loud rule as the single-row variant. */
     const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
-    if (!out || !x || !model_map || rows == 0 || weight_offset > model_size ||
+    if ((!out && !out_q && !out_b) || !x || !model_map || rows == 0 || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
-        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        (out && out->bytes < (uint64_t)n * rows * sizeof(float)) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
     if (!w) return 0;
@@ -1110,11 +1112,11 @@ int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const puls
         return 0;
     }
     if (w_bf16)
-        rms_norm_weight_kernel<true><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+        rms_norm_weight_kernel<true><<<rows, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, rows, eps,
                                               (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp,
                                               (__nv_bfloat16 *)out_b);
     else
-        rms_norm_weight_kernel<false><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+        rms_norm_weight_kernel<false><<<rows, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, rows, eps,
                                               (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp,
                                               (__nv_bfloat16 *)out_b);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight rows mx launch");

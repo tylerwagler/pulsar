@@ -334,10 +334,10 @@ bool gpu_graph_dspark_project_main_x(
     }
     pulsar_gpu_mxfp8_act_cache_disarm();
 
-    /* L158: main_x feeds the seed-KV GEMVs (gpu_graph_dspark_seed_draft_kv,
-     * called right after this) -- another dense projection that read f32.  The
-     * norm emits E4M3 into main_x's slot and leaves it ARMED for the seed; the
-     * f32 store stays (the spec dump reads it).  The seed disarms when done. */
+    /* main_x feeds the seed-KV GEMVs (gpu_graph_dspark_seed_draft_kv, called
+     * right after this): the norm emits E4M3 into main_x's slot and leaves it
+     * ARMED for the seed, which disarms when done.  The f32 row is written
+     * only when the spec dump (session_spec.cpp) will read it. */
     void *mx_q = NULL, *mx_sf = NULL; int mx_kbp = 0;
     if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_main_x, 1, E, &mx_q, &mx_sf, &mx_kbp)) {
         static int said = 0;
@@ -345,7 +345,7 @@ bool gpu_graph_dspark_project_main_x(
         ok = false;
     }
     if (ok) {
-        ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->dspark_main_x,
+        ok = pulsar_gpu_rms_norm_weight_mx_tensor(gpu_graph_spec_dump_active() ? g->dspark_main_x : NULL,
                                                proj_out,
                                                dspark_model->map,
                                                dspark_model->size,
@@ -690,7 +690,8 @@ bool gpu_graph_dspark_draft_forward_banks(
         }
         if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
             ffn_cur_view, g->batch_attn_norm, dn_q, dn_sf, dn_kbp,
-            NULL /* no bf16 consumer in the drafter */, 0u /* keep the f32 store */,
+            NULL /* no bf16 consumer in the drafter */,
+            gpu_graph_f32_store_observed_any() ? 0u : n_draft /* f32 rows only for a dump */,
             hc_split_view, hc_mix_view, g->batch_cur_hc,
             dspark_model->map, dspark_model->size,
             layer->hc_attn_scale->abs_offset,
@@ -720,7 +721,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             ok = false;
         }
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_mx_tensor(
-            g->batch_qr_norm, g->batch_qr,
+            NULL /* no f32 reader: attn_q_b reads the E4M3 slot keyed on batch_qr_norm */, g->batch_qr,
             dspark_model->map, dspark_model->size,
             layer->attn_q_a_norm->abs_offset,
             q_rank, n_draft, PULSAR_RMS_EPS,
