@@ -125,17 +125,6 @@ uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
     return pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM);
 }
 
-/* The comment that stood here described gpu_graph_attn_comp_read_cache: a
- * dequantise of the packed comp pool into an f32 shadow, for prefill consumers
- * that could only read f32.  Both are gone -- every prefill consumer reads
- * PULSAR_ATTN_PACK rows (2026-08-18), and the attention kernels no longer take a
- * comp format parameter at all -- but the comment outlived the function and
- * ended up describing the unrelated one below. */
-
-
-
-
-
 pulsar_gpu_tensor *gpu_graph_attn_comp_update_target(
         pulsar_gpu_graph *g,
         uint32_t       il) {
@@ -268,8 +257,6 @@ bool gpu_graph_layer_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0);
 
-
-bool gpu_graph_decode_stage_profile_enabled(uint32_t il);
 
 
 bool gpu_graph_matmul_plain_tensor(

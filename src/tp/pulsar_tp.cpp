@@ -1609,10 +1609,6 @@ uint64_t pulsar_tp_slab_batch_in_offset(const pulsar_tp_slab *s, uint32_t layer,
     return s->batch_in_off + (uint64_t)layer * PULSAR_TP_BATCH_MAX_ROWS * vec_bytes;
 }
 
-uint64_t pulsar_tp_slab_gpu_flags_offset(const pulsar_tp_slab *s) {
-    return s->gpu_flags_off;
-}
-
 int pulsar_tp_identity_check(const pulsar_tp_identity *mine,
                              const pulsar_tp_identity *theirs,
                              char *err, size_t errlen) {
@@ -2350,29 +2346,5 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *r
     }
     *full_accept = msg.full;
     *replay_n = msg.replay;
-    return 1;
-}
-
-int pulsar_tp_hash_check(pulsar_tp *tp, uint64_t seq, uint64_t hash,
-                         char *err, size_t errlen) {
-    struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_HASH, &mine, sizeof(mine))) {
-        tp_set_err(err, errlen, "tp: hash send failed");
-        return 0;
-    }
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != PULSAR_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp: hash recv failed");
-        return 0;
-    }
-    if (theirs.seq != seq || theirs.hash != hash) {
-        tp_set_err(err, errlen,
-                   "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
-                   (unsigned long long)seq,
-                   (unsigned long long)hash, (unsigned long long)theirs.hash);
-        return -1;
-    }
     return 1;
 }

@@ -99,7 +99,6 @@ static bool imatrix_collect_layer_batch(
             c->observed_routes++;
         }
     }
-    c->observed_tokens += n_tokens;
     c->chunks++;
     return true;
 }

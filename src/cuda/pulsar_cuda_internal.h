@@ -100,17 +100,6 @@ enum {
     ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
      (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 
-/* Default-ON env gate for the measured fast tiers.  Suite-v1 KL cleared the
- * fp16 attention and MXFP4 indexer tiers on 2026-08-08 (exact per-position
- * KL(off||on) p95 well inside the quant's own divergence-from-reference
- * budget; docs/engine-perf-map.md, "fidelity ledger"), so presence-means-on
- * flipped to on-unless-"0".  Setting the variable to "0" opts out; any other
- * value (or unset) leaves the tier enabled. */
-static inline int pulsar_env_tier_on(const char *name) {
-    const char *v = getenv(name);
-    return !(v && v[0] == '0' && v[1] == '\0');
-}
-
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
  * __half since the L045 flip. */
 typedef __half pulsar_q_t;
@@ -471,21 +460,6 @@ int cuda_attention_score_buffer_fits(uint32_t n_comp);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);
-int cuda_matmul_fp8_hc_expand_tensor_labeled(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *block_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        const pulsar_gpu_tensor *block_add,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        const char             *label);
 
 /* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */
 

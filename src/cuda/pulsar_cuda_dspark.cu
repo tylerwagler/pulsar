@@ -512,41 +512,6 @@ int pulsar_gpu_dspark_confidence_score_model(
 }
 
 
-/* after_ffn_hc is an HC residual CARRIER (BF16 storage; task #62) — load via
- * pulsar_hc_load, accumulate in f32. Output is a plain f32 embedding row. */
-__global__ static void dspark_hc_mean_reduce_kernel(
-        float *out,
-        const pulsar_hc_t *after_ffn_hc,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
-         d += blockDim.x * gridDim.x) {
-        float sum = 0.0f;
-        for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += pulsar_hc_load(after_ffn_hc, (uint64_t)hc * n_embd + d);
-        out[d] = sum / (float)n_hc;
-    }
-}
-
-int pulsar_gpu_dspark_hc_mean_reduce(
-        pulsar_gpu_tensor *out,
-        const pulsar_gpu_tensor *after_ffn_hc,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    if (!out || !after_ffn_hc || n_embd == 0 || n_hc == 0) return 0;
-    if (out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
-    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
-
-    const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (n_embd + block_dim - 1) / block_dim;
-
-    dspark_hc_mean_reduce_kernel<<<grid_dim, block_dim>>>(
-        (float *)out->ptr,
-        (const pulsar_hc_t *)after_ffn_hc->ptr,
-        n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
-}
-
 
 /* Batched variant over a [n_tokens, n_hc, n_embd] HC tensor: out[p] = mean over
  * hc of in[p]. Captures the drafter's anchor-layer hidden for EVERY position of

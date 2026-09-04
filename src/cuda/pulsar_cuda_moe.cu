@@ -426,7 +426,7 @@ static int routed_moe_launch_cutlass_grouped(
     /* Reduce straight from the padded GEMM output through pair_slot -- the
      * flat `down` buffer is NOT touched on this path (its scatter + re-read
      * used to move 2*n_tokens*n_expert*out_dim f32 per layer for nothing).
-     * The per-expert fallback and the MMQ arms still write `down`. */
+     * The MMQ down arm still writes `down`. */
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
     moe_sum_padded_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
             (float *)out->ptr, ffn_out, pair_slot, out_dim, n_expert, n_tokens);
@@ -766,10 +766,8 @@ static int routed_moe_launch_mixed40(
             /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
              * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
             (void)gate_g; (void)up_g; (void)mid_g;
-            /* Hand over the producing norm's E4M3 if it is still cached, exactly
-             * as the grouped path above does. Without it the GEMV re-derives the
-             * same encoding and dequantises it straight back to f32 -- the same
-             * values, encoded twice. A miss just takes the f32 path. */
+            /* Hand over the producing norm's E4M3, exactly as the grouped path
+             * above does.  A miss refuses (L158): there is no re-encode here. */
             const void *gq = NULL, *gsf = NULL;
             int gkbp = 0;
             if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &gq, &gsf, &gkbp)) {
@@ -983,7 +981,8 @@ __global__ static void moe_mmq_swiglu_fold_v4_kernel(
     mid_out[q] = o;
 }
 
-/* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
+/* Returns 1 when MMQ produced `mid` (the IQ2 tier), 0 when this layer's gate/up
+ * is not that tier and the caller's MXFP4 arms run instead. */
 static int routed_moe_try_mmq_gate_up(
         float *mid_out,
         float *gate_scratch,
@@ -1379,102 +1378,6 @@ static int routed_moe_launch(
 
 
 
-int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
-    /* Nothing below this line consults esz: every scratch/output cast in the
-     * MoE lane is (float *) over a tensor the graph allocates f32.  That was
-     * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
-     * MoE tensor is ever narrowed, ten casts become defect nine at once,
-     * silently.  So the whole lane's f32 assumption is enforced ONCE, here at
-     * its two entry points. */
-    if (pulsar_tensor_esz(out) != sizeof(float) || pulsar_tensor_esz(up) != sizeof(float) ||
-        pulsar_tensor_esz(mid) != sizeof(float) || pulsar_tensor_esz(down) != sizeof(float) ||
-        pulsar_tensor_esz(weights) != sizeof(float) || pulsar_tensor_esz(x) != sizeof(float)) {
-        fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
-        return 0;
-    }
-    if (gate_type == 40u && down_type == 40u) {
-        /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
-         * 4 launches with no host round-trip, vs the grouped path's BLOCKING
-         * per-layer offsets readback -- required for CUDA graph capture of the
-         * decode tape, and computes the exact same function (see the batch
-         * path's comment; bit-exact oracle in temp/fp4gemv_test.cu covers
-         * n_tokens>=1). */
-        if (            mid && mid->ptr && down && down->ptr && out && out->ptr &&
-            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
-            mid->bytes >= (uint64_t)n_expert * expert_mid_dim * sizeof(float) &&
-            down->bytes >= (uint64_t)n_expert * out_dim * sizeof(float) &&
-            out->bytes >= (uint64_t)out_dim * sizeof(float) &&
-            selected->bytes >= (uint64_t)n_expert * sizeof(int32_t) &&
-            weights->bytes >= (uint64_t)n_expert * sizeof(float) &&
-            x->bytes >= (uint64_t)expert_in_dim * sizeof(float)) {
-            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
-            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
-            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
-            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
-            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
-            /* Handover first (L089): when the producing norm already emitted
-             * this x as E4M3, gemv_small reads THOSE bytes and never
-             * dereferences the f32 -- which REMOVES the sixth reader instead of
-             * guarding it, and is what makes lifting the n<=8 ffn store-skip
-             * possible.  The guard now covers only the miss path, which packs.
-             * Same shape as the gemv_gateup handover above. */
-            const void *hq = NULL, *hsf = NULL;
-            int hkbp = 0;
-            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, 1u, expert_in_dim, &hq, &hsf, &hkbp)) {
-                hq = NULL; hsf = NULL; hkbp = 0;
-            }
-            if (!hq) {
-                fprintf(stderr, "pulsar: routed MoE small-batch FFN (decode): no producer E4M3 for x (in_dim=%u) -- refusing\n",
-                        expert_in_dim);
-                return 0;
-            }
-            if (gate_w && up_w && down_w &&
-                pulsar_cutlass_expert_ffn_gemv_small(
-                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
-                        (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
-                        gate_expert_bytes, gate_row_bytes,
-                        down_expert_bytes, down_row_bytes,
-                        clamp, 1, (int)n_expert, n_total_expert,
-                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                        hq, hsf, hkbp) == 0) {
-                moe_sum_kernel<<<(uint32_t)((out_dim + 255u) / 256u), 256>>>(
-                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1u);
-                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
-            }
-            /* any failure: fall through to the grouped CUTLASS path */
-        }
-        /* type-40 decode bypassed the fp4 GEMV fast path -> the per-expert
-         * CUTLASS loop.  Announce once, unconditionally, so the slow decode
-         * tier is not silent. */
-        /* L158 inc 5: the fp4 decode GEMV is THE decode path for this shape;
-         * the per-expert loop it fell back to is deleted. */
-        {
-            static int said = 0;
-            if (!said) { said = 1; fprintf(stderr, "pulsar: MoE fp4 decode GEMV failed -- no fallback; refusing\n"); }
-        }
-        return 0;
-    }
-    if ((gate_type == 40u) != (down_type == 40u)) {
-        /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed --
-         * routed_moe_launch is 43/43 only and cannot read the type-40 swizzle,
-         * so a mixed layer must never fall through to it. */
-        return routed_moe_launch_mixed40(out, up, mid, down, model_map, model_size,
-                                         gate_offset, up_offset, down_offset, gate_type, down_type,
-                                         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-                                         expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, 1);
-    }
-    return routed_moe_launch(out, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
-}
-
 
 /* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
  * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
@@ -1629,8 +1532,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
              * this x as E4M3, gemv_small reads THOSE bytes and never
              * dereferences the f32 -- which REMOVES the sixth reader instead of
              * guarding it, and is what makes lifting the n<=8 ffn store-skip
-             * possible.  The guard now covers only the miss path, which packs.
-             * Same shape as the gemv_gateup handover above. */
+             * possible.  A miss refuses (L158); same shape as the gemv_gateup
+             * handover above. */
             const void *hq = NULL, *hsf = NULL;
             int hkbp = 0;
             if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &hq, &hsf, &hkbp)) {

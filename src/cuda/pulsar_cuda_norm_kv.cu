@@ -1379,43 +1379,6 @@ int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 
 
-int pulsar_gpu_kv_fp8_store_raw_tensor(
-        pulsar_gpu_tensor *kv,
-        pulsar_gpu_tensor *raw_cache,
-        uint32_t          raw_cap,
-        uint32_t          raw_row,
-        uint32_t          head_dim,
-        uint32_t          n_rot,
-        bool              keep_f32) {
-    if (head_dim != 512u) {
-        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
-         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
-         * no caller passes anything else -- refuse rather than trust that
-         * (the standard the quantize_store entry already applies). */
-        return 0;
-    }
-    if (head_dim != 512u || n_rot != PULSAR_ATTN_PACK_NROT) {
-        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
-         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
-         * no caller passes anything else -- refuse rather than trust that
-         * (the standard the quantize_store entry already applies). */
-        return 0;
-    }
-    if (!kv || !raw_cache || raw_cap == 0 || head_dim == 0 || n_rot > head_dim ||
-        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    /* One row, packed, with the ring's own modulo.  The f32 staging round-trip
-     * is OBSERVER-ONLY (L094): the packed row is what every consumer reads, so
-     * keep_f32 buys the invariant that the staging still decodes to the packed
-     * values -- which only a dump or the range sweep ever checks. */
-    attn_pack_store_kernel<<<1, 64>>>(keep_f32 ? (float *)kv->ptr : NULL,
-                                      (const float *)kv->ptr,
-                                      (uint8_t *)raw_cache->ptr,
-                                      raw_row, 1u, head_dim, n_rot,
-                                      NULL, NULL, 1u, raw_cap);
-    return cuda_ok(cudaGetLastError(), "raw pack store launch");
-}
-
 
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||

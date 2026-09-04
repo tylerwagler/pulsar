@@ -212,7 +212,6 @@ void pulsar_session_free(pulsar_session *s) { if (s) s->destroy(); }
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
-void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out) { if (s) { s->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) { return s ? s->touched_kv_bytes() : 0; }
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) { return s ? s->bank_free_physical(bank) : false; }
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) { return s ? s->bank_alloc_physical(bank) : false; }

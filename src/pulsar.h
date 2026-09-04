@@ -155,11 +155,6 @@ typedef struct {
     bool     has_dspark;            ///< true when speculative decode is active
 } pulsar_spec_metrics;
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
-/** Per-session cumulative counters (accepted/draft/num_drafts/gen_tokens only;
- * accepted_per_pos left zero). Snapshot + diff across one request for a
- * per-response accept-rate the global engine counters cannot attribute under
- * concurrent decode. */
-void pulsar_session_spec_metrics(const pulsar_session *s, pulsar_spec_metrics *out);
 /** Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */

@@ -616,7 +616,6 @@ typedef struct {
      * is answer text or another reasoning pass (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
     bool sent_reasoning;  ///< a reasoning delta has been emitted
-    bool sent_content;    ///< a content delta has been emitted
     /** Borrowed (never owned): the request's logprob ledger, so the delta
      * emitters can attach the entries whose bytes the delta releases.  NULL
      * whenever the client did not ask for logprobs — openai_stream_start

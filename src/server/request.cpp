@@ -68,16 +68,13 @@ void request_apply_forced_tool_prefill(request *r) {
 
 
 
-void stop_list_clear(stop_list *stops);
 
 
-bool id_list_contains(const stop_list *ids, const char *id);
 
 
 void id_list_push_unique(stop_list *ids, const char *id);
 
 
-void id_list_free(stop_list *ids);
 
 
 
@@ -693,7 +690,6 @@ static void append_raw_json_line(buf *b, const char *json) {
 
 
 
-void json_escape(buf *b, const char *s);
 
 
 
@@ -1408,7 +1404,6 @@ fail:
 
 
 
-void append_tool_result_text(buf *b, const char *s);
 
 
 

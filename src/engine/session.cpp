@@ -576,26 +576,6 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
 }
 
 
-/* Per-SESSION cumulative DSpark counters (accepted/draft/drafts/gen). Same
- * semantics as pulsar_engine_spec_metrics but scoped to one session, so a caller
- * can diff a snapshot across a single request for a per-response accept-rate.
- * accepted_per_pos is left zero (the per-position waterfall stays a /metrics,
- * cross-request concern). */
-void pulsar_session::spec_metrics(pulsar_spec_metrics *out) const {
-    auto *s = this;
-    if (!out) return;
-    memset(out, 0, sizeof(*out));
-    if (!s) return;
-    out->accepted_tokens = s->spec.spec_accepted_tokens;
-    out->draft_tokens = s->spec.spec_draft_tokens;
-    out->num_drafts = s->spec.spec_num_drafts;
-    out->gen_tokens = s->spec.spec_gen_tokens;
-    out->max_draft = !s->engine ? 0
-                    : s->engine->dspark_draft_tokens > PULSAR_SPEC_DEPTH_MAX
-                         ? s->engine->dspark_draft_tokens : PULSAR_SPEC_DEPTH_MAX;
-    out->has_dspark = s->engine ? s->engine->dspark_ready : false;
-}
-
 
 uint64_t pulsar_engine::weights_resident_bytes() {
     auto *e = this;

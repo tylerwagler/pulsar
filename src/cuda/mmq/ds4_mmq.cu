@@ -716,14 +716,6 @@ int ds4_mmq_moe_pair_impl(
         }
         if (!src1_e4m3) return -1;   /* take() latches */
         cudaMemsetAsync(src1_e4m3, 0, nbytes_src1_act, stream);
-        /* Prefer the producer's own encoding when the caller handed one over:
-         * identical bytes, but a 1-byte read per element instead of 4 and no
-         * encode at all.  Falling back to encoding from f32 is a COST choice,
-         * not a format one -- both paths emit the same E4M3. */
-        /* One-shot, like the other tier announcements: which way the expert
-         * activations got their E4M3 is provenance worth seeing once, and it is
-         * the difference between "this made no difference" and "this never
-         * ran". */
         /* L158 inc 5: the producer's encoding or nothing; the encode-from-f32
          * branch is gone. */
         if (!act_q || !act_sf) {

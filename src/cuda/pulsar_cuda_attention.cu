@@ -93,29 +93,6 @@ __device__ static inline float attn_pack_dot_full(const QT *qh, const pulsar_att
     return dot;
 }
 
-/* Packed-row dot walked d = lane, lane+8, ... by one thread (8-lane strided
- * kernels): per-16 scale hoisted (two dims per block per thread share it).
- * Same d-ascending visit order as the plain strided loop. */
-template <typename QT>
-__device__ static inline float attn_pack_dot_lane8(const QT *qh, const pulsar_attn_pack_t *kv, uint64_t row, uint32_t lane, uint32_t head_dim, float dot) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint8_t *pr = (const uint8_t *)kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const uint8_t *psc = pr + nib_bytes;
-    const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
-    for (uint32_t off = 0; off < n_nope; off += PULSAR_KV4_NV_BLOCK) {
-        const float scale = attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
-        for (uint32_t d = off + lane; d < off + PULSAR_KV4_NV_BLOCK; d += 8u) {
-            const uint32_t nib = (pr[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
-            dot += q_load<QT>(qh, d) * attn_kv4_e2m1(nib, scale);
-        }
-    }
-    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u);
-    for (uint32_t d = n_nope + lane; d < head_dim; d += 8u)
-        dot += q_load<QT>(qh, d) * __bfloat162float(rope[d - n_nope]);
-    return dot;
-}
-
 /* Four consecutive comp-pool dims (dims [c4*4, c4*4+4)) as a float4, from a
  * (pool, row) address; the row-relative decode is attn_comp_row_ld4 in
  * pulsar_cuda_internal.h, shared with the f16 kernel's smem tile decode. */

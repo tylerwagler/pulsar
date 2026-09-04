@@ -36,7 +36,6 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
 
 
 
-void json_escape(buf *b, const char *s);
 
 
 

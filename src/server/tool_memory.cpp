@@ -40,7 +40,6 @@ void server_log(pulsar_log_type type, const char *fmt, ...) {
 
 
 
-bool id_list_contains(const stop_list *ids, const char *id);
 
 
 void id_list_push_unique(stop_list *ids, const char *id);

@@ -217,7 +217,6 @@ __global__ void pack_act_e4m3_rowmajor_warp(uint8_t *A_data, TSFA tSFA, const fl
 
 // LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
 __device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-__device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
 // mid = silu(clamp(gate)) * clamp(up) * routing_weight.
 // TWIN of swiglu_kernel in pulsar_cuda_hc_router.cu, and deliberately a
 // separate copy: this TU deliberately does not take pulsar_cuda_internal.h
@@ -225,10 +224,10 @@ __device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t
 // so the two cannot share a definition without coupling them. They MUST agree on the arithmetic above.
 // Two differences that are intentional, not drift: the routing weight is a
 // per-row array here and a scalar there, and the engine's twin carries an
-// E4M3 + E8M0 epilogue that this one does not -- which is why the CUTLASS
-// down path re-quantises mid (the grouped/GEMM path via pack_activation, the
-// GEMV path via e4m3_act_roundtrip_kernel) instead of reading the producer's
-// encoding.
+// E4M3 + E8M0 epilogue that this one does not.  Since L158 every CUTLASS down
+// arm reads mid's E4M3 from the engine's activation cache (or, for the small
+// fused FFN, from its own swizzled pack of the same values); nothing here
+// re-derives an encoding from f32.
 // This cited `pulsar_cuda.cu:10827-10835` until 2026-08-17 to assert the
 // agreement. That file does not exist -- the engine was split up long ago --
 // so the reference had been unfollowable, and the invariant uncheckable,
@@ -401,10 +400,8 @@ static void swiglu_pack_activation(float *mid_f32, uint8_t *A_data, ElementSF *A
 }
 
 /* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
- * 128x4 SF atom swizzle from pulsar_cuda_matmul.cu (mx_sfoff).  Duplicated here
- * rather than exported because it is the on-disk-free layout of a device buffer
- * this TU only READS -- and the two must agree, so it is spelled out identically
- * and asserted by the bit-exactness of the gather against the pack path. */
+ * 128x4 SF atom swizzle, pulsar_mx_sfoff from pulsar_cuda_mx.cuh -- the one
+ * authority, shared with every producer and reader of that plane. */
 
 /* Gather ALREADY-E4M3 activations straight into the grouped GEMM's A operand.
  *
@@ -477,33 +474,6 @@ static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, 
 static size_t gemm_workspace_bytes(int M, int N, int K){
   auto args = make_gemm_args(nullptr,nullptr,nullptr,nullptr,nullptr,M,N,K);
   return Gemm::get_workspace_size(args);
-}
-
-// One MXFP4 GEMM: D[M,N] = A[M,K](act,packed) . B[N,K](weight,packed). A_sf/B_sf = swizzled SF
-// buffers. workspace must be at least gemm_workspace_bytes(M,N,K) bytes, caller-owned.
-static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
-                    const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K,
-                    void *workspace){
-  auto args = make_gemm_args(D,A_data,A_sf,B_data,B_sf,M,N,K);
-  Gemm gemm;
-  /* can_implement is pure host-side argument validation and is deterministic
-   * per (M,N,K); the expert loop re-ran it for every expert's every GEMM. Cache
-   * validated shapes (single-threaded GPU submission thread; the shape set is
-   * tiny -- a few (T,mid,in)/(T,out,mid) combos). */
-  {
-    static uint64_t seen[64];
-    static int n_seen = 0;
-    const uint64_t key = ((uint64_t)(uint32_t)M << 42) ^ ((uint64_t)(uint32_t)N << 21) ^ (uint32_t)K;
-    bool hit = false;
-    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { hit = true; break; }
-    if (!hit) {
-      if (gemm.can_implement(args)!=cutlass::Status::kSuccess) return 1;
-      if (n_seen < 64) seen[n_seen++] = key;
-    }
-  }
-  if (gemm.initialize(args, workspace)!=cutlass::Status::kSuccess) return 2;
-  auto st = gemm.run();
-  return st==cutlass::Status::kSuccess ? 0 : 3;
 }
 
 
@@ -870,7 +840,7 @@ int pulsar_cutlass_grouped_proj(
 // down, no readback, no sort.  Activations are E4M3 (the A8 arms; the producer's grouped
 // encoding when armed, an on-the-spot roundtrip otherwise) -- the SAME format the GEMM
 // path quantizes to, so the two paths differ in launch shape, not operand numerics.
-// Data layout (see pulsar_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
+// Data layout (the converter's pack step): B is ColumnMajor packed E2M1 -- logical
 // (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
 // (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
 // coalesced. SF is the swizzled tile-atom layout, indexed with the same layout object
@@ -885,7 +855,7 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 }
 
 // v3: the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles --
-// verified empirically (temp/fp4gemv_test.cu): pulsar_cutlass_pack_source's data
+// verified empirically (temp/fp4gemv_test.cu): the converter's pack step's data
 // section is an IDENTITY COPY of the source's row-major e2m1 bytes, i.e. logical
 // (n,k) lives at nibble k + n*K, byte n*(K/2) + k/2. (pack_weight_f32's manual
 // "n + k*N" math -- and its byte-for-byte comment -- does NOT match pack_source;
@@ -897,14 +867,11 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 // indexed with the same layout object the packers use (SF sections of both
 // packers agree byte-for-byte).
 
-/* A8=true reads the activation as the E4M3 + swizzled-E8M0 pair the producing
- * norm already emitted, instead of the f32 buffer e4m3_act_roundtrip_kernel
- * builds by deriving that same encoding and immediately throwing the bytes
- * away.  Bit-exact, not merely equivalent: the round-trip writes
- * (float)e4m3(v*inv)*s and this computes (float)e4m3 * s from the same block
- * scale, so the value entering the dot product is identical.  A lane's 8
+/* Reads the activation as the E4M3 + swizzled-E8M0 pair the producing norm
+ * emitted: (float)e4m3 * s with s the block's shared scale.  A lane's 8
  * consecutive k start at a multiple of 8 and so never straddle a 32-element
- * block, which is what lets one scale serve the inner unroll. */
+ * block, which is what lets one scale serve the inner unroll.  (The f32
+ * round-trip arm this once mirrored is gone, L158.) */
 template <class SFL, bool A8 = false>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N]
@@ -964,9 +931,9 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   }
 }
 
-/* A8=true reads mid as the E4M3 + E8M0 pair e4m3_act_pack_kernel emitted, rather
- * than the f32 buffer the round-trip leaves behind after deriving exactly those
- * bytes. Same value into the dot product, 1 byte read instead of 4. */
+/* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
+ * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the small fused FFN's
+ * own pack below): 1 byte read per element, the source's own format. */
 template <class SFL, bool A8 = false>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
@@ -1013,17 +980,11 @@ __global__ static void expert_gemv_down_kernel(
 
 
 
-/* SWIZZLE-writing twin of e4m3_act_pack_kernel.  IDENTICAL per-32 amax, se and
- * encode -- so its values are bit-identical to both the round-trip and the
- * linear packer -- but the scale byte lands at pulsar_mx_sfoff(row, kb, kbp)
- * instead of at sf[b].
- *
- * ⚠ BOTH PACKERS EXIST BECAUSE THE TWO A8 ARMS DISAGREE ABOUT THE SCALE PLANE.
- * expert_gemv_down_kernel reads it LINEARLY (xsf[k0>>5], offset per slot);
- * expert_gemv_gu_swiglu_kernel reads it through the SWIZZLE, because its A8 arm
- * was built to consume the PRODUCER's cache.  Handing a swizzled reader a
- * linear plane compiles clean and computes a well-formed WRONG answer -- that
- * mistake was one build away from shipping on 2026-08-23.
+/* The E4M3 + swizzled-E8M0 packer for the small fused FFN's internal mid:
+ * the same per-32 amax, shared exponent and encode as pulsar_mx_emit_block,
+ * with the scale byte at pulsar_mx_sfoff(row, kb, kbp) -- the ONE scale-plane
+ * layout every A8 reader in this file uses (the linear packer and the reader
+ * that wanted it went with L158).
  *
  * ⚠ THE SCALE SLAB MUST BE ZEROED BEFORE THIS RUNS.  mx_sfoff leaves holes
  * whenever rows or blocks are not multiples of 128/4, and the GEMM reads those
@@ -1074,10 +1035,9 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* BOTH legs are native-format now.  The gate/up leg reads its scale plane
-   * through pulsar_mx_sfoff's swizzle, so it is fed by
-   * e4m3_act_pack_swizzled_kernel; the down leg reads a linear plane and keeps
-   * e4m3_act_pack_kernel.  Sizes are in BYTES (payload + scales) expressed in
-   * the buffer's float units.
+   * through pulsar_mx_sfoff's swizzle, and so does the down leg; both are fed
+   * by e4m3_act_pack_swizzled_kernel.  Sizes are in BYTES (payload + scales)
+   * expressed in the buffer's float units.
    *
    * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
    * into 512-byte groups, so it needs ceil(rows/128) * (kbp/4) * 512 and must be
@@ -1156,20 +1116,6 @@ int pulsar_cutlass_expert_ffn_gemv_small(
 }
 
 
-/* ---- Single-projection W4A8 GEMV for MIXED type-40 layers at DECODE/small-batch (n<=4). ----
- * Decode is memory-bound; the M=1 CUTLASS tensor-core GEMM wastes launch + pack + TC-underfill
- * overhead. These reuse the lean expert_gemv_* kernels (fp4 weight read directly, dequant via LUT,
- * E4M3-roundtripped f32 activations = same function as the prefill grouped GEMM). One launch over
- * all (token,expert) slots, no per-expert loop, no host sync. `mid`/`down_out` are the pair-layout
- * f32 accumulators the caller composes with the dp4a side. Persistent actbuf grown on demand. */
-static int gemv_actbuf_ensure(size_t need_floats) {
-  if (need_floats <= g_fp4_gemv_actbuf_floats) return 1;
-  if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free(); cudaFree(g_fp4_gemv_actbuf); }
-  g_fp4_gemv_actbuf = nullptr;
-  if (cudaMalloc(&g_fp4_gemv_actbuf, need_floats * sizeof(float)) != cudaSuccess) { g_fp4_gemv_actbuf_floats = 0; return 0; }
-  g_fp4_gemv_actbuf_floats = need_floats;
-  return 1;
-}
 /* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
 int pulsar_cutlass_gemv_gateup(
     float *mid, const float *x, const int32_t *selected, const float *rweights,
@@ -1236,74 +1182,9 @@ int pulsar_cutlass_gemv_down(
 // DeepSeek-V4-Flash source stores rich experts — into CUTLASS B layout (ColumnMajor packed E2M1
 // data + swizzled SFB). Host-side, lossless (copies nibbles+scale verbatim). This is the permanent
 // source->CUTLASS packer; nothing consumes ds4's 17-byte format.
-void pulsar_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
-  auto lB   = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
-  auto layB = make_layout(make_shape(N,K,1), lB);
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  auto tB   = make_tensor(recast_ptr<cutlass::float_e2m1_t>(Bd), layB);
-  auto tSFB = make_tensor(Bsf, lSFB);
-  int nblk=K/32, rowbytes=K/2;
-  for(int n=0;n<N;n++) for(int kb=0;kb<nblk;kb++){
-    tSFB(n, kb*32, 0) = ElementSF::bitcast(e8m0[(size_t)n*nblk + kb]);   // E8M0 scale
-    const uint8_t *row = e2m1 + (size_t)n*rowbytes + kb*16;              // E2M1: 16 bytes = 32 nibbles
-    for(int i=0;i<16;i++){ uint8_t byte=row[i]; int k=kb*32+i*2;
-      tB(n,k,0)   = cutlass::float_e2m1_t::bitcast(byte & 0xF);
-      tB(n,k+1,0) = cutlass::float_e2m1_t::bitcast(byte >> 4); }
-  }
-}
 
 // Physical element count of the swizzled SF tensor for a weight of shape (N=out, K=in).
-size_t pulsar_cutlass_weight_sf_count(int N, int K){
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  return cute::size(cute::filter_zeros(lSFB));
-}
 
-#ifdef PULSAR_MXFP4_REPACK_CLI
-#include <cstdlib>
-#include <cstring>
-#include <algorithm>
-#include <vector>
-// Offline converter CLI. Two modes:
-//   per-expert: e2m1.bin e8m0.bin N K out_data.bin out_sf.bin
-//   stacked   : --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin
-//               (in: [ne,N,K/2] + [ne,N,K/32]; out: per expert data||sf, expert-major)
-int main(int argc, char **argv){
-  if(argc>=8 && strcmp(argv[1],"--stacked")==0){
-    int N=atoi(argv[4]), K=atoi(argv[5]), ne=atoi(argv[6]);
-    size_t e2each=(size_t)N*(K/2), e8each=(size_t)N*(K/32);
-    std::vector<uint8_t> e2(e2each*ne), e8(e8each*ne);
-    FILE*f1=fopen(argv[2],"rb"); if(!f1||fread(e2.data(),1,e2.size(),f1)!=e2.size()){ fprintf(stderr,"e2m1 read fail\n"); return 1; } fclose(f1);
-    FILE*f2=fopen(argv[3],"rb"); if(!f2||fread(e8.data(),1,e8.size(),f2)!=e8.size()){ fprintf(stderr,"e8m0 read fail\n"); return 1; } fclose(f2);
-    size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
-    FILE*fo=fopen(argv[7],"wb"); if(!fo){ fprintf(stderr,"out open fail\n"); return 1; }
-    std::vector<uint8_t> Bd((size_t)N*K/2); std::vector<ElementSF> Bsf(sfn);
-    for(int i=0;i<ne;i++){
-      std::fill(Bd.begin(),Bd.end(),(uint8_t)0);
-      std::fill(Bsf.begin(),Bsf.end(),ElementSF::bitcast(127));
-      pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data()+(size_t)i*e2each, e8.data()+(size_t)i*e8each, N, K);
-      fwrite(Bd.data(),1,Bd.size(),fo); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fo);
-    }
-    fclose(fo);
-    printf("stacked N=%d K=%d ne=%d -> per-expert data=%zuB sf=%zuB total=%zuB\n",
-           N,K,ne, Bd.size(), sfn*sizeof(ElementSF), (size_t)ne*(Bd.size()+sfn*sizeof(ElementSF)));
-    return 0;
-  }
-  if(argc<7){ fprintf(stderr,"usage: %s e2m1.bin e8m0.bin N K out_data.bin out_sf.bin\n       %s --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin\n",argv[0],argv[0]); return 1; }
-  int N=atoi(argv[3]), K=atoi(argv[4]);
-  size_t e2n=(size_t)N*(K/2), e8n=(size_t)N*(K/32);
-  std::vector<uint8_t> e2(e2n), e8(e8n);
-  FILE*f1=fopen(argv[1],"rb"); if(!f1||fread(e2.data(),1,e2n,f1)!=e2n){ fprintf(stderr,"e2m1 read fail %s\n",argv[1]); return 1; } fclose(f1);
-  FILE*f2=fopen(argv[2],"rb"); if(!f2||fread(e8.data(),1,e8n,f2)!=e8n){ fprintf(stderr,"e8m0 read fail %s\n",argv[2]); return 1; } fclose(f2);
-  std::vector<uint8_t> Bd((size_t)N*K/2,0);
-  size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
-  std::vector<ElementSF> Bsf(sfn, ElementSF::bitcast(127));
-  pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data(), e8.data(), N, K);
-  FILE*fd=fopen(argv[5],"wb"); fwrite(Bd.data(),1,Bd.size(),fd); fclose(fd);
-  FILE*fs=fopen(argv[6],"wb"); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fs); fclose(fs);
-  printf("packed N=%d K=%d -> data=%zuB sf=%zuB\n",N,K,Bd.size(),sfn*sizeof(ElementSF));
-  return 0;
-}
-#endif
 
 /* An #ifdef PULSAR_MXFP4_STANDALONE self-check main() lived here until the
  * 2026-08-22 types sweep.  Nothing ever defined the macro, its oracle modelled

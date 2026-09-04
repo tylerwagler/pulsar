@@ -540,10 +540,10 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
  * drafts, and the batched anchor-hidden capture gives the drafter its
  * conditioning at whatever position ends up last-accepted. Drafting for the
  * NEXT step then conditions on the hidden that PRODUCED the next base token
- * (matching the reference generate.py forward_spec dataflow; the legacy loop
- * conditions on the hidden AFTER re-evaluating the base token -- a one-position
- * train/inference mismatch this path removes).
- * Greedy-only, like the legacy block (generate.cpp gates on temperature<=0).
+ * (matching the reference generate.py forward_spec dataflow; the deleted
+ * per-round loop conditioned on the hidden AFTER re-evaluating the base token
+ * -- a one-position train/inference mismatch this path removed).
+ * Greedy-only (generate.cpp gates on temperature<=0).
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
 
@@ -682,7 +682,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
     uint32_t n_draft = spec_cur_depth(s);   /* L107: session depth, not the static engine width */
     if (n_draft > 16u) n_draft = 16u;
     if (n_draft == 0u) return 0;
-    /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
+    /* Draft forward + markov refine (the reference forward_spec's Steps 3-5).
      * NOTE: no seed here -- the committed positions' rows were seeded above
      * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
      * processed as batch position 0.
@@ -1552,7 +1552,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         /* Partial/zero accept: target state includes rejected positions.
          * Stage A: restore the pre-batch frontier and replay the committed
          * prefix (first_token + accepted drafts). The decode path re-captures
-         * each position's hidden; seed per position as the legacy loop does.
+         * each position's hidden; seed per position, as the reference does.
          * (Stage B replaces this replay with transactional state rollback.) */
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);

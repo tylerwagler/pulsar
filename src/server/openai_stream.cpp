@@ -1432,7 +1432,6 @@ bool openai_sse_stream_update(int fd, server *s, const request *r, const char *i
             if (!sse_chat_delta_n(fd, r, id, "content",
                                   raw + st->emit_pos,
                                   limit - st->emit_pos, st->lp, limit)) return false;
-            st->sent_content = true;
             st->emit_pos = limit;
         }
 

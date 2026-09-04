@@ -32,7 +32,7 @@ int ds4_mmq_init(int device);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
-//   0 otherwise (caller should fall back to its existing dequant+cublas path).
+//   0 otherwise (the caller refuses; there is no second path).
 //
 // Wraps ggml_cuda_should_use_mmq. type_x uses ds4 quant codes which match
 // ggml's enum:
@@ -78,7 +78,7 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 //
 // K must be a multiple of 256.  n_expert_used must be one of the values
 // the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
-// (or any other value, which falls back to the generic path).  For V4
+// (any other value takes the generic MMQ kernel).  For V4
 // Flash, n_expert_used = 6.
 //
 // Output is NOT nonfinite-sanitized: the routed-MoE consumers

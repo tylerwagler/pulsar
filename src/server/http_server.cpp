@@ -675,7 +675,6 @@ void server::client_done() {
 
 
 
-void set_client_socket_nonblocking(int fd);
 
 
 

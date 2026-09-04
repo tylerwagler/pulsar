@@ -51,7 +51,6 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
 
 
 
-int sample_argmax(const float *logits, uint32_t n_vocab);
 
 
 

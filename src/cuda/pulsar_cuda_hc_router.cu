@@ -193,35 +193,6 @@ static void hc_expand_launch(uint32_t blocks, uint32_t threads,
 }
 
 
-__global__ static void hc_split_weighted_sum_fused_kernel(
-        float *out,
-        float *split,
-        const float *mix,
-        const pulsar_hc_t *residual_hc,
-        const float *scale,
-        const float *base,
-        uint32_t n_embd,
-        uint32_t n_hc,
-        uint32_t n_rows,
-        uint32_t sinkhorn_iters,
-        float epsv) {
-    uint32_t t = blockIdx.x;
-    uint32_t d = threadIdx.x;
-    if (t >= n_rows || n_hc != 4) return;
-    const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    __shared__ float hc4_c[16];
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
-    __syncthreads();
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
-        }
-        out[(uint64_t)t * n_embd + col] = acc;
-    }
-}
-
 
 
 /* BIT-EXACT register-staging rewrite (2026-07-21).  At decode n_rows==1, so this
@@ -335,8 +306,6 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
 }
 
 
-/* Generic fallback for n_embd > BLK*VEC (byte-identical to the pre-2026-07-21
- * kernel: same column order, same tree, same global round trip). */
 
 
 
@@ -652,35 +621,6 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
 }
 
 
-int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
-        pulsar_gpu_tensor       *gate,
-        pulsar_gpu_tensor       *up,
-        pulsar_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        float                   clamp,
-        void                   *mid_q,
-        void                   *mid_sf,
-        int                     mid_kbp) {
-    return pulsar_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
-                                        gate_offset, in_dim, out_dim, x, 1) &&
-           pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
-                                        up_offset, in_dim, out_dim, x, 1) &&
-           /* One row here, so n == out_dim and the MX row width IS out_dim.
-            * skip_f32 = 0 deliberately: this is the DECODE path, where the
-            * store is one row (8 KiB, not 32 MiB) and so is worth nothing,
-            * while the arms that could read it are the n==1 GEMVs rather than
-            * the single cuBLASLt path prefill takes.  The prefill call site in
-            * gpu_prefill.cpp is where the store is actually dead. */
-           pulsar_gpu_swiglu_mx_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f,
-                                       mid_q, mid_sf, mid_kbp, (uint32_t)out_dim, 0);
-}
-
 
 int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
@@ -716,34 +656,6 @@ int pulsar_gpu_directional_steering_project_tensor(
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
 
-
-int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits) {
-    if (!selected || !weights || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
-    int32_t tok = (int32_t)token;
-    int ok = 1;
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
-    if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
-        if (!bias) ok = 0;
-    }
-    if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
-        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
-        else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
-        if (!hash) ok = 0;
-    }
-    if (ok) {
-        dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, probs ? (float *)probs->ptr : NULL,
-                                                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                     has_bias && !hash_mode, hash_mode);
-        ok = cuda_ok(cudaGetLastError(), "router_select launch");
-    }
-    return ok;
-}
 
 
 int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
@@ -804,52 +716,6 @@ int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_t
 
 
 
-
-int pulsar_gpu_hc_split_weighted_sum_tensor(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps) {
-    if (!out || !split || !mix || !residual_hc || !model_map ||
-        n_embd == 0 || n_hc != 4) {
-        return 0;
-    }
-    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    const uint64_t mix_bytes = mix_hc * sizeof(float);
-    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
-    if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
-        scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
-        base_offset > model_size || mix_bytes > model_size - base_offset) {
-        return 0;
-    }
-    uint64_t n_rows = out->bytes / out_row_bytes;
-    if (mix->bytes < n_rows * mix_bytes ||
-        split->bytes < n_rows * mix_bytes ||
-        residual_hc->bytes < n_rows * residual_row_bytes) {
-        return 0;
-    }
-    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
-    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
-    if (!scale || !base) return 0;
-    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256>>>(
-            (float *)out->ptr,
-            (float *)split->ptr,
-            (const float *)mix->ptr,
-            (const pulsar_hc_t *)residual_hc->ptr,
-            scale,
-            base,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
-    return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
-}
 
 
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
@@ -982,22 +848,6 @@ int pulsar_gpu_output_hc_weights_tensor(
 }
 
 
-int pulsar_gpu_hc_expand_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *post, const pulsar_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
-                      (pulsar_hc_t *)out_hc->ptr,
-                                                    (const float *)block_out->ptr,
-                                                    (const float *)block_out->ptr,
-                                                    (const pulsar_hc_t *)residual_hc->ptr,
-                                                    (const float *)post->ptr,
-                                                    (const float *)comb->ptr,
-                                                    n_embd, n_hc, n_tokens,
-                                                    n_hc, n_hc * n_hc, 0);
-    return cuda_ok(cudaGetLastError(), "hc_expand launch");
-}
-
 
 int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
@@ -1039,53 +889,7 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
 
 
 
-int pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *shared_mid,
-        const pulsar_gpu_tensor *routed_out,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    return pulsar_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim,
-                                        shared_mid, 1) &&
-           pulsar_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
-                                                residual_hc, split, n_embd, n_hc);
-}
 
-
-
-int pulsar_gpu_matmul_fp8_hc_expand_tensor(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *block_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
-                                                    model_map, model_size,
-                                                    weight_offset,
-                                                    in_dim, out_dim,
-                                                    x,
-                                                    NULL,
-                                                    residual_hc,
-                                                    split,
-                                                    n_embd, n_hc,
-                                                    "fp8_hc_expand");
-}
 
 
 

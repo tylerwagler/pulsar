@@ -1259,42 +1259,6 @@ void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, 
 
 
 
-/* Standard DS4 RMSNorm with learned per-channel scale. */
-void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
-
-    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
-}
-
-
-
-
-
-
-static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
-#if defined(__ARM_NEON)
-    uint64_t i = 0;
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    for (; i + 8 <= n; i += 8) {
-        const float16x8_t hv = vreinterpretq_f16_u16(vld1q_u16(row + i));
-        const float32x4_t h0 = vcvt_f32_f16(vget_low_f16(hv));
-        const float32x4_t h1 = vcvt_f32_f16(vget_high_f16(hv));
-        acc0 = vfmaq_f32(acc0, h0, vld1q_f32(x + i));
-        acc1 = vfmaq_f32(acc1, h1, vld1q_f32(x + i + 4));
-    }
-
-    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
-    return acc;
-#else
-    float acc = 0.0f;
-    for (uint64_t i = 0; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
-    return acc;
-#endif
-}
 
 
 
@@ -1313,7 +1277,9 @@ static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n)
 
 
 
-void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
+
+
+
 
 
 
@@ -1364,7 +1330,6 @@ void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const
 
 
 
-float silu(float x);
 
 
 

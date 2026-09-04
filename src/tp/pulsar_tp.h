@@ -165,9 +165,6 @@ void pulsar_tp_mark_failed(pulsar_tp *tp);
 uint32_t pulsar_tp_n_layer(const pulsar_tp *tp);     /* decoded from the hello */
 uint64_t pulsar_tp_vec_bytes(const pulsar_tp *tp);   /* n_embd * 4 (f32 partials) */
 
-/* GPU-written gate-ready flags region of the slab (u32 per slot). */
-uint64_t pulsar_tp_slab_gpu_flags_offset(const pulsar_tp_slab *s);
-
 /* Register the slab base with the transport.  The engine allocates one
  * contiguous (GPU-visible on GB10) block and hands its base VA here; the
  * transport registers it with the NIC (RDMA) and exchanges remote keys, or
@@ -261,11 +258,6 @@ typedef struct {
 int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
                            char *err, size_t errlen);
 void pulsar_tp_command_free(pulsar_tp_command *command);
-
-/* Debug lockstep check: both sides send their hidden-state hash for a token
- * and compare.  Returns 0 on transport failure, -1 on hash mismatch. */
-int pulsar_tp_hash_check(pulsar_tp *tp, uint64_t seq, uint64_t hash,
-                         char *err, size_t errlen);
 
 /* Vocab-split output head: the worker ships its logits half to the leader
  * after every eval (and after a sync) on the control socket. */

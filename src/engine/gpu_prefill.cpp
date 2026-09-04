@@ -353,12 +353,6 @@ static bool gpu_graph_layer_stage_profile_enabled(uint32_t il) {
 
 
 
-bool gpu_graph_decode_stage_profile_enabled(uint32_t il) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DECODE_STAGE_PROFILE", &cache) &&
-           gpu_graph_profile_layer_env_match("PULSAR_CUDA_DECODE_STAGE_PROFILE_LAYER", il);
-}
-
 
 
 /* Optional prefill stage profiler. It intentionally ends the current GPU

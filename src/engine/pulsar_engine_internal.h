@@ -295,31 +295,6 @@ typedef struct {
     uint64_t rope_orig_ctx;    ///< context length the RoPE settings were trained at
 } pulsar_shape;
 
-/** Q2_K weight block: 2-bit quants with a two-level scale.
- *
- * `d` and `dmin` are the block-level scale and minimum; `scales` carries a
- * packed per-sub-block pair that those two rescale. The minimum is why a Q8_K
- * activation has to precompute group sums -- applying it needs sum(a) over
- * each group. */
-typedef struct {
-    uint8_t  scales[QK_K / 16];  ///< packed per-sub-block scale and min selectors
-    uint8_t  qs[QK_K / 4];       ///< packed 2-bit quants, 4 per byte
-    uint16_t d;                  ///< block scale, f16
-    uint16_t dmin;               ///< block minimum, f16
-} block_q2_K;
-
-/** Q8_K activation block: int8 quants with one f32 scale.
- *
- * `bsums` is the reason this format exists rather than plain int8. A K-quant
- * weight carries a per-sub-block minimum, and the dot product needs
- * sum(activations) over each 16-element group to apply it. Precomputing those
- * sums at quantisation time keeps the inner loop a pure int8 dot. */
-typedef struct {
-    float   d;                     ///< scale: dequantised value is d * qs[i]
-    int8_t  qs[QK_K];              ///< quantised activations
-    int16_t bsums[QK_K / 16];      ///< sum of qs over each 16-element group
-} block_q8_K;
-
 /** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
  *
  * `qs` is not raw quants -- it packs indices INTO a fixed grid of 8-value
@@ -642,8 +617,8 @@ typedef struct {
  * matmul_q8_0_pair_batch, matmul_q8_0_grouped_batch) had no definition AT ALL:
  * their bodies were deleted at some earlier point and the prototypes outlived
  * them, which is why a grep for "q8" kept finding a CPU int8 path that could not
- * run.  block_q8_K itself stays -- other declarations still reference it, and
- * whether THOSE are live is a separate audit. */
+ * run.  block_q8_K and block_q2_K followed 2026-09-04 (L159 inc 3): nothing
+ * read them; quant_formats.cpp only asserted their sizes, and went too. */
 
 /* =========================================================================
  * KV Cache and Compressors.
@@ -1256,7 +1231,6 @@ typedef struct {
     int   *selected_buf;   ///< host copy of batch_router_selected: which expert each row went to
     float *sq_tmp;         ///< scratch for the per-row squaring pass
     uint32_t cap_tokens;   ///< rows the host buffers can hold, i.e. the prefill chunk width
-    uint64_t observed_tokens; ///< tokens accumulated so far
     uint64_t observed_routes; ///< (token, expert) routing decisions accumulated
     uint32_t chunks;          ///< prefill chunks processed
     const char *dataset_path; ///< calibration corpus being read
@@ -1824,7 +1798,6 @@ struct pulsar_session {
      * boundaries. Behind pulsar_session_set_cancel(). */
     void set_cancel(pulsar_session_cancel_fn fn, void *ud);
     /** Copy out the cumulative speculative-decode counters. */
-    void spec_metrics(pulsar_spec_metrics *out) const;
     /** Resident KV bytes actually touched by the CURRENT bank -- the demand-paged
      * figure, which is below the reserved capacity on a short session. */
     uint64_t touched_kv_bytes() const;
@@ -2179,9 +2152,6 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
 void weights_free(pulsar_weights *w);
 /** Load one token embedding row and expand it to float activations. */
 void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out);
-/** Standard DS4 RMSNorm with learned per-channel scale. */
-void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps);
-void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
@@ -2650,7 +2620,6 @@ bool gpu_graph_indexer_stage_profile_boundary(
         uint32_t    n_tokens,
         uint32_t    n_comp,
         double     *stage_t0);
-bool gpu_graph_decode_stage_profile_enabled(uint32_t il);
 bool gpu_graph_layer_stage_profile_boundary(
         const char *part,
         const char *stage,
@@ -2863,57 +2832,6 @@ void pulsar_acquire_instance_lock(void);
 
 /** ---- shared inline helpers ---- */
 
-static inline PULSAR_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int8x16_t qv = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(gv), vget_low_s8(qv));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
-    return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid1[i] * (int32_t)q8[8 + i];
-    return sum;
-#endif
-}
-
-static inline PULSAR_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const uint8x16_t packed = vld1q_u8(q2);
-    uint8x16_t shifted;
-    switch (shift) {
-    case 0: shifted = packed; break;
-    case 2: shifted = vshrq_n_u8(packed, 2); break;
-    case 4: shifted = vshrq_n_u8(packed, 4); break;
-    default: shifted = vshrq_n_u8(packed, 6); break;
-    }
-    const uint8x16_t vals_u = vandq_u8(shifted, vdupq_n_u8(3));
-    const int8x16_t vals = vreinterpretq_s8_u8(vals_u);
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), q8v, vals);
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    uint8_t vals_tmp[16];
-    for (uint32_t i = 0; i < 16; i++) vals_tmp[i] = (q2[i] >> shift) & 3;
-    const int8x16_t vals = vreinterpretq_s8_u8(vld1q_u8(vals_tmp));
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(q8v), vget_low_s8(vals));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(q8v), vget_high_s8(vals));
-    const int32x4_t s0 = vpaddlq_s16(p0);
-    const int32x4_t s1 = vpaddlq_s16(p1);
-    return vaddvq_s32(vaddq_s32(s0, s1));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 16; i++) sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
-    return sum;
-#endif
-}
-
 /** =========================================================================
  * Scalar Conversion and Quantized Tensor Kernels.
  * =========================================================================
@@ -2955,44 +2873,6 @@ static inline float f16_to_f32(uint16_t h) {
     float f;
     memcpy(&f, &bits, sizeof(f));
     return f;
-#endif
-}
-
-static inline uint16_t f32_to_f16(float f) {
-#if defined(__ARM_NEON)
-    const float32x4_t fv = vdupq_n_f32(f);
-    const float16x4_t hv = vcvt_f16_f32(fv);
-    return vget_lane_u16(vreinterpret_u16_f16(hv), 0);
-#else
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(bits));
-
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = bits & 0x7fffffu;
-
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        const uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        const uint32_t round_bit = (mant >> (shift - 1)) & 1u;
-        const uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
-        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
-        return (uint16_t)(sign | half_mant);
-    }
-
-    if (exp >= 31) {
-        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
-            return (uint16_t)(sign | 0x7e00u);
-        }
-        return (uint16_t)(sign | 0x7c00u);
-    }
-
-    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    const uint32_t round = mant & 0x1fffu;
-    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
-    return (uint16_t)half;
 #endif
 }
 
