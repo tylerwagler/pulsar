@@ -582,26 +582,38 @@ void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, 
 void pulsar_gpu_mxfp8_act_cache_disarm(void);
 
 
-/** Widest decode prefix the M-neutral kernel paths cover.  ONE authority: the
- * armed nt-caps in pulsar_cuda_matmul.cu, the MoE grouped/non-grouped boundary
- * (pulsar_cuda_moe.cu), and the PULSAR_MSEQ_MAX static_assert in the engine all
- * reference this.  A batched step's decode rows past this width would take a
- * batch-shape-dependent GEMM instead of the per-row-independent kernels — the
- * "same op, two numerics, chosen by width" bug family — so growing
- * PULSAR_MSEQ_MAX past it must FAIL THE BUILD, not warn at runtime. */
+/** The widest DECODE batch the M-independent kernels take (the nt GEMV
+ * instantiations in pulsar_cuda_matmul.cu, the small-batch expert FFN GEMV
+ * and per-expert projection in pulsar_cuda_moe.cu enumerate up to it).  It
+ * bounds pulsar_gpu_matmul_set_batch_decode_rows, and the PULSAR_MSEQ_MAX
+ * static_assert in the engine keeps the bank count inside it: a decode row
+ * past this width would have no M-independent arm, so growing PULSAR_MSEQ_MAX
+ * past it FAILS THE BUILD.  It chooses no arm: row KIND does (below). */
 #define PULSAR_GPU_MNEUTRAL_ROWS_MAX 16u
 
-/** plan-34 phase-2 inc 2/4: arm the M-neutral batched-matmul mode with a PREFIX
- * ROW COUNT. `n` = the number of leading DECODE rows in the batched step; those
- * rows run through the M-independent custom per-token kernels (byte-identical
- * across batch width), while the trailing prefill rows [n..M) take the fast
- * cuBLAS(Lt)/grouped tensor-core path. n==0 disarms (pure prefill / classic).
- * n==M arms the whole batch (decode-only, == inc-2). Set once at
- * multiseq_step_begin, cleared at step_end — never on a per-token path.
- * The query returns the count (MoE two-pass reads it to place the split;
- * inc-2/3 dense-GEMM callers treat nonzero as "armed"). */
-void pulsar_gpu_matmul_set_batch_mneutral(int n);
-int  pulsar_gpu_matmul_batch_mneutral(void);   /* query: decode-prefix row count (0 = disarmed) */
+/** ROW KIND.  `n` is the number of leading DECODE rows in the batch being
+ * encoded -- a fact about the rows, declared by the lane that owns them, and
+ * the ONE thing every dense GEMM and MoE dispatcher reads to choose its arm:
+ *   - decode rows (n > 0, n >= the call's n_tok) take the M-INDEPENDENT arms
+ *     (one-row GEMV at 1, nt / small-batch FFN / per-expert projection at
+ *     2..PULSAR_GPU_MNEUTRAL_ROWS_MAX), so a decode row's bytes depend on
+ *     neither its batchmates nor the batch width;
+ *   - prefill rows (n == 0) take the TENSOR-CORE arms (cuBLAS(Lt), grouped
+ *     CUTLASS) at ANY n_tok, one row included -- the arm the B300 reference
+ *     computes prefill rows with;
+ *   - a mixed batch (0 < n < n_tok) is laid out [decode rows 0..n) then one
+ *     prefill run [n..n_tok); the dispatchers split there and recurse with n
+ *     on the prefix and 0 on the suffix.
+ * Row COUNT chooses nothing (L167: it had been a proxy for kind, with a mode
+ * flag as tie-break).  Lanes that own decode rows declare them at their entry
+ * and restore on exit (pulsar_decode_rows_scope in the engine): the batched
+ * step, the classic verify block, the drafter's forwards and seeds, the
+ * one-row output head.  Prefill declares nothing.  The prefill encoder's
+ * f32-store skips read it too: the split's offset views key no slot, so the
+ * skips apply only while no decode prefix is in flight.
+ * Returns 0 and refuses when n exceeds PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
+int pulsar_gpu_matmul_set_batch_decode_rows(int n);
+int pulsar_gpu_matmul_batch_decode_rows(void);
 
 int pulsar_gpu_matmul_bf16_tensor(
         pulsar_gpu_tensor       *out,

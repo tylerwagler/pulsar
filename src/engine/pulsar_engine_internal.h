@@ -649,18 +649,43 @@ typedef struct {
  * streams — decode throughput saturates ~4 concurrent streams, but every
  * bank beyond that keeps another conversation's KV warm between turns
  * instead of evicting it.  imatrix's run-head structure documents <= 16 as
- * its bound; the M-neutral dense-step caps (PULSAR_GPU_MNEUTRAL_ROWS_MAX)
- * follow it, and the build refuses the drift below. */
+ * its bound; the dense-step row cap (PULSAR_GPU_MNEUTRAL_ROWS_MAX) bounds
+ * it, and the build refuses the drift below. */
 #define PULSAR_MSEQ_MAX 16u
-/** Every decode row of a batched step must fit the M-neutral kernel paths, or
- * rows past the cap silently take a batch-shape-dependent GEMM (this exact
- * drift happened once: the caps were written when MSEQ_MAX was 8 and did not
- * follow it to 16). The build refuses the drift now. */
+/** Every decode row of a batched step must fit the row cap's M-independent
+ * kernels, or rows past the cap silently take a batch-shape-dependent GEMM
+ * (this exact drift happened once: the caps were written when MSEQ_MAX was 8
+ * and did not follow it to 16). The build refuses the drift now. */
 static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
-              "PULSAR_MSEQ_MAX exceeds the M-neutral kernel row cap; extend the "
+              "PULSAR_MSEQ_MAX exceeds the dense-step row cap; extend the "
               "NT kernel instantiations in pulsar_cuda_matmul.cu and the MoE "
               "boundary in pulsar_cuda_moe.cu, then raise "
               "PULSAR_GPU_MNEUTRAL_ROWS_MAX in pulsar_gpu.h");
+
+/** Declares the rows of every GEMM / MoE call issued inside its scope as
+ * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
+ * take the M-independent arms whatever the batch width.  Lanes that own decode
+ * rows open one at their entry -- the classic verify block, the drafter's
+ * forwards and seeds, the one-row output head; the batched step sets the
+ * count itself in gpu_graph_multiseq_step_begin -- and the destructor restores
+ * the caller's count, so a scope opened mid-step (a seed inside the fused spec
+ * loop) leaves the step's declaration intact.  `ok()` is false when the setter
+ * refused (n past PULSAR_GPU_MNEUTRAL_ROWS_MAX); the caller refuses too. */
+class pulsar_decode_rows_scope {
+public:
+    explicit pulsar_decode_rows_scope(uint32_t n)
+        : saved_(pulsar_gpu_matmul_batch_decode_rows()),
+          ok_(pulsar_gpu_matmul_set_batch_decode_rows((int)n) != 0) {}
+    ~pulsar_decode_rows_scope() {
+        (void)pulsar_gpu_matmul_set_batch_decode_rows(saved_);   /* restoring an accepted value */
+    }
+    bool ok() const { return ok_; }
+    pulsar_decode_rows_scope(const pulsar_decode_rows_scope &) = delete;
+    pulsar_decode_rows_scope &operator=(const pulsar_decode_rows_scope &) = delete;
+private:
+    int  saved_;
+    bool ok_;
+};
 
 /** Fixed per-bank KV slabs: per layer, one contiguous allocation per cache
  * kind, bank-major, stride = one bank's single-session capacity.  When the
@@ -2142,8 +2167,6 @@ void config_validate_model(const pulsar_model *m);
 void weights_bind(pulsar_weights *w, const pulsar_model *m);
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m);
 void weights_free(pulsar_weights *w);
-/** Load one token embedding row and expand it to float activations. */
-void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out);
 /** Dense layers and compressed layers use different RoPE bases. */
 float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
@@ -2505,7 +2528,9 @@ bool gpu_graph_dspark_project_main_x(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w);
-void gpu_graph_dspark_seed_draft_kv(
+/** Seed n_rows drafter-KV rows from main_x.  false = a stage failed and the
+ * three ring counters were rolled back; the caller refuses its spec round. */
+bool gpu_graph_dspark_seed_draft_kv(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
@@ -2579,8 +2604,6 @@ int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                       float *out, uint64_t n);
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n);
-/** f32 -> HC carrier bytes (RNE, matches the GPU __float2bfloat16 store). */
-void pulsar_store_hc_carrier_f32(void *dst, const float *src, uint64_t n);
 bool gpu_graph_upload_prompt_tokens(
         pulsar_gpu_tensor *out_tokens,
         const token_vec  *prompt,

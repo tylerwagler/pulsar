@@ -436,20 +436,23 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * so the signedness restatement cannot change a bit -- noted so the next
      * format change treats the pair as one fact. */
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
-    /* The sort stays OFF for n_tokens == 1.  It is a locality optimization:
-     * the fp16 kernel reads topk[] in whatever order it is given, masks each id
-     * outside the row's visible prefix, and folds rows through an online
-     * softmax that is correct for ANY permutation -- there is no dedup, no
-     * monotonicity assumption, and no binary search anywhere in it.  At decode
-     * the whole 512-row compressed scan is L2-resident, so ascending row
-     * addresses buy nothing while the bitonic sort costs ~4.2 us per token.
-     *
-     * It is NOT output-neutral, though: the online fold is order-dependent in
-     * floating point, so sorting changes the reduction order and the logits with
-     * it (measured 2026-08-13: max |Δlogit| 5.44 vs unsorted, for ~0% throughput
-     * at frontiers 4k..32k).  "Locality only" describes the memory access, not
-     * the arithmetic. */
-    if (n_tokens > 1u && top_k == 512u) {
+    /* Sort every row's 512 selected ids ascending before the fold -- at every
+     * row count, n_tokens == 1 included (L167).  The fp16 kernel reads topk[]
+     * in whatever order it is given, masks each id outside the row's visible
+     * prefix, and folds rows through an online softmax that is correct for ANY
+     * permutation; but the fold is order-dependent in floating point, so the
+     * ORDER of topk[] is part of the arithmetic (measured 2026-08-13: max
+     * |Δlogit| 5.44 sorted vs unsorted).  The top-k kernels emit ids in score
+     * order, which differs between the n_comp-bucketed variants (1024 / pow2 /
+     * CUB); the sort makes the fold order a function of the SET selected, so a
+     * row's logits depend on neither the ranking kernel nor -- since the sort
+     * runs for one row too -- on whether the row rides a 1-row decode step or a
+     * multi-row verify batch.  Until L167 the sort was skipped at n_tokens == 1
+     * as a locality-only cost (~4.2 us per row), which made the 1-row and N-row
+     * indexed folds two numerics for the same row -- the L161 class of split.
+     * top_k != 512 is a shape the sort kernel does not take; the ids fold in
+     * ranking order there for every row count alike. */
+    if (top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;

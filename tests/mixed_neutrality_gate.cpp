@@ -19,9 +19,10 @@
  *    rel-RMS = 0 (byte-identical KV => no corruption), same oracle as inc-3.
  *
  *  GATE 3 (MoE two-pass split boundary): with n_dec >= 2 (the per-token MoE path is
- *    taken over the decode prefix) AND K > 8 (the grouped MoE path is taken over the
- *    prefill suffix), BOTH row classes are correct — gate 4 proves the decode prefix,
- *    gate 2 proves the prefill suffix, and the split lands at row n_dec (asserted).
+ *    taken over the decode prefix) AND a K-row prefill suffix (the grouped MoE path
+ *    is taken over prefill rows at any K -- row kind chooses, L167), BOTH row classes
+ *    are correct — gate 4 proves the decode prefix, gate 2 proves the prefill suffix,
+ *    and the split lands at row n_dec (asserted).
  *
  * The comp caches have one format each (packed attn / MXFP4 indexer).
  * MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS >= n_dec+1. Run under GPU discipline.
@@ -63,7 +64,7 @@ static void dump_prefix(const char *tag) {
     setenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX", pfx, 1);
 }
 #define C0    128               /* prefill bank's classic first chunk (lifts frontier off 0) */
-#define K_PRE 64                /* prefill run length; >8 => grouped MoE suffix taken */
+#define K_PRE 64                /* prefill run length (prefill rows => grouped MoE suffix at any K) */
 #define PBASE 700               /* prefill bank token region (distinct from decode banks) */
 
 static pulsar_engine *g_e;
@@ -494,12 +495,17 @@ int GATE_ENTRY(int argc, char **argv) {
         if (rel_rms >= 1e-2) { fprintf(stderr, "GATE 2 FAIL: prefill last-pos rel-RMS %.3e >= 1e-2 (corruption)\n", rel_rms); g_fail = 1; }
     }
 
-    /* GATE 3: split boundary. n_dec>=2 => per-token MoE prefix; K>8 => grouped MoE suffix. */
-    printf("GATE 3 MoE SPLIT: n_dec=%d (per-token MoE, rows [0,%d)) | K=%d>8 (grouped MoE, rows [%d,%d)) | "
+    /* GATE 3: split boundary. n_dec>=2 => per-token MoE prefix (decode rows);
+     * the K-row suffix is prefill rows => grouped MoE at any K (row kind
+     * chooses the arm, L167). */
+    printf("GATE 3 MoE SPLIT: n_dec=%d (per-token MoE, rows [0,%d)) | K=%d prefill rows (grouped MoE, rows [%d,%d)) | "
            "per-token->grouped switch at row %d %s\n",
            g_n_dec, g_n_dec, K_PRE, g_n_dec, g_n_dec + K_PRE, g_n_dec,
-           (g_n_dec >= 2 && K_PRE > 8) ? "OK" : "MISCONFIGURED");
-    if (!(g_n_dec >= 2 && K_PRE > 8)) { fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>8)\n"); g_fail = 1; }
+           (g_n_dec >= 2 && K_PRE >= 1) ? "OK" : "MISCONFIGURED");
+    if (!(g_n_dec >= 2 && K_PRE >= 1)) {
+        fprintf(stderr, "GATE 3 FAIL: gate misconfigured (need n_dec>=2 and K>=1)\n");
+        g_fail = 1;
+    }
 
 done:
     free(ref_dec); free(mix_dec); free(lv1_dec); free(mix_pre); free(cls_pre);

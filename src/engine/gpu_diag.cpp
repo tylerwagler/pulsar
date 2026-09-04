@@ -1387,32 +1387,25 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
      * device array. */
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
-    /* plan-34 inc 2/3/4: arm the M-independent custom GEMMs for the DECODE PREFIX
-     * of this step. Row layout (inc 4): decode rows first — one 1-row run per
-     * decode bank — then the K-row PREFILL run(s). n_dec = the count of leading
-     * rows that live in length-1 runs; every dense GEMM runs those rows through the
-     * M-independent custom kernel (byte-identical to a decode-only step of that
-     * width — gate-4 neutrality) and the trailing prefill rows through the fast
-     * tensor-core path. Decode-only (every run length 1) => n_dec == n_rows (arm
-     * all, == inc-2). Pure prefill (first run length>1) => n_dec == 0 (arm none,
-     * == inc-3). The scan stops at the first multi-row run: the inc-4 scheduler
-     * lays decode rows strictly before the prefill run (a length-1 run appearing
-     * AFTER a prefill run is not an inc-4 layout and would be treated as prefill —
-     * documented, enforced by the row builder / gate). */
-    /* L146: a step whose WHOLE batch fits the M-neutral row cap is M-neutral in
-     * full, whatever its run structure.  The prefix scan below exists for the
-     * mixed step whose trailing run is a K-row prefill chunk (K up to the
-     * prefill cap) -- those rows want the tensor-core path.  A production
-     * verify batch -- three slots x (1 + draft depth) rows, no prefill run --
-     * has NO length-1 runs, so the scan armed nothing: every dense projection
-     * took cuBLASLt at grids of 4-32 CTAs (output_a 291 us where the grouped
-     * nt kernel takes ~150, output_b 266 vs ~155) and the MXFP4 MoE took the
-     * grouped path, padding 54 rows to ~7,000 (gather + swiglu-pack 3.1 ms per
-     * layer for ~1 MB of activations) -- L145.  At <= PULSAR_GPU_MNEUTRAL_ROWS_MAX
-     * rows there is no run the tensor-core path serves better, and the
-     * per-row-exact kernels are the ones the decode prefix already uses, so arm
-     * them all.  Every row's output is then independent of its batchmates --
-     * the property gate 4 asserts for decode rows, extended to draft rows. */
+    /* Declare the step's DECODE-ROW COUNT (pulsar_gpu.h,
+     * pulsar_gpu_matmul_set_batch_decode_rows): row KIND is what every dense
+     * GEMM and MoE tier reads to choose its arm (L167).  Row layout (plan-34
+     * inc 4): decode rows first -- one run per decode bank, 1 row plain or
+     * 1 + drafts under verify -- then the K-row PREFILL run(s).  Where
+     * 0 < n_dec < n_rows the dispatchers split the batch at n_dec: the decode
+     * prefix runs as its own call, so its bytes equal a decode-only step of
+     * that width (gate-4 neutrality), and the prefill suffix runs through the
+     * tensor-core window arm.  This entry is not told the kinds, so it infers
+     * them from the layout: a step of <= PULSAR_GPU_MNEUTRAL_ROWS_MAX rows is
+     * the served decode/verify shape (three slots x (1 + draft depth) rows, no
+     * prefill run -- L146) and declares every row decode; a wider step counts
+     * the leading length-1 runs, stopping at the first multi-row run because
+     * the scheduler lays decode rows strictly before the prefill run.  The
+     * inference is exact for every step the scheduler builds today; a prefill
+     * chunk of <= 16 rows co-scheduled into a <= 16-row step would be declared
+     * decode by it (the caller would have to pass the count).  The setter
+     * refuses a count past the cap, which the PULSAR_MSEQ_MAX static_assert
+     * makes unreachable from here. */
     uint32_t n_dec = 0;
     if (n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
         n_dec = n_rows;
@@ -1423,13 +1416,17 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             if (rl == 1) { n_dec++; t++; } else break;
         }
     }
-    pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
+    if (!pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec)) {
+        g->batch_multiseq = false;
+        g->batch_multiseq_rows = 0;
+        return false;
+    }
     return true;
 }
 
 bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     if (!g || !g->batch_multiseq) return false;
-    pulsar_gpu_matmul_set_batch_mneutral(0);
+    (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
     g->batch_multiseq = false;
     const uint32_t n_rows = g->batch_multiseq_rows;
     g->batch_multiseq_rows = 0;

@@ -1827,62 +1827,55 @@ void cuda_fp8_weight_cache_clear(void) {
 
 
 
-/* plan-34 phase-2 inc 2 — cuBLASLt ALGO-STABILITY. When armed (a batched
- * multiseq/mixed step), force the M-INDEPENDENT custom per-token GEMV kernels for
- * the whole batched row range [2..PULSAR_MSEQ_MAX=8] instead of switching to a
- * cuBLAS(Lt) tensor-core GEMM at n_tok>=5. cuBLAS(Lt) resolves an M-dependent
- * (ntok-keyed heuristic) algo, so a co-scheduled decode bank's logits would shift
- * with the batch width (measured: M=5/8 differ from M=2). The custom deint_nt /
- * f16_nt kernels compute each output row purely from THAT row's activations, so
- * they are byte-identical across M by construction. Armed once per step
- * (multiseq_step_begin) / cleared (step_end) — NEVER per token. Classic prefill
- * never arms it, so its large-M cuBLAS tensor-core path is unchanged, and the
- * decode-only lane (n_tok<=4, already custom) is bit-for-bit unchanged.
+/* ROW KIND CHOOSES THE ARM; ROW COUNT NEVER DOES (L167).
  *
- * plan-34 phase-2 inc 4 — GENERALIZED to a PREFIX ROW COUNT. In a fused mixed
- * step the row layout is [decode rows 0..n_dec) then one K-row prefill run
- * [n_dec..M). The decode prefix must stay M-independent (byte-identical to a
- * decode-only step of width n_dec — gate-4 neutrality); the prefill suffix takes
- * the fast tensor-core path (correctness, not byte-identity). g_mneutral_rows now
- * holds n_dec (0 = pure prefill / not armed; == n_tok = decode-only). Each dense
- * GEMM splits by recursing with the flag set to each range's PURE regime, so the
- * exact inc-2 (custom) and inc-3 (tensor-core) code paths are reused verbatim —
- * the decode prefix launch is LITERALLY the same nt<n_dec> a decode-only step
- * emits, and the prefill suffix is the same tensor-core GEMM a pure-prefill step
- * emits at that width. No kernel logic is duplicated. */
-/* THE UNARMED ROW CAP, defined once. Below or at this many rows an unarmed
- * dense GEMM takes the M-independent nt kernel; above it, cuBLAS/cuBLASLt,
- * whose result is batch-shape dependent. Raising it 4 -> 8 was tried and
- * REVERTED on 2026-07-21 (the measurement lives at the mxfp8 dispatch below,
- * which is the authority on the number). It was a bare `4` at three dispatch
- * sites with a comment saying they must move together -- a rule with no
- * mechanism (L069's defect shape); now there is one of it. The ARMED cap is
- * PULSAR_GPU_MNEUTRAL_ROWS_MAX (pulsar_gpu.h), already single-sourced. */
-#define PULSAR_GEMV_NT_CAP 4u
-static int g_mneutral_rows = 0;
-void pulsar_gpu_matmul_set_batch_mneutral(int n) {
-    /* The armed nt-caps cover PULSAR_GPU_MNEUTRAL_ROWS_MAX rows, and the engine
-     * static_asserts PULSAR_MSEQ_MAX against it -- so this branch is unreachable
-     * from the batched lane.  It stays as a fail-loud guard for any OTHER caller:
-     * rows past the cap would take a batch-shape-dependent GEMM, the "same op,
-     * two numerics, chosen by width" shape this codebase keeps getting bitten by. */
+ * g_batch_decode_rows is the number of leading DECODE rows in the batch being
+ * encoded -- a fact about the rows, declared by the lane that owns them
+ * (pulsar_gpu_matmul_set_batch_decode_rows; the batched step, the classic
+ * verify block, the drafter's forwards and seeds, the one-row output head).
+ * Every dense dispatcher in this file and every MoE tier in
+ * pulsar_cuda_moe.cu reads it the same way:
+ *   - decode rows (0 < n_dec, n_dec >= n_tok): the M-INDEPENDENT arms -- the
+ *     one-row GEMV at n_tok == 1, the nt kernels at 2..PULSAR_GPU_MNEUTRAL_
+ *     ROWS_MAX (one weight read serving every row, each output row computed
+ *     from its own activation alone, bit-identical to the one-row kernel).
+ *     A decode row's bytes therefore depend on neither its batchmates nor the
+ *     batch width.  The setter refuses a count past the cap, so a decode call
+ *     is never wider than the nt instantiations.
+ *   - prefill rows (n_dec == 0): the TENSOR-CORE arms -- cuBLAS(Lt), the
+ *     grouped CUTLASS GEMMs -- at ANY n_tok, one row included.  This is the
+ *     arm the B300 reference computes prefill rows with (the reference gate
+ *     graded a 6-row remainder chunk moved onto nt as further from source).
+ *   - mixed (0 < n_dec < n_tok): the batch is laid out [decode rows 0..n_dec)
+ *     then one prefill run [n_dec..n_tok); each dispatcher splits there and
+ *     recurses with n_dec on the prefix and 0 on the suffix (the suffix reads
+ *     the producer's full-width slot through a row window).
+ * Until L167 the arm was chosen by ROW COUNT with a global mode flag as a
+ * tie-break (nt to 4 rows unarmed, to 16 armed, tensor-core above): a proxy
+ * for kind that put 5..16-row prefill remainders on one arm or the other by
+ * the caller's mode, and a 1-row prefill chunk on the decode GEMV.  The
+ * prefill byte gate's depth 4102 (= 4096 + 6, a 6-row remainder) is the
+ * depth that moves whenever a prefill row leaves the tensor-core arm.
+ * Set once at the lane's entry, restored on exit -- never on a per-token
+ * path (pulsar_decode_rows_scope in the engine). */
+static int g_batch_decode_rows = 0;
+int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
+    /* Refuse, do not warn: decode rows past the cap would take a
+     * batch-shape-dependent GEMM.  The engine static_asserts PULSAR_MSEQ_MAX
+     * against the cap, so the batched lane cannot reach this; a probe can. */
     if (n > (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr, "pulsar: WARNING batched step of %d rows exceeds the "
-                            "m-neutral cap of %u -- rows past the cap take a different "
-                            "GEMM and neutrality is not guaranteed\n",
-                            n, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
-        }
+        fprintf(stderr, "pulsar: batched step declares %d decode rows; the row cap is %u -- "
+                        "refusing (rows past the cap would take a batch-shape-dependent GEMM)\n",
+                        n, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        return 0;
     }
-    g_mneutral_rows = (n > 0) ? n : 0;
+    g_batch_decode_rows = (n > 0) ? n : 0;
+    return 1;
 }
-/* Queried cross-TU by the MoE dispatch (pulsar_cuda_moe.cu): the number of leading
- * decode rows that must take the M-independent per-token expert path (the trailing
- * prefill rows take the grouped GEMM). 0 = not armed. Nonzero = armed (inc-2/3
- * read it as a boolean; inc-4 MoE two-pass reads the count to place the split). */
-int pulsar_gpu_matmul_batch_mneutral(void) { return g_mneutral_rows; }
+/* Read cross-TU by the MoE dispatch (pulsar_cuda_moe.cu) to place its split,
+ * and by the prefill encoder's f32-store skips (the split's offset views key no
+ * slot, so the skips apply only when no decode prefix is in flight). */
+int pulsar_gpu_matmul_batch_decode_rows(void) { return g_batch_decode_rows; }
 
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
@@ -1920,13 +1913,13 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
      * slot, so BOTH halves quantize from f32 -- including the half whose store
      * was skipped.  The check above cannot see that case (the base pointer is
      * covered by a valid slot), so it is made here, where the split is decided. */
-    if (g_mneutral_rows > 0 && (uint64_t)g_mneutral_rows < n_tok) {
+    if (g_batch_decode_rows > 0 && (uint64_t)g_batch_decode_rows < n_tok) {
         for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
             if (g_act_slots[i].key_ptr == x->ptr && g_act_slots[i].f32_absent) {
                 fprintf(stderr, "pulsar: mxfp8 '%s' mixed-batch split (n_dec=%d of %llu) on a "
                                 "buffer whose f32 store was SKIPPED -- refusing; the split "
                                 "halves cannot reach the E4M3 cache.\n",
-                        label ? label : "?", g_mneutral_rows, (unsigned long long)n_tok);
+                        label ? label : "?", g_batch_decode_rows, (unsigned long long)n_tok);
                 return 0;
             }
         }
@@ -1936,7 +1929,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
      * suffix [n_dec,n_tok) in the tensor-core (prefill) regime, by recursing with
      * the flag set to each range's pure value. Offsets are row-major (float rows). */
     {
-        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             /* Row strides are BYTES: the output half must follow the OUTPUT
              * element size, or the suffix lands at the wrong offset. */
@@ -1948,18 +1941,20 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                                                              out->bytes - n_dec * outb);
             pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
                                                              x->bytes - n_dec * inb);
-            const int saved = g_mneutral_rows;
-            g_mneutral_rows = (int)n_dec;  ///< decode prefix: n_dec == n_tok' => all custom
+            const int saved = g_batch_decode_rows;
+            g_batch_decode_rows = (int)n_dec;  ///< decode prefix: n_dec == n_tok' => no further split
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
                     weight_offset, in_dim, out_dim, &x_pre, n_dec, label);
-            g_mneutral_rows = 0;  ///< prefill suffix: tensor-core
-            /* L158 inc 4: the suffix reads the producer's full-width slot
-             * through a row window; an offset f32 view keyed no slot and used
-             * to be quantised here -- that path is gone. */
+            g_batch_decode_rows = 0;
+            /* The suffix is the step's prefill run: tensor-core window arm at
+             * any width (GATE 2 grades its rows for correctness).  L158 inc 4:
+             * the window reads the producer's full-width slot; an offset f32
+             * view keyed no slot and used to be quantised here -- that path is
+             * gone. */
             (void)out_suf; (void)x_suf;
             int r2 = cuda_matmul_fp8_mx_window(out, model_map, model_size,
                     weight_offset, in_dim, out_dim, x, n_dec, n_tok - n_dec, label);
-            g_mneutral_rows = saved;
+            g_batch_decode_rows = saved;
             return r1 && r2;
         }
     }
@@ -1976,45 +1971,35 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * real variable was n_tok against the allocation. */
         if (weight_offset > model_size || fbytes > model_size - weight_offset ||
             x->bytes < n_tok * in_dim * sizeof(float)) return 0;
-        /* Small batches (spec-decode verify, n_tok 2..4): batched GEMV over the
-         * de-interleaved weight. One weight-row read serves all tokens, vs the
-         * tensor-core tile path which is latency-bound at these shapes (the
-         * measured "CUTLASS launch storm" that made verify(3) cost ~2x a decode
-         * token). Bit-identical per token to the n=1 kernel, so verify logits match
-         * the decode path's numerics.  (Until L158, 2026-09-03, an f32-activation
-         * twin of each kernel sat behind this arm for the no-slot case; the pair
-         * of f32 kernels is deleted and the no-slot case refuses.)  The claim
-         * was silently false from the day A8 converted n==1 and left
-         * this arm on f32 until 0a60a1a converted it too.  (A sentence ended
-         * here describing an env override that dispatched tensor-core for all
-         * n_tok>1; the override is gone and the sentence had been truncated
-         * mid-clause for however long, so it goes with it.) */
-        /* 2026-07-21: raising this default 4 -> 8 was TRIED and REVERTED. The
-         * "bit-identical" claim above is GEMV-n vs GEMV-1 -- it does NOT extend to
-         * the cuBLASLt dispatch this cap hands off to, which is what widening the
-         * window actually swaps out. Measured at verify width 6: all 129280 logits
-         * differ, max |d| 1.674, RMS 0.312 vs sigma 6.02, and 115/128 generated
-         * tokens change. It also reaches real prefill -- the final chunk keeps the
-         * exact remainder, so a 4102-token prompt at chunk 4096 ends on n_tok=6 and
-         * its logits move (4100 -> n_tok=4 is byte-identical, control). The
-         * prefill byte-exact gate pins chunk 4096 with depths 512/2048/4096/6144
-         * DID once never land a 5..8 remainder -- depth 4102 was added precisely
-         * to cover it (4102 = 4096 + 6), and it is the depth that moves whenever
-         * this cap or the MoE kernel choice changes. Keep 4.
-         * The width-6 verify win is real but belongs entirely to moe_gemv_cap
-         * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
-        static const int gemv_max_n = (int)PULSAR_GEMV_NT_CAP;
-        /* inc 2: raise the custom-nt cap for a batched step so armed widths keep
-         * the M-independent kernel instead of cuBLASLt. Default cap (gemv_max_n=4)
-         * is unchanged for classic prefill (never armed) and for the decode-only
-         * lane (n_tok<=4), which take the identical cases 2/3/4 below. The armed
-         * cap is PULSAR_GPU_MNEUTRAL_ROWS_MAX, static_assert-tied to
-         * PULSAR_MSEQ_MAX (it drifted once: caps stayed 8 while MSEQ went 16). */
-        const uint64_t nt_cap = (g_mneutral_rows > 0)
-                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)gemv_max_n;
-        /* nt_cap is 4 or MNEUTRAL_ROWS_MAX, so <= nt_cap already bounds the
-         * row count; the explicit MNEUTRAL conjunct here was provably true (K13). */
-        if (n_tok >= 2 && n_tok <= nt_cap && in_dim % 128 == 0) {
+        /* Row kind (see the header at g_batch_decode_rows).  The split above
+         * has already run, so n_dec is 0 (prefill rows) or >= n_tok (decode). */
+        const int decode_kind = g_batch_decode_rows > 0;
+        if (!decode_kind) {
+            /* PREFILL rows, any n_tok (one included): the cuBLASLt MX
+             * tensor-core GEMM, and only that -- a failure inside it (handle,
+             * workspace arena, heuristic, the matmul itself) is refused here.
+             * Until L164 it fell to the per-token GEMV; until L167 a 1-row
+             * prefill chunk took the GEMV by row count. */
+            if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
+                    weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+            fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (prefill rows, n_tok=%llu "
+                            "in_dim=%llu out_dim=%llu) -- refusing\n",
+                    label ? label : "weights", (unsigned long long)n_tok,
+                    (unsigned long long)in_dim, (unsigned long long)out_dim);
+            return 0;
+        }
+        /* DECODE rows, n_tok 2..cap (spec-verify batches, drafter forwards):
+         * batched GEMV over the de-interleaved weight.  One weight-row read
+         * serves every row; each row's result is bit-identical to the n == 1
+         * kernel's below, so a row's bytes do not depend on the batch width.
+         * (Until L158 an f32-activation twin of each kernel sat behind this
+         * arm for the no-slot case; the no-slot case refuses.) */
+        if (n_tok >= 2) {
+            if (in_dim % 128 != 0) {
+                fprintf(stderr, "pulsar: mxfp8 '%s' decode GEMV needs in_dim %% 128 == 0 (in_dim=%llu) "
+                                "-- refusing\n", label ? label : "?", (unsigned long long)in_dim);
+                return 0;
+            }
             const fp8_mx_weight *bw = cuda_fp8_mx_weight(model_map, weight_offset, fbytes,
                                                          in_dim, out_dim, label);
             if (bw) {
@@ -2075,22 +2060,12 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                  * fallback that stood here is gone; see act_a8_missing_fail). */
                 return act_a8_missing_fail("verify-batch GEMV", n_tok, in_dim, out_dim);
             }
-        }
-        /* Prefill (n_tok > 1) is the cuBLASLt MX tensor-core GEMM, and only
-         * that: a failure inside it (handle, workspace arena, heuristic, the
-         * matmul itself) is reported and refused here.  Until L164 it fell
-         * through to the per-token GEMV loop below -- a different kernel with a
-         * different accumulation order, taken exactly when something upstream
-         * had gone wrong, with no message.  The loop is the n_tok == 1 arm. */
-        if (n_tok > 1) {
-            if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
-                    weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
-            fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (n_tok=%llu in_dim=%llu "
-                            "out_dim=%llu) -- refusing to fall through to the per-token GEMV\n",
-                    label ? label : "weights", (unsigned long long)n_tok,
-                    (unsigned long long)in_dim, (unsigned long long)out_dim);
+            fprintf(stderr, "pulsar: mxfp8 '%s' decode GEMV: de-interleaved weight did not resolve "
+                            "(in_dim=%llu out_dim=%llu) -- refusing\n",
+                    label ? label : "?", (unsigned long long)in_dim, (unsigned long long)out_dim);
             return 0;
         }
+        /* DECODE row, n_tok == 1: the one-row GEMV. */
         const unsigned wpb = 8;  ///< output rows per block
         dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
         /* Prefer the de-interleaved cached weight (contiguous E4M3 -> coalesced 128-wide
@@ -2216,7 +2191,7 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * M-independent, prefill suffix [n_dec,n_tok) tensor-core, via pure-regime
      * recursion. */
     {
-        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < n_tok) {
             const uint64_t inb = in_dim * sizeof(float), outb = out_dim * sizeof(float);
             pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
@@ -2225,12 +2200,12 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
                                                              out->bytes - n_dec * outb);
             pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
                                                              x->bytes - n_dec * inb);
-            const int saved = g_mneutral_rows;
-            g_mneutral_rows = (int)n_dec;
+            const int saved = g_batch_decode_rows;
+            g_batch_decode_rows = (int)n_dec;
             int r1 = matmul_bf16_wptr(&out_pre, w, in_dim, out_dim, &x_pre, n_dec);
-            g_mneutral_rows = 0;
+            g_batch_decode_rows = 0;
             int r2 = matmul_bf16_wptr(&out_suf, w, in_dim, out_dim, &x_suf, n_tok - n_dec);
-            g_mneutral_rows = saved;
+            g_batch_decode_rows = saved;
             return r1 && r2;
         }
     }
@@ -2275,9 +2250,32 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * larger than the f32 arm's, not smaller" until 2026-08-17, which was true
      * and was the bug. */
     {
-        const uint64_t nt_cap = (g_mneutral_rows > 0)
-                ? (uint64_t)PULSAR_GPU_MNEUTRAL_ROWS_MAX : (uint64_t)PULSAR_GEMV_NT_CAP;
-        if (n_tok >= 2 && n_tok <= nt_cap) {
+        /* Row kind (see the header at g_batch_decode_rows): prefill rows take
+         * cublasGemmEx at any n_tok, one included; decode rows take the nt
+         * kernels at 2..cap and the one-row kernel below at 1. */
+        const int decode_kind = g_batch_decode_rows > 0;
+        if (!decode_kind) {
+            if (!g_cublas_ready) {
+                fprintf(stderr, "pulsar: bf16 GEMM on prefill rows (n_tok=%llu in_dim=%llu out_dim=%llu): "
+                                "cuBLAS handle not ready -- refusing\n", (unsigned long long)n_tok,
+                        (unsigned long long)in_dim, (unsigned long long)out_dim);
+                return 0;
+            }
+            const uint16_t *xb = (const uint16_t *)xb16;
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            cublasStatus_t st = cublasGemmEx(g_cublas,
+                                             CUBLAS_OP_T, CUBLAS_OP_N,
+                                             (int)out_dim, (int)n_tok, (int)in_dim,
+                                             &alpha,
+                                             w, CUDA_R_16BF, (int)in_dim,
+                                             xb, CUDA_R_16BF, (int)in_dim,
+                                             &beta,
+                                             out->ptr, CUDA_R_32F, (int)out_dim,
+                                             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            return cublas_ok(st, "bf16 matmul");
+        }
+        if (n_tok >= 2) {
             #define PULSAR_NT_LAUNCH_R(N, RR) matmul_nt_kernel<N, RR, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \
                     (float *)out->ptr, (const __nv_bfloat16 *)w,                        \
                     xb16, in_dim, out_dim)
@@ -2308,21 +2306,9 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
             return cuda_ok(cudaGetLastError(), "matmul_bf16 nt launch");
         }
     }
-    if (g_cublas_ready && n_tok > 1) {
-        const uint16_t *xb = (const uint16_t *)xb16;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        cublasStatus_t st = cublasGemmEx(g_cublas,
-                                         CUBLAS_OP_T, CUBLAS_OP_N,
-                                         (int)out_dim, (int)n_tok, (int)in_dim,
-                                         &alpha,
-                                         w, CUDA_R_16BF, (int)in_dim,
-                                         xb, CUDA_R_16BF, (int)in_dim,
-                                         &beta,
-                                         out->ptr, CUDA_R_32F, (int)out_dim,
-                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-        return cublas_ok(st, "bf16 matmul");
-    }
+    /* DECODE row, n_tok == 1: the one-row kernel.  (A cuBLAS handle that was
+     * not ready used to land any n_tok here -- a fallback; prefill rows now
+     * refuse instead.) */
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr, w, xb16, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
@@ -2422,14 +2408,13 @@ int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, 
 
 /* Decode grouped "a" projection: prefer the de-interleaved cached weight (vectorized
  * coalesced loads) over the raw 33B kernel. Bit-exact. */
-/* L141: one A8 launch for every n the M-neutral lane can carry.  n == 1 keeps
- * the one-token kernel; 2..PULSAR_GPU_MNEUTRAL_ROWS_MAX stage each weight
- * block once for all rows.  Anything wider is not reachable today (above
- * a_gemv_max_n the tensor-core arm runs unless M-neutral, whose cap this
- * switch enumerates) and falls back to the per-token grid: a new caller gets
- * the old cost, never a different answer. */
+/* L141: one A8 launch for every decode-row count the setter admits.  n == 1
+ * keeps the one-token kernel; 2..PULSAR_GPU_MNEUTRAL_ROWS_MAX stage each
+ * weight block once for all rows.  Prefill rows take the tensor-core 'a' arm
+ * and never reach here; a wider call is refused (the per-token grid that used
+ * to catch it was a fallback nobody measured). */
 static_assert(PULSAR_GPU_MNEUTRAL_ROWS_MAX == 16u,
-              "grouped_fp8mx_a_a8_rows enumerates NT up to the M-neutral row cap");
+              "grouped_fp8mx_a_a8_rows enumerates NT up to the row cap");
 static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, int KBp,
         const __nv_fp8_e4m3 *xq, const unsigned char *sx, int xKBp, uint64_t slab,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint32_t n_tokens,
@@ -2461,12 +2446,12 @@ static int launch_grouped_fp8mx_a_a8_rows(float *low, const fp8_mx_weight *dw, i
     case 15: PULSAR_OA_NT(15); break;
     case 16: PULSAR_OA_NT(16); break;
     default:
-        grouped_fp8mx_a_warp8_a8_kernel<<<dim3(gx, n_tokens, 1), 256>>>(
-                low, dw->data, dw->scale, KBp, xq, sx, xKBp, slab,
-                group_dim, rank, n_groups, n_tokens, x_tok_stride, blocks);
-        break;
+        #undef PULSAR_OA_NT
+        fprintf(stderr, "pulsar: %s: n_tokens=%u is above the row cap %u -- refusing "
+                        "(the tensor-core 'a' arm owns this width)\n",
+                what, n_tokens, (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        return 0;
     }
-    #undef PULSAR_OA_NT
     return cuda_ok(cudaGetLastError(), what);
 }
 
@@ -2568,7 +2553,7 @@ int pulsar_gpu_attention_output_batch_tensor(
      * and the mxfp8 'b' path then run their PURE code for each range (the 'b' proj
      * recurses no further: its sub-range already has n_dec in {n_tok',0}). */
     {
-        const uint64_t n_dec = (uint64_t)g_mneutral_rows;
+        const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < (uint64_t)n_tokens) {
             const uint64_t low_dim = (uint64_t)n_groups * rank;
             const uint64_t headb = (uint64_t)n_groups * group_dim * PULSAR_HEADS_ELT_SIZE;
@@ -2581,17 +2566,18 @@ int pulsar_gpu_attention_output_batch_tensor(
             pulsar_gpu_tensor low_suf = pulsar_tensor_subview(low, n_dec * lowb, low->bytes - n_dec * lowb);
             pulsar_gpu_tensor hd_suf  = pulsar_tensor_subview(heads, n_dec * headb,
                                                              heads->bytes - n_dec * headb);
-            const int saved = g_mneutral_rows;
-            g_mneutral_rows = (int)n_dec;
+            const int saved = g_batch_decode_rows;
+            g_batch_decode_rows = (int)n_dec;
             int r1 = pulsar_gpu_attention_output_batch_tensor(&out_pre, &low_pre, model_map,
                     model_size, out_a_offset, out_b_offset, group_dim, rank, n_groups,
                     out_dim, &hd_pre, (uint32_t)n_dec);
-            g_mneutral_rows = 0;
-            /* L158 inc 4: the suffix's 'a' reads the producer's full-width
-             * grouped encoding through a row window (tensor-core arm at any
-             * width); its `low` is then emitted and consumed as its own
-             * producer/consumer pair, as before.  An offset heads view keyed
-             * no encoding and used to be quantised -- that path is gone. */
+            g_batch_decode_rows = 0;
+            /* The suffix is a prefill run inside a step wider than the cap:
+             * its 'a' takes the tensor-core arm at any width, reading the
+             * producer's full-width grouped encoding through a row window
+             * (L158 inc 4); its `low` is then emitted and consumed as its own
+             * producer/consumer pair.  An offset heads view keyed no encoding
+             * and used to be quantised -- that path is gone. */
             (void)hd_suf;
             const uint32_t n_suf = n_tokens - (uint32_t)n_dec;
             int r2 = cuda_attention_output_a_mx_gemm(&low_suf, model_map, model_size, out_a_offset,
@@ -2599,7 +2585,7 @@ int pulsar_gpu_attention_output_batch_tensor(
             if (r2) r2 = emit_low_e4m3(&low_suf, n_suf, low_dim);
             if (r2) r2 = cuda_matmul_mxfp8_tensor_labeled(&out_suf, model_map, model_size, out_b_offset,
                                                           low_dim, out_dim, &low_suf, n_suf, "attn_output_b");
-            g_mneutral_rows = saved;
+            g_batch_decode_rows = saved;
             return r1 && r2;
         }
     }
@@ -2618,29 +2604,23 @@ int pulsar_gpu_attention_output_batch_tensor(
         return 0;
     }
 
-    /* "a" projection: prefill takes the block-scaled MXFP8xMXFP8 tensor-core
-     * GEMMs; decode and small verify batches (n_tokens<=4) take the
-     * register-blocked GEMV path (launch_grouped_fp8mx_a dispatches the nt
-     * variant at 2..4 -- one launch vs 8 per-group GEMMs, bit-identical per
-     * token to decode's kernel).  (A sentence ended here describing an env
-     * override that restored the dispatch for all n_tokens>1; the override is
-     * gone and the sentence was truncated mid-clause.  The same fragment,
-     * near-verbatim, sat at the mxfp8 nt cap -- one edit left both behind.) */
-    /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
-     * for the measurement).  It shared its cap with that gate, so the two
-     * defaults must move together. */
-    static const int a_gemv_max_n = (int)PULSAR_GEMV_NT_CAP;
-    int a_done = 0;
-    /* plan-34 inc 2: a batched multiseq/mixed step must NOT take the M-dependent
-     * tensor-core (cuBLASLt) 'a' GEMM -- fall to launch_grouped_fp8mx_a, whose
-     * warp8/nt kernels are per-token M-independent (bit-identical to the n=1
-     * DEINT kernel), so a co-scheduled decode bank's attn-output row is invariant
-     * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
-    if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0) {
-        a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
-                                                 group_dim, rank, n_groups, heads, n_tokens, 0);
-    }
-    if (!a_done) {
+    /* "a" projection by row kind (see the header at g_batch_decode_rows; the
+     * split above leaves n_dec at 0 or >= n_tokens): prefill rows take the
+     * block-scaled MXFP8xMXFP8 tensor-core GEMMs at any n_tokens, one
+     * included; decode rows take launch_grouped_fp8mx_a -- the warp8/nt A8
+     * kernels, one launch for all groups, each row bit-identical to the
+     * n == 1 kernel, so a row's attn-output bytes do not depend on its
+     * batchmates.  Either arm runs or the call refuses; the tensor-core arm's
+     * failure used to fall to the GEMV. */
+    if (g_batch_decode_rows == 0) {
+        if (!cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
+                                             group_dim, rank, n_groups, heads, n_tokens, 0)) {
+            fprintf(stderr, "pulsar: attn-out 'a' tensor-core GEMM failed (n_tokens=%u rank=%llu "
+                            "group_dim=%llu) -- refusing\n",
+                    n_tokens, (unsigned long long)rank, (unsigned long long)group_dim);
+            return 0;
+        }
+    } else {
         if (!launch_grouped_fp8mx_a((float *)low->ptr, model_map, out_a_offset, out_a_bytes,
                                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
                                     (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;

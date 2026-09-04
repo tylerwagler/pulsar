@@ -1,19 +1,19 @@
-/* L151 SWEEP: the M-independent nt kernels vs the tensor-core/cuBLASLt arms,
- * per dense GEMM shape, at every decode-sized row count.
+/* L151 SWEEP: the dense GEMM dispatch per production shape at every
+ * decode-sized row count, both row kinds.
  *
  * MODEL-DEPENDENT (real weights, real cache, real dispatch): `make cuda-nt-sweep`.
- * For each production dense shape and M in {1..16} it times the SAME wrapper
- * call twice: unarmed (the default dispatch: nt up to PULSAR_GEMV_NT_CAP = 4
- * rows, cuBLASLt/tensor-core above) and armed
- * (pulsar_gpu_matmul_set_batch_mneutral(M): the nt kernels up to
- * PULSAR_GPU_MNEUTRAL_ROWS_MAX). At M <= 4 both take the nt kernel, so those
- * rows are a repeatability check. The question it answers: is there any M <= 16
- * at which the size-dependent arm is FASTER, i.e. would raising the default cap
- * to 16 (retiring the arm/disarm flag, L151) cost anything?
+ * For each production dense shape and M in {1..16} it times the engine's own
+ * wrapper call twice: with the M rows declared DECODE rows
+ * (pulsar_gpu_matmul_set_batch_decode_rows(M): the M-independent GEMV/nt
+ * arms, what a verify step or drafter forward of M rows runs) and declared
+ * PREFILL rows (count 0: cuBLASLt/tensor-core at every M, what an M-row
+ * remainder chunk runs).  Since L167 row KIND chooses the arm, not row count,
+ * so the two columns are the two lanes' costs for the same shape (rule 8:
+ * sweep kernels across M).
  *
- * Host wall-clock around 40 launches + one sync, per (shape, M, arm); launch
- * cost is included equally on both sides. GB/s is weight bytes / time, the
- * bandwidth-bound ceiling being ~273 GB/s on the GB10.
+ * Host wall-clock around 40 launches + one sync, per (shape, M, kind); GB/s
+ * is weight bytes / decode time, the bandwidth-bound ceiling being ~273 GB/s
+ * on the GB10.
  *
  * MoE experts are NOT here: their two tiers (per-expert vs grouped cutlass)
  * take routing and a real batch; L146 measured them in-engine (grouped loses
@@ -117,10 +117,10 @@ int main(int argc, char **argv) {
     const int NM = (int)(sizeof(Ms) / sizeof(Ms[0]));
     const uint32_t MMAX = 16;
     const int reps = 40;
-    printf("layer %u; times are us per call (%d launches + 1 sync); 'unarmed' = default dispatch "
-           "(nt <= %u rows, tensor-core above), 'armed' = M-neutral (nt <= %u rows)\n\n",
-           il, reps, 4u, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
-    printf("%-20s %-6s %5s | %9s %9s | %7s | %s\n", "shape", "fmt", "M", "unarmed", "armed", "ratio", "armed GB/s (weights/time)");
+    printf("layer %u; times are us per call (%d launches + 1 sync); 'decode' = rows declared decode "
+           "(GEMV/nt arms, <= %u rows), 'prefill' = rows declared prefill (tensor-core at every M)\n\n",
+           il, reps, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+    printf("%-20s %-6s %5s | %9s %9s | %7s | %s\n", "shape", "fmt", "M", "decode", "prefill", "ratio", "decode GB/s (weights/time)");
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         const pulsar_tensor *w = shapes[si].w;
         gemm_ctx c;
@@ -147,14 +147,12 @@ int main(int argc, char **argv) {
                               (w->type == PULSAR_TENSOR_BF16 ? 2.0 : 1.03);
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            const double tu = time_launches(gemm_launch, &c, M, reps);
-            pulsar_gpu_matmul_set_batch_mneutral((int)M);
-            const double ta = time_launches(gemm_launch, &c, M, reps);
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f%s\n", shapes[si].name, type_name(w->type),
-                   M, tu, ta, tu > 0 && ta > 0 ? tu / ta : 0.0, ta > 0 ? wbytes / ta / 1e3 : 0.0,
-                   M <= 4 ? "   (both nt: repeatability)" : "");
+            if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
+            const double td = time_launches(gemm_launch, &c, M, reps);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+            const double tp = time_launches(gemm_launch, &c, M, reps);
+            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f\n", shapes[si].name, type_name(w->type),
+                   M, td, tp, td > 0 && tp > 0 ? tp / td : 0.0, td > 0 ? wbytes / td / 1e3 : 0.0);
         }
         pulsar_gpu_mxfp8_act_cache_disarm();
         pulsar_gpu_tensor_free(c.x);
@@ -184,14 +182,12 @@ int main(int argc, char **argv) {
         const double wbytes = ((double)L->attn_output_a->elements + (double)L->attn_output_b->elements) * 1.03;
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            const double tu = time_launches(attnout_launch, &a, M, reps);
-            pulsar_gpu_matmul_set_batch_mneutral((int)M);
-            const double ta = time_launches(attnout_launch, &a, M, reps);
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f%s\n", "attn_output a+b", "mxfp8", M, tu, ta,
-                   tu > 0 && ta > 0 ? tu / ta : 0.0, ta > 0 ? wbytes / ta / 1e3 : 0.0,
-                   M <= 4 ? "   (both nt: repeatability)" : "");
+            if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) return 1;
+            const double td = time_launches(attnout_launch, &a, M, reps);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+            const double tp = time_launches(attnout_launch, &a, M, reps);
+            printf("%-20s %-6s %5u | %9.1f %9.1f | %7.2f | %6.0f\n", "attn_output a+b", "mxfp8", M, td, tp,
+                   td > 0 && tp > 0 ? tp / td : 0.0, td > 0 ? wbytes / td / 1e3 : 0.0);
         }
         pulsar_gpu_tensor_free(a.heads);
         pulsar_gpu_tensor_free(a.low);

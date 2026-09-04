@@ -38,7 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 16 = PULSAR_GPU_MNEUTRAL_ROWS_MAX: the whole armed M-neutral range.  The
+/* 16 = PULSAR_GPU_MNEUTRAL_ROWS_MAX: the whole M-independent row range.  The
  * sweep stopped at 8 until 2026-09-02 (L152/L153) -- the same blind spot every
  * other gate had, and where the 8-vs-9-row MoE cap defect lived. */
 #define GATE_MAX_N 16

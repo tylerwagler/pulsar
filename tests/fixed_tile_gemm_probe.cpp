@@ -2,10 +2,11 @@
  * M-neutral and cuBLASLt-flat on the <= 16-row dense step?
  *
  * MODEL-DEPENDENT (real MXFP8_LT weights): `make cuda-fixed-tile-probe`.
- * For each dense shape and M in {1..16} it times three arms on the same
+ * For each dense shape and M in {1..16} it times two arms on the same
  * f32 activation rows:
- *   unarmed  -- the default dispatch (nt <= 4 rows, cuBLASLt above)
- *   armed    -- M-neutral (nt kernels up to 16 rows)
+ *   engine   -- the engine's dispatch with the M rows declared DECODE rows
+ *               (pulsar_gpu_matmul_set_batch_decode_rows(M): the M-independent
+ *               GEMV/nt arms, the served verify-step shape; L167)
  *   ft64/128 -- the probe's CUTLASS block-scaled MXFP8 x MXFP8 GEMM with a
  *               fixed 128 x TN x 128 tile (fixed_tile_gemm_kernels.cu), fed the
  *               engine's own E4M3 bytes and the LT weight slabs
@@ -16,8 +17,8 @@
  *      same rows of the 16-row call, for every M (mismatching floats counted);
  *   3. layout: how many weight scale bytes the CUTLASS SFB layout places at a
  *      different offset than the LT slab (0 = the LT slab is usable as-is).
- * Also printed: max |ft - unarmed| and max |ft - armed| per shape, so the
- * accumulation-order distance to both existing arms is on record.
+ * Also printed: max |ft - engine| per shape, so the accumulation-order
+ * distance to the engine's arm is on record.
  *
  * Host wall-clock around 40 launches + one sync per arm, as in the L151 sweep. */
 #include "pulsar.h"
@@ -114,8 +115,10 @@ int main(int argc, char **argv) {
     const uint32_t MMAX = 16;
     const int reps = 40;
     int rc = 0;
-    printf("layer %u; us per call (%d launches + 1 sync). unarmed = default dispatch (nt <= 4, cuBLASLt above); "
-           "armed = M-neutral nt; ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; bf16: 64xTNx32 mma.sync)\n\n", il, reps);
+    printf("layer %u; us per call (%d launches + 1 sync). engine = the dispatch with M rows declared decode "
+           "(GEMV/nt arms, <= %u rows); ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; "
+           "bf16: 64xTNx32 mma.sync)\n\n",
+           il, reps, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         const pulsar_tensor *w = shapes[si].w;
         const bool is_bf16 = w->type == PULSAR_TENSOR_BF16;
@@ -154,10 +157,10 @@ int main(int argc, char **argv) {
                    shapes[si].name, K, N, wbytes / 1e6, sfb_mismatch, (unsigned long long)N * (K / 32),
                    sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
         }
-        printf("  %5s | %9s %9s | %9s %9s | %8s %8s | %10s %10s | %s\n", "M", "unarmed", "armed", "ft64", "ft128",
-               "ft64GB/s", "ft128GBs", "|ft64-un|", "|ft64-arm|", "neutral(ft64/ft128: rows==M16)");
+        printf("  %5s | %9s | %9s %9s | %8s %8s | %10s | %s\n", "M", "engine", "ft64", "ft128",
+               "ft64GB/s", "ft128GBs", "|ft64-eng|", "neutral(ft64/ft128: rows==M16)");
         /* neutrality references: the 16-row ft outputs */
-        std::vector<float> ref64, ref128, cur, ref_un, ref_arm;
+        std::vector<float> ref64, ref128, cur, ref_eng;
         for (int tn = 64; tn <= 128; tn += 64) {
             c.tn = tn;
             if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "ft%d at M=16 failed for %s\n", tn, shapes[si].name); rc = 1; break; }
@@ -166,14 +169,11 @@ int main(int argc, char **argv) {
         if (rc) break;
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            const double tu = time_launches(engine_launch, &c, M, reps);
-            if (!read_out(c.out, ref_un, (uint64_t)M * N)) { rc = 1; break; }
-            pulsar_gpu_matmul_set_batch_mneutral((int)M);
-            const double ta = time_launches(engine_launch, &c, M, reps);
-            if (!read_out(c.out, ref_arm, (uint64_t)M * N)) { rc = 1; break; }
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            double tf[2] = {-1, -1}, dun = 0, darm = 0;
+            if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) { rc = 1; break; }
+            const double te = time_launches(engine_launch, &c, M, reps);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+            if (!read_out(c.out, ref_eng, (uint64_t)M * N)) { rc = 1; break; }
+            double tf[2] = {-1, -1}, deng = 0;
             uint64_t bad[2] = {0, 0};
             for (int ti = 0; ti < 2; ti++) {
                 c.tn = ti == 0 ? 64 : 128;
@@ -183,11 +183,11 @@ int main(int argc, char **argv) {
                 const std::vector<float> &ref = ti == 0 ? ref64 : ref128;
                 for (uint64_t i = 0; i < (uint64_t)M * N; i++)
                     if (memcmp(&cur[i], &ref[i], sizeof(float)) != 0) bad[ti]++;
-                if (ti == 0) { dun = max_abs_diff(cur, ref_un, (uint64_t)M * N); darm = max_abs_diff(cur, ref_arm, (uint64_t)M * N); }
+                if (ti == 0) deng = max_abs_diff(cur, ref_eng, (uint64_t)M * N);
             }
             if (rc) break;
-            printf("  %5u | %9.1f %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e %10.3e | %s / %s%s\n", M, tu, ta, tf[0], tf[1],
-                   tf[0] > 0 ? wbytes / tf[0] / 1e3 : 0.0, tf[1] > 0 ? wbytes / tf[1] / 1e3 : 0.0, dun, darm,
+            printf("  %5u | %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e | %s / %s%s\n", M, te, tf[0], tf[1],
+                   tf[0] > 0 ? wbytes / tf[0] / 1e3 : 0.0, tf[1] > 0 ? wbytes / tf[1] / 1e3 : 0.0, deng,
                    bad[0] == 0 ? "YES" : "NO", bad[1] == 0 ? "YES" : "NO",
                    (bad[0] || bad[1]) ? "  <-- rows differ from the 16-row call" : "");
         }

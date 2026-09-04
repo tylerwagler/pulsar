@@ -6,27 +6,6 @@
  * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
  * layer-0 parity self-test (since removed) and the env-gated DSpark
  * dumps — never the production decode path. n is a sample count. */
-/* Host-side f32 -> HC carrier store (task #62). Round-to-nearest-even so a host
- * staged write matches the GPU's __float2bfloat16 store path. NaN is
- * CANONICALIZED to 0x7FFF, which is what cvt.rn.bf16.f32 emits on sm_80+ (and
- * what CUDA's software path returns) — passing the payload through in the high
- * half would NOT match. Inf needs no special case: it rounds exactly through
- * the RNE path below. `dst` is raw carrier bytes, n a sample count. */
-void pulsar_store_hc_carrier_f32(void *dst, const float *src, uint64_t n) {
-    uint16_t *d = (uint16_t *)dst;
-    for (uint64_t i = 0; i < n; i++) {
-        uint32_t x;
-        memcpy(&x, &src[i], sizeof(x));
-        if ((x & 0x7FFFFFFFu) > 0x7F800000u) {       /* NaN -> canonical */
-            d[i] = 0x7FFFu;
-        } else {
-            const uint32_t bias = 0x7FFFu + ((x >> 16) & 1u);   /* RNE; Inf exact */
-            d[i] = (uint16_t)((x + bias) >> 16);
-        }
-    }
-}
-
-
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n) {
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
@@ -301,6 +280,11 @@ bool gpu_graph_dspark_project_main_x(
     pulsar_gpu_tensor *target_concat = g->dspark_concat;
     pulsar_gpu_tensor *proj_out = g->dspark_proj_out;
     if (!target_concat || !proj_out) return false;
+    /* The projection is one DECODE row (the drafter's conditioning); the GEMV
+     * under it takes the M-independent arm.  Restored on exit, so a caller
+     * mid-step (the fused loop seeds up to 5 rows per step) keeps its count. */
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
 
     /* L158 (2026-09-03): this was the ONE dense GEMV in the served lane still
      * multiplying f32 activations.  Three tensor copies built an f32 concat,
@@ -364,7 +348,7 @@ bool gpu_graph_dspark_project_main_x(
     return ok;
 }
 
-void gpu_graph_dspark_seed_draft_kv(
+bool gpu_graph_dspark_seed_draft_kv(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
@@ -376,15 +360,24 @@ void gpu_graph_dspark_seed_draft_kv(
     pulsar_gpu_tensor *kv_out = g->dspark_seed_kv;
     pulsar_gpu_tensor *kv_norm = g->dspark_seed_norm;
     pulsar_gpu_tensor *kv_rot = g->dspark_seed_rot;
-    if (!kv_out || !kv_norm || !kv_rot) return;
+    if (!kv_out || !kv_norm || !kv_rot) {
+        fprintf(stderr, "pulsar: drafter KV seed: seed scratch not allocated -- refusing\n");
+        return false;
+    }
+    /* One DECODE row per layer GEMV (kv projection of main_x). */
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
 
     /* ⚠ THE THREE LAYERS MUST ADVANCE IN LOCKSTEP, so a partial failure rolls the
-     * whole seed back.  This loop used to `continue` past a failed layer without
-     * advancing dspark_n_raw[li], leaving that layer's ring counter behind its
-     * siblings' PERMANENTLY: every later draft then RoPEs at a different sequence
-     * position per layer.  The verifier still rejects the bad drafts, so output
-     * stays exact -- which is precisely why it was invisible.  What degrades is
-     * ACCEPTANCE, silently, for the rest of the session.
+     * whole seed back and the call REFUSES.  This loop used to `continue` past a
+     * failed layer without advancing dspark_n_raw[li], leaving that layer's ring
+     * counter behind its siblings' PERMANENTLY: every later draft then RoPEs at
+     * a different sequence position per layer.  The verifier still rejects the
+     * bad drafts, so output stays exact -- which is precisely why it was
+     * invisible.  What degrades is ACCEPTANCE, silently, for the rest of the
+     * session.  Until L167 the rollback was followed by a once-only WARNING and
+     * the step drafted unseeded -- the same silent acceptance dip, one step
+     * wide; now the caller's spec round refuses instead.
      *
      * Rolling the counters back is enough to stay consistent: rows already
      * written sit at ring slots the counters no longer reach, so nothing reads
@@ -466,16 +459,13 @@ void gpu_graph_dspark_seed_draft_kv(
         g->dspark_n_raw[0] = n_raw_entry[0];
         g->dspark_n_raw[1] = n_raw_entry[1];
         g->dspark_n_raw[2] = n_raw_entry[2];
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING drafter KV seed failed (%u row(s)) -- rolled the "
-                    "three layers back to %u/%u/%u to keep them in step; this step's "
-                    "draft is unseeded and acceptance will dip until the next seed\n",
-                    n_rows, n_raw_entry[0], n_raw_entry[1], n_raw_entry[2]);
-        }
+        fprintf(stderr,
+                "pulsar: drafter KV seed failed (%u row(s)); the three layers are rolled "
+                "back to %u/%u/%u -- refusing the spec round rather than drafting unseeded\n",
+                n_rows, n_raw_entry[0], n_raw_entry[1], n_raw_entry[2]);
+        return false;
     }
+    return true;
 }
 
 bool gpu_graph_dspark_draft_forward(
@@ -567,25 +557,19 @@ bool gpu_graph_dspark_draft_forward_banks(
     }
     struct MetaGuard {
         pulsar_gpu_tensor **r, **v, *s;
-        bool armed;
         ~MetaGuard() {
             for (int i = 0; i < 3; i++) { pulsar_gpu_tensor_free(r[i]); pulsar_gpu_tensor_free(v[i]); }
             pulsar_gpu_tensor_free(s);
-            if (armed) pulsar_gpu_matmul_set_batch_mneutral(0);
         }
-    } meta_guard = { meta_rope, meta_vis, meta_seq, false };
-    if (banked) {
-        /* M-NEUTRAL for the whole banked forward (the verify step's L146 rule):
-         * every dense GEMM, the grouped attention-output GEMV, the head and the
-         * MoE take their row-independent arms, so a bank's rows compute the
-         * same bytes whether it rides the forward alone or with others. Without
-         * this, 3 rows take the nt kernels and 9 rows take cuBLASLt, and the
-         * identity gate sees 1-4% confidence drift and the odd flipped draft.
-         * The cap is the arms' row budget; the caller groups banks to fit. */
-        if (n_draft > PULSAR_GPU_MNEUTRAL_ROWS_MAX) return false;
-        pulsar_gpu_matmul_set_batch_mneutral((int)n_draft);
-        meta_guard.armed = true;
-    }
+    } meta_guard = { meta_rope, meta_vis, meta_seq };
+    /* Every row of a drafter forward -- banked or the single-bank one -- is a
+     * DECODE row: declare the count so every dense GEMM, the attn-out GEMV,
+     * the heads and the MoE under it take the M-independent arms whatever the
+     * batch width (until L167 the single-bank forward declared nothing and
+     * its 5..16-row GEMMs took cuBLASLt by row count).  The setter refuses a
+     * forward wider than the cap; the caller groups banks to fit it. */
+    pulsar_decode_rows_scope rows(n_draft);
+    if (!rows.ok()) return false;
     /* L106 K2a: the drafter hand-rolls its attention half and never passes
      * through the batch encode whose first act is the gact disarm -- so a
      * gact entry armed and noted by a prior prefill chunk or spec verify of
@@ -929,13 +913,20 @@ bool gpu_graph_dspark_draft_forward_banks(
     return ok;
 }
 
-/* Encode the final HC collapse, output norm, and vocab projection on GPU. */
+/* Encode the final HC collapse, output norm, and vocab projection on GPU for
+ * ONE row (g->cur_hc): the last row of a whole/chunked prefill.  Its logits are
+ * the first decode output -- the same distribution the classic decode step
+ * produces with the one-row GEMV -- so the row is declared a DECODE row and
+ * the vocab GEMM takes the M-independent arm (as it did before L167, by row
+ * count).  The callers are the prefill lane, which declares nothing itself. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
     bool ok = gpu_graph_norm_mix_plain((const pulsar_model *)model, weights->output_hc_fn,
                                        hc_dim, PULSAR_N_HC, g->cur_hc, g->output_pre);
     if (ok) {

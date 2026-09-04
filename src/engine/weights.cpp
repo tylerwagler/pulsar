@@ -1227,32 +1227,6 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
 
 
 
-/* Load one token embedding row and expand it to float activations. */
-void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out) {
-    pulsar_tensor *te = w->token_embd;
-    if (token < 0 || (uint64_t)token >= te->dim[1]) {
-        pulsar_die("token id is outside the embedding table");
-    }
-
-    const uint16_t *base = (const uint16_t *)tensor_data(m, te);
-    const uint64_t stride = te->dim[0];
-    const uint16_t *row = base + (uint64_t)token * stride;
-
-    /* Same 2-byte stride either way; only the decode differs. bf16 is the top
-     * 16 bits of the f32, so widening is a shift, not a conversion. */
-    if (te->type == PULSAR_TENSOR_BF16) {
-        for (uint64_t i = 0; i < stride; i++) {
-            const uint32_t bits = (uint32_t)row[i] << 16;
-            float v;
-            memcpy(&v, &bits, sizeof(v));
-            out[i] = v;
-        }
-    } else {
-        for (uint64_t i = 0; i < stride; i++) {
-            out[i] = f16_to_f32(row[i]);
-        }
-    }
-}
 
 
 
