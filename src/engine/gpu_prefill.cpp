@@ -103,8 +103,15 @@ bool gpu_graph_upload_prompt_tokens(
 
 
 
-/* Rebuild ratio-4 compressor state after chunked prefill so a following decode
- * token sees the same rolling compression window. */
+/* Rebuild the ratio-4 compressor state from a chunk's last four rows,
+ * re-projected as DECODE rows (the M-independent nt arm at n = 4): the state
+ * is what the decode path would have stored for those positions, so the
+ * window a following decode token folds into is built by the decode kernels
+ * rather than by the chunk's tensor-core projection.  Needs four rows: a
+ * shorter chunk has no complete window to rebuild and is REFUSED.  The
+ * batched compressor paths that call this run on ratio-aligned chunks
+ * (n_tokens % 4 == 0) or on a whole prompt, and a whole prompt shorter than
+ * the window skips the call (see the zero-prefix sites). */
 static bool gpu_graph_refresh_ratio4_compressor_state(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
@@ -118,20 +125,23 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
         uint32_t          pos0,
         uint32_t          n_tokens) {
     if (n_tokens < 4) {
-        return true;
+        fprintf(stderr, "pulsar: ratio-4 compressor state rebuild needs a chunk of >= 4 rows, got %u "
+                        "at pos0=%u -- refusing (a whole prompt shorter than the window is skipped by "
+                        "the caller; the chunked paths run this on ratio-aligned chunks only)\n",
+                n_tokens, pos0);
+        return false;
     }
     if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
         head_dim == 0 || width == 0) {
         return false;
     }
 
-    /*
-     * The recurrent ratio-4 state is intentionally rebuilt from the last
-     * four tokens using the small-batch projection kernel. The full-chunk
-     * projection is already available, but it uses the matrix-matrix path;
-     * mixing those two accumulation orders changes a few FP8 rounding
-     * decisions in later chunks.
-     */
+    /* Re-project the last four rows as decode rows and rebuild the state from
+     * them (pulsar_gpu_compressor_prefill_state_ratio4_tensor).  The chunk's
+     * own projections of these rows sit in batch_comp_kv/_sc already, from the
+     * prefill (tensor-core) arm, whose accumulation order differs. */
+    pulsar_decode_rows_scope rows(4u);
+    if (!rows.ok()) return false;
     pulsar_gpu_tensor *tail_hc = pulsar_gpu_tensor_view(
             g->batch_attn_norm,
             (uint64_t)(n_tokens - 4u) * PULSAR_N_EMBD * sizeof(float),
@@ -173,45 +183,13 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
 
 
 
-/* CPU fallback for seeding batched HC state from token embeddings.  It is still
- * useful for tiny speculative verifier batches where a separate GPU embedding
- * command buffer costs more than the small host write. */
-static bool gpu_graph_upload_prompt_embeddings_hc_cpu(
-        pulsar_gpu_tensor   *out_hc,
-        const pulsar_model    *model,
-        const pulsar_weights  *weights,
-        const token_vec    *prompt,
-        uint32_t            pos0,
-        uint32_t            n_tokens) {
-    if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    const uint64_t total = (uint64_t)n_tokens * hc_dim;
-    /* out_hc is an HC residual CARRIER (BF16 storage; task #62) — stage in the
-     * carrier's element size, NOT f32, or this write overflows the device buffer
-     * by 2x. Rounding matches the GPU store path (__float2bfloat16 = RNE). */
-    unsigned char *hc = (unsigned char *)xmalloc((size_t)total * PULSAR_HC_ELT_SIZE);
-    float *plain = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(plain[0]));
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        embed_token_f16(model, weights, prompt->v[pos0 + t], plain);
-        unsigned char *dst = hc + (uint64_t)t * hc_dim * PULSAR_HC_ELT_SIZE;
-        for (uint32_t h = 0; h < PULSAR_N_HC; h++) {
-            unsigned char *row = dst + (uint64_t)h * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;
-            pulsar_store_hc_carrier_f32(row, plain, PULSAR_N_EMBD);
-        }
-    }
-
-    const bool ok = pulsar_gpu_tensor_write(out_hc, 0, hc, total * PULSAR_HC_ELT_SIZE) != 0;
-    free(plain);
-    free(hc);
-    return ok;
-}
-
-
-
 /* Seed the batched HC state from token ids: every HC stream starts as the same
- * 4096-wide embedding.  Long prefill chunks use the GPU get-rows/repeat
- * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
+ * 4096-wide embedding, gathered on the device from the uploaded token ids
+ * (pulsar_gpu_embed_tokens_hc_tensor) at every n_tokens.  The gather is an
+ * exact copy -- each bf16 embedding row into the bf16 HC carrier -- so no
+ * numerics live here.  The host build-and-upload twin that served n_tokens <
+ * 512 until L167 was a second implementation of the same copy (rule 1) and is
+ * deleted with its helpers embed_token_f16 and pulsar_store_hc_carrier_f32. */
 bool gpu_graph_upload_prompt_embeddings_hc(
         pulsar_gpu_tensor   *out_hc,
         pulsar_gpu_tensor   *tokens,
@@ -221,29 +199,20 @@ bool gpu_graph_upload_prompt_embeddings_hc(
         uint32_t            pos0,
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
-
-    /* Prompts shorter than this are embedded on the host; the device gather
-     * only pays off once the launch amortises over enough rows. */
-    const uint32_t gpu_min = 512;
-
-    if (tokens && n_tokens >= gpu_min) {
-        return pulsar_gpu_embed_tokens_hc_tensor(out_hc,
-                                                tokens,
-                                                model->map,
-                                                model->size,
-                                                weights->token_embd->abs_offset,
-                                                (uint32_t)weights->token_embd->dim[1],
-                                                n_tokens,
-                                                PULSAR_N_EMBD,
-                                                PULSAR_N_HC) != 0;
+    if (!tokens) {
+        fprintf(stderr, "pulsar: prompt embedding gather needs the device token tensor "
+                        "(gpu_graph_upload_prompt_tokens first) -- refusing\n");
+        return false;
     }
-
-    return gpu_graph_upload_prompt_embeddings_hc_cpu(out_hc,
-                                                       model,
-                                                       weights,
-                                                       prompt,
-                                                       pos0,
-                                                       n_tokens);
+    return pulsar_gpu_embed_tokens_hc_tensor(out_hc,
+                                            tokens,
+                                            model->map,
+                                            model->size,
+                                            weights->token_embd->abs_offset,
+                                            (uint32_t)weights->token_embd->dim[1],
+                                            n_tokens,
+                                            PULSAR_N_EMBD,
+                                            PULSAR_N_HC) != 0;
 }
 
 
@@ -376,24 +345,32 @@ static bool gpu_graph_indexed_attention_span(
     bool ok = iq_view && iw_view && sq_view && sh_view &&
               (!op->mseq || (sp_view && ss_view));
 
-    /* L121: banked multi-row spans used to run the generic per-(comp,row)
-     * score kernel -- rows x depth-linear, 26 ms/layer at depth 24.5k vs the
-     * 0.2 ms indexed attention it feeds, the 6x deep-decode regression of the
-     * unified lane.  A serving span is per-bank contiguous runs of
-     * consecutive positions (step_begin's contiguity guarantee), so each run
-     * is shape-identical to the classic non-banked case: score it through the
-     * block-scaled MXFP4 tier against the bank's own comp slab.  Any span
-     * that violates the run shape falls back to the generic descriptor
-     * launcher wholesale; single-row spans keep the direct-one tier
-     * (bit-identical to classic single-token decode). */
-    bool span_runs_conform = op->mseq && sn > 1u;
-    for (uint32_t t = 1; span_runs_conform && t < sn; t++) {
+    /* L121: a banked multi-row span is scored per bank run through the
+     * block-scaled MXFP4 tier against the bank's own comp slab (the generic
+     * per-(comp,row) descriptor kernel was rows x depth-linear: 26 ms/layer
+     * at depth 24.5k vs the 0.2 ms indexed attention it feeds).  Each run is
+     * shape-identical to the classic non-banked case because
+     * gpu_graph_multiseq_step_begin admits no batch whose per-bank rows are
+     * not one contiguous run of consecutive positions (gpu_diag.cpp: the "not
+     * contiguous" / "not consecutive within its run" rejections).  The run
+     * shape is re-checked here and a violation REFUSES.  Until L167 it sent
+     * the whole span to the generic descriptor kernel instead -- a different
+     * accumulation order selected by batch layout, unreachable behind
+     * step_begin's check and measured by nothing.  Single-row spans take the
+     * direct-one tier (bit-identical to classic single-token decode). */
+    bool span_runs_conform = true;
+    for (uint32_t t = 1; op->mseq && span_runs_conform && t < sn; t++) {
         const uint32_t a = s0 + t;
         if (g->ms_seq_id[a] == g->ms_seq_id[a - 1u] &&
             g->ms_positions[a] != g->ms_positions[a - 1u] + 1)
             span_runs_conform = false;
     }
-    if (ok && span_runs_conform) {
+    if (ok && !span_runs_conform) {
+        fprintf(stderr, "pulsar: indexer span at layer %u: a bank's %u rows are not consecutive "
+                        "positions (step_begin admits no such batch) -- refusing\n", il, sn);
+        ok = false;
+    }
+    if (ok && op->mseq && sn > 1u) {
         for (uint32_t r0 = 0; ok && r0 < sn; ) {
             uint32_t rn = 1;
             while (r0 + rn < sn &&
@@ -620,7 +597,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * read f32.  Declared to the cache so a slot miss refuses, never converts
      * unwritten bytes. */
     const bool flat_skip_f32 = flat_hc_b &&
-                               pulsar_gpu_matmul_batch_mneutral() == 0 &&
+                               pulsar_gpu_matmul_batch_decode_rows() == 0 &&
                                !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b,
@@ -673,7 +650,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * when the mixed-batch split is armed (its offset views key no slot). */
         attn_norm_keep_from = 0u;
         if (attn_norm_q && attn_norm_b &&
-            pulsar_gpu_matmul_batch_mneutral() == 0 &&
+            pulsar_gpu_matmul_batch_decode_rows() == 0 &&
             !gpu_graph_f32_store_observed_any()) {
             attn_norm_keep_from = n_tokens;
             static int announced_ans = 0;
@@ -791,7 +768,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * comment there for why the cache-lookup invariant does not cover the
          * prefix split. */
         const bool qr_skip_f32 = (qr_norm_q != NULL) &&
-                                 pulsar_gpu_matmul_batch_mneutral() == 0 &&
+                                 pulsar_gpu_matmul_batch_decode_rows() == 0 &&
                                  !gpu_graph_f32_store_observed("q_lora_norm", il, pos0);
         if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(g->batch_qr_norm,
                                                              g->batch_qr,
@@ -1139,7 +1116,12 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok && n_comp != 0) {
                     ok = gpu_graph_commit_attn_comp_stage(g, il, 0, n_comp);
                 }
-                if (ok && ratio == 4) {
+                /* A whole prompt shorter than the ratio-4 window has no complete
+                 * group to rebuild: pulsar_gpu_compressor_prefill_tensor placed
+                 * its n_tokens rows in the current-group half at their phase
+                 * slots, exactly where the decode store puts them.  The rebuild
+                 * refuses such a chunk. */
+                if (ok && ratio == 4 && n_tokens >= 4u) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
                                                                      g->layer_attn_state_kv[il],
@@ -1570,7 +1552,9 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) ok = gpu_graph_emit_keep_restore(g, il,
                             g->banks.n_banks ? g->banks.cur_bank : 0u, 0, n_comp, true);
                 }
-                if (ok) {
+                /* Same skip as the attention compressor above: a prompt shorter
+                 * than the window has nothing to rebuild. */
+                if (ok && n_tokens >= 4u) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
                                                                      g->layer_index_state_kv[il],
@@ -2313,7 +2297,7 @@ bool gpu_graph_encode_layer_ffn_batch(
     /* L157: same dead-store skip as the attention-side flat_hc norm, same
      * predicate; the consumer is hc_ffn_fn's GEMM on the shared bf16 core. */
     const bool flat_skip_f32_ffn = flat_hc_b_ffn &&
-                                   pulsar_gpu_matmul_batch_mneutral() == 0 &&
+                                   pulsar_gpu_matmul_batch_decode_rows() == 0 &&
                                    !gpu_graph_f32_store_observed_any();
     if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       flat_hc_b_ffn,
@@ -2361,7 +2345,7 @@ bool gpu_graph_encode_layer_ffn_batch(
          * the f32 rows on the host (imatrix.cpp) and marks the graph while it
          * runs. */
         if (ffn_norm_q && ffn_norm_b && !g->imatrix_f32_rows &&
-            pulsar_gpu_matmul_batch_mneutral() == 0 &&
+            pulsar_gpu_matmul_batch_decode_rows() == 0 &&
             !gpu_graph_f32_store_observed_any()) {
             ffn_norm_keep_from = n_tokens;
             static int announced_fns = 0;
@@ -2499,12 +2483,12 @@ bool gpu_graph_encode_layer_ffn_batch(
          * and recurses on OFFSET row pointers, which key no cache slot, so \
          * BOTH halves quantize from f32 -- the store we just skipped.  The \
          * backstop refused (correctly) and the GEMM failed.  d967327's \
-         * predicate required g_mneutral_rows == 0 for exactly this reason; \
+         * predicate required batch_decode_rows == 0 for exactly this reason; \
          * dropping it was my error.  The invariant "valid => every arm takes \
          * A8" holds only for arms that LOOK UP the cache, and the split does \
          * not. */ \
         const int shmid_skip_f32 = (shmid_q != NULL) && \
-                                   pulsar_gpu_matmul_batch_mneutral() == 0; \
+                                   pulsar_gpu_matmul_batch_decode_rows() == 0; \
         if (ok) ok = pulsar_gpu_swiglu_mx_tensor(g->batch_shared_mid, \
                                              g->batch_shared_gate, \
                                              g->batch_shared_up, \

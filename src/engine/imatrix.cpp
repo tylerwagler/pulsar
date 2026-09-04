@@ -860,6 +860,12 @@ bool gpu_graph_verify_suffix_tops(
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
+    /* The verify block's rows are DECODE rows (the continuation token and the
+     * drafts under test): every GEMM and MoE tier below takes the
+     * M-independent arms whatever n_tokens is (L167; until then row count
+     * chose, so a 5..16-row block took cuBLASLt).  Restored on return. */
+    pulsar_decode_rows_scope rows(n_tokens);
+    if (!rows.ok()) return false;
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,

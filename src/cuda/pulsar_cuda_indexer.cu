@@ -900,8 +900,15 @@ static int indexer_scores_launch(
                 causal ? 1 : 0);
     }
 
-    /* Everything else -- the banked descriptor path, and any shape the MXFP4
-     * tier does not take -- goes to the generic per-(comp,row) kernel. */
+    /* Everything else goes to the generic per-(comp,row) kernel: shapes the
+     * MXFP4 tier does not take, and descriptor (banked) batches of more than
+     * one row.  The engine's banked lane never sends the latter: it scores
+     * each bank run through the tier in scalar mode (gpu_prefill.cpp, the
+     * indexer span) and refuses a span whose runs are not consecutive
+     * positions; the multi-row descriptor arm is reached by the smoke's
+     * generic-kernel identity check (tests/cuda_long_context_smoke.cpp,
+     * mb_idx_run_case at n_head 4).  Whether this kernel and the tier agree
+     * to the bit on the same shape is not asserted anywhere. */
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
                                          (const pulsar_mxkv_pack_t *)q->ptr,

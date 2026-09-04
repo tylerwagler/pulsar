@@ -6,14 +6,18 @@
  * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING
  * (+25% structured, +10% prose vs verify-all), where the low-confidence tail is
  * real.  The old "optimal trim loosens with depth" was a k=5 artifact — the
- * real driver is acceptance rate, not depth, and it washes out at k=3.  Trim is
- * exact and output-invariant on STRUCTURED, but narrowing the verify batch
- * shifts float accumulation ~1 ULP and can flip near-tie greedy argmax on flat
- * (prose) distributions (benign numerical tie, same class as yield-quench) — so
- * tau is distribution-preserving but NOT byte-identical on greedy prose.
- * PULSAR_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
- * n_draft).  Adaptive tau is not worth building at k=3 (payoff ~2-6%, mostly
- * captured by 0.25). */
+ * real driver is acceptance rate, not depth, and it washes out at k=3.  The
+ * trim is a SCHEDULE knob: it decides which drafts are verified, never a
+ * verified row's numerics -- verify rows are DECODE rows and every decode row
+ * takes the M-independent kernels whatever the batch width (row kind chooses
+ * the arm, L167), so a row that survives the trim computes the same bytes at
+ * any width (cuda-mixed-neutrality-gate GATE 5/5R assert it row by row, 1..16
+ * rows).  The "narrowing the verify batch shifts float accumulation ~1 ULP"
+ * this comment carried described the pre-L167 dispatch, where a 5..16-row
+ * verify batch took cuBLASLt by row count.  PULSAR_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off"
+ * disables (verify all n_draft) -- tools/confhead sets it; it is a named
+ * exception in docs/ENGINEERING-RULES.md.  Adaptive tau is not worth building
+ * at k=3 (payoff ~2-6%, mostly captured by 0.25). */
 static float dspark_conf_sched_tau(void) {
     static float cached = -1.0f;
     if (cached < 0.0f) {
@@ -514,8 +518,9 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
                                  (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;
     }
     if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights)) return false;
-    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
-    return true;
+    /* A failed seed has rolled the drafter rings back; the caller refuses the
+     * round (L167) instead of drafting from an unseeded window. */
+    return gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
 }
 
 /* Fused DSpark loop (P2, PULSAR_DSPARK_FUSED=1): ONE batched target forward per
@@ -1124,7 +1129,8 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         const uint32_t take = avail < win ? avail : win;
         const uint32_t first = g->dspark_prompt_n - take;
         bool seed_ok = true;
-        for (uint32_t j = 0; seed_ok && j < take; j++) {
+        uint32_t j = 0;
+        for (; seed_ok && j < take; j++) {
             const uint32_t slot = (first + j) % win;
             for (int i = 0; seed_ok && i < 3; i++) {
                 seed_ok = pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
@@ -1132,8 +1138,17 @@ static int spec_round_begin(pulsar_session *s, int first_token,
                                               (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
                                               (uint64_t)PULSAR_N_EMBD * sizeof(float)) != 0;
             }
-            if (seed_ok && gpu_graph_dspark_project_main_x(g, &e->dspark_model, w))
-                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, w, 1);
+            if (seed_ok)
+                seed_ok = gpu_graph_dspark_project_main_x(g, &e->dspark_model, w) &&
+                          gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, w, 1);
+        }
+        if (!seed_ok) {
+            /* Refuse the round rather than draft from a half-seeded window
+             * (L167; a failed projection used to be skipped over and a failed
+             * seed warned once and drafted unseeded).  The target state is
+             * untouched and the window stays pending for the next attempt. */
+            snprintf(err, errlen, "DSpark prompt-window seed failed after %u of %u rows", j - 1u, take);
+            return -1;
         }
         if (dspark_stats)
             fprintf(stderr, "pulsar: dspark prompt-window seeded %u rows (prompt_n=%u)\n",
@@ -2064,10 +2079,11 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
     if (n_sel == 0) return 0;
     (void)n_g;
 
-    /* groups: consecutive banks whose rows fit the M-neutral row budget the
-     * banked forward arms (PULSAR_GPU_MNEUTRAL_ROWS_MAX), at most
-     * PULSAR_DSPARK_BANKS_MAX banks each; production (3 banks x <=4 drafts) is
-     * one group. A bank whose depth alone exceeds the budget is refused. */
+    /* groups: consecutive banks whose rows fit the widest decode batch the
+     * M-independent kernels take (PULSAR_GPU_MNEUTRAL_ROWS_MAX; the forward
+     * declares its rows decode), at most PULSAR_DSPARK_BANKS_MAX banks each;
+     * production (3 banks x <=4 drafts) is one group. A bank whose depth alone
+     * exceeds the cap is refused. */
     for (int gs = 0; gs < n_sel;) {
         int ge = gs;
         uint32_t rows = 0;

@@ -436,19 +436,19 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * so the signedness restatement cannot change a bit -- noted so the next
      * format change treats the pair as one fact. */
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
-    /* The sort stays OFF for n_tokens == 1.  It is a locality optimization:
-     * the fp16 kernel reads topk[] in whatever order it is given, masks each id
-     * outside the row's visible prefix, and folds rows through an online
-     * softmax that is correct for ANY permutation -- there is no dedup, no
-     * monotonicity assumption, and no binary search anywhere in it.  At decode
-     * the whole 512-row compressed scan is L2-resident, so ascending row
-     * addresses buy nothing while the bitonic sort costs ~4.2 us per token.
-     *
-     * It is NOT output-neutral, though: the online fold is order-dependent in
-     * floating point, so sorting changes the reduction order and the logits with
-     * it (measured 2026-08-13: max |Δlogit| 5.44 vs unsorted, for ~0% throughput
-     * at frontiers 4k..32k).  "Locality only" describes the memory access, not
-     * the arithmetic. */
+    /* The indexed kernel takes topk[] in whatever order it is given, masks each
+     * id outside the row's visible prefix, and folds rows through an online
+     * softmax that is correct for ANY permutation; but the fold is
+     * order-dependent in floating point, so the ORDER of topk[] is part of the
+     * arithmetic (measured 2026-08-13: max |dlogit| 5.44 sorted vs unsorted).
+     * Multi-row batches sort by id so the fold order is a function of the SET
+     * selected, not of which n_comp-bucketed ranking kernel (1024 / pow2 /
+     * CUB) produced it.  One-row steps fold in ranking order: that is the
+     * order the B300 reference prefers (L167, 2026-09-04: sorting the one-row
+     * fold moved story depth 4102 8.4% further from the source), and the
+     * reference decides.  The two orders are a known 1-row-vs-N-row split,
+     * open as rows/L170.md; top_k != 512 is a shape the sort kernel does not
+     * take, so those ids fold in ranking order for every row count. */
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");

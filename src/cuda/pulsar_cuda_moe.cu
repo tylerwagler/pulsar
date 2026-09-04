@@ -547,21 +547,16 @@ static int routed_moe_launch_mixed40(
     const uint64_t nact = (n_total_expert < pair_count) ? (uint64_t)n_total_expert : (uint64_t)pair_count;
     const uint64_t padded_upper = (((uint64_t)pair_count + 128ull * nact + 127ull) / 128ull) * 128ull;
     /* the CUTLASS side's inner (K) dim: in_dim for gate/up (A), mid_dim for down (B) */
-    /* Small batches (decode n=1, spec-verify n<=4) use the PER-EXPERT single-proj CUTLASS path: the
-     * 128-padded grouped buffer would be almost all padding (few tokens spread over many experts),
-     * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
-     * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
-    /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
-     * per-token (non-grouped) path across the whole row range (up to
-     * PULSAR_GPU_MNEUTRAL_ROWS_MAX, static_assert-tied to PULSAR_MSEQ_MAX):
-     * the grouped path's per-expert group sizes depend on the batch composition,
-     * so a co-scheduled decode bank's expert output would shift with the batch
-     * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
-     * output independent of M) and buffers are sized by n_tokens, so any armed
-     * width is safe on the same argument that covered 5..8.
-     * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
-    const int use_grouped = pulsar_gpu_matmul_batch_mneutral()
-            ? (n_tokens > PULSAR_GPU_MNEUTRAL_ROWS_MAX) : (n_tokens > 4u);
+    /* Row KIND chooses (pulsar_gpu_matmul_batch_decode_rows, pulsar_gpu.h;
+     * the two-pass split in routed_moe_batch_impl leaves the count at 0 or
+     * >= n_tokens here).  Decode rows take the PER-EXPERT single-proj CUTLASS
+     * path: fixed compile-time tiles, each row's output independent of the
+     * batch.  Prefill rows take the grouped, no-host-sync path at any
+     * n_tokens, whose per-expert group sizes -- and therefore its numerics --
+     * depend on the batch composition.  (Row count chose this until L167: > 4
+     * unarmed, > 16 armed.)  `rows` sizes the gather/proj buffers for
+     * whichever path is active. */
+    const int use_grouped = pulsar_gpu_matmul_batch_decode_rows() == 0;
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
 
     /* model weight bases */
@@ -1262,18 +1257,18 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
      * is strictly per-row (selected/weights/x/out addressed by token), so a decode
      * row's expert output is invariant to co-scheduled rows ONLY if it takes the
      * M-independent per-token path — but the grouped GEMM's per-expert group sizes
-     * depend on the whole batch. So: run the PER-TOKEN path over the decode prefix
-     * (n_tokens=n_dec<=PULSAR_GPU_MNEUTRAL_ROWS_MAX keeps the GEMV/non-grouped
-     * dispatch) and the GROUPED path over the prefill suffix, offsetting every
-     * per-token buffer by n_dec rows.
-     *   - Pass 1 keeps the flag = n_dec (nonzero) so the capped dispatch picks the
-     *     per-token path for any armed n_dec; n_tokens==n_dec => it does NOT re-split.
-     *   - Pass 2 clears the flag so it (a) does not re-split and (b) is BYTE-
-     *     IDENTICAL to an inc-3 pure-prefill MoE of the same K rows (grouped path,
-     *     which reads no flag). The flag is restored before returning so the rest of
-     *     the layer/step still splits its dense GEMMs. */
+     * depend on the whole batch. So: run the decode prefix as its own call
+     * (n_dec <= PULSAR_GPU_MNEUTRAL_ROWS_MAX, so the capped dispatch below takes
+     * the per-token path) and the prefill suffix as its own call, offsetting
+     * every per-token buffer by n_dec rows.
+     *   - Pass 1 runs with the decode-row count = n_dec == n_tokens, so it does
+     *     not re-split.
+     *   - Pass 2 runs with the count cleared so it (a) does not re-split and (b)
+     *     is BYTE-IDENTICAL to a pure-prefill MoE of the same K rows.  The count
+     *     is restored before returning so the rest of the layer/step still splits
+     *     its dense GEMMs. */
     {
-        const uint32_t n_dec = (uint32_t)pulsar_gpu_matmul_batch_mneutral();
+        const uint32_t n_dec = (uint32_t)pulsar_gpu_matmul_batch_decode_rows();
         if (n_dec > 0 && n_dec < n_tokens && x && selected && weights && out) {
             const uint64_t f = sizeof(float), i4 = sizeof(int32_t);
             pulsar_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
@@ -1288,14 +1283,14 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
                     n_total_expert, n_expert, clamp, x, layer_index, n_dec);
-            pulsar_gpu_matmul_set_batch_mneutral(0);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
             /* L158 inc 5: the suffix view keys no slot; give it one from the
              * producer's full-width encoding (byte copy + scale re-base).  No
              * encoding on x means no MoE -- refuse rather than quantise. */
             if (!pulsar_gpu_mxfp8_act_cache_window(x, n_dec, n_tokens - n_dec, expert_in_dim, &x_s)) {
                 fprintf(stderr, "pulsar: routed MoE mixed split: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
                         expert_in_dim, n_tokens);
-                pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
+                (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
                 return 0;
             }
             const int r2 = routed_moe_batch_impl(&out_s, &up_s, &mid_s, &down_s,
@@ -1303,72 +1298,49 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
                     n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec);
-            pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
             return (r1 && r2) ? 1 : 0;
         }
     }
     if (gate_type == 40u && down_type == 40u) {
-        /* Small batches (spec-decode verify, n_tokens 2..4): direct fp4 GEMV over the
-         * packed expert weights -- 4 launches per layer (act-roundtrip + gate/up+swiglu
-         * + act-roundtrip + down) vs the grouped path's BLOCKING per-layer offsets
-         * readback + ~5 launches per active expert. Computes the exact same function
-         * as the grouped GEMMs (weights read in the verified row-major CUTLASS B
-         * layout; activations round-tripped through the same fp4 quantizer) -- proven
-         * bit-exact vs a quant-exact CPU oracle (temp/fp4gemv_test.cu) and clean-text
-         * on-model. Measured verify(3) step 118.2 -> 116.5 ms; the bigger win is
-         * removing the per-rich-layer host sync from the verify path (CUDA-graph
-         * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
-         */
-        /* inc 2 (2026-07): raised the M-independent GEMV cap to what was then
-         * PULSAR_MSEQ_MAX (8) for a batched step so 5..8 kept the per-token
-         * path instead of the grouped GEMM.  MSEQ_MAX is 16 now, and L152
-         * (2026-09-02) tied the ARMED cap to PULSAR_GPU_MNEUTRAL_ROWS_MAX; the
-         * unarmed 8 below is that historical value. */
-        /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
-         * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
-         * blocking per-layer offsets readback. Both arms are 8 now; the 5..8 path
-         * is the same kernel already used under mneutral.
-         * VERIFIED bit-exact in isolation vs the cap-4 build at verify widths 6
-         * and 8 (byte-identical logits + token stream, 3 fresh loads per arm), and
-         * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
-         * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
-         * sibling caps in pulsar_cuda_matmul.cu were tried alongside this and are NOT
-         * bit-exact -- they stay at 4; do not re-couple them to this one.
-         * L117 2026-08-26: floor lowered 2 -> 1. The >=2 floor predated any
-         * M=1 caller (classic decode owns single-token MoE elsewhere), but the
-         * batched lanes DO reach here with one row — a lane-2 group that
-         * shrinks to one slot, a 1-bank quenched spec round, and the row-cost
-         * probe — and fell onto the grouped-CUTLASS prefill machinery
-         * (pack + 3 grouped GEMMs + gather + f32 swiglu per type-40 layer,
-         * ~25-30 ms/sweep of fixed cost for one token; nsys diff in
-         * pulsar-notes rows/L117.md). GEMV vs grouped was byte-identical at
-         * widths 6/8 (above); M=1 verified the same way (probe logits hash,
-         * see the row). */
-        /* L152 2026-09-02: the cap was a bare 8, INSIDE the M-neutral range
-         * (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16).  So an armed 9..16-row step took
-         * routed_moe_launch_cutlass_dispatch's fixed-tile projection while the
-         * same bank's rows in a <= 8-row step took this GEMV.  The two agree
-         * to the last bit on MOST rows and not on all (a final-rounding
-         * difference that shows up in ~1 element per 50k, e.g. one bf16 hidden
-         * element of one drafter row at layer 0), which is exactly the
-         * row-selective non-identity both L150 (batched drafter identical at 8
-         * rows, not at 9) and L152 (GATE 5R: bank 0 rows 2-4 off by whole
-         * logits at 10 rows, byte-identical at 8) bisected to.  The in-file
-         * "byte-identical at widths 6/8" note above compared the two paths
-         * only where both were reachable, i.e. never above 8.  An armed step
-         * now takes the GEMV for the whole neutral range; unarmed callers
-         * (classic prefill) keep the old cap. */
-        const uint32_t moe_gemv_cap = pulsar_gpu_matmul_batch_mneutral()
-                ? PULSAR_GPU_MNEUTRAL_ROWS_MAX : 8u;
-        if (n_tokens >= 1u && n_tokens <= moe_gemv_cap &&
-            mid && mid->ptr && down && down->ptr && out && out->ptr &&
-            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
-            mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
-            down->bytes >= (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) &&
-            out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float) &&
-            selected->bytes >= (uint64_t)n_tokens * n_expert * sizeof(int32_t) &&
-            weights->bytes >= (uint64_t)n_tokens * n_expert * sizeof(float) &&
-            x->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(float)) {
+        /* Which expert-FFN arithmetic a row gets is a numerics boundary: the
+         * direct fp4 GEMV over the packed expert weights (4 launches per
+         * layer, gate/up+swiglu, down, their E4M3 emits, no host sync, each
+         * row from its own activation) and routed_moe_launch_cutlass_dispatch's
+         * grouped fixed-tile projection do NOT agree to the last bit on every
+         * row (a final-rounding difference in ~1 element per 50k; L150 and
+         * L152 bisected the row-selective drift of a 9..16-row drafter step
+         * to exactly this boundary when a cap of 8 chose here inside the
+         * M-neutral range).  The rule, in two halves (L167):
+         *   DECODE rows (pulsar_gpu_matmul_batch_decode_rows > 0; the two-pass
+         *   split above leaves the count at 0 or >= n_tokens, the setter bounds
+         *   it at PULSAR_GPU_MNEUTRAL_ROWS_MAX) take the GEMV at ANY width, so
+         *   the whole neutral range is one arithmetic and no cap sits inside it.
+         *   PREFILL rows take the GEMV up to MOE_PREFILL_GEMV_ROWS and the
+         *   grouped projection above it.  The cap is REFERENCE-GRADED, not a
+         *   speed choice: the 6-row remainder chunk of the story blob's
+         *   depth-4102 prefill graded 8.4% further from the B300 reference on
+         *   the grouped kernel (KL 6.456e-07 -> 6.997e-07; every other depth
+         *   unchanged; cuda-reference-gate FAIL), and back to bit-identical
+         *   with the GEMV.  A prefill remainder is a fixed function of the
+         *   chunk schedule, never a per-step width, so this cap creates no
+         *   step-to-step neutrality boundary.
+         * A decode call whose buffers do not fit refuses -- it used to fall to
+         * the grouped path. */
+        enum { MOE_PREFILL_GEMV_ROWS = 8 };
+        if (pulsar_gpu_matmul_batch_decode_rows() > 0 || n_tokens <= (uint32_t)MOE_PREFILL_GEMV_ROWS) {
+            if (!(mid && mid->ptr && down && down->ptr && out && out->ptr &&
+                  selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
+                  mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
+                  down->bytes >= (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) &&
+                  out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float) &&
+                  selected->bytes >= (uint64_t)n_tokens * n_expert * sizeof(int32_t) &&
+                  weights->bytes >= (uint64_t)n_tokens * n_expert * sizeof(float) &&
+                  x->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(float))) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN (n_tok=%u): a scratch "
+                                "buffer is missing or too small -- refusing\n", n_tokens);
+                return 0;
+            }
             const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
             const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
             const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
