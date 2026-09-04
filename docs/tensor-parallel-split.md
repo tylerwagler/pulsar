@@ -5,6 +5,10 @@ vLLM DSv4 TP/EP study (private: `pulsar-notes/vllm-ds4-tp-ep-study-2026-08-26.md
 — evidence and sources; this file is the public record the code implements).
 Port decisions: ledger L102, plan 102, docs/tensor-parallel-port.md.
 
+Merged with the `tensor_parallel` branch into `dev` 2026-09-04 (the branch is
+history; this file lives on dev). Slice-4 status below is current as of that
+merge — the remaining 4b-CUDA/4c/4d/4e chunks are GPU/pair-gated.
+
 ## The split model (two ranks = one EP group)
 
 1. **Routed experts: whole-expert-per-rank.** vLLM is EP-first for MoE — routed
@@ -73,14 +77,17 @@ bug, not a design change.
       **Binder cross-check PASSED:** `shape_profiles.cpp` Flash {43L, 4096h,
       129280v, 512 head-dim, 64 rot, 256+1 exp, 6 used} matches the study's
       V4-Flash constants exactly.
-- 4b. **DONE 2026-08-26 (host half only, by design)** — gate scheduler
-      `pulsar_tp_sched.{h,cpp}`: drives the transport per-exchange over the
-      DS per-layer ATTN→FFN order and the prefill big-gate-per-layer path,
-      with the two CUDA-touching steps (.cu write/read partial) funneled
+- 4b. **DONE → dev (host half only, by design; merged 2026-09-04)** — gate
+      scheduler `pulsar_tp_sched.{h,cpp}`: drives the transport per-exchange
+      over the DS per-layer ATTN→FFN order and the prefill big-gate-per-layer
+      path, with the two CUDA-touching steps (.cu write/read partial) funneled
       through hook pointers → every scheduling/lockstep rule is host-tested
       (tp_sched_test: 2 decode tokens x 86 gates + prefill chunk, symmetric
-      on both ranks over the TCP loopback).  The `.cu` wrapper implementations
-      deliberately ship in 4c WITH their engine callers (no dead code).
+      on both ranks over the TCP loopback).  Also landed in the merge: the
+      host-pinned slab allocator (`pulsar_tp_gpu_slab_alloc_hostpin/free_hostpin`,
+      src/tp/pulsar_tp_gpu.cpp — `cudaHostRegister` verdict).  The `.cu`
+      wrapper implementations deliberately ship with their engine callers
+      (no dead code) — see the hook-targets inventory note in port.md.
 - 4b. CUDA gate machinery on the engine worker thread — big_gate first
       (prefill), per-layer gates (decode). GPU-gated; the hard chunk.
 - 4c. Ownership-aware routed-MoE kernels (skip peer-owned experts, emit the
@@ -90,11 +97,12 @@ bug, not a design change.
       mixed, spec rounds).
 
 ## Open items for bring-up
-- **Slab (resolved on-pair 2026-09-02):** `cudaMallocManaged` does NOT register
-  with `ibv_reg_mr` on GB10 (EFAULT). Host-pinned (`malloc` + `cudaHostRegister`)
-  registers and the probe passes over RDMA — engine slice 4c must allocate the
-  slab host-pinned, not managed (kernels still write it directly over unified
-  memory; no D2H/H2D bounce). **GPUDirect RDMA is unavailable on this platform**
+- **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**
+  `cudaMallocManaged` does NOT register with `ibv_reg_mr` on GB10 (EFAULT).
+  Host-pinned (`malloc` + `cudaHostRegister`) registers and the probe passes
+  over RDMA — `pulsar_tp_gpu_slab_alloc_hostpin` (src/tp/pulsar_tp_gpu.cpp,
+  on dev) is the allocator slice 4b-CUDA uses; kernels still write it directly
+  over unified memory, no D2H/H2D bounce. **GPUDirect RDMA is unavailable on this platform**
   (tests/tp_dmabuf_probe: attrs 110/116 = 0, CUDA-13 GPURDMA flag rejected,
   dma-buf import EINVAL) — so host-pinned is final, not a stopgap. Recheck the
   probe if the nvidia driver ever advertises `GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED`.

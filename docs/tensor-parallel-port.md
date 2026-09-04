@@ -1,6 +1,10 @@
 # Tensor Parallelism (TP) — port seed
 
-Status of the two-Spark TP effort, kept in-repo as the branch's decision record.
+Status of the two-Spark TP effort, kept in-repo as the decision record. The
+`tensor_parallel` branch was retired into `dev` 2026-09-04 (zero commits absent
+from dev; nothing unique lost) — `dev` is the single active line, so read
+`origin/dev` for any engine analysis. All TP code lives only inside dev's
+history.
 Source of truth for scope decisions: `~/Projects/pulsar-notes/plans/102-tensor-parallel-two-sparks.md`
 (private) + ledger L102. This file is the public, in-tree pointer that code
 comments can cite (like the Lnnn tags elsewhere).
@@ -64,18 +68,68 @@ highest risk; interacts with MLA, attn-pack KV, indexer.
 
 1. **Option/identity surface** — TP CLI parse + validate, `pulsar_tp_options`,
    `pulsar_tp_identity`; requesting TP before wiring errors clearly. Host-testable.
+   **DONE → dev** (fail-loud open guard in place).
 2. **Slab layout + pure arithmetic** — `pulsar_tp_slab_bytes`/offsets, the two-rank
    hello/identity exchange types, unit-tested (no sockets, no CUDA).
+   **DONE → dev**.
 3. **Transport alone** — import `pulsar_tp.{cpp,h}`, socket/RDMA bring-up + gate
    exchanges, exercised by a standalone two-thread (or two-host) loopback test.
-   Still NO callers in the engine.
+   Still NO callers in the engine. **DONE → dev** (TCP + dlopen-libibverbs RDMA,
+   loopback host suite; bench 1-link vs 2-link awaits the pair window).
 4. **Prefill TP (Phase 1)** — write the CUDA `big_gate` path only, split routed
-   experts, prove on prefill. First engine-visible TP.
+   experts, prove on prefill. First engine-visible TP. **= slice 4b-CUDA; OPEN,
+   GPU-gated** (see slice-4 sequencing in docs/tensor-parallel-split.md).
 5. **Decode gates + vocab head (Phase 2)** — per-layer gates, ownership-aware MoE,
-   vocab-split output head.
+   vocab-split output head. **= slices 4b-CUDA/4c/4d; OPEN, GPU-gated.**
 6. **Session lockstep (Phase 3)** — mirror banks/warm-fork, multiseq, mixed, spec.
+   **= slice 4e; OPEN, GPU-gated.**
 7. **Attention head split (Phase 4)** — deferred; only after 1-6 prove transport.
 
 Exit criteria per phase: numeric/gated on a TP pair, reference-graded where the
 summation order changes. Single-box behavior must remain bit-identical (options
 default off, zero TP code on the live path).
+
+## 4b-CUDA hook targets (engine inventory, verified on dev 2026-09-04)
+
+Where the gate-scheduler `write_partial`/`read_partial` hooks bind. Names are
+stable; re-verify line numbers if they drift before the pair window.
+
+- **Layer boundaries (decode + prefill).** Every layer runs through
+  `gpu_graph_encode_layer_batch` (src/engine/gpu_prefill.cpp:2668), which chains
+  `gpu_graph_encode_layer_attention_batch` then `gpu_graph_encode_layer_ffn_batch`
+  and finally swaps the HC twins. The two gate points per layer are just after
+  the ATTN call (output of attention) and just after the FFN call, before the
+  cur/next swap (output of the layer). Decode goes through the multiseq graph
+  tier (`gpu_graph_decode_multiseq_batch`, session.cpp) — a gate's recv is a
+  host-side wait and cannot live inside a captured graph, so the machinery must
+  straddle per-layer graph launches (this interaction is part of the 4b work).
+- **Hidden carrier (what a partial is read from / added to).** The batched HC
+  twins `g->batch_cur_hc` / `g->batch_next_hc`
+  (pulsar_engine_internal.h:1013-1014), f32
+  `[n_tokens, PULSAR_N_HC * PULSAR_N_EMBD]`, row = `batch_index * hc_dim`.
+  The outgoing layer-il residual is the twin that pre-swap holds the layer's
+  output — exact phase/offset (which twin, pre- vs post-swap) and where the
+  peer partial lands is pinned at bind time.
+- **Routed MoE output (slice 4c).** `pulsar_gpu_routed_moe_batch_tensor`
+  (src/cuda/pulsar_cuda_moe.cu:1465) emits `out` f32 `[n_tokens, N_EMBD]` from
+  the top-k `selected`/`weights` per token; the FFN accumulation at
+  gpu_prefill.cpp:2620 sums `batch_routed_out` + `batch_shared_out` into
+  `batch_ffn_out` (pulsar_engine_internal.h:1054-1063). Ownership-aware kernels
+  take a contiguous 128-expert half per rank and emit an f32 partial instead of
+  the pooled sum.
+- **Vocab head (4d).** `gpu_graph_encode_output_head` (src/engine/gpu_decode.cpp:936),
+  `output_embd` in, `logits` f32 N_VOCAB out; both bf16-matmul and MXFP8 arms
+  (gpu_decode.cpp:1001-1011); per-token in decode, last row of the chunk in
+  prefill.
+- **Threading (design rule 1 holds on dev).** One GPU-capable thread: pthread at
+  cli_main.cpp:1030 → `worker_main` (server_sched.cpp:2514) →
+  `worker_{batched,mixed,spec}_batched_quantum` → `pulsar_session_decode_mixed`.
+  `g_cublas` is created and bound to the per-thread default stream
+  (pulsar_cuda_runtime.cu:916-920); kernels launch on `cudaStreamPerThread`
+  (`--default-stream per-thread` build), events via
+  `pulsar_gpu_marker_record`/`_done` (pulsar_cuda_runtime.cu:1594-1615), full
+  sync only via `pulsar_gpu_synchronize`.
+- **Already in place.** CLI parse for `--tp-role` (cli_main.cpp:445,
+  pulsar_cli.cpp) and the fail-loud engine-open guard (session.cpp:296 —
+  refuses `tp_role != 0` until 4b-CUDA lands). No other engine TP path exists;
+  everything else in this section is new wiring.
