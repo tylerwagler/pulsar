@@ -1015,16 +1015,58 @@ void pulsar_gpu_cleanup(void) {
 
 
 /* Running total of live pulsar_gpu_tensor_alloc/_managed bytes (views excluded:
- * they don't own memory).  This is the ground truth the server's per-session
- * memory ledger reconciles against (pulsar_session_create snapshots it around the
- * graph allocation), catching drift between the sizing estimate and what the
- * allocator really did.  Atomic because drafter conf/token staging tensors are
- * allocated per spec step; one relaxed add is noise next to the cudaMalloc it
- * accompanies. */
+ * they don't own memory).  pulsar_session_create snapshots it around the graph
+ * allocation to measure what a session took; the server commits that measured
+ * number to its memory ledger.  Atomic because drafter conf/token staging
+ * tensors are allocated per spec step; one relaxed add is noise next to the
+ * cudaMalloc it accompanies. */
 static uint64_t g_tensor_alloc_bytes;
 
 uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
+}
+
+/* Dry-run allocation: between dry_begin and dry_end on this thread, the two
+ * allocators hand out placeholders (`dry` set, a fake non-NULL pointer so the
+ * NULL checks and views in the allocation code behave as they do for a real
+ * allocation, the true byte count so view bounds hold) and total the bytes
+ * asked for instead of calling cudaMalloc.  The session pricer runs the real
+ * allocation code this way: the price and the allocation are one function. */
+static thread_local struct {
+    int      active;
+    uint64_t bytes;          /* every dry allocation, requested bytes */
+    uint64_t managed_bytes;  /* the cudaMallocManaged subset */
+    uintptr_t cursor;        /* fake address space so placeholders are distinct */
+} g_dry;
+
+void pulsar_gpu_tensor_dry_begin(void) {
+    g_dry.active = 1;
+    g_dry.bytes = 0;
+    g_dry.managed_bytes = 0;
+    g_dry.cursor = 4096;
+}
+
+void pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes) {
+    if (bytes) *bytes = g_dry.bytes;
+    if (managed_bytes) *managed_bytes = g_dry.managed_bytes;
+    g_dry.active = 0;
+}
+
+int pulsar_gpu_tensor_dry_active(void) {
+    return g_dry.active;
+}
+
+static pulsar_gpu_tensor *dry_alloc(uint64_t bytes, int managed) {
+    pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->ptr = (void *)g_dry.cursor;
+    g_dry.cursor += (bytes + 255u) & ~(uintptr_t)255u;
+    t->bytes = bytes;
+    t->owner = 1;
+    t->dry = 1;
+    g_dry.bytes += bytes;
+    if (managed) g_dry.managed_bytes += bytes;
+    return t;
 }
 
 /* Allocate n_elems of esz bytes each, recording BOTH the element size and the
@@ -1050,6 +1092,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
 
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
+    if (g_dry.active) return dry_alloc(bytes, 0);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
@@ -1066,6 +1109,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
 
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
+    if (g_dry.active) return dry_alloc(bytes, 1);
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
@@ -1127,6 +1171,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->dry = base->dry;
     t->esz = base->esz;   /* a view of a narrowed buffer is still narrowed */
     t->fmt = base->fmt;   /* and still the same FORMAT (L106 K15) */
     return t;
@@ -1136,7 +1181,7 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
 
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) {
+    if (tensor->owner && tensor->ptr && !tensor->dry) {
         (void)cudaFree(tensor->ptr);
         __atomic_sub_fetch(&g_tensor_alloc_bytes, tensor->bytes, __ATOMIC_RELAXED);
     }
@@ -1165,7 +1210,7 @@ void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor) {
 
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
-    if (count == 0) return 1;
+    if (count == 0 || tensor->dry) return 1;
     fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
@@ -1174,6 +1219,7 @@ int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t 
 
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (tensor->dry) return 1;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
@@ -1200,6 +1246,7 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
 
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (tensor->dry) return 1;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
@@ -1213,7 +1260,7 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
     }
-    if (bytes == 0) return 1;
+    if (bytes == 0 || dst->dry || src->dry) return 1;
     return cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
                               (const char *)src->ptr + src_offset,
                               (size_t)bytes,
@@ -1241,7 +1288,7 @@ int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
         bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
         return 0;
     }
-    if (bytes == 0) return 1;
+    if (bytes == 0 || dst->dry || src->dry) return 1;
     return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                                    (const char *)src->ptr + src_offset,
                                    (size_t)bytes,

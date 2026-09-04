@@ -136,6 +136,16 @@ void pulsar_gpu_cleanup(void);
  * excluded).  Snapshot around a session create to measure its true resident
  * cost; the server ledger commits that actual. */
 uint64_t pulsar_gpu_tensor_alloc_bytes_current(void);
+/** Dry-run allocation on the calling thread: after dry_begin, the two tensor
+ * allocators return placeholders and total the requested bytes instead of
+ * touching the device; every device operation on a placeholder is a no-op
+ * that reports success.  dry_end returns the totals (all bytes; the
+ * cudaMallocManaged subset) and ends the run.  The session pricer runs the
+ * real allocation code this way -- the price of a session and its allocation
+ * are one piece of code. */
+void     pulsar_gpu_tensor_dry_begin(void);
+void     pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes);
+int      pulsar_gpu_tensor_dry_active(void);
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes);
 /* n_elems * esz bytes, with esz recorded on the tensor.  Use this for any
  * buffer whose elements are not f32; consumers then derive the type from

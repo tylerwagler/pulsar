@@ -2762,9 +2762,10 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
  * fail closed).  Never called on a token/layer hot path (defined in
  * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
 uint64_t server_mem_available_bytes(void);
-/* Log estimate-vs-actual for a freshly created session, warn loudly on >10%
- * drift (sizing code out of sync with the allocator), and return the value
- * the ledger must commit — the actual (defined in generate.cpp). */
+/* Log priced-vs-actual for a freshly created session and return the bytes the
+ * ledger commits (the actual); 0 when they differ -- the price is the
+ * allocator run dry, so a difference is an accounting hole and the caller
+ * refuses to start (defined in server_sched.cpp). */
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                                uint64_t est_bytes,
                                                uint64_t actual_bytes);

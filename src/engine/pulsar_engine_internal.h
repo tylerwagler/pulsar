@@ -1374,14 +1374,15 @@ struct pulsar_engine {
     /** True when the artifact is a REAP-pruned expert set rather than the full
      * model -- the two have different expert counts and cannot share caches. */
     bool is_pruned() const;
-    /** TRUE per-session GPU cost at `ctx_size`: persistent KV + prefill working
-     * set + drafter state. The number admission control must use.
+    /** GPU bytes pulsar_session::create takes at `ctx_size` with the current
+     * bank pool: the allocation code run dry, so the price and the allocation
+     * are one function.  The number admission control must use.
      * @return bytes, or 0 if no session could be created. */
     uint64_t session_cost_bytes(int ctx_size);
-    /** session_cost_bytes() priced for an explicit bank-pool size, so the server
-     * can evaluate the (banks, ctx) fit table before committing to one.
+    /** session_cost_bytes() for an explicit bank-pool size, so the server can
+     * evaluate the (banks, ctx) fit table before committing to one.
      * @param ctx_size context size to price
-     * @param n_banks  >= 1; 1 is the classic single-session cost
+     * @param n_banks  >= 1; 1 is the classic single-session layout
      * @return bytes, or 0 if no session could be created. */
     uint64_t session_cost_bytes_banked(int ctx_size, int n_banks);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
@@ -2152,6 +2153,7 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
 uint64_t argmax_f32(const float *x, uint64_t n);
 /** Release every GPU tensor owned by the whole-model graph runtime. */
 void gpu_graph_free(pulsar_gpu_graph *g);
+void gpu_graph_release(pulsar_gpu_graph *g);   /* tensors only; no segment-graph reset */
 bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n);
 bool gpu_graph_load_directional_steering(
         pulsar_gpu_graph *g,
@@ -2220,8 +2222,9 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
+        uint32_t                n_banks,
         bool                    enable_spec);
-/** Bank-pool size the next gpu_graph_alloc_raw_cap will use: PULSAR_MSEQ_BANKS
+/** Bank-pool size a live gpu_graph_alloc_raw_cap is given: PULSAR_MSEQ_BANKS
  * parsed once (clamped to [1, PULSAR_MSEQ_MAX]; 1 = pool disabled), or the value
  * a caller set.  The one owner of the number (L159 inc 5). */
 uint32_t gpu_graph_bank_pool_n(void);
@@ -2246,6 +2249,15 @@ uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
  * the per-bank compressor frontier. See the definitions in gpu_diag.cpp. */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g);
+/** Compressed rows a layer of compress ratio `ratio` (non-zero) holds at
+ * ctx_size: the one capacity formula, read by gpu_graph_compute_dims (the
+ * allocator's per-layer caps) and the KV sizing in steering.cpp. */
+static inline uint32_t gpu_graph_comp_cap(uint32_t ctx_size, uint32_t ratio) {
+    return ctx_size / ratio + 2u;
+}
+/** One bank's comp + index cache bytes at ctx_size in their stored row formats
+ * (steering.cpp); the demand-paged term of the overcommit split. */
+uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
 /** Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
  * from its compressor frontier.  Every bank -- live or idle -- reads
  * ms_n_comp[bank] now; stage 1b removed the separate live-scalar case.  The increment-2b guard uses this for the
@@ -2413,29 +2425,6 @@ int gpu_graph_decode_multiseq_batch(
         uint32_t              *out_n_rows,
         uint32_t               max_head_runs,
         bool                   capture_cur);
-/** TRUE per-session GPU byte cost of gpu_graph_alloc_raw_cap (+ the DSpark
- * graph state when enable_spec); the sizing side of the admission-control
- * single source of truth (see gpu_diag.cpp).  Includes the whole bank pool
- * when PULSAR_MSEQ_BANKS >= 2 (same knob the allocator reads). */
-uint64_t gpu_graph_session_bytes(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec);
-/** Same, but priced for an EXPLICIT bank-pool size instead of reading
- * PULSAR_MSEQ_BANKS — the fit-table / auto-sizing path (cli_main) evaluates many
- * (n_banks, ctx) candidates before the env is committed. n_banks == 0 or 1 is
- * the classic single-session layout. */
-uint64_t gpu_graph_session_bytes_banked(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec,
-        uint32_t                 n_banks);
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]);
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,

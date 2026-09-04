@@ -1784,7 +1784,8 @@ int generate_gpu_graph_raw_swa(
     }
     pulsar_gpu_graph g;
     bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        gpu_graph_bank_pool_n(), false);
     if (!ok) {
         fprintf(stderr, "pulsar: failed to allocate GPU graph runtime\n");
         return 1;

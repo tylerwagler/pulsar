@@ -190,12 +190,12 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
         pulsar_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
-/** TRUE total per-session GPU byte cost of pulsar_session_create(e, ctx_size):
- * persistent KV caches + the full prefill working set (scaled by the engine's
- * prefill chunk) + speculative/DSpark drafter state when the engine has a
- * drafter loaded.  Shares sizing code with the graph allocator; this is the
- * number admission control must use.  Returns 0 if no session could be
- * created (no graph backend / weights not loaded). */
+/** GPU bytes pulsar_session_create(e, ctx_size) allocates: persistent KV
+ * caches, the prefill working set (scaled by the engine's prefill chunk), the
+ * drafter state when a drafter is loaded.  It is the allocation code itself
+ * run dry, so it equals pulsar_session_resident_bytes of the session it
+ * prices; this is the number admission control must use.  Returns 0 if no
+ * session could be created (no graph backend / weights not loaded). */
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size);
 /** Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
  * evaluates the (banks, ctx) fit table before committing PULSAR_MSEQ_BANKS. n_banks
@@ -282,10 +282,9 @@ int  pulsar_session_bank_fork_partial(pulsar_session *s, uint32_t src, uint32_t 
  * n_cached could proceed. Pure host reads; safe at routing time. */
 int  pulsar_session_bank_fork_partial_feasible(pulsar_session *s, uint32_t src,
                                             int n_cached);
-/** GPU bytes the session's create actually allocated (allocator delta measured
- * across pulsar_session_create).  Reconcile against
- * pulsar_engine_session_cost_bytes after each create; commit this actual to any
- * memory ledger. */
+/** GPU bytes the session's create allocated (allocator delta measured across
+ * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the
+ * same context and pool size -- the server asserts it after each create. */
 uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
 /** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.

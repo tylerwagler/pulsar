@@ -94,8 +94,18 @@ int main(int argc, char **argv) {
     free(text);
     if (base.len < 256) { fprintf(stderr, "prompt too short\n"); return 1; }
 
+    /* The price is the allocator run dry: it must equal what the create took,
+     * to the byte, at this pool size and context. */
+    const uint64_t priced = pulsar_engine_session_cost_bytes(e, ctx);
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
+    if (priced == 0 || priced != pulsar_session_resident_bytes(s)) {
+        fprintf(stderr, "accounting_gate: FAIL session priced %" PRIu64 " B, create allocated %" PRIu64 " B\n",
+                priced, pulsar_session_resident_bytes(s));
+        return 1;
+    }
+    fprintf(stderr, "accounting_gate: session price == allocation (%.3f GiB)\n",
+            (double)priced / (1024.0 * 1024.0 * 1024.0));
 
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "

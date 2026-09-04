@@ -252,6 +252,12 @@ struct pulsar_gpu_tensor {
     void *ptr;        ///< device pointer
     uint64_t bytes;   ///< allocation size
     int owner;        ///< non-zero when this struct owns `ptr` and must free it
+    /** Non-zero for a placeholder handed out while pulsar_gpu_tensor_dry_begin
+     * is in force: nothing is behind `ptr`, and every device operation on the
+     * tensor (fill, write, read, copy, free) is a no-op that reports success.
+     * Exists so the allocation code can be run to PRICE a session without
+     * touching the device -- one authority for what a session costs. */
+    int dry;
     /** Bytes per element.  0 = unspecified, which reads as f32: that keeps
      * every pre-existing alloc meaning exactly what it meant, so only a
      * buffer that is NOT f32 has to say so, once, where it is created.

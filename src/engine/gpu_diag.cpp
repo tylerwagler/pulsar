@@ -208,13 +208,10 @@ bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
  * GPU Release Graph Allocation.
  * ========================================================================= */
 
-/** Derived capacities and tensor dimensions for one session's GPU graph.
- * Computed by gpu_graph_compute_dims and shared by the allocator
- * (gpu_graph_alloc_raw_cap) and the sizing estimate (gpu_graph_session_bytes)
- * so admission control and the allocator can never disagree about the derived
- * quantities.  The per-buffer byte expressions still appear in both functions;
- * the server's estimate-vs-actual reconciliation (>10% drift warning) is the
- * enforcement that they stay in sync. */
+/** Derived capacities and tensor dimensions for one session's GPU graph,
+ * computed by gpu_graph_compute_dims for gpu_graph_alloc_raw_cap.  There is
+ * no separate sizing estimate: a session is priced by running that allocator
+ * dry (pulsar_engine::session_cost_bytes_banked). */
 typedef struct {
     uint32_t raw_cap;      ///< positions the raw KV ring holds
     uint32_t raw_window;   ///< positions retained per layer in that ring
@@ -266,8 +263,7 @@ static void gpu_graph_compute_dims(
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    d->comp_cap = ctx_size / min_ratio + 2u;
-    if (d->comp_cap < 2u) d->comp_cap = 2u;
+    d->comp_cap = gpu_graph_comp_cap(ctx_size, min_ratio);
     d->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
     if (d->attn_comp_stage_cap < 2u) d->attn_comp_stage_cap = 2u;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -275,8 +271,7 @@ static void gpu_graph_compute_dims(
         if (ratio == 0) {
             d->layer_comp_cap[il] = 0;
         } else {
-            d->layer_comp_cap[il] = ctx_size / ratio + 2u;
-            if (d->layer_comp_cap[il] < 2u) d->layer_comp_cap[il] = 2u;
+            d->layer_comp_cap[il] = gpu_graph_comp_cap(ctx_size, ratio);
         }
     }
 
@@ -296,197 +291,17 @@ static void gpu_graph_compute_dims(
 
 
 
-/* TRUE total per-session GPU byte cost: the sum of every pulsar_gpu_tensor that
- * gpu_graph_alloc_raw_cap (and, when enable_spec, gpu_graph_init_dspark_target)
- * allocates for one session.  This is what admission control must price a
- * session at — the packed KV estimate (pulsar_context_memory_estimate_packed)
- * covers only the persistent KV rows plus the indexer score/mask scratch and
- * undercounts the real cost by roughly an order of magnitude (2026-07-13
- * incident: three ctx=65536 slots admitted at 0.5 GiB each consumed the whole
- * GB10 and hard-locked the machine).
- *
- * KEEP IN SYNC with the allocators below (gpu_graph_alloc_raw_cap,
- * gpu_graph_bank_slabs_alloc, gpu_graph_init_dspark_target — same order,
- * same expressions).
- * The server reconciles this estimate against the measured allocation delta
- * after every session create and logs a loud warning on >10% drift, so a
- * missed buffer surfaces on the first live run instead of as an
- * under-admission OOM.
- *
- * EXCLUSION LIST — intentionally unaccounted per-session allocations (each
- * negligible, absorbed by PULSAR_SERVER_MEM_FLOOR_BYTES; do not re-derive):
- *   - the lazy gpu_graph_ensure_batch_ffn_out buffer (only allocated under
- *     steering/diagnostics);
- *   - directional-steering dirs (gpu_graph_load_directional_steering,
- *     ~PULSAR_N_LAYER*PULSAR_N_EMBD floats — these ARE inside the measured create
- *     delta, so they show up in reconciliation but never in this estimate);
- *   - the spec snapshot/restore descriptor tables that
- *     pulsar_gpu_batched_copy_prepare lazily cudaMallocs on the first fused
- *     spec step (~KBs; raw cudaMalloc, outside both this estimate and the
- *     pulsar_gpu_tensor byte counter that reconciliation measures). */
-uint64_t gpu_graph_session_bytes(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec) {
-    return gpu_graph_session_bytes_banked(weights, layer, raw_cap, ctx_size,
-                                          prefill_cap, enable_spec,
-                                          gpu_graph_bank_pool_n());
-}
-
-uint64_t gpu_graph_session_bytes_banked(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec,
-        uint32_t                 n_banks_in) {
-    gpu_graph_dims dz;
-    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
-    const uint64_t pc = dz.prefill_cap;
-    const uint64_t f32 = sizeof(float);
-    const uint64_t hc = PULSAR_HC_ELT_SIZE;   /* HC residual carrier element (BF16); task #62 */
-
-    /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
-     * indexer_scores working buffer — shared with the managed-vs-device
-     * KV placement policy the allocator itself uses.  In bank-pool mode the
-     * persistent KV slabs (and the per-bank compressor state lanes below)
-     * scale with the pool size; everything else is shared by all banks. */
-    const uint64_t n_banks = n_banks_in < 1u ? 1u : n_banks_in;
-    uint64_t kv_cache_bytes = 0;
-    uint64_t total = gpu_graph_context_bytes_for_kv_policy(
-            dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);
-    if (n_banks > 1u) total += (n_banks - 1u) * kv_cache_bytes;
-
-    /* Per-layer attention/indexer state — one lane per bank — and the
-     * single-lane spec shadows (spec never runs against a shared pool). */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint64_t attn_state = (uint64_t)coff * PULSAR_N_HEAD_DIM *
-                                    coff * ratio * f32;
-        total += n_banks * 2ull * attn_state;             /* layer_attn_state_kv/score */
-        /* inc 6: banked pools carry a snapshot lane PER BANK (batched spec
-         * verify snapshots every decode bank before the shared forward). */
-        if (enable_spec) total += (n_banks > 0 ? n_banks : 1) * 2ull * attn_state;
-        if (ratio == 4) {
-            const uint64_t index_state = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM *
-                                         coff * ratio * f32;
-            total += n_banks * 2ull * index_state;        /* layer_index_state_kv/score */
-            if (enable_spec) total += (n_banks > 0 ? n_banks : 1) * 2ull * index_state;
-        }
-    }
-
-    /* Single-token graph buffers. */
-    total += dz.hc_dim * hc;                              /* cur_hc (carrier) */
-    total += dz.hc_dim * f32;                             /* flat_hc (RMSNorm out, f32) */
-    total += dz.mix_hc * f32;                             /* hc_split (views free) */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* attn_norm */
-    total += (uint64_t)PULSAR_N_HEAD_DIM * f32;              /* kv */
-    total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
-    total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
-    total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
-             pc * sizeof(uint32_t);                       /* comp_selected */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* ffn_norm */
-    total += 2ull * PULSAR_N_HC * f32;                       /* output_pre, output_weights */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* output_embd, output_norm */
-    total += dz.vocab_dim * f32;                          /* logits */
-    total += pc * sizeof(int32_t);                        /* prefill_tokens */
-    /* Multi-row logits readback slab.  Allocated unconditionally (NOT under
-     * enable_spec): besides the DSpark draft/verify passes it is the output
-     * buffer of every batched multi-row head — gpu_graph_verify_suffix_tops
-     * and the Tier-2 batched multi-session decode driver
-     * (gpu_graph_decode_multiseq_batch) both read their rows out of it, and
-     * those paths must work with speculation disabled (--no-dspark,
-     * pulsar-bench/pulsar-eval/agent, or any model without a merged drafter). */
-    total += (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_N_VOCAB * f32; /* spec_logits */
-
-    /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
-     * the non-KV cost (~4 GiB at pc=4096 on Flash). */
-    total += 2ull * pc * dz.hc_dim * hc;                  /* batch_cur/next_hc (carriers) */
-    total += pc * dz.hc_dim * f32;                        /* batch_flat_hc (RMSNorm out, f32) */
-    total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_norm */
-    if (gpu_graph_f32_store_observed_any())
-        total += pc * PULSAR_N_EMBD * f32;                   /* batch_attn_cur (dump-only) */
-    total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
-    total += pc * dz.q_dim * PULSAR_Q_ELT_SIZE;           /* batch_q */
-    total += 2ull * pc * PULSAR_N_HEAD_DIM * f32;            /* batch_kv_raw/kv */
-    total += 2ull * pc * dz.comp_width_max * f32;         /* batch_comp_kv/sc */
-    total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q (rope staging) */
-    total += pc * (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_ENGINE_IDXFP4_ROWBYTES; /* batch_indexer_qp (packed) */
-    total += pc * PULSAR_N_INDEXER_HEAD * f32;               /* batch_indexer_weights */
-    total += pc * dz.q_dim * PULSAR_HEADS_ELT_SIZE;       /* batch_heads */
-    total += pc * dz.low_dim * f32;                       /* batch_attn_low */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_out */
-    total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
-    total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_ffn_cur/norm */
-    total += pc * dz.shared_dim * (f32 + 2ull * PULSAR_SHARED_ACT_ELT_SIZE); /* batch_shared_mid f32 + gate/up f16 (L033) */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_shared_out */
-    total += 2ull * pc * PULSAR_N_EXPERT * f32;              /* batch_router_logits/probs */
-    total += pc * PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
-    total += 2ull * pc * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* batch_routed_up/mid */
-    total += pc * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;   /* batch_routed_down */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_routed_out */
-
-    /* DSpark drafter graph state (gpu_graph_init_dspark_target), allocated by
-     * pulsar_session_create whenever the engine has a drafter loaded — the
-     * production merged GGUF auto-enables it. */
-    if (enable_spec) {
-        total += 3ull * PULSAR_N_EMBD * f32;                 /* dspark_target_h[3] */
-        total += 3ull * 17 * PULSAR_N_EMBD * f32;            /* dspark_target_h_batch[3] */
-        /* Option F: dspark_raw_cache[3] + dspark_prompt_h[3] are BANKED slabs
-         * (n_banks lanes) so the N=2 spec-time-slice lane keeps a warm ring per
-         * bank; the rest of the drafter state is shared across banks. */
-        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW
-                 * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;          /* dspark_raw_cache[3], packed */
-        total += (uint64_t)PULSAR_N_EMBD * f32;              /* dspark_main_x */
-        total += 3ull * pc * PULSAR_N_EMBD * f32;            /* dspark_bulk_h[3] */
-        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_EMBD * f32; /* dspark_prompt_h[3] */
-        const uint64_t attn_w = 2ull * PULSAR_N_HEAD_DIM;
-        const uint64_t idx_w = 2ull * PULSAR_N_INDEXER_HEAD_DIM;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            total += 2ull * (PULSAR_SPEC_LOGITS_ROWS + 1u) * attn_w * f32;            /* spec_comp_kv/sc_save */
-            if (ratio == 4) total += 2ull * (PULSAR_SPEC_LOGITS_ROWS + 1u) * idx_w * f32; /* spec_icomp_kv/sc_save */
-        }
-        total += (uint64_t)PULSAR_N_HEAD_DIM * f32;          /* spec_comp_scratch_row */
-        total += 3ull * PULSAR_N_EMBD * f32;                 /* dspark_concat */
-        total += (uint64_t)PULSAR_N_EMBD * f32;              /* dspark_proj_out */
-        total += 3ull * PULSAR_N_HEAD_DIM * f32;             /* dspark_seed_kv/norm/rot */
-        total += (uint64_t)PULSAR_N_VOCAB * f32;             /* dspark_markov_logits */
-    }
-    return total;
-}
 
 
 
-/* Tier-2 overcommit (task #55, increment 1): the DEMAND-PAGED (cudaMallocManaged,
- * physical-on-touch) bytes of ONE bank's ctx-scaled comp + index caches at the
- * given context.  This is exactly the comp/index portion of
- * gpu_graph_kv_cache_bytes_for_context (steering.cpp) MINUS the eager raw ring —
- * the part the overcommit auto-size reserves as VA only and does NOT charge at
- * admission (the eager floor is charged; physical materializes as the frontier
- * grows, tracked by gpu_graph_touched_kv_bytes).  Row widths track the ACTUAL
- * packed storage (PULSAR_ATTN_PACK attn comp + MXFP4 indexer), matching the slab
- * allocator in gpu_graph_bank_slabs_alloc. */
+/* Tier-2 overcommit: the DEMAND-PAGED (cudaMallocManaged, physical-on-touch)
+ * bytes of ONE bank's ctx-scaled comp + index caches -- the part the overcommit
+ * auto-size reserves as VA only and does NOT charge at admission (the eager
+ * floor is charged; physical materializes as the frontier grows, tracked by
+ * gpu_graph_touched_kv_bytes).  The comp/index term of the KV-policy sizing,
+ * from the same function (steering.cpp). */
 uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
-    uint64_t bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * attn_row;
-        if (ratio == 4) bytes += comp_cap * idx_row;
-    }
-    return bytes;
+    return gpu_graph_comp_index_bytes_for_context(ctx_size);
 }
 
 
@@ -549,8 +364,8 @@ uint32_t gpu_graph_bank_pool_n(void) {
 /* Allocate the fixed per-bank KV slabs (layout: pulsar_bank_slabs in
  * pulsar_engine_internal.h; design adapted from Entrpi/ds4 v0.2 — citation at
  * the struct).  Per-bank byte expressions MUST match the single-session
- * branches in gpu_graph_alloc_raw_cap below and the pricing in
- * gpu_graph_session_bytes.  Compressor state lanes are primed for every bank
+ * branches in gpu_graph_alloc_raw_cap below (the bank-0 views installed there
+ * cover exactly what the classic layout allocates).  Compressor state lanes are primed for every bank
  * here (kv = 0, score = -inf), exactly like a fresh single-session graph, so
  * a later bank admit starts from the same state a cold session would. */
 static bool gpu_graph_bank_slabs_alloc(
@@ -1666,7 +1481,10 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
 
 
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
- * weights are not copied here; tensors reference the mapped GGUF. */
+ * weights are not copied here; tensors reference the mapped GGUF.  n_banks is
+ * the Tier-2 pool size (1 = the classic single-session layout; a live create
+ * passes gpu_graph_bank_pool_n(), the pricer the candidate it is costing).
+ * On failure the graph's tensors are released; nothing else is touched. */
 bool gpu_graph_alloc_raw_cap(
         pulsar_gpu_graph *g,
         const pulsar_weights     *weights,
@@ -1674,8 +1492,10 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
+        uint32_t                n_banks,
         bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
+    if (n_banks < 1u) n_banks = 1u;
     gpu_graph_dims dz;
     gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
     raw_cap = dz.raw_cap;
@@ -1748,7 +1568,7 @@ bool gpu_graph_alloc_raw_cap(
                 "the row holds n_rot %u and nope widths in multiples of %u) -- refusing\n",
                 (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT,
                 (unsigned)PULSAR_ATTN_PACK_NROT, (unsigned)PULSAR_ATTN_PACK_NOPE_ALIGN);
-        gpu_graph_free(g);
+        gpu_graph_release(g);
         return false;
     }
 
@@ -1763,21 +1583,21 @@ bool gpu_graph_alloc_raw_cap(
                     "pulsar: PULSAR_KV4 is set but the switch was REMOVED (L111 "
                     "unification 2026-08-27: every KV buffer is the 384 B NVFP4 "
                     "row); unset it -- refusing to start\n");
-            gpu_graph_free(g);
+            gpu_graph_release(g);
             return false;
         }
-        fprintf(stderr, "pulsar: KV rows = NVFP4 (%llu B/row, unified: raw ring + "
-                        "comp pool + drafter + chunk)\n",
-                (unsigned long long)pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM));
+        if (!pulsar_gpu_tensor_dry_active())   /* a pricing run allocates nothing */
+            fprintf(stderr, "pulsar: KV rows = NVFP4 (%llu B/row, unified: raw ring + "
+                            "comp pool + drafter + chunk)\n",
+                    (unsigned long long)pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM));
     }
 
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer
      * cache pointers below then become bank-0 views instead of owning
      * allocations, and all single-session code runs unmodified. */
-    const uint32_t n_banks = gpu_graph_bank_pool_n();
     if (n_banks >= 2u &&
         !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz, enable_spec)) {
-        gpu_graph_free(g);
+        gpu_graph_release(g);
         return false;
     }
     const bool banked = g->banks.n_banks != 0;
@@ -1930,7 +1750,7 @@ bool gpu_graph_alloc_raw_cap(
             fprintf(stderr,
                     "pulsar: PULSAR_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
                     PULSAR_N_INDEXER_HEAD_DIM);
-            gpu_graph_free(g);
+            gpu_graph_release(g);
             return false;
         }
         /* f32 emit/repack staging for the packed indexer cache: comp-cap rows so
@@ -2067,7 +1887,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
-    if (!ok) gpu_graph_free(g);
+    if (!ok) gpu_graph_release(g);
     return ok;
 }
 

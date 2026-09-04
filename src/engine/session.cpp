@@ -142,7 +142,8 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 
     pulsar_gpu_graph g;
     bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        gpu_graph_bank_pool_n(), false);
     if (!ok) {
         fprintf(stderr, "pulsar: failed to allocate imatrix GPU graph runtime\n");
         free(dataset);
@@ -630,7 +631,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     const uint64_t alloc_before = pulsar_gpu_tensor_alloc_bytes_current();
     if (!gpu_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
-                                   e->dspark_ready))
+                                   gpu_graph_bank_pool_n(), e->dspark_ready))
     {
         free(s);
         return 1;
@@ -664,29 +665,15 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
 }
 
 
-/* TRUE total per-session GPU byte cost of pulsar_session_create at this context
- * size — the admission-control price of a session.  Derives prefill/raw caps
- * exactly like pulsar_session_create and includes the DSpark drafter graph state
- * when the engine has a drafter loaded, so callers cannot pass mismatched
- * parameters.  Built on the same sizing code as the allocator
- * (gpu_graph_session_bytes, gpu_diag.cpp); reconcile against
- * pulsar_session_resident_bytes after the create. */
-uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
-    auto *e = this;
-    if (!e || ctx_size <= 0) return 0;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
-    const uint32_t prefill_cap = gpu_graph_prefill_cap_for_prompt(ctx_size,
-                                                                  e->prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
-    if (!shape_layer) return 0;
-    return gpu_graph_session_bytes(&e->weights, shape_layer, raw_cap,
-                                   (uint32_t)ctx_size, prefill_cap,
-                                   e->dspark_ready);
-}
-
-uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size,
-                                              int n_banks) {
+/* The price of pulsar_session::create at this context size IS the create: the
+ * same three allocation steps run with the tensor primitives in dry mode
+ * (pulsar_gpu_tensor_dry_begin), so the number admission control charges and
+ * the number the allocator commits come from one piece of code -- the server
+ * checks them equal after every create.  Not in the price, on either side:
+ * allocations made on demand after create (gpu_graph_ensure_batch_ffn_out,
+ * the multiseq descriptors, the batched-copy descriptor tables); the server's
+ * memory floor absorbs those. */
+uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks) {
     auto *e = this;
     if (!e || ctx_size <= 0 || n_banks < 1) return 0;
     if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
@@ -695,9 +682,25 @@ uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size,
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
     const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) return 0;
-    return gpu_graph_session_bytes_banked(&e->weights, shape_layer, raw_cap,
-                                          (uint32_t)ctx_size, prefill_cap,
-                                          e->dspark_ready, (uint32_t)n_banks);
+    pulsar_gpu_graph g;
+    pulsar_gpu_tensor_dry_begin();
+    const bool ok =
+        gpu_graph_alloc_raw_cap(&g, &e->weights, shape_layer, raw_cap,
+                                (uint32_t)ctx_size, prefill_cap, (uint32_t)n_banks,
+                                e->dspark_ready) &&
+        gpu_graph_load_directional_steering(&g, e->directional_steering_file,
+                                            e->directional_steering_attn_scale,
+                                            e->directional_steering_ffn_scale) &&
+        (!e->dspark_ready ||
+         gpu_graph_init_dspark_target(&g, e->dspark_weights.target_layer_ids));
+    uint64_t bytes = 0;
+    pulsar_gpu_tensor_dry_end(&bytes, NULL);
+    gpu_graph_release(&g);
+    return ok ? bytes : 0;
+}
+
+uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
+    return session_cost_bytes_banked(ctx_size, (int)gpu_graph_bank_pool_n());
 }
 
 uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {

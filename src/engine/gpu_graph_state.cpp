@@ -2,12 +2,20 @@
 
 
 
-/* Release every GPU tensor owned by the whole-model graph runtime. */
+/* Tear down a graph that has run: the cached segment graphs bake THIS graph's
+ * device allocations and must not survive it (a later session reusing the
+ * addresses would replay against freed state; the multiseq gates caught
+ * this), then every tensor goes. */
 void gpu_graph_free(pulsar_gpu_graph *g) {
-    /* L119: cached segment graphs bake THIS graph's device allocations —
-     * they must not survive it (a later session reusing the addresses would
-     * replay against freed state; the multiseq gates caught this). */
     pulsar_gpu_seg_reset();
+    gpu_graph_release(g);
+}
+
+/* Release every GPU tensor (and host table) the graph owns, and nothing else:
+ * the allocator's own failure paths and the dry-run pricer use this -- a graph
+ * that never ran has baked no segment graph, and a pricing run must not reset
+ * the live session's. */
+void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);

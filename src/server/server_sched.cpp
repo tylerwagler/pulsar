@@ -70,32 +70,26 @@ int server::job_needed_ctx(const job *j) const {
 
 
 
-/* Reconcile a session's admission estimate with the bytes the allocator
- * actually committed (2026-07-13 lockup postmortem: the ledger must track
- * reality, not a formula). Logs the pair, warns loudly on >10% drift — that
- * means gpu_graph_session_bytes (gpu_diag.cpp) has fallen out of sync with
- * gpu_graph_alloc_raw_cap — and returns the value to commit to the ledger
- * (the actual, unless the engine could not measure one). */
+/* Check the price admission charged against the bytes the allocator committed.
+ * Both come from the same allocation code (the price is that code run dry), so
+ * they are equal, or an allocation inside the create window bypassed the
+ * tensor primitives -- an accounting hole the ledger must not paper over.
+ * Returns the bytes to commit (the actual), 0 on a mismatch: the caller
+ * refuses to start. */
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                         uint64_t est_bytes,
                                         uint64_t actual_bytes) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: slot %d session cost: est=%.2f GiB actual=%.2f GiB (ctx=%d)",
+               "pulsar-server: slot %d session cost: priced=%.2f GiB actual=%.2f GiB (ctx=%d)",
                slot_idx, (double)est_bytes / gib, (double)actual_bytes / gib, ctx);
-    if (actual_bytes == 0) return est_bytes;
-    if (est_bytes > 0 &&
-        (actual_bytes > est_bytes + est_bytes / 10 ||
-         est_bytes > actual_bytes + actual_bytes / 10))
-    {
+    if (actual_bytes == 0 || est_bytes != actual_bytes) {
         server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: SESSION COST DRIFT >10%%: est=%.2f GiB vs actual=%.2f GiB "
-                   "— gpu_graph_session_bytes is out of sync with gpu_graph_alloc_raw_cap "
-                   "(or a deliberately unaccounted allocation is enabled: directional-"
-                   "steering dirs are in the measured delta but excluded from the "
-                   "estimate — see the exclusion list in gpu_diag.cpp); "
-                   "fix the sizing code (gpu_diag.cpp) before trusting admission control",
-                   (double)est_bytes / gib, (double)actual_bytes / gib);
+                   "pulsar-server: SESSION COST MISMATCH: priced %llu bytes, allocated %llu "
+                   "-- the price is the allocator run dry, so an allocation inside "
+                   "pulsar_session_create bypassed the tensor primitives; refusing to start",
+                   (unsigned long long)est_bytes, (unsigned long long)actual_bytes);
+        return 0;
     }
     return actual_bytes;
 }

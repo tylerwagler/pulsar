@@ -650,11 +650,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Full N-bank cost prices what the allocator will ACTUALLY reserve (incl. the
+    /* Full N-bank cost is what the allocator will reserve (incl. the
      * demand-paged VA, which cudaMallocManaged counts at full size). Under
      * overcommit, admission is gated on the eager-floor est instead so the pool
-     * comes up at N>1; the full est is kept for the est-vs-actual reconcile below
-     * (it matches the measured resident, so no false drift warning). */
+     * comes up at N>1; the full price is what the create is checked against. */
     const uint64_t full_banked_est = pulsar_engine_session_cost_bytes(engine, cfg.ctx_size);
     uint64_t overcommit_admission_est = 0;
     if (overcommit) {
@@ -691,16 +690,19 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return 1;
     }
-    /* Reconcile the estimate with what the allocator really did and commit the
-     * ACTUAL to the ledger (>10% drift means the sizing code in gpu_diag.cpp has
-     * fallen out of sync with the allocator — fix that, not the ledger). Under
-     * overcommit the admission est is the eager floor only; reconcile against the
-     * FULL banked est so it still matches the measured resident (which counts the
-     * demand-paged managed VA at full size) — no false drift warning. */
+    /* The price and the allocation are one piece of code; check they agree
+     * and commit the actual to the ledger.  Under overcommit the admission
+     * est is the eager floor only; the FULL banked price is what the create
+     * allocated (the demand-paged managed VA counts at full size). */
     const uint64_t session_actual =
         server_reconciled_session_cost(0, cfg.ctx_size,
                                        overcommit ? full_banked_est : session_est,
                                        pulsar_session_resident_bytes(session));
+    if (session_actual == 0) {
+        pulsar_session_free(session);
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* Materialize the lazy first-generation CUDA working set BEFORE deriving
      * the admission budget or opening the listener (F1, task #32). */
