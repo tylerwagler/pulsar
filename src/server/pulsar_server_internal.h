@@ -1015,20 +1015,21 @@ typedef struct {
  * increment-2 single-session server. */
 /* Raised 5 -> 8 (2026-08-10): banks are warm-state slots, not decode
  * streams, and 5 was below the fast-lane boundary for no reason.  8 is the
- * measured sweet spot: the batched custom-nt matmul lane and the split-KV
- * decode gate cap their fast paths at 8 rows, and N=12 aggregate decode
- * holds 29.2 tok/s at 8 banks vs 21.9 at 12 (the >8-row steps fall to the
- * slow lanes).  The engine allows up to PULSAR_MSEQ_MAX=16 via an operator
+ * measured sweet spot when it was set: N=12 aggregate decode held 29.2 tok/s
+ * at 8 banks vs 21.9 at 12 (the dense-step lanes then capped their fast
+ * paths at 8 rows; the M-neutral range is 16 since L150/L152 and the
+ * attention kernel is row-count-neutral since L161/L166, so this number is
+ * due a re-measure).  The engine allows up to PULSAR_MSEQ_MAX=16 via an operator
  * PULSAR_MSEQ_BANKS pin for TTFT-focused deploys that accept that cliff.
  * KNOWN LIMIT, measured: with active conversations == banks, pool-full
  * eviction is LRU and cyclic traffic evicts exactly the next returning
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
 #define PULSAR_SESSION_POOL_CAP 16
-/* Auto-sizing cap: the batched custom-nt matmul lane and the split-KV decode
- * gate cap their fast paths at 8 rows, and N=12 aggregate decode holds 29.2
- * tok/s at 8 banks vs 21.9 at 12 (>8-row steps fall to the slow lanes) — so
- * the DEFAULT config never auto-sizes past 8.  POOL_CAP above is the hard
+/* Auto-sizing cap: measured 2026-08-10, when the dense-step lanes capped
+ * their fast paths at 8 rows -- N=12 aggregate decode held 29.2 tok/s at 8
+ * banks vs 21.9 at 12 -- so the DEFAULT config never auto-sizes past 8 (the
+ * lanes are 16-row neutral now; the cap awaits a re-measure).  POOL_CAP above is the hard
  * array bound = PULSAR_MSEQ_MAX, so an operator PULSAR_MSEQ_BANKS pin up to
  * 16 is safe (it was an out-of-bounds walk when the pin exceeded the array,
  * a latent bug up to and including the 5-slot era). */

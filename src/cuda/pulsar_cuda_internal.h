@@ -132,29 +132,6 @@ __device__ __forceinline__ float q_load<float>(const float *p, uint64_t i) { ret
 template <>
 __device__ __forceinline__ float q_load<__half>(const __half *p, uint64_t i) { return __half2float(p[i]); }
 
-/* Four consecutive Q values as a float4, indexed in units of FOUR ELEMENTS.
- *
- * The heads8 kernels give each lane dims 4*lane + 128k .. +3 via q4[lane+32k].
- * Keeping that index in element-quads means the f16 arm reads the SAME dims as
- * the f32 arm -- an 8-byte load instead of 16 -- so the lane->dim mapping and
- * the shared-memory K layout are untouched.  Values are unpacked to f32 on the
- * spot, so the dot products and their register footprint are unchanged. */
-template <typename QT>
-__device__ __forceinline__ float4 q_load4(const QT *p, uint32_t i4);
-template <>
-__device__ __forceinline__ float4 q_load4<float>(const float *p, uint32_t i4) {
-    return ((const float4 *)p)[i4];
-}
-template <>
-__device__ __forceinline__ float4 q_load4<__half>(const __half *p, uint32_t i4) {
-    const uint2 raw = ((const uint2 *)p)[i4];          /* 4 halves, 8 B */
-    const __half2 lo = *(const __half2 *)&raw.x;
-    const __half2 hi = *(const __half2 *)&raw.y;
-    const float2 a = __half22float2(lo);
-    const float2 b = __half22float2(hi);
-    return make_float4(a.x, a.y, b.x, b.y);
-}
-
 template <typename QT>
 __device__ __forceinline__ void q_store(QT *p, uint64_t i, float v);
 template <>
@@ -459,10 +436,6 @@ __device__ static __forceinline__ float warp_sum_f32(float v) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
     return v;
-}
-
-__device__ static __forceinline__ float dot4_f32(float4 a, float4 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
 #endif /* PULSAR_CUDA_INTERNAL_H */

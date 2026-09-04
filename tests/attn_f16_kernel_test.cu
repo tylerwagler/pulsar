@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
          * masks the score to -INF so the row contributes zero; substituting row
          * 0 for real would inject an unselected position AND double-count row 0
          * whenever row 0 was also legitimately selected.  This oracle used to
-         * mirror the f32 kernel, which does substitute -- so it encoded the
+         * mirror the f32 kernel of the time (deleted in L166), which did substitute -- so it encoded the
          * behaviour the f16 kernel was written to fix, and every top_k>0 shape
          * disagreed with it by ~8e-1.  The divergence is confined to
          * out-of-VISIBLE selections, which is why ratio=0 (everything visible)
@@ -253,7 +253,7 @@ int main(int argc, char **argv) {
                                            (const pulsar_attn_pack_t *)dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
-                                           NULL, NULL, NULL, 0u, 1u, NULL)
+                                           NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL)
         : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
                                            n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,

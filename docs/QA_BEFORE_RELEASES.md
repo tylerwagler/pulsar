@@ -74,8 +74,9 @@ The individual targets, all needing the GB10 and (except the first two) the
 model.  Record pass/fail against the release commit:
 
 - `make cuda-regression` — modelless kernel smokes.
-- `make cuda-attn-gates` — fp16 attention kernel oracle, banked cross-session
-  KV-leak isolation, split-KV decode merge (modelless).
+- `make cuda-attn-gates` — fp16 attention kernel oracle (dense, compressed,
+  indexed, decode-batch, one-row), banked cross-session KV-leak isolation
+  (modelless).
 - `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
   `PREFILL_BASELINE_REF` blob.  **The baseline ref must postdate type-43**
   (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the

@@ -194,7 +194,7 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make cuda-regression     Kernel smokes vs synthetic slabs (modelless)"
 	@echo "  make cuda-attn-gates     fp16 attention correctness gates: kernel oracle,"
-	@echo "                           banked KV-leak isolation, split-KV merge (modelless)"
+	@echo "                           banked KV-leak isolation, one-row launch (modelless)"
 	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
 	@echo "                           FRONTIER_MODEL=./ds4flash.gguf by default)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
@@ -260,10 +260,10 @@ cuda-minp-prefilter-gate: tests/minp_prefilter_gate
 	./tests/minp_prefilter_gate
 
 # fp16 attention correctness gates (standalone .cu, no model needed):
-# kernel-vs-f64 oracle, banked cross-sequence isolation (the KV-leak oracle
-# for the default-on fp16 tier), and split-KV decode merge vs the single-walk
-# golden across every staging branch.  Each file's header documents its scope;
-# these were previously build-by-hand only.
+# kernel-vs-f64 oracle across the dense, compressed, indexed, decode-batch and
+# one-row shapes, and banked cross-sequence isolation (the KV-leak oracle for
+# the one attention kernel).  Each file's header documents its scope; these
+# were previously build-by-hand only.
 # ARCH MUST BE PINNED HERE, and the failure mode if it is not is a LIE rather
 # than an error.  pulsar_cuda_attn_f16.cu compiles its whole MMA body behind
 # `__CUDA_ARCH__ >= 800`; below that the kernel is a no-op stub that voids its
@@ -278,12 +278,12 @@ cuda-minp-prefilter-gate: tests/minp_prefilter_gate
 # arch; pin it so the default can never decide whether a gate is honest.
 ATTN_GATE_ARCH ?= sm_120f
 
-# ⚠ THESE THREE #include A SHIPPED .cu AND MUST DEPEND ON IT.
+# ⚠ THESE TWO #include A SHIPPED .cu AND MUST DEPEND ON IT.
 #
 # Each of these tests compiles one .cu that pulls in the real kernel source, so
 # the engine is genuinely a prerequisite -- and until 2026-08-18 the rules said
 # only "<test>.cu Makefile".  Every kernel change since the KV format was
-# unified therefore left them UP TO DATE, and all three sat stale for days:
+# unified therefore left them UP TO DATE, and they sat stale for days:
 # attn_f16_kernel_test was feeding f32 rows to a packed reader and would have
 # reported 598016 NaNs the moment it was rebuilt.  It took deleting the vendored
 # MMQ headers to force that rebuild.
@@ -294,7 +294,7 @@ ATTN_GATE_ARCH ?= sm_120f
 # the engine side.
 #
 # ✅ Project-wide -MMD -MP landed 2026-08-18, so these lists are no longer what
-# keeps these three correct -- the generated .d files are.  They are KEPT as the
+# keeps these tests correct -- the generated .d files are.  They are KEPT as the
 # floor: on a first build, or immediately after `make clean`, no .d exists yet
 # and a hand-listed prerequisite is all make has.
 # ---- standalone probes ---------------------------------------------------
@@ -363,30 +363,26 @@ tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
                             src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-tests/attn_decode_split_test: tests/attn_decode_split_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attention.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
-	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
-
 # attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
 # raw_cap] and its own header argues the compressed and indexed halves matter --
 # "wiring the kernel in against only the n_comp=0 path would have shipped that
 # half untested" -- but the gate ran the default (n_comp=0) shape ONLY, so both
 # halves were untested exactly as that note warned.  Running them found a stale
 # oracle: it clamped an out-of-visible top-k selection to row 0, mirroring the
-# f32 kernel, while the f16 kernel masks the row to -INF (row 0 substitution
+# f32 kernel of the time, while the f16 kernel masks the row to -INF (row 0 substitution
 # double-counts row 0 whenever row 0 was also legitimately selected).  Every
 # top_k>0 shape disagreed by ~8e-1 and nothing was running to notice.
 # attn_f16_banked_test took a "p" argument selecting ATTN_PACK comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 5 20    # indexed + ring raw rows
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
+	./tests/attn_f16_kernel_test 1 16 32 x 12 1 5 20     # ONE-row indexed launch (L166: n_tokens==1 is the same kernel)
 	./tests/attn_f16_banked_test
-	./tests/attn_decode_split_test
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips
@@ -1354,7 +1350,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/attn_decode_split_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

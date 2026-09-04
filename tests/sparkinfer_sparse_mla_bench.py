@@ -10,6 +10,8 @@ Reference to beat, from tests/attn_indexed_bench.cu (calibrated to the engine
 ramp within 3.9%), at the plateau (causal depth >= 2048):
 
     attention_indexed_mixed_heads8_online_kernel<8,16>   6.917 ms / 512 tokens
+    (the f32 indexed kernel of the time; deleted in L166 -- the fp16
+    tensor-core kernel in pulsar_cuda_attn_f16.cu is the live comparison)
 
 Our shape, verified against the gguf and the engine trace:
     num_q_heads 64, head_dim 512 (DSV4: d_qk == d_v == 512), topk 512,

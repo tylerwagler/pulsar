@@ -13,13 +13,15 @@
  * head-token pairs attend.  Nothing saturates in any format (max|q| 17.6,
  * max|kv| 5.65), so this is a resolution choice, not a range one.
  *
- * WHAT THIS REPLACES.  attention_static_mixed_heads8_online_kernel runs at
- * pipe_tensor 0%, pipe_fma 40%, pipe_lsu 56%: one warp per head, one KV row at
- * a time, and a 32-lane shuffle reduction to produce ONE score out of 16 FMAs
- * of useful work -- while all 8 warps in the block re-read the same 2 KB latent
- * row out of shared memory.  Both costs are structural, and both disappear when
- * the reduction becomes the MMA's k dimension and the operands are reused
- * across the MMA's m dimension.
+ * WHAT THIS REPLACED.  The f32 online-softmax kernels (the last of them, the
+ * decode kernel, deleted in L166 -- this kernel is now the ONE decode/prefill
+ * attention kernel for every production shape) ran at pipe_tensor 0%,
+ * pipe_fma 40%, pipe_lsu 56%: one warp per head, one KV row at a time, and a
+ * 32-lane shuffle reduction to produce ONE score out of 16 FMAs of useful
+ * work -- while all 8 warps in the block re-read the same 2 KB latent row out
+ * of shared memory.  Both costs are structural, and both disappear when the
+ * reduction becomes the MMA's k dimension and the operands are reused across
+ * the MMA's m dimension.
  *
  * MLA, so K AND V ARE THE SAME TENSOR.  The launcher passes raw_kv as both, and
  * there is one latent 512-wide vector per position.  The tile is therefore
@@ -185,11 +187,22 @@ static void attn_f16_kernel(
         uint32_t n_head,
         uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start_in,
         uint32_t top_k,
+        /* positions: ring mode -> per-row query position for the row plan and
+         * the fused Q rope; dense mode -> fused Q rope only (a banked
+         * zero-prefix prefill batch ropes at positions[t], not t). */
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks,
         int ring,                         /* ring/descriptor row plan; topk may
                                            * be NULL -> visible comp prefix */
+        int non_causal,                   /* ring mode only: a query sees every
+                                           * raw row up to the ring's last one,
+                                           * not only rows at or before its own
+                                           * position (the drafter's raw-window
+                                           * forward).  Changes WHICH raw rows
+                                           * are visible, never how a visible
+                                           * row is folded; comp visibility is
+                                           * untouched. */
         /* Grouped E4M3 activation slots for the attn-output "a" projection.
          * NULL = f32 only.  This epilogue owns the NOPE blocks (head dims
          * [0, n_nope)); rope_tail_kernel rewrites [n_nope, AF16_DIM) in place
@@ -214,7 +227,7 @@ static void attn_f16_kernel(
     (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
     (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
     (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
-    (void)ring;
+    (void)ring; (void)non_causal;
     (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
     (void)n_groups; (void)n_nope;
     (void)gact_tok0; (void)gact_ntok;
@@ -237,8 +250,8 @@ static void attn_f16_kernel(
     const uint32_t ldm_half = (lane >> 3u) & 1u;
 
     /* Dead/evicted row: zero the heads and leave together.  This MUST precede
-     * every __syncthreads in the kernel, exactly as in the f32 twin -- a
-     * partial early return past a barrier hangs the block. */
+     * every __syncthreads in the kernel -- a partial early return past a
+     * barrier hangs the block. */
     if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
         for (uint32_t i = tid; i < AF16_HPB * AF16_DIM; i += AF16_THREADS) {
             const uint32_t hh = hbase + i / AF16_DIM;
@@ -249,18 +262,30 @@ static void attn_f16_kernel(
 
     /* ---- row plan ------------------------------------------------------
      * Two modes.  Dense window (topk == NULL, ring == 0) is the raw/mixed
-     * launchers' contiguous causal window.  RING mode reproduces
-     * attention_indexed_mixed_heads8_online_kernel's plan verbatim: raw rows
-     * come out of a ring buffer (hence the modulo and the row table) and the
+     * prefill launchers' contiguous causal window over the batch's own
+     * tokens.  RING mode is the decode-batch and indexed plan: raw rows come
+     * out of a ring buffer (hence the modulo and the row table) and the
      * compressed rows are either a top-k SELECTION (topk != NULL) or the
-     * visible prefix (topk == NULL -- the continued-prefill sweep).  The
+     * visible prefix (topk == NULL -- the decode-batch sweep).  The
      * banked-descriptor variant (positions/seq_id/comp_bank_ptrs) and
      * ATTN_PACK comp rows are both served: the preamble below derives the
-     * per-row qpos / raw_base / comp_src byte-for-byte as the f32 kernel
-     * does, and NULL descriptors collapse every term to the scalar
-     * pos0+t path.  Bank isolation is gated by
-     * tests/attn_f16_banked_test.cu; pack decode goes through the shared
-     * attn_comp_pack_ld. */
+     * per-row qpos / raw_base / comp_src from the descriptors, and
+     * NULL descriptors collapse every term to the scalar pos0+t path.  Bank
+     * isolation is gated by tests/attn_f16_banked_test.cu; pack decode goes
+     * through the shared attn_comp_pack_ld.
+     *
+     * RAW VISIBILITY.  The ring holds positions [first_raw_pos, raw_last_pos]
+     * (per row under descriptors: the window ending at positions[t]; scalar:
+     * the n_raw rows ending at pos0 + n_tokens - 1).  A row sees
+     *   lo = max(first_raw_pos, qpos + 1 - window)      (window 0 = unbounded)
+     *   hi = non_causal ? raw_last_pos : min(qpos, raw_last_pos)
+     * so causal rows see only ring rows at or before their own position and
+     * non-causal rows see the whole ring up to its last row.  Under
+     * descriptors raw_last_pos == positions[t], so the drafter's banked
+     * launch (positions = each bank's VISIBILITY position, the bank's last
+     * draft position, window = raw_cap) derives the same window either way;
+     * the scalar launch (pos0 = the first query's position, n_raw = the
+     * visible rows) is where the two rules differ. */
     __shared__ uint32_t sRawRows[256];
     __shared__ uint32_t sRawCount, sRawFirst;
     __shared__ uint32_t sVisComp;
@@ -268,8 +293,8 @@ static void attn_f16_kernel(
     uint32_t comp_base = 0u;
     const pulsar_attn_pack_t *comp_src = comp_kv;
     if (ring) {
-        /* Descriptor (banked) preamble, byte-for-byte as the f32 kernel derives
-         * it; NULL descriptors collapse to the scalar pos0+t path. */
+        /* Descriptor (banked) preamble; NULL descriptors collapse to the
+         * scalar pos0+t path. */
         const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
         uint32_t eff_n_raw = n_raw, eff_raw_start = raw_start_in, first_raw_pos;
         if (positions) {
@@ -294,7 +319,8 @@ static void attn_f16_kernel(
                         const uint32_t wlo = qpos + 1u - window;
                         if (wlo > lo) lo = wlo;
                     }
-                    const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                    const uint32_t hi = non_causal ? raw_last_pos
+                                      : (qpos < raw_last_pos ? qpos : raw_last_pos);
                     if (hi >= lo) { rf = lo - first_raw_pos; rc = hi - lo + 1u; }
                     if (rc > 256u) rc = 256u;
                 }
@@ -512,8 +538,9 @@ static void attn_f16_kernel(
             if (r < nr && sSrc[buf][r]) {
                 const uint8_t *pr = sRawB[buf][r];
                 /* One row format for raw and comp alike (L111 unification):
-                 * the row-relative decode is the same attn_comp_row_ld4 the
-                 * f32 kernels use, reading the smem copy the stage filled. */
+                 * the row-relative decode is the one attn_comp_row_ld4
+                 * (pulsar_cuda_internal.h), reading the smem copy the stage
+                 * filled. */
                 const float4 v = attn_comp_row_ld4(pr, d4 >> 2, AF16_DIM);
                 f0 = v.x; f1 = v.y; f2 = v.z; f3 = v.w;
             }
@@ -811,7 +838,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok,
-        const pulsar_gpu_q_prep *q_prep) {
+        const int *positions, const pulsar_gpu_q_prep *q_prep) {
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
     if (!heads || !sinks || !q || !raw_kv) return 0;
     pulsar_gpu_q_prep qp;
@@ -851,11 +878,14 @@ int pulsar_gpu_attention_f16_prefill_mx(
     if (!af16_dynsmem_ok()) return 0;
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
+    /* Dense mode: `positions` reaches the kernel for the fused Q rope only
+     * (positions[t] instead of t); the row plan stays the dense causal
+     * window.  With q_prep == NULL it is unused. */
     attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv,
                                             comp_kv ? comp_kv : raw_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
                                             n_head, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, 0,
+                                            (const int32_t *)positions, NULL, NULL, 0u, 1u, 0, 0,
                                             (__nv_fp8_e4m3 *)gact_data,
                                             (unsigned char *)gact_scale,
                                             gact_kbp, gact_slab, n_groups, n_nope,
@@ -904,7 +934,7 @@ int pulsar_gpu_attention_f16_prefill(
                                                n_tokens, n_comp, window, ratio,
                                                n_head, head_dim,
                                                NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
-                                               q_prep);
+                                               NULL, q_prep);
 }
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
@@ -912,7 +942,10 @@ int pulsar_gpu_attention_f16_prefill(
  * Banked descriptors are all-or-nothing (positions+seq_id+comp_bank_ptrs
  * together or none -- a partial set is refused rather than guessed at), and
  * comp rows are ATTN_PACK, always -- the format parameter is gone (see the note
- * on the kernel).  A 0 here is a real failure, never a silent shape demotion. */
+ * on the kernel).  non_causal selects the raw visibility rule (kernel note:
+ * RAW VISIBILITY); it is the drafter's raw-window forward and is passed
+ * through unchanged.  A 0 here is a real failure, never a silent shape
+ * demotion. */
 int pulsar_gpu_attention_f16_indexed(
         void *heads_v, const float *sinks, const void *q,
         const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv, const int *topk,
@@ -920,7 +953,7 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks,
+        uint32_t comp_cap, uint32_t n_banks, uint32_t non_causal,
         const pulsar_gpu_q_prep *q_prep) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
@@ -940,7 +973,7 @@ int pulsar_gpu_attention_f16_indexed(
         qp = *q_prep;
     }
 
-    /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
+    /* Descriptors are all-or-nothing, as in the dispatcher's own check. */
     if ((positions != NULL) != (seq_id != NULL)) return 0;
     /* comp_cap is the PER-BANK comp-row stride, so it is only meaningful when
      * there are compressed rows to address.  Requiring it unconditionally under
@@ -955,9 +988,9 @@ int pulsar_gpu_attention_f16_indexed(
     if (n_tokens == 0u || raw_cap == 0u) return 0;
     if (topk && top_k == 0u) return 0;      /* a table with no budget is a bug */
     /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
-     * is what sRawRows[256] must hold.  The kernel caps that at 256 exactly as
-     * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
-     * matches rather than silently differing. */
+     * is what sRawRows[256] must hold; the kernel caps it at 256
+     * (PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP, which the dispatcher's descriptor
+     * check enforces on `window`). */
     if (!af16_device_supported()) return 0;
     if (!af16_dynsmem_ok()) return 0;
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
@@ -970,6 +1003,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
                                             positions ? n_banks : 1u, 1,
+                                            non_causal != 0u,
                                             NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                             qp, q_prep != NULL);
     return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");

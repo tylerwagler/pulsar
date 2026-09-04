@@ -1,251 +1,28 @@
 #include "pulsar_cuda_internal.h"
 
-/* Store one float4's worth of merged attention output at the STORED heads
- * width (L033).  The split-KV merge kernels used to write their result as
- *     ((float4 *)(heads + base))[idx] = acc;
- * which reinterprets the buffer: with pulsar_heads_t narrowed to bf16 that
- * stamps f32 bit patterns across EIGHT bf16 elements -- type-legal, compiles
- * clean, and decodes as garbage ("grep the buffer, not the accessor"; this was
- * the fourth instance the L033 flip surfaced, and the one that made decode
- * emit an endless BOS stream).  Element indexing is preserved exactly: slot
- * idx covers elements [idx*4, idx*4+4). */
-__device__ __forceinline__ static void heads_store4(
-        pulsar_heads_t *row, uint32_t idx, float4 v) {
-    const uint64_t b = (uint64_t)idx * 4u;
-    heads_store(row, b + 0u, v.x);
-    heads_store(row, b + 1u, v.y);
-    heads_store(row, b + 2u, v.z);
-    heads_store(row, b + 3u, v.w);
-}
-
-
-/* Every KV buffer is PULSAR_ATTN_PACK rows -- 384 B NVFP4 at head_dim 512:
+/* Attention dispatch.  Every attention launch in this engine -- prefill raw
+ * window, prefill static-mixed, batched decode (causal and the drafter's
+ * non-causal raw window), indexed top-k -- goes to the ONE fp16 tensor-core
+ * kernel in pulsar_cuda_attn_f16.cu (L161/L164/L166).  This file holds the
+ * tensor-level argument checks, the shape refusals and the top-k sort; it
+ * launches no attention kernel of its own.  The f32 kernels that used to live
+ * here (prefill raw, prefill mixed, indexed heads8-online, decode heads8-online
+ * + split-KV merge) were deleted in L166 once their last shapes -- n_tokens ==
+ * 1 and the non-causal drafter window -- moved to the fp16 kernel; each had
+ * been a second numerics for a shape the fp16 kernel also served.
+ *
+ * Every KV operand is PULSAR_ATTN_PACK rows -- 384 B NVFP4 at head_dim 512:
  * e2m1 nibbles under per-16 e4m3 scales and an f32 row scale, rope dims bf16
- * -- so ONE decoder serves the sliding-window ring, the compressed pool, the
- * drafter's ring and the current chunk alike (restored by the L111
- * unification after a brief comp-only split).
- *
- * There WAS a per-call format flag here (`raw_f16`, later `raw_pack`). It died
- * on 2026-08-17 once the last f32 operand went: prefill's batch_kv, which
- * attention read directly while every other reader took packed rows. I tried to
- * delete this flag three times before that and was wrong each time -- the
- * drafter's ring, then prefill's batch_kv -- so it is worth saying plainly that
- * what made it removable was removing its last CALLER, not re-reading the
- * grep. */
-__device__ static inline float raw_kv_ld(const pulsar_attn_pack_t *raw_kv, uint64_t row,
-                                         uint32_t d, uint32_t head_dim) {
-    return attn_comp_pack_ld(raw_kv, row, d, head_dim);
-}
+ * -- so ONE decoder (attn_comp_pack_ld / attn_comp_row_ld4 in
+ * pulsar_cuda_internal.h) serves the sliding-window ring, the compressed pool,
+ * the drafter's ring and the current chunk alike (L111).  The row is LOSSY vs
+ * the f32 pipeline; what makes it shippable is the measured L111 verdict.  All
+ * pack formats are pointer-compatible, so a wrong operand reads rows at the
+ * wrong stride -- out of bounds, NaN, and a clean compile -- which is why the
+ * launchers below check byte bounds at the packed stride. */
 
-/* The c4-th group of four dims of `row` (per-16 scale shared by the four). */
-__device__ static inline float4 raw_kv_ld4(const pulsar_attn_pack_t *raw_kv, uint64_t row,
-                                           uint32_t c4, uint32_t head_dim) {
-    const uint32_t d0 = c4 << 2;
-    float4 v;
-    v.x = attn_comp_pack_ld(raw_kv, row, d0 + 0u, head_dim);
-    v.y = attn_comp_pack_ld(raw_kv, row, d0 + 1u, head_dim);
-    v.z = attn_comp_pack_ld(raw_kv, row, d0 + 2u, head_dim);
-    v.w = attn_comp_pack_ld(raw_kv, row, d0 + 3u, head_dim);
-    return v;
-}
-
-/* THE COMP CACHE OPERAND IS PULSAR_ATTN_PACK ROWS -- the same 384 B NVFP4
- * row as every other KV buffer (layout in pulsar_cuda_internal.h).  The row
- * is LOSSY vs the f32 pipeline (e2m1 nope under per-16 e4m3 scales; rope
- * bf16 verbatim); what makes it shippable is the measured L111 verdict, not
- * value preservation.
- *
- * A per-call comp_kv_pack flag once chose between packed and f32 comp rows
- * here, and a CF template briefly chose between e4m3 and nv rows; both are
- * gone -- one format, so one code path.  Worth recording why such a flag is
- * not free: all these formats are pointer-compatible, so passing one wrong
- * reads rows at the wrong stride -- out of bounds, NaN, and a clean compile. */
-/* attn_pack_e4m3 / attn_comp_pack_ld now live in pulsar_cuda_internal.h so the
- * fp16 tensor-core kernel decodes ATTN_PACK rows with the SAME code rather
- * than a transcription of it -- there is then no second copy of the contract
- * to drift or to get wrong. */
-
-/* Packed-row dot walked d = 0..head_dim-1 by one thread: per-16 scale
- * hoisted (e4m3 code x f32 row scale), nibbles fetched eight at a time as one
- * uint32 (rows are 16-byte multiples), d-ascending accumulation order. */
-template <typename QT>
-__device__ static inline float attn_pack_dot_full(const QT *qh, const pulsar_attn_pack_t *kv, uint64_t row, uint32_t head_dim, float dot) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint8_t *pr = (const uint8_t *)kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const uint8_t *psc = pr + nib_bytes;
-    const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
-    for (uint32_t off = 0; off < n_nope; off += PULSAR_KV4_NV_BLOCK) {
-        const float scale = attn_pack_e4m3(psc[off / PULSAR_KV4_NV_BLOCK], row_scale);
-        const uint32_t *pw = (const uint32_t *)(pr + off / 2u);
-        for (uint32_t i = 0; i < PULSAR_KV4_NV_BLOCK / 8u; i++) {
-            const uint32_t w = pw[i];
-            const uint32_t d = off + i * 8u;
-            #pragma unroll
-            for (uint32_t k = 0; k < 8u; k++) {
-                dot += q_load<QT>(qh, d + k) * attn_kv4_e2m1((w >> (4u * k)) & 0xFu, scale);
-            }
-        }
-    }
-    const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u);
-    for (uint32_t d = 0; d < PULSAR_ATTN_PACK_NROT; d++)
-        dot += q_load<QT>(qh, n_nope + d) * __bfloat162float(rope[d]);
-    return dot;
-}
-
-/* Four consecutive comp-pool dims (dims [c4*4, c4*4+4)) as a float4, from a
- * (pool, row) address; the row-relative decode is attn_comp_row_ld4 in
- * pulsar_cuda_internal.h, shared with the f16 kernel's smem tile decode. */
-__device__ static inline float4 attn_comp_ld4(const pulsar_attn_pack_t *kv, uint64_t row, uint32_t c4, uint32_t head_dim) {
-    const uint8_t *pr = (const uint8_t *)kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    return attn_comp_row_ld4(pr, c4, head_dim);
-}
-
-template <typename QT>
-
-__global__ static void attention_prefill_raw_kernel(
-        pulsar_heads_t *heads,
-        const float *sinks,
-        const QT *q,
-        const pulsar_attn_pack_t *raw_kv,
-        uint32_t n_tokens,
-        uint32_t window,
-        uint32_t n_head,
-        uint32_t head_dim) {
-    uint32_t t = blockIdx.x;
-    uint32_t h = blockIdx.y;
-    if (t >= n_tokens || h >= n_head) return;
-    /* window==0 means unlimited, as the mixed/softmax/decode kernels all treat
-     * it (:172, :251, :309, :450) -- their convention is "all rows k<=t
-     * visible". This kernel's old `min(t+1, window)` instead yielded 0 rows at
-     * window==0, disagreeing with its own softmax normalizer (:251) and
-     * corrupting the row if a full-attention config ever reached the raw tier.
-     * For window>0 this is bit-identical to min(t+1, window). */
-    uint32_t raw_count = (window != 0u && window < t + 1u) ? window : t + 1u;
-    uint32_t raw_start = t + 1 - raw_count;
-    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    __shared__ float scores[256];
-    __shared__ float partial[128];
-    __shared__ float max_s;
-    __shared__ float denom;
-    float scale = rsqrtf((float)head_dim);
-    float local_max = sinks[h];
-    __syncthreads();
-    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
-        scores[r] = dot * scale;
-        local_max = fmaxf(local_max, scores[r]);
-    }
-    partial[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float den = expf(sinks[h] - max_s);
-        for (uint32_t r = 0; r < raw_count; r++) {
-            scores[r] = expf(scores[r] - max_s);
-            den += scores[r];
-        }
-        denom = den;
-    }
-    __syncthreads();
-    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < raw_count; r++) {
-            acc += raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim) * scores[r];
-        }
-        heads_store(oh, d, acc / denom);
-    }
-}
-
-template <typename QT>
-__global__ static void attention_prefill_mixed_kernel(
-        pulsar_heads_t *heads,
-        const float *sinks,
-        const QT *q,
-        const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv,
-        uint32_t n_tokens,
-        uint32_t n_comp,
-        uint32_t window,
-        uint32_t ratio,
-        uint32_t n_head,
-        uint32_t head_dim) {
-    uint32_t t = blockIdx.x;
-    uint32_t h = blockIdx.y;
-    if (t >= n_tokens || h >= n_head) return;
-    const QT *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
-    uint32_t raw_count = t + 1u - raw_start;
-    uint32_t visible_comp = (t + 1u) / ratio;
-    if (visible_comp > n_comp) visible_comp = n_comp;
-    __shared__ float scores[512];
-    __shared__ float partial[256];
-    __shared__ float max_s;
-    __shared__ float denom;
-    float scale = rsqrtf((float)head_dim);
-    float local_max = sinks[h];
-    uint32_t n_score = raw_count + visible_comp;
-
-    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += q_load<QT>(qh, d) * raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim);
-        scores[r] = dot * scale;
-        local_max = fmaxf(local_max, scores[r]);
-    }
-    for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
-        float s = -INFINITY;
-        {
-            /* Packed rows go through attn_pack_dot_full -- the same walk the
-              * decode kernels use, so there is one decoder for the one format.
-              * This kernel could ONLY read f32 until 2026-08-17, which is why a
-              * whole f32 shadow of the packed pool existed to feed it. */
-            float dot = 0.0f;
-            dot = attn_pack_dot_full(qh, comp_kv, (uint64_t)c, head_dim, 0.0f);
-
-            s = dot * scale;
-        }
-        scores[raw_count + c] = s;
-        local_max = fmaxf(local_max, s);
-    }
-    partial[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
-    __syncthreads();
-    float den_local = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
-        scores[i] = expf(scores[i] - max_s);
-        den_local += scores[i];
-    }
-    partial[threadIdx.x] = den_local;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
-    __syncthreads();
-    pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv_ld(raw_kv, (uint64_t)(raw_start + r), d, head_dim) * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++)
-            acc += (attn_comp_pack_ld(comp_kv, (uint64_t)c, d, head_dim)) * scores[raw_count + c];
-        heads_store(oh, d, acc / denom);
-    }
-}
-
-/* positions/seq_id/comp_cap (all descriptor-aware decode kernels): per-row
+/* positions/seq_id/comp_cap -- the descriptor contract of the fp16 kernel's
+ * ring mode (pulsar_cuda_attn_f16.cu), validated by the launchers below: per-row
  * multi-session banking (design adapted from the MIT-licensed Entrpi/ds4
  * fork, v0.2 c71a49a — see pulsar_bank_slabs in the engine; reimplemented, no
  * code copied).  positions[t] is row t's absolute query position, seq_id[t]
@@ -269,652 +46,6 @@ __global__ static void attention_prefill_mixed_kernel(
  * from classic — that is the mid-prefill-bank case the driver must never
  * co-schedule.  positions == NULL && seq_id == NULL degenerates to the
  * classic single-cache scalar path bit-exactly. */
-/* Occupancy knob for the prefill attention kernel.  ncu at the shipped shape:
- * 70 registers/thread x 512 threads = 35840 regs/block against 65536 per SM, so
- * exactly ONE block fits and occupancy pins at 33.3% (Block Limit Registers = 1,
- * Block Limit Shared Mem = 1 -- both binding).  The dominant stall is
- * short_scoreboard (MIO / shared memory) at 3.49 of ~9.3 cycles per
- * issue-active, so more resident warps is the obvious lever.
- *
- * MEASURED, harness `tests/attn_indexed_bench.cu` (deleted a71e346) at the
- * shipped shape:
- *   min_blocks   sub-batch 4   sub-batch 7
- *   (none)          9.957         10.098 ms
- *   2               6.998          7.097 ms   <- 1.42x, shipped
- *   3              79.839         79.911 ms   <- register spill, 8x WORSE
- * In-engine: prefill @4k 670.84 -> 730.71 (+8.9%), @8k 647.19 -> 702.79.
- * Frontier logits are BYTE-IDENTICAL with and without, so this is free speed,
- * not a precision trade -- verified by gguf-tools/lb_numerics_check.sh.
- * Override with -DPULSAR_ATTN_MIN_BLOCKS=N; 3 is a cliff, do not raise blindly. */
-#ifndef PULSAR_ATTN_MIN_BLOCKS
-#define PULSAR_ATTN_MIN_BLOCKS 2
-#endif
-#define PULSAR_ATTN_LB __launch_bounds__(512, PULSAR_ATTN_MIN_BLOCKS)
-
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, typename QT>
-__global__ PULSAR_ATTN_LB static void attention_indexed_mixed_heads8_online_kernel(
-        pulsar_heads_t *heads,
-        const float *sinks,
-        const QT *q,
-        const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv,
-        const int32_t *topk,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_raw,
-        uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
-        uint32_t top_k,
-        uint32_t window,
-        uint32_t ratio,
-        uint32_t n_head,
-        uint32_t head_dim,
-        const int32_t * __restrict__ positions,
-        const int32_t * __restrict__ seq_id,
-        const void * const * __restrict__ comp_bank_ptrs,
-        uint32_t comp_cap,
-        uint32_t n_banks) {
-    uint32_t t = blockIdx.x;
-    uint32_t head_group = blockIdx.y;
-    if (t >= n_tokens || head_dim != 512u) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
-    const bool valid_head = head < n_head;
-    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
-        /* Dead/evicted row: zero the head, then all threads return together
-         * (no __syncthreads has run yet).  See
-         * attention_decode_mixed_heads8_online_kernel. */
-        if (valid_head) {
-            pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
-            for (uint32_t d = lane; d < head_dim; d += 32u) heads_store(oh, d, 0.0f);
-        }
-        return;
-    }
-
-    __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t raw_count;
-    __shared__ uint32_t raw_first_idx;
-    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
-
-    /* Descriptor (banked) preamble: per-row qpos, raw ring span, per-bank base
-     * derived from positions[t]/seq_id[t], byte-for-byte as
-     * attention_decode_mixed_heads8_online_kernel derives them.  NULL
-     * descriptors reproduce the classic scalar pos0+t / raw_start / contiguous
-     * comp path exactly (raw_base = comp_base = 0, comp_src = comp_kv). */
-    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-    uint32_t eff_n_raw = n_raw;
-    uint32_t eff_raw_start = raw_start;
-    uint32_t first_raw_pos;
-    if (positions) {
-        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
-        first_raw_pos = qpos + 1u - eff_n_raw;
-    } else {
-        first_raw_pos = pos0 + n_tokens - n_raw;
-    }
-    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
-    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
-    const pulsar_attn_pack_t *comp_src = comp_bank_ptrs ? (const pulsar_attn_pack_t *)comp_bank_ptrs[sid_b] : comp_kv;
-    const uint64_t comp_base = comp_bank_ptrs ? 0u
-                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
-    uint32_t visible_comp = n_comp;
-    if (ratio != 0) {
-        visible_comp = (qpos + 1u) / ratio;
-        if (visible_comp > n_comp) visible_comp = n_comp;
-    }
-
-    if (threadIdx.x == 0) {
-        raw_count = 0;
-        raw_first_idx = 0;
-        if (eff_n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
-            if (qpos >= first_raw_pos) {
-                uint32_t lo = first_raw_pos;
-                if (window != 0 && qpos + 1u > window) {
-                    const uint32_t wlo = qpos + 1u - window;
-                    if (wlo > lo) lo = wlo;
-                }
-                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
-                if (hi >= lo) {
-                    raw_first_idx = lo - first_raw_pos;
-                    raw_count = hi - lo + 1u;
-                    if (raw_count > 256u) raw_count = 256u;
-                }
-            }
-        }
-    }
-    __syncthreads();
-    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
-    }
-    __syncthreads();
-
-    uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
-    if (comp_count > 512u) comp_count = 512u;
-    const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
-    const QT *qrow = valid_head
-        ? (q + ((uint64_t)t * n_head + head) * head_dim)
-        : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q_load4<QT>(qrow, lane +  0u);
-        q1 = q_load4<QT>(qrow, lane + 32u);
-        q2 = q_load4<QT>(qrow, lane + 64u);
-        q3 = q_load4<QT>(qrow, lane + 96u);
-    }
-
-    float max_s = -INFINITY;
-    float sum_s = 0.0f;
-    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0, o2 = o0, o3 = o0;
-
-    for (uint32_t row0 = 0; row0 < n_score; row0 += ROWS_PER_STAGE) {
-        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE ? n_score - row0 : ROWS_PER_STAGE;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
-            /* Clamp the top-k index to visible_comp: the engine's invariant keeps
-             * padding sentinels (UINT32_MAX) out of this path, but a stray value
-             * would otherwise be a ~4 GB wild read. Substitute row 0 on violation. */
-            uint32_t comp_idx = 0u;
-            if (sr >= raw_count) {
-                int32_t c = topk[(uint64_t)t * top_k + (sr - raw_count)];
-                comp_idx = (c >= 0 && (uint32_t)c < visible_comp) ? (uint32_t)c : 0u;
-            }
-            if (sr < raw_count) {
-                kv_shared[off] = raw_kv_ld4(raw_kv, (uint64_t)raw_rows[sr], c4, head_dim);
-            } else {
-                /* comp row -> f32 float4 via the shared row loader; the
-                 * indexed row id is the top-k comp_idx, not sr-raw_count. */
-                kv_shared[off] = attn_comp_ld4(comp_src,
-                        comp_base + (uint64_t)comp_idx, c4, head_dim);
-            }
-        }
-        __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
-
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
-                sum_s = sum_s * old_scale + row_scale;
-                o0.x = o0.x * old_scale + k0.x * row_scale;
-                o0.y = o0.y * old_scale + k0.y * row_scale;
-                o0.z = o0.z * old_scale + k0.z * row_scale;
-                o0.w = o0.w * old_scale + k0.w * row_scale;
-                o1.x = o1.x * old_scale + k1.x * row_scale;
-                o1.y = o1.y * old_scale + k1.y * row_scale;
-                o1.z = o1.z * old_scale + k1.z * row_scale;
-                o1.w = o1.w * old_scale + k1.w * row_scale;
-                o2.x = o2.x * old_scale + k2.x * row_scale;
-                o2.y = o2.y * old_scale + k2.y * row_scale;
-                o2.z = o2.z * old_scale + k2.z * row_scale;
-                o2.w = o2.w * old_scale + k2.w * row_scale;
-                o3.x = o3.x * old_scale + k3.x * row_scale;
-                o3.y = o3.y * old_scale + k3.y * row_scale;
-                o3.z = o3.z * old_scale + k3.z * row_scale;
-                o3.w = o3.w * old_scale + k3.w * row_scale;
-                max_s = new_m;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (valid_head) {
-        const float sink = sinks[head];
-        const float new_m = fmaxf(max_s, sink);
-        const float old_scale = expf(max_s - new_m);
-        const float sink_scale = expf(sink - new_m);
-        sum_s = sum_s * old_scale + sink_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
-
-        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
-        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
-        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
-        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
-        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        pulsar_heads_t *outr = heads + ((uint64_t)t * n_head + head) * head_dim;
-        heads_store4(outr, lane +  0u, o0);
-        heads_store4(outr, lane + 32u, o1);
-        heads_store4(outr, lane + 64u, o2);
-        heads_store4(outr, lane + 96u, o3);
-    }
-}
-
-/* Same cliff as the indexed kernel above, found by the occupancy audit: 70
- * registers x 256 threads = 17920 per block against 65536 per SM, so 3 blocks
- * fit and occupancy sits at 50%.  smem (8389 B) allows 12 blocks, so registers
- * alone are binding here -- capping at 64 fits a 4th block (66.7%).  This is
- * 299 ms of a ~4.6 s prefill.  Launched <<<grid, 256>>> at both call sites. */
-#ifndef PULSAR_ATTN_STATIC_MIN_BLOCKS
-#define PULSAR_ATTN_STATIC_MIN_BLOCKS 4
-#endif
-
-/* The release line's occupancy cap (__launch_bounds__, +8.9% prefill,
- * bit-exact -- 1d2ef4f).  The cap stays on the templated form: it is the
- * thing that bought the +8.9%, and dropping it while changing the Q load
- * would confound two effects. */
-template <typename QT>
-__global__ __launch_bounds__(256, PULSAR_ATTN_STATIC_MIN_BLOCKS)
-static void attention_decode_mixed_heads8_online_kernel(
-        pulsar_heads_t *heads,
-        const float *sinks,
-        const QT *q,
-        const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv,
-        uint32_t non_causal,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_raw,
-        uint32_t raw_cap,
-        uint32_t raw_start,
-        uint32_t n_comp,
-        uint32_t window,
-        uint32_t ratio,
-        uint32_t n_head,
-        uint32_t head_dim,
-        const int32_t * __restrict__ positions,
-        const int32_t * __restrict__ seq_id,
-        const void * const * __restrict__ comp_bank_ptrs,
-        uint32_t comp_cap,
-        uint32_t n_banks,
-        float * __restrict__ part_o,
-        float * __restrict__ part_ml) {
-    uint32_t t = blockIdx.x;
-    uint32_t head_group = blockIdx.y;
-    if (t >= n_tokens || head_dim != 512u) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
-    /* Split-KV mode (gridDim.z > 1): each z-block walks only its slice of the
-     * row list and emits UNNORMALIZED partials (m, l, o) for a separate merge
-     * kernel; the sink joins at merge time, once per head.  gridDim.z == 1
-     * (part_o/part_ml NULL) is the classic single-walk kernel, bit-identical
-     * to before this parameter existed: the slice below degenerates to
-     * [0, n_score) and the epilogue takes the old path. */
-    const uint32_t n_split = gridDim.z;
-    const uint32_t split = blockIdx.z;
-    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
-        /* Dead/evicted row (seq_id outside [0, n_banks); descriptor note above).  All threads
-         * return together (no __syncthreads has run yet).  In split mode the
-         * merge kernel reads every partial slot, so a dead row must write
-         * m=-inf/l=0/o=0 partials rather than leave stale scratch: the merge
-         * then yields exactly 0, matching the direct zeroing below. */
-        if (valid_head) {
-            if (n_split > 1u) {
-                const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split + split;
-                float4 *po = (float4 *)(part_o + pbase * head_dim);
-                const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                po[lane +  0u] = z4;
-                po[lane + 32u] = z4;
-                po[lane + 64u] = z4;
-                po[lane + 96u] = z4;
-                if (lane == 0) {
-                    part_ml[pbase * 2u + 0u] = -INFINITY;
-                    part_ml[pbase * 2u + 1u] = 0.0f;
-                }
-            } else {
-                pulsar_heads_t *oh = heads + ((uint64_t)t * n_head + head) * head_dim;
-                for (uint32_t d = lane; d < head_dim; d += 32u) heads_store(oh, d, 0.0f);
-            }
-        }
-        return;
-    }
-
-    __shared__ uint32_t raw_rows[256];
-    __shared__ uint32_t raw_count_s;
-    __shared__ uint32_t raw_first_idx_s;
-    __shared__ float4 kv_shared[4 * 128];
-
-    /* Descriptor preamble: see the positions/seq_id/comp_cap note above. */
-    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-    uint32_t eff_n_raw = n_raw;
-    uint32_t eff_raw_start = raw_start;
-    uint32_t first_raw_pos;
-    if (positions) {
-        eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-        if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-        eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
-        first_raw_pos = qpos + 1u - eff_n_raw;
-    } else {
-        first_raw_pos = pos0 + n_tokens - n_raw;
-    }
-    const uint32_t raw_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
-    /* Per-bank comp base (descriptor note above). */
-    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
-    const pulsar_attn_pack_t *comp_src = comp_bank_ptrs ? (const pulsar_attn_pack_t *)comp_bank_ptrs[sid_b] : comp_kv;
-    const uint64_t comp_base = comp_bank_ptrs ? 0u
-                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
-    /* Scalar decode-entry convention: n_tokens==1, pos0==0, ratio==0,
-     * positions==NULL — the caller means "attend to ALL cached rows" and does
-     * NOT supply a real absolute position, so qpos is 0 and the windowing
-     * arithmetic below does not apply.  Every decode entry keeps this convention. */
-    const bool single_all = (n_tokens == 1u && ratio == 0u && positions == NULL);
-    uint32_t comp_count = 0;
-    if (n_comp != 0u) {
-        if (single_all) {
-            comp_count = n_comp;
-        } else if (ratio != 0u) {
-            comp_count = (qpos + 1u) / ratio;
-            if (comp_count > n_comp) comp_count = n_comp;
-        }
-    }
-    if (threadIdx.x == 0) {
-        uint32_t raw_count = 0;
-        uint32_t raw_first_idx = 0;
-        if (eff_n_raw != 0u) {
-            const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
-            /* single_all MUST be handled before the qpos comparison below.  In
-             * that convention first_raw_pos = pos0 + n_tokens - n_raw = 1 - 128,
-             * which UNDERFLOWS to 4294967169, so `qpos(0) >= first_raw_pos` is
-             * false and raw_count would stay 0 — silently dropping the ENTIRE
-             * SWA raw window while comp_count above stayed correct.  That is not
-             * a visible failure: it just answers from compressed rows only, and
-             * measures as a large FAKE speedup (skipping 128 rows/layer/token)
-             * with heavy logit damage underneath. */
-            if (single_all) {
-                raw_count = eff_n_raw > 256u ? 256u : eff_n_raw;
-            } else if (qpos >= first_raw_pos) {
-                uint32_t lo = first_raw_pos;
-                if (window != 0u && qpos + 1u > window) {
-                    const uint32_t wlo = qpos + 1u - window;
-                    if (wlo > lo) lo = wlo;
-                }
-                const uint32_t hi = non_causal ? raw_last_pos : (qpos < raw_last_pos ? qpos : raw_last_pos);
-                if (hi >= lo) {
-                    raw_first_idx = lo - first_raw_pos;
-                    raw_count = hi - lo + 1u;
-                    if (raw_count > 256u) raw_count = 256u;
-                }
-            }
-        }
-        raw_count_s = raw_count;
-        raw_first_idx_s = raw_first_idx;
-    }
-    __syncthreads();
-    const uint32_t raw_count = raw_count_s;
-    const uint32_t raw_first_idx = raw_first_idx_s;
-    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = raw_base + (eff_raw_start + raw_first_idx + r) % raw_cap;
-    }
-    __syncthreads();
-
-    const uint32_t n_score = raw_count + comp_count;
-    /* This block's row slice: ceil-divided so the last split absorbs the
-     * remainder; an empty slice ([lo >= n_score)) skips the walk and emits
-     * the m=-inf/l=0 identity partial.  n_split==1 => [0, n_score). */
-    const uint32_t rows_per_split = (n_score + n_split - 1u) / n_split;
-    const uint32_t row_lo = split * rows_per_split;
-    uint32_t row_hi = row_lo + rows_per_split;
-    if (row_hi > n_score) row_hi = n_score;
-    const float scale = rsqrtf((float)head_dim);
-    const QT *qrow = valid_head
-        ? (q + ((uint64_t)t * n_head + head) * head_dim)
-        : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q_load4<QT>(qrow, lane +  0u);
-        q1 = q_load4<QT>(qrow, lane + 32u);
-        q2 = q_load4<QT>(qrow, lane + 64u);
-        q3 = q_load4<QT>(qrow, lane + 96u);
-    }
-
-    float max_s = -INFINITY;
-    float sum_s = 0.0f;
-    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0, o2 = o0, o3 = o0;
-
-    for (uint32_t row0 = row_lo; row0 < row_hi; row0 += 4u) {
-        const uint32_t nr = row_hi - row0 < 4u ? row_hi - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
-            if (sr < raw_count) {
-                kv_shared[off] = raw_kv_ld4(raw_kv, (uint64_t)raw_rows[sr], c4, head_dim);
-            } else {
-                /* comp row via the shared float4 row loader. */
-                kv_shared[off] = attn_comp_ld4(comp_src,
-                        comp_base + (sr - raw_count), c4, head_dim);
-            }
-        }
-        __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
-
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
-                sum_s = sum_s * old_scale + row_scale;
-                o0.x = o0.x * old_scale + k0.x * row_scale;
-                o0.y = o0.y * old_scale + k0.y * row_scale;
-                o0.z = o0.z * old_scale + k0.z * row_scale;
-                o0.w = o0.w * old_scale + k0.w * row_scale;
-                o1.x = o1.x * old_scale + k1.x * row_scale;
-                o1.y = o1.y * old_scale + k1.y * row_scale;
-                o1.z = o1.z * old_scale + k1.z * row_scale;
-                o1.w = o1.w * old_scale + k1.w * row_scale;
-                o2.x = o2.x * old_scale + k2.x * row_scale;
-                o2.y = o2.y * old_scale + k2.y * row_scale;
-                o2.z = o2.z * old_scale + k2.z * row_scale;
-                o2.w = o2.w * old_scale + k2.w * row_scale;
-                o3.x = o3.x * old_scale + k3.x * row_scale;
-                o3.y = o3.y * old_scale + k3.y * row_scale;
-                o3.z = o3.z * old_scale + k3.z * row_scale;
-                o3.w = o3.w * old_scale + k3.w * row_scale;
-                max_s = new_m;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (valid_head && n_split > 1u) {
-        /* Split mode: emit the raw online-softmax state for the merge kernel.
-         * o is the UNNORMALIZED sum exp(s - m)*v over this slice; the sink
-         * joins at merge, once per head.  An empty slice emits the identity
-         * (m=-inf, l=0, o=0). */
-        const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split + split;
-        float4 *po = (float4 *)(part_o + pbase * head_dim);
-        po[lane +  0u] = o0;
-        po[lane + 32u] = o1;
-        po[lane + 64u] = o2;
-        po[lane + 96u] = o3;
-        if (lane == 0) {
-            part_ml[pbase * 2u + 0u] = max_s;
-            part_ml[pbase * 2u + 1u] = sum_s;
-        }
-        return;
-    }
-    if (valid_head) {
-        const float sink = sinks[head];
-        const float new_m = fmaxf(max_s, sink);
-        const float old_scale = expf(max_s - new_m);
-        const float sink_scale = expf(sink - new_m);
-        sum_s = sum_s * old_scale + sink_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
-
-        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
-        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
-        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
-        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
-        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        pulsar_heads_t *outr = heads + ((uint64_t)t * n_head + head) * head_dim;
-        heads_store4(outr, lane +  0u, o0);
-        heads_store4(outr, lane + 32u, o1);
-        heads_store4(outr, lane + 64u, o2);
-        heads_store4(outr, lane + 96u, o3);
-    }
-}
-
-/* Softmax merge for the split-KV decode walk: combines the per-slice
- * online-softmax partials (m_i, l_i, o_i) of one (token, head) with the
- * standard log-sum-exp reassociation and applies the sink term exactly once:
- *
- *   m*  = max(max_i m_i, sink)
- *   l*  = sum_i l_i*exp(m_i - m*) + exp(sink - m*)
- *   out = sum_i o_i*exp(m_i - m*) / l*
- *
- * Empty or dead slices carry (m=-inf, l=0, o=0) and vanish: exp(-inf - m*)
- * is 0 because m* >= sink is finite.  A dead row (every slice the identity)
- * therefore yields exactly 0, matching the direct kernel's zeroing.  NOT
- * bit-identical to the single-walk kernel -- the summation is reassociated;
- * same numerics class as the heads8-online carve-out itself, gated the same
- * way (engine KL closed loop, see docs/engine-perf-map.md).
- * Launch: grid (n_tokens, n_head), 128 threads; each thread owns 4 dims. */
-__global__ static void attention_decode_split_merge_kernel(
-        pulsar_heads_t *heads,
-        const float *sinks,
-        const float * __restrict__ part_o,
-        const float * __restrict__ part_ml,
-        uint32_t n_split,
-        uint32_t n_head,
-        uint32_t head_dim) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t head = blockIdx.y;
-    const uint32_t tid = threadIdx.x;
-    if (head >= n_head || head_dim != 512u) return;
-    const uint64_t pbase = ((uint64_t)t * n_head + head) * n_split;
-
-    const float sink = sinks[head];
-    float m_star = sink;
-    for (uint32_t i = 0; i < n_split; i++)
-        m_star = fmaxf(m_star, part_ml[(pbase + i) * 2u + 0u]);
-    float l_star = expf(sink - m_star);
-    float w[8];
-    for (uint32_t i = 0; i < n_split && i < 8u; i++) {
-        w[i] = expf(part_ml[(pbase + i) * 2u + 0u] - m_star);
-        l_star += part_ml[(pbase + i) * 2u + 1u] * w[i];
-    }
-    const float inv = l_star == 0.0f ? 0.0f : 1.0f / l_star;
-
-    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    for (uint32_t i = 0; i < n_split && i < 8u; i++) {
-        const float4 v = ((const float4 *)(part_o + (pbase + i) * head_dim))[tid];
-        acc.x += w[i] * v.x;
-        acc.y += w[i] * v.y;
-        acc.z += w[i] * v.z;
-        acc.w += w[i] * v.w;
-    }
-    acc.x *= inv; acc.y *= inv; acc.z *= inv; acc.w *= inv;
-    heads_store4(heads + ((uint64_t)t * n_head + head) * head_dim, tid, acc);
-}
-
-/* Split-KV partial scratch: static device storage so the split launch is
- * CUDA-graph-safe (no allocation at capture or replay time) and needs no
- * per-call setup.  Sized for the worst gated shape (16 tokens x 128 heads x
- * 8 splits x 512 dims = 33.6 MiB).  The decode step executes one attention
- * launch at a time on one stream, so a single scratch is safe; a future
- * multi-stream decode would need per-stream scratch.
- *
- * L150/L152 (2026-09-02): the token cap covers every row count the M-neutral
- * decode step can carry (PULSAR_GPU_MNEUTRAL_ROWS_MAX = 16), not just 8.  The
- * split tier's softmax merge rounds differently from the single-walk kernel,
- * so a cap inside the neutral range means a bank's rows compute one way in a
- * <= cap-row step and another way above it.  Raised on principle: the 8-vs-9
- * row non-identity that L150 and L152 bisected to was NOT this cap (measured:
- * 8 -> 16 changed no bit of either gate, because the batched verify step
- * takes the fp16 indexed tier and the drafter forward the raw fp16 tier;
- * neither reaches this launcher above one token).  That defect was the MoE
- * GEMV cap in pulsar_cuda_moe.cu (moe_gemv_cap).  This launcher is reached
- * with 9..16 tokens only when the fp16 tiers decline (non-causal batches,
- * oversized comp), and there the same argument applies. */
-#define PULSAR_DEC_SPLITKV_S 8u
-#define PULSAR_DEC_SPLITKV_MAX_TOKENS 16u
-#define PULSAR_DEC_SPLITKV_MAX_HEADS 128u
-/* CONCURRENCY (multi-stream decode, mid-roadmap): a single shared __device__
- * partials buffer is safe only while one thread submits decode. It CANNOT be
- * made thread_local (device globals are per-context, not per-host-thread); a
- * second concurrent attention launch would clobber these partials. The fix is
- * per-stream/per-call scratch, not a keyword change. */
-static __device__ float g_dec_splitkv_part_o[PULSAR_DEC_SPLITKV_MAX_TOKENS *
-        PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 512u];
-static __device__ float g_dec_splitkv_part_ml[PULSAR_DEC_SPLITKV_MAX_TOKENS *
-        PULSAR_DEC_SPLITKV_MAX_HEADS * PULSAR_DEC_SPLITKV_S * 2u];
-
-static int attention_decode_heads8_launch(
-        pulsar_heads_t *heads, const float *sinks, const pulsar_q_t *q, const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv, uint32_t non_causal, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
-        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim,
-        const int32_t *positions, const int32_t *seq_id,
-        const void * const *comp_bank_ptrs, uint32_t comp_cap, uint32_t n_banks,
-        const char *what) {
-    if (n_tokens <= PULSAR_DEC_SPLITKV_MAX_TOKENS &&
-        n_head <= PULSAR_DEC_SPLITKV_MAX_HEADS && head_dim == 512u) {
-        static int announced = 0;
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr, "pulsar: decode attention = f32 split-KV x%u tier for this shape "
-                            "(n_head=%u non_causal=%u; the fp16 tier takes causal shapes with "
-                            "n_head a multiple of 32; softmax-merge reassociation, single walk "
-                            "above %u tokens)\n",
-                    PULSAR_DEC_SPLITKV_S, n_head, non_causal, PULSAR_DEC_SPLITKV_MAX_TOKENS);
-        }
-        static float *part_o = NULL;
-        static float *part_ml = NULL;
-        if (!part_o &&
-            (cudaGetSymbolAddress((void **)&part_o, g_dec_splitkv_part_o) != cudaSuccess ||
-             cudaGetSymbolAddress((void **)&part_ml, g_dec_splitkv_part_ml) != cudaSuccess)) {
-            part_o = NULL;
-            fprintf(stderr, "pulsar: split-KV scratch symbol lookup FAILED; "
-                            "refusing to fall through\n");
-            return 0;
-        }
-        dim3 sgrid(n_tokens, (n_head + 7u) / 8u, PULSAR_DEC_SPLITKV_S);
-            attention_decode_mixed_heads8_online_kernel<<<sgrid, 256>>>(heads, sinks,
-                    q, raw_kv, comp_kv, non_causal,
-                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                    n_head, head_dim, positions, seq_id, comp_bank_ptrs,
-                    comp_cap, n_banks, part_o, part_ml);
-        dim3 mgrid(n_tokens, n_head, 1);
-        attention_decode_split_merge_kernel<<<mgrid, 128>>>(heads, sinks,
-                part_o, part_ml, PULSAR_DEC_SPLITKV_S, n_head, head_dim);
-        return cuda_ok(cudaGetLastError(), what);
-    }
-    dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(heads, sinks,
-                q, raw_kv, comp_kv, non_causal,
-                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim, positions, seq_id, comp_bank_ptrs,
-                comp_cap, n_banks, NULL, NULL);
-    return cuda_ok(cudaGetLastError(), what);
-}
 
 __global__ static void indexed_topk_sort_512_asc_kernel(
         int32_t *dst,
@@ -949,30 +80,6 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
     dst_row[tid] = rows[tid];
 }
 
-/* A wrapper received RAW q (q_prep != NULL) but is about to hand it to a
- * consumer that does not fuse the Q norm+rope -- apply the standalone kernel
- * now.  Not a second numerics: the standalone kernel and the f16 tier's fused
- * Q build share pulsar_cuda_rope.cuh and the f16 build is bit-exact against
- * head_rms_norm_rope_tail (attn_f16.cu), so which one runs changes where the
- * work happens, never the answer.  Placed immediately above every such
- * consumer; the fused f16 calls pass q_prep through instead.  A missed site is
- * a wrong answer the prefill/frontier gates catch. */
-static int attention_q_prep_apply(const pulsar_gpu_tensor *q, uint32_t n_tokens,
-                                  uint32_t n_head, uint32_t head_dim,
-                                  uint32_t pos0, const pulsar_gpu_tensor *positions,
-                                  const pulsar_gpu_q_prep *qp) {
-    return pulsar_gpu_head_rms_norm_rope_tail_tensor((pulsar_gpu_tensor *)q,
-            n_tokens, n_head, head_dim, qp->n_rot, pos0, qp->n_ctx_orig, false,
-            qp->freq_base, qp->freq_scale, qp->ext_factor, qp->attn_factor,
-            qp->beta_fast, qp->beta_slow, qp->eps, positions);
-}
-#define ATTN_Q_PREP_STANDALONE(qt, ntok, pos0v, posv) \
-    do { if (q_prep) { \
-        if (!attention_q_prep_apply((qt), (ntok), n_head, head_dim, (pos0v), (posv), q_prep)) \
-            return 0; \
-        q_prep = NULL; \
-    } } while (0)
-
 int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope, int *mx_out,
         const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep) {
@@ -986,71 +93,57 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* The dense f16 launch does not carry per-token positions, so a banked
-     * batch that somehow routes here must norm the old way (rope by t would
-     * be silently wrong). Dense zero-prefix batches pass positions == NULL. */
-    if (positions) ATTN_Q_PREP_STANDALONE(q, n_tokens, 0u, positions);
-    /* One-shot branch report, same as the mixed path. This is the RAW entry;
-     * pulsar-bench showed real prefill never reaches the mixed launch, so this
-     * is where production prefill attention is actually served. */
+    /* One kernel for every row count (L166): the fp16 tensor-core tier is the
+     * raw-window prefill arm at n_tokens == 1 as at 4096.  A 1-token chunk
+     * (a prompt of 4096k+1 tokens, a one-token prompt, a one-token suffix)
+     * used to take an f32 per-(token,head) kernel -- the L161 class of split,
+     * on the prefill side.  Shapes the tier does not serve have no kernel and
+     * are refused by name; a 0 from the launcher is a real failure, reported
+     * rather than demoted.  Under banked descriptors the kernel ropes Q at
+     * positions[t] (the dense row plan is unchanged: a zero-prefix batch's
+     * raw rows are its own tokens). */
+    if (head_dim != 512u) {
+        fprintf(stderr, "pulsar: prefill raw attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+        return 0;
+    }
+    if ((n_head % 32u) != 0u) {
+        fprintf(stderr, "pulsar: prefill raw attention: n_head %u has no kernel "
+                        "(the fp16 tensor-core tier tiles 32 heads per block)\n", n_head);
+        return 0;
+    }
+    if (!pulsar_gpu_attn_f16_tier_on()) {
+        fprintf(stderr, "pulsar: prefill raw attention: this device has no fp16 tensor-core tier "
+                        "(mma.m16n8k16 needs sm_80+); no other kernel is built\n");
+        return 0;
+    }
+    /* One-shot branch report.  This is the RAW entry; pulsar-bench showed real
+     * prefill never reaches the mixed launch, so this is where production
+     * prefill attention is actually served. */
     static int raw_path_reported = 0;
     if (!raw_path_reported) {
         raw_path_reported = 1;
-        /* Name the arm the dispatch below ACTUALLY takes -- this string said
-         * "FUSED window kernel" for a predicate that has routed to the fp16
-         * MMA tier since it shipped, the same label-lies-about-the-arm class
-         * as the drafter launch log (L106 A3). */
-        const int f16_tier = n_tokens > 1 && head_dim == 512 && (n_head % 16u) == 0u;
         fprintf(stderr,
-                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> %s\n",
-                n_tokens, head_dim, window,
-                f16_tier ? "fp16 tensor-core tier" : "generic per-token kernel");
+                "pulsar: ATTN-RAW n_tokens=%u head_dim=%u window=%u -> fp16 tensor-core tier "
+                "(fp16 operands, f32 accumulate; every row count)\n",
+                n_tokens, head_dim, window);
     }
-    if (n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier.  The kernel this replaces runs at pipe_tensor
-         * 0%; see docs/engine-perf-map.md.  DEFAULT-ON since 2026-08-08 and
-         * UNCONDITIONAL since 2026-09-02 (the =0 opt-out had no caller; the
-         * cuBLAS two-GEMM arm it fell back to went with it): fp16 operands change the numbers,
-         * and the suite-v1 KL run is what cleared the flip — the component
-         * measurement (tests/attn_precision_fidelity.cc, deleted a71e346:
-         * top-1 attention
-         * position preserved ~100%, KL <= 3e-7) was evidence, not the gate.
-         * Shape conditions are checked by the launcher itself, and a 0 return
-         * here is a REAL failure, so it is reported rather than silently
-         * demoted to the FMA kernel. */
-        if ((n_head % 16u) == 0u)   /* head_dim==512 proven by the enclosing branch (K13) */ {
-            static int announced = 0;
-            if (!announced) {
-                announced = 1;
-                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(fp16 operands, f32 accumulate)\n");
-            }
-            /* Only the fp16 tier emits the grouped E4M3 encoding.  If it
-             * declines, *mx_out stays unset and the launcher refuses: the "a"
-             * GEMM has no quantiser of its own, and a half-written encoding
-             * would be a wrong answer. */
-            if (pulsar_gpu_attention_f16_prefill_mx(
-                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-                    (const pulsar_attn_pack_t *)raw_kv->ptr, NULL,
-                    n_tokens, 0u, window, 1u, n_head, head_dim,
-                    gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
-                    0u, n_tokens, q_prep)) {
-                if (mx_out && gact_data) *mx_out = 1;
-                return 1;
-            }
-            fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
-                            "fall through to the f32 kernel\n");
-            return 0;
-        }
+    /* Only the fp16 tier emits the grouped E4M3 encoding.  If it declines,
+     * *mx_out stays unset and the launcher refuses: the "a" GEMM has no
+     * quantiser of its own, and a half-written encoding would be a wrong
+     * answer. */
+    if (pulsar_gpu_attention_f16_prefill_mx(
+            (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+            (const pulsar_attn_pack_t *)raw_kv->ptr, NULL,
+            n_tokens, 0u, window, 1u, n_head, head_dim,
+            gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
+            0u, n_tokens,
+            positions ? (const int *)positions->ptr : NULL, q_prep)) {
+        if (mx_out && gact_data) *mx_out = 1;
+        return 1;
     }
-    ATTN_Q_PREP_STANDALONE(q, n_tokens, 0u, NULL);
-    dim3 grid(n_tokens, n_head, 1);
-    attention_prefill_raw_kernel<<<grid, 128>>>((pulsar_heads_t *)heads->ptr,
-                                                sinks,
-                                                (const pulsar_q_t *)q->ptr,
-                                                (const pulsar_attn_pack_t *)raw_kv->ptr,
-                                                n_tokens, window, n_head, head_dim);
-    return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
+    fprintf(stderr, "pulsar: fp16 prefill raw attention FAILED (n_tokens=%u n_head=%u "
+                    "window=%u); refusing to fall through\n", n_tokens, n_head, window);
+    return 0;
 }
 
 static int attention_decode_batch_launch(
@@ -1141,60 +234,55 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* ONE decode attention kernel for every row count AND every context
-     * length (L161, L164).  The tier is chosen by the model's shape alone:
-     * the fp16 tensor-core kernel tiles over heads, so one query row is a
-     * natural input, and it walks every compressed row -- it has no scratch
-     * that could run out.  Two things once split one conversation's attention
-     * numerics without a shape change: the row count (n_tokens > 1 chose the
-     * tier; all 129280 head logits differed, rows/L161.md) and the context
-     * length (the f32 kernel's score scratch was checked before the tier
-     * choice, so past 11456 compressed rows every step took the f32 kernel,
-     * rows/L164.md).  Both selectors are gone, and so is the single-token
-     * entry that always took the f32 kernel.  The fp16 tier refuses rather
-     * than approximates comp-mask, non-causal and FP8 comp rows; those shapes
-     * are the f32 kernel's, below.  A 0 from the launcher is a real failure
-     * and is reported, not demoted. */
-    if (head_dim == 512) {
-        if (pulsar_gpu_attention_prefill_reads_packed_comp() &&
-            !non_causal && (n_head % 32u) == 0u) {
-            static int announced_dc = 0;
-            if (!announced_dc) {
-                announced_dc = 1;
-                fprintf(stderr, "pulsar: decode attention = fp16 tensor-core tier (every row count)\n");
-            }
-            if (pulsar_gpu_attention_f16_indexed(
-                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-                    (const pulsar_attn_pack_t *)raw_kv->ptr,
-                    n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
-                    NULL /* no topk: visible-prefix sweep */,
-                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-                    0u, window, ratio, n_head, head_dim,
-                    (const int *)positions_ptr, (const int *)seq_id_ptr,
-                    comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, q_prep))
-                return 1;
-            fprintf(stderr, "pulsar: fp16 continued-prefill attention FAILED; "
-                            "refusing to fall through\n");
-            return 0;
-        }
-        /* The f32 online kernel is the arm for the shapes the fp16 tier
-         * refuses -- non-causal batches (the drafter's raw window), comp-mask,
-         * head counts that are not a multiple of 32 -- at any context length:
-         * it walks the rows it is given and holds no fixed-size scratch. */
-        ATTN_Q_PREP_STANDALONE(q, n_tokens, pos0, positions);
-        return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
-                (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
-                n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
-                non_causal, n_tokens, pos0,
-                n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
-                head_dim, positions_ptr, seq_id_ptr,
-                comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
-                "attention decode window launch");
+    /* ONE decode attention kernel (L161, L164, L166): the fp16 tensor-core
+     * kernel serves every row count, every context length and both
+     * visibility rules.  It tiles over heads, so one query row is a natural
+     * input; it walks every compressed row, so it has no scratch that could
+     * run out; and non_causal is a flag it carries (the drafter's raw-window
+     * forward: a query sees every raw row up to the last one, not only rows
+     * at or before its own position -- pulsar_cuda_attn_f16.cu, the ring
+     * preamble).  Three selectors once split one conversation's attention
+     * numerics without a shape change -- the row count (n_tokens > 1 chose
+     * the tier; all 129280 head logits differed, rows/L161.md), the context
+     * length (an f32 kernel's score scratch was checked before the tier
+     * choice, rows/L164.md) and the visibility rule (the f32 kernel survived
+     * as the non-causal arm, rows/L166.md).  All three are gone with the f32
+     * kernel.  What the fp16 kernel does not serve has no kernel here and is
+     * refused by name below; a 0 from the launcher is a real failure and is
+     * reported, not demoted. */
+    if (head_dim != 512u) {
+        fprintf(stderr, "pulsar: decode attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+        return 0;
     }
-    /* head_dim != 512: the generic per-(row,head) decode kernel that served it
-     * was deleted 2026-09-02 (no shape profile has another head_dim; every
-     * 512 path above routes to heads8).  Fail loud. */
-    fprintf(stderr, "pulsar: decode attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+    if ((n_head % 32u) != 0u) {
+        fprintf(stderr, "pulsar: decode attention: n_head %u has no kernel "
+                        "(the fp16 tensor-core tier tiles 32 heads per block)\n", n_head);
+        return 0;
+    }
+    if (!pulsar_gpu_attention_prefill_reads_packed_comp()) {
+        fprintf(stderr, "pulsar: decode attention: this device has no fp16 tensor-core tier "
+                        "(mma.m16n8k16 needs sm_80+); no other kernel is built\n");
+        return 0;
+    }
+    static int announced_dc = 0;
+    if (!announced_dc) {
+        announced_dc = 1;
+        fprintf(stderr, "pulsar: decode attention = fp16 tensor-core tier "
+                        "(every row count, causal and non-causal)\n");
+    }
+    if (pulsar_gpu_attention_f16_indexed(
+            (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+            (const pulsar_attn_pack_t *)raw_kv->ptr,
+            n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
+            NULL /* no topk: visible-prefix sweep */,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+            0u, window, ratio, n_head, head_dim,
+            (const int *)positions_ptr, (const int *)seq_id_ptr,
+            comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, non_causal, q_prep))
+        return 1;
+    fprintf(stderr, "pulsar: fp16 decode attention FAILED (n_tokens=%u n_head=%u "
+                    "n_comp=%u non_causal=%u); refusing to fall through\n",
+            n_tokens, n_head, n_comp, non_causal);
     return 0;
 }
 
@@ -1295,12 +383,9 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_q_prep *q_prep) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
-     * per-bank ring capacity, rejections fail-loud).  NOTE: banked rows are NO
-     * LONGER forced onto the generic per-(row,head) kernel — 0e643eb taught the
-     * heads8-online fast variant the banked descriptors, and the dispatch below
-     * routes banked rows to it (see the rationale at the dispatch site).  That
-     * recovered ~5x on ratio-4 banked prefill; do not "restore" the old
-     * single-bank-only restriction. */
+     * per-bank ring capacity, rejections fail-loud).  Banked rows take the same
+     * fp16 kernel as scalar rows (its ring preamble derives the per-row plan
+     * from the descriptors); there is no single-bank-only arm. */
     const int descr = positions != NULL || seq_id != NULL;
     if (descr &&
         (!positions || !seq_id || n_banks == 0 || raw_cap == 0 || ratio == 0 ||
@@ -1352,12 +437,12 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * format change treats the pair as one fact. */
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     /* The sort stays OFF for n_tokens == 1.  It is a locality optimization:
-     * attention_indexed_mixed_heads8_online_kernel reads topk[] in whatever order
-     * it is given, clamps each id against visible_comp, and folds rows through an
-     * online softmax that is correct for ANY permutation — there is no dedup, no
-     * monotonicity assumption, and no binary search anywhere in it.  At decode the
-     * whole 512-row compressed scan is L2-resident, so ascending row addresses buy
-     * nothing while the bitonic sort costs ~4.2 us per token.
+     * the fp16 kernel reads topk[] in whatever order it is given, masks each id
+     * outside the row's visible prefix, and folds rows through an online
+     * softmax that is correct for ANY permutation -- there is no dedup, no
+     * monotonicity assumption, and no binary search anywhere in it.  At decode
+     * the whole 512-row compressed scan is L2-resident, so ascending row
+     * addresses buy nothing while the bitonic sort costs ~4.2 us per token.
      *
      * It is NOT output-neutral, though: the online fold is order-dependent in
      * floating point, so sorting changes the reduction order and the logits with
@@ -1372,113 +457,45 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    /* The heads8-online kernel is banked-aware (it takes the descriptor
-     * arrays), so banked rows route here too — recovering the ~5x it holds over
-     * the generic per-(row,head) kernel that banked mode was previously forced
-     * onto.  The rb4 twopass variant stays single-bank-only, so a banked launch
-     * always takes the online branch (never rb4).
-     *
-     * Scope guard: packed comp routes to the online kernel ONLY in banked mode
-     * (descr) or on a single-token (decode) row.  Multi-token classic (non-descr)
-     * paths keep their exact prior kernel choice — f32 -> online, pack -> generic.
-     *
-     * THE n_tokens == 1 CARVE-OUT CHANGES BEHAVIOUR, DELIBERATELY.  Single-token
-     * decode used to fall through to attention_indexed_mixed_kernel at
-     * grid(1, n_head): 64 blocks, each dequantizing the SAME compressed rows for
-     * one head.  Routing it here instead gives grid(1, n_head/16): each block
-     * stages a row into shared memory once and reuses it for 16 heads, amortizing
-     * the pack dequant instructions and the load latency across the group.  This
-     * is a LATENCY / instruction-amortization win, NOT a bandwidth win — the
-     * indexer caps the compressed scan at top_k=512 rows (~0.46 MB per layer),
-     * which sits entirely in GB10's 24 MiB L2, so the reads the old kernel
-     * repeated were already L2 hits.  Do not expect it to scale with context.
-     *
-     * It is NOT bit-exact against the generic kernel: the online softmax folds
-     * rows in a different order, so decode logits drift (top-1 held everywhere
-     * sampled; top-10 reorders and a greedy stream diverges within a token or
-     * two).  Each build stays perfectly deterministic run to run.  Prefill is
-     * untouched — it already took this kernel. */
-    /* There WAS a packed-comp clause here excluding multi-token non-descriptor
-     * calls, on the grounds that "the f32 indexed kernel cannot read ATTN_PACK
-     * rows there".  It can, and could all along: the heads8 online arm below
-     * takes comp_kv_pack and decodes through attn_comp_pack_ld in its smem
-     * staging (so did the generic attention_indexed_mixed_kernel in its dot
-     * and accumulation, until it was deleted 2026-09-02).
-     * Decode has proved it every step since the format was unified: at
-     * n_tokens == 1 the clause admitted packed rows and routed them to exactly
-     * this heads8 kernel.
-     *
-     * Keeping it cost more than speed once all six prefill sites went packed:
-     * the clause started REFUSING the shipped shape, so multi-token tier-off
-     * fell through to the generic kernel -- 2.3x slower, and a different float
-     * accumulation order, which moved the tier-off logits (max 29.474 ->
-     * 28.028 on a 5530-token prompt).  Dropping it puts that shape back on the
-     * heads8 kernel and the value back. */
-    const int f16_idx_ok = pulsar_gpu_attention_prefill_reads_packed_comp() &&
-                           head_dim == 512u && (n_head % 32u) == 0u && n_tokens > 1u;
-    if (head_dim == 512 && top_k <= 512u) {
-        /* rb4 twopass has no pack support, so pack (and banked) always take the
-         * online branch. */
-        /* fp16 tensor-core tier for the indexed path -- it replaced the f32
-         * kernel that was the largest single entry in the prefill map
-         * (12.5%).  Banked descriptors and ATTN_PACK comp rows ride the fp16
-         * tier too, each behind its own gate: bank isolation is proven
-         * algebraically (tests/attn_f16_banked_test.cu -- a wrong-bank read
-         * is plausible attention, not an error, so it needs a test that
-         * cannot be fooled), and packed rows decode through the one shared
-         * attn_comp_pack_ld.  What KEEPS the f32 online kernel: single-token
-         * indexed decode (n_tokens == 1). */
-        if (f16_idx_ok && topk_ptr) {
-            static int announced = 0;
-            if (!announced) {
-                announced = 1;
-                fprintf(stderr, "pulsar: indexed attention = fp16 tensor-core tier\n");
-            }
-            if (pulsar_gpu_attention_f16_indexed(
-                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-                    (const pulsar_attn_pack_t *)raw_kv->ptr, (const pulsar_attn_pack_t *)comp_kv->ptr,
-                    (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
-                    raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
-                    (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
-                    comp_cap, descr ? n_banks : 1u, q_prep))
-                return 1;
-            fprintf(stderr, "pulsar: fp16 indexed attention FAILED; refusing to "
-                            "fall through to the f32 kernel\n");
-            return 0;
-        }
-        ATTN_Q_PREP_STANDALONE(q, n_tokens, pos0, positions);
-        {   /* the two-pass rb4 alternative is gone; this is the only arm */
-            dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((pulsar_heads_t *)heads->ptr,
-                                                                               sinks,
-                                                                               (const pulsar_q_t *)q->ptr,
-                                                                               (const pulsar_attn_pack_t *)raw_kv->ptr,
-                                                                               (const pulsar_attn_pack_t *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               n_head,
-                                                                               head_dim,
-                                                                               positions_ptr,
-                                                                               seq_id_ptr,
-                                                                               comp_bank_ptrs_ptr,
-                                                                               comp_cap,
-                                                                               descr ? n_banks : 1u);
-            return cuda_ok(cudaGetLastError(), "attention indexed online launch");
-        }
+    /* One kernel for every row count (L166): the fp16 tensor-core tier is the
+     * indexed arm at n_tokens == 1 too -- the per-token indexed prefill loop
+     * and a 1-token indexed chunk used to take an f32 heads8-online kernel
+     * (the L161 class of split: 1-row and N-row indexed attention were two
+     * numerics).  Banked descriptors and ATTN_PACK comp rows ride the tier,
+     * each behind its own gate: bank isolation is proven algebraically
+     * (tests/attn_f16_banked_test.cu -- a wrong-bank read is plausible
+     * attention, not an error, so it needs a test that cannot be fooled), and
+     * packed rows decode through the one shared attn_comp_pack_ld.  Shapes the
+     * tier does not serve are refused by name. */
+    if (head_dim != 512u) {
+        fprintf(stderr, "pulsar: indexed attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+        return 0;
     }
-    /* head_dim != 512 has no kernel here: the generic per-(row,head) indexed
-     * kernel that served it was deleted 2026-09-02 -- it was reachable only
-     * through the PULSAR_CUDA_NO_INDEXED_HEADS8 opt-out (nothing set it) or a
-     * head_dim no shape profile has.  Fail loud, do not compute something else. */
-    fprintf(stderr, "pulsar: indexed attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+    if ((n_head % 32u) != 0u) {
+        fprintf(stderr, "pulsar: indexed attention: n_head %u has no kernel "
+                        "(the fp16 tensor-core tier tiles 32 heads per block)\n", n_head);
+        return 0;
+    }
+    if (!pulsar_gpu_attention_prefill_reads_packed_comp()) {
+        fprintf(stderr, "pulsar: indexed attention: this device has no fp16 tensor-core tier "
+                        "(mma.m16n8k16 needs sm_80+); no other kernel is built\n");
+        return 0;
+    }
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: indexed attention = fp16 tensor-core tier (every row count)\n");
+    }
+    if (pulsar_gpu_attention_f16_indexed(
+            (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+            (const pulsar_attn_pack_t *)raw_kv->ptr, (const pulsar_attn_pack_t *)comp_kv->ptr,
+            (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
+            raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
+            (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
+            comp_cap, descr ? n_banks : 1u, 0u /* causal */, q_prep))
+        return 1;
+    fprintf(stderr, "pulsar: fp16 indexed attention FAILED (n_tokens=%u n_head=%u n_comp=%u "
+                    "top_k=%u); refusing to fall through\n", n_tokens, n_head, n_comp, top_k);
     return 0;
 }
 
@@ -1527,69 +544,50 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* The fused online-softmax kernel can now carry the comp mask, so the
-     * masked case no longer has to fall back to the unfused two-GEMM path that
-     * materialises the whole score matrix. Gated while it is A/B'd against
-     * that path; the fused kernel reassociates the softmax (online rescale vs
-     * batch max/sum), so it is NOT bit-identical to the GEMM path. */
-    /* PULSAR_ATTN_FUSED_COMP is gone -- no setter anywhere, so the masked case
-     * never took the fused kernel and the A/B it gated never ran. */
-    /* L106 K13: `allow_fused` was a constant 1 (its PULSAR_ATTN_FUSED_COMP
-     * setter is long gone); the false side of every `allow_fused &&` was
-     * dead text misleading readers about reachability.  Folded through. */
-    /* One-shot: which branch actually serves this workload. Guessing at this
+    /* One kernel for every row count (L166) -- see the twin in the raw-window
+     * launcher.  This is the site that carries the traffic: the raw-window one
+     * runs twice a prefill, this one runs per layer. */
+    if (head_dim != 512u) {
+        fprintf(stderr, "pulsar: prefill mixed attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
+        return 0;
+    }
+    if ((n_head % 32u) != 0u) {
+        fprintf(stderr, "pulsar: prefill mixed attention: n_head %u has no kernel "
+                        "(the fp16 tensor-core tier tiles 32 heads per block)\n", n_head);
+        return 0;
+    }
+    if (!pulsar_gpu_attn_f16_tier_on()) {
+        fprintf(stderr, "pulsar: prefill mixed attention: this device has no fp16 tensor-core tier "
+                        "(mma.m16n8k16 needs sm_80+); no other kernel is built\n");
+        return 0;
+    }
+    /* One-shot: which shape actually serves this workload.  Guessing at this
      * has been wrong twice; print it rather than infer it. */
     static int mixed_path_reported = 0;
     if (!mixed_path_reported) {
         mixed_path_reported = 1;
-        /* Same truth-in-labeling fix as the RAW entry above (L106 A3). */
-        const int mf16_tier = n_tokens > 1 && head_dim == 512 && (n_head % 16u) == 0u;
         fprintf(stderr,
-                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> %s\n",
-                n_tokens, n_comp,
-                mf16_tier ? "fp16 tensor-core tier" : "generic per-token kernel");
+                "pulsar: ATTN-MIXED n_tokens=%u n_comp=%u -> fp16 tensor-core tier "
+                "(fp16 operands, f32 accumulate; every row count)\n",
+                n_tokens, n_comp);
     }
-    if (n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier -- see the twin in the raw-window launcher.
-         * This is the site that carries the traffic: the raw-window one runs
-         * twice a prefill, this one runs per layer. */
-        if ((n_head % 16u) == 0u)   /* head_dim==512 proven by the enclosing branch (K13) */ {
-            static int announced = 0;
-            if (!announced) {
-                announced = 1;
-                fprintf(stderr, "pulsar: attention = fp16 tensor-core tier "
-                                "(fp16 operands, f32 accumulate)\n");
-            }
-            /* Same emission contract as the raw-window twin: only the fp16
-             * tier may write the grouped encoding, and on a decline *mx_out
-             * stays unset and the launcher refuses rather than reading a
-             * half-written slab. */
-            if (pulsar_gpu_attention_f16_prefill_mx(
-                    (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-                    (const pulsar_attn_pack_t *)raw_kv->ptr,
-                    n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : NULL,
-                    n_tokens, n_comp, window, ratio, n_head, head_dim,
-                    gact_data, gact_scale, gact_kbp,
-                    gact_slab, n_groups, n_nope,
-                    0u, n_tokens, q_prep)) {
-                if (mx_out && gact_data) *mx_out = 1;
-                return 1;
-            }
-            fprintf(stderr, "pulsar: fp16 attention tier FAILED; refusing to "
-                            "fall through to the f32 kernel\n");
-            return 0;
-        }
+    /* Same emission contract as the raw-window twin: only the fp16 tier may
+     * write the grouped encoding, and on a decline *mx_out stays unset and
+     * the launcher refuses rather than reading a half-written slab. */
+    if (pulsar_gpu_attention_f16_prefill_mx(
+            (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
+            (const pulsar_attn_pack_t *)raw_kv->ptr,
+            n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : NULL,
+            n_tokens, n_comp, window, ratio, n_head, head_dim,
+            gact_data, gact_scale, gact_kbp,
+            gact_slab, n_groups, n_nope,
+            0u, n_tokens, NULL /* dense zero-prefix batch: rope at t */, q_prep)) {
+        if (mx_out && gact_data) *mx_out = 1;
+        return 1;
     }
-    ATTN_Q_PREP_STANDALONE(q, n_tokens, 0u, NULL);
-    dim3 grid(n_tokens, n_head, 1);
-        attention_prefill_mixed_kernel<<<grid, 256>>>((pulsar_heads_t *)heads->ptr,
-                                                  sinks,
-                                                  (const pulsar_q_t *)q->ptr,
-                                                  (const pulsar_attn_pack_t *)raw_kv->ptr,
-                                                  n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
-                                                  n_tokens, n_comp, window, ratio,
-                                                  n_head, head_dim);
-    return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
+    fprintf(stderr, "pulsar: fp16 prefill mixed attention FAILED (n_tokens=%u n_head=%u "
+                    "n_comp=%u); refusing to fall through\n", n_tokens, n_head, n_comp);
+    return 0;
 }
 
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(

@@ -95,8 +95,8 @@ dual path it found, with element-format tags making activation formats
 type-checked rather than convention.
 Earlier: v0.4.x moved the engine onto the tensor cores end to end: the
 vendored-MMQ D2R path runs every 2-bit routed-expert GEMM on the tensor cores,
-prefill attention is fp16 tensor-core on all paths, the indexer scorer runs
-block-scaled MXFP4, and split-KV decode attention lifts shallow-context decode
+attention is fp16 tensor-core on every path (one kernel since L166), the
+indexer scorer runs block-scaled MXFP4, and the fp16 decode walk lifts shallow-context decode
 — cold prefill now holds ~900-950 t/s from 2k through 32k (see Speed). On the
 serving side it adds the 0731 three-level reasoning-effort scheme, the
 Anthropic `web_search` server tool (backed by a SearXNG endpoint you point it
@@ -287,12 +287,15 @@ the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
 - Block-scaled MXFP4 indexer scorer. Default-on; its opt-out switch
   (`PULSAR_CUDA_INDEXER_MXFP4`) was retired in the v0.5.0 switch audit and the
   packed indexer cache is now allocated unconditionally.
-- Split-KV decode attention with softmax merge (8 row-splits up to 16 tokens
-  per launch; the small-batch decode walk no longer serializes on 8 blocks).
-  Its `PULSAR_CUDA_DECODE_SPLITKV=0` opt-out was retired 2026-09-02; the
-  single-walk kernel still serves launches above 16 tokens by size, not by
-  switch. (The separate `PULSAR_SPLITKV_DEBUG` A/B switch, which ran both
-  walks per call, was retired in the v0.5.0 switch audit.)
+- One attention kernel: the fp16 tensor-core tier serves prefill (raw and
+  static-mixed), indexed top-k and batched decode at every row count
+  (n_tokens == 1 included), every context length and both visibility rules
+  (the drafter's non-causal raw window included).  The four f32 online
+  kernels -- prefill raw, prefill mixed, indexed heads8-online, decode
+  heads8-online with its split-KV merge -- were deleted 2026-09-04 (L166)
+  once their last shapes moved over; a shape the tier does not serve
+  (head_dim != 512, n_head % 32 != 0, no sm_80+ tensor cores) is refused by
+  name, never computed another way.
 
 | Context | Prefill (t/s, cold) | Decode plain (t/s) |
 | ---: | ---: | ---: |
@@ -403,8 +406,8 @@ tensor cores.
 **KV state is overcommitted rather than fully charged** (since v0.3.1). The default
 context is **1M tokens** with **overcommit ON**: a small pool of banks (auto-sized,
 up to 8 by default — banks are warm-state slots, not decode streams, and 8 is the
-fast-lane boundary: the batched matmul lane and split-KV decode cap their fast
-paths at 8 rows, so the default never auto-sizes past it; an operator
+measured fast-lane boundary (N=12 aggregate decode held 29.2 tok/s at 8 banks
+vs 21.9 at 12 when it was set), so the default never auto-sizes past it; an operator
 `PULSAR_MSEQ_BANKS` pin up to 16 is allowed for TTFT-focused deploys that accept
 the >8-row slow-lane cliff) comes up "grow-to-1M-capable," but only the *eager floor* (raw sliding
 window + state lanes + drafter) is charged at admission — the ctx-scaled

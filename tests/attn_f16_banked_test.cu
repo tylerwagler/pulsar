@@ -63,8 +63,9 @@ int cuda_ok(cudaError_t err, const char *what) {
  * in E4M3 with a unit block scale, so the packed row decodes to exactly the
  * same constant and the isolation assertion below is unchanged -- it now also
  * exercises packed row ADDRESSING (row stride, scale offset, rope offset).
- * The FORMAT itself is not at risk here: the kernel decodes through the same
- * attn_comp_pack_ld the f32 kernel uses, so there is one implementation. */
+ * The FORMAT itself is not at risk here: the kernel decodes through the one
+ * attn_comp_pack_ld / attn_comp_row_ld4 decoder (pulsar_cuda_internal.h), so
+ * there is one implementation. */
 static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
     const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
     /* Exact NV construction: row scale = v (f32, exact), every per-16 scale
@@ -188,7 +189,7 @@ int main(int argc, char **argv) {
         dout, ds, dq, (const pulsar_attn_pack_t *)draw,
         (const pulsar_attn_pack_t *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
-        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, NULL);
+        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, 0u /* causal */, NULL);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;

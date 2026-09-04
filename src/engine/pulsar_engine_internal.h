@@ -649,10 +649,8 @@ typedef struct {
  * streams — decode throughput saturates ~4 concurrent streams, but every
  * bank beyond that keeps another conversation's KV warm between turns
  * instead of evicting it.  imatrix's run-head structure documents <= 16 as
- * its bound; the batched custom-nt matmul lane and the split-KV decode
- * gate still cap their fast paths at 8 rows, so a step with >8
- * simultaneously-decoding sessions takes the slower lane (correct, and
- * rare at the ~4-stream saturation point). */
+ * its bound; the M-neutral dense-step caps (PULSAR_GPU_MNEUTRAL_ROWS_MAX)
+ * follow it, and the build refuses the drift below. */
 #define PULSAR_MSEQ_MAX 16u
 /** Every decode row of a batched step must fit the M-neutral kernel paths, or
  * rows past the cap silently take a batch-shape-dependent GEMM (this exact

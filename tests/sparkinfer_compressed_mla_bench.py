@@ -12,7 +12,8 @@ signature mirrors OUR kernel's structure exactly:
     head_dim 512, v_head_dim 512       <- DSV4, matches ours
 
 i.e. sliding-window + indexed-sparse + sinks fused in a single pass, which is
-what attention_indexed_mixed_heads8_online_kernel does.
+what the engine's indexed attention does (attn_f16_kernel since the f32
+attention_indexed_mixed_heads8_online_kernel was deleted in L166).
 
 Reference to beat (tests/attn_indexed_bench.cu, calibrated to the engine ramp
 within 3.9%, plateau at causal depth >= 2048):

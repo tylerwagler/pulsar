@@ -13,9 +13,10 @@
  *     agreement on a degenerate input) while a few sink-dominated heads with
  *     |ref| ~ 3e-4 reported 6.4e-2 and failed the gate on nothing but a
  *     small-norm denominator.
- *   - attn_decode_split_test: residuals of 1.3e-49 and 0.0e+00, because when
- *     one split holds all the weight there is no reassociation to measure and
- *     the softmax MERGE -- the entire subject of that test -- is never run.
+ *   - the split-KV merge gate (deleted with the f32 decode kernel, L166):
+ *     residuals of 1.3e-49 and 0.0e+00, because when one split held all the
+ *     weight there was no reassociation to measure and the softmax MERGE --
+ *     the entire subject of that test -- never ran.
  *
  * Encoding a draw against the block scale fixes both, and has a useful
  * property: the decoded magnitude tracks the DRAW, not the scale byte, so the

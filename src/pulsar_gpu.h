@@ -410,6 +410,10 @@ int pulsar_gpu_attention_f16_prefill_mx(
         void *gact_data, void *gact_scale, int gact_kbp,
         uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
         uint32_t gact_tok0, uint32_t gact_ntok,
+        /* positions: int32 [n_tokens] DEVICE array or NULL.  Dense mode uses it
+         * for the fused Q rope only (positions[t] instead of t); the row plan is
+         * the batch's own causal window either way. */
+        const int *positions,
         const pulsar_gpu_q_prep *q_prep);
 
 int pulsar_gpu_attention_f16_prefill(
@@ -441,10 +445,12 @@ int pulsar_gpu_attention_f16_prefill(
 
 /** fp16 tensor-core attention, INDEXED: raw rows come from a ring buffer and
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
- * (topk == NULL, the continued-prefill sweep).  Banked descriptors
- * (positions/seq_id/comp_bank_ptrs; all-or-nothing) and ATTN_PACK comp rows
- * are ATTN_PACK rows, always -- bank isolation gated by
- * tests/attn_f16_banked_test.cu.  Returns 0 on refusal or failure. */
+ * (topk == NULL, the decode-batch sweep).  This is the ONE decode attention
+ * kernel (L166): every row count, every context length, causal and
+ * non-causal.  Banked descriptors (positions/seq_id/comp_bank_ptrs;
+ * all-or-nothing) are served; comp rows are ATTN_PACK rows, always -- bank
+ * isolation gated by tests/attn_f16_banked_test.cu.  Returns 0 on refusal or
+ * failure. */
 int pulsar_gpu_attention_f16_indexed(
         /* heads: stored attention output, PULSAR_HEADS_ELT_SIZE bytes/element;
          * opaque here for the same reason as q below (L033). Pass tensor->ptr. */
@@ -472,6 +478,11 @@ int pulsar_gpu_attention_f16_indexed(
         const void * const      *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
+        /* Raw visibility rule: 0 = causal (a row sees ring rows at or before
+         * its own position), nonzero = every ring row up to the last one
+         * (the drafter's raw-window forward).  Only WHICH rows are visible
+         * changes; compressed-row visibility and the fold are the same. */
+        uint32_t                non_causal,
         const pulsar_gpu_q_prep *q_prep);
 
 /** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
@@ -1298,9 +1309,14 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(
  * seq_id must carry TRUE bank ids in [0, n_banks): a row whose id is out
  * of range (stale slot, -1 sentinel) reads nothing and gets zero head
  * outputs — fail-visible, never a wild read.  Banked mode requires a
- * nonzero window <= 256 (the kernels' per-row raw scratch bound); banked
+ * nonzero window <= 256 (the kernel's per-row raw scratch bound); banked
  * argument rejections return 0 and print the reason to stderr.  Pass
- * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact. */
+ * NULL/NULL/0/1 for the classic single-cache behavior — bit-exact.
+ * non_causal selects the raw visibility rule: 0 = a row sees ring rows at or
+ * before its own position; nonzero = every ring row up to the last one (the
+ * drafter's raw-window forward, whose queries all see the whole draft).
+ * Both rules run on the same fp16 tensor-core kernel (L166); the flag
+ * changes which rows are visible, never how a visible row is folded. */
 int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,

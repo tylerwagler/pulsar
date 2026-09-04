@@ -837,19 +837,17 @@ bool gpu_graph_encode_layer_attention_batch(
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
-        /* Deferring norm+rope into the attention Q load leaves batch_q RAW,
-         * so a "Qcur" dump -- the only Q dump left -- still forces the fused
-         * kernel: the normed+roped Q otherwise exists only inside the
-         * attention kernel's registers. */
-        /* A "Qcur" dump still forces the materialising path -- under defer
-         * batch_q holds RAW q_b output and the normed+roped Q exists only
-         * inside the attention kernel's registers, so there is nothing to
-         * dump without computing it somewhere.  That at least lands on the
-         * FUSED kernel, which is a real fallback path (non-f16 hardware; the
-         * PULSAR_CUDA_ATTN_F16=0 opt-out is gone since 2026-09-02), not a
-         * debug-only one. */
-        const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0) &&
-                                     pulsar_gpu_attn_f16_tier_on();
+        /* WHERE the Q head-norm + tail rope runs, never WHICH attention kernel.
+         * Shipped: deferred into the fp16 attention kernel's Q-fragment build
+         * (q_prep), so batch_q stays RAW and the normed+roped Q exists only in
+         * the kernel's registers.  A "Qcur" dump needs that intermediate in
+         * memory, so it runs the standalone head_rms_norm_rope_tail kernel
+         * first and hands attention pre-normed Q (q_prep NULL).  The two are
+         * bit-exact (shared rope core, replicated reduction -- attn_f16.cu),
+         * and the attention launch is the same fp16 kernel either way (L166:
+         * there is no other attention kernel; a device without the tier is
+         * refused by the attention launch, not routed elsewhere). */
+        const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0);
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
         if (ok && prefill_q_defer) {
@@ -891,8 +889,9 @@ bool gpu_graph_encode_layer_attention_batch(
          * own warning, not the numbers production computes.  A debug
          * affordance that changes what it observes cannot diagnose what it
          * observes, so it is gone along with the "Qnorm" dump.  Prefill Q now
-         * has exactly two paths: deferred into attention (shipped) and the
-         * fused kernel (fallback).  L045 stage 2.
+         * has exactly two places to be normed: inside attention (shipped) or
+         * by the standalone kernel above (the "Qcur" dump); same numbers,
+         * same attention kernel after it.  L045 stage 2.
          *
          * If the post-norm/pre-rope intermediate is ever genuinely needed, the
          * honest way to get it is an optional store from the SHIPPED kernel,

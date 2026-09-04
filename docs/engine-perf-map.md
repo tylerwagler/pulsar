@@ -95,7 +95,8 @@ is what the `flashinfer-attn` branch was named for.
 
 It is NOT reachable by tuning.  Both occupancy knobs are already measured with
 documented cliffs (`PULSAR_ATTN_MIN_BLOCKS` 2, where 3 spills and is 8x worse;
-`PULSAR_ATTN_STATIC_MIN_BLOCKS` 4), the loads are already float4, and the
+`PULSAR_ATTN_STATIC_MIN_BLOCKS` 4 -- both knobs died with the f32 kernels in
+L166), the loads are already float4, and the
 softmax is already online.  The limit is structural: head_dim is 512 with one
 warp per head, so each of the 8 warps re-reads the whole 2 KB KV row out of
 shared memory (8x amplification) and then spends a 32-lane reduction plus a
@@ -290,6 +291,15 @@ cell) and gains at every depth.  This is the same merge machinery the
 flash-style prefill rewrite wants; build it once, spend it twice.
 
 #### SHIPPED (2026-08-09): split-KV decode, default-on
+
+RETIRED 2026-09-04 (L166): the f32 decode kernel, its split-KV merge and the
+unit gate below were deleted once the fp16 tensor-core tier took the drafter's
+non-causal raw window; the f32 prefill raw/mixed kernels and the indexed
+heads8-online kernel went in the same row once their n_tokens == 1 shapes moved
+over.  Every `attention_*_heads8_online` name in this file is a deleted kernel;
+there is ONE attention kernel now, `attn_f16_kernel` (pulsar_cuda_attn_f16.cu),
+and `pulsar_cuda_attention.cu` only dispatches to it.  The sections are kept as
+the record of the measurements.
 
 One kernel, two modes: gridDim.z > 1 makes each z-block walk its slice and
 emit (m, l, o) partials to static device scratch (graph-safe, 16.8 MiB);

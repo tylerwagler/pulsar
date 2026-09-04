@@ -15,6 +15,8 @@
  * calibrated to the engine ramp
  * at 3.9%, at the plateau (sub-batch 4+, causal depth >= 2048):
  *     attention_indexed_mixed_heads8_online_kernel<8,16>  6.917 ms / 512 tokens
+ *     (the f32 indexed kernel of the time, deleted in L166; the live kernel
+ *     is attn_f16_kernel in pulsar_cuda_attn_f16.cu)
  *
  * Shape (verified against the gguf and the engine trace):
  *     num_heads 64, head_dim 512 (DSV4: d_qk == d_v == 512), topk 512,

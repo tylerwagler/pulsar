@@ -101,11 +101,25 @@ cleanup:
     return rc;
 }
 
-static int check_decode_attention_f32_shape(void) {
-    const uint32_t n_head = 8;
+/* One-row decode at a LONG compressed context must read the compressed rows.
+ * L164 teeth: an f32 decode kernel once took every step past 11456 compressed
+ * rows because its score scratch was checked before the tier choice; the fp16
+ * tensor-core tier is the one decode kernel now (L166) and walks every visible
+ * row.  n_comp sits above that old cap on purpose.  Raw rows are zero and the
+ * compressed rows carry 1.0 in dim 0 with q = 0, so every score is 0 and the
+ * head's dim 0 is the compressed rows' share of a uniform softmax
+ * (11500 / (11500 + 128 + sink)), scaled by whatever the ATTN_PACK encode made
+ * of 1.0 -- well above 0.90 unless the compressed rows were skipped. */
+static int check_decode_attention_one_row_long_comp(void) {
+    const uint32_t n_head = 32;
     const uint32_t head_dim = 512;
     const uint32_t n_raw = 128;
-    const uint32_t n_comp = 8100;
+    const uint32_t n_comp = 11500;
+    const uint32_t ratio = 4;
+    /* Scalar-mode visibility is derived from pos0 + t: the row's (qpos+1)/ratio
+     * must reach n_comp and its ring span [pos0 + 1 - n_raw, pos0] must not
+     * underflow, so the query sits at the emit boundary 4 * n_comp - 1. */
+    const uint32_t pos0 = ratio * n_comp - 1u;
     const uint64_t q_count = (uint64_t)n_head * head_dim;
     const uint64_t raw_count = (uint64_t)n_raw * head_dim;
     const uint64_t comp_count = (uint64_t)n_comp * head_dim;
@@ -142,12 +156,10 @@ static int check_decode_attention_f32_shape(void) {
         pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp, 0, n_comp,
                                                    head_dim, SMOKE_ATTN_NROT,
                                                    /*keep_f32=*/true) &&
-        /* n_head 8 is outside the fp16 tier (needs a multiple of 32), so this
-         * one-row batch is served by the f32 split-KV kernel, at any n_comp. */
         pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads, sinks, n_head * sizeof(float), 0,
                                                              q, raw, comp,
-                                                             1, 0, n_raw, n_raw, 0, n_comp,
-                                                             0, 0, n_head, head_dim,
+                                                             1, pos0, n_raw, n_raw, 0, n_comp,
+                                                             0, ratio, n_head, head_dim,
                                                              0, NULL, NULL, NULL, 0, 1, NULL) &&
         pulsar_gpu_synchronize() &&
         pulsar_gpu_tensor_read_f32(heads, 0, heads_host, q_count)) {
@@ -155,11 +167,14 @@ static int check_decode_attention_f32_shape(void) {
         for (uint32_t h = 0; h < n_head; h++) {
             const float v = heads_host[(uint64_t)h * head_dim];
             if (v < 0.90f) {
-                fprintf(stderr, "attention fallback ignored compressed rows for head=%u value=%f\n",
+                fprintf(stderr, "one-row long-comp attention ignored compressed rows for head=%u value=%f\n",
                         h, (double)v);
                 rc = 1;
             }
         }
+        if (rc == 0)
+            printf("  one-row decode at n_comp=%u: compressed rows read (dim0=%.4f)\n",
+                   n_comp, (double)heads_host[0]);
     }
 
     pulsar_gpu_tensor_free(comp);
@@ -176,8 +191,13 @@ static int check_decode_attention_f32_shape(void) {
     return rc;
 }
 
+/* The drafter's raw-window forward: the same fp16 kernel, causal and
+ * non-causal, on the scalar (NULL-descriptor) launch where the two visibility
+ * rules differ.  Causal rows see ring rows at or before their own position,
+ * so their outputs are position-dependent; non-causal rows all see the whole
+ * ring, so with identical queries their outputs are byte-identical. */
 static int check_dspark_non_causal_attention(void) {
-    const uint32_t n_head = 8;
+    const uint32_t n_head = 32;
     const uint32_t head_dim = 512;
     const uint32_t n_tokens = 5;
     const uint32_t n_raw = 5;
@@ -468,8 +488,10 @@ static int check_dspark_confidence_head(void) {
  * (qpos+1)/ratio, and the banked per-row derivation must reproduce exactly
  * that (a floor(qpos/ratio) derivation fails the emit-boundary rows below).
  * Rows must also be independent of batch composition (row permutation).
- * Attention here is deterministic per row: one block per (row, head), so
- * per-row reduction order cannot depend on batchmates.
+ * Attention here is deterministic per row: one block per (row, 32-head
+ * group) in the fp16 tensor-core kernel, so per-row reduction order cannot
+ * depend on batchmates.  n_head is 32 -- the kernel's head tile -- so these
+ * cases run the production kernel, not a stand-in.
  * ------------------------------------------------------------------------- */
 
 static uint32_t mb_rng_state = 0x12345u;
@@ -484,9 +506,7 @@ typedef struct {
     uint32_t ref_n_comp;   /* scalar n_comp for the single-session reference:
                             * ENGINE-TRUE frontier at qpos, i.e. (qpos+1)/ratio
                             * (emit-before-attention), capped by the bank's
-                            * comp capacity.  Exception: the heads8-online case
-                            * passes the cross-bank superset to pin kernel
-                            * selection (see the comment there). */
+                            * comp capacity. */
 } mb_row;
 
 /* One descriptor launch over `rows`, then per-row single-session reference
@@ -603,20 +623,19 @@ static int mb_run_case(const char *label,
     /* Per-row single-session references against the bank's slab view.
      *
      * The reference is a classic scalar-mode BATCH of the 3 consecutive
-     * positions ending at the row's qpos (NULL descriptors — the unchanged
-     * single-session verify-batch shape), and we compare the last row.  A
-     * 1-row reference would be wrong-by-construction: the generic kernel's
-     * score pass legitimately switches to a cheaper loop when the LAUNCH is
-     * single-token (n_tokens == 1), and that loop's float accumulation order
-     * differs.  Within multi-row launches the per-row math depends only on
-     * (bank, qpos) — which is exactly the batch-composition independence this
-     * smoke asserts byte-for-byte. */
+     * positions ending at the row's qpos (NULL descriptors — the
+     * single-session verify-batch shape), and we compare the last row.  The
+     * row count no longer selects a kernel (L161: one kernel for every row
+     * count), so a 1-row reference would agree too; the 3-row shape is kept
+     * because it exercises the scalar pos0 + t derivation against the banked
+     * per-row one, and per-row math depends only on (bank, qpos) — which is
+     * exactly the batch-composition independence this smoke asserts
+     * byte-for-byte. */
     for (uint32_t r = 0; r < n_rows; r++) {
         const mb_row *row = &rows[r];
         const uint32_t ref_rows = 3;
-        /* raw is PULSAR_ATTN_PACK now, comp is still the f32 slab this test hands
-         * over with comp_kv_pack=0 -- so the two bank strides are NOT the same
-         * arithmetic any more, which is exactly what this line got wrong. */
+        /* raw and comp are both PULSAR_ATTN_PACK rows; the bank strides differ
+         * only by capacity. */
         const uint64_t raw_bank_bytes = (uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim);
         const uint64_t comp_bank_bytes = (uint64_t)comp_cap * SMOKE_ATTN_ROWBYTES(head_dim);
         pulsar_gpu_tensor *raw_view = pulsar_gpu_tensor_view(
@@ -714,11 +733,11 @@ done:
 }
 
 static int check_multibank_decode_attention(void) {
-    const uint32_t n_head = 8, head_dim = 512;
+    const uint32_t n_head = 32, head_dim = 512;
     const uint32_t raw_cap = 64, window = 32, ratio = 4, n_banks = 2;
     const uint32_t comp_cap = 32;               /* per-bank comp-row stride */
     /* static: the runtime host-registers the model-map page (never freed). */
-    static float sinks[8];
+    static float sinks[32];
     for (uint32_t h = 0; h < n_head; h++) sinks[h] = 0.1f * (float)h;
 
     const uint64_t raw_count = (uint64_t)n_banks * raw_cap * head_dim;
@@ -764,22 +783,22 @@ static int check_multibank_decode_attention(void) {
     }
 
     {
-        /* Generic mixed kernel: bank 0 with a WRAPPED ring (qpos 100 > raw_cap
-         * 64), bank 1 at qpos 39 — an EMIT boundary (39 ≡ ratio-1 mod 4) where
-         * the engine-true frontier is (39+1)/4 = 10 while a floor(39/4)
-         * derivation would see only 9; this row FAILS under the old floor rule
-         * (regression teeth for the emit-step divergence bug) — and bank 1
-         * again at 37 (non-emit, frontier 9).  References use the engine-true
-         * (qpos+1)/4 as scalar n_comp; the batch passes the cross-bank
-         * superset 25. */
+        /* Mixed raw + compressed: bank 0 with a WRAPPED ring (qpos 100 >
+         * raw_cap 64), bank 1 at qpos 39 — an EMIT boundary (39 ≡ ratio-1
+         * mod 4) where the engine-true frontier is (39+1)/4 = 10 while a
+         * floor(39/4) derivation would see only 9; this row FAILS under the
+         * old floor rule (regression teeth for the emit-step divergence bug)
+         * — and bank 1 again at 37 (non-emit, frontier 9).  References use
+         * the engine-true (qpos+1)/4 as scalar n_comp; the batch passes the
+         * cross-bank superset 25. */
         const mb_row rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
-        if (mb_run_case("mixed-generic", rows, 3, raw_slab, raw_cap,
+        if (mb_run_case("mixed", rows, 3, raw_slab, raw_cap,
                         comp_slab, comp_cap, 25, window, ratio, n_banks,
                         sinks, n_head, head_dim, 0, NULL, 0) != 0) goto done;
         /* Batch-composition independence: permuted rows, same per-row bytes
          * (mb_run_case re-verifies each row against its reference). */
         const mb_row perm[3] = { {1, 37, 9}, {0, 100, 25}, {1, 39, 10} };
-        if (mb_run_case("mixed-generic-permuted", perm, 3, raw_slab, raw_cap,
+        if (mb_run_case("mixed-permuted", perm, 3, raw_slab, raw_cap,
                         comp_slab, comp_cap, 25, window, ratio, n_banks,
                         sinks, n_head, head_dim, 0, NULL, 0) != 0) goto done;
         /* Raw-only path (n_comp = 0): both banks, one wrapped. */
@@ -800,46 +819,49 @@ static int check_multibank_decode_attention(void) {
              1,  8, -1,  5, 24,  3, 12,  2,
         };
         const mb_row idx_rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
-        /* Banked descriptors ride the heads8 / fp16 indexed kernels (the generic
-         * indexed kernel and the PULSAR_CUDA_NO_INDEXED_HEADS8 opt-out that
-         * pinned this case to it were deleted 2026-09-02).  Batch and the 3-row
-         * references take the same dispatch, so the byte comparison stands. */
+        /* Batch and the 3-row references take the same dispatch (the fp16
+         * indexed tier at n_head 32), so the byte comparison stands. */
         const int idx_rc = mb_run_case("indexed", idx_rows, 3, raw_slab, raw_cap,
                                        comp_slab, comp_cap, 25, window, ratio, n_banks,
                                        sinks, n_head, head_dim, 1, topk_host, top_k);
         if (idx_rc != 0) goto done;
     }
 
-    /* heads8-online variant: a cross-bank superset n_comp too large for the
-     * shared-memory score buffer forces the online kernel for the batch AND
-     * for the single-row references.  Bank 0 sits at qpos 45999, an EMIT
-     * boundary (45999 ≡ 3 mod 4): its engine-true frontier is 46000/4 =
-     * 11500 == the scalar, while floor(45999/4) = 11499 — teeth for the
-     * online kernel's per-row rule.  Bank 1 (qpos 20000, frontier 5000)
-     * must ALSO get the 11500 scalar in its reference: scalar n_comp picks
-     * the kernel (a 5000 scalar fits the score buffer and would take the
-     * generic kernel, whose reduction order differs), while the rows a
-     * reference actually reads come from the kernel's own (qpos+1)/ratio
-     * derivation, which caps at 5000 regardless of the larger scalar. */
+    /* Long compressed context: the same visibility contract at a depth above
+     * the old f32 kernel's score-scratch cap (L164: 11456 rows once changed
+     * the kernel; L166: there is one kernel).  Bank 0 sits at qpos 45999, an
+     * EMIT boundary (45999 ≡ 3 mod 4): its engine-true frontier is 46000/4 =
+     * 11500 == the superset, while floor(45999/4) = 11499 — teeth for the
+     * per-row rule at depth.  Bank 1 (qpos 20000) sees 5000 of the superset.
+     * The slab is encoded through the shipping ATTN_PACK encoder like the
+     * small one above; an f32 slab read at the packed stride would be a
+     * deterministic-garbage fixture that proves only determinism. */
     {
         const uint32_t big_comp_cap = 11504;
         const uint32_t big_n_comp = 11500;
         const uint64_t big_count = (uint64_t)n_banks * big_comp_cap * head_dim;
         float *big_host = (float *)malloc(big_count * sizeof(float));
-        pulsar_gpu_tensor *big_slab = pulsar_gpu_tensor_alloc(big_count * sizeof(float));
+        pulsar_gpu_tensor *big_f32 = pulsar_gpu_tensor_alloc(big_count * sizeof(float));
+        pulsar_gpu_tensor *big_slab = pulsar_gpu_tensor_alloc(
+                (uint64_t)n_banks * big_comp_cap * SMOKE_ATTN_ROWBYTES(head_dim));
         int big_rc = 1;
-        if (big_host && big_slab) {
+        if (big_host && big_f32 && big_slab) {
             mb_rng_state = 0x5eed5u;
             for (uint64_t i = 0; i < big_count; i++) big_host[i] = mb_rand();
-            if (pulsar_gpu_tensor_write(big_slab, 0, big_host, big_count * sizeof(float))) {
-                const mb_row rows[2] = { {0, 45999, big_n_comp}, {1, 20000, big_n_comp} };
-                big_rc = mb_run_case("mixed-online", rows, 2, raw_slab, raw_cap,
+            if (pulsar_gpu_tensor_write(big_f32, 0, big_host, big_count * sizeof(float)) &&
+                pulsar_gpu_attn_pack_quantize_store_tensor(big_f32, big_slab, 0,
+                                                           (uint32_t)(n_banks * big_comp_cap),
+                                                           head_dim, SMOKE_ATTN_NROT,
+                                                           /*keep_f32=*/true)) {
+                const mb_row rows[2] = { {0, 45999, big_n_comp}, {1, 20000, 5000} };
+                big_rc = mb_run_case("mixed-long-comp", rows, 2, raw_slab, raw_cap,
                                      big_slab, big_comp_cap, big_n_comp, window,
                                      ratio, n_banks, sinks, n_head, head_dim,
                                      0, NULL, 0);
             }
         }
         pulsar_gpu_tensor_free(big_slab);
+        pulsar_gpu_tensor_free(big_f32);
         free(big_host);
         if (big_rc != 0) goto done;
     }
@@ -1267,7 +1289,7 @@ int main(void) {
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
-    if (check_decode_attention_f32_shape() != 0) rc = 1;
+    if (check_decode_attention_one_row_long_comp() != 0) rc = 1;
     if (check_multibank_decode_attention() != 0) rc = 1;
     if (check_multibank_indexer() != 0) rc = 1;
     if (check_multibank_raw_store() != 0) rc = 1;
