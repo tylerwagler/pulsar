@@ -184,7 +184,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate cuda-row-neutrality-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -901,6 +901,13 @@ cuda-prefill-gate-baseline:
 # look like a real regression (hit 2026-08-14 during the L031 sweep).
 SPEC_GATE_MODEL ?= $(FRONTIER_MODEL)
 SPEC_GATE_ARGS ?= 0.95
+# L161: a 1-row decode step and an N-row step must be the same numerics --
+# the attention tier used to be chosen by row count and the battery never
+# compared the two.  Same token on the same prefilled bank: classic eval,
+# 1-row decode_mixed, 2-row decode_mixed (and a different batchmate); any bit
+# of difference fails.  MODEL-DEPENDENT, ~2 min.
+cuda-row-neutrality-gate: tests/mseq_short_ctx_probe
+	./tests/mseq_short_ctx_probe $(FRONTIER_MODEL)
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
 
@@ -933,7 +940,8 @@ GATE_TARGETS = unit-test-gate \
                cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate \
                cuda-fork-gate cuda-algo-stability-gate cuda-mixed-prefill-gate \
                cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide \
-               cuda-spec-sampling-gate
+               cuda-spec-sampling-gate \
+               cuda-row-neutrality-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with
@@ -1189,6 +1197,10 @@ tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/mseq_short_ctx_probe.cpp
+tests/mseq_short_ctx_probe: tests/mseq_short_ctx_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS)

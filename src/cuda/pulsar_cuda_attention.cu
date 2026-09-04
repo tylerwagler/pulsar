@@ -1233,20 +1233,25 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "pulsar: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (n_tokens > 1 && head_dim == 512) {
-        /* fp16 tensor-core tier for the CONTINUED-PREFILL batch: this is the
-         * kernel that grows with context (27.9 ms/launch and 10.8% of GPU at a
-         * 32k prefill) and it is token-parallel here (n_tokens >= 128), so the
-         * fp16 decomposition applies.  True decode (n_tokens == 1) never
-         * reaches this branch and stays on the f32 kernel.  Refused rather
-         * than approximated: comp-mask, non-causal, and FP8 comp rows.  A 0
-         * from the launcher is a real failure and is reported, not demoted. */
+    /* L161: ONE decode attention kernel for every row count.  This read
+     * `n_tokens > 1` and sent the single-row step (classic decode, a lone
+     * client, the first speculative round after a fresh prefill) to the f32
+     * online kernel while 2..16 rows took the fp16 tensor-core tier -- two
+     * attention numerics for one conversation, chosen by how many clients
+     * happened to step together: all 129280 head logits differed, max |delta|
+     * 3.85 at ctx 17 (tests/mseq_short_ctx_probe, rows/L161.md).  The tier's
+     * MMA tiles over HEADS (AF16_HEADS), so one query row is a natural input;
+     * the continued-prefill batch (n_tokens >= 128) takes the same kernel.
+     * Refused rather than approximated: comp-mask, non-causal, and FP8 comp
+     * rows.  A 0 from the launcher is a real failure and is reported, not
+     * demoted. */
+    if (head_dim == 512) {
         if (pulsar_gpu_attention_prefill_reads_packed_comp() &&
             !non_causal && (n_head % 32u) == 0u) {
             static int announced_dc = 0;
             if (!announced_dc) {
                 announced_dc = 1;
-                fprintf(stderr, "pulsar: continued-prefill attention = fp16 tensor-core tier\n");
+                fprintf(stderr, "pulsar: decode attention = fp16 tensor-core tier (every row count)\n");
             }
             if (pulsar_gpu_attention_f16_indexed(
                     (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
@@ -1271,27 +1276,6 @@ static int attention_decode_batch_launch(
                 head_dim, positions_ptr, seq_id_ptr,
                 comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
                 "attention decode window launch");
-    }
-    if (head_dim == 512u) {
-        /* L117 2026-08-26: n_tokens == 1 here (the n>1 branch above returned).
-         * The generic per-(row,head) kernel below re-walks every raw+comp row
-         * once PER HEAD (~27x byte roofline; measured 13.7 ms/sweep in the
-         * M=1 batch cell vs 3.2 ms at M=2 — nsys diff in pulsar-notes
-         * rows/L117.md). Classic solo decode has routed head_dim==512 to the
-         * heads8-online kernel BY DEFAULT since 2026-08-02
-         * (pulsar_gpu_attention_decode_heads_tensor above) — give the batched
-         * M=1 tail the same tier. Same reassociation class as that default
-         * (NOT bit-exact vs the generic kernel); M=1 batch output is excluded
-         * from the multiseq neutrality comparisons by construction. */
-        ATTN_Q_PREP_FALLBACK(q, n_tokens, pos0, positions);
-        return attention_decode_heads8_launch((pulsar_heads_t *)heads->ptr, sinks,
-                (const pulsar_q_t *)q->ptr, (const pulsar_attn_pack_t *)raw_kv->ptr,
-                n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
-                non_causal, n_tokens, pos0,
-                n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
-                head_dim, positions_ptr, seq_id_ptr,
-                comp_bank_ptrs_ptr, comp_cap, kernel_n_banks,
-                "attention decode batch-1 online launch");
     }
     /* head_dim != 512: the generic per-(row,head) decode kernel that served it
      * was deleted 2026-09-02 (no shape profile has another head_dim; every

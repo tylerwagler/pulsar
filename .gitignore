@@ -30,6 +30,9 @@ __pycache__/
 /tests/tp_core_test
 /tests/tp_transport_test
 /tests/tp_sched_test
+/tests/mseq_short_ctx_probe
+/tests/fixed_tile_gemm_probe
+/tests/nt_crossover_sweep
 /tests/tp_identity_test
 /tests/tp_wide_test
 /tests/tp_fault_test
