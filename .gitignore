@@ -32,6 +32,17 @@ __pycache__/
 /tests/accounting_gate
 /tests/prefill_bitexact_gate
 /tests/spec_sampling_gate
+# tp test binaries (sources live on origin/dev; built during tp/merge work on any branch)
+/tests/tp_core_test
+/tests/tp_transport_test
+/tests/tp_sched_test
+/tests/tp_identity_test
+/tests/tp_wide_test
+/tests/tp_fault_test
+/tests/tp_cmd_stress_test
+/tests/tp_verify_test
+/tests/tp_slab_gpu_probe
+/tests/tp_dmabuf_probe
 /gguf-tools/test_quants
 .claude/
 /data/
