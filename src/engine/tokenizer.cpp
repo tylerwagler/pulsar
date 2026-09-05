@@ -728,6 +728,39 @@ void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens
 
 
 
+/* Print a decoded piece as a quoted string: printable ASCII and well-formed
+ * UTF-8 verbatim, \n \r \t \" \\ as escapes, every other byte as \xNN. */
+static void dump_piece_quoted(FILE *fp, const char *s, size_t n) {
+    fputc('"', fp);
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = (unsigned char)s[i];
+        const int seq = utf8_seq_ok((const unsigned char *)s + i, n - i);
+        if (seq > 1) {
+            fwrite(s + i, 1, (size_t)seq, fp);
+            i += (size_t)seq;
+            continue;
+        }
+        switch (c) {
+        case '\n': fputs("\\n", fp); break;
+        case '\r': fputs("\\r", fp); break;
+        case '\t': fputs("\\t", fp); break;
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        default:
+            if (c >= 0x20 && c < 0x7f) fputc(c, fp);
+            else fprintf(fp, "\\x%02x", c);
+        }
+        i++;
+    }
+    fputc('"', fp);
+}
+
+
+
+/* --dump-tokens: the ids, then one line per token with the DECODED bytes (what
+ * pulsar_token_text hands the server and the CLI) followed by the raw GPT-2
+ * byte-encoded vocab string, so a tokenization mismatch can be read against
+ * either form. */
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
@@ -739,7 +772,12 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
     for (int i = 0; i < tokens->len; i++) {
         int id = tokens->v[i];
         if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
+            size_t n = 0;
+            char *piece = vocab_token_text(vocab, id, &n);
+            fprintf(fp, "%6d  ", id);
+            dump_piece_quoted(fp, piece, n);
+            fprintf(fp, "  raw=%.*s\n", (int)vocab->token[id].len, vocab->token[id].ptr);
+            free(piece);
         }
     }
 }
@@ -785,7 +823,12 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
-    pulsar_vocab *vocab = &e->vocab;
+    return vocab_token_text(&e->vocab, token, len);
+}
+
+
+
+char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = (char *)xmalloc(1);

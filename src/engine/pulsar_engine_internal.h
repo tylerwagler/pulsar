@@ -2782,6 +2782,11 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
 void token_vec_push(token_vec *tv, int token);
 void token_vec_free(token_vec *tv);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
+/** The bytes `token` decodes to -- the GPT-2 byte alphabet reversed, literal
+ * specials verbatim, an out-of-range id empty.  The ONE detokenizer:
+ * pulsar_token_text and dump_tokens_fp both call it.  Malloc'd,
+ * NUL-terminated; *len (optional) receives the byte count. */
+char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
 int sample_argmax(const float *logits, uint32_t n_vocab);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
