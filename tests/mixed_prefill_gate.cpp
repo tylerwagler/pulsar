@@ -21,6 +21,7 @@
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
+#include "gate_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,9 +54,10 @@ static bool decode_cont(pulsar_session *s, int F, int t0, int *out){
     free(lg); return ok;
 }
 
-/* classic RESUME reference: prefill [0,F) via pulsar_session_sync (the second sync
- * resumes at c0>0 = same decode-attention kernel as the mixed path), copy the
- * last-position full-vocab logits, then decode NGEN. */
+/* classic RESUME reference: prefill [0,c0) via pulsar_session_sync, then [c0,F)
+ * as a classic CONTINUATION at c0 (gate_prefill_suffix_classic -- the same
+ * chunking as the mixed path; since L183 sync itself would recompute from the
+ * grid), copy the last-position full-vocab logits, then decode NGEN. */
 static bool classic_stream(int c0, int F, int *out, float *out_lg){
     pulsar_session *s=NULL; if(pulsar_session_create(&s,g_e,4096)!=0) return false;
     pulsar_gpu_graph *g=&s->graph; char e[256]; bool ok=true;
@@ -63,8 +65,7 @@ static bool classic_stream(int c0, int F, int *out, float *out_lg){
     pulsar_session_invalidate(s);
     pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
     if(pulsar_session_sync(s,&p0,e,sizeof e)!=0){ fprintf(stderr,"classic first-chunk: %s\n",e); ok=false; }
-    pulsar_tokens p={.v=g_toks.v,.len=F,.cap=F};           /* RESUMES at c0 (pos0>0) */
-    if(ok && pulsar_session_sync(s,&p,e,sizeof e)!=0){ fprintf(stderr,"classic resume: %s\n",e); ok=false; }
+    if(ok && !gate_prefill_suffix_classic(s,&g_toks,c0,F,e,sizeof e)){ fprintf(stderr,"classic resume: %s\n",e); ok=false; }   /* continues at c0 */
     if(ok){ gpu_graph_bank_counters_capture(g,0);
             pulsar_session_copy_logits(s,out_lg,(int)PULSAR_N_VOCAB);   /* last-position logits */
             ok=decode_cont(s,F,pulsar_session_argmax(s),out); }
@@ -103,9 +104,8 @@ static bool classic_prefill_time(int c0, int K, double *secs){
     pulsar_session_invalidate(s);
     pulsar_tokens p0={.v=g_toks.v,.len=c0,.cap=c0};
     if(pulsar_session_sync(s,&p0,e,sizeof e)!=0) ok=false;              /* untimed first chunk */
-    pulsar_tokens p1={.v=g_toks.v,.len=c0+K,.cap=c0+K};
     double t0=now_s();
-    if(ok && pulsar_session_sync(s,&p1,e,sizeof e)!=0) ok=false;        /* resumes at c0, prefills K */
+    if(ok && !gate_prefill_suffix_classic(s,&g_toks,c0,c0+K,e,sizeof e)) ok=false;   /* continues at c0, prefills K */
     *secs=now_s()-t0;
     pulsar_session_free(s); return ok;
 }

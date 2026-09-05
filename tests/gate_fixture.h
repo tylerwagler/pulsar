@@ -17,6 +17,38 @@
 
 #define GATE_STORY_PROMPT "tests/long_context_story_prompt.txt"
 
+/* L183: prefill toks[start, end) as a classic CONTINUATION at `start` -- the
+ * chunked prefill entered at the checkpoint, which is what pulsar_session_sync
+ * did before L183.  Since L183 the public sync recomputes a resume from the
+ * last chunk-grid boundary (a resume is a cold prefill), so a gate that
+ * compares the MIXED lane's prefill of [start, end) against the classic lane
+ * on the SAME chunking needs this entry; through sync it would compare the
+ * mixed continuation against a cold prefill and measure chunk dependence
+ * instead of lane parity (that is what the chunk-neutrality gate measures).
+ * Leaves the session's checkpoint at `end` and its logits at the last row. */
+static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_tokens *toks,
+                                               int start, int end, char *err, size_t errlen) {
+    if (!s || !toks || start < 0 || end <= start || end > toks->len) {
+        snprintf(err, errlen, "classic suffix: bad range [%d, %d)", start, end);
+        return false;
+    }
+    if (s->checkpoint.len != start) {
+        snprintf(err, errlen, "classic suffix: checkpoint at %d, suffix starts at %d", s->checkpoint.len, start);
+        return false;
+    }
+    bool cancelled = false;
+    if (!gpu_graph_prefill_chunked_range(&s->graph, &s->engine->model, &s->engine->weights, toks,
+                                         (uint32_t)start, (uint32_t)(end - start), s->logits,
+                                         false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &cancelled)) {
+        snprintf(err, errlen, "classic suffix prefill [%d, %d) failed", start, end);
+        return false;
+    }
+    pulsar_tokens p = *toks; p.len = end;
+    pulsar_tokens_copy(&s->checkpoint, &p);
+    s->checkpoint_valid = true;
+    return true;
+}
+
 static inline char *gate_read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;

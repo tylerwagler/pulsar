@@ -269,8 +269,9 @@ static bool classic_resume(int K, float *out_lg, int *next_tok) {
     pulsar_session_invalidate(s);
     pulsar_tokens p0 = { .v = (int *)pptr, .len = C0, .cap = C0 };
     if (pulsar_session_sync(s, &p0, err, sizeof err) != 0) { fprintf(stderr, "classic chunk: %s\n", err); ok = false; }
-    pulsar_tokens p1 = { .v = (int *)pptr, .len = C0 + K, .cap = C0 + K };
-    if (ok && pulsar_session_sync(s, &p1, err, sizeof err) != 0) { fprintf(stderr, "classic resume: %s\n", err); ok = false; }
+    /* the classic CONTINUATION at C0 (since L183 sync would recompute from the grid) */
+    pulsar_tokens pall = { .v = (int *)pptr, .len = C0 + K, .cap = C0 + K };
+    if (ok && !gate_prefill_suffix_classic(s, &pall, C0, C0 + K, err, sizeof err)) { fprintf(stderr, "classic resume: %s\n", err); ok = false; }
     if (ok) {
         gpu_graph_bank_counters_capture(g, 0);
         pulsar_session_copy_logits(s, out_lg, (int)PULSAR_N_VOCAB);
