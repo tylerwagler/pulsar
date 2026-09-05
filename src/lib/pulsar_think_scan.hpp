@@ -33,7 +33,7 @@ static inline bool bytes_is_partial_prefix(const char *p, size_t n, const char *
 /** Scanner state.  Zero-initialise, or set `in_think` when generation starts
  * inside a reasoning block (the assistant prefix already emitted <think>). */
 struct pulsar_think_scanner {
-    bool in_think;      ///< between <think> and </think>
+    bool in_think;      ///< between `<think>` and `</think>`
     char pending[8];    ///< '<'-led bytes withheld while a tag may still be forming
     size_t pending_len; ///< bytes held in `pending`
 };

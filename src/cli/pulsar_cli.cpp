@@ -207,7 +207,7 @@ typedef struct {
     pulsar_engine *engine;      ///< for detokenising
     FILE *fp;                   ///< output sink
     bool format_thinking;       ///< style reasoning blocks distinctly
-    pulsar_think_scanner think; ///< <think> tag state: in_think styles text, held tag prefix
+    pulsar_think_scanner think; ///< `<think>` tag state: in_think styles text, held tag prefix
     bool color_open;            ///< an SGR sequence is open and must be closed
     bool use_color;             ///< the sink accepts ANSI colour
     bool last_output_newline;   ///< last byte written was '\n'

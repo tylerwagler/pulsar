@@ -1397,7 +1397,7 @@ typedef struct {
 
     byte_buf stream;        ///< generated text of the active case
     style_buf styles;       ///< per-byte style codes for `stream`
-    pulsar_think_scanner think; ///< <think> tag state: in_think styles `stream`, held tag prefix
+    pulsar_think_scanner think; ///< `<think>` tag state: in_think styles `stream`, held tag prefix
 } eval_ui;
 
 static eval_ui *global_ui;
