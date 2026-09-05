@@ -1292,6 +1292,13 @@ tests/mseq_short_ctx_probe: tests/mseq_short_ctx_probe.o src/lib/pulsar_help.o $
 tests/spec_teacher_forced_probe: tests/spec_teacher_forced_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# L183: the chunk-mate census driver (prefill exactly N tokens as one chunk; the
+# instrument is the engine's per-op dump, PULSAR_CUDA_GRAPH_DUMP_*).
+tests/prefill_chunk_census_probe.o: tests/prefill_chunk_census_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/prefill_chunk_census_probe.cpp
+tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
