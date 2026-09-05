@@ -55,8 +55,11 @@ static char *read_file(const char *path, size_t *len_out) {
 static int pending_q0(pulsar_session *s, uint32_t width, float temperature, int top_k,
                       float top_p, float min_p, pulsar_sample_scratch *scratch,
                       pulsar_sample_dist *qd, int *sparse) {
-    float confs[16];
-    if (pulsar_session_bank_pending_confs(s, 0u, confs) == 0u) return 0;
+    /* LIVE state (the caller restored bank 0): the saved carry is what the
+     * sweep reads between rounds, the live shadow is what round_begin will
+     * consume.  Harvest first: the chain may still be in flight. */
+    pulsar_session_spec_chain_harvest(s);
+    if (s->spec.dspark_n_pending == 0u) return 0;
     const uint32_t qn = s->spec.dspark_pending_qn[0];
     memset(qd, 0, sizeof *qd);
     if (qn > 0) {
@@ -109,7 +112,9 @@ int GATE_ENTRY(int argc, char **argv) {
             fprintf(stderr, "prompt has %d tokens, need %d\n", toks.len, start + n_pos + 40);
             goto done;
         }
-        const int ctx = start + n_pos + 64;
+        /* a round commits 1 + (drafts that were the truth) tokens, so the
+         * measured positions can outrun n_pos; size the context for that */
+        const int ctx = start + 4 * n_pos + 128;
         /* the batched round flow runs on a bank pool (the redraft's drafter
          * scratch is allocated with the pool's slabs, and a pool exists from
          * two banks); the probe uses bank 0 only */
@@ -136,12 +141,20 @@ int GATE_ENTRY(int argc, char **argv) {
         int agree = 0, greedy_hit = 0, n_meas = 0, n_sparse = 0, n_rounds = 0;
         int pos = start;   /* committed prefix length; toks.v[pos] is the next true token */
         while (n_meas < n_pos) {
+            if (pos + 20 > ctx) { fprintf(stderr, "context exhausted at pos %d after %d measured positions\n", pos, n_meas); break; }
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
             /* q for the token at pos+1, drafted by the previous forced end (none before the first round) */
             pulsar_sample_dist qd; int sparse = 0;
             const int have_q = pending_q0(s, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &qd, &sparse);
             if (have_q < 0) { fprintf(stderr, "q read failed at pos %d\n", pos); goto done; }
             const int draft0 = have_q ? (int)s->spec.dspark_pending[0] : -1;
+            if (!have_q && n_rounds >= 3 && n_meas == 0) {
+                /* the first round has nothing pending by construction; from
+                 * the second on a missing draft is a broken redraft, not data */
+                fprintf(stderr, "no pending draft after %d rounds (bank depth %d, quenched %d) -- the redraft is not producing\n",
+                        n_rounds, pulsar_session_bank_spec_depth(s, 0u), (int)s->spec.spec_quenched);
+                goto done;
+            }
             int first;
             if (n_rounds == 0) {
                 first = toks.v[pos];
@@ -217,6 +230,13 @@ int GATE_ENTRY(int argc, char **argv) {
             }
             pos += na;
             n_rounds++;
+            /* The yield-quench controller is a SPEED policy: it latches when
+             * rounds convert too little and routes the request to plain
+             * decode.  Under teacher forcing a round converts only drafts that
+             * ARE the corpus token, so it would latch within ten rounds and end
+             * the measurement; re-arm it every round, as a request boundary
+             * does.  The probe measures the drafter, not the controller. */
+            spec_quench_reset(s);
             pulsar_session_bank_state_save(s, bank0);
             pulsar_spec_round *rr = r; uint32_t bb = bank0;
             if (pulsar_session_spec_redraft_batch(s, &rr, &bb, &rngp, 1, err, sizeof err) != 0) {
@@ -226,6 +246,7 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_session_spec_redraft_commit(s, r);
             pulsar_session_bank_state_save(s, bank0);
         }
+        if (n_meas == 0) { fprintf(stderr, "nothing measured\n"); goto done; }
         printf("TEACHER-FORCED: positions=%d start=%d rounds=%d temp=%.2f min_p=%.2f | E[accept]=%.6f  "
                "argmax agreement=%.5f  draft==truth=%.5f  mean q(p-mode)=%.5f  (sparse q at %d positions)\n",
                n_meas, start, n_rounds, temperature, min_p, sum_acc / n_meas, (double)agree / n_meas,
