@@ -13,6 +13,7 @@
 #define SMOKE_ATTN_NROT 64u
 #define SMOKE_ATTN_ROWBYTES(HD) pulsar_gpu_attn_pack_rowbytes(HD)
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +33,93 @@ static double getenv_seconds(const char *name, double fallback) {
     char *end = NULL;
     const double v = strtod(s, &end);
     return end != s && v > 0.0 ? v : fallback;
+}
+
+/* L172: every ranking kernel (1024 bitonic, pow2<2048>, pow2<4096>, CUB at
+ * 4096 and 4097..8192, pow2_u16<8192>, and the chunk/tree path above 8192)
+ * must select the SAME set for the same scores.  The kernel is chosen by
+ * n_comp, so the same base row is ranked at n_comp values one row apart on
+ * each side of every bucket boundary (the extra rows are -inf and can never
+ * enter a top-512 with >= 512 finite rows).  Scores are tie-heavy on purpose:
+ * exact +0.0, -0.0, denormals (FTZ-equal to zero) and 101 repeated values --
+ * the shape ReLU'd, quantised indexer scores take.  The oracle is the host
+ * comparator with value semantics (score desc, id asc; the zero class equal).
+ * Mutation-validated: the bit-pattern CUB key fails at 4096 and 8192. */
+static float ftz_host(float v) { return fabsf(v) < FLT_MIN ? 0.0f : v; }
+static int host_better(float av, uint32_t ai, float bv, uint32_t bi) {
+    av = ftz_host(av); bv = ftz_host(bv);
+    return av > bv || (av == bv && ai < bi);
+}
+static int cmp_u32(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+/* Host oracle: top_k ids of row[0..n) under the value order (score desc, id asc,
+ * the zero class equal), returned sorted ascending for a set comparison. */
+static void host_topk_set(const float *row, uint32_t n, uint32_t top_k, uint32_t *out) {
+    uint32_t n_sel = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t pos = n_sel;
+        while (pos > 0 && host_better(row[i], i, row[out[pos - 1]], out[pos - 1])) pos--;
+        if (pos >= top_k) continue;
+        const uint32_t last = n_sel < top_k ? n_sel : top_k - 1u;
+        for (uint32_t j = last; j > pos; j--) out[j] = out[j - 1];
+        out[pos] = i;
+        if (n_sel < top_k) n_sel++;
+    }
+    qsort(out, top_k, sizeof(uint32_t), cmp_u32);
+}
+static int check_topk_set_identity(void) {
+    const uint32_t N_MAX = 8193u, top_k = 512u;
+    static const uint32_t ncs[] = { 1024u, 1025u, 2048u, 2049u, 4095u, 4096u, 8192u, 8193u };
+    float *base = (float *)malloc((size_t)N_MAX * sizeof(float));
+    uint32_t *expect = (uint32_t *)malloc((size_t)2u * top_k * sizeof(uint32_t));
+    uint32_t *got = (uint32_t *)malloc((size_t)2u * top_k * sizeof(uint32_t));
+    float *row2 = (float *)malloc((size_t)2u * N_MAX * sizeof(float));
+    if (!base || !expect || !got || !row2) return 1;
+    /* 300 strictly positive scores (ids 0..1199 step 4, 101 repeated values) and
+     * a zero class everywhere else (+0.0, -0.0, +-denormal), so slots 300..511
+     * of every top-512 are decided by the tie-break among zero-class rows --
+     * exactly where a bit-pattern order ranks +0.0 and +denormals above -0.0. */
+    for (uint32_t i = 0; i < N_MAX; i++) {
+        if (i < 1200u && (i % 4u) == 0u) { base[i] = 0.01f + (float)((i * 37u) % 101u) / 100.0f; continue; }
+        switch (i % 4u) {
+        case 0: base[i] = 0.0f; break;
+        case 1: base[i] = -0.0f; break;
+        case 2: base[i] = 1e-40f; break;
+        default: base[i] = -1e-40f; break;
+        }
+    }
+    int rc = 0;
+    for (size_t k = 0; k < sizeof(ncs) / sizeof(ncs[0]); k++) {
+        const uint32_t n_comp = ncs[k];
+        /* row 0 = base, row 1 = base reversed (the zero class then leads) */
+        for (uint32_t i = 0; i < n_comp; i++) { row2[i] = base[i]; row2[(uint64_t)n_comp + i] = base[n_comp - 1u - i]; }
+        host_topk_set(row2, n_comp, top_k, expect);
+        host_topk_set(row2 + n_comp, n_comp, top_k, expect + top_k);
+        /* n_tokens 2 and, at 8193, also 1 (the chunk width keys on n_tokens == 1) */
+        for (uint32_t n_tokens = (n_comp > 8192u ? 1u : 2u); n_tokens <= 2u; n_tokens++) {
+            pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * n_comp * sizeof(float));
+            pulsar_gpu_tensor *selected = pulsar_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
+            int ok = scores && selected &&
+                     pulsar_gpu_tensor_write(scores, 0, row2, (uint64_t)n_tokens * n_comp * sizeof(float)) &&
+                     pulsar_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
+                     pulsar_gpu_synchronize() &&
+                     pulsar_gpu_tensor_read(selected, 0, got, (uint64_t)n_tokens * top_k * sizeof(uint32_t));
+            pulsar_gpu_tensor_free(selected); pulsar_gpu_tensor_free(scores);
+            if (!ok) { printf("topk set identity: n_comp=%u n_tokens=%u: launch FAILED\n", n_comp, n_tokens); rc = 1; continue; }
+            uint32_t nd[2] = { 0u, 0u };
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                qsort(got + (uint64_t)t * top_k, top_k, sizeof(uint32_t), cmp_u32);
+                for (uint32_t i = 0; i < top_k; i++) nd[t] += got[(uint64_t)t * top_k + i] != expect[(uint64_t)t * top_k + i];
+            }
+            printf("topk set identity: n_comp=%5u n_tokens=%u: ids differing from the value-order oracle: row0 %u/%u, row1 %u/%u%s\n",
+                   n_comp, n_tokens, nd[0], top_k, nd[1], top_k, (nd[0] || nd[1]) ? "  FAIL" : "  OK");
+            if (nd[0] || nd[1]) rc = 1;
+        }
+    }
+    free(base); free(expect); free(got); free(row2);
+    return rc;
 }
 
 static int check_large_topk(void) {
@@ -1286,6 +1374,7 @@ int main(void) {
 
     if (!pulsar_gpu_init()) return 1;
     int rc = check_large_topk();
+    rc |= check_topk_set_identity();
     if (check_dspark_markov_head() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;

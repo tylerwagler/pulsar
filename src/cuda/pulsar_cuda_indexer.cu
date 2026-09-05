@@ -404,7 +404,18 @@ __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
 
 
 
+/* The radix key must induce the SAME order as topk_score_better, which
+ * compares VALUES: -0.0 == +0.0, and under FTZ (--use_fast_math) a denormal
+ * compares equal to zero.  The bit-pattern key does not: it ranks +0.0 above
+ * -0.0 and any denormal above +0.0, so on a zero-score tie the CUB kernel and
+ * the bitonic kernels selected DIFFERENT rows (L172).  Zero-score ties are the
+ * common case here -- every scorer ReLUs each head before the weighted sum,
+ * and the FTZ epilogue keeps the sign of a flushed zero.  Canonicalise the
+ * whole zero class to +0.0 before packing; `v == 0.0f` is true for -0.0 and,
+ * under FTZ, for every denormal.  NaN cannot be ordered by either relation and
+ * is not a score any scorer emits; it keeps the key's deterministic rank. */
 __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) {
+    if (v == 0.0f) v = 0.0f;
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
