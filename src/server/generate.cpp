@@ -202,8 +202,8 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     }
     while (*p && isspace((unsigned char)*p)) p++;
 
-    const char *user = strstr(p, "<｜User｜>");
-    const char *assistant = strstr(p, "<｜Assistant｜>");
+    const char *user = strstr(p, PULSAR_RENDER_USER);
+    const char *assistant = strstr(p, PULSAR_RENDER_ASSISTANT);
     const char *end = NULL;
     if (user && assistant) end = user < assistant ? user : assistant;
     else end = user ? user : assistant;
@@ -214,6 +214,30 @@ static char *rendered_chat_system_region(const char *prompt_text) {
 
 
 
+/* A server-side tool result appended to the live session mid-turn: close an
+ * open think block, then exactly what the replay path renders for ONE tool
+ * message after the assistant's call turn -- EOS, the tool_result, the
+ * generation prefix (render_live_tool_tail) -- or next-turn prefix reuse dies. */
+static char *build_live_tool_result_suffix(const request *r,
+                                           const thinking_state *thinking,
+                                           const char *result_text) {
+    const pulsar_think_mode mode = r ? r->think_mode : PULSAR_THINK_NONE;
+    buf suffix = {0};
+    if (pulsar_think_mode_enabled(mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    chat_msgs msgs = {0};
+    chat_msg result = {0};
+    result.role = xstrdup("tool");
+    result.content = xstrdup(result_text ? result_text : "");
+    chat_msgs_push(&msgs, result);
+    char *tail = render_live_tool_tail(&msgs, 0, r && r->has_tools, mode);
+    buf_puts(&suffix, tail);
+    free(tail);
+    chat_msgs_free(&msgs);
+    return buf_take(&suffix);
+}
+
 /* The template turn appended to the live session after the server executed a
  * web_search call: end the assistant call turn, present the results as an
  * ordinary tool_result, and reopen the assistant.  Byte-shape must match what
@@ -222,15 +246,7 @@ static char *rendered_chat_system_region(const char *prompt_text) {
 char *build_web_search_result_suffix(const request *r,
                                      const thinking_state *thinking,
                                      const char *result_text) {
-    buf suffix = {0};
-    if (r && pulsar_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
-    append_tool_result_text(&suffix, result_text ? result_text : "");
-    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    return buf_take(&suffix);
+    return build_live_tool_result_suffix(r, thinking, result_text);
 }
 
 
@@ -253,18 +269,11 @@ char *build_invalid_dsml_tool_error_suffix(const request *r,
         buf_puts(&tool_error, system);
     }
 
-    buf suffix = {0};
-    if (r && pulsar_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
-    append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
-    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    char *suffix = build_live_tool_result_suffix(r, thinking, tool_error.ptr ? tool_error.ptr : "");
 
     free(system);
     buf_free(&tool_error);
-    return buf_take(&suffix);
+    return suffix;
 }
 
 
@@ -286,16 +295,17 @@ bool should_remember_thinking_checkpoint(const request *r,
 
 
 
+/* The assistant turn after prompt_text's generation prefix ("<｜Assistant｜>"
+ * + "<think>" or "</think>"), as render_chat_prompt_text will render it once
+ * it is history under tool context: reasoning replayed, think closed,
+ * content, DSML, EOS.  One primitive with the renderer (append_assistant_
+ * turn_close), so the checkpoint key byte-matches the replay by construction. */
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
+    const bool think = pulsar_think_mode_enabled(r->think_mode);
     buf suffix = {0};
-    if (pulsar_think_mode_enabled(r->think_mode)) {
-        buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, content ? content : "");
-    append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    append_assistant_turn_close(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
+                                content, calls);
     return buf_take(&suffix);
 }
 
@@ -314,15 +324,10 @@ char *build_responses_visible_assistant_suffix(const request *r,
      * reasoning in the remembered visible prefix when this assistant turn ended
      * in tool calls.  A client that does replay final-answer reasoning will not
      * match this visible shortcut and can still use exact token-prefix replay. */
-    if (pulsar_think_mode_enabled(r->think_mode)) {
-        if (r->reasoning_summary_emit && calls && calls->len > 0) {
-            buf_puts(&suffix, reasoning ? reasoning : "");
-        }
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, content ? content : "");
-    append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    const bool think = pulsar_think_mode_enabled(r->think_mode);
+    const bool replay = think && r->reasoning_summary_emit && calls && calls->len > 0;
+    append_assistant_turn_close(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
+                                content, calls);
     return buf_take(&suffix);
 }
 
@@ -356,9 +361,8 @@ char *build_toolless_thinking_visible_text(const request *r,
 
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    /* the stripped turn: no opener, the think close, the content, EOS */
+    append_assistant_turn_close(&visible, true, NULL, content, NULL);
     return buf_take(&visible);
 }
 

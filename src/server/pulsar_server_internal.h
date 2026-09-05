@@ -1026,6 +1026,12 @@ typedef struct {
  * actually begin with. (Unit tests keep independent string literals on
  * purpose — they pin the wire bytes, not this macro.) */
 #define PULSAR_SERVER_RENDER_BOS "<｜begin▁of▁sentence｜>"
+/* The chat template's role markers and turn terminator (DeepSeek V4).  Written
+ * only by the renderers in prompt_render.cpp; read by the few places that
+ * parse a rendered prompt back (generate.cpp rendered_chat_system_region). */
+#define PULSAR_RENDER_USER "<｜User｜>"
+#define PULSAR_RENDER_ASSISTANT "<｜Assistant｜>"
+#define PULSAR_RENDER_EOS "<｜end▁of▁sentence｜>"
 
 /* Slot-routing trivial-match allowance (task #30, 2026-07-16). The router's
  * choose-vs-provision gate treats a candidate slot's common token prefix as
@@ -2466,6 +2472,48 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas);
 bool chat_history_preserves_reasoning(const chat_msgs *msgs,
                                              const char *tool_schemas);
+/* ---- how a chat turn renders: the ONE authority (prompt_render.cpp, L185) ----
+ *
+ * render_chat_prompt_text (the full replay), render_live_tool_tail (the
+ * suffix appended to live KV for a tool-result continuation), the checkpoint
+ * suffix builders in generate.cpp and the legacy /v1/completions template
+ * all produce a turn's bytes through append_chat_msg / append_assistant_open /
+ * append_assistant_turn_close below.  A checkpoint key that does not
+ * byte-match the next request's render is a silent cold re-prefill of the
+ * whole conversation (server_jobs.cpp remember_*_checkpoint), so there is
+ * exactly one place that decides those bytes. */
+/** Per-render state: the mode, the reasoning-replay facts of the message
+ * list, and where the turn structure stands. */
+typedef struct {
+    bool think;               ///< thinking mode enabled: assistant turns carry a think block
+    bool tool_context;        ///< tools advertised or used in the history: reasoning replays on every turn
+    int last_user_idx;        ///< index of the last user-side message; assistant turns after it replay reasoning
+    bool pending_assistant;   ///< a user-side turn is open; the next assistant turn (or the tail) opens with the role marker
+    bool pending_tool_result; ///< the open user-side turn is a run of tool results (one role marker for the run)
+} chat_render;
+void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
+                      pulsar_think_mode think_mode);
+/** Append message `i` of `msgs`, which must not be a system-REGION message
+ * (the caller owns that decision; a system message given here renders in
+ * place as an environment note). */
+void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r);
+/** The generation prefix: the assistant role marker and the think opener
+ * (thinking mode) or the empty think block's close (not). */
+void append_assistant_open(buf *out, bool think);
+/** An assistant turn after its opener: `reasoning` (when non-NULL -- the
+ * replayed block's body), the think close (when `close_think`), the visible
+ * content, the DSML tool calls, EOS. */
+void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
+                                 const char *content, const tool_calls *calls);
+/** Close a render: an open user-side turn gets the generation prefix. */
+void chat_render_finish(buf *out, const chat_render *r);
+/** The live-KV continuation suffix for msgs[start..): EOS, the new user-side
+ * messages, the generation prefix. */
+char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
+                            pulsar_think_mode think_mode);
+/** The legacy /v1/completions template: a fixed system line and the prompt
+ * as the one user turn, through the same renderer. */
+char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode);

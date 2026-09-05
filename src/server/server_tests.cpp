@@ -6154,6 +6154,255 @@ static void test_l184_dsml_entity_pair_round_trips(void) {
     TEST_ASSERT(pulsar_dsml_attr("<x string=\"true\">", "name") == NULL);
 }
 
+static chat_msg l185_msg(const char *role, const char *content, const char *reasoning) {
+    chat_msg m = {0};
+    m.role = xstrdup(role);
+    m.content = content ? xstrdup(content) : NULL;
+    m.reasoning = reasoning ? xstrdup(reasoning) : NULL;
+    return m;
+}
+
+static void l185_add_call(chat_msg *m, const char *id, const char *name, const char *args) {
+    tool_call tc = {0};
+    tc.id = xstrdup(id);
+    tc.name = xstrdup(name);
+    tc.arguments = xstrdup(args);
+    tool_calls_push(&m->calls, tc);
+}
+
+/* render(msgs[0..n)) with its trailing EOS removed, malloc'd */
+static char *l185_render_prefix_sans_eos(const chat_msgs *msgs, int n, const char *schemas) {
+    chat_msgs view = *msgs;   /* shallow: never freed */
+    view.len = n;
+    char *text = render_chat_prompt_text(&view, schemas, NULL, PULSAR_THINK_HIGH);
+    size_t len = strlen(text), eos = strlen(PULSAR_RENDER_EOS);
+    TEST_ASSERT(len >= eos && !strcmp(text + len - eos, PULSAR_RENDER_EOS));
+    if (len >= eos) text[len - eos] = '\0';
+    return text;
+}
+
+/* L185: how a chat turn renders is ONE function (append_chat_msg and its two
+ * primitives).  A production-shaped transcript -- system, user/assistant
+ * turns with reasoning, a tool call, its result, another turn -- goes through
+ * every entry that produces turn bytes: the full replay (pinned), the live
+ * tool tail on both protocol shapes, both checkpoint suffix builders, the
+ * toolless visible key, the server-tool result suffix and the legacy
+ * /v1/completions template.  Shared parts must be byte-equal. */
+static void test_l185_every_renderer_produces_the_authority_bytes(void) {
+    const char *schemas = "{\"name\":\"bash\"}";
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, l185_msg("system", "You are terse.", NULL));      /* 0 */
+    chat_msgs_push(&msgs, l185_msg("user", "hi", NULL));                     /* 1 */
+    chat_msgs_push(&msgs, l185_msg("assistant", "hello", "greet"));          /* 2 */
+    chat_msgs_push(&msgs, l185_msg("user", "list /tmp", NULL));              /* 3 */
+    chat_msg call = l185_msg("assistant", "", "need ls");                    /* 4 */
+    l185_add_call(&call, "call_1", "bash", "{\"command\":\"ls /tmp\"}");
+    chat_msgs_push(&msgs, call);
+    chat_msg result = l185_msg("tool", "a.txt\nb.txt", NULL);                /* 5 */
+    result.tool_call_id = xstrdup("call_1");
+    chat_msgs_push(&msgs, result);
+    chat_msgs_push(&msgs, l185_msg("assistant", "two files", "read it"));    /* 6 */
+    chat_msgs_push(&msgs, l185_msg("user", "thanks", NULL));                 /* 7 */
+
+    /* 1. the authority, pinned from the first history byte */
+    char *full = render_chat_prompt_text(&msgs, schemas, NULL, PULSAR_THINK_HIGH);
+    const char *hist = strstr(full, PULSAR_RENDER_USER "hi");
+    TEST_ASSERT(hist != NULL);
+    const char *want_hist =
+        "<｜User｜>hi<｜Assistant｜><think>greet</think>hello<｜end▁of▁sentence｜>"
+        "<｜User｜>list /tmp<｜Assistant｜><think>need ls</think>"
+        "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls /tmp</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>"
+        "<｜User｜><tool_result>a.txt\nb.txt</tool_result>"
+        "<｜Assistant｜><think>read it</think>two files<｜end▁of▁sentence｜>"
+        "<｜User｜>thanks<｜Assistant｜><think>";
+    TEST_ASSERT(hist && !strcmp(hist, want_hist));
+
+    /* 2. the live tool tail (Responses shape: tool-role result) == the full
+     *    render of the same messages minus the already-live prefix */
+    {
+        chat_msgs cont = msgs;   /* shallow view through the tool result */
+        cont.len = 6;
+        char *full_cont = render_chat_prompt_text(&cont, schemas, NULL, PULSAR_THINK_HIGH);
+        char *prefix = l185_render_prefix_sans_eos(&msgs, 5, schemas);
+        char *tail = render_live_tool_tail(&cont, 5, true, PULSAR_THINK_HIGH);
+        TEST_ASSERT(!strcmp(tail, "<｜end▁of▁sentence｜><｜User｜><tool_result>a.txt\nb.txt"
+                                  "</tool_result><｜Assistant｜><think>"));
+        buf glued = {0};
+        buf_puts(&glued, prefix);
+        buf_puts(&glued, tail);
+        TEST_ASSERT(!strcmp(glued.ptr, full_cont));
+        /* ...and the production entry hands out the same bytes */
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = PULSAR_THINK_HIGH;
+        r.has_tools = true;
+        responses_prepare_live_continuation(&r, &cont);
+        TEST_ASSERT(r.responses_live_suffix_text && !strcmp(r.responses_live_suffix_text, tail));
+        request_free(&r);
+        buf_free(&glued);
+        free(tail);
+        free(prefix);
+        free(full_cont);
+    }
+
+    /* 3. the live tool tail, Anthropic shape (user-role result carrying the
+     *    wrapper), including a trailing system message rendered in place */
+    {
+        chat_msgs anth = {0};
+        for (int i = 0; i < 5; i++) {
+            chat_msg m = l185_msg(msgs.v[i].role, msgs.v[i].content, msgs.v[i].reasoning);
+            if (msgs.v[i].calls.len) l185_add_call(&m, "call_1", "bash", "{\"command\":\"ls /tmp\"}");
+            chat_msgs_push(&anth, m);
+        }
+        chat_msg ur = l185_msg("user", "<tool_result>a.txt\nb.txt</tool_result>", NULL);
+        chat_msg_add_tool_call_id(&ur, "call_1");
+        chat_msgs_push(&anth, ur);
+        chat_msgs_push(&anth, l185_msg("system", "Be brief.", NULL));
+        char *full_anth = render_chat_prompt_text(&anth, schemas, NULL, PULSAR_THINK_HIGH);
+        char *prefix = l185_render_prefix_sans_eos(&anth, 5, schemas);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_ANTHROPIC;
+        r.think_mode = PULSAR_THINK_HIGH;
+        r.has_tools = true;
+        anthropic_prepare_live_continuation(&r, &anth);
+        TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+        buf glued = {0};
+        buf_puts(&glued, prefix);
+        buf_puts(&glued, r.anthropic_live_suffix_text ? r.anthropic_live_suffix_text : "");
+        TEST_ASSERT(!strcmp(glued.ptr, full_anth));
+        TEST_ASSERT(strstr(glued.ptr, "<｜User｜><system-reminder>\nBe brief.\n</system-reminder><｜Assistant｜><think>") != NULL);
+        request_free(&r);
+        buf_free(&glued);
+        free(prefix);
+        free(full_anth);
+        chat_msgs_free(&anth);
+    }
+
+    /* 4. the tool checkpoint suffix: prompt_text (ends with the generation
+     *    prefix) + suffix == the replay of the finished call turn */
+    {
+        chat_msgs pre = msgs;
+        pre.len = 4;
+        char *prompt_text = render_chat_prompt_text(&pre, schemas, NULL, PULSAR_THINK_HIGH);
+        chat_msgs with_call = msgs;
+        with_call.len = 5;
+        char *replay = render_chat_prompt_text(&with_call, schemas, NULL, PULSAR_THINK_HIGH);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.think_mode = PULSAR_THINK_HIGH;
+        r.has_tools = true;
+        r.reasoning_summary_emit = true;
+        char *suffix = build_tool_checkpoint_suffix(&r, "", "need ls", &msgs.v[4].calls);
+        buf key = {0};
+        buf_puts(&key, prompt_text);
+        buf_puts(&key, suffix);
+        TEST_ASSERT(!strcmp(key.ptr, replay));
+        /* 5. the Responses visible suffix, with calls: the same bytes */
+        char *visible = build_responses_visible_assistant_suffix(&r, "", "need ls", &msgs.v[4].calls);
+        TEST_ASSERT(!strcmp(visible, suffix));
+        free(visible);
+        /* ...without calls it strips the reasoning: the replay of the same
+         *    turn with EMPTY reasoning (tool context keeps the block) */
+        chat_msgs pre2 = msgs;
+        pre2.len = 2;
+        char *prompt2 = render_chat_prompt_text(&pre2, schemas, NULL, PULSAR_THINK_HIGH);
+        chat_msgs stripped = {0};
+        chat_msgs_push(&stripped, l185_msg("system", "You are terse.", NULL));
+        chat_msgs_push(&stripped, l185_msg("user", "hi", NULL));
+        chat_msgs_push(&stripped, l185_msg("assistant", "hello", ""));
+        char *replay2 = render_chat_prompt_text(&stripped, schemas, NULL, PULSAR_THINK_HIGH);
+        visible = build_responses_visible_assistant_suffix(&r, "hello", "greet", NULL);
+        buf key2 = {0};
+        buf_puts(&key2, prompt2);
+        buf_puts(&key2, visible);
+        TEST_ASSERT(!strcmp(key2.ptr, replay2));
+        buf_free(&key2);
+        free(visible);
+        free(replay2);
+        free(prompt2);
+        chat_msgs_free(&stripped);
+        request_free(&r);
+        buf_free(&key);
+        free(suffix);
+        free(replay);
+        free(prompt_text);
+    }
+
+    /* 6. toolless: historical reasoning is stripped, and the toolless visible
+     *    key is a prefix of the next turn's replay */
+    {
+        chat_msgs tl = {0};
+        chat_msgs_push(&tl, l185_msg("user", "hi", NULL));
+        char *prompt_text = render_chat_prompt_text(&tl, NULL, NULL, PULSAR_THINK_HIGH);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.think_mode = PULSAR_THINK_HIGH;
+        r.prompt_text = xstrdup(prompt_text);
+        char *visible = build_toolless_thinking_visible_text(&r, "hello");
+        chat_msgs_push(&tl, l185_msg("assistant", "hello", "greet"));
+        chat_msgs_push(&tl, l185_msg("user", "thanks", NULL));
+        char *future = render_chat_prompt_text(&tl, NULL, NULL, PULSAR_THINK_HIGH);
+        TEST_ASSERT(visible && !strncmp(future, visible, strlen(visible)));
+        TEST_ASSERT(strstr(future, "<｜User｜>hi<｜Assistant｜></think>hello<｜end▁of▁sentence｜>"
+                                   "<｜User｜>thanks<｜Assistant｜><think>") != NULL);
+        /* an assistant turn AFTER the last user message replays its reasoning */
+        tl.len = 2;
+        char *prefill = render_chat_prompt_text(&tl, NULL, NULL, PULSAR_THINK_HIGH);
+        TEST_ASSERT(strstr(prefill, "<｜User｜>hi<｜Assistant｜><think>greet</think>hello<｜end▁of▁sentence｜>") != NULL);
+        tl.len = 3;
+        free(prefill);
+        free(future);
+        free(visible);
+        request_free(&r);
+        free(prompt_text);
+        chat_msgs_free(&tl);
+    }
+
+    /* 7. a server-executed tool's result suffix == the live tail of one tool message */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.think_mode = PULSAR_THINK_HIGH;
+        r.has_tools = true;
+        thinking_state th;
+        memset(&th, 0, sizeof th);
+        th.inside = true;
+        char *ws = build_web_search_result_suffix(&r, &th, "results </tool_result> x");
+        chat_msgs one = {0};
+        chat_msgs_push(&one, l185_msg("tool", "results </tool_result> x", NULL));
+        char *tail = render_live_tool_tail(&one, 0, true, PULSAR_THINK_HIGH);
+        TEST_ASSERT(!strncmp(ws, "</think>", 8) && !strcmp(ws + 8, tail));
+        TEST_ASSERT(!strcmp(tail, "<｜end▁of▁sentence｜><｜User｜><tool_result>results &lt;/tool_result> x"
+                                  "</tool_result><｜Assistant｜><think>"));
+        free(tail);
+        free(ws);
+        chat_msgs_free(&one);
+        request_free(&r);
+    }
+
+    /* 8. the legacy /v1/completions template, pinned and through the renderer */
+    {
+        char *legacy = render_completion_prompt_text("hi", PULSAR_THINK_HIGH);
+        buf want = {0};
+        buf_puts(&want, PULSAR_SERVER_RENDER_BOS);
+        buf_puts(&want, pulsar_think_effort_prefix(PULSAR_THINK_HIGH));
+        buf_puts(&want, "You are a helpful assistant<｜User｜>hi<｜Assistant｜><think>");
+        TEST_ASSERT(!strcmp(legacy, want.ptr));
+        buf_free(&want);
+        free(legacy);
+        legacy = render_completion_prompt_text("hi", PULSAR_THINK_NONE);
+        TEST_ASSERT(!strcmp(legacy, PULSAR_SERVER_RENDER_BOS "You are a helpful assistant<｜User｜>hi<｜Assistant｜></think>"));
+        free(legacy);
+    }
+
+    free(full);
+    chat_msgs_free(&msgs);
+}
+
 /* L190 C1: the MemAvailable-floor refusal is a per-request condition; its
  * warning prints once per period and carries the count the period swallowed,
  * instead of once per process. */
@@ -6654,6 +6903,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l184_every_consumer_loops_the_syntax_table();
     test_l184_shared_tool_stream_drives_protocol_emitters();
     test_l184_dsml_entity_pair_round_trips();
+    test_l185_every_renderer_produces_the_authority_bytes();
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_warm_match_usable_rule();
     test_l179_guard_victim_skips_pinned_live_spilled();

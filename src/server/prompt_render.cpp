@@ -325,13 +325,98 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
 
 
 
+void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
+                      pulsar_think_mode think_mode) {
+    memset(r, 0, sizeof *r);
+    r->think = pulsar_think_mode_enabled(think_mode);
+    r->tool_context = tools_advertised || chat_history_uses_tool_context(msgs, NULL);
+    r->last_user_idx = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (role_is_user_like(msgs->v[i].role)) r->last_user_idx = i;
+    }
+}
+
+
+
+void append_assistant_open(buf *out, bool think) {
+    buf_puts(out, PULSAR_RENDER_ASSISTANT);
+    buf_puts(out, think ? "<think>" : "</think>");
+}
+
+
+
+void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
+                                 const char *content, const tool_calls *calls) {
+    if (reasoning) buf_puts(out, reasoning);
+    if (close_think) buf_puts(out, "</think>");
+    buf_puts(out, content ? content : "");
+    append_dsml_tool_calls_text(out, calls);
+    buf_puts(out, PULSAR_RENDER_EOS);
+}
+
+
+
+void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
+    const chat_msg *m = &msgs->v[i];
+    if (role_is_system(m->role)) {
+        /* Mid-conversation system message: render in place as an
+         * environment note (the wrapper agent clients already use for
+         * injected context), so the rendered prefix stays append-only
+         * across turns (L113). */
+        buf_puts(out, PULSAR_RENDER_USER "<system-reminder>\n");
+        buf_puts(out, m->content ? m->content : "");
+        buf_puts(out, "\n</system-reminder>");
+        r->pending_assistant = true;
+        r->pending_tool_result = false;
+    } else if (!strcmp(m->role, "user")) {
+        buf_puts(out, PULSAR_RENDER_USER);
+        buf_puts(out, m->content ? m->content : "");
+        r->pending_assistant = true;
+        r->pending_tool_result = false;
+    } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+        if (!r->pending_tool_result) buf_puts(out, PULSAR_RENDER_USER);
+        buf_puts(out, "<tool_result>");
+        append_tool_result_text(out, m->content);
+        buf_puts(out, "</tool_result>");
+        r->pending_assistant = true;
+        r->pending_tool_result = true;
+    } else if (!strcmp(m->role, "assistant")) {
+        if (r->pending_assistant) {
+            /* Reasoning replays on every turn under tool context (agentic
+             * clients echo reasoning_content so the model keeps its chain of
+             * thought across tool rounds) and otherwise only on turns after
+             * the last user-side message; a stripped turn renders an empty
+             * think block closed, "</think>", with no opener.  The checkpoint
+             * keys (generate.cpp build_*_suffix) are built from the same two
+             * primitives, so they byte-match this by construction. */
+            const bool replay = r->think && (r->tool_context || i > r->last_user_idx);
+            if (replay) append_assistant_open(out, true);
+            else buf_puts(out, PULSAR_RENDER_ASSISTANT);
+            append_assistant_turn_close(out, true, replay ? (m->reasoning ? m->reasoning : "") : NULL,
+                                        m->content, &m->calls);
+        } else {
+            /* A second assistant message in a row continues the open turn. */
+            append_assistant_turn_close(out, false, NULL, m->content, &m->calls);
+        }
+        r->pending_assistant = false;
+        r->pending_tool_result = false;
+    }
+}
+
+
+
+void chat_render_finish(buf *out, const chat_render *r) {
+    if (r->pending_assistant) append_assistant_open(out, r->think);
+}
+
+
+
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode) {
     (void)tool_orders;
-    const bool think = pulsar_think_mode_enabled(think_mode);
-    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
-    int last_user_idx = -1;
+    chat_render r;
+    chat_render_init(&r, msgs, tool_schemas && tool_schemas[0], think_mode);
     buf system = {0};
     /* Render tool schemas before the client system content so the cold
      * boundary-trim (KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS) chops a dynamic
@@ -360,73 +445,38 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         if (system.len) buf_puts(&system, "\n\n");
         buf_puts(&system, m->content ? m->content : "");
     }
-    for (int i = 0; i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
-    }
 
     buf out = {0};
     buf_puts(&out, PULSAR_SERVER_RENDER_BOS);
     buf_puts(&out, pulsar_think_effort_prefix(think_mode));
     buf_puts(&out, system.ptr ? system.ptr : "");
 
-    bool pending_assistant = false;
-    bool pending_tool_result = false;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            if (m->system_field || i < leading_end) continue;  /* in the region */
-            /* Mid-conversation system message: render in place as an
-             * environment note (the wrapper agent clients already use for
-             * injected context), so the rendered prefix stays append-only
-             * across turns. */
-            buf_puts(&out, "<｜User｜><system-reminder>\n");
-            buf_puts(&out, m->content ? m->content : "");
-            buf_puts(&out, "\n</system-reminder>");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
-            pending_assistant = true;
-            pending_tool_result = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    if (tool_context || i > last_user_idx) {
-                        buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
-                        buf_puts(&out, "</think>");
-                    } else {
-                        buf_puts(&out, "</think>");
-                    }
-                } else {
-                    buf_puts(&out, "</think>");
-                }
-            }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
-            pending_assistant = false;
-            pending_tool_result = false;
-        }
+        if (role_is_system(m->role) && (m->system_field || i < leading_end)) continue;  /* in the region */
+        append_chat_msg(&out, msgs, i, &r);
     }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
-    }
+    chat_render_finish(&out, &r);
 
     buf_free(&system);
     return buf_take(&out);
+}
+
+
+
+char *render_completion_prompt_text(const char *prompt, pulsar_think_mode think_mode) {
+    chat_msgs msgs = {0};
+    chat_msg system = {0};
+    system.role = xstrdup("system");
+    system.content = xstrdup("You are a helpful assistant");
+    chat_msgs_push(&msgs, system);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup(prompt ? prompt : "");
+    chat_msgs_push(&msgs, user);
+    char *text = render_chat_prompt_text(&msgs, NULL, NULL, think_mode);
+    chat_msgs_free(&msgs);
+    return text;
 }
 
 
@@ -446,64 +496,24 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
  * This is intentionally independent from req.prompt's already-tokenized suffix:
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
- * replay/live-KV boundary. */
-static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   pulsar_think_mode think_mode) {
-    const bool think = pulsar_think_mode_enabled(think_mode);
+ * replay/live-KV boundary.  The bytes are the full render's bytes for the same
+ * messages (append_chat_msg), so the live KV and the next replay agree. */
+char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
+                            pulsar_think_mode think_mode) {
+    chat_render r;
+    chat_render_init(&r, msgs, tools_advertised, think_mode);
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
-
-    bool pending_assistant = false;
-    bool pending_tool_result = false;
+    buf_puts(&out, PULSAR_RENDER_EOS);
     for (int i = start; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            /* L113: a system message arriving mid tool-loop renders in place,
-             * exactly as the full-replay render will place it next turn --
-             * dropping it here (the old behavior) both hid it from the model
-             * and made the live KV mismatch the following replay. The
-             * system FIELD never belongs in a continuation tail. */
-            if (m->system_field) continue;
-            buf_puts(&out, "<｜User｜><system-reminder>\n");
-            buf_puts(&out, m->content ? m->content : "");
-            buf_puts(&out, "\n</system-reminder>");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
-            pending_assistant = true;
-            pending_tool_result = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
-                    buf_puts(&out, "</think>");
-                } else {
-                    buf_puts(&out, "</think>");
-                }
-            }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
-            pending_assistant = false;
-            pending_tool_result = false;
-        }
+        /* L113: a system message arriving mid tool-loop renders in place,
+         * exactly as the full-replay render will place it next turn --
+         * dropping it here (the old behavior) both hid it from the model
+         * and made the live KV mismatch the following replay. The
+         * system FIELD never belongs in a continuation tail. */
+        if (role_is_system(msgs->v[i].role) && msgs->v[i].system_field) continue;
+        append_chat_msg(&out, msgs, i, &r);
     }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
-    }
+    chat_render_finish(&out, &r);
     return buf_take(&out);
 }
 
@@ -636,7 +646,7 @@ void responses_prepare_live_continuation(request *r,
 
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+        render_live_tool_tail(msgs, tail_start, r->has_tools, r->think_mode);
 }
 
 
@@ -721,6 +731,6 @@ void anthropic_prepare_live_continuation(request *r,
 
     free(r->anthropic_live_suffix_text);
     r->anthropic_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+        render_live_tool_tail(msgs, tail_start, r->has_tools, r->think_mode);
 }
 

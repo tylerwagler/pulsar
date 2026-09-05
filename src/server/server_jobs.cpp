@@ -396,7 +396,9 @@ void server::remember_thinking_checkpoint(session_slot *sl,
  * same visible transcript on disk (kv_cache_store_current).
  *
  * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
- * for a tool-context turn (prompt_render.cpp: `tool_context || i > last_user_idx`),
+ * for a tool-context turn (prompt_render.cpp append_chat_msg: `tool_context ||
+ * i > last_user_idx`; the suffix below is built from the renderer's own
+ * append_assistant_turn_close, L185),
  * because agentic clients (opencode et al.) replay reasoning_content verbatim so
  * the model keeps its chain of thought across tool rounds.  So the key MUST carry
  * the reasoning too — an earlier version dropped it (<think></think>), which byte-

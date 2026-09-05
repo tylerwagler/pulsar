@@ -1574,15 +1574,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    buf rendered;
-    rendered = {};
-    buf_puts(&rendered, PULSAR_SERVER_RENDER_BOS);
-    buf_puts(&rendered, pulsar_think_effort_prefix(r->think_mode));
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
-    buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    r->prompt_text = buf_take(&rendered);
+    r->prompt_text = render_completion_prompt_text(prompt, r->think_mode);
     pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
