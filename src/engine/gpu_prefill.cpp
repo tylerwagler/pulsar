@@ -1951,11 +1951,18 @@ bool gpu_graph_encode_layer_attention_batch(
              * the per-layer traffic carrier -- the raw site runs twice a
              * prefill, this one for every layer (L039 item 2; D1 measured the
              * quantize pass it replaces at 117 ms / 43 launches). */
+            /* A missing slot used to zero the pointers and let the "a" GEMM
+             * quantize the heads in a separate pass -- a second arithmetic
+             * for the same conversation, chosen by whether a scratch
+             * reservation succeeded, with no message (L174; the L158 shape). */
             if (!pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
                                             &gact_data, &gact_scale, &gact_kbp, &gact_slab)) {
-                gact_data = NULL; gact_scale = NULL; gact_kbp = 0; gact_slab = 0;
+                fprintf(stderr, "pulsar: layer %u: grouped E4M3 activation slot for %u x %u x %u heads "
+                                "unavailable -- refusing (no quantize-pass fallback)\n",
+                        il, n_tokens, n_groups, group_dim);
+                ok = false;
             }
-            ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
+            if (ok) ok = pulsar_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        model->map,
                                                                        model->size,
                                                                        layer->attn_sinks->abs_offset,
@@ -2048,6 +2055,18 @@ bool gpu_graph_encode_layer_attention_batch(
                 const uint32_t cur_index = index_counts ? index_counts[t] : 0u;
                 uint32_t n_selected = 0;
                 bool have_topk = false;
+                /* The indexer ranks ITS compressed rows and the attention
+                 * folds the selected ids over ITS compressed rows: the two
+                 * frontiers must agree or an id is out of range on one side.
+                 * The arm used to gate on cur_comp and pass cur_index, and a
+                 * disagreement surfaced only as a silent top_k > n_comp
+                 * refusal inside the ranking entry (L174). */
+                if (ratio == 4 && cur_comp != cur_index) {
+                    fprintf(stderr, "pulsar: layer %u pos %u: attention comp frontier %u != indexer comp frontier %u "
+                                    "-- refusing\n", il, pos, cur_comp, cur_index);
+                    ok = false;
+                    break;
+                }
 
                 if (ratio == 4 && cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));

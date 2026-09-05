@@ -1144,10 +1144,13 @@ int gpu_graph_decode_multiseq_batch(
         /* L149 phase 2: every round in this step is in the sparse min-p
          * contract -- read the prefilter's compact block (16 KB/row) instead of
          * the 517 KB rows; the caller's `logits` block is left untouched and
-         * the accept walk builds from candidates (device row read as fallback). */
-        ok = gpu_graph_spec_compact_read(g, 0u, head_runs) ||
-             pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
-                                    (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+         * the accept walk builds from candidates.  A failed compact read used to
+         * fall to the full readback silently -- a device error read as a slower
+         * path (L174). */
+        ok = gpu_graph_spec_compact_read(g, 0u, head_runs);
+        if (!ok)
+            fprintf(stderr, "pulsar: spec compact readback failed for %u rows -- refusing "
+                            "(no full-row readback fallback; L174)\n", head_runs);
     } else {
         g->spec_compact_rows = 0;
         ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,

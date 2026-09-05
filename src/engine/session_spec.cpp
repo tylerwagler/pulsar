@@ -1536,8 +1536,14 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                                            r.K ? r.row_tops : NULL, NULL);
     g->dspark_capture_batch_n = 0;
     g->spec_comp_save_n = 0;
-    if (ok && g->spec_compact_armed) (void)gpu_graph_spec_compact_read(g, 0u, r.n_batch);
-    else g->spec_compact_rows = 0;
+    if (ok && g->spec_compact_armed) {
+        if (!gpu_graph_spec_compact_read(g, 0u, r.n_batch)) {
+            fprintf(stderr, "pulsar: spec compact readback failed for %u rows -- refusing (L174)\n", r.n_batch);
+            ok = false;
+        }
+    } else {
+        g->spec_compact_rows = 0;
+    }
     g->spec_compact_armed = false;
     if (!ok) {
         s->checkpoint.len = r.saved_len;

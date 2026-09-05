@@ -1628,6 +1628,9 @@ int pulsar_gpu_compressor_update_tensor(
         kv_cur->bytes < kv_bytes || sc_cur->bytes < kv_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
         (emit && comp_cache->bytes < comp_bytes)) {
+        fprintf(stderr, "pulsar: compressor update rejected: comp_row=%u emit=%u head_dim=%u (comp cache %llu B, "
+                        "needs %llu) -- refusing\n", comp_row, (unsigned)emit, head_dim,
+                (unsigned long long)(comp_cache ? comp_cache->bytes : 0ull), (unsigned long long)comp_bytes);
         return 0;
     }
     if (!pulsar_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,

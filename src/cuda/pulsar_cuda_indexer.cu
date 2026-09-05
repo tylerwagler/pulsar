@@ -851,9 +851,17 @@ static int indexer_scores_launch(
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < comp_bytes ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        fprintf(stderr, "pulsar: indexer scores rejected: n_tokens=%u n_comp=%u head_dim=%u comp rows needed=%llu "
+                        "(index_comp %llu B, scores %llu B) -- refusing\n",
+                n_tokens, n_comp, head_dim, (unsigned long long)comp_rows_min,
+                (unsigned long long)(index_comp ? index_comp->bytes : 0ull),
+                (unsigned long long)(scores ? scores->bytes : 0ull));
         return 0;
     }
-    if (causal && ratio == 0) return 0;
+    if (causal && ratio == 0) {
+        fprintf(stderr, "pulsar: indexer scores rejected: causal scan with compression ratio 0 -- refusing\n");
+        return 0;
+    }
     const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
     const void * const *index_bank_ptrs_ptr =
@@ -1005,6 +1013,9 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
         weights->bytes < (uint64_t)run_n * n_head * sizeof(float) ||
         scores->bytes < (uint64_t)run_n * n_comp * sizeof(float) ||
         bank_index_comp->bytes < (uint64_t)vis_max * PULSAR_MXKV_FP4_ROWBYTES(128u)) {
+        fprintf(stderr, "pulsar: indexer decode-run scores rejected: run_n=%u run_pos0=%u n_comp=%u visible rows=%u "
+                        "(bank index comp %llu B) -- refusing\n", run_n, run_pos0, n_comp, vis_max,
+                (unsigned long long)(bank_index_comp ? bank_index_comp->bytes : 0ull));
         return 0;
     }
     return pulsar_gpu_indexer_scores_mxfp4(
@@ -1026,6 +1037,10 @@ int pulsar_gpu_indexer_topk_tensor(
         top_k > n_comp ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
+        fprintf(stderr, "pulsar: indexer top-k rejected: n_tokens=%u n_comp=%u top_k=%u (scores %llu B, selected %llu B) "
+                        "-- refusing\n", n_tokens, n_comp, top_k,
+                (unsigned long long)(scores ? scores->bytes : 0ull),
+                (unsigned long long)(selected ? selected->bytes : 0ull));
         return 0;
     }
     if (top_k == 512u && n_comp <= 1024u) {

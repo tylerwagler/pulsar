@@ -427,7 +427,10 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
-    if (top_k > 512u) return 0;
+    if (top_k > 512u) {
+        fprintf(stderr, "pulsar: indexed attention: top_k %u > 512 has no kernel -- refusing\n", top_k);
+        return 0;
+    }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -457,7 +460,11 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
-        if (!sorted) return 0;
+        if (!sorted) {
+            fprintf(stderr, "pulsar: indexed attention: %llu-byte scratch for the top-k id sort unavailable "
+                            "(n_tokens=%u) -- refusing\n", (unsigned long long)sort_bytes, n_tokens);
+            return 0;
+        }
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
