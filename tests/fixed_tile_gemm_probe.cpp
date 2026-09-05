@@ -293,6 +293,38 @@ int main(int argc, char **argv) {
                        tl, te > 0 ? tl / te : 0.0, bad_lt == 0 ? "YES" : "NO", dl);
             }
         }
+        /* L183 census: the engine's RESUME situation -- the same plane, the GEMM
+         * called on a row-offset WINDOW of it (rows [s, MMAX)), compared to the
+         * same rows of the full call.  The engine's mixed-batch suffix and a
+         * resumed chunk both hit this path (act_slot_find_window hands back
+         * row0 = s).  A plain GEMM's row is a function of its own inputs, so
+         * every window must match; a kernel whose per-column arithmetic depends
+         * on the column's slot in the call will not. */
+        if (prefill && is_bf16 && rc == 0) {
+            std::vector<float> full, win;
+            if (!engine_launch(&c, MMAX) || !pulsar_gpu_end_commands() || ft_sync() != 0 ||
+                !read_out(c.out, full, (uint64_t)MMAX * N)) { rc = 1; break; }
+            const uint32_t shifts[] = {1, 2, 4, 6, 8, 16, 128, 2048};
+            printf("  window test (rows [s,%u) of the same plane vs the full call):", MMAX);
+            for (size_t si2 = 0; si2 < sizeof(shifts) / sizeof(shifts[0]); si2++) {
+                const uint32_t sft = shifts[si2];
+                const uint64_t inb = c.in_dim * sizeof(float), outb = c.out_dim * sizeof(float);
+                pulsar_gpu_tensor *xw = pulsar_gpu_tensor_view(c.x, (uint64_t)sft * inb, (uint64_t)(MMAX - sft) * inb);
+                pulsar_gpu_tensor *ow = pulsar_gpu_tensor_view(c.out, (uint64_t)sft * outb, (uint64_t)(MMAX - sft) * outb);
+                if (!xw || !ow) { pulsar_gpu_tensor_free(xw); pulsar_gpu_tensor_free(ow); rc = 1; break; }
+                ctx_t cw = c; cw.x = xw; cw.out = ow;
+                const bool okw = engine_launch(&cw, MMAX - sft) && pulsar_gpu_end_commands() && ft_sync() == 0 &&
+                                 read_out(c.out, win, (uint64_t)MMAX * N);
+                pulsar_gpu_tensor_free(xw); pulsar_gpu_tensor_free(ow);
+                if (!okw) { rc = 1; break; }
+                uint64_t bad = 0;
+                for (uint64_t i = (uint64_t)sft * N; i < (uint64_t)MMAX * N; i++)
+                    if (memcmp(&win[i], &full[i], sizeof(float)) != 0) bad++;
+                printf("  s=%u:%s", sft, bad == 0 ? "same" : "DIFF");
+                if (bad) printf("(%llu)", (unsigned long long)bad);
+            }
+            printf("\n");
+        }
         printf("\n");
         if (c.ft) ft_release(c.ft);
         if (c.fb) fb_release(c.fb);
