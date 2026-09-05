@@ -48,8 +48,15 @@ static int g_fail;
 
 static const int g_prompt_off[GATE_MAX_N] = {0, 401, 907, 233, 601, 811, 101, 499,
                                              1301, 1499, 1201, 1601, 1109, 1705, 1401, 1000};
-static const int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158,
-                                             177, 233, 140, 201, 169, 150, 120, 205};
+static int g_prompt_len[GATE_MAX_N] = {130, 258, 511, 187, 342, 419, 275, 158,
+                                       177, 233, 140, 201, 169, 150, 120, 205};
+/* L175: with "deep" as the second argument bank 0 (the row every width is
+ * compared on) is prefilled to DEEP_LEN tokens, past 2048, so its decode step
+ * runs the indexed lane (top-k selection engaged, n_comp > 512) while the
+ * width sweep exercises the row-count-keyed dispatches around it.  Every
+ * other gate that sweeps width does so under 512 tokens, where that lane is
+ * off.  The other banks stay short: only bank 0's row is asserted. */
+#define DEEP_LEN 2200
 
 /* Run ONE batched decode step at width M on a fresh session; copy bank 0's logit
  * row (PULSAR_N_VOCAB floats) into row0_out. Returns false on any engine failure. */
@@ -86,11 +93,14 @@ int GATE_ENTRY(int argc, char **argv) {
     g_e = NULL;
     memset(&g_toks, 0, sizeof g_toks);
     g_fail = 0;
-    if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [deep]\n", argv[0]); return 2; }
+    const bool deep = argc > 2 && strcmp(argv[2], "deep") == 0;
+    if (deep) g_prompt_len[0] = DEEP_LEN;
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
     if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats)\n");
+    printf("CONFIG: packed attn comp cache + MXFP4 indexer cache (the only formats); bank 0 at %d tokens%s\n",
+           g_prompt_len[0], deep ? " (deep: indexed lane engaged)" : "");
 
     int need = 0;
     for (int k = 0; k < GATE_MAX_N; k++)

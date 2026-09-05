@@ -246,6 +246,9 @@ int main(int argc, char **argv) {
         {"cuda-evict-restore-gate",   gate_bank_evict_restore_gate_main, 2, NULL, NULL, {NULL}},
         {"cuda-fork-gate",            gate_bank_fork_gate_main,         3, NULL, NULL, {NULL}},
         {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}},
+        /* L175: the same 1..16 width sweep with bank 0 at ~2200 tokens, so the
+         * indexed lane is engaged while the row-count-keyed dispatches vary. */
+        {"cuda-algo-stability-gate-deep", gate_algo_stability_gate_main, 16, NULL, NULL, {"deep", NULL}},
         {"cuda-mixed-prefill-gate",   gate_mixed_prefill_gate_main,     2, NULL, NULL, {NULL}},
         {"cuda-mixed-neutrality-gate", gate_mixed_neutrality_gate_main, 3, "PULSAR_GATE_ROWS_FATAL", "5,5 8,8", {NULL}},
         {"cuda-mixed-neutrality-gate-wide", gate_mixed_neutrality_gate_main, 13, "PULSAR_GATE_NDEC", "12", {NULL}},
