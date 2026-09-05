@@ -222,6 +222,8 @@ help:
 	@echo "  make gates               Run EVERY release-blocking gate and print a"
 	@echo "                           pass/fail summary (needs the GB10 + model:"
 	@echo "                           make gates FRONTIER_MODEL=/srv/models/x.gguf)"
+	@echo "                           = $(GATE_TARGETS)"
+	@echo "                           (cuda-runner-gate runs the model gates in one process)"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:

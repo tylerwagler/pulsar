@@ -1866,6 +1866,24 @@ bool gpu_graph_encode_layer_attention_batch(
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
                 };
+                /* The span hands n_comp -- the ATTENTION frontier -- to the indexer as
+                 * its row count and score stride too.  The indexer keeps its own
+                 * frontier (ms_n_index_comp); the two are equal by construction on a
+                 * ratio-4 layer and step_end asserts it after the step.  Assert it
+                 * BEFORE the launch as well, per bank in the batch, so a divergence
+                 * refuses instead of scoring rows past the indexer's frontier (L178). */
+                if (ok && mseq) {
+                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                        if (t > 0 && g->ms_seq_id[t] == g->ms_seq_id[t - 1]) continue;
+                        const uint32_t b = (uint32_t)g->ms_seq_id[t];
+                        if (g->ms_n_index_comp[b][il] != g->ms_n_comp[b][il]) {
+                            fprintf(stderr, "pulsar: layer %u bank %u: indexer comp frontier %u != attention comp "
+                                            "frontier %u before the indexed span -- refusing\n",
+                                    il, b, g->ms_n_index_comp[b][il], g->ms_n_comp[b][il]);
+                            ok = false;
+                        }
+                    }
+                }
                 for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += span) {
                     const uint32_t sn = n_tokens - s0 < span ? n_tokens - s0 : span;
                     const uint32_t spos0 = pos0 + s0;
