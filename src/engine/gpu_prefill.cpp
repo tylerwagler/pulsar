@@ -144,9 +144,13 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
     const uint32_t n_full = n_tokens >= 4u ? 4u : 0u;
     const uint32_t n_tail = n_full + rem;
 
-    /* Re-project the tail rows as decode rows.  The chunk's own projections
-     * of these rows sit in batch_comp_kv/_sc already, from the prefill
-     * (tensor-core) arm, whose accumulation order differs. */
+    /* Re-project the tail rows as decode rows into comp_tail_kv/_sc.  The
+     * chunk's own projections sit in batch_comp_kv/_sc, from the prefill
+     * (tensor-core) arm, whose accumulation order differs -- and they must
+     * stay there: gpu_graph_proj_ring_deposit_tail reads that buffer's last
+     * eight rows AFTER this rebuild.  Writing the re-projection into
+     * batch_comp_kv rows 0..n_tail-1 handed the ring tail tokens under head
+     * positions for every 5..11-token chunk (L171). */
     pulsar_decode_rows_scope rows(n_tail);
     if (!rows.ok()) return false;
     pulsar_gpu_tensor *tail_hc = pulsar_gpu_tensor_view(
@@ -155,7 +159,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
             (uint64_t)n_tail * PULSAR_N_EMBD * sizeof(float));
     bool ok = tail_hc != NULL;
     if (ok) {
-        ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv,
+        ok = gpu_graph_matmul_plain_tensor(g->comp_tail_kv,
                                               model,
                                               kv_weight,
                                          PULSAR_N_EMBD,
@@ -164,7 +168,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                          n_tail) != 0;
     }
     if (ok) {
-        ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc,
+        ok = gpu_graph_matmul_plain_tensor(g->comp_tail_sc,
                                              model,
                                              score_weight,
                                          PULSAR_N_EMBD,
@@ -175,8 +179,8 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
     if (ok) {
         ok = pulsar_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
                                                               state_score,
-                                                              g->batch_comp_kv,
-                                                              g->batch_comp_sc,
+                                                              g->comp_tail_kv,
+                                                              g->comp_tail_sc,
                                                               model->map,
                                                               model->size,
                                                               ape->abs_offset,

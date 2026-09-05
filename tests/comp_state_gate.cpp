@@ -34,6 +34,16 @@
  * Mutation-validated against the pre-L168 rebuild: PLACEMENT fails (rows 4..
  * empty) and COMPLETE GROUP fails (0.47-1.2: r of the four rows are other tokens).
  *
+ * RING ALIASING (L171, bit-level): after prefill(9) the rewind projection ring
+ * holds positions 1..8 of the chunk's PREFILL-arm projections.  The rebuild
+ * used to re-project the tail (tokens 4..8) into the same scratch buffer's
+ * rows 0..4 before the ring deposit read rows 1..8, so ring positions 1..4
+ * were byte-identical to the rebuild's state rows for tokens 5..8.  The gate
+ * asserts, per layer and compressor, that positions 1..8 are deposited and
+ * that no ring KV row 1..4 equals the state KV row it aliased (rows 1, 2, 3 of
+ * the complete group and partial row 4; the score half differs by the bias).
+ * Mutation-validated: the pre-L171 helper fails it on every ratio-4 layer.
+ *
  *   ./tests/comp_state_gate MODEL
  */
 #include "pulsar.h"
@@ -168,6 +178,65 @@ static int check_one(pulsar_gpu_graph *gA, state_rows *A, state_rows *B, uint32_
     return 1;
 }
 
+/* L171: ring row at absolute position `pos` (slot pos % PULSAR_REWIND_RING_DEPTH). */
+static int read_ring_row(pulsar_gpu_graph *g, uint32_t il, int indexer, uint32_t pos, uint32_t width,
+                         float *kv, float *sc) {
+    pulsar_gpu_tensor *rk = indexer ? g->layer_index_proj_kv[il] : g->layer_attn_proj_kv[il];
+    pulsar_gpu_tensor *rs = indexer ? g->layer_index_proj_sc[il] : g->layer_attn_proj_sc[il];
+    if (!rk || !rs) return 0;
+    const uint64_t off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * width;
+    return pulsar_gpu_tensor_read_f32(rk, off, kv, width) && pulsar_gpu_tensor_read_f32(rs, off, sc, width);
+}
+
+/* After prefill(L_RING = 9): ring positions 1..4 must not be the rebuild's
+ * rows.  Tail = tokens 4..8 (n_full 4 + rem 1): scratch row r held token 4+r,
+ * so ring position p (scratch row p) aliased state row p for p = 1..3 and
+ * state row 4 (partial, token 8) for p = 4. */
+#define L_RING 9
+static int check_ring_alias(pulsar_session *s, int indexer, int *n_checked) {
+    pulsar_gpu_graph *g = &s->graph;
+    const char *what = indexer ? "indexer" : "attn";
+    int fails = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (pulsar_layer_compress_ratio(il) != 4u) continue;
+        state_rows st;
+        if (!read_state(g, il, indexer, &st)) continue;
+        const uint32_t w = st.width;
+        float *rkv = (float *)malloc(w * sizeof(float));
+        float *rsc = (float *)malloc(w * sizeof(float));
+        int layer_ok = rkv && rsc;
+        /* Positions 1..8 must be deposited at all (kv non-zero): a missing
+         * deposit would make the aliasing check below pass vacuously. */
+        for (uint32_t p = 1; layer_ok && p <= 8; p++) {
+            if (!read_ring_row(g, il, indexer, p, w, rkv, rsc)) { layer_ok = 0; break; }
+            int nz = 0;
+            for (uint32_t j = 0; j < w; j++) nz += rkv[j] != 0.0f;
+            if (nz == 0) {
+                printf("  FAIL layer %2u %-7s ring position %u is empty: the chunk tail was not deposited\n", il, what, p);
+                fails++;
+            }
+        }
+        /* The KV half is copied verbatim into both the state and the ring
+         * (the score half gets the positional bias added in the state), so
+         * aliasing shows as byte-identical KV rows. */
+        for (uint32_t p = 1; layer_ok && p <= 4; p++) {
+            if (!read_ring_row(g, il, indexer, p, w, rkv, rsc)) { layer_ok = 0; break; }
+            const uint32_t srow = p < 4u ? p : 4u;
+            int same = 1;
+            for (uint32_t j = 0; j < w && same; j++)
+                if (rkv[j] != st.kv[(uint64_t)srow * w + j]) same = 0;
+            if (same) {
+                printf("  FAIL layer %2u %-7s ring position %u KV is byte-identical to state row %u: the deposit read "
+                       "the rebuild's re-projection (L171)\n", il, what, p, srow);
+                fails++;
+            }
+        }
+        if (layer_ok) (*n_checked)++;
+        free(rkv); free(rsc); free_state(&st);
+    }
+    return fails;
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     g_fail = 0;
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -229,6 +298,15 @@ int GATE_ENTRY(int argc, char **argv) {
             total_checked += checked;
         }
         if (total_checked == 0) { fprintf(stderr, "comp_state_gate: no ratio-4 compressor state found\n"); goto done; }
+        /* L171: ring aliasing after a 9-token whole prompt */
+        {
+            if (sync_prefix(s, &prompt, L_RING, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L_RING, err); goto done; }
+            int n_ring = 0;
+            const int f = check_ring_alias(s, 0, &n_ring) + check_ring_alias(s, 1, &n_ring);
+            if (f) g_fail = 1;
+            if (n_ring == 0) { fprintf(stderr, "comp_state_gate: no projection ring found\n"); goto done; }
+            printf("ring aliasing (L=%d): %d compressor rings checked, %d aliased rows%s\n", L_RING, n_ring, f, f ? "" : "  OK");
+        }
         rc = g_fail ? 1 : 0;
     }
 done:

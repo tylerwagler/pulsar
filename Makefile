@@ -906,7 +906,8 @@ cuda-row-neutrality-gate: tests/mseq_short_ctx_probe
 cuda-row-neutrality-gate-deep: tests/mseq_short_ctx_probe
 	./tests/mseq_short_ctx_probe $(FRONTIER_MODEL) 1100
 # L168: the ratio-4 compressor state after an unaligned whole-prompt prefill
-# (n_tokens % 4 = 1, 2, 3) has the decode store's layout and content.
+# (n_tokens % 4 = 1, 2, 3) has the decode store's layout and content; L171: the
+# rewind projection ring did not read the rebuild's scratch.
 # MODEL-DEPENDENT, ~1 min.
 cuda-comp-state-gate: tests/comp_state_gate
 	./tests/comp_state_gate $(FRONTIER_MODEL)

@@ -1066,6 +1066,14 @@ typedef struct {
     pulsar_gpu_tensor *batch_kv_pack;
     pulsar_gpu_tensor *batch_comp_kv;               ///< batched twin: compressed KV rows produced this chunk
     pulsar_gpu_tensor *batch_comp_sc;               ///< batched twin: compressed score rows produced this chunk
+    /** Scratch for the ratio-4 compressor state rebuild's tail re-projection
+     * (<= 8 rows x comp width, both halves).  Its own buffer because the
+     * rebuild used to write into batch_comp_kv/_sc rows 0..n_tail-1 while the
+     * rewind projection-ring deposit still had to read that chunk's rows
+     * n_tokens-8..n_tokens-1 from the same buffer -- for chunks of 5..11
+     * tokens the ring received tail tokens filed under head positions (L171). */
+    pulsar_gpu_tensor *comp_tail_kv;
+    pulsar_gpu_tensor *comp_tail_sc;
     pulsar_gpu_tensor *batch_indexer_q;  ///< f32 rope staging, producer-internal (L090.4)
     pulsar_gpu_tensor *batch_indexer_qp;  ///< packed E2M1 Q rows -- what the scorers read
     pulsar_gpu_tensor *batch_indexer_weights;  ///< batched twin: per-head indexer mixing weights
