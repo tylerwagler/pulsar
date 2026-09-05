@@ -111,10 +111,11 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         const int ctx = start + n_pos + 64;
         /* the batched round flow runs on a bank pool (the redraft's drafter
-         * scratch is allocated with it); one bank is the whole probe */
-        pulsar_engine_set_bank_pool(1u);
+         * scratch is allocated with the pool's slabs, and a pool exists from
+         * two banks); the probe uses bank 0 only */
+        pulsar_engine_set_bank_pool(2u);
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
-        if (pulsar_session_bank_count(s) < 1) { fprintf(stderr, "no bank pool\n"); goto done; }
+        if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "no bank pool\n"); goto done; }
         const int width = pulsar_engine_logits_width(e);
         const int eos = pulsar_token_eos(e);
         logits = (float *)malloc((size_t)17 * (size_t)width * sizeof(float));
