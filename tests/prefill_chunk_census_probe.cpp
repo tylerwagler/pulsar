@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static char *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
@@ -33,10 +34,14 @@ static char *read_file(const char *path, size_t *len_out) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s MODEL N [CHUNK=8192]\n", argv[0]); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: %s MODEL N [CHUNK=8192] [FIRST=0]\n", argv[0]); return 2; }
     const int n = atoi(argv[2]);
     const uint32_t chunk = argc > 3 ? (uint32_t)atoi(argv[3]) : 8192u;
-    if (n < 1 || chunk < 16u) { fprintf(stderr, "bad N or CHUNK\n"); return 2; }
+    /* FIRST > 0: sync FIRST tokens first, then N -- the second sync evaluates
+     * [FIRST, N) as a chunk starting off position 0, the resume shape; its
+     * dumps carry pos0 = FIRST. */
+    const int first = argc > 4 ? atoi(argv[4]) : 0;
+    if (n < 1 || chunk < 16u || first < 0 || first >= n) { fprintf(stderr, "bad N, CHUNK or FIRST\n"); return 2; }
 
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1];
@@ -59,10 +64,20 @@ int main(int argc, char **argv) {
         const int ctx = n + 64 > 8192 ? n + 64 : 8192;
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
         char err[256];
-        pulsar_tokens p = toks; p.len = n;
+        pulsar_tokens p = toks;
+        if (first > 0) {
+            p.len = first;
+            if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync(first): %s\n", err); goto done; }
+        }
+        p.len = n;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync: %s\n", err); goto done; }
-        printf("CENSUS DRIVER: prefilled %d tokens in chunks of %u (%s)\n", n, chunk,
-               (uint32_t)n <= chunk ? "one chunk" : "several chunks");
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double secs = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
+        printf("CENSUS DRIVER: prefilled %d tokens in chunks of %u (%s%s): %.3f s, %.0f tok/s\n", n, chunk,
+               (uint32_t)(n - first) <= chunk ? "one chunk" : "several chunks",
+               first > 0 ? ", after a first sync" : "", secs, (double)(n - first) / secs);
         rc = 0;
     }
 done:
