@@ -103,15 +103,18 @@ bool gpu_graph_upload_prompt_tokens(
 
 
 
-/* Rebuild the ratio-4 compressor state from a chunk's last four rows,
- * re-projected as DECODE rows (the M-independent nt arm at n = 4): the state
- * is what the decode path would have stored for those positions, so the
- * window a following decode token folds into is built by the decode kernels
- * rather than by the chunk's tensor-core projection.  Needs four rows: a
- * shorter chunk has no complete window to rebuild and is REFUSED.  The
- * batched compressor paths that call this run on ratio-aligned chunks
- * (n_tokens % 4 == 0) or on a whole prompt, and a whole prompt shorter than
- * the window skips the call (see the zero-prefix sites). */
+/* Rebuild the ratio-4 compressor state from a chunk's tail, re-projected as
+ * DECODE rows (the M-independent arm, n <= 7): the state is what the decode
+ * path would have stored for those positions, so the window a following
+ * decode token folds into is built by the decode kernels rather than by the
+ * chunk's tensor-core projection.  The tail is the last COMPLETE group of four
+ * (when the chunk has one) plus the partial group of rem = n_tokens % 4 rows;
+ * pulsar_gpu_compressor_prefill_state_ratio4_tensor lays them out as the
+ * decode store does (rows 0..3 complete, 4 + phase partial).  Until L168 the
+ * tail was the last four rows written at 0..3 regardless of alignment, which
+ * dropped the partial group for every whole prompt with n_tokens % 4 != 0.
+ * Chunk starts are ratio-aligned at every caller (chunk multiples, or 0); an
+ * unaligned start is refused, not laid out by the wrong phase. */
 static bool gpu_graph_refresh_ratio4_compressor_state(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
@@ -124,28 +127,32 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
         uint32_t          width,
         uint32_t          pos0,
         uint32_t          n_tokens) {
-    if (n_tokens < 4) {
-        fprintf(stderr, "pulsar: ratio-4 compressor state rebuild needs a chunk of >= 4 rows, got %u "
-                        "at pos0=%u -- refusing (a whole prompt shorter than the window is skipped by "
-                        "the caller; the chunked paths run this on ratio-aligned chunks only)\n",
-                n_tokens, pos0);
+    if (n_tokens == 0u) {
+        fprintf(stderr, "pulsar: ratio-4 compressor state rebuild on an empty chunk at pos0=%u -- refusing\n", pos0);
+        return false;
+    }
+    if ((pos0 % 4u) != 0u) {
+        fprintf(stderr, "pulsar: ratio-4 compressor state rebuild: chunk start %u is not ratio-aligned "
+                        "(n_tokens=%u) -- refusing\n", pos0, n_tokens);
         return false;
     }
     if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
         head_dim == 0 || width == 0) {
         return false;
     }
+    const uint32_t rem = n_tokens % 4u;
+    const uint32_t n_full = n_tokens >= 4u ? 4u : 0u;
+    const uint32_t n_tail = n_full + rem;
 
-    /* Re-project the last four rows as decode rows and rebuild the state from
-     * them (pulsar_gpu_compressor_prefill_state_ratio4_tensor).  The chunk's
-     * own projections of these rows sit in batch_comp_kv/_sc already, from the
-     * prefill (tensor-core) arm, whose accumulation order differs. */
-    pulsar_decode_rows_scope rows(4u);
+    /* Re-project the tail rows as decode rows.  The chunk's own projections
+     * of these rows sit in batch_comp_kv/_sc already, from the prefill
+     * (tensor-core) arm, whose accumulation order differs. */
+    pulsar_decode_rows_scope rows(n_tail);
     if (!rows.ok()) return false;
     pulsar_gpu_tensor *tail_hc = pulsar_gpu_tensor_view(
             g->batch_attn_norm,
-            (uint64_t)(n_tokens - 4u) * PULSAR_N_EMBD * sizeof(float),
-            4ull * PULSAR_N_EMBD * sizeof(float));
+            (uint64_t)(n_tokens - n_tail) * PULSAR_N_EMBD * sizeof(float),
+            (uint64_t)n_tail * PULSAR_N_EMBD * sizeof(float));
     bool ok = tail_hc != NULL;
     if (ok) {
         ok = gpu_graph_matmul_plain_tensor(g->batch_comp_kv,
@@ -154,7 +161,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                          PULSAR_N_EMBD,
                                          width,
                                          tail_hc,
-                                         4) != 0;
+                                         n_tail) != 0;
     }
     if (ok) {
         ok = gpu_graph_matmul_plain_tensor(g->batch_comp_sc,
@@ -163,7 +170,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                          PULSAR_N_EMBD,
                                          width,
                                          tail_hc,
-                                         4) != 0;
+                                         n_tail) != 0;
     }
     if (ok) {
         ok = pulsar_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
@@ -175,7 +182,9 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                                               ape->abs_offset,
                                                               ape->type,
                                                               head_dim,
-                                                              pos0 + n_tokens - 4u) != 0;
+                                                              pos0 + n_tokens - n_tail,
+                                                              n_full,
+                                                              rem) != 0;
     }
     pulsar_gpu_tensor_free(tail_hc);
     return ok;
@@ -1116,12 +1125,10 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok && n_comp != 0) {
                     ok = gpu_graph_commit_attn_comp_stage(g, il, 0, n_comp);
                 }
-                /* A whole prompt shorter than the ratio-4 window has no complete
-                 * group to rebuild: pulsar_gpu_compressor_prefill_tensor placed
-                 * its n_tokens rows in the current-group half at their phase
-                 * slots, exactly where the decode store puts them.  The rebuild
-                 * refuses such a chunk. */
-                if (ok && ratio == 4 && n_tokens >= 4u) {
+                /* Every whole prompt, including one shorter than the window:
+                 * the rebuild lays out the complete group (if any) and the
+                 * partial rows the way the decode store does (L168). */
+                if (ok && ratio == 4) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
                                                                      g->layer_attn_state_kv[il],
@@ -1552,9 +1559,9 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) ok = gpu_graph_emit_keep_restore(g, il,
                             g->banks.n_banks ? g->banks.cur_bank : 0u, 0, n_comp, true);
                 }
-                /* Same skip as the attention compressor above: a prompt shorter
-                 * than the window has nothing to rebuild. */
-                if (ok && n_tokens >= 4u) {
+                /* Same as the attention compressor above: every whole prompt,
+                 * complete group plus partial rows (L168). */
+                if (ok) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
                                                                      g->layer_index_state_kv[il],

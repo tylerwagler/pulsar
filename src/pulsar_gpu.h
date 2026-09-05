@@ -1260,6 +1260,16 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
+/** Rebuild the 8-row ratio-4 compressor state from a chunk's tail, already
+ *  projected as DECODE rows: `kv_tail`/`sc_tail` hold the last complete group
+ *  (`n_full` = 4 rows, or 0 when the chunk has none) followed by the partial
+ *  group (`rem` = 0..3 rows), in position order; `pos0` is the position of tail
+ *  row 0 and must be ratio-aligned.  Lays them out exactly as
+ *  pulsar_gpu_compressor_prefill_tensor and the decode store do: the complete
+ *  group at rows 0..3, partial row r at row 4 + r (its phase); the other rows
+ *  are empty (kv 0, score -inf).  Refuses a malformed tail or an unaligned
+ *  position (L168: the rebuild used to write the last four rows at 0..3 and
+ *  drop the partial group for every prompt with n_tokens % 4 != 0). */
 int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
         pulsar_gpu_tensor       *state_kv,
         pulsar_gpu_tensor       *state_score,
@@ -1270,7 +1280,9 @@ int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
         uint64_t                ape_offset,
         uint32_t                ape_type,
         uint32_t                head_dim,
-        uint32_t                pos0);
+        uint32_t                pos0,
+        uint32_t                n_full,
+        uint32_t                rem);
 
 /** As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if

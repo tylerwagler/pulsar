@@ -1887,16 +1887,37 @@ int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
         uint64_t                ape_offset,
         uint32_t                ape_type,
         uint32_t                head_dim,
-        uint32_t                pos0) {
+        uint32_t                pos0,
+        uint32_t                n_full,
+        uint32_t                rem) {
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
         head_dim == 0 || (ape_type != 0u && ape_type != 1u)) {
         return 0;
     }
     const uint32_t ratio = 4u;
+    /* The tail is the last complete group (n_full = 4 rows, or 0 when the
+     * chunk has none) followed by the partial group (rem = 0..3 rows), in
+     * position order.  pos0 is the position of tail row 0 and must be
+     * ratio-aligned: the layout below puts partial row r in state row 4 + r
+     * and compressor_store_kernel puts a decode token in row 4 + pos % 4, so
+     * the two agree only when r == phase.  The caller derives pos0 from an
+     * aligned chunk start; an unaligned one is a caller bug, refused here
+     * rather than laid out wrong (L168). */
+    if ((n_full != 0u && n_full != ratio) || rem >= ratio || n_full + rem == 0u) {
+        fprintf(stderr, "pulsar: compressor state rebuild: n_full=%u rem=%u is not a ratio-4 tail "
+                        "(4 or 0 complete rows + 0..3 partial rows) -- refusing\n", n_full, rem);
+        return 0;
+    }
+    if ((pos0 % ratio) != 0u) {
+        fprintf(stderr, "pulsar: compressor state rebuild: tail position %u is not ratio-aligned -- "
+                        "refusing (partial rows are laid out by phase)\n", pos0);
+        return 0;
+    }
     const uint32_t width = 2u * head_dim;
     const uint32_t state_rows = 8u;
+    const uint32_t n_tail = n_full + rem;
     const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
-    const uint64_t tail_bytes = (uint64_t)ratio * width * sizeof(float);
+    const uint64_t tail_bytes = (uint64_t)n_tail * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
@@ -1911,13 +1932,27 @@ int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
                  "compressor state kv zero")) return 0;
     fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor state score fill launch")) return 0;
-    uint64_t n = (uint64_t)ratio * width;
-    compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
-            (float *)state_kv->ptr, (float *)state_score->ptr,
-            (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
-            ape, 0, ape_type, width, ratio, pos0,
-            0, 0, ratio);
-    return cuda_ok(cudaGetLastError(), "compressor state set launch");
+    /* Same two placements pulsar_gpu_compressor_prefill_tensor makes: the
+     * complete group at rows 0..3, the partial rows at 4 + phase. */
+    if (n_full != 0u) {
+        uint64_t n = (uint64_t)n_full * width;
+        compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
+                ape, 0, ape_type, width, ratio, pos0,
+                0, 0, n_full);
+        if (!cuda_ok(cudaGetLastError(), "compressor state set launch (complete group)")) return 0;
+    }
+    if (rem != 0u) {
+        uint64_t n = (uint64_t)rem * width;
+        compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+                (float *)state_kv->ptr, (float *)state_score->ptr,
+                (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
+                ape, 0, ape_type, width, ratio, pos0,
+                n_full, ratio, rem);
+        if (!cuda_ok(cudaGetLastError(), "compressor state set launch (partial group)")) return 0;
+    }
+    return 1;
 }
 
 
