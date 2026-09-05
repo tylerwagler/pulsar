@@ -1151,15 +1151,29 @@ static void test_tool_call_quality(void) {
  * configs that reach production. It compares the built distribution
  * bit-for-bit AND the rng-driven accept/draw/draw-excluding sequences the
  * spec path actually consumes.
+ *
+ * L186: pulsar_sample_dist_build is THE authority for the candidate set, and
+ * the plain sampler (sample_top_p_min_p) is build -> pulsar_sample_dist_draw.
+ * Section (c) pins that identity under fixed seeds: plain(row, seed) ==
+ * draw(ref_build(row), seed) == draw(build(row), seed), rng left in the same
+ * state, across every shape x config -- including the production shape
+ * (top_k 0, top_p 1, min_p 0.05) and the top_k / top_p shapes, near-tie rows
+ * and rows with -inf holes. The pre-L186 plain references (their own cutoff
+ * loops, a vocab-order walk at top_p >= 1, a -1e30 seed) are deleted: the
+ * plain lane has no semantics of its own to reference any more. Degenerate
+ * rows (no finite logit) refuse on both sides and the plain sampler returns
+ * -1 with the rng untouched.
  * ============================================================================ */
 
+/* THE row-max rule the references share with the engine: first finite value
+ * seeds, lowest id on ties, -1 when nothing is finite (L186). */
 static int ref_sample_argmax(const float *logits, uint32_t n_vocab) {
-    float best_v = -INFINITY;
-    int best = 0;
+    float best_v = 0.0f;
+    int best = -1;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
-        if (v > best_v) { best_v = v; best = (int)i; }
+        if (best < 0 || v > best_v) { best_v = v; best = (int)i; }
     }
     return best;
 }
@@ -1194,9 +1208,11 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
                                          pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
+        const int best = ref_sample_argmax(logits, n_vocab);
+        if (best < 0) return 0;   /* no finite logit: refuse, like the engine */
         out->ids = (int *)malloc(sizeof(int));
         out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->ids[0] = best;
         out->probs[0] = 1.0f;
         out->n = 1;
         return 1;
@@ -1232,12 +1248,7 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
     }
     if (n == 0) {
         free(cand);
-        out->ids = (int *)malloc(sizeof(int));
-        out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = ref_sample_argmax(logits, n_vocab);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
+        return 0;   /* no finite logit: refuse, like the engine */
     }
 
     const float max_logit = cand[0].logit;
@@ -1247,13 +1258,8 @@ static int ref_sample_dist_build_sortsum(const float *logits, uint32_t n_vocab,
         sum += cand[i].prob;
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = (int *)malloc(sizeof(int));
-        out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = cand[0].id;
-        out->probs[0] = 1.0f;
-        out->n = 1;
         free(cand);
-        return 1;
+        return 0;   /* no drawable mass (NaN temperature): refuse, like the engine */
     }
     const float min_e = cand[0].prob * min_p;   /* L149: division-free min-p */
     float filtered_sum = 0.0f;
@@ -1290,9 +1296,11 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
                                  pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
+        const int best = ref_sample_argmax(logits, n_vocab);
+        if (best < 0) return 0;   /* no finite logit: refuse, like the engine */
         out->ids = (int *)malloc(sizeof(int));
         out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = ref_sample_argmax(logits, n_vocab);
+        out->ids[0] = best;
         out->probs[0] = 1.0f;
         out->n = 1;
         return 1;
@@ -1348,12 +1356,7 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
     }
     if (n == 0) {
         free(cand);
-        out->ids = (int *)malloc(sizeof(int));
-        out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = ref_sample_argmax(logits, n_vocab);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
+        return 0;   /* no finite logit: refuse, like the engine */
     }
 
     if (!have_probs) {
@@ -1364,13 +1367,8 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = (int *)malloc(sizeof(int));
-        out->probs = (float *)malloc(sizeof(float));
-        out->ids[0] = cand[0].id;
-        out->probs[0] = 1.0f;
-        out->n = 1;
         free(cand);
-        return 1;
+        return 0;   /* no drawable mass (NaN temperature): refuse, like the engine */
     }
     const float min_e = cand[0].prob * min_p;   /* L149: division-free min-p */
     float filtered_sum = 0.0f;
@@ -1393,181 +1391,6 @@ static int ref_sample_dist_build(const float *logits, uint32_t n_vocab,
     return 1;
 }
 
-
-/* Verbatim pre-radix sample_full_vocab / sample_top_p_min_p (tokenizer.c at
- * 9587033), renamed. The plain sampling path carries the same full-vocab sort
- * as the speculative one and was rewritten the same way; this pins it. Note
- * its `sum` accumulates in VOCAB order BEFORE the sort, unlike dist_build's —
- * a difference the rewrite has to respect, so it is worth gating directly.
- *
- * Kept verbatim ON PURPOSE — including its qsort, whose tie order the C
- * standard leaves unspecified. That is the point: this is the behaviour we
- * claim to reproduce, so the reference must be the real thing. Note which
- * side is fragile: glibc merge-sorts (stably) at this size today, but falls
- * back to an unstable quicksort if its temp malloc fails, and upstream has
- * been moving qsort toward introsort. If a future glibc lands that, the
- * tie-sensitive shapes fail HERE while the shipped code stays correct — the
- * radix sort is unconditionally stable, i.e. strictly MORE deterministic than
- * the qsort it replaced. Fix that by giving this reference an explicit
- * (logit, id) comparator; do not "fix" the sampler. */
-static float ref_rng_f32(uint64_t *state) {
-    uint64_t x = *state;
-    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
-    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-    *state = x;
-    const uint64_t r = x * 0x2545f4914f6cdd1dULL;
-    return (float)((r >> 40) & 0xffffffu) / 16777216.0f;
-}
-
-static int ref_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng) {
-    float max_logit = PULSAR_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
-    if (finite == 0) return ref_sample_argmax(logits, n_vocab);
-
-    if (top_p >= 1.0f) {
-        float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = ref_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
-    }
-
-    sample_candidate *cand = (sample_candidate *)malloc((size_t)finite * sizeof(cand[0]));
-    uint32_t n = 0;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-        sum += p;
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        free(cand);
-        return best;
-    }
-
-    qsort(cand, n, sizeof(cand[0]), ref_cand_cmp_desc);
-    const float min_e = cand[0].prob * (min_p > 0.0f ? min_p : 0.0f);   /* L149 */
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (i > 0 && cand[i].prob < min_e) break;
-        filtered_sum += cand[i].prob;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) {
-        free(cand);
-        return best;
-    }
-
-    float r = ref_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            free(cand);
-            return id;
-        }
-    }
-    const int id = cand[filtered - 1].id;
-    free(cand);
-    return id;
-}
-
-
-static int ref_top_p_min_p(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng) {
-    if (temperature <= 0.0f) return ref_sample_argmax(logits, n_vocab);
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return ref_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
-    if (top_k > 1024) top_k = 1024;
-    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
-
-    int ids[1024];
-    float vals[1024];
-    int n = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (n == top_k && v <= vals[n - 1]) continue;
-        int j = n < top_k ? n++ : n - 1;
-        while (j > 0 && vals[j - 1] < v) {
-            vals[j] = vals[j - 1];
-            ids[j] = ids[j - 1];
-            j--;
-        }
-        vals[j] = v;
-        ids[j] = (int)i;
-    }
-    if (n == 0) return ref_sample_argmax(logits, n_vocab);
-
-    float probs[1024];
-    const float max_logit = vals[0];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        probs[i] = expf((vals[i] - max_logit) / temperature);
-        sum += probs[i];
-    }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
-
-    const float min_e = probs[0] * min_p;   /* L149: division-free min-p */
-    float filtered_sum = 0.0f;
-    int filtered = 0;
-    for (int i = 0; i < n; i++) {
-        if (i > 0 && probs[i] < min_e) break;
-        filtered_sum += probs[i];
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered <= 0) return ids[0];
-
-    float r = ref_rng_f32(rng) * filtered_sum;
-    for (int i = 0; i < filtered; i++) {
-        r -= probs[i];
-        if (r <= 0.0f) return ids[i];
-    }
-    return ids[filtered - 1];
-}
 
 #define SAMP_N_VOCAB 129280u
 
@@ -1705,6 +1528,17 @@ static void samp_fill_shape(float *l, uint32_t n, int shape, const char **name) 
             l[400] = L_below;   /* prob 1ulp below the boundary */
         }
         break;
+    case 12: *name = "finite logits below the old -1e30 sentinel";
+        /* Every finite value sits below -1e30, the seed the plain sampler
+         * used before L186: a sentinel-seeded max never updated, every
+         * prob underflowed to 0 and token 0 (a -inf entry here) was emitted
+         * at zero probability while the spec lane built a real nucleus.
+         * First-finite seeding makes id 500 the max on both sides. */
+        for (uint32_t i = 0; i < n; i++) l[i] = -INFINITY;
+        l[500] = -2.0e30f;
+        l[700] = -2.0e30f;    /* tie: ascending id keeps 500 first */
+        l[900] = -3.0e30f;
+        break;
     default: *name = "?"; break;
     }
 }
@@ -1815,7 +1649,7 @@ static void test_sampler_dist_equivalence(void) {
     sampler_warn_if_flush_to_zero();
     pulsar_sample_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
-    /* Separate scratch for the plain (sample_full_vocab) path, shared across
+    /* Separate scratch for the plain sampler (sample_top_p_min_p), shared across
      * every shape/config below so buffer REUSE is exercised, not just first use. */
     pulsar_sample_scratch plain_scratch;
     memset(&plain_scratch, 0, sizeof(plain_scratch));
@@ -1824,15 +1658,43 @@ static void test_sampler_dist_equivalence(void) {
     int sparse_checked = 0;
     pulsar_sample_scratch sparse_scratch;
     memset(&sparse_scratch, 0, sizeof(sparse_scratch));
-    for (int shape = 0; shape <= 11; shape++) {
+    int refused = 0;
+    int identity_trials = 0;
+    for (int shape = 0; shape <= 12; shape++) {
         const char *sname = "?";
         samp_fill_shape(logits, n, shape, &sname);
+        /* THE row-max rule at its two teeth: no finite value -> -1 (shape 7);
+         * finite values below the retired -1e30 seed -> the first of them,
+         * ascending id on the tie (shape 12). */
+        if (shape == 7) TEST_ASSERT(sample_argmax(logits, n) == -1);
+        if (shape == 12) TEST_ASSERT(sample_argmax(logits, n) == 500);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
             const samp_cfg *cfg = &samp_cfgs[c];
             pulsar_sample_dist ref, got;
-            ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p, &ref);
-            pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p, cfg->min_p,
-                                  &scratch, &got);
+            const int ref_rc = ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
+                                                     cfg->top_p, cfg->min_p, &ref);
+            const int got_rc = pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
+                                                        cfg->top_p, cfg->min_p, &scratch, &got);
+            /* (0) a row with no drawable distribution refuses on BOTH sides,
+             * `out` zeroed, and the plain sampler propagates the refusal as -1
+             * without spending an rng word (L186; the callers' handling is
+             * L188's). */
+            if (ref_rc != got_rc)
+                fprintf(stderr, "sampler: shape=%s cfg=%s build rc %d != %d\n",
+                        sname, cfg->name, ref_rc, got_rc);
+            TEST_ASSERT(ref_rc == got_rc);
+            if (!got_rc) {
+                TEST_ASSERT(got.n == 0 && got.ids == NULL && got.probs == NULL);
+                uint64_t r = 0xABCD0000u;
+                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
+                                               cfg->min_p, &r, NULL) == -1);
+                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
+                                               cfg->min_p, &r, &plain_scratch) == -1);
+                TEST_ASSERT(r == 0xABCD0000u);
+                refused++;
+                checked++;
+                continue;
+            }
             /* L149: the device-prefiltered build must be the same distribution */
             if (cfg->temp > 0.0f && cfg->top_k <= 0 && cfg->top_p == 1.0f &&
                 cfg->min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && cfg->min_p <= 1.0f)
@@ -1871,35 +1733,43 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(pulsar_sample_dist_prob(&ref, probe) == pulsar_sample_dist_prob(&got, probe));
             }
 
-            /* (c) the PLAIN sampling path (sample_full_vocab), pinned against
-             * the pre-radix reference: same seed must draw the same token and
-             * leave the rng in the same state. */
-            /* Run BOTH allocation modes against the same reference. The scratch
-             * path reuses session-owned buffers instead of malloc/freeing ~5 MB
-             * per token; it must draw the identical token and leave the rng in
-             * the identical state, or the reuse changed sampling. The scratch is
-             * deliberately shared across trials AND configs here, since that is
-             * how a session uses it — a stale-state bug would show up as a
-             * divergence on the second call, not the first. */
+            /* (c) THE plain sampler is build -> draw (L186). Under a fixed seed
+             * it must return the token pulsar_sample_dist_draw pulls from the
+             * REFERENCE nucleus -- the independent qsort build, walked in the
+             * one sorted order -- and from the shipped one, and leave the rng
+             * where draw leaves it. This is the plain-lane == spec-lane
+             * identity: server_sched's per-token draw and session_spec's
+             * accept walk now map one rng state to one token. Greedy takes the
+             * point mass and spends no rng word (the spec lane's greedy walk
+             * draws nothing either). Both allocation modes run: the scratch
+             * path reuses session-owned buffers and is deliberately shared
+             * across trials AND configs, as a session shares it -- a
+             * stale-state bug shows up on the second call, not the first. */
             for (int trial = 0; trial < 16; trial++) {
-                uint64_t r1 = 0xABCD0000u + (uint64_t)trial, r2 = r1, r3 = r1;
-                const int want = ref_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                 cfg->top_p, cfg->min_p, &r1);
-                const int got_tok = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                       cfg->top_p, cfg->min_p, &r2, NULL);
-                const int got_scr = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                       cfg->top_p, cfg->min_p, &r3,
-                                                       &plain_scratch);
-                if (want != got_tok)
-                    fprintf(stderr, "sampler: shape=%s cfg=%s plain draw %d != %d\n",
-                            sname, cfg->name, want, got_tok);
-                if (got_scr != got_tok)
+                const uint64_t seed = 0xABCD0000u + (uint64_t)trial;
+                uint64_t r_ref = seed, r_got = seed, r_plain = seed, r_scr = seed;
+                const int want = cfg->temp <= 0.0f ? ref.ids[0]
+                                                   : pulsar_sample_dist_draw(&ref, &r_ref);
+                const int via_got = cfg->temp <= 0.0f ? got.ids[0]
+                                                      : pulsar_sample_dist_draw(&got, &r_got);
+                const int plain = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                     cfg->top_p, cfg->min_p, &r_plain, NULL);
+                const int scr = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
+                                                   cfg->top_p, cfg->min_p, &r_scr,
+                                                   &plain_scratch);
+                if (plain != want)
+                    fprintf(stderr, "sampler: shape=%s cfg=%s plain draw %d != draw(build) %d\n",
+                            sname, cfg->name, plain, want);
+                if (scr != plain)
                     fprintf(stderr, "sampler: shape=%s cfg=%s scratch draw %d != malloc %d\n",
-                            sname, cfg->name, got_scr, got_tok);
-                TEST_ASSERT(want == got_tok);
-                TEST_ASSERT(got_scr == got_tok);
-                TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(r3 == r2);
+                            sname, cfg->name, scr, plain);
+                TEST_ASSERT(plain == want);
+                TEST_ASSERT(via_got == want);
+                TEST_ASSERT(scr == plain);
+                TEST_ASSERT(r_plain == r_ref);
+                TEST_ASSERT(r_got == r_ref);
+                TEST_ASSERT(r_scr == r_plain);
+                identity_trials++;
             }
 
             pulsar_sample_dist_free(&ref);
@@ -1939,8 +1809,11 @@ static void test_sampler_dist_equivalence(void) {
     pulsar_sample_scratch_free(&scratch);
     pulsar_sample_scratch_free(&plain_scratch);
     free(logits);
-    printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference\n",
-           checked);
+    /* exactly the all-non-finite shape refuses, for every config */
+    TEST_ASSERT(refused == (int)(sizeof(samp_cfgs) / sizeof(samp_cfgs[0])));
+    printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference; "
+           "plain == draw(build) on %d fixed-seed trials; %d degenerate combos refused\n",
+           checked, identity_trials, refused);
 }
 
 
@@ -1973,16 +1846,17 @@ static void test_sampler_prefilter_equivalence(void) {
     int n_shifts = 0;
     double max_rel = 0.0, max_rel_shifted = 0.0;
     int max_shape = -1, max_cfg = -1;
-    for (int shape = 0; shape <= 11; shape++) {
+    for (int shape = 0; shape <= 12; shape++) {
         const char *sname = "?";
         samp_fill_shape(logits, n, shape, &sname);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
             const samp_cfg *cfg = &samp_cfgs[c];
             pulsar_sample_dist old, got;
-            ref_sample_dist_build_sortsum(logits, n, cfg->temp, cfg->top_k,
-                                          cfg->top_p, cfg->min_p, &old);
-            pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
-                                  cfg->top_p, cfg->min_p, &scratch, &got);
+            const int old_rc = ref_sample_dist_build_sortsum(logits, n, cfg->temp, cfg->top_k,
+                                                             cfg->top_p, cfg->min_p, &old);
+            const int got_rc = pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
+                                                        cfg->top_p, cfg->min_p, &scratch, &got);
+            TEST_ASSERT(old_rc == got_rc);   /* a degenerate row refuses on both sides */
             /* MIN-P membership vs the old semantics is identical (the
              * prefilter is a superset under ANY sum and the exact cutoff
              * decides; the boundary teeth below pin it). What CAN move is
@@ -2783,7 +2657,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
     {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
 #endif
-    {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
+    {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},

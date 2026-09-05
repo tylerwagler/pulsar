@@ -2787,6 +2787,8 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
  * pulsar_token_text and dump_tokens_fp both call it.  Malloc'd,
  * NUL-terminated; *len (optional) receives the byte count. */
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
+/** THE row-max rule: the first finite value seeds, lowest id wins a tie.
+ * @return the argmax id, or -1 when the row has no finite value. */
 int sample_argmax(const float *logits, uint32_t n_vocab);
 /** The candidate distribution a sampler draws from, after filtering. */
 typedef struct {
@@ -2795,8 +2797,15 @@ typedef struct {
     uint32_t n;    ///< candidates present in both arrays
 } pulsar_sample_dist;
 
-/** `scratch` is required (non-NULL) and must outlive nothing: it is pure
- * working memory, reusable across calls and independent of `out`. */
+/** THE authority for the sampled candidate set (temperature, top-k, top-p,
+ * min-p) and its order: every lane -- the plain samplers below and the
+ * speculative accept walk -- draws from this object, so one rng state yields
+ * one token whichever lane runs (L186).  `scratch` is required (non-NULL) and
+ * must outlive nothing: it is pure working memory, reusable across calls and
+ * independent of `out`.
+ * @return 1 with `out` filled; 0 with `out` zeroed for a row no distribution
+ * can be drawn from (no finite logit, or a non-positive / non-finite
+ * candidate mass) -- said once on stderr. */
 int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
@@ -2835,10 +2844,12 @@ int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q
 int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
                                   pulsar_sample_scratch *scratch, uint64_t *rng);
 
-/** `scratch` is optional reusable working memory for the full-vocab (top_k <= 0)
- * path, which otherwise malloc/frees ~5 MB per sampled token. Pass the calling
- * session's sample_scratch; NULL is valid and restores the malloc behaviour for
- * callers with no session (pulsar_sample_logits). */
+/** The plain per-token sampler: pulsar_sample_dist_build -> pulsar_sample_dist_draw,
+ * nothing else (greedy takes the point mass without an rng word).  `scratch`
+ * is optional reusable working memory; pass the calling session's
+ * sample_scratch, or NULL for a call-local one (pulsar_sample_logits, which
+ * has no session) -- the same path, ~5 MB of malloc/free per call.
+ * @return the token, or -1 when the build refused the row. */
 int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,

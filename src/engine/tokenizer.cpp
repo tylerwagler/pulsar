@@ -877,12 +877,18 @@ int pulsar_token_assistant(pulsar_engine *e) {
 
 
 
+/* THE row-max rule, shared by every sampler entry: the first finite value
+ * seeds, then strict '>' so the lowest id wins a tie; a row with no finite
+ * value has no argmax (-1).  No sentinel seed -- sample_full_vocab used to
+ * seed -1e30 and classed a row whose finite logits all sat below it as
+ * empty, emitting token 0 at zero probability (L186). */
 int sample_argmax(const float *logits, uint32_t n_vocab) {
-    int best = 0;
-    float best_v = PULSAR_NEG_INF;
+    int best = -1;
+    float best_v = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (v > best_v) {
+        if (!isfinite(v)) continue;
+        if (best < 0 || v > best_v) {
             best_v = v;
             best = (int)i;
         }
@@ -1007,8 +1013,9 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 /* =====
- * min-p prefilter threshold (shared by sample_full_vocab and
- * pulsar_sample_dist_build's full-vocab paths).
+ * min-p prefilter threshold (pulsar_sample_dist_build's full-vocab path; the
+ * device prefilter's contract, pulsar_sample_dist_build_prefiltered, is the
+ * same superset argument in logit units).
  *
  * The min-p cutoff every path applies post-sort keeps candidate i (i > 0) iff
  *
@@ -1091,212 +1098,121 @@ static void sample_qmap_reserve(pulsar_sample_scratch *s, uint32_t cap) {
 
 
 
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        pulsar_sample_scratch *scratch) {
-    float max_logit = PULSAR_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
-
-    if (top_p >= 1.0f) {
-        float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
-    }
-
-    /* Same full-vocab qsort the speculative dist_build had (~10.6 ms a call),
-     * on the PLAIN per-token path — reached whenever a client sends top_p < 1
-     * without a top_k, which is a common shape. Radix-sorted for the same
-     * reason and with the same byte-exactness argument.
-     *
-     * `sum` here accumulates in VOCAB order, BEFORE the sort (unlike
-     * dist_build, which sums post-sort) — so this loop must stay exactly as it
-     * was: it still adds EVERY finite candidate's prob, in the same order, so
-     * `sum` is bit-identical with the prefilter on or off. probs are computed
-     * once and carried THROUGH the sort by packing the compaction index as the
-     * radix payload, rather than recomputed post-sort: a second expf loop
-     * could be vectorized differently from this one under -ffast-math and
-     * differ in the last ulp.
-     *
-     * With min_p > 0 only the prefilter's survivors (a superset of the min-p
-     * cutoff's survivors — see SAMPLE_MINP_PREFILTER_SLACK) are collected for
-     * sorting, which is what turns the 129k-candidate sort into a
-     * tens-of-candidates sort at the default min_p. The cutoff loop below is
-     * unchanged and trims the boundary byte-exactly, so this path's output
-     * (token and rng stream) is bit-identical to the unfiltered build. */
-    /* Borrow the caller's reusable scratch when there is one.  These three
-     * buffers are ~5 MB at full vocab and were malloc/free'd PER SAMPLED TOKEN
-     * on this path — which is the plain sampler, reached whenever a client
-     * sends top_p < 1 without a top_k (a common shape).  pulsar_sample_dist_build
-     * already reuses exactly these buffers for the speculative walk; this path
-     * simply never did.  A NULL scratch keeps the original malloc behaviour for
-     * pulsar_sample_logits, which has no session to borrow from. */
-    sample_candidate *cand;
-    uint64_t *keys;
-    uint64_t *tmp;
-    if (scratch) {
-        sample_scratch_reserve(scratch, finite);
-        cand = scratch->cand;
-        keys = scratch->keys;
-        tmp  = scratch->tmp;
-    } else {
-        cand = (sample_candidate *)xmalloc((size_t)finite * sizeof(cand[0]));
-        keys = (uint64_t *)xmalloc((size_t)finite * sizeof(keys[0]));
-        tmp  = (uint64_t *)xmalloc((size_t)finite * sizeof(tmp[0]));
-    }
-    uint32_t n = 0;
-    float sum = 0.0f;
-    const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
-        ? min_p * SAMPLE_MINP_PREFILTER_SLACK : -1.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        sum += p;
-        if (p >= prefilter || (int)i == best) {
-            keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
-            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-        }
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        if (!scratch) {
-            free(cand);
-            free(keys);
-            free(tmp);
-        }
-        return best;
-    }
-
-    /* finite >= 1 here (checked above), so n >= 1 as sample_radix_sort_desc
-     * requires. Stable over an ascending fill => ties keep ascending vocab id,
-     * matching the qsort this replaces. */
-    sample_radix_sort_desc(keys, tmp, n);
-    /* The gather cannot run in place, so it needs a second buffer: scratch->cand2
-     * exists for exactly this (see its comment) and is reserved to the same cap. */
-    sample_candidate *sorted = scratch
-        ? scratch->cand2
-        : (sample_candidate *)xmalloc((size_t)n * sizeof(sorted[0]));
-    for (uint32_t i = 0; i < n; i++) sorted[i] = cand[(uint32_t)keys[i]];
-    if (!scratch) {
-        free(cand);
-        free(keys);
-        free(tmp);
-    }
-    cand = sorted;
-    /* L149: division-free min-p (see the prefilter note above). */
-    const float min_e = cand[0].prob * (min_p > 0.0f ? min_p : 0.0f);
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (i > 0 && cand[i].prob < min_e) break;
-        filtered_sum += cand[i].prob;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) {
-        if (!scratch) free(cand);
-        return best;
-    }
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            if (!scratch) free(cand);
-            return id;
-        }
-    }
-    const int id = cand[filtered - 1].id;
-    if (!scratch) free(cand);
-    return id;
-}
-
-
-
 /* =====
- * Filtered-distribution object for speculative sampling.
+ * THE sampler: the one authority for the candidate set (L186).
  *
- * Builds the SAME final sampling distribution sample_top_p_min_p draws from
- * (temperature scaling, top-k preselect, min-p relative floor, top-p nucleus
- * with the crossing candidate included), but materialized so the speculative
- * path can (a) query p(token), (b) draw, and (c) draw excluding a rejected
- * token — the exact residual rule for deterministic-proposal speculative
- * sampling. Mirrors the sampler branch-for-branch; the spec_sampling harness
- * chi-square-checks the equivalence.
+ * pulsar_sample_dist_build turns a logits row plus (temperature, top-k,
+ * top-p, min-p) into the filtered, renormalised nucleus every lane draws
+ * from.  The plain per-token samplers (sample_top_p_min_p, behind
+ * pulsar_sample_logits / pulsar_session_sample) are build -> draw; the
+ * speculative lane builds the same object to query p(token), draw, and draw
+ * the residual of a rejected proposal.  One candidate order -- descending
+ * logit, ascending id on ties, the order pulsar_sample_dist_draw walks -- so
+ * a given rng state yields the same token whether or not speculation is
+ * armed; tests/pulsar_test.cpp --sampler pins plain == draw(build) under
+ * fixed seeds.  Before L186 the plain sampler carried its own cutoff loops
+ * and, at top_p >= 1, walked candidates in VOCAB order: the same marginals,
+ * a different token for the same rng word, so quenching the drafter
+ * mid-request changed the sampled sequence under a fixed seed.
+ *
+ * Degenerate rows refuse.  No finite logit, or a candidate mass that is not
+ * a positive finite number (a NaN temperature), returns 0 through
+ * sample_dist_refuse -- one message, `out` zeroed -- and the plain samplers
+ * return -1.  No point mass at token 0, no best-effort candidate.
  *
  * NOTE on optimizing this: `sum` is taken over ALL n candidates BEFORE any
- * cutoff, and both cutoffs are relative to it (min_prob =
- * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
- * candidates from `sum` — the NAIVE min-p pre-filter — therefore changes
- * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
- * probability. It is not an equivalent rewrite; tests/pulsar_test.cpp --sampler
- * catches it (n 6 != 5). The full-vocab sum is load-bearing.
+ * cutoff, and the top-p cutoff is relative to it (filtered_sum / sum).
+ * Dropping candidates from `sum` -- the NAIVE min-p pre-filter -- therefore
+ * changes `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
+ * probability. It is not an equivalent rewrite; tests/pulsar_test.cpp
+ * --sampler catches it (n 6 != 5). The full-vocab sum is load-bearing.
  *
  * What the top_k <= 0, min_p > 0 path DOES do (the LEGAL prefilter): the sum
  * still covers every finite candidate, but is accumulated in VOCAB-INDEX
  * order in the same pass that computes each prob once and collects only the
  * prefilter survivors (see SAMPLE_MINP_PREFILTER_SLACK: a strict superset of
  * the min-p cutoff's survivors under ANY sum, forming a prefix of the
- * descending sort). Only the survivors are sorted — tens instead of 129k at
- * the server-default min_p = 0.05 — and the byte-exact cutoff loop then
- * trims the boundary with the same comparisons as ever, evaluated against
- * that sum. Distribution-preserving by construction; NOT stream-preserving:
+ * descending sort). Only the survivors are sorted -- tens instead of 129k at
+ * the server-default min_p = 0.05 -- and the byte-exact cutoff then trims
+ * the boundary with the same comparisons as ever, evaluated against that
+ * sum. Distribution-preserving by construction; NOT stream-preserving:
  * summing in index order instead of the old sorted-descending order rounds
  * differently (~1e-7 relative), so every output prob moves by that much and
  * rng draws near a bucket edge can flip. Survivor membership and order are
- * unchanged (tests/pulsar_test.cpp --sampler-prefilter pins set/order identity
- * against the old-sum reference and characterizes the prob delta; --sampler
- * is byte-exact against the re-derived index-order-sum reference). The
- * min_p <= 0 full sort and the top_k > 0 preselect keep the old sorted-order
- * sum and remain byte-identical to the pre-prefilter build.
+ * unchanged (tests/pulsar_test.cpp --sampler-prefilter pins set/order
+ * identity against the old-sum reference and characterizes the prob delta;
+ * --sampler is byte-exact against the re-derived index-order-sum reference).
+ * The min_p <= 0 full sort and the top_k > 0 preselect keep the old
+ * sorted-order sum and remain byte-identical to the pre-prefilter build.
  *
  * ALIASING CONTRACT: `out`'s ids/probs must never point into `scratch`. The
- * spec walk (session.cpp) holds one dist at a time while reusing the scratch
- * across accepted positions, so handing `out` a scratch pointer to save the
- * malloc would be silently wrong the moment two dists overlap — and the
- * --sampler gate builds one dist at a time, so it would NOT catch it.
+ * spec walk (session_spec.cpp) holds one dist at a time while reusing the
+ * scratch across accepted positions, so handing `out` a scratch pointer to
+ * save the malloc would be silently wrong the moment two dists overlap --
+ * and the --sampler gate builds one dist at a time, so it would NOT catch it.
  */
+
+/* THE refusal for a row no distribution can be drawn from.  Every builder
+ * fails through here and the plain samplers propagate the 0 as -1, so a
+ * degenerate row refuses in one place (fail closed, loudly, once). */
+static int sample_dist_refuse(pulsar_sample_dist *out, uint32_t n_vocab, const char *why) {
+    memset(out, 0, sizeof(*out));
+    static int said = 0;
+    if (!said) {
+        said = 1;
+        fprintf(stderr,
+                "pulsar: sampler: refusing a %u-wide logits row: %s -- no token is drawn "
+                "(said once)\n",
+                n_vocab, why);
+    }
+    return 0;
+}
+
+/* THE nucleus cutoff and emit, shared by every builder.  `n` >= 1 candidates
+ * in descending (logit, ascending id) order are read through prob(i) / id(i)
+ * (two callers keep two candidate layouts; the order is what is shared).
+ * min-p is division-free (L149: prob(0) == expf(0) == 1.0f exactly, so the
+ * floor is prob(0) * min_p and the decision depends on prob(i) alone); top-p
+ * is relative to `sum`, the mass the caller accumulated over ALL its
+ * candidates, and includes the crossing candidate.  A caller whose contract
+ * has proven the top-p test inert and that holds no full-row mass (the
+ * device-prefiltered build) passes sum = +inf, which makes the test false
+ * without a second loop.  Emits the nucleus renormalised over itself, in
+ * the order pulsar_sample_dist_draw walks. */
+template <class ProbAt, class IdAt>
+static void sample_nucleus_emit(uint32_t n, float sum, float top_p, float min_p,
+                                ProbAt prob, IdAt id, pulsar_sample_dist *out) {
+    const float min_e = prob(0) * min_p;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float p = prob(i);
+        if (i > 0 && p < min_e) break;
+        filtered_sum += p;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    /* filtered >= 1: i == 0 never breaks on min-p, and the top-p break
+     * follows the increment. */
+    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
+    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
+    out->n = filtered;
+    for (uint32_t i = 0; i < filtered; i++) {
+        out->ids[i] = id(i);
+        out->probs[i] = prob(i) / filtered_sum;   /* renormalized nucleus */
+    }
+}
+
 int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
     if (temperature <= 0.0f) {
+        const int best = sample_argmax(logits, n_vocab);
+        if (best < 0) return sample_dist_refuse(out, n_vocab, "no finite logit");
         out->ids = (int *)xmalloc(sizeof(int));
         out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = sample_argmax(logits, n_vocab);
+        out->ids[0] = best;
         out->probs[0] = 1.0f;
         out->n = 1;
         return 1;
@@ -1305,8 +1221,8 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
     if (min_p < 0.0f) min_p = 0.0f;
     if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
 
-    /* collect candidates: full vocab, or top-k preselect like the sampler.
-     * Buffers come from the caller's scratch and are reused across calls —
+    /* collect candidates: full vocab, or top-k preselect.
+     * Buffers come from the caller's scratch and are reused across calls --
      * the sampled speculative walk calls this per accepted position. */
     uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
     sample_scratch_reserve(scratch, cap);
@@ -1326,14 +1242,13 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
      * probabilities, PACKED (4 B/entry, into cand's storage — cand itself is
      * unused on that path), and leaves the ids where the radix sort already
      * put them: the low 32 bits of keys[i]. `pv`/`idk` are the resulting
-     * lazy view; SC_PROB/SC_ID below read whichever representation is live.
-     * Arithmetic is UNCHANGED: same max_logit (logits[keys[0]] IS cand[0].logit),
-     * same expf inputs in the same sorted order, same `sum` accumulation
-     * order, hence the same cutoff, `filtered` set and output probabilities. */
+     * lazy view; the prob/id readers below read whichever representation is
+     * live. Arithmetic is UNCHANGED: same max_logit (logits[keys[0]] IS
+     * cand[0].logit), same expf inputs in the same sorted order, same `sum`
+     * accumulation order, hence the same cutoff, `filtered` set and output
+     * probabilities. */
     const float *pv = NULL;         /* packed probs, sorted order (or NULL) */
     const uint64_t *idk = NULL;     /* sorted keys; id = low 32 bits (or NULL) */
-#define SC_PROB(i) (pv ? pv[(i)] : sc[(i)].prob)
-#define SC_ID(i)   (idk ? (int)(uint32_t)idk[(i)] : sc[(i)].id)
     uint32_t n = 0;
     int have_probs = 0;
     float sum = 0.0f;
@@ -1353,9 +1268,9 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
     } else if (min_p > SAMPLE_MINP_PREFILTER_MIN) {
         /* min-p prefilter path (see the block comment above; the MIN floor
          * keeps the cutoff arithmetic normal — below it the exact full sort
-         * runs instead). Pass 1: the
-         * true max over finite logits, first occurrence on ties — the same
-         * candidate the stable descending sort put at cand[0]. */
+         * runs instead). Pass 1: the row max by THE rule (sample_argmax):
+         * first finite value seeds, lowest id on ties — the same candidate
+         * the stable descending sort puts at cand[0]. */
         float max_logit = 0.0f;
         uint32_t max_id = 0;
         uint32_t finite = 0;
@@ -1419,14 +1334,7 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
             have_probs = 1;
         }
     }
-    if (n == 0) {
-        out->ids = (int *)xmalloc(sizeof(int));
-        out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = sample_argmax(logits, n_vocab);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
-    }
+    if (n == 0) return sample_dist_refuse(out, n_vocab, "no finite logit");
 
     if (!have_probs) {
         const float max_logit = sc[0].logit;
@@ -1435,36 +1343,15 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
             sum += sc[i].prob;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = (int *)xmalloc(sizeof(int));
-        out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = SC_ID(0);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
-    }
-    /* L149: division-free min-p (see the prefilter note above). */
-    const float min_e = SC_PROB(0) * min_p;
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = SC_PROB(i);
-        if (i > 0 && p < min_e) break;
-        filtered_sum += p;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) filtered = 1;
-    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
-    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
-    out->n = filtered;
-    for (uint32_t i = 0; i < filtered; i++) {
-        out->ids[i] = SC_ID(i);
-        out->probs[i] = SC_PROB(i) / filtered_sum;   /* renormalized nucleus */
-    }
+    /* prob(0) == expf(0) == 1 exactly, so the mass is >= 1 for any finite
+     * temperature: only a NaN temperature reaches this. */
+    if (sum <= 0.0f || !isfinite(sum))
+        return sample_dist_refuse(out, n_vocab, "candidate mass is not a positive finite number");
+    sample_nucleus_emit(n, sum, top_p, min_p,
+                        [&](uint32_t i) { return pv ? pv[i] : sc[i].prob; },
+                        [&](uint32_t i) { return idk ? (int)(uint32_t)idk[i] : sc[i].id; },
+                        out);
     return 1;
-#undef SC_PROB
-#undef SC_ID
 }
 
 /* L149: the min-p prefilter path of pulsar_sample_dist_build, fed a
@@ -1476,8 +1363,9 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
  * maximum and delta <= T * ln(min_p) (a margin below the floor). That set is
  * a superset of the min-p survivors {i : expf((v_i - max)/T) >= min_p} and
  * contains the max, so -- probs being monotone in the logit -- the sorted
- * survivors are a prefix of the sorted candidates and the cutoff loop below
- * walks exactly what pulsar_sample_dist_build walks over the full row.
+ * survivors are a prefix of the sorted candidates and the shared cutoff
+ * (sample_nucleus_emit) walks exactly what pulsar_sample_dist_build walks
+ * over the full row.
  *
  * Byte-identical to pulsar_sample_dist_build(row, n_vocab, T, 0, 1.0f, min_p)
  * for min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN:
@@ -1489,10 +1377,14 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
  *     exists (sum >= filtered_sum + min_p while one does, and
  *     min_p / filtered_sum > 2 ulp(1) for min_p >= the MIN and
  *     filtered_sum <= PULSAR_N_VOCAB), and when it fires the next candidate
- *     fails min-p anyway -- same `filtered`, same probs.
- * Anything outside the contract returns 0 with `out` untouched and the
- * caller reads the full row instead (pulsar_test --sampler pins the identity
- * and its sensitivity). */
+ *     fails min-p anyway -- same `filtered`, same probs.  This path holds
+ *     no full-row mass, so it hands the shared cutoff sum = +inf: the same
+ *     loop, the test provably inert.
+ * Anything outside the contract returns 0 with `out` untouched; the caller
+ * decides whether that is a shape outside the sparse contract (read the
+ * full row) or a device result that broke it (refuse) -- see
+ * session_spec.cpp (pulsar_test --sampler pins the identity and its
+ * sensitivity). */
 int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
                                          float max_logit, float temperature, float min_p,
                                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
@@ -1518,23 +1410,11 @@ int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, 
     /* The sorted head must be the max the caller named, or the list is not
      * the superset the contract promises: refuse rather than sample from it. */
     if (sc[0].logit != max_logit) return 0;
-    const float min_e = sc[0].prob * min_p;
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (i > 0 && sc[i].prob < min_e) break;
-        filtered_sum += sc[i].prob;
-        filtered++;
-    }
-    if (filtered == 0) filtered = 1;
     memset(out, 0, sizeof(*out));
-    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
-    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
-    out->n = filtered;
-    for (uint32_t i = 0; i < filtered; i++) {
-        out->ids[i] = sc[i].id;
-        out->probs[i] = sc[i].prob / filtered_sum;
-    }
+    sample_nucleus_emit(n, INFINITY, 1.0f, min_p,
+                        [&](uint32_t i) { return sc[i].prob; },
+                        [&](uint32_t i) { return sc[i].id; },
+                        out);
     return 1;
 }
 
@@ -1684,58 +1564,28 @@ int sample_top_p_min_p(
         float        min_p,
         uint64_t    *rng,
         pulsar_sample_scratch *scratch) {
-    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng, scratch);
-    if (top_k > 1024) top_k = 1024;
-    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
-
-    int ids[1024];
-    float vals[1024];
-    int n = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (n == top_k && v <= vals[n - 1]) continue;
-        int j = n < top_k ? n++ : n - 1;
-        while (j > 0 && vals[j - 1] < v) {
-            vals[j] = vals[j - 1];
-            ids[j] = ids[j - 1];
-            j--;
-        }
-        vals[j] = v;
-        ids[j] = (int)i;
+    /* build -> draw, nothing else: the candidate set, its order and every
+     * clamp live in pulsar_sample_dist_build (L186).  A caller with no
+     * session (pulsar_sample_logits) gets a call-local scratch -- the same
+     * path, the buffers' lifetime is the only difference. */
+    pulsar_sample_scratch local;
+    if (!scratch) {
+        memset(&local, 0, sizeof(local));
+        scratch = &local;
     }
-    if (n == 0) return sample_argmax(logits, n_vocab);
-
-    float probs[1024];
-    const float max_logit = vals[0];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        probs[i] = expf((vals[i] - max_logit) / temperature);
-        sum += probs[i];
+    int tok = -1;
+    pulsar_sample_dist d;
+    if (pulsar_sample_dist_build(logits, n_vocab, temperature, top_k, top_p, min_p,
+                                 scratch, &d)) {
+        /* Greedy is a point mass and draws nothing: no rng word, the same
+         * decision the speculative lane's greedy walk makes, so the two
+         * lanes' rng streams stay in step across a greedy stretch (a
+         * tool-call payload forcing temperature 0 mid-request). */
+        tok = temperature <= 0.0f ? d.ids[0] : pulsar_sample_dist_draw(&d, rng);
+        pulsar_sample_dist_free(&d);
     }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
-
-    /* L149: division-free min-p (see the prefilter note above). */
-    const float min_e = probs[0] * min_p;
-    float filtered_sum = 0.0f;
-    int filtered = 0;
-    for (int i = 0; i < n; i++) {
-        if (i > 0 && probs[i] < min_e) break;
-        filtered_sum += probs[i];
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered <= 0) return ids[0];
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (int i = 0; i < filtered; i++) {
-        r -= probs[i];
-        if (r <= 0.0f) return ids[i];
-    }
-    return ids[filtered - 1];
+    if (scratch == &local) pulsar_sample_scratch_free(&local);
+    return tok;
 }
 
 
@@ -1826,6 +1676,11 @@ int generate_gpu_graph_raw_swa(
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
 
         int token = sample_argmax(logits, PULSAR_N_VOCAB);
+        if (token < 0) {
+            fprintf(stderr, "pulsar: no finite logit at position %d -- stopping\n", pos);
+            ok = false;
+            break;
+        }
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);

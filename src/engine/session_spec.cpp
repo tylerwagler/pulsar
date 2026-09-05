@@ -588,12 +588,12 @@ static int spec_accept_walk(pulsar_session *s,
             pulsar_sample_dist dist;
             if (!spec_compact_dist(compact, row0 + (uint32_t)commit, temperature, top_k,
                                    top_p, min_p, &s->sample_scratch, &dist)) {
-                if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
+                if (!read_row(read_ud, (uint32_t)commit, row_logits) ||
+                    !pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
+                                              top_p, min_p, &s->sample_scratch, &dist)) {
                     *out_carry_tok = -1;
                     return -1;
                 }
-                pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
-                                      top_p, min_p, &s->sample_scratch, &dist);
             }
             const bool accepted_row = pend_sampled
                 ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
@@ -616,13 +616,19 @@ static int spec_accept_walk(pulsar_session *s,
                     memcpy(qd.ids, s->spec.dspark_pending_qids[commit], (size_t)qn * sizeof(int));
                     memcpy(qd.probs, s->spec.dspark_pending_qprobs[commit],
                            (size_t)qn * sizeof(float));
-                } else
-                pulsar_sample_dist_build(s->dspark_pending_qrows +
-                                          (size_t)commit * PULSAR_N_VOCAB,
-                                      PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
-                                      s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
-                                      s->spec.dspark_pending_min_p,
-                                      &s->sample_scratch, &qd);
+                } else if (!pulsar_sample_dist_build(s->dspark_pending_qrows +
+                                                         (size_t)commit * PULSAR_N_VOCAB,
+                                                     PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
+                                                     s->spec.dspark_pending_top_k,
+                                                     s->spec.dspark_pending_top_p,
+                                                     s->spec.dspark_pending_min_p,
+                                                     &s->sample_scratch, &qd)) {
+                    /* the stored q row refused: the proposal this draft was
+                     * drawn from cannot be rebuilt, so the walk fails */
+                    pulsar_sample_dist_free(&dist);
+                    *out_carry_tok = -1;
+                    return -1;
+                }
                 carry_tok = pulsar_sample_dist_draw_residual(&dist, &qd,
                                                           &s->sample_scratch, rng);
                 pulsar_sample_dist_free(&qd);
@@ -828,12 +834,12 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
         }
         if (!q_built) {
             float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
-            if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
+            if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes) ||
+                !pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
+                                          &s->sample_scratch, &q)) {
                 draft_ok = false;
                 break;
             }
-            pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
-                                  &s->sample_scratch, &q);
         }
         const int drawn = pulsar_sample_dist_draw(&q, rng);
         refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
@@ -1034,6 +1040,13 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     const pulsar_dspark_weights *w = &e->dspark_weights;
     static int dspark_stats_env = -1;
     const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
+    if (first_token < 0 || (uint32_t)first_token >= PULSAR_N_VOCAB) {
+        /* -1 is what pulsar_session_spec_next_base returns when the sampler
+         * refused the row; the base token feeds the embedding gather, so a
+         * non-id must stop here. */
+        snprintf(err, errlen, "spec round: base token %d is not a vocab id", first_token);
+        return -1;
+    }
     {
         /* the round is reused across rounds; its redraft record's lazily-owned
          * fallback rows (L150) survive the reset, everything else is cleared */
@@ -1382,10 +1395,21 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
             carry_tok = sample_argmax(s->logits, PULSAR_N_VOCAB);
         } else {
             pulsar_sample_dist bonus;
-            pulsar_sample_dist_build(s->logits, PULSAR_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &s->sample_scratch, &bonus);
-            carry_tok = pulsar_sample_dist_draw(&bonus, rng);
-            pulsar_sample_dist_free(&bonus);
+            if (pulsar_sample_dist_build(s->logits, PULSAR_N_VOCAB, temperature, top_k,
+                                         top_p, min_p, &s->sample_scratch, &bonus)) {
+                carry_tok = pulsar_sample_dist_draw(&bonus, rng);
+                pulsar_sample_dist_free(&bonus);
+            }
+        }
+        if (carry_tok < 0) {
+            /* the committed row has no drawable distribution (the sampler said
+             * why, once): no carry can be honest, so the round fails */
+            s->checkpoint.len = saved_len;
+            (void)spec_frontier_restore(&frontier, s);
+            spec_frontier_free(&frontier);
+            snprintf(err, errlen, "DSpark fused: the sampler refused the carry row");
+            s->checkpoint_valid = false;
+            return -1;
         }
     }
 
@@ -1617,6 +1641,10 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
         s->spec.spec_carry_valid = false;
         first = sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k,
                                    top_p, min_p, rng, &s->sample_scratch);
+        if (first < 0) {
+            snprintf(err, errlen, "the sampler refused the live logits row");
+            return -1;
+        }
     }
     if (first == eos_token) {
         /* never forward EOS through the target (matches the old caller loops,
@@ -2009,9 +2037,11 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                         if (built) pulsar_sample_dist_free(&qd);
                         ok = false; break;
                     }
-                    if (!built)
-                        pulsar_sample_dist_build(row, PULSAR_N_VOCAB, q->temperature, q->top_k, q->top_p,
-                                              q->min_p, &s->sample_scratch, &qd);
+                    if (!built &&
+                        !pulsar_sample_dist_build(row, PULSAR_N_VOCAB, q->temperature, q->top_k,
+                                                  q->top_p, q->min_p, &s->sample_scratch, &qd)) {
+                        ok = false; break;
+                    }
                     q->qn[pos] = 0;
                 }
                 const int drawn = pulsar_sample_dist_draw(&qd, rngs[order[j]]);

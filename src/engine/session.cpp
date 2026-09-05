@@ -1194,11 +1194,14 @@ int pulsar_session::argmax() {
 int pulsar_session::argmax_excluding(int excluded_id) {
     auto *s = this;
     if (!s || !s->logits) return -1;
+    /* THE row-max rule (sample_argmax): first finite value seeds, lowest id
+     * wins a tie, -1 when nothing is finite. */
     int best = -1;
-    float best_logit = PULSAR_NEG_INF;
+    float best_logit = 0.0f;
     for (uint32_t i = 0; i < PULSAR_N_VOCAB; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
+        if (!isfinite(v)) continue;
         if (best < 0 || v > best_logit) {
             best = (int)i;
             best_logit = v;
@@ -1242,11 +1245,18 @@ int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
         out[i].logprob = PULSAR_NEG_INF;
     }
 
-    float max_logit = PULSAR_NEG_INF;
+    /* Row max by THE rule (sample_argmax): the first finite value seeds.  A
+     * -1e30 seed is finite, so an all-non-finite row used to pass the
+     * isfinite(max_logit) check below and score against log(0). */
+    float max_logit = 0.0f;
+    bool have_max = false;
     for (int i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
-        if (v > max_logit) max_logit = v;
+        if (!have_max || v > max_logit) {
+            max_logit = v;
+            have_max = true;
+        }
         for (int j = 0; j < k; j++) {
             if (out[j].id < 0 || v > out[j].logit) {
                 for (int l = k - 1; l > j; l--) out[l] = out[l - 1];
@@ -1256,7 +1266,7 @@ int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
             }
         }
     }
-    if (!isfinite(max_logit)) return 0;
+    if (!have_max) return 0;
 
     double sum = 0.0;
     for (int i = 0; i < n_vocab; i++) {
@@ -1275,12 +1285,17 @@ int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
                              pulsar_token_score *out) {
     if (!logits || !out || n_vocab <= 0 || token < 0 || token >= n_vocab) return 0;
 
-    float max_logit = PULSAR_NEG_INF;
+    float max_logit = 0.0f;
+    bool have_max = false;
     for (int i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (isfinite(v) && v > max_logit) max_logit = v;
+        if (!isfinite(v)) continue;
+        if (!have_max || v > max_logit) {
+            max_logit = v;
+            have_max = true;
+        }
     }
-    if (!isfinite(max_logit)) return 0;
+    if (!have_max) return 0;
 
     double sum = 0.0;
     for (int i = 0; i < n_vocab; i++) {

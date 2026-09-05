@@ -397,10 +397,19 @@ void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
                                       const pulsar_tokens *prompt,
                                       pulsar_prefix_match *out);
+/** Greedy token over the session's live logits: the first finite value seeds,
+ * the lowest id wins a tie. @return the id, or -1 when no logit is finite. */
 int pulsar_session_argmax(pulsar_session *s);
+/** pulsar_session_argmax with `excluded_id` removed from the row. @return the id, or -1. */
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
+/** Sample one token from a logits row under (temperature, top-k, top-p,
+ * min-p); the row twin of pulsar_session_sample.  Greedy (temperature <= 0)
+ * consumes no rng word.
+ * @return the token id, or -1 for a row no distribution can be drawn from
+ * (no finite logit). */
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
+/** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
