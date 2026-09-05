@@ -1735,6 +1735,9 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
             pool, (uint32_t)PULSAR_SERVER_DECODE_QUANTUM_TOKENS);
     const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
     const uint64_t bound = s->guard_touched_budget;
+    /* No breach, no plan: the common quantum costs one gauge read, as before
+     * the plan-then-execute split (review of abc847f). */
+    if (pulsar_session_touched_kv_bytes(pool) + delta <= bound) return;
     /* Finding 2: free_physical zeroes a spilled bank's frontier, so a spill
      * drops touched by exactly that bank's touched bytes (the pool gauge IS
      * the per-bank sum, gpu_graph_touched_kv_bytes). guard_spill_plan walks
