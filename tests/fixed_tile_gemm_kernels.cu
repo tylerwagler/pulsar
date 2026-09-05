@@ -321,6 +321,16 @@ static int fb_run_tn(fb_ctx *c, const float *x_dev, int M, float *D_dev) {
     return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
+/* L183: write the engine's bf16 activation PLANE for x (the bf16-weight GEMM
+ * reads only a producer-emitted plane since L159; the probe is the producer
+ * here, with the same RNE rounding the engine's kernels use). */
+extern "C" int fb_emit_plane(const pulsar_gpu_tensor *x, int M, int K, void *xb) {
+    if (!x || !xb || M < 1 || K < 1 || x->bytes < (uint64_t)M * K * sizeof(float)) return 4;
+    const uint64_t n = (uint64_t)M * K;
+    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>((uint16_t *)xb, (const float *)x->ptr, n);
+    return cudaGetLastError() == cudaSuccess ? 0 : 10;
+}
+
 extern "C" int fb_run(fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
     if (!c || !x || !D || M < 1 || M > c->m_max) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;

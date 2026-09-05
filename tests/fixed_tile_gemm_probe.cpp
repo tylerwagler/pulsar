@@ -156,6 +156,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "activation encode failed for %s\n", shapes[si].name);
             return 1;
         }
+        /* L183: the bf16-weight GEMM reads a producer-emitted bf16 plane only
+         * (L159); the probe is that producer for its synthetic x. */
+        if (is_bf16) {
+            void *xb = NULL;
+            if (!pulsar_gpu_bf16_act_slot(c.x, MMAX, c.in_dim, &xb) ||
+                fb_emit_plane(c.x, (int)MMAX, (int)c.in_dim, xb) != 0 || ft_sync() != 0) {
+                fprintf(stderr, "bf16 plane emit failed for %s\n", shapes[si].name);
+                return 1;
+            }
+            pulsar_gpu_bf16_act_note(c.x, MMAX, c.in_dim);
+        }
         /* LT slabs straight from the mmap: [data N*K][scale rup(N,128)*rup(K/32,4)] */
         const uint8_t *host = (const uint8_t *)e->model.map + w->abs_offset;
         const size_t data_bytes = (size_t)N * K;
