@@ -1221,6 +1221,21 @@ typedef enum {
                                       per-reason counters, not a reason */
 } provision_refusal;
 
+/** Rate limiter for a warning about a PER-REQUEST condition that the worker
+ * re-evaluates every quantum (L190 C1): one line per period, carrying the
+ * count of occurrences the period swallowed, so the log shows the condition
+ * is still live without a line per retry -- and never a single line per
+ * process for something that happens per request. */
+typedef struct {
+    double last_sec;      ///< wall clock of the last line printed; 0 = never printed
+    unsigned suppressed;  ///< occurrences since that line
+} warn_limiter;
+/** True when the caller should log now; *skipped receives the occurrences
+ * suppressed since the previous line (0 on the first). */
+bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsigned *skipped);
+/** Period of the MemAvailable-floor provisioning refusal line. */
+#define PULSAR_SERVER_MEM_FLOOR_WARN_SEC 10.0
+
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
  * ONE worker thread does every piece of engine work; client threads only parse,
@@ -1308,6 +1323,7 @@ struct server {
     uint64_t     guard_eager_bytes;      ///< eager floor already resident
     uint64_t     guard_evictions;        ///< spills performed, for metrics
     char         spill_dir[512];         ///< LOCAL fast-disk scratch for spills (never NAS, never tmpfs)
+    warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
     /** Trivial-match threshold for the choose-vs-provision routing decision:
      * template-header tokens measured at startup +
      * PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS (cli_main.cpp; immutable after

@@ -5953,6 +5953,51 @@ static void test_l179_lane_abandon_needs_decode_and_hangup(void) {
     TEST_ASSERT(!lane_should_abandon(NULL, false, sv[0]));
     TEST_ASSERT(!lane_should_abandon(&g, false, -1));
     close(sv[0]);
+
+    /* L190 C3: a writer that has FAILED (EPIPE, stall, overflow, shutdown) is
+     * a gone client too, socket state notwithstanding -- with a LIVE peer and
+     * no fd at all, the same phase/feed rule applies. */
+    int live[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, live) == 0);
+    if (live[0] < 0 || live[1] < 0) return;
+    memset(&g, 0, sizeof g);
+    g.writer.failed = true;
+    for (size_t pi = 0; pi < sizeof phases / sizeof phases[0]; pi++)
+    for (int require = 0; require < 2; require++)
+    for (int valid = 0; valid < 2; valid++) {
+        g.phase = phases[pi];
+        g.batch_feed_valid = valid != 0;
+        const bool want = phases[pi] == GEN_DECODE && (!require || valid);
+        TEST_ASSERT(lane_should_abandon(&g, require != 0, live[0]) == want);
+        TEST_ASSERT(lane_should_abandon(&g, require != 0, -1) == want);
+    }
+    g.writer.failed = false;
+    g.phase = GEN_DECODE;
+    g.batch_feed_valid = true;
+    TEST_ASSERT(!lane_should_abandon(&g, true, live[0]));
+    close(live[0]);
+    close(live[1]);
+}
+
+/* L190 C1: the MemAvailable-floor refusal is a per-request condition; its
+ * warning prints once per period and carries the count the period swallowed,
+ * instead of once per process. */
+static void test_l190_mem_floor_warn_is_rate_limited(void) {
+    warn_limiter w = {0};
+    unsigned skipped = 99;
+    TEST_ASSERT(warn_limiter_due(&w, 100.0, 10.0, &skipped));   /* first: prints */
+    TEST_ASSERT(skipped == 0);
+    TEST_ASSERT(!warn_limiter_due(&w, 101.0, 10.0, &skipped));  /* inside the period */
+    TEST_ASSERT(!warn_limiter_due(&w, 109.9, 10.0, &skipped));
+    TEST_ASSERT(skipped == 0);                                   /* untouched while suppressed */
+    TEST_ASSERT(w.suppressed == 2);
+    TEST_ASSERT(warn_limiter_due(&w, 110.0, 10.0, &skipped));   /* period elapsed: prints */
+    TEST_ASSERT(skipped == 2);                                   /* ...and reports the two */
+    TEST_ASSERT(w.suppressed == 0);
+    TEST_ASSERT(w.last_sec == 110.0);
+    TEST_ASSERT(!warn_limiter_due(&w, 115.0, 10.0, &skipped));
+    TEST_ASSERT(warn_limiter_due(&w, 130.0, 10.0, &skipped));
+    TEST_ASSERT(skipped == 1);
 }
 
 /* L179 branch 6 (i) -- fork_make_room's LRU-superseded victim scan
@@ -6430,6 +6475,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_lane_select_spec_needs_every_decoder();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
+    test_l190_mem_floor_warn_is_rate_limited();
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_warm_match_usable_rule();
     test_l179_guard_victim_skips_pinned_live_spilled();

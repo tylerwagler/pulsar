@@ -2251,7 +2251,21 @@ void server::generate_job_step(session_slot *sl) {
 /* Unbind: drain deferred client bytes, free the resumable state. */
 void server::generate_job_end(session_slot *sl) {
     auto *s = this;
-    if (sl->gen) slot_writer_drain(&sl->gen->writer);
+    if (sl->gen) {
+        /* A writer that failed EARLIER already ended the job (lane_should_abandon
+         * / the emit path) and logged why; a drain that fails HERE is the one
+         * failure nothing else reports -- the final response never reached the
+         * client (L190 C3). */
+        slot_writer *w = &sl->gen->writer;
+        const bool failed_before = w->failed;
+        if (!slot_writer_drain(w) && !failed_before)
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: ctx=%s%s%s client stream failed at drain: "
+                       "%zu final bytes undelivered",
+                       sl->gen->ctx_span,
+                       sl->gen->req_flags[0] ? " " : "", sl->gen->req_flags,
+                       w->pending.len - w->off);
+    }
     s->gen_state_free(sl);
     sl->active_job = NULL;
     sl->state = SLOT_IDLE;

@@ -244,6 +244,17 @@ static bool server_bank_floor_refuses(int n_provisioned, uint64_t avail, uint64_
     return n_provisioned > 0 && (avail == 0 || !server_mem_floor_admits(avail, marginal));
 }
 
+bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsigned *skipped) {
+    if (w->last_sec != 0.0 && now_sec - w->last_sec < period_sec) {
+        w->suppressed++;
+        return false;
+    }
+    *skipped = w->suppressed;
+    w->suppressed = 0;
+    w->last_sec = now_sec;
+    return true;
+}
+
 session_slot *server::provision_bank(provision_refusal *refusal) {
     auto *s = this;
     *refusal = PROVISION_OK;
@@ -268,14 +279,20 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * admission pressure on a tight box belongs to the SECOND bank onward. */
     const uint64_t avail = server_mem_available_bytes();
     if (server_bank_floor_refuses(n_provisioned, avail, s->bank_marginal_bytes)) {
-        static bool warned; /* single worker thread */
-        if (!warned) {
-            warned = true;
+        /* A per-request condition: the head job is re-tried every quantum and
+         * the next job meets the same floor.  One line per period with the
+         * count it swallowed (L190 C1); a once-per-process line hid every
+         * refusal after the first. */
+        unsigned skipped = 0;
+        if (warn_limiter_due(&s->mem_floor_warn, server_now_sec(),
+                             PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped)) {
             server_log(PULSAR_LOG_WARNING,
                        "pulsar-server: bank provisioning refused: MemAvailable %.2f GiB "
-                       "below floor for marginal %.2f GiB (job queued)",
+                       "below floor for marginal %.2f GiB (job queued; %u refusals "
+                       "in the last %.0f s not logged)",
                        (double)avail / (1024.0 * 1024.0 * 1024.0),
-                       (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0));
+                       (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
+                       skipped, PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
         }
         *refusal = PROVISION_REFUSED_MEM_FLOOR;
         return NULL;
@@ -285,9 +302,19 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
     /* Install and reset the bank to an empty conversation with a valid (empty)
      * host carry, so routing/metrics read pos 0 and gen_begin cold-prefills. A
      * free (SLOT_EVICTED) bank is never guard-spilled (spilled banks stay
-     * provisioned), so this switch never restores — the result is
-     * unconditionally true. */
-    (void)s->bank_switch(idx);
+     * provisioned), so this never restores from disk -- but the state restore
+     * that installs the bank can still refuse (bank_switch's contract: a bank
+     * whose slabs are missing).  Then the bank is NOT installed and live_bank
+     * still names another bank; resetting and saving "bank idx" here would
+     * clobber THAT bank's carry with an empty one.  Refuse the provision and
+     * let worker_try_bind fail the job (eviction cannot relieve this). */
+    if (!s->bank_switch(idx)) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: bank %d install failed (state restore refused); "
+                   "provisioning refused, job fails", idx);
+        *refusal = PROVISION_REFUSED_CREATE_FAIL;
+        return NULL;
+    }
     pulsar_session_invalidate(pool);
     pulsar_session_bank_state_save(pool, (uint32_t)idx);
     sl->provisioned = true;
@@ -1353,6 +1380,28 @@ bool server::worker_try_bind() {
         pthread_mutex_unlock(&j->mu);
         return true;
     }
+    if (!sl && refusal == PROVISION_REFUSED_CREATE_FAIL) {
+        /* The bank the pool offered could not be installed (provision_bank:
+         * state restore refused).  Eviction does not relieve it and retrying
+         * every quantum would hard-spin on an empty pool (worker_main's wait
+         * predicate), so answer the client with a 500 and pop the job, the
+         * way the context-length reject above does. */
+        s->note_provision_refusal(j, refusal);
+        pthread_mutex_lock(&s->mu);
+        s->head = j->next;
+        if (!s->head) s->tail = NULL;
+        if (s->n_queued > 0) s->n_queued--;
+        pthread_mutex_unlock(&s->mu);
+        j->next = NULL;
+        const char *emsg = "session bank could not be installed (state restore refused)";
+        if (j->req.api == API_ANTHROPIC) http_error_anthropic(j->fd, 500, emsg);
+        else http_error(j->fd, 500, emsg);
+        pthread_mutex_lock(&j->mu);
+        j->done = true;
+        pthread_cond_signal(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+        return true;
+    }
     if (!sl) {
         /* Still queued. A no-op when the head is merely waiting on a busy
          * owner slot (refusal stays PROVISION_OK there). */
@@ -1620,7 +1669,17 @@ bool server::spill_bank(session_slot *victim) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     const uint32_t vb = victim->bank;
-    (void)s->bank_switch((int)vb);         /* victim never spilled (pick excludes) → true */
+    /* The victim is never spilled (the pick excludes spilled banks), so this
+     * never reloads from disk, but the installing state restore can refuse.
+     * Then live_bank still names another bank and the kv_save below would
+     * snapshot THAT bank's rings under the victim's file name (L190 A4).
+     * Abort the spill; the caller stops spilling this quantum. */
+    if (!s->bank_switch((int)vb)) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: guard: bank %u install failed (state restore refused); "
+                   "spill aborted", vb);
+        return false;
+    }
     char path[600];
     snprintf(path, sizeof path, "%s/spill-bank-%u.kv", s->spill_dir, vb);
     /* Durability: free_physical below drops the bank's only other copy, so this
@@ -1842,16 +1901,33 @@ static void park_live_bank(server *s, session_slot **dec, int n, const session_s
 
 /* L118 per-quantum client-liveness poll, shared by the three batched lanes
  * (L179 branch 13). A slot is abandoned iff it is mid-decode (GEN_DECODE),
- * its client has hung up (gen_client_disconnected: POLLRDHUP on fd) and --
- * on the lanes that ask for it -- its batch_feed is valid. The plain and
- * mixed lanes require batch_feed_valid (their abandon path also clears it,
- * so the pending commit is dropped exactly once); the spec lane does not
+ * its client is gone and -- on the lanes that ask for it -- its batch_feed is
+ * valid. "Gone" is either signal: the socket hung up (gen_client_disconnected:
+ * POLLRDHUP on fd), or the slot's writer has already FAILED (EPIPE, stall
+ * timeout, pending overflow, shutdown -- genmsg.cpp slot_writer_send/flush/
+ * drain).  A failed writer used to be read only by the next byte-producing
+ * emit, so a stream holding bytes back (tool-tag or stop-sequence hold)
+ * decoded on for a client that could no longer hear it (L190 C3).  The plain
+ * and mixed lanes require batch_feed_valid (their abandon path also clears
+ * it, so the pending commit is dropped exactly once); the spec lane does not
  * (its per-slot epilogue finishes a dead client through the normal path).
  * The asymmetry is the caller's, stated at each call. */
 static bool lane_should_abandon(const gen_state *g, bool require_batch_feed, int fd) {
     if (!g || g->phase != GEN_DECODE) return false;
     if (require_batch_feed && !g->batch_feed_valid) return false;
+    if (g->writer.failed) return true;
     return gen_client_disconnected(fd);
+}
+
+/* The abandon itself, shared by the three lanes: name the signal, stop the
+ * slot (drop_feed on the lanes whose pending commit must be dropped once). */
+static void lane_abandon(gen_state *g, bool drop_feed) {
+    server_log(PULSAR_LOG_DEFAULT,
+               "pulsar-server: %s, abandoning generation after %d tokens",
+               g->writer.failed ? "client stream failed" : "client disconnected",
+               g->completion);
+    if (drop_feed) g->batch_feed_valid = false;
+    g->phase = GEN_FINISH;
 }
 
 void server::worker_batched_decode_quantum(session_slot **dec, int n) {
@@ -1876,13 +1952,8 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
      * cadence. */
     for (int i = 0; i < n; i++) {
         gen_state *pg = dec[i]->gen;
-        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/true, pg->j->fd)) {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
-                       pg->completion);
-            pg->batch_feed_valid = false;
-            pg->phase = GEN_FINISH;
-        }
+        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/true, pg->j->fd))
+            lane_abandon(pg, /*drop_feed=*/true);
     }
 
     /* ENTRY: a slot not yet in the batch samples its first feed token from its
@@ -2103,12 +2174,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
      * final write fails harmlessly on the dead fd). */
     for (int i = 0; i < n; i++) {
         gen_state *pg = dec[i]->gen;
-        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/false, pg->j->fd)) {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
-                       pg->completion);
-            pg->phase = GEN_FINISH;
-        }
+        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/false, pg->j->fd))
+            lane_abandon(pg, /*drop_feed=*/false);
     }
 
     pulsar_spec_round *rounds[PULSAR_SESSION_POOL_CAP] = {0};
@@ -2407,6 +2474,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             pulsar_spec_round *live_rounds[PULSAR_SPEC_LOGITS_ROWS];
             uint32_t live_banks[PULSAR_SPEC_LOGITS_ROWS];
             uint64_t *live_rngs[PULSAR_SPEC_LOGITS_ROWS];
+            session_slot *live_slots[PULSAR_SPEC_LOGITS_ROWS];
             int nl = 0;
             for (int q = 0; q < m && nl < (int)PULSAR_SPEC_LOGITS_ROWS; q++) {
                 session_slot *sl = dec[live_idx[q]];
@@ -2414,6 +2482,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 live_rounds[nl] = rounds[live_idx[q]];
                 live_banks[nl] = (uint32_t)sl->bank;
                 live_rngs[nl] = &sl->gen->rng;
+                live_slots[nl] = sl;
                 nl++;
             }
             char rerr[160];
@@ -2424,7 +2493,18 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                            "pulsar-server: batched redraft failed: %s (banks take a plain step)",
                            rerr);
             for (int q = 0; q < nl; q++) {
-                if (!s->bank_switch(live_banks[q])) continue;
+                if (!s->bank_switch(live_banks[q])) {
+                    /* bank_switch's contract: a failed state restore fails the
+                     * request.  Skipping the commit left the bank's ring holding
+                     * an uncommitted draft and the slot decoding on (L190 D1). */
+                    gen_state *g = live_slots[q]->gen;
+                    snprintf(g->err, sizeof g->err,
+                             "bank %u state restore failed before redraft commit",
+                             (unsigned)live_banks[q]);
+                    g->finish = "error";
+                    g->phase = GEN_FINISH;
+                    continue;
+                }
                 pulsar_session_spec_redraft_commit(pool, live_rounds[q]);
                 pulsar_session_bank_state_save(pool, live_banks[q]);
             }
@@ -2567,13 +2647,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
      * continued-store caveat as the plain lane). */
     for (int i = 0; i < n; i++) {
         gen_state *lg = dec[i]->gen;
-        if (lg && lane_should_abandon(lg, /*require_batch_feed=*/true, lg->j->fd)) {
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: client disconnected, abandoning generation after %d tokens",
-                       lg->completion);
-            lg->batch_feed_valid = false;
-            lg->phase = GEN_FINISH;
-        }
+        if (lg && lane_should_abandon(lg, /*require_batch_feed=*/true, lg->j->fd))
+            lane_abandon(lg, /*drop_feed=*/true);
     }
 
     /* Decode-bank ENTRY — identical to worker_batched_decode_quantum. */
