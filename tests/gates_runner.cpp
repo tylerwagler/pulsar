@@ -256,6 +256,10 @@ int main(int argc, char **argv) {
          * must share (filler 1100 -> ~2217 tokens).  Mutation-validated: the
          * n_tokens > 1 sort condition fails it on all 129280 logits. */
         {"cuda-row-neutrality-gate-deep", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"1100", NULL}},
+        /* L175: the same at ~10k tokens (n_comp ~2600, the pow2<4096> ranking
+         * bucket): the 1-row indexer scorer vs the N-row tier (L173) and the
+         * ranking kernel past the 2048 boundary, on logits. */
+        {"cuda-row-neutrality-gate-deeper", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"4200", NULL}},
         /* L168: the ratio-4 compressor state after an unaligned whole-prompt
          * prefill has the decode store's layout (complete group at 0..3,
          * partial rows at 4 + phase) and its content, at r = 1, 2, 3. */

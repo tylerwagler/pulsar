@@ -71,7 +71,11 @@ int GATE_ENTRY(int argc, char **argv) {
     float *C = NULL, *A = NULL, *B = NULL, *D = NULL;
     int rc = 1;
     {
-        if (pulsar_session_create(&s, e, 4096) != 0) { fprintf(stderr, "session failed\n"); goto done; }
+        /* Filler words are ~2-3 tokens each; size the context so the deep
+         * entries (L170: 1100 -> ~2217 tokens; L175: 4200 -> ~10k) fit. */
+        int ctx = 4096;
+        while (ctx < filler * 3 + 512) ctx *= 2;
+        if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session failed (ctx %d)\n", ctx); goto done; }
         if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "pool has %d banks\n", pulsar_session_bank_count(s)); goto done; }
 
         if (filler > 0) {

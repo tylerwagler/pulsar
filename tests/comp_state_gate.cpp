@@ -137,21 +137,21 @@ static int sync_prefix(pulsar_session *s, const pulsar_tokens *full, int len, ch
 }
 
 /* Check one compressor (attn or indexer) at one r: returns layers checked. */
-static int check_one(pulsar_gpu_graph *gA, state_rows *A, state_rows *B, uint32_t il, int indexer, uint32_t r,
+static int check_one(pulsar_gpu_graph *gA, state_rows *A, state_rows *B, uint32_t il, int indexer, uint32_t r, int has_full,
                      double *worst_full, double *min_part, double *worst_part) {
     (void)gA;
     const char *what = indexer ? "indexer" : "attn";
     const uint32_t w = A->width;
-    /* PLACEMENT on the prefill(L) state */
+    /* PLACEMENT on the prefill(L) state (has_full: the chunk has a complete group) */
     for (uint32_t row = 0; row < STATE_ROWS; row++) {
-        const int want = (row < 4u) ? 1 : (row < 4u + r ? 1 : 0);
+        const int want = (row < 4u) ? has_full : (row < 4u + r ? 1 : 0);
         const int got = row_kind(A, row);
         if (got != want) {
             printf("  FAIL layer %2u %-7s r=%u: state row %u is %s, expected %s\n", il, what, r, row,
                    got == 1 ? "populated" : got == 0 ? "empty" : "malformed", want ? "populated" : "empty");
             g_fail = 1;
         }
-        const int gotB = row_kind(B, row);
+        const int gotB = B ? row_kind(B, row) : want;
         if (gotB != want) {
             printf("  FAIL layer %2u %-7s r=%u: DECODE-built state row %u is %s, expected %s (fixture broken)\n",
                    il, what, r, row, gotB == 1 ? "populated" : gotB == 0 ? "empty" : "malformed",
@@ -159,6 +159,7 @@ static int check_one(pulsar_gpu_graph *gA, state_rows *A, state_rows *B, uint32_
             g_fail = 1;
         }
     }
+    if (!B) return 1;   /* short-prompt pass: placement only */
     /* COMPLETE GROUP: rows 0..3 within COMP_GROUP_TOL of the aligned prefill's rebuild */
     const double d_full_kv = rel_l1(B->kv, A->kv, 4ull * w);
     const double d_full_sc = rel_l1(B->sc, A->sc, 4ull * w);
@@ -288,7 +289,7 @@ int GATE_ENTRY(int argc, char **argv) {
                     if (!a->ok) continue;
                     state_rows *b = &B[il * 2u + (uint32_t)ix];
                     if (!read_state(&s->graph, il, ix, b)) { fprintf(stderr, "read decode state layer %u\n", il); goto done; }
-                    checked += check_one(&s->graph, a, b, il, ix, r, &worst_full, &min_part, &worst_part);
+                    checked += check_one(&s->graph, a, b, il, ix, r, 1, &worst_full, &min_part, &worst_part);
                     free_state(a); free_state(b);
                 }
             }
@@ -298,6 +299,24 @@ int GATE_ENTRY(int argc, char **argv) {
             total_checked += checked;
         }
         if (total_checked == 0) { fprintf(stderr, "comp_state_gate: no ratio-4 compressor state found\n"); goto done; }
+        /* L175: whole prompts shorter than the window (L = 1, 2, 3): no complete
+         * group, rows 0..3 empty, rows 4..4+L-1 the partial group.  Placement
+         * only (there is no shorter prefill to decode from). */
+        for (int L = 1; L <= 3; L++) {
+            if (sync_prefix(s, &prompt, L, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L, err); goto done; }
+            int checked = 0;
+            double d0 = 0.0, d1 = 0.0, d2 = 0.0;
+            for (uint32_t il = 0; il < n_layer; il++) {
+                if (pulsar_layer_compress_ratio(il) != 4u) continue;
+                for (int ix = 0; ix < 2; ix++) {
+                    state_rows a;
+                    if (!read_state(&s->graph, il, ix, &a)) continue;
+                    checked += check_one(&s->graph, &a, NULL, il, ix, (uint32_t)L, 0, &d0, &d1, &d2);
+                    free_state(&a);
+                }
+            }
+            printf("short prompt L=%d: %d compressor states checked, placement%s\n", L, checked, g_fail ? " FAIL" : " OK");
+        }
         /* L171: ring aliasing after a 9-token whole prompt */
         {
             if (sync_prefix(s, &prompt, L_RING, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L_RING, err); goto done; }

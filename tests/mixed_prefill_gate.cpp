@@ -30,7 +30,7 @@ static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
 static int g_fail;
 #define NGEN 24
-#define C0   128            /* first (classic) chunk: lifts frontier off 0, ratio-aligned */
+#define C0   130            /* first (classic) chunk: lifts frontier off 0; NOT ratio-aligned (L175: the K-row run then starts at pos0 % 4 == 2, the per-row compressor arm every prefix-cache resume takes three times in four) */
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static char *read_file(const char *p, size_t *n){ FILE *f=fopen(p,"rb"); if(!f)return NULL;
