@@ -125,7 +125,65 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
 
 
 
-__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+/* L188: the non-finite flag for the routed experts.
+ *
+ * Until 2026-09-05 the MMQ down GEMM ran a whole-buffer pass that rewrote every
+ * NaN/Inf to 0.0f (ds4_mmq_sanitize_f32) -- a plausible number from a different
+ * computation, emitted as a token, with no message and no counter.  There is no
+ * sanitizer anywhere now.  Instead the per-token reduction, which is the one
+ * kernel every routed arm already runs over every output element, checks the
+ * sum it is about to store: a non-finite sum means at least one expert's down
+ * row was non-finite (NaN and Inf both propagate through the add), and the
+ * flag records the FIRST (layer, arm) that tripped -- atomicCAS from 0, so a
+ * NaN that propagates through every later layer does not overwrite the origin.
+ * The kernel pays one isfinite per output element and no atomic on the good
+ * path; the host reads the 4 bytes at the step's stream drain
+ * (pulsar_gpu_end_commands -> pulsar_gpu_routed_moe_nonfinite_take), which is
+ * already a synchronisation point, so the decode lane pays no extra sync.
+ *
+ * Code layout: bits 0..7 = layer_index + 1 (0 means "clear"), bits 8..15 = arm. */
+__device__ static uint32_t g_moe_nonfinite = 0u;
+
+enum moe_nonfinite_arm {
+    MOE_NF_ARM_MMQ_DOWN     = 1,   ///< IQ2_XXS MMQ down (routed_moe_launch)
+    MOE_NF_ARM_GROUPED_DOWN = 2,   ///< grouped CUTLASS MXFP4 down (routed_moe_launch_cutlass_grouped)
+    MOE_NF_ARM_GEMV_DOWN    = 3,   ///< small-batch MXFP4 GEMV down (pulsar_cutlass_expert_ffn_gemv_small)
+    MOE_NF_ARM_MIXED_DOWN   = 4,   ///< mixed type-40/type-43 down (routed_moe_launch_mixed40)
+};
+
+/** The flag value moe_sum stores for a non-finite sum at (layer_index, arm). */
+static __host__ __device__ __forceinline__ uint32_t moe_nonfinite_code(uint32_t layer_index, uint32_t arm) {
+    return (arm << 8) | ((layer_index + 1u) & 0xffu);
+}
+
+/** Record `nf_code` in the flag if `acc` is not finite (first writer wins). */
+__device__ static __forceinline__ void moe_flag_nonfinite(float acc, uint32_t nf_code) {
+    if (!isfinite(acc)) atomicCAS(&g_moe_nonfinite, 0u, nf_code);
+}
+
+int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm) {
+    uint32_t code = 0u;
+    if (!cuda_ok(cudaMemcpyFromSymbol(&code, g_moe_nonfinite, sizeof code, 0, cudaMemcpyDeviceToHost),
+                 "routed MoE non-finite flag read")) return -1;
+    if (code == 0u) return 0;
+    const uint32_t zero = 0u;
+    if (!cuda_ok(cudaMemcpyToSymbol(g_moe_nonfinite, &zero, sizeof zero, 0, cudaMemcpyHostToDevice),
+                 "routed MoE non-finite flag clear")) return -1;
+    if (layer_index) *layer_index = (code & 0xffu) - 1u;
+    if (arm) {
+        switch (code >> 8) {
+        case MOE_NF_ARM_MMQ_DOWN:     *arm = "MMQ down"; break;
+        case MOE_NF_ARM_GROUPED_DOWN: *arm = "grouped CUTLASS MXFP4 down"; break;
+        case MOE_NF_ARM_GEMV_DOWN:    *arm = "small-batch MXFP4 GEMV down"; break;
+        case MOE_NF_ARM_MIXED_DOWN:   *arm = "mixed type-40/type-43 down"; break;
+        default:                      *arm = "unknown arm"; break;
+        }
+    }
+    return 1;
+}
+
+__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens,
+                                      uint32_t nf_code) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
     if (gid >= n) return;
@@ -133,6 +191,7 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
     for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    moe_flag_nonfinite(acc, nf_code);
     out[gid] = acc;
 }
 
@@ -233,7 +292,7 @@ __global__ static void moe_padded_gather_kernel(
  * -1, matching the padded_pair<0 convention, and contribute nothing. */
 __global__ static void moe_sum_padded_kernel(
         float *out, const float *ffn_out, const int32_t *pair_slot,
-        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t nf_code) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
     if (gid >= n) return;
@@ -244,6 +303,7 @@ __global__ static void moe_sum_padded_kernel(
         const int32_t R = pair_slot[(uint64_t)tok * n_expert + e];
         if (R >= 0) acc += ffn_out[(uint64_t)R * out_dim + row];
     }
+    moe_flag_nonfinite(acc, nf_code);
     out[gid] = acc;
 }
 
@@ -282,6 +342,7 @@ static int routed_moe_launch_cutlass_grouped(
         uint32_t n_expert,
         float clamp,
         const pulsar_gpu_tensor *x,
+        uint32_t layer_index,
         uint32_t n_tokens) {
     if (!out || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
@@ -430,7 +491,8 @@ static int routed_moe_launch_cutlass_grouped(
      * The MMQ down arm still writes `down`. */
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
     moe_sum_padded_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-            (float *)out->ptr, ffn_out, pair_slot, out_dim, n_expert, n_tokens);
+            (float *)out->ptr, ffn_out, pair_slot, out_dim, n_expert, n_tokens,
+            moe_nonfinite_code(layer_index, MOE_NF_ARM_GROUPED_DOWN));
     return cuda_ok(cudaGetLastError(), "moe_grouped padded sum launch");
 }
 
@@ -442,13 +504,13 @@ static int routed_moe_launch_cutlass_dispatch(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* The grouped GEMM is the only path for this shape.  A failure here is a
      * failure. */
     const int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+            selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
     if (!rc) {
         static int said = 0;
         if (!said) { said = 1; fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
@@ -515,7 +577,7 @@ static int routed_moe_launch_mixed40(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     const int caseA = (gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4);   /* gate/up MXFP4, down MMQ */
     const int caseB = (down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4);   /* gate/up MMQ, down MXFP4 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
@@ -823,7 +885,8 @@ static int routed_moe_launch_mixed40(
     if (!ok) return 0;
 
     uint64_t n = (uint64_t)n_tokens * out_dim;
-    moe_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr, down_flat, out_dim, n_expert, n_tokens);
+    moe_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr, down_flat, out_dim, n_expert, n_tokens,
+                                                          moe_nonfinite_code(layer_index, MOE_NF_ARM_MIXED_DOWN));
     return cuda_ok(cudaGetLastError(), "mixed40 sum");
 }
 
@@ -1227,7 +1290,8 @@ static int routed_moe_launch(
          * set means one of them ran. */
         if (ok) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens,
+                                                     moe_nonfinite_code(layer_index, MOE_NF_ARM_MMQ_DOWN));
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         return ok;
@@ -1386,7 +1450,8 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             }
             const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-                    (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+                    (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens,
+                    moe_nonfinite_code(layer_index, MOE_NF_ARM_GEMV_DOWN));
             if (!cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 0;
             return 1;
         }
@@ -1396,7 +1461,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                          down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x,
-                                         n_tokens);
+                                         layer_index, n_tokens);
     }
     if ((gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4) != (down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4)) {
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
@@ -1404,7 +1469,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                                         selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
     }
     return routed_moe_launch(out, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,

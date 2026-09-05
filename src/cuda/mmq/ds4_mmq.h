@@ -83,9 +83,13 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 // (any other value takes the generic MMQ kernel).  For V4
 // Flash, n_expert_used = 6.
 //
-// Output is NOT nonfinite-sanitized: the routed-MoE consumers
-// (moe_mmq_swiglu / moe_sum with guard_nonfinite=1) sanitize at read.
-// New callers must sanitize at consumption.
+// Output is NOT nonfinite-sanitized, and nothing downstream sanitizes it
+// either (L188).  The routed-MoE reduction (moe_sum_kernel /
+// moe_sum_padded_kernel, pulsar_cuda_moe.cu) sets a device-side flag when it
+// sums a non-finite value; pulsar_gpu_end_commands reads that flag at the
+// step's stream drain and refuses the step, naming the layer and the arm.
+// A NaN/Inf here is a defect upstream (activation encoding, scale slab,
+// weight resolution) and is reported, never rewritten.
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 

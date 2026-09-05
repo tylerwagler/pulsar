@@ -243,23 +243,14 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // from plain pointers + shape ints instead of ggml_tensor introspection.
 // ----------------------------------------------------------------------------
 
-// Per-device singleton context. Owns the pool for stream-K fixup scratch used
-// by the dense and routed entry points.
-namespace {
-
-__global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = p[i];
-    if (!isfinite(v)) p[i] = 0.0f;
-}
-
-static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
-    if (!p || n == 0) return;
-    ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
-}
-
-} // anonymous namespace
+// The whole-buffer non-finite pass that used to follow the routed down GEMM
+// (ds4_mmq_sanitize_f32: `if (!isfinite(v)) p[i] = 0`) is GONE (L188).  It
+// turned a NaN/Inf -- the one signal that the activation encoding, the scale
+// slab or the weight resolution went wrong -- into a plausible zero, with no
+// message and no counter.  A non-finite routed-expert output now trips a
+// device-side flag in the consumer's reduction (moe_sum_kernel /
+// moe_sum_padded_kernel in pulsar_cuda_moe.cu) and the step refuses at its
+// stream drain (pulsar_gpu_end_commands), naming the layer and the arm.
 
 
 
@@ -300,10 +291,6 @@ int ds4_mmq_moe_impl(
          * kernel loads tiles from it directly and W is ignored (see mmq_args). */
         const char    * x_soa      = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
-         * when every consumer sanitizes at read (the routed-MoE swiglu/sum
-         * kernels do). */
-        bool            sanitize_out = true,
         /* The activation: the producer's E4M3 [n_tokens, K] plus its ue8m0
          * plane (pulsar_mx_sfoff swizzle, act_kbp blocks per row).  Required;
          * every activation stride below is derived from K. */
@@ -530,9 +517,6 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: D2R launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    if (sanitize_out) {
-        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-    }
     return 0;
 }
 
@@ -565,8 +549,6 @@ int ds4_mmq_moe_pair_impl(
         const char    * xa_soa     = NULL,
         const char    * xb_soa     = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): see ds4_mmq_moe_impl. */
-        bool            sanitize_out = true,
         /* The activation, as in ds4_mmq_moe_impl: the producer's E4M3 plus
          * its ue8m0 plane and pitch.  Required. */
         const void    * act_q      = NULL,
@@ -770,11 +752,6 @@ int ds4_mmq_moe_pair_impl(
         return -1;
     }
     }
-
-    if (sanitize_out) {
-        ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-    }
     return 0;
 }
 
@@ -819,12 +796,11 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    /* sanitize_out=false: see ds4_mmq_q2_K_moe_soa. */
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
-        /*sanitize_out=*/false, act_q, act_sf, act_kbp);
+        act_q, act_sf, act_kbp);
 }
 
 
@@ -855,8 +831,9 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
  * Upstream has q2_K_moe_soa (single) and iq2_xxs_moe_pair_soa (pair) but no
  * IQ2 SINGLE soa entry; a routed DOWN whose tensor is IQ2 rather than Q2_K
  * (our v5mx) needs exactly that.  Body mirrors ds4_mmq_q2_K_moe_soa with the
- * IQ2 block count from ds4_mmq_iq2_xxs_moe_pair_soa (blocks, not row-pairs),
- * and keeps sanitize_out=true so semantics match the raw entry it replaces. */
+ * IQ2 block count from ds4_mmq_iq2_xxs_moe_pair_soa (blocks, not row-pairs).
+ * Its output is NOT sanitized (L188): the consumer's moe_sum flags a
+ * non-finite value and the step refuses. */
 extern "C" int ds4_mmq_iq2_xxs_moe_soa(
         const void * W_soa, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -870,6 +847,5 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe_soa", W_soa, ids, out,
                                                M, K, n_tokens, n_experts, n_expert_used, stream,
                                                (const char *)W_soa, nblk,
-                                               /*sanitize_out=*/true,
                                                act_q, act_sf, act_kbp);
 }

@@ -425,6 +425,11 @@ extern std::unordered_set<uint64_t> g_fp8_offsets;
 
 #include "pulsar_cuda_scratch.h"   /* cuda_tmp_alloc + the slotted bump arena */
 void cuda_fp8_weight_cache_clear(void);
+/** L188: read-and-clear the routed experts' non-finite flag (pulsar_cuda_moe.cu).
+ * Returns 1 and names the first (layer, arm) whose per-token reduction summed a
+ * non-finite value, 0 when the flag is clear, -1 on a CUDA error.  Called once
+ * per step at the stream drain (pulsar_gpu_end_commands); a 1 fails the step. */
+int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
 int cublas_ok(cublasStatus_t st, const char *what);

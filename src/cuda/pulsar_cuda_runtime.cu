@@ -1563,7 +1563,21 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
-    return cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands");
+    if (!cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands")) return 0;
+    /* L188: the stream is drained -- this is where every step reads its logits
+     * back -- so the routed experts' non-finite flag is read here, once, with no
+     * extra synchronisation.  A set flag fails the step by name; nothing
+     * downstream rewrites a NaN into a number. */
+    uint32_t nf_layer = 0u;
+    const char *nf_arm = NULL;
+    const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
+    if (nf < 0) return 0;
+    if (nf > 0) {
+        fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) -- refusing the step "
+                        "(no sanitizer rewrites it; L188)\n", nf_layer, nf_arm);
+        return 0;
+    }
+    return 1;
 }
 
 
