@@ -1186,6 +1186,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           const int32_t *compact,
                           bool defer_redraft,
                           double t0,
+                          const int32_t *forced_truth,
                           int *accepted, int accepted_cap,
                           char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
@@ -1216,10 +1217,25 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * The rejected row's replacement becomes the carry token. All three paths
      * yield the exact per-token target distribution. */
     int carry_tok = -1;
-    const int commit_rc = spec_accept_walk(s, read_row, read_ud, compact, row0,
-                                           row_tops, pend, K, pend_sampled,
-                                           temperature, top_k, top_p, min_p,
-                                           rng, &carry_tok);
+    int commit_rc;
+    if (forced_truth) {
+        /* TEACHER-FORCED end (gate-facing, L182): the walk is replaced by
+         * equality against the true continuation -- draft i is accepted iff it
+         * IS truth[i], the carry is the first true token the drafts did not
+         * cover, and no draw is made.  The context the redraft conditions on
+         * is the corpus, so the drafter's next proposal is a deterministic
+         * function of (model, drafter, context).  Everything after this point
+         * -- controllers, metrics, the trim, the redraft -- runs as in
+         * production. */
+        commit_rc = 0;
+        while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
+        carry_tok = (int)forced_truth[commit_rc];
+    } else {
+        commit_rc = spec_accept_walk(s, read_row, read_ud, compact, row0,
+                                     row_tops, pend, K, pend_sampled,
+                                     temperature, top_k, top_p, min_p,
+                                     rng, &carry_tok);
+    }
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
         (void)spec_frontier_restore(&frontier, s);
@@ -1559,7 +1575,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                           temperature, top_k, top_p, min_p, rng,
                           spec_row_read_classic, g, 0u,
                           g->spec_compact_rows >= r.n_batch ? g->spec_compact_host : NULL,
-                          false, t0, accepted, accepted_cap, err, errlen);
+                          false, t0, NULL, accepted, accepted_cap, err, errlen);
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -1741,13 +1757,14 @@ static bool spec_row_read_dev(void *ud, uint32_t row, float *out) {
     return gpu_graph_read_spec_logits_row(d->g, d->row0 + row, out);
 }
 
-int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token, int eos_token,
-                               float temperature, int top_k, float top_p,
-                               float min_p, uint64_t *rng,
-                               const float *rows, uint32_t row0,
-                               int *accepted, int accepted_cap,
-                               char *err, size_t errlen) {
+static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
+                                int first_token, int eos_token,
+                                float temperature, int top_k, float top_p,
+                                float min_p, uint64_t *rng,
+                                const float *rows, uint32_t row0,
+                                const int32_t *forced_truth,
+                                int *accepted, int accepted_cap,
+                                char *err, size_t errlen) {
     pulsar_gpu_graph *g = &s->graph;
     /* L149 phase 2: the step read the compact block instead of `rows`. Row
      * argmaxes come from its headers (the host tie rule, computed on device);
@@ -1776,7 +1793,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                               spec_row_read_dev, &src, row0, g->spec_compact_host,
                               true /* L150: redraft deferred to the batch */,
                               0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
-                              accepted, accepted_cap, err, errlen);
+                              forced_truth, accepted, accepted_cap, err, errlen);
     }
     /* Greedy walk consumes per-row argmaxes; the classic forward computes
      * them on-device, the shared block computes them here. Draft i is judged
@@ -1791,7 +1808,36 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           spec_row_read_block, &src, row0, NULL,
                           true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
-                          accepted, accepted_cap, err, errlen);
+                          forced_truth, accepted, accepted_cap, err, errlen);
+}
+
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
+                               int first_token, int eos_token,
+                               float temperature, int top_k, float top_p,
+                               float min_p, uint64_t *rng,
+                               const float *rows, uint32_t row0,
+                               int *accepted, int accepted_cap,
+                               char *err, size_t errlen) {
+    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+                                min_p, rng, rows, row0, NULL, accepted, accepted_cap,
+                                err, errlen);
+}
+
+int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
+                                      int first_token, int eos_token,
+                                      float temperature, int top_k, float top_p,
+                                      float min_p, uint64_t *rng,
+                                      const float *rows, uint32_t row0,
+                                      const int32_t *truth,
+                                      int *accepted, int accepted_cap,
+                                      char *err, size_t errlen) {
+    if (!truth) {
+        snprintf(err, errlen, "spec round_end_forced: no truth");
+        return -1;
+    }
+    return spec_round_end_block(s, r, first_token, eos_token, temperature, top_k, top_p,
+                                min_p, rng, rows, row0, truth, accepted, accepted_cap,
+                                err, errlen);
 }
 
 

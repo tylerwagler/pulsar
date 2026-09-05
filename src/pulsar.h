@@ -603,6 +603,23 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen);
+/** Gate-facing (L182): pulsar_session_spec_round_end with the acceptance walk
+ * replaced by TEACHER FORCING.  Draft i is accepted iff it equals truth[i]; the
+ * carry is the first true token the drafts did not cover, so `truth` must hold
+ * K + 1 ids (K = the round's pending drafts).  No draw is made and rng is
+ * untouched; controllers, metrics, the trim and the deferred redraft run as in
+ * production, so the next redraft is conditioned on the corpus and the
+ * drafter's proposal becomes a deterministic function of the context.  The
+ * teacher-forced acceptance probe (tests/spec_teacher_forced_probe.cpp) reads
+ * that proposal against the target's row at fixed positions. */
+int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
+                                      int first_token, int eos_token,
+                                      float temperature, int top_k, float top_p,
+                                      float min_p, uint64_t *rng,
+                                      const float *rows, uint32_t row0,
+                                      const int32_t *truth,
+                                      int *accepted, int accepted_cap,
+                                      char *err, size_t errlen);
 void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
 /** Arm (n_rows > 0) or disarm (0) the drafter anchor capture + Stage-B comp
  * saves for the NEXT batched forward -- the shared verify step saves every
