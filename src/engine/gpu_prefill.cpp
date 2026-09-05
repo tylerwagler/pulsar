@@ -1439,11 +1439,10 @@ bool gpu_graph_encode_layer_attention_batch(
              * that zeroed it as "dead" made the kernels skip compressed
              * attention outright (n_comp == 0 is "no comp operand"). */
             if (mseq) {
-                n_comp = 0u;
-                for (uint32_t t = 0; t < n_tokens; t++) {
-                    const uint32_t v = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
-                    if (v > n_comp) n_comp = v;
-                }
+                /* The step's superset, computed and cap-checked once in
+                 * step_begin (L178: this used to re-derive it from
+                 * ms_positions with no cap check). */
+                n_comp = g->batch_comp_sup[il];
             } else {
                 n_comp = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
             }
@@ -2699,7 +2698,7 @@ bool gpu_graph_encode_layer_batch(
          * need to: a rewind can never target into an aligned chunk, and the
          * newest-first walk stops before any pre-chunk entry. */
         if (g->r128_perrow_chunk) {
-            const uint32_t utail = n_tokens < 32u ? n_tokens : 32u;
+            const uint32_t utail = n_tokens < PULSAR_REWIND_RING_DEPTH ? n_tokens : PULSAR_REWIND_RING_DEPTH;
             for (uint32_t k = 0; k < utail; k++)
                 gpu_graph_r128_undo_note_pos(g, pos0 + n_tokens - utail + k);
         }

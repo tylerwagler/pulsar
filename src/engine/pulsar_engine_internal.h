@@ -874,7 +874,7 @@ typedef struct {
      * layer_r128_undo_* below; banked lanes ride the state-view repoint. */
     pulsar_gpu_tensor *layer_r128_undo_kv[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane view, KV half (pos %% 32 addressed)
     pulsar_gpu_tensor *layer_r128_undo_sc[PULSAR_MAX_LAYER];  ///< ratio-128 undo lane view, score half
-    uint32_t r128_undo_pos[32];  ///< host ring of stored positions, newest-first walked by rewind()
+    uint32_t r128_undo_pos[PULSAR_REWIND_RING_DEPTH];  ///< host ring of stored positions, newest-first walked by rewind()
     uint32_t r128_undo_head;     ///< next push slot in the host ring
     uint32_t r128_undo_n;        ///< live entries (<= PULSAR_REWIND_RING_DEPTH)
     /** Scratch, per chunk: the per-row extension arm captured this chunk's
@@ -1135,6 +1135,12 @@ typedef struct {
      * multiseq step; NULL in production single-session serving. */
     uint32_t ms_n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];        ///< compressed KV rows per (bank, layer); the authoritative frontier
     uint32_t ms_n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];  ///< compressed INDEX rows per (bank, layer); ratio-4 only
+    /** The step's cross-bank compressed-row superset per layer, max over the
+     * step's rows of (pos + 1) / ratio: computed ONCE in step_begin (where it
+     * is checked against layer_comp_cap) and read by the layer encode as the
+     * comp operand bound of every attention/indexer launch.  It used to be
+     * re-derived from ms_positions at the encode with no cap check (L178). */
+    uint32_t batch_comp_sup[PULSAR_MAX_LAYER];
     /** L120 value-half: per-bank projection-ring span bounds (see
      * proj_ring_lo/hi), captured/installed with ms_n_comp.  Zeroed on fork
      * and spill-restore: an uncovered rewind skips the value restore. */
@@ -1142,7 +1148,7 @@ typedef struct {
     uint32_t ms_proj_ring_hi[PULSAR_MSEQ_MAX];  ///< one past the newest; lo == hi means the ring is empty
     /** L124: per-bank undo-log host state, captured/installed with ms_n_comp;
      * zeroed on fork and spill-restore. */
-    uint32_t ms_r128_undo_pos[PULSAR_MSEQ_MAX][32];  ///< positions in the bank's undo log, newest at head
+    uint32_t ms_r128_undo_pos[PULSAR_MSEQ_MAX][PULSAR_REWIND_RING_DEPTH];  ///< positions in the bank's undo log, newest at head
     uint32_t ms_r128_undo_head[PULSAR_MSEQ_MAX];     ///< ring index the next entry is written at
     uint32_t ms_r128_undo_n[PULSAR_MSEQ_MAX];        ///< entries currently live (<= PULSAR_REWIND_RING_DEPTH)
     /** Tier-2 Option F: per-bank DSpark drafter-ring frontier counters (the

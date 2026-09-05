@@ -623,13 +623,18 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
 /* plan-33 inc C: base alignment for a partial cut = LCM of the layer compress
  * ratios (128 on Flash): a multiple-of-LCM cut leaves every ratio-128 layer with
  * an EMPTY in-progress group; only ratio-4 layers straddle (boundary row). */
+static uint32_t u32_gcd(uint32_t a, uint32_t b) { while (b) { const uint32_t t = a % b; a = b; b = t; } return a; }
 uint32_t pulsar_partial_fork_base_align(void) {
     static uint32_t a = 0;
     if (a == 0u) {
+        /* The LCM, computed as stated -- the code used to take the max, which
+         * equals the LCM only while every ratio divides the largest (true for
+         * {4, 128}; an invariant that lived in the comment, L178). */
         uint32_t m = 4u;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             const uint32_t r = pulsar_layer_compress_ratio(il);
-            if (r > m) m = r;
+            if (r == 0u) continue;
+            m = m / u32_gcd(m, r) * r;
         }
         a = m;
     }
@@ -1103,7 +1108,8 @@ bool gpu_graph_r128_undo_capture(pulsar_gpu_graph *g, uint32_t il, uint32_t pos)
      * row is pos %% 32 (unique within any restorable window -- ghost
      * overshoot <= 16 < 32, same argument as the L120 projection ring). */
     const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
-    const uint64_t state_off = (uint64_t)(pos % 128u) * row_bytes;
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);   /* the state ring is ratio rows */
+    const uint64_t state_off = (uint64_t)(pos % ratio) * row_bytes;
     const uint64_t lane_off = (uint64_t)(pos % PULSAR_REWIND_RING_DEPTH) * row_bytes;
     return pulsar_gpu_tensor_copy_async(uk, lane_off, g->layer_attn_state_kv[il],
                                         state_off, row_bytes) != 0 &&
@@ -1117,7 +1123,7 @@ void gpu_graph_r128_undo_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
      * are fine: restore is idempotent per lane row. */
     g->r128_undo_pos[g->r128_undo_head] = pos;
     g->r128_undo_head = (g->r128_undo_head + 1u) % PULSAR_REWIND_RING_DEPTH;
-    if (g->r128_undo_n < 32u) g->r128_undo_n++;
+    if (g->r128_undo_n < PULSAR_REWIND_RING_DEPTH) g->r128_undo_n++;
 }
 
 void gpu_graph_proj_ring_note_pos(pulsar_gpu_graph *g, uint32_t pos) {
@@ -1293,14 +1299,14 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         if (t > 0 && seq[t] == seq[t - 1]) continue;
         const uint32_t b = (uint32_t)seq[t];
         const uint32_t p = (uint32_t)pos[t];
-        const bool use_scalars = capture_cur && b == cur_bank;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint32_t have_comp = use_scalars ? gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)
-                                                   : g->ms_n_comp[b][il];
-            const uint32_t have_index = use_scalars ? gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)
-                                                    : g->ms_n_index_comp[b][il];
+            /* Stage 1b made the per-bank array the only frontier storage; the
+             * cur-bank selector that stood here chose between two names for
+             * the same memory (L178). */
+            const uint32_t have_comp = g->ms_n_comp[b][il];
+            const uint32_t have_index = g->ms_n_index_comp[b][il];
             if (have_comp != p / ratio ||
                 (ratio == 4 && have_index != p / ratio)) {
                 fprintf(stderr,
@@ -1370,6 +1376,9 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             return false;
         }
     }
+    /* One authority for the step's comp bound: the layer encode reads
+     * batch_comp_sup instead of re-deriving it from ms_positions (L178). */
+    memcpy(g->batch_comp_sup, sup, sizeof(uint32_t) * PULSAR_N_LAYER);
     /* All rejection points passed: NOW commit the cur-bank capture. */
     if (capture_cur) gpu_graph_bank_counters_capture(g, cur_bank);
     /* STAGE 1b: the cross-bank SUPERSET is no longer written anywhere.
@@ -1441,12 +1450,10 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        uint32_t sup = 0;
         for (uint32_t t = 0; t < n_rows && ok; t++) {
             if (t + 1 < n_rows && g->ms_seq_id[t + 1] == g->ms_seq_id[t]) continue;
             const uint32_t b = (uint32_t)g->ms_seq_id[t];
             const uint32_t want = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
-            if (want > sup) sup = want;
             if (g->ms_n_comp[b][il] != want ||
                 (ratio == 4 && g->ms_n_index_comp[b][il] != want)) {
                 fprintf(stderr,
@@ -1462,7 +1469,6 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
          * several banks' rows wrote through; there is no shared value now, so
          * the failure mode is unrepresentable rather than merely detected.
          * The per-bank assertions above are the real check and they remain. */
-        (void)sup;
     }
     return ok;
 }

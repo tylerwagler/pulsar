@@ -1373,6 +1373,13 @@ void pulsar_session::invalidate() {
      * drafter-relative, so restarting at 0 is exact. */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
+    /* The projection-ring span describes the bank the views pointed at when
+     * it was deposited; after a repoint + invalidate it still advertised the
+     * OLD bank's positions over the NEW bank's lanes, and a rewind before the
+     * next deposit would have replayed them (L178).  Empty it: the next chunk
+     * or per-row store re-establishes the span. */
+    s->graph.proj_ring_lo = 0u;
+    s->graph.proj_ring_hi = 0u;
 }
 
 
@@ -1577,11 +1584,13 @@ void pulsar_session::rewind(int pos) {
             const uint32_t p = g2->r128_undo_pos[idx];
             if (p < (uint32_t)pos) break;
             const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
-            const uint64_t state_off = (uint64_t)(p % 128u) * row_bytes;
             const uint64_t lane_off = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * row_bytes;
             for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                if (pulsar_layer_compress_ratio(il) != 128u) continue;
+                const uint32_t ratio = pulsar_layer_compress_ratio(il);
+                if (ratio != 128u) continue;
                 if (!g2->layer_r128_undo_kv[il] || !g2->layer_r128_undo_sc[il]) continue;
+                /* the state ring is ratio rows; same expression as the capture (L178) */
+                const uint64_t state_off = (uint64_t)(p % ratio) * row_bytes;
                 if (pulsar_gpu_tensor_copy_async(g2->layer_attn_state_kv[il], state_off,
                                                  g2->layer_r128_undo_kv[il], lane_off, row_bytes) == 0 ||
                     pulsar_gpu_tensor_copy_async(g2->layer_attn_state_score[il], state_off,
