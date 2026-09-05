@@ -79,13 +79,22 @@ __global__ static void dspark_markov_step_kernel(
  * single-step entry reads back only the winning id (4 bytes, one copy); the
  * chained walk writes it straight into the device id feed.
  *
- * Tie-break: blocks map to ascending contiguous vocab ranges and the
- * per-block reduction breaks ties toward the lowest id.  Each thread here
- * scans its strided subset of blocks in ascending order with the same
- * strict-'>' merge, and the shared-memory tree keeps the lower-index side as
- * the incumbent, so the lowest-id global argmax is preserved exactly --
- * matching a sequential argmax over the vocab.
+ * Tie-break: the lowest id wins, matching a sequential argmax over the vocab.
+ * Blocks map to ascending contiguous vocab ranges and the per-block reduction
+ * breaks ties toward the lowest id, but a thread here scans blocks {t, t+256,
+ * ...}, so its incumbent can carry a HIGHER id than a later thread's -- so
+ * (value, id) is compared at every level, the strided scan and the
+ * shared-memory tree alike, with the lower id winning a tie.  The strict-'>'
+ * merge this replaces kept the lower THREAD, which at n_blocks > blockDim
+ * (505 > 256) let block 256 beat block 1 on an exact tie (L191 #5; drafts
+ * change only on exact ties).  A thread with no block holds (-inf, INT32_MAX)
+ * so it never wins a tie.
  */
+__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
+                                                  float v, int32_t id) {
+    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
+}
+
 __global__ static void dspark_markov_reduce_kernel(
         int32_t *dst,               /* winner id (L108 P1: points into the
                                      * chain's device id array, so the next
@@ -94,11 +103,9 @@ __global__ static void dspark_markov_reduce_kernel(
         const float *vals,
         uint32_t n_blocks) {
     float best_val = -INFINITY;
-    int32_t best_id = 0;
-    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
-        const float nb = vals[b];
-        if (nb > best_val) { best_val = nb; best_id = ids[b]; }
-    }
+    int32_t best_id = 0x7fffffff;
+    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x)
+        dspark_argmax_merge(&best_val, &best_id, vals[b], ids[b]);
 
     __shared__ float best_vals[256];
     __shared__ int32_t best_ids[256];
@@ -107,12 +114,9 @@ __global__ static void dspark_markov_reduce_kernel(
     best_ids[tid] = best_id;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float nb = best_vals[tid + stride];
-            if (nb > best_vals[tid]) {
-                best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-            }
-        }
+        if (tid < stride)
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         __syncthreads();
     }
     if (tid == 0) *dst = best_ids[0];
@@ -807,8 +811,8 @@ __global__ static void dspark_markov_step_banks_kernel(
     }
 }
 
-/* One block per bank: the same merge as dspark_markov_reduce_kernel over that
- * bank's partials, the winner written to dst[b * dst_stride]. */
+/* One block per bank: the same (value, id) merge as dspark_markov_reduce_kernel
+ * over that bank's partials, the winner written to dst[b * dst_stride]. */
 __global__ static void dspark_markov_reduce_banks_kernel(
         int32_t *__restrict__ dst,
         uint32_t dst_stride,
@@ -818,11 +822,9 @@ __global__ static void dspark_markov_reduce_banks_kernel(
     const uint32_t b = blockIdx.x;
     ids += (uint64_t)b * n_blocks; vals += (uint64_t)b * n_blocks;
     float best_val = -INFINITY;
-    int32_t best_id = 0;
-    for (uint32_t k = threadIdx.x; k < n_blocks; k += blockDim.x) {
-        const float nb = vals[k];
-        if (nb > best_val) { best_val = nb; best_id = ids[k]; }
-    }
+    int32_t best_id = 0x7fffffff;
+    for (uint32_t k = threadIdx.x; k < n_blocks; k += blockDim.x)
+        dspark_argmax_merge(&best_val, &best_id, vals[k], ids[k]);
     __shared__ float best_vals[256];
     __shared__ int32_t best_ids[256];
     const uint32_t tid = threadIdx.x;
@@ -830,12 +832,9 @@ __global__ static void dspark_markov_reduce_banks_kernel(
     best_ids[tid] = best_id;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float nb = best_vals[tid + stride];
-            if (nb > best_vals[tid]) {
-                best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-            }
-        }
+        if (tid < stride)
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         __syncthreads();
     }
     if (tid == 0) dst[(uint64_t)b * dst_stride] = best_ids[0];
