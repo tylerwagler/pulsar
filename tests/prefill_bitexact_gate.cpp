@@ -175,7 +175,7 @@
  *
  * usage: ./tests/prefill_bitexact_gate MODEL --dump  FILE
  *        ./tests/prefill_bitexact_gate MODEL --check FILE EXPECTED_BASELINE_REF
- *        ./tests/prefill_bitexact_gate MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]
+ *        ./tests/prefill_bitexact_gate MODEL --check-reference REF.bin TOKENS.bin [KL_TOL] [--prefill-chunk N]
  *            [--known-high d1,d2,...] [--known-flip d1,d2,...]
  *        (from the repo root — reads tests/long_context_story_prompt.txt;
  *         or `make cuda-prefill-gate` / `make cuda-prefill-gate-baseline`)
@@ -231,11 +231,16 @@ static uint32_t g_n_depths = 7u;
  * ring -- never touches the prefill's own frontier logits, so the byte gate
  * above was blind to L168 (the partial group dropped for every prompt with
  * n % 4 != 0) at every depth.  --dump-decode / --check-decode prefill D tokens,
- * run ONE classic decode step (the token at D from the same prompt) and record
- * THAT step's logits: they depend on the state the prefill left behind.  The
- * depths are chosen so the prefill ends in an unaligned partial group: 1001
- * (single chunk, n % 4 == 1), 4102 (chunked, 6-row remainder), 8197 (chunked,
- * 5-row remainder).  A distinct blob magic keeps the two blob kinds apart. */
+ * run DECODE_STEPS classic decode steps (the prompt's tokens at D..D+4) and
+ * record the LAST step's logits.  Five, not one: the partial group the
+ * prefill leaves behind is read only when the group CLOSES (the phase wraps,
+ * up to three steps later) and the pooled row is attended by the step after
+ * that -- measured 2026-09-05: a misplaced partial group left the first
+ * decode step's logits byte-identical at all three depths.  The depths end
+ * in an unaligned partial group: 1001 (single chunk, n % 4 == 1), 4102
+ * (chunked, 6-row remainder), 8197 (chunked, 5-row remainder).  A distinct
+ * blob magic keeps the two blob kinds apart. */
+#define DECODE_STEPS 5u
 static const uint32_t g_decode_depths[] = { 1001u, 4102u, 8197u };
 static int g_decode = 0;
 static const char *g_blob_magic = "DS4PFXG1";
@@ -498,12 +503,16 @@ static int prefill_logits_ctx(uint32_t depth, float *out, int width, int ctx) {
         return 0;
     }
     if (g_decode) {
-        /* L181: one classic decode step on the token at `depth` -- its logits
-         * read the compressor state, ring and seed the prefill left behind. */
-        if (pulsar_session_eval(s, g_toks.v[depth], err, sizeof(err)) != 0) {
-            fprintf(stderr, "PREFILL GATE: decode step failed after depth %u: %s\n", depth, err);
-            pulsar_session_free(s);
-            return 0;
+        /* L181: DECODE_STEPS classic decode steps on the prompt's tokens at
+         * depth..depth+4; the LAST step's logits are what the blob holds.  The
+         * group the prefill left half-built closes within these steps and its
+         * pooled compressed row is attended before the last one. */
+        for (uint32_t k = 0; k < DECODE_STEPS; k++) {
+            if (pulsar_session_eval(s, g_toks.v[depth + k], err, sizeof(err)) != 0) {
+                fprintf(stderr, "PREFILL GATE: decode step %u failed after depth %u: %s\n", k, depth, err);
+                pulsar_session_free(s);
+                return 0;
+            }
         }
     }
     const int got = pulsar_session_copy_logits(s, out, width);
@@ -752,6 +761,14 @@ static void row_entropy(const float *row, int width, double *H_out, double *p1_o
  * a control. */
 #define GATE_NET_DEAD_BAND 5e-5   /* = 0.005%, half of the last printed digit */
 
+/* L180: the reference mode's prefill chunk.  4096 is production parity; the
+ * --prefill-chunk override exists to grade OTHER chunkings of the same prompt
+ * against the same reference rows -- the prefill lane is not chunk-mate
+ * neutral (one extra token moves earlier tokens' deep hidden states by up to
+ * 12%), and whether that is a fidelity choice or noise is decided by the KL
+ * to the source per chunking, not argued.  Reference mode only. */
+static uint32_t g_ref_prefill_chunk = 4096u;
+
 static int depth_in_list(uint32_t d, const uint32_t *list, int n) {
     for (int i = 0; i < n; i++) if (list[i] == d) return 1;
     return 0;
@@ -829,7 +846,7 @@ static int run_check_reference(const char *model, const char *ref_path,
     memset(&opt, 0, sizeof(opt));
     opt.model_path = model;
     opt.backend = PULSAR_BACKEND_CUDA;
-    opt.prefill_chunk = 4096;   /* production parity, as in the byte gate */
+    opt.prefill_chunk = g_ref_prefill_chunk;   /* 4096 = production parity, as in the byte gate */
     opt.dspark_disable = true;
     if (gate_engine_open(&g_e, &opt) != 0) {
         fprintf(stderr, "engine open failed\n");
@@ -837,6 +854,8 @@ static int run_check_reference(const char *model, const char *ref_path,
         free(ref_rows);
         return 1;
     }
+    printf("  prefill chunk: %u%s\n", g_ref_prefill_chunk,
+           g_ref_prefill_chunk == 4096u ? " (production)" : " (L180 chunking probe)");
     const int width = pulsar_engine_logits_width(g_e);
     if (width <= 0) {
         fprintf(stderr, "bad logits width %d\n", width);
@@ -1152,7 +1171,7 @@ int GATE_ENTRY(int argc, char **argv) {
                      strcmp(argv[2], "--check-reference"))) {
         fprintf(stderr, "usage: %s MODEL --dump  FILE\n"
                         "       %s MODEL --check FILE EXPECTED_BASELINE_REF\n"
-                        "       %s MODEL --dump-decode  FILE            (L181: one decode step after each unaligned prefill)\n"
+                        "       %s MODEL --dump-decode  FILE            (L181: five decode steps after each unaligned prefill)\n"
                         "       %s MODEL --check-decode FILE EXPECTED_DECODE_BASELINE_REF\n"
                         "       %s MODEL --check-fidelity FILE EXPECTED_BASELINE_REF [KL_TOL]\n"
                         "       %s MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]\n",
@@ -1193,7 +1212,8 @@ int GATE_ENTRY(int argc, char **argv) {
         int enforce = 0;
         double tol = 1e30;
         /* --kl-baseline FILE : grade DIRECTION (closer/further from source)
-         * --dump-kl FILE     : record the current per-depth KL as a budget */
+         * --dump-kl FILE     : record the current per-depth KL as a budget
+         * --prefill-chunk N  : L180 -- grade another chunking of the same prompt */
         const char *kl_base_path = NULL, *kl_dump_path = NULL;
         for (int a = 5; a < argc; a++) {
             if (strncmp(argv[a], "--known-high", 12) == 0) {
@@ -1220,6 +1240,15 @@ int GATE_ENTRY(int argc, char **argv) {
                 const char *v = strchr(argv[a], '=');
                 if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
                 kl_dump_path = v;
+            } else if (strncmp(argv[a], "--prefill-chunk", 15) == 0) {
+                const char *v = strchr(argv[a], '=');
+                if (!v && a + 1 < argc) v = argv[++a]; else if (v) v++;
+                const unsigned long c = v ? strtoul(v, NULL, 10) : 0ul;
+                if (c < 16ul || c > 32768ul) {
+                    fprintf(stderr, "--prefill-chunk: %s is not a chunk size (16..32768)\n", v ? v : "(missing)");
+                    return 2;
+                }
+                g_ref_prefill_chunk = (uint32_t)c;
             } else {
                 tol = atof(argv[a]);
                 enforce = 1;
@@ -1328,7 +1357,7 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
 
-    const uint32_t deepest = g_depths[N_DEPTHS - 1] + (g_decode ? 1u : 0u);   /* decode mode reads the token at depth */
+    const uint32_t deepest = g_depths[N_DEPTHS - 1] + (g_decode ? DECODE_STEPS : 0u);   /* decode mode reads the tokens at depth..depth+4 */
     if (g_toks.len < (int)deepest) {
         fprintf(stderr, "prompt too short: %d tokens, need %u\n", g_toks.len, deepest);
         goto done;
@@ -1349,7 +1378,7 @@ int GATE_ENTRY(int argc, char **argv) {
     snprintf(hdr.build_ref, REF_LEN, "%s", PULSAR_GATE_BUILD_REF);
 
     printf("prefill bit-exactness gate%s: model=%s width=%d prompt_fnv=%016llx depths=",
-           g_decode ? " (DECODE STEP after each prefill, L181)" : "",
+           g_decode ? " (5 DECODE STEPS after each prefill, L181)" : "",
            pulsar_engine_model_name(g_e), width, (unsigned long long)hdr.prompt_fnv);
     for (uint32_t i = 0; i < N_DEPTHS; i++) printf("%s%u", i ? "," : "", g_depths[i]);
     printf("\n");
