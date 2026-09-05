@@ -1135,7 +1135,7 @@ static int routed_moe_launch(
          * own forwards (speculative verify batches are n>1 and already ran
          * E4M3).
          *
-         * ds4_mmq.cu:492 already refuses exactly this on the prefill down path
+         * mmq/ds4_mmq.cu already refuses exactly this on the prefill down path
          * by name -- "one activation format, every batch size" -- having been
          * written after a size-thresholded split hid a missing conversion for
          * two days.  This was the surviving instance of the thing that comment

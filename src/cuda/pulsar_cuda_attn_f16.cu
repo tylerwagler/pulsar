@@ -28,21 +28,25 @@
  * staged ONCE and used in both orientations: as the B operand transposed for
  * the scores, and as the B operand directly for the value sum.
  *
- * DECOMPOSITION.  Block = 16 heads (the MMA's M) x 8 warps.
- *   phase 1  S[16][16] = Q[16][512] . KV[16][512]^T
- *            2 n-tiles x 32 k-steps = 64 MMAs.  With 8 warps that is 2 n-tiles
- *            x a 4-way split of k, so each warp owns 8 k-steps and the four
+ * DECOMPOSITION.  Block = AF16_HPB = 32 heads (AF16_MT = 2 M-tiles of the
+ * MMA's M = AF16_HEADS = 16) x AF16_WARPS = 16 warps.
+ *   phase 1  S[32][16] = Q[32][512] . KV[16][512]^T
+ *            2 M-tiles x 2 n-tiles x AF16_KSTEPS = 32 k-steps = 128 MMAs.
+ *            The 16 warps split as job = warp & 3 (M-tile = job >> 1, n-tile =
+ *            job & 1) x kgrp = warp >> 2 (a 4-way split of k), so each warp
+ *            owns AF16_KPW = 8 k-steps of one (M-tile, n-tile) and the four
  *            partials are summed through smem.  Splitting k (not n) is what
  *            lets every warp hold its Q fragments in REGISTERS for the whole
  *            kernel -- 8 k-steps x 4 regs = 32 -- since Q never changes.
  *   phase 2  online softmax over the tile, f32, per head.
- *   phase 3  O[16][512] += P[16][16] . KV[16][512]
- *            warp w owns dims 64w..64w+63: 8 n-tiles x 1 k-step = 8 MMAs, and
- *            its accumulator is 16 heads x 64 dims = 32 regs/lane.
+ *   phase 3  O[32][512] += P[32][16] . KV[16][512]
+ *            warp w owns dims AF16_DPW*w..+31 (AF16_DPW = 32): 4 n-tiles x
+ *            2 M-tiles x 1 k-step = 8 MMAs, and its accumulator
+ *            acc[AF16_MT][AF16_DPW/8][4] is 32 heads x 32 dims = 32 regs/lane.
  *
  * The output accumulator is what sets the shape.  O is heads x 512 in f32, so
- * splitting the 512 across the 8 warps is the only way it fits in registers at
- * all: 16x512/(8x32) = 32 per lane.  Everything else follows from that.
+ * splitting the 512 across the 16 warps is the only way it fits in registers at
+ * all: 32x512/(16x32) = 32 per lane.  Everything else follows from that.
  *
  * Fragment layout is the one verified in tests/attn_mma_probe.cu, not the one
  * remembered from the ISA doc -- the block-scaled work turned up two layout
@@ -781,11 +785,10 @@ static int af16_device_supported(void) {
     return ok;
 }
 
-/* Only the fp16 tier consumes packed comp rows on the multi-token
- * single-sequence path; the f32 indexed kernel's own gate refuses them there
- * (descr || !comp_kv_pack || n_tokens == 1 || f16_idx_ok -- the last term IS
- * this function, widening the gate for the tier that reads pack natively).
- * So this answers for the tier that is actually going to run. */
+/* Does the backend's prefill attention read packed comp rows natively?  Since
+ * L166 the fp16 tier is the ONLY attention kernel and it reads ATTN_PACK comp
+ * rows always, so the answer is the tier flag itself: packed comp is readable
+ * exactly when the tier can run, and nothing else can run. */
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
     /* L106 K14: this had a body IDENTICAL to pulsar_gpu_attn_f16_tier_on and
      * the two drifted risk was real (same predicate, two caches).  The two
@@ -939,9 +942,11 @@ int pulsar_gpu_attention_f16_prefill(
 
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
  * top-k SELECTION (topk != NULL) or the visible prefix (topk == NULL).
- * Banked descriptors are all-or-nothing (positions+seq_id+comp_bank_ptrs
- * together or none -- a partial set is refused rather than guessed at), and
- * comp rows are ATTN_PACK, always -- the format parameter is gone (see the note
+ * Banked descriptors: positions and seq_id are a PAIR (one without the other
+ * is refused rather than guessed at); comp_bank_ptrs is optional under them --
+ * NULL means the scalar comp base + seq_id*comp_cap, which the dispatcher
+ * documents as bit-identical to a contiguous pool.  Comp rows are ATTN_PACK,
+ * always -- the format parameter is gone (see the note
  * on the kernel).  non_causal selects the raw visibility rule (kernel note:
  * RAW VISIBILITY); it is the drafter's raw-window forward and is passed
  * through unchanged.  A 0 here is a real failure, never a silent shape

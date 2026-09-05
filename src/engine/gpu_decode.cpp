@@ -83,11 +83,11 @@ int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 
 
-/* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
- * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
- * work buffer (indexer_scores) is allocated with only N token
- * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
- * 0 restores the historical full-chunk buffers. */
+/* Prefill score slice, in rows: the prefill [indexer score -> top-k -> indexed
+ * attention] sequence runs in <= slice-token spans so indexer_scores (the one
+ * ctx-scaling f32 work buffer with a token dimension) is allocated with slice
+ * rows instead of prefill_cap.  512, one number one place (validated bit-exact;
+ * the PULSAR_PREFILL_SLICE env override went with L159 inc 4). */
 uint32_t gpu_graph_prefill_slice(void) {
     /* The prefill score slice, in rows.  The env override had no caller
      * (L159 inc 4); one number, one place. */

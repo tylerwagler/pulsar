@@ -1976,13 +1976,10 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * gpu_graph_attn_comp_read_cache -- a full
                                                                         * dequantise of 584 B rows into a 2048 B f32
                                                                         * shadow, on the SHIPPED path, because the
-                                                                        * consumer could not read packed.  It can now:
-                                                                        * the f16 prefill entry takes comp_pack, and
-                                                                        * the scalar mixed kernel reads packed too, so
-                                                                        * BOTH arms of this launch now read packed:
-                                                                        * the f16 tier via comp_pack, and the cuBLAS
-                                                                        * two-GEMM arm via the packed branch added to
-                                                                        * attention_prefill_pack_mixed_kv_kernel. */
+                                                                        * consumer could not read packed.  The launcher
+                                                                        * has ONE arm now (L166): the fp16 tier reads
+                                                                        * the ATTN_PACK pool natively through comp_kv;
+                                                                        * no shadow, no second kernel. */
                                                                        mseq ? gpu_graph_bank_attn_comp_pool(g, il)
                                                                             : g->layer_attn_comp_cache[il],
                                                                        gact_data, gact_scale, gact_kbp,

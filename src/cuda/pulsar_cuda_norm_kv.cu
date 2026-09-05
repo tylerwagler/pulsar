@@ -508,15 +508,6 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
  * way).  (The E4M3 floor 1.0e-4f was checked and is NOT on a misround point.)
  * ============================================================================ */
 
-/* Exact ceil-log2 E8M0 bucket computed from float bit patterns — no log2f/ceilf,
- * so no --use_fast_math misrounding at bucket boundaries. For a max_repr equal to
- * M_m*2^(E_m-127), the smallest 2^k with max_repr*2^k >= amax has exponent field
- * (E_m+k) and mantissa M_m; comparing positive floats is comparing their bit
- * patterns, so k = exp(amax) - E_m + (mant(amax) > M_m). Re-encoding rows that are
- * already on the (grid * 2^m) lattice is then value-idempotent. */
-
-
-
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
     const char *p = (const char *)base + offset;
     if (type == 1u) return __half2float(((const __half *)p)[idx]);
@@ -555,11 +546,13 @@ __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
  * The recipe lives on in attn_pack_store. */
 
 /* PULSAR_ATTN_PACK store: quantize the nope dims of n_rows f32 rows of x with
- * the engine's ONE fp8 recipe (per-64 amax reduction, exp2(ceil(log2(amax/448)))
- * scale, clamp to +-448, E4M3 roundtrip), write the roundtripped f32 back into x (so
- * the stage/dumps show the same values the f32 pipeline produces), and store
- * the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h; 384 B at
- * head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
+ * the engine's ONE NVFP4 recipe (per-PULSAR_KV4_NV_BLOCK = 16 amax, one f32 row
+ * scale keyed so every block scale fits E4M3, a per-block E4M3 scale code whose
+ * DECODED value x row scale is what both the encode and every reader use, E2M1
+ * nibbles by dsv4_e2m1fn_encode_dev -- L111), write the roundtripped f32 back
+ * into x (so the stage/dumps show the same values the packed row decodes to),
+ * and store the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h;
+ * 384 B at head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
  * takes the same treatment one dtype up: bf16-roundtripped in place, then
  * stored.  Read-back is bit-identical to the f32 path. */
 /* `x` is the OPTIONAL f32 staging to round-trip in place; NULL when the source
@@ -736,10 +729,11 @@ __device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
 /* Fused indexer-q epilogue: rope the tail, then the Hadamard+FP4 QAT
  * round-trip, one 128-thread block per (token, head) row. Replaces the two
  * back-to-back launches over the same tensor (rope_tail_kernel then
- * indexer_hadamard_fp4_kernel), saving a full read+write of the buffer. The
+ * indexer_hadamard_fp4_pack_kernel), saving a full read+write of the buffer. The
  * rotation is the SAME device function rope_tail_kernel runs and the QAT
- * body is the same code as indexer_hadamard_fp4_kernel, in the same order,
- * so the result is bit-exact vs the two-launch sequence; the __syncthreads
+ * body is the same code as indexer_hadamard_fp4_pack_kernel, in the same order,
+ * so the PACKED row is bit-exact vs the two-launch sequence (this kernel writes
+ * no f32 back -- see the note at its QAT phase); the __syncthreads
  * between the phases stands in for the old kernel boundary (one block owns
  * the whole row, so a block-local barrier is equivalent). */
 __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
@@ -787,10 +781,10 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
     if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
 }
 
-/* Same QAT transform as indexer_rope_hadamard_fp4_kernel minus the rope (bit-identical f32 result
- * written back to x), additionally emitting the row in MXKV FP4 layout — E2M1
- * nibble pairs low-nibble-first followed by one E8M0 byte per 32-block — so a
- * packed indexer cache stores exactly the values the f32 path would.  The E8M0
+/* Same QAT transform as indexer_rope_hadamard_fp4_pack_q_kernel minus the rope,
+ * emitting the row in MXKV FP4 layout — E2M1 nibble pairs low-nibble-first
+ * followed by one E8M0 byte per 32-block; the dequantised f32 goes back into x
+ * only under keep_f32 (observers -- every consumer reads the packed row).  The E8M0
  * exponent clamp only differs from the unpacked path outside [2^-127, 2^127]
  * scales, which the 7e-38 amax floor already makes unreachable. */
 __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,

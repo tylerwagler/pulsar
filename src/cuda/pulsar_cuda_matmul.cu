@@ -155,7 +155,8 @@ __global__ static void matmul_nt_kernel(
 }
 
 /* L151-D: rows per block for the generic nt kernel -- same rule and same
- * neutrality argument as nt_a8_rows_per_warp: R never changes a (row, token)
+ * neutrality argument as the A8 twin PULSAR_FP8MX_ROWS_A8 (rows per warp,
+ * fixed at build time): R never changes a (row, token)
  * accumulator's sequence, so it may follow the row count.  1 up to 4 rows
  * (roofline already), 2 up to 8, 4 above; capped by out_dim (the 1 GB head
  * takes 4, N >= 8192 takes 2, small shapes stay 1). */
@@ -978,9 +979,10 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
     const mxfp8_act_cache_t *cover = act_slot_find_rows(ptr, n_tok, in_dim);
     if (cover && cover->valid && cover->xq && cover->sx) return 0;  ///< served from cache
     /* Matching the BASE pointer is not enough.  Consumers reach these buffers
-     * through offset VIEWS -- gpu_prefill.cpp:143 takes the last four rows of
-     * batch_attn_norm for the ratio-4 compressor rebuild and hands them to a
-     * plain matmul at n_tok=4.  A view keys no slot, so an equality test sees
+     * through offset VIEWS -- gpu_prefill.cpp:143-168 takes the last n_tail <= 7
+     * rows (n_full + rem, L168) of batch_attn_norm for the ratio-4 compressor
+     * rebuild and hands them to a plain matmul at n_tok = n_tail.  A view keys
+     * no slot, so an equality test sees
      * nothing and the GEMM quantizes from bytes that were never written.  Test
      * CONTAINMENT in the skipped buffer's extent instead.
      * (Cf. the standing lesson that consumers bypass the accessor: the bug
@@ -993,7 +995,7 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
         const char *p    = (const char *)ptr;
         if (p < base || p >= end) continue;
         /* Row-granular: the skip may deliberately KEEP a tail (the ratio-4
-         * rebuild reads the last four rows of attn_norm).  Absent rows are
+         * rebuild reads the last n_tail <= 7 rows of attn_norm).  Absent rows are
          * [0, f32_keep_from); a read is hazardous only if it TOUCHES them.
          * The read's row extent is computed in the SLOT's stride -- if the
          * reader's in_dim disagrees with the slot's, fall back to refusing,
@@ -2625,12 +2627,12 @@ int pulsar_gpu_attention_output_batch_tensor(
                                     group_dim, rank, n_groups, n_tokens, blocks_a, low_dim,
                                     (const pulsar_heads_t *)heads->ptr, "attn_out_a")) return 0;
     }
-    /* Emit `low` here too, for the same reason as the n==1 entry below: the "b"
-     * GEMM consumes it next. This entry is what the SERVER actually takes --
-     * with the drafter live, verify batches come through here, not through
-     * attention_output_low_tensor -- so emitting only there converted the
-     * benchmark and left production on f32. The bench has no drafter, so it
-     * could not have shown that. */
+    /* Emit `low` here, as the split-step suffix arm above does after its own
+     * "a" GEMM: the "b" GEMM consumes it next.  This entry is what the SERVER
+     * actually takes -- with the drafter live, verify batches come through
+     * here -- and an emission that once lived only on a since-deleted
+     * single-row entry converted the benchmark and left production on f32.
+     * The bench has no drafter, so it could not have shown that. */
     if (!emit_low_e4m3(low, n_tokens, low_dim)) return 0;
 
     return cuda_matmul_mxfp8_tensor_labeled(out,

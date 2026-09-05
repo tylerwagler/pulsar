@@ -899,7 +899,7 @@ typedef struct {
     void *spec_restore_copies;   ///< baked batched-copy handle, spec -> layer direction
     uint32_t spec_frontier_copy_n;          ///< tensors in each copy set
     uint64_t spec_frontier_copy_max_bytes;  ///< largest single copy, for staging
-    int spec_frontier_copy_init;            ///< tri-state: unbuilt / built / permanently failed (falls back to the per-tensor loop)
+    int spec_frontier_copy_init;            ///< 0 unbuilt (a failed prepare leaves it 0 and the next snapshot retries), 1 built; see spec_frontier_copy_tables_init
     /** Shared multi-row logits slab (16 rows x n_vocab f32), written by every
      * batched multi-row output head: the DSpark draft/verify passes,
      * gpu_graph_verify_suffix_tops, and the Tier-2 batched multi-session
@@ -1045,8 +1045,8 @@ typedef struct {
     pulsar_gpu_tensor *batch_q;                     ///< batched twin: queries in head space
     /** L037 lever 3: when q_prep_active, batch_q holds RAW head projections
      * for the current layer and every attention call this chunk passes
-     * &q_prep so the f16 kernel fuses norm+rope into its Q load (non-f16
-     * consumers apply the standalone kernel via the dispatch fallback).
+     * &q_prep so the f16 kernel fuses norm+rope into its Q load -- the only
+     * attention consumer since L166; there is no standalone q_prep kernel.
      * Set per layer at the Q-path norm decision in gpu_prefill. */
     pulsar_gpu_q_prep q_prep;
     int q_prep_active;  ///< the fused norm+rope Q path is armed for this layer
@@ -2477,11 +2477,11 @@ uint32_t gpu_graph_raw_start_for_span(
         uint32_t               last_pos,
         uint32_t               n_raw);
 bool gpu_graph_env_flag(const char *name, int *cache);
-/** PULSAR_PREFILL_SLICE=\<N\>: process the prefill [indexer score -> top-k ->
- * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
- * work buffer (indexer_scores) is allocated with only N token
- * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
- * 0 restores the historical full-chunk buffers.
+/** Prefill score slice, in rows: the prefill [indexer score -> top-k -> indexed
+ * attention] sequence runs in <= slice-token spans so indexer_scores (the one
+ * ctx-scaling f32 work buffer with a token dimension) is allocated with slice
+ * rows instead of prefill_cap.  512, one number one place (the
+ * PULSAR_PREFILL_SLICE env override went with L159 inc 4).
  */
 uint32_t gpu_graph_prefill_slice(void);
 /* True when PULSAR_IDX_FP4 is set (cached). When on, the ratio-4 indexer

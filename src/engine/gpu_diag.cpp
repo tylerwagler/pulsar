@@ -367,10 +367,11 @@ static bool gpu_graph_bank_slabs_alloc(
         const gpu_graph_dims *dz,
         bool                  enable_spec) {
     pulsar_bank_slabs *b = &g->banks;
-    /* The raw KV ring is PULSAR_ATTN_PACK rows: 584 B at head_dim 512, the same
-      * 448 E4M3 + 8 scale + 64 bf16 layout the compressed pool uses. It was
-      * __half (1024 B) until 2026-08-17, which spent 2 bytes per element on nope
-      * dims that hold E4M3 precision, in a dtype the source model has nowhere. */
+    /* The raw KV ring is PULSAR_ATTN_PACK rows: PULSAR_ENGINE_ATTN_PACK_ROWBYTES
+     * = 384 B at head_dim 512 (224 E2M1 nibble bytes + 28 E4M3 block scales +
+     * 4 B f32 row scale + 128 B bf16 rope tail), the same layout the compressed
+     * pool uses. It was __half (1024 B) until 2026-08-17, which spent 2 bytes
+     * per element on nope dims the source model holds at E4M3 precision. */
     b->n_banks = n_banks;
     b->cur_bank = 0;
     b->raw_bank_bytes = (uint64_t)dz->raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
@@ -1753,9 +1754,10 @@ bool gpu_graph_alloc_raw_cap(
         g->idx_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                  PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     }
-    /* PULSAR_PREFILL_SLICE: these two are the only ctx-scaling f32 work buffers
-     * with a prefill_cap token dimension; under slicing they only ever hold
-     * one <=slice-token span at a time. */
+    /* Prefill slice (gpu_graph_prefill_slice): indexer_scores is the one
+     * ctx-scaling f32 work buffer with a prefill_cap token dimension; under
+     * slicing it holds one <=slice-token span at a time.  comp_selected is
+     * uint32 and stays at the full pc -- the selection is whole-chunk. */
     const uint64_t score_rows = (gpu_graph_prefill_slice() != 0u &&
                                  (uint64_t)gpu_graph_prefill_slice() < pc)
         ? (uint64_t)gpu_graph_prefill_slice() : pc;

@@ -1336,8 +1336,9 @@ pulsar_context_memory pulsar_context_memory_estimate_packed(
 
     const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    /* Raw SWA ring: PULSAR_ATTN_PACK rows (584 B), not f16 (1024 B) since the
-     * KV-packing campaign; match the allocator (gpu_diag raw_bank_bytes). */
+    /* Raw SWA ring: PULSAR_ATTN_PACK rows (PULSAR_ENGINE_ATTN_PACK_ROWBYTES, 384 B
+     * at head_dim 512), not f16 (1024 B) since the KV-packing campaign; match
+     * the allocator (gpu_diag raw_bank_bytes). */
     m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
 
     /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */

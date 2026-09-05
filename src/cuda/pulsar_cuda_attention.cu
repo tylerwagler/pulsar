@@ -116,9 +116,12 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
                         "(mma.m16n8k16 needs sm_80+); no other kernel is built\n");
         return 0;
     }
-    /* One-shot branch report.  This is the RAW entry; pulsar-bench showed real
-     * prefill never reaches the mixed launch, so this is where production
-     * prefill attention is actually served. */
+    /* One-shot branch report.  This is the RAW entry: it serves the ratio-0
+     * (raw-window-only) layers of a zero-prefix chunk and a chunk's raw prefix
+     * (gpu_prefill.cpp raw_batch_attention / raw_prefix_tokens) -- twice a
+     * prefill.  The per-layer traffic carrier is attention_prefill_mixed_launch
+     * below, reached for every ratio-128 layer whose n_comp != 0 (see its twin
+     * comment). */
     static int raw_path_reported = 0;
     if (!raw_path_reported) {
         raw_path_reported = 1;

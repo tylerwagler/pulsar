@@ -104,10 +104,16 @@
 #define PULSAR_SHARED_ACT_ELT_SIZE 2u
 #define PULSAR_SHARED_ACT_ELT_FMT  PULSAR_ELT_F16   /* f16 staging; runtime-esz consumers */
 
-/** spec_logits row capacity.  The multi-row logits slab is sized to the
- * deepest speculative verify / multiseq head the engine ever emits
- * (PULSAR_MSEQ_MAX), NOT to prefill_cap -- guards on row indices must check
- * against THIS, or the 16 lives only in a comment. */
+/** spec_logits row capacity: the per-forward ROW BUDGET of the batched lane,
+ * NOT prefill_cap.  One shared forward carries every co-scheduled session's
+ * verify row plus its draft rows, so the server's ranked allocator fits draft
+ * depths to PULSAR_SPEC_LOGITS_ROWS - n_live and refuses a demand above it
+ * (server_sched.cpp); the multiseq ALL_ROWS head refuses n_rows above it
+ * (session_multiseq.cpp), and a plain PULSAR_MSEQ_MAX-row step must fit
+ * (static_assert PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS, imatrix.cpp).
+ * spec_logits, dspark_prefilter_sel, dspark_row_meta and spec_compact_host
+ * are all sized by this one constant (gpu_diag.cpp) -- guards on row indices
+ * must check against THIS, or the number lives only in a comment. */
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
  * measured sublinear c4 scaling); the ROWCOST table says marginal row cost
@@ -294,8 +300,11 @@ int pulsar_gpu_indexer_score_one_tensor(
  * score -INF.  Scalar n_comp = cross-bank superset (scan bound + scores-row
  * stride only).  NULL/NULL/0/1 = classic single-cache behavior bit-exactly.
  * Banked multi-token rows run the generic kernel (the WMMA tier stays
- * single-bank); banked n_tokens==1 keeps the direct-one fast tier so the
- * scan is bit-identical to classic single-token decode.
+ * single-bank).  A banked ONE-row descriptor launch at n_head 64 / head_dim
+ * 128 is refused here (L173: the direct-one kernel is gone and the generic
+ * kernel would be a second arithmetic for a row the tier serves); the engine
+ * scores such a run through the tier in scalar mode on the bank's view via
+ * pulsar_gpu_indexer_scores_decode_run_tensor.
  * L121: the engine now splits banked multi-token spans into same-bank
  * consecutive-position runs and feeds each through the run entry below
  * (block-scaled MXFP4 tier); this generic path remains the fallback for
@@ -343,7 +352,8 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
 
 /** Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
  * natively?  When it does, the engine hands it the packed cache directly and
- * skips dequantising into the f32 shadow -- 584 B/row instead of 2048, on the
+ * skips dequantising into the f32 shadow -- PULSAR_ATTN_PACK_ROWBYTES (384 B/row
+ * at head_dim 512) instead of 2048, on the
  * rows that dominate the tile, plus one whole pass removed.  Bit-exact either
  * way: packed rows decode to exactly the values the f32 cache would hold.
  * Backend-neutral question; the answer is a property of the backend's kernels,
@@ -352,8 +362,9 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
 
 /* fp16 tensor-core attention (m16n8k16, f32 accumulate).  Raw pointers: a leaf
  * kernel behind the attention launchers, which do the tensor-level checking.
- * Returns 0 on refusal or failure.  Requires head_dim == 512 and n_head a
- * multiple of 16.  Operand format chosen by measurement, not preference --
+ * Returns 0 on refusal or failure.  Requires head_dim == 512 (AF16_DIM) and
+ * n_head a multiple of 32 (AF16_HPB, the heads one block owns; every launcher
+ * refuses n_head % AF16_HPB).  Operand format chosen by measurement, not preference --
  * the operand study is in src/cuda/pulsar_cuda_attn_f16.cu's header, and
  * docs/engine-perf-map.md.  (It used to cite tests/attn_precision_fidelity.cc,
  * deleted in a71e346 -- L106 K8 -- when its dump-format producer left the
@@ -447,8 +458,11 @@ int pulsar_gpu_attention_f16_prefill(
  * compressed rows are a top-k selection (topk != NULL) or the visible prefix
  * (topk == NULL, the decode-batch sweep).  This is the ONE decode attention
  * kernel (L166): every row count, every context length, causal and
- * non-causal.  Banked descriptors (positions/seq_id/comp_bank_ptrs;
- * all-or-nothing) are served; comp rows are ATTN_PACK rows, always -- bank
+ * non-causal.  Banked descriptors are served: positions and seq_id are checked
+ * as a PAIR (one without the other is refused); comp_bank_ptrs is an optional
+ * per-bank base table -- NULL under descriptors means the scalar comp base +
+ * seq_id*comp_cap, bit-identical to a contiguous pool.  Comp rows are
+ * ATTN_PACK rows, always -- bank
  * isolation gated by tests/attn_f16_banked_test.cu.  Returns 0 on refusal or
  * failure. */
 int pulsar_gpu_attention_f16_indexed(
@@ -545,7 +559,7 @@ int pulsar_gpu_argmax_tensor(
  * @param out_dim        output width (N)
  * @param x              activation rows
  * @param n_tok          rows to multiply (M)
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_matmul_mxfp8_tensor(
         pulsar_gpu_tensor       *out,
@@ -796,7 +810,7 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
  *                       to f32 before it multiplies, so an f32 tensor stays
  *                       bit-exact. Pass the TENSOR's type; never assume, the
  *                       drafter and the main model can differ.
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_rms_norm_weight_mx_tensor(
         pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map,
@@ -820,7 +834,7 @@ int pulsar_gpu_rms_norm_weight_tensor(
  * and UE8M0 block scales emitted into out_q/out_sf (pass NULLs for f32 only; `out` may be NULL when out_q or out_b is set -- no f32 row is stored then).
  * Used by the drafter's per-row norms so its GEMVs read a slot, not f32.
  * n must be a multiple of 256 when out_q is set (fails loudly otherwise).
- * @return 0 on success. */
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`). */
 int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
                                               const void *model_map, uint64_t model_size,
                                               uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
@@ -871,7 +885,7 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(
  *                          this while a debug dump of that tensor is active --
  *                          the dump reads f32 and would silently show stale
  *                          bytes.
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         pulsar_gpu_tensor       *q_out,
@@ -926,7 +940,7 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * @param beta_slow   YaRN ramp end
  * @param eps         RMS epsilon
  * @param positions   optional per-row absolute positions; see the note above
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(
         pulsar_gpu_tensor *x,
@@ -1011,7 +1025,7 @@ uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
  * @param keep_f32  write the dequantised values back into the f32 staging.
  *                  OBSERVER-ONLY -- consumers read the packed rows. Pass
  *                  gpu_graph_f32_store_observed_any() (L094).
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_attn_pack_quantize_store_tensor(
         pulsar_gpu_tensor *x,
@@ -1055,10 +1069,9 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         uint32_t          head_dim,
         bool              keep_f32);
 
-/* Tell the indexer score kernels the indexer compressed cache is stored
- * MXKV-FP4-packed (68 B/row at head_dim 128) instead of f32. */
-
-/* Every KV buffer is PULSAR_ATTN_PACK rows -- 584 B at head_dim 512 -- so the
+/* Every KV buffer is PULSAR_ATTN_PACK rows -- PULSAR_ATTN_PACK_ROWBYTES(512) =
+ * 384 B: 224 E2M1 nibble bytes + 28 E4M3 block scales + 4 B f32 row scale +
+ * 128 B bf16 rope tail -- so the
  * attention readers and raw-KV writers below take NO format parameter.
  *
  * They carried one (`raw_f16`, later `raw_pack`) until 2026-08-17. Three storage
@@ -1739,7 +1752,7 @@ int pulsar_gpu_hc_weighted_sum_tensor(
  * @param eps                 collapse epsilon
  * @param norm_eps            RMS epsilon for the norm half
  * @param norm_w_bf16         1 when the norm weight is stored bf16 rather than f32
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
@@ -1785,7 +1798,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
  *                       0 F32. Templated rather than F16-gated -- the fusion is
  *                       about avoiding a scratch round trip, not about the
  *                       weight being 2 bytes.
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,

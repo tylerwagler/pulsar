@@ -1,10 +1,9 @@
 #include "pulsar_cuda_internal.h"
 
-/* When set, the indexer compressed cache is stored MXKV-FP4-packed
+/* The indexer compressed cache is always MXKV-FP4-packed
  * (PULSAR_MXKV_FP4_ROWBYTES(128) = 68 B/row: 64 E2M1 nibble pairs low-nibble-first
- * + 4 E8M0 block-32 scales) instead of f32.  The cache rows are QAT-roundtripped
- * to exactly these values in both modes, so the scores are bit-identical; packed
- * mode only changes storage and read traffic.  head_dim must be 128. */
+ * + 4 E8M0 block-32 scales); the score kernels read packed rows and nothing
+ * else.  head_dim must be 128. */
 
 
 /* E2M1 nibble -> float by PURE BIT MATH (sign, 2-bit exp, 1-bit mantissa).
@@ -95,8 +94,10 @@ __global__ static void indexer_scores_kernel(
             return;
         }
     }
-    /* Per-bank index base (see attention_decode_mixed_kernel): base-pointer table
-     * → separate per-bank allocation at LOCAL row; NULL → classic seq_id*comp_cap. */
+    /* Per-bank index base (the same addressing the fp16 attention tier's
+     * descriptor preamble applies to comp_bank_ptrs, pulsar_cuda_attn_f16.cu):
+     * base-pointer table → separate per-bank allocation at LOCAL row; NULL →
+     * classic seq_id*comp_cap. */
     const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
     const pulsar_mxkv_pack_t *index_src = index_bank_ptrs ? (const pulsar_mxkv_pack_t *)index_bank_ptrs[sid_b] : index_comp;
     const uint64_t comp_base = index_bank_ptrs ? 0u
@@ -224,8 +225,9 @@ __device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
  *   j <  4   partner is in the same thread   -> pure registers
  *   j <  128 partner is in the same warp     -> __shfl_xor_sync
  *   j >= 128 partner is in another warp      -> shared memory (vectorised)
- * That leaves only 15 of the 78 stages touching shared memory (and 30 of the
- * 78 barriers), which is what this kernel is actually bound by.
+ * That leaves only the j >= 128 stages touching shared memory: 15 of the 78
+ * (and 30 of the 78 barriers) for SORT_N 4096, 10 of the 66 for the 2048
+ * instantiation -- which is what this kernel is actually bound by.
  *
  * On entry the input must already be in sv[]/sx[]; on exit the sorted result
  * is in the registers (shared memory contents are stale). */
@@ -993,8 +995,9 @@ int pulsar_gpu_indexer_topk_tensor(
          * blocks instead of one.  Which of those matters depends entirely on
          * n_tokens:
          *
-         *   decode  (n_tokens == 1): the grid is (1, n_chunks) -- three blocks
-         *     on a 48-SM GPU.  The stage is pure block latency, so halving the
+         *   decode  (n_tokens == 1): the grid is (1, n_chunks) -- five 2048-wide
+         *     blocks at n_comp 9216 (three with the 4096 chunk) on a 48-SM GPU.
+         *     The stage is pure block latency, so halving the
          *     per-block network depth is the whole game.  Measured standalone at
          *     n_comp=9216 (the ctx-32k value): chunk stage 33.3 -> 22.1 us,
          *     whole chain 59.8 -> 50.4 us; in-engine decode_topk 70.2 -> 60.2 us.
