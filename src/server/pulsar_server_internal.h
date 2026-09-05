@@ -12,6 +12,7 @@
 #include "pulsar_gpu.h"
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
+#include "pulsar_dsml.h"
 
 #include <new>
 #include <string>
@@ -102,20 +103,8 @@
 #define JSON_MAX_NESTING 256
 
 
-#define PULSAR_DSML "｜DSML｜"
-#define PULSAR_DSML_SHORT "DSML｜"
-#define PULSAR_TOOL_CALLS_START "<" PULSAR_DSML "tool_calls>"
-#define PULSAR_TOOL_CALLS_END "</" PULSAR_DSML "tool_calls>"
-#define PULSAR_INVOKE_START "<" PULSAR_DSML "invoke"
-#define PULSAR_INVOKE_END "</" PULSAR_DSML "invoke>"
-#define PULSAR_PARAM_START "<" PULSAR_DSML "parameter"
-#define PULSAR_PARAM_END "</" PULSAR_DSML "parameter>"
-#define PULSAR_TOOL_CALLS_START_SHORT "<" PULSAR_DSML_SHORT "tool_calls>"
-#define PULSAR_TOOL_CALLS_END_SHORT "</" PULSAR_DSML_SHORT "tool_calls>"
-#define PULSAR_INVOKE_START_SHORT "<" PULSAR_DSML_SHORT "invoke"
-#define PULSAR_INVOKE_END_SHORT "</" PULSAR_DSML_SHORT "invoke>"
-#define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT "parameter"
-#define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT "parameter>"
+/* The DSML tag literals and the syntax table live in src/lib/pulsar_dsml.h
+ * (one authority for the server AND the agent, L184). */
 
 
 /* =========================================================================
@@ -576,34 +565,53 @@ typedef enum {
     DSML_TOOL_ERROR,
 } dsml_tool_stream_state;
 
-/* Shared states for protocol-specific DSML stream projections.  The model
- * still samples DSML; these states only translate already-sampled bytes into
- * OpenAI / Anthropic wire events while final parsing remains authoritative. */
-/** Projects a streaming DSML tool call into OpenAI tool_call deltas.
+/* Shared states for the DSML stream projection.  The model still samples
+ * DSML; these states only translate already-sampled bytes into OpenAI /
+ * Anthropic wire events while final parsing remains authoritative. */
+/** Projects a streaming DSML tool call into a protocol's wire events.
  *
  * A projection, not a parser: it translates already-sampled bytes into wire
  * events so the client sees the call forming, while the FINAL parse of the
  * complete text stays authoritative. The two can disagree mid-stream -- an
  * incomplete marker, a malformed block -- and when they do, the final parse
  * wins.
- */
-typedef struct {
+ *
+ * ONE state machine (dsml_tool_stream_update / _finalize, genmsg.cpp) drives
+ * both OpenAI tool_call deltas and Anthropic tool_use blocks; what differs
+ * per protocol -- the call header, the argument-fragment event, the
+ * block/stop lifecycle -- is the protocol's ::dsml_tool_stream_ops.  Before
+ * L184 the machine existed twice, verbatim, and `"stream": true` could
+ * return a different tool-call reading than the final parse on one protocol
+ * but not the other. */
+typedef struct dsml_tool_stream dsml_tool_stream;
+struct dsml_tool_stream {
     dsml_tool_stream_state state;  ///< where the projection is in the block
-    const char *tool_calls_end;    ///< marker literal ending the tool_calls block
-    const char *invoke_start;      ///< marker literal opening one invocation
-    const char *invoke_end;        ///< marker literal closing one invocation
-    const char *param_start;       ///< marker literal opening a parameter
-    const char *param_end;         ///< marker literal closing a parameter
+    const pulsar_dsml_syntax *syn; ///< the marker literals this block opened with; borrowed
     size_t parse_pos;              ///< how far into the generated text the projection has consumed
-    int index;                     ///< index of the tool call being emitted (OpenAI numbers them)
+    int index;                     ///< invocation index: OpenAI's tool_call index / Anthropic's block counter
     bool active;                   ///< a tool block is being projected
-    bool emitted_any;              ///< at least one delta has gone out
+    bool emitted_any;              ///< at least one event has gone out
     bool args_open;                ///< the arguments JSON object is open and needs closing
     bool first_param;              ///< next parameter needs no leading comma
     bool param_is_string;          ///< current value is a JSON string, so it needs quoting and escaping
     char **ids;                    ///< generated call ids, one per invocation, owned
     int ids_cap;                   ///< entries allocated in `ids`
-} openai_tool_stream;
+};
+
+/** A protocol's emitters for the shared projection.  Each returns false on a
+ * client write failure, which aborts the update; `ctx` is the protocol's own
+ * state (socket, request, stream). */
+typedef struct {
+    /** Invocation ts->index opens, calling `name`: OpenAI sends the tool_call
+     * start delta (id + name), Anthropic starts the tool_use block.  The
+     * argument object's "{" follows through args_fragment. */
+    bool (*begin_invoke)(void *ctx, dsml_tool_stream *ts, const char *name);
+    /** A fragment of the argument object's JSON text (keys, values, braces). */
+    bool (*args_fragment)(void *ctx, dsml_tool_stream *ts, const char *text, size_t len);
+    /** Invocation ts->index is complete (its "}" went out): Anthropic stops
+     * the content block, OpenAI has nothing to send. */
+    bool (*end_invoke)(void *ctx, dsml_tool_stream *ts);
+} dsml_tool_stream_ops;
 
 /** OpenAI chat-completions SSE projection for one response. */
 typedef struct {
@@ -621,7 +629,7 @@ typedef struct {
      * whenever the client did not ask for logprobs — openai_stream_start
      * zeroes it and only the job binds it. */
     logprob_ledger *lp;
-    openai_tool_stream tool;  ///< tool-call projection nested in this stream
+    dsml_tool_stream tool;  ///< tool-call projection nested in this stream
 } openai_stream;
 
 typedef enum {
@@ -640,20 +648,6 @@ typedef enum {
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
-/** The DSML marker literals for one model.
- *
- * Kept as a table rather than hardcoded so the parsers, the stream
- * projections, and the decode tracker all agree on the same six strings by
- * construction instead of by three copies staying in sync. */
-typedef struct {
-    const char *tool_calls_start;  ///< opens the tool-calls block
-    const char *tool_calls_end;    ///< closes it
-    const char *invoke_start;      ///< opens one invocation
-    const char *invoke_end;        ///< closes it
-    const char *param_start;       ///< opens a parameter
-    const char *param_end;         ///< closes it
-} dsml_syntax;
-
 /** Tracks where generation is inside a DSML block, at DECODE time.
  *
  * Runs during sampling rather than after it, so it can tell the sampler when a
@@ -664,7 +658,7 @@ typedef struct {
 typedef struct {
     dsml_track_mode mode;      ///< what the tracker is watching for
     dsml_decode_state decode;  ///< where it currently is
-    const dsml_syntax *syn;    ///< marker literals for this model; borrowed
+    const pulsar_dsml_syntax *syn;  ///< marker literals this block opened with; borrowed
     size_t pos;                ///< how far into the generated text it has consumed
     bool json_in_string;       ///< inside a JSON string, where markers do not apply
     bool json_escaped;         ///< previous byte was a backslash, so this one is literal
@@ -741,22 +735,6 @@ typedef enum {
     ANTH_BLOCK_TOOL,      ///< a tool_use block is open
 } anthropic_block_type;
 
-/** Projects a streaming DSML tool call into Anthropic tool_use events.
- * The Anthropic twin of ::openai_tool_stream; same projection contract. */
-typedef struct {
-    dsml_tool_stream_state state;  ///< where the projection is in the block
-    const dsml_syntax *syn;        ///< the marker literals this model's DSML uses
-    size_t parse_pos;              ///< how far into the generated text the projection has consumed
-    int index;                     ///< content-block index of the tool being emitted
-    bool active;                   ///< a tool block is being projected
-    bool emitted_any;              ///< at least one event has gone out
-    bool args_open;                ///< the input JSON object is open and needs closing
-    bool first_param;              ///< next parameter needs no leading comma
-    bool param_is_string;          ///< current value is a JSON string, so it needs quoting and escaping
-    char **ids;                    ///< generated tool_use ids, owned
-    int ids_cap;                   ///< entries allocated in `ids`
-} anthropic_tool_stream;
-
 /* Anthropic streaming uses the same sampled DSML bytes that will later be
  * parsed and remembered for exact continuation.  This state is only a wire
  * projection: it turns an in-progress DSML block into content_block/tool_use
@@ -779,7 +757,7 @@ typedef struct {
     bool has_tools;      ///< copied from the request at start, so a round reset can re-arm without it
     bool sent_thinking;  ///< a thinking delta has been emitted
     bool sent_text;      ///< a text delta has been emitted
-    anthropic_tool_stream tool;  ///< tool-call projection nested in this stream
+    dsml_tool_stream tool;  ///< tool-call projection nested in this stream
 } anthropic_stream;
 
 typedef struct job job;
@@ -2413,7 +2391,6 @@ typedef struct {
 
 extern volatile sig_atomic_t g_stop_requested;
 extern volatile sig_atomic_t g_listen_fd;
-extern const dsml_syntax dsml_syntaxes[3];
 
 /* ---- shared functions ---- */
 
@@ -2518,8 +2495,17 @@ void observe_tool_markers(const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end);
 size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit);
 const char *find_last_substr(const char *s, const char *needle);
-char *dsml_unescape_text(const char *s);
-char *dsml_attr(const char *tag, const char *name);
+/* ---- the shared DSML tool-stream projection (genmsg.cpp) ---- */
+bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos);
+void dsml_tool_stream_free(dsml_tool_stream *ts);
+bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+                             const char *raw, size_t raw_len);
+bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+                               const char *raw, size_t raw_len);
+/** The call id of invocation `index`, generated on first use in the
+ * protocol's id style and deduplicated against this stream's earlier ids and
+ * (with a bound server) tool memory. */
+const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_style api);
 bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls);

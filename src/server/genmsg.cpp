@@ -232,23 +232,7 @@ bool send_all(int fd, const void *p, size_t n) {
 
 void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
+    json_escape_fragment_n(b, s, strlen(s));
     buf_putc(b, '"');
 }
 
@@ -291,12 +275,14 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
  * tag debris, never value content.  Returns len unchanged when the tail is
  * not tag-shaped. */
 size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len) {
-    static const char *ends[] = {
-        PULSAR_PARAM_END, PULSAR_INVOKE_END, PULSAR_TOOL_CALLS_END,
-        PULSAR_PARAM_END_SHORT, PULSAR_INVOKE_END_SHORT, PULSAR_TOOL_CALLS_END_SHORT,
-        "</parameter>", "</invoke>", "</tool_calls>",
-    };
+    /* Every closing literal of every syntax in the table. */
+    const char *ends[PULSAR_DSML_SYNTAXES * 3];
     size_t max_tag = 0;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        ends[i * 3 + 0] = pulsar_dsml_syntaxes[i].param_end;
+        ends[i * 3 + 1] = pulsar_dsml_syntaxes[i].invoke_end;
+        ends[i * 3 + 2] = pulsar_dsml_syntaxes[i].tool_calls_end;
+    }
     for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
         const size_t l = strlen(ends[i]);
         if (l > max_tag) max_tag = l;
@@ -315,15 +301,12 @@ size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len)
     return len;
 }
 
+/* The EARLIEST occurrence of any syntax's tool_calls opener (closer) in s. */
 const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, PULSAR_TOOL_CALLS_START),
-        strstr(s, PULSAR_TOOL_CALLS_START_SHORT),
-        strstr(s, "<tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = strstr(s, pulsar_dsml_syntaxes[i].tool_calls_start);
+        if (p && (!best || p < best)) best = p;
     }
     return best;
 }
@@ -332,13 +315,9 @@ const char *find_any_tool_start(const char *s) {
 
 const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, PULSAR_TOOL_CALLS_END),
-        strstr(s, PULSAR_TOOL_CALLS_END_SHORT),
-        strstr(s, "</tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const char *p = strstr(s, pulsar_dsml_syntaxes[i].tool_calls_end);
+        if (p && (!best || p < best)) best = p;
     }
     return best;
 }
@@ -390,55 +369,6 @@ const char *find_last_substr(const char *s, const char *needle) {
 
 
 
-/* The prompt renderer escapes DSML text so a tool argument can safely contain
- * shell operators or closing tags.  The generated-DSML parser must undo exactly
- * those entities before it turns parameters back into JSON; otherwise
- * parse->render is not a stable cache key. */
-char *dsml_unescape_text(const char *s) {
-    buf b = {0};
-    for (s = s ? s : ""; *s; s++) {
-        if (*s != '&') {
-            buf_putc(&b, *s);
-        } else if (!strncmp(s, "&amp;", 5)) {
-            buf_putc(&b, '&');
-            s += 4;
-        } else if (!strncmp(s, "&lt;", 4)) {
-            buf_putc(&b, '<');
-            s += 3;
-        } else if (!strncmp(s, "&gt;", 4)) {
-            buf_putc(&b, '>');
-            s += 3;
-        } else if (!strncmp(s, "&quot;", 6)) {
-            buf_putc(&b, '"');
-            s += 5;
-        } else if (!strncmp(s, "&apos;", 6)) {
-            buf_putc(&b, '\'');
-            s += 5;
-        } else {
-            buf_putc(&b, '&');
-        }
-    }
-    return buf_take(&b);
-}
-
-
-
-char *dsml_attr(const char *tag, const char *name) {
-    char pat[64];
-    snprintf(pat, sizeof(pat), "%s=\"", name);
-    const char *p = strstr(tag, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
-    const char *q = strchr(p, '"');
-    if (!q) return NULL;
-    char *raw = xstrndup(p, (size_t)(q - p));
-    char *decoded = dsml_unescape_text(raw);
-    free(raw);
-    return decoded;
-}
-
-
-
 static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
     if (args->len) buf_puts(args, ", ");
     json_escape(args, name ? name : "");
@@ -474,8 +404,8 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     if (!tag_end) return false;
 
     char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
+    char *name = pulsar_dsml_attr(tag, "name");
+    char *is_string = pulsar_dsml_attr(tag, "string");
     free(tag);
     if (!name) {
         free(is_string);
@@ -493,7 +423,7 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
     const char *type = is_string ? is_string : "true";
     char *value = !strcmp(type, "true") ?
-        dsml_unescape_text(raw_value) : xstrdup(raw_value);
+        pulsar_dsml_unescape(raw_value) : xstrdup(raw_value);
     tool_call_json_args_add(out, name, value, type);
 
     free(name);
@@ -621,24 +551,18 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         }
     }
 
-    const char *start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START);
-    int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
-    if (!start) start = strstr(tool_search, PULSAR_TOOL_CALLS_START);
-    if (!start) {
-        start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, PULSAR_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "\n\n<tool_calls>");
-        style = start ? 1 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "<tool_calls>");
-        style = start ? 1 : style;
+    /* Which syntax opens the block: table order is the preference (canonical
+     * first), and within one syntax the "\n\n"-separated opener is preferred
+     * over a bare one -- the same ranking the pre-L184 if/else chain had. */
+    const char *start = NULL;
+    const pulsar_dsml_syntax *syn = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES && !start; i++) {
+        const pulsar_dsml_syntax *cand = &pulsar_dsml_syntaxes[i];
+        char sep[80];
+        snprintf(sep, sizeof sep, "\n\n%s", cand->tool_calls_start);
+        start = strstr(tool_search, sep);
+        if (!start) start = strstr(tool_search, cand->tool_calls_start);
+        if (start) syn = cand;
     }
     if (!start) {
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
@@ -647,27 +571,12 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
-    const char *tool_calls_start = PULSAR_TOOL_CALLS_START;
-    const char *tool_calls_end = PULSAR_TOOL_CALLS_END;
-    const char *invoke_start = PULSAR_INVOKE_START;
-    const char *invoke_end = PULSAR_INVOKE_END;
-    const char *param_start = PULSAR_PARAM_START;
-    const char *param_end = PULSAR_PARAM_END;
-    if (style == 1) {
-        tool_calls_start = "<tool_calls>";
-        tool_calls_end = "</tool_calls>";
-        invoke_start = "<invoke";
-        invoke_end = "</invoke>";
-        param_start = "<parameter";
-        param_end = "</parameter>";
-    } else if (style == 2) {
-        tool_calls_start = PULSAR_TOOL_CALLS_START_SHORT;
-        tool_calls_end = PULSAR_TOOL_CALLS_END_SHORT;
-        invoke_start = PULSAR_INVOKE_START_SHORT;
-        invoke_end = PULSAR_INVOKE_END_SHORT;
-        param_start = PULSAR_PARAM_START_SHORT;
-        param_end = PULSAR_PARAM_END_SHORT;
-    }
+    const char *tool_calls_start = syn->tool_calls_start;
+    const char *tool_calls_end = syn->tool_calls_end;
+    const char *invoke_start = syn->invoke_start;
+    const char *invoke_end = syn->invoke_end;
+    const char *param_start = syn->param_start;
+    const char *param_end = syn->param_end;
 
     const char *p = strstr(start, tool_calls_start);
     if (!p) return false;
@@ -691,7 +600,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         const char *tag_end = strchr(p, '>');
         if (!tag_end) return false;
         char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
-        char *name = dsml_attr(tag, "name");
+        char *name = pulsar_dsml_attr(tag, "name");
         free(tag);
         if (!name) return false;
         p = tag_end + 1;
@@ -715,8 +624,8 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 return false;
             }
             tag = xstrndup(p, (size_t)(tag_end - p + 1));
-            char *param_name = dsml_attr(tag, "name");
-            char *param_is_string = dsml_attr(tag, "string");
+            char *param_name = pulsar_dsml_attr(tag, "name");
+            char *param_is_string = pulsar_dsml_attr(tag, "string");
             free(tag);
             if (!param_name) {
                 free(name);
@@ -761,7 +670,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
             const char *type = param_is_string ? param_is_string : "true";
             char *value = !strcmp(type, "true") ?
-                dsml_unescape_text(raw_value) : xstrdup(raw_value);
+                pulsar_dsml_unescape(raw_value) : xstrdup(raw_value);
             tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);
@@ -961,3 +870,300 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
     buf_putc(b, ']');
 }
 
+
+
+
+/* =========================================================================
+ * The DSML tool-stream projection, shared by the OpenAI and Anthropic
+ * streamers (L184).  See ::dsml_tool_stream in the header for the contract.
+ * ========================================================================= */
+
+void dsml_tool_stream_free(dsml_tool_stream *ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
+    free(ts->ids);
+    ts->ids = NULL;
+    ts->ids_cap = 0;
+}
+
+
+
+/* Which syntax opens the block at `pos` decides every literal the projection
+ * matches from here on. */
+bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos) {
+    dsml_tool_stream_free(ts);
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
+            ts->syn = syn;
+            ts->parse_pos = pos + strlen(syn->tool_calls_start);
+            return true;
+        }
+    }
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return false;
+}
+
+
+
+static bool dsml_tool_stream_has_id(const dsml_tool_stream *ts, const char *id, int upto) {
+    if (!ts || !id || !id[0]) return false;
+    if (upto > ts->ids_cap) upto = ts->ids_cap;
+    for (int i = 0; i < upto; i++) {
+        if (ts->ids[i] && !strcmp(ts->ids[i], id)) return true;
+    }
+    return false;
+}
+
+
+
+/* Free function (NOT a server:: method): legitimately called with a null
+ * server (the unit tests project without a bound server).  As a member the
+ * `!s` guard would be elided under -O3 (this assumed non-null). */
+const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_style api) {
+    if (!ts || index < 0) return "";
+    if (index >= ts->ids_cap) {
+        int old = ts->ids_cap;
+        int cap = old ? old : 4;
+        while (cap <= index) cap *= 2;
+        ts->ids = (char **)server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
+        memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
+        ts->ids_cap = cap;
+    }
+    if (!ts->ids[index]) {
+        char id[64];
+        for (;;) {
+            random_tool_id(id, sizeof(id), api);
+            if (!dsml_tool_stream_has_id(ts, id, index) &&
+                (!s || !s->tool_memory_has_id(id))) break;  /* null s (no bound server) => no dedup */
+        }
+        ts->ids[index] = xstrdup(id);
+    }
+    return ts->ids[index];
+}
+
+
+
+static bool dsml_tool_stream_fail(dsml_tool_stream *ts) {
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return true;
+}
+
+
+
+/* A string parameter's value bytes: DSML entities undone, then JSON-string
+ * escaped, as a fragment inside the already-open quotes. */
+static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                        void *ctx, const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = pulsar_dsml_unescape(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = ops->args_fragment(ctx, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+
+
+static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                        void *ctx, const char *name, bool is_string) {
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = ops->args_fragment(ctx, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+
+
+static bool dsml_tool_start_invoke(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                   void *ctx, const char *raw, size_t raw_len) {
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = pulsar_dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return dsml_tool_stream_fail(ts);
+
+    bool ok = ops->begin_invoke(ctx, ts, name) &&
+              ops->args_fragment(ctx, ts, "{", 1);
+    free(name);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+
+
+static bool dsml_tool_start_param(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                  void *ctx, const char *raw, size_t raw_len) {
+    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = pulsar_dsml_attr(tag, "name");
+    char *is_string = pulsar_dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return dsml_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = dsml_tool_emit_param_prefix(ts, ops, ctx, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_PARAM_VALUE;
+    return true;
+}
+
+
+
+static bool dsml_tool_emit_value(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                 void *ctx, const char *raw, size_t value_end) {
+    if (value_end <= ts->parse_pos) return true;
+    return ts->param_is_string ?
+        dsml_tool_emit_string_value(ts, ops, ctx, raw + ts->parse_pos, value_end - ts->parse_pos) :
+        ops->args_fragment(ctx, ts, raw + ts->parse_pos, value_end - ts->parse_pos);
+}
+
+
+
+static bool dsml_tool_finish_param(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops,
+                                   void *ctx, const char *raw, size_t value_end) {
+    if (!dsml_tool_emit_value(ts, ops, ctx, raw, value_end)) return false;
+    if (ts->param_is_string && !ops->args_fragment(ctx, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->syn->param_end);
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+
+
+/* The invocation's "}" and the protocol's block stop, then the next index. */
+static bool dsml_tool_close_invoke(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx) {
+    if (ts->args_open && !ops->args_fragment(ctx, ts, "}", 1)) return false;
+    ts->args_open = false;
+    if (!ops->end_invoke(ctx, ts)) return false;
+    ts->index++;
+    return true;
+}
+
+
+
+/* Generation ended (final) while a streamed tool call is still open: the
+ * client has already received the call header and a prefix of the argument
+ * deltas, so the truncation cannot be reclassified as text (the non-stream
+ * path's try_repair_dsml equivalent).  What CAN be guaranteed is well-formed
+ * wire JSON: flush the un-emitted value bytes, close an open string value,
+ * close the args object, stop the block.  The argument VALUE stays truncated
+ * -- exactly what the repaired non-stream parse of the same bytes yields --
+ * and the finish reason (length) still tells the client the turn was cut. */
+bool dsml_tool_stream_finalize(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+                               const char *raw, size_t raw_len) {
+    if (!ts->active) return true;
+    if (ts->state == DSML_TOOL_PARAM_VALUE) {
+        /* Flush only up to the stream-safe limit: the held-back tail is a
+         * partial closing tag (the model was mid-"</...parameter>") or a
+         * split UTF-8 sequence -- tag debris and mojibake, never value
+         * content.  Dropping it beats the non-stream repair here, which
+         * keeps the fragment in the value. */
+        size_t limit = tool_param_value_stream_safe_len(
+                raw, ts->parse_pos, raw_len, ts->syn->param_end, ts->param_is_string);
+        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
+        if (!dsml_tool_emit_value(ts, ops, ctx, raw, limit)) return false;
+        if (limit > ts->parse_pos) ts->parse_pos = limit;
+        if (ts->param_is_string && !ops->args_fragment(ctx, ts, "\"", 1)) return false;
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    }
+    if (ts->args_open && !dsml_tool_close_invoke(ts, ops, ctx)) return false;
+    ts->active = false;
+    ts->state = DSML_TOOL_DONE;
+    return true;
+}
+
+
+
+bool dsml_tool_stream_update(dsml_tool_stream *ts, const dsml_tool_stream_ops *ops, void *ctx,
+                             const char *raw, size_t raw_len) {
+    const pulsar_dsml_syntax *syn = ts->syn;
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->tool_calls_end)) {
+                ts->parse_pos += strlen(syn->tool_calls_end);
+                ts->active = false;
+                ts->state = DSML_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, syn->tool_calls_end, syn->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!dsml_tool_start_invoke(ts, ops, ctx, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return dsml_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->invoke_end)) {
+                if (!dsml_tool_close_invoke(ts, ops, ctx)) return false;
+                ts->parse_pos += strlen(syn->invoke_end);
+                ts->state = DSML_TOOL_BETWEEN_INVOKES;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, syn->invoke_end, syn->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, syn->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!dsml_tool_start_param(ts, ops, ctx, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return dsml_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos, raw_len - ts->parse_pos,
+                                               syn->param_end);
+            if (end) {
+                if (!dsml_tool_finish_param(ts, ops, ctx, raw, (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos, raw_len,
+                                                            syn->param_end, ts->param_is_string);
+            if (!dsml_tool_emit_value(ts, ops, ctx, raw, limit)) return false;
+            if (limit > ts->parse_pos) ts->parse_pos = limit;
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}

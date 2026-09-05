@@ -5979,6 +5979,181 @@ static void test_l179_lane_abandon_needs_decode_and_hangup(void) {
     close(live[1]);
 }
 
+/* L184: the syntax table is the ONE authority.  Every consumer -- the final
+ * parser, the stream projection's opener, the marker finders, the truncated
+ * close-tag trimmer -- must recognise every row, not just the canonical one
+ * (each used to carry its own 3-element copy; a row added to one and not
+ * another would make "stream": true and the final parse disagree). */
+static void test_l184_every_consumer_loops_the_syntax_table(void) {
+    TEST_ASSERT(PULSAR_DSML_SYNTAXES == 3);
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        buf text = {0};
+        buf_puts(&text, "ok\n\n");
+        buf_puts(&text, syn->tool_calls_start);
+        buf_puts(&text, "\n");
+        buf_puts(&text, syn->invoke_start);
+        buf_puts(&text, " name=\"bash\">\n");
+        buf_puts(&text, syn->param_start);
+        buf_puts(&text, " name=\"command\" string=\"true\">ls &amp;&amp; pwd");
+        buf_puts(&text, syn->param_end);
+        buf_puts(&text, "\n");
+        buf_puts(&text, syn->param_start);
+        buf_puts(&text, " name=\"timeout\" string=\"false\">10");
+        buf_puts(&text, syn->param_end);
+        buf_puts(&text, "\n");
+        buf_puts(&text, syn->invoke_end);
+        buf_puts(&text, "\n");
+        buf_puts(&text, syn->tool_calls_end);
+
+        /* the final parser */
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex(text.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(calls.len == 1 &&
+                    !strcmp(calls.v[0].arguments, "{\"command\": \"ls && pwd\", \"timeout\": 10}"));
+        TEST_ASSERT(content && !strcmp(content, "ok"));
+
+        /* the marker finders */
+        const char *start = find_any_tool_start(text.ptr);
+        TEST_ASSERT(start == text.ptr + 4);
+        TEST_ASSERT(find_any_tool_end(text.ptr) ==
+                    text.ptr + text.len - strlen(syn->tool_calls_end));
+
+        /* the stream projection opens on this row and binds to it */
+        dsml_tool_stream ts;
+        memset(&ts, 0, sizeof ts);
+        TEST_ASSERT(dsml_tool_stream_init(&ts, text.ptr, text.len, 4));
+        TEST_ASSERT(ts.syn == syn);
+        TEST_ASSERT(ts.parse_pos == 4 + strlen(syn->tool_calls_start));
+        dsml_tool_stream_free(&ts);
+
+        /* a truncated closing tag of this row is trimmed as tag debris */
+        buf cut = {0};
+        buf_puts(&cut, "value");
+        buf_append(&cut, syn->param_end, strlen(syn->param_end) - 1);
+        TEST_ASSERT(trim_truncated_dsml_close_tail(cut.ptr, 0, cut.len) == 5);
+        buf_free(&cut);
+
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        buf_free(&text);
+    }
+}
+
+/* L184: the DSML tool-stream machine is ONE function driven through a
+ * protocol's emitters.  Drive it through capturing emitters, byte by byte,
+ * and pin what the protocol layer receives: one header per invocation, the
+ * argument object as fragments that concatenate to canonical JSON, one
+ * close per invocation, the index advancing past each. */
+typedef struct {
+    buf events;   /* "B<name>" per begin, "E" per end */
+    buf args;     /* every args fragment, concatenated */
+    int begins;
+    int ends;
+} capture_tool_ctx;
+
+static bool capture_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
+    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
+    (void)ts;
+    buf_printf(&c->events, "B%s;", name);
+    c->begins++;
+    return true;
+}
+static bool capture_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
+    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
+    (void)ts;
+    buf_append(&c->args, text, len);
+    return true;
+}
+static bool capture_end_invoke(void *vctx, dsml_tool_stream *ts) {
+    capture_tool_ctx *c = (capture_tool_ctx *)vctx;
+    (void)ts;
+    buf_puts(&c->events, "E;");
+    c->ends++;
+    return true;
+}
+static const dsml_tool_stream_ops capture_tool_ops = {
+    capture_begin_invoke, capture_args_fragment, capture_end_invoke,
+};
+
+static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
+    const char *raw =
+        PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"bash\">\n"
+        PULSAR_PARAM_START " name=\"command\" string=\"true\">echo \"a\" &lt;b" PULSAR_PARAM_END "\n"
+        PULSAR_PARAM_START " name=\"timeout\" string=\"false\">10" PULSAR_PARAM_END "\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_INVOKE_START " name=\"read\">\n"
+        PULSAR_PARAM_START " name=\"path\" string=\"true\">/tmp/x" PULSAR_PARAM_END "\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_TOOL_CALLS_END;
+    const size_t n = strlen(raw);
+
+    capture_tool_ctx c;
+    memset(&c, 0, sizeof c);
+    dsml_tool_stream ts;
+    memset(&ts, 0, sizeof ts);
+    TEST_ASSERT(dsml_tool_stream_init(&ts, raw, n, 0));
+    for (size_t len = 1; len <= n; len++) {
+        TEST_ASSERT(dsml_tool_stream_update(&ts, &capture_tool_ops, &c, raw, len));
+    }
+    TEST_ASSERT(!ts.active);
+    TEST_ASSERT(ts.state == DSML_TOOL_DONE);
+    TEST_ASSERT(ts.index == 2);
+    TEST_ASSERT(c.begins == 2 && c.ends == 2);
+    TEST_ASSERT(c.events.ptr && !strcmp(c.events.ptr, "Bbash;E;Bread;E;"));
+    /* entities undone, JSON-escaped, raw JSON values verbatim, one object per call */
+    TEST_ASSERT(c.args.ptr &&
+                !strcmp(c.args.ptr, "{\"command\":\"echo \\\"a\\\" <b\",\"timeout\":10}{\"path\":\"/tmp/x\"}"));
+    dsml_tool_stream_free(&ts);
+    buf_free(&c.events);
+    buf_free(&c.args);
+
+    /* truncated mid-value: finalize closes the string and the object and the
+     * invocation, so the protocol's wire JSON stays well-formed */
+    const char *cut =
+        PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"bash\">\n"
+        PULSAR_PARAM_START " name=\"command\" string=\"true\">ls -la</";
+    memset(&c, 0, sizeof c);
+    memset(&ts, 0, sizeof ts);
+    TEST_ASSERT(dsml_tool_stream_init(&ts, cut, strlen(cut), 0));
+    TEST_ASSERT(dsml_tool_stream_update(&ts, &capture_tool_ops, &c, cut, strlen(cut)));
+    TEST_ASSERT(ts.active && ts.state == DSML_TOOL_PARAM_VALUE);
+    TEST_ASSERT(dsml_tool_stream_finalize(&ts, &capture_tool_ops, &c, cut, strlen(cut)));
+    TEST_ASSERT(!ts.active && ts.state == DSML_TOOL_DONE);
+    TEST_ASSERT(ts.index == 1 && c.ends == 1);
+    TEST_ASSERT(c.args.ptr && !strcmp(c.args.ptr, "{\"command\":\"ls -la\"}"));
+    dsml_tool_stream_free(&ts);
+    buf_free(&c.events);
+    buf_free(&c.args);
+}
+
+/* L184: one entity encode/decode pair (src/lib/pulsar_dsml).  The renderer's
+ * attribute encoding round-trips through the parser's decoder; the decoder
+ * also knows &apos;, which the model writes and the renderer never does. */
+static void test_l184_dsml_entity_pair_round_trips(void) {
+    const char *specials = "a&b <c> \"d\" 'e' &amp;literal";
+    char *enc = pulsar_dsml_escape_attr(specials);
+    TEST_ASSERT(!strcmp(enc, "a&amp;b &lt;c&gt; &quot;d&quot; 'e' &amp;amp;literal"));
+    char *dec = pulsar_dsml_unescape(enc);
+    TEST_ASSERT(!strcmp(dec, specials));
+    free(dec);
+    free(enc);
+    dec = pulsar_dsml_unescape("&apos;x&apos; & &unknown; &lt;");
+    TEST_ASSERT(!strcmp(dec, "'x' & &unknown; <"));
+    free(dec);
+    char *attr = pulsar_dsml_attr("<x name=\"a&amp;b\" string=\"true\">", "name");
+    TEST_ASSERT(attr && !strcmp(attr, "a&b"));
+    free(attr);
+    TEST_ASSERT(pulsar_dsml_attr("<x name=\"unterminated>", "name") == NULL);
+    TEST_ASSERT(pulsar_dsml_attr("<x string=\"true\">", "name") == NULL);
+}
+
 /* L190 C1: the MemAvailable-floor refusal is a per-request condition; its
  * warning prints once per period and carries the count the period swallowed,
  * instead of once per process. */
@@ -6476,6 +6651,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
+    test_l184_every_consumer_loops_the_syntax_table();
+    test_l184_shared_tool_stream_drives_protocol_emitters();
+    test_l184_dsml_entity_pair_round_trips();
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_warm_match_usable_rule();
     test_l179_guard_victim_skips_pinned_live_spilled();

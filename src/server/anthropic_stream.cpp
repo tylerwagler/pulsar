@@ -156,60 +156,9 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
 
 
-static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
-    if (!ts) return;
-    for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
-    free(ts->ids);
-    ts->ids = NULL;
-    ts->ids_cap = 0;
-}
-
-
-
 void anthropic_stream_free(anthropic_stream *st) {
     if (!st) return;
-    anthropic_tool_stream_free(&st->tool);
-}
-
-
-
-static bool anthropic_tool_stream_has_id(const anthropic_tool_stream *ts,
-                                         const char *id, int upto) {
-    if (!ts || !id || !id[0]) return false;
-    if (upto > ts->ids_cap) upto = ts->ids_cap;
-    for (int i = 0; i < upto; i++) {
-        if (ts->ids[i] && !strcmp(ts->ids[i], id)) return true;
-    }
-    return false;
-}
-
-
-
-/* Free function (NOT a server:: method): legitimately called with a null server
- * (no bound server — streaming tests, parse-without-server). As a member the
- * `!s` guard below would be dead code under -O3 this-non-null assumption; as a
- * free function taking server* the guard holds. */
-static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts,
-                                            int index) {
-    if (!ts || index < 0) return "";
-    if (index >= ts->ids_cap) {
-        int old = ts->ids_cap;
-        int cap = old ? old : 4;
-        while (cap <= index) cap *= 2;
-        ts->ids = (char* *)server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
-        memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
-        ts->ids_cap = cap;
-    }
-    if (!ts->ids[index]) {
-        char id[64];
-        for (;;) {
-            random_tool_id(id, sizeof(id), API_ANTHROPIC);
-            if (!anthropic_tool_stream_has_id(ts, id, index) &&
-                (!s || !s->tool_memory_has_id(id))) break;  /* null s (no bound server) => no dedup, as the predecessor free fn did */
-        }
-        ts->ids[index] = xstrdup(id);
-    }
-    return ts->ids[index];
+    dsml_tool_stream_free(&st->tool);
 }
 
 
@@ -353,285 +302,42 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
 
 
 
-static bool anthropic_tool_emit_args_fragment(int fd, anthropic_stream *st,
-                                              const char *text, size_t len) {
-    return anthropic_sse_tool_delta_live(fd, st, text, len);
-}
+/* The Anthropic side of the shared DSML tool-stream projection (genmsg.cpp
+ * dsml_tool_stream_update): a tool_use content block per invocation, its
+ * arguments as input_json_delta, stopped when the invocation closes.  The
+ * block/stop lifecycle stays here, in the protocol; the DSML walk is shared. */
+typedef struct {
+    int fd;
+    server *s;
+    const char *id;
+    anthropic_stream *st;
+} anthropic_tool_ctx;
 
-
-
-static bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
-                                             const char *text, size_t len) {
-    if (len == 0) return true;
-    char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
-    buf frag = {0};
-    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
-    bool ok = anthropic_tool_emit_args_fragment(fd, st,
-                                                frag.ptr ? frag.ptr : "",
-                                                frag.len);
-    buf_free(&frag);
-    free(unescaped);
-    free(raw);
-    return ok;
-}
-
-
-
-static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
-                                             const char *name, bool is_string) {
-    anthropic_tool_stream *ts = &st->tool;
-    buf frag = {0};
-    if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
-    json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
-    bool ok = anthropic_tool_emit_args_fragment(fd, st,
-                                                frag.ptr ? frag.ptr : "",
-                                                frag.len);
-    buf_free(&frag);
-    return ok;
-}
-
-
-
-/* The parser below mirrors the OpenAI tool-delta parser but keeps Anthropic's
- * content-block lifecycle local.  A callback abstraction would save lines, but
- * it would hide the different block/stop semantics that make this code easy to
- * audit when a client reports a streaming regression. */
-static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
-                                       const char *raw, size_t raw_len,
-                                       size_t pos) {
-    anthropic_tool_stream_free(ts);
-    memset(ts, 0, sizeof(*ts));
-    ts->active = true;
-    ts->state = DSML_TOOL_BETWEEN_INVOKES;
-    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
-        const dsml_syntax *syn = &dsml_syntaxes[i];
-        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
-            ts->syn = syn;
-            ts->parse_pos = pos + strlen(syn->tool_calls_start);
-            return true;
-        }
-    }
-    ts->active = false;
-    ts->state = DSML_TOOL_ERROR;
-    return false;
-}
-
-
-
-static bool anthropic_tool_stream_fail(anthropic_tool_stream *ts) {
-    ts->active = false;
-    ts->state = DSML_TOOL_ERROR;
-    return true;
-}
-
-
-
-static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
-                                        const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos,
-                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
-    if (!name) return anthropic_tool_stream_fail(ts);
-
+static bool anthropic_tool_begin_invoke(void *vctx, dsml_tool_stream *ts, const char *name) {
+    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
     /* This id is already visible to the client.  After final parsing,
      * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
      * before tool_memory_remember(), so the next tool_result can continue from
      * the live KV state instead of re-rendering canonical JSON. */
-    const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
-    bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
-              anthropic_tool_emit_args_fragment(fd, st, "{", 1);
-    free(name);
-    if (!ok) return false;
-
-    ts->emitted_any = true;
-    ts->args_open = true;
-    ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
+    const char *tool_id = dsml_tool_stream_id(c->s, ts, ts->index, API_ANTHROPIC);
+    return anthropic_sse_open_tool_block(c->fd, c->st, tool_id, name);
 }
 
-
-
-static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
-                                       const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos,
-                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name || !is_string) {
-        free(name);
-        free(is_string);
-        return anthropic_tool_stream_fail(ts);
-    }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
-    free(name);
-    free(is_string);
-    if (!ok) return false;
-
-    ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_PARAM_VALUE;
-    return true;
+static bool anthropic_tool_args_fragment(void *vctx, dsml_tool_stream *ts, const char *text, size_t len) {
+    (void)ts;
+    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
+    return anthropic_sse_tool_delta_live(c->fd, c->st, text, len);
 }
 
-
-
-static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
-                                        const char *raw, size_t value_end) {
-    anthropic_tool_stream *ts = &st->tool;
-    if (value_end > ts->parse_pos) {
-        bool ok = ts->param_is_string ?
-            anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                             value_end - ts->parse_pos) :
-            anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                              value_end - ts->parse_pos);
-        if (!ok) return false;
-    }
-    if (ts->param_is_string &&
-        !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->syn->param_end);
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
+static bool anthropic_tool_end_invoke(void *vctx, dsml_tool_stream *ts) {
+    (void)ts;
+    anthropic_tool_ctx *c = (anthropic_tool_ctx *)vctx;
+    return anthropic_sse_close_block_live(c->fd, c->id, c->st);
 }
 
-
-
-/* Twin of openai_tool_stream_finalize: generation ended mid-call, the client
- * already holds the tool_use block header and a prefix of input_json_delta,
- * so make the wire JSON well-formed (flush value bytes, close the string,
- * close the args object, stop the content block).  The value stays truncated
- * -- matching the repaired non-stream parse -- and stop_reason still marks
- * the turn as cut. */
-static bool anthropic_tool_stream_finalize(int fd, const char *id,
-                                           anthropic_stream *st,
-                                           const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    if (!ts->active) return true;
-    if (ts->state == DSML_TOOL_PARAM_VALUE) {
-        /* See openai_tool_stream_finalize: the held tail is tag debris or a
-         * split UTF-8 sequence, never value content -- trim, don't flush. */
-        size_t limit = tool_param_value_stream_safe_len(
-                raw, ts->parse_pos, raw_len, ts->syn->param_end,
-                ts->param_is_string);
-        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
-        if (limit > ts->parse_pos) {
-            bool ok = ts->param_is_string ?
-                anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                                 limit - ts->parse_pos) :
-                anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                                  limit - ts->parse_pos);
-            if (!ok) return false;
-            ts->parse_pos = limit;
-        }
-        if (ts->param_is_string &&
-            !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
-        ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    }
-    if (ts->args_open) {
-        if (!anthropic_tool_emit_args_fragment(fd, st, "}", 1)) return false;
-        ts->args_open = false;
-        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-        ts->index++;
-    }
-    ts->active = false;
-    ts->state = DSML_TOOL_DONE;
-    return true;
-}
-
-static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
-                                         anthropic_stream *st,
-                                         const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    while (ts->active && ts->parse_pos < raw_len) {
-        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
-                ts->parse_pos += strlen(ts->syn->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos,
-                                ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_invoke(fd, s, st, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return anthropic_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_end)) {
-                if (ts->args_open &&
-                    !anthropic_tool_emit_args_fragment(fd, st, "}", 1)) return false;
-                ts->args_open = false;
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                ts->parse_pos += strlen(ts->syn->invoke_end);
-                ts->index++;
-                ts->state = DSML_TOOL_BETWEEN_INVOKES;
-                continue;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos,
-                                ts->syn->invoke_end, ts->syn->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_param(fd, st, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return anthropic_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_PARAM_VALUE) {
-            const char *end = find_lit_bounded(raw + ts->parse_pos,
-                                               raw_len - ts->parse_pos,
-                                               ts->syn->param_end);
-            if (end) {
-                if (!anthropic_tool_finish_param(fd, st, raw,
-                                                 (size_t)(end - raw))) return false;
-                continue;
-            }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len,
-                                                            ts->syn->param_end,
-                                                            ts->param_is_string);
-            if (limit > ts->parse_pos) {
-                bool ok = ts->param_is_string ?
-                    anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                                     limit - ts->parse_pos) :
-                    anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                                      limit - ts->parse_pos);
-                if (!ok) return false;
-                ts->parse_pos = limit;
-            }
-            return true;
-        }
-
-        return true;
-    }
-    return true;
-}
+static const dsml_tool_stream_ops anthropic_tool_ops = {
+    anthropic_tool_begin_invoke, anthropic_tool_args_fragment, anthropic_tool_end_invoke,
+};
 
 
 
@@ -804,7 +510,7 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
             if (!final &&
-                anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                dsml_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = ANTH_STREAM_TOOL;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -816,9 +522,10 @@ bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        anthropic_tool_ctx ctx = {fd, s, id, st};
+        if (!dsml_tool_stream_update(&st->tool, &anthropic_tool_ops, &ctx, raw, raw_len)) return false;
         if (final && st->tool.active &&
-            !anthropic_tool_stream_finalize(fd, id, st, raw, raw_len)) return false;
+            !dsml_tool_stream_finalize(&st->tool, &anthropic_tool_ops, &ctx, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;

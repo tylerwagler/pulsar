@@ -7,19 +7,19 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
-        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "You can invoke tools by writing a \"" PULSAR_TOOL_CALLS_START "\" block like the following:\n\n"
+        PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
+        PULSAR_PARAM_START " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" PULSAR_PARAM_END "\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_INVOKE_START " name=\"$TOOL_NAME2\">\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>\n\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_TOOL_CALLS_END "\n\n"
         "String parameters should be specified as raw text and set `string=\"true\"`. "
         "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
-        "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
+        "Only if a string value itself contains the exact closing parameter tag `" PULSAR_PARAM_END "`, write that tag as `&lt;/" PULSAR_DSML "parameter>` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
         /* Do not ask the model to OPEN a <think> block the prompt already
          * opened — that wording provoked a second reasoning pass after the
@@ -118,20 +118,18 @@ bad:
 
 
 
+/* Attribute values (tool and parameter names) carry the ONE entity encoding
+ * the parser reverses (pulsar_dsml_unescape via pulsar_dsml_attr). */
 static void append_dsml_attr_escaped(buf *b, const char *s) {
-    for (s = s ? s : ""; *s; s++) {
-        if (*s == '&') buf_puts(b, "&amp;");
-        else if (*s == '<') buf_puts(b, "&lt;");
-        else if (*s == '>') buf_puts(b, "&gt;");
-        else if (*s == '"') buf_puts(b, "&quot;");
-        else buf_putc(b, *s);
-    }
+    char *escaped = pulsar_dsml_escape_attr(s);
+    buf_puts(b, escaped);
+    free(escaped);
 }
 
 
 
 static void append_dsml_parameter_text(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+    const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -166,7 +164,7 @@ void append_tool_result_text(buf *b, const char *s) {
 
 
 static void append_dsml_json_literal(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+    const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -181,14 +179,14 @@ static void append_dsml_json_literal(buf *b, const char *s) {
 
 
 static void append_dsml_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<｜DSML｜parameter name=\"");
+    buf_puts(b, PULSAR_PARAM_START " name=\"");
     append_dsml_attr_escaped(b, arg->key);
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
     if (arg->is_string) append_dsml_parameter_text(b, arg->value);
     else append_dsml_json_literal(b, arg->value);
-    buf_puts(b, "</｜DSML｜parameter>\n");
+    buf_puts(b, PULSAR_PARAM_END "\n");
 }
 
 
@@ -248,20 +246,21 @@ void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
         buf_puts(b, calls->raw_dsml);
         return;
     }
-    buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    /* The renderer writes the canonical spelling (row 0 of the table). */
+    buf_puts(b, "\n\n" PULSAR_TOOL_CALLS_START "\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        buf_puts(b, "<｜DSML｜invoke name=\"");
+        buf_puts(b, PULSAR_INVOKE_START " name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
         if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
-            buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            buf_puts(b, PULSAR_PARAM_START " name=\"arguments\" string=\"true\">");
             append_dsml_parameter_text(b, tc->arguments);
-            buf_puts(b, "</｜DSML｜parameter>\n");
+            buf_puts(b, PULSAR_PARAM_END "\n");
         }
-        buf_puts(b, "</｜DSML｜invoke>\n");
+        buf_puts(b, PULSAR_INVOKE_END "\n");
     }
-    buf_puts(b, "</｜DSML｜tool_calls>");
+    buf_puts(b, PULSAR_TOOL_CALLS_END);
 }
 
 
