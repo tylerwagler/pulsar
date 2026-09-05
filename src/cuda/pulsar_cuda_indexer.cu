@@ -6,124 +6,6 @@
  * else.  head_dim must be 128. */
 
 
-/* E2M1 nibble -> float by PURE BIT MATH (sign, 2-bit exp, 1-bit mantissa).
- * Normals (e>=1) are exactly (1 + m/2) * 2^(e-1), which is the f32 whose
- * exponent field is (e+126) and whose mantissa bit is m<<22; the one subnormal
- * pair is m*0.5.  Verified equal to the 8-entry table for ALL 8 codes, and the
- * sign fold is exact either way ((-a)*b == -(a*b) in IEEE).
- *
- * TWIN of attn_pack_e4m3's shape in pulsar_cuda_internal.h, and for the same
- * reason.  This used to be an 8-way switch called PER ELEMENT from the decode
- * scorer's inner loop -- 32 lanes x 64 heads x every compressed-row block --
- * and it was MEASURED at ~1.9% of decode on 2026-08-23 (the FP4 Q transport
- * reads 7.5x less memory yet ran slower, which is what pointed at instruction
- * count rather than bandwidth). */
-__device__ __forceinline__ static float idx_e2m1_decode(uint32_t nib, float scale) {
-    const uint32_t e = (nib >> 1) & 3u;
-    const uint32_t m = nib & 1u;
-    const float v = e ? __uint_as_float(((e + 126u) << 23) | (m << 22))
-                      : (float)m * 0.5f;
-    const float sv = v * scale;
-    return (nib & 8u) ? -sv : sv;
-}
-
-__device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index_comp,
-                                                 uint64_t row, uint32_t d,
-                                                 uint32_t head_dim) {
-    (void)head_dim;   /* packed rows are always the 68-byte head_dim-128 layout */
-    const uint8_t *r = (const uint8_t *)index_comp + row * PULSAR_MXKV_FP4_ROWBYTES(128u);
-    /* 2^(e8-127) built directly as a float exponent — exact for e8 in [1,254],
-     * and the pack amax floor (7e-38 -> e8 >= 2) rules out byte 0. ~20% cheaper
-     * per scan call than exp2f in the occupancy-bound small-ctx regime. */
-    const float scale = __uint_as_float((uint32_t)r[64u + (d >> 5u)] << 23);
-    const uint8_t byte = r[d >> 1u];
-    const uint8_t nib = (d & 1u) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xfu);
-    return idx_e2m1_decode(nib, scale);
-}
-
-
-
-/* positions/seq_id/comp_cap/n_banks (descriptor-aware indexer kernels): the
- * same per-row multi-session banking as the decode attention kernels
- * (pulsar_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
- * fork, v0.2 c71a49a; reimplemented, no code copied).  positions[t] is row
- * t's absolute query position, seq_id[t] its TRUE bank id; the row's visible
- * compressed count derives per row as (qpos+1)/ratio — the SAME emit-
- * inclusive rule the classic scalar path uses ((pos0+t+1)/ratio), because
- * the engine emits a step's compressed rows BEFORE the indexer scan reads
- * them.  Banked rows read the compressed cache at seq_id*comp_cap offsets;
- * the scalar n_comp is a cross-bank superset used only as the scan/grid
- * bound, never to address into a bank.  Rows past the row's own visible
- * frontier score -INFINITY so top-k never selects an unprimed or foreign
- * slot (the shallow-bank rows of a mixed batch see -INF for the superset
- * tail).  Dead rows (out-of-pool seq_id) fail visible: the whole score row
- * is -INFINITY, and the consuming attention kernel's own dead-row guard
- * zeroes that row's head outputs.  positions == NULL && seq_id == NULL
- * degenerates to the classic single-cache scalar path bit-exactly. */
-__global__ static void indexer_scores_kernel(
-        float *scores,
-        const pulsar_mxkv_pack_t *q,
-        const float *weights,
-        const pulsar_mxkv_pack_t *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal,
-        const int32_t * __restrict__ positions,
-        const int32_t * __restrict__ seq_id,
-        const void * const * __restrict__ index_bank_ptrs,
-        uint32_t comp_cap,
-        uint32_t n_banks) {
-    uint32_t c = blockIdx.x;
-    uint32_t t = blockIdx.y;
-    if (c >= n_comp || t >= n_tokens) return;
-    if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
-        /* Dead/evicted row: fail-visible -INF score row (see header note). */
-        if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
-        return;
-    }
-    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-    if (causal) {
-        uint32_t n_visible = (qpos + 1u) / ratio;
-        if (c >= n_visible) {
-            if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
-            return;
-        }
-    }
-    /* Per-bank index base (the same addressing the fp16 attention tier's
-     * descriptor preamble applies to comp_bank_ptrs, pulsar_cuda_attn_f16.cu):
-     * base-pointer table → separate per-bank allocation at LOCAL row; NULL →
-     * classic seq_id*comp_cap. */
-    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
-    const pulsar_mxkv_pack_t *index_src = index_bank_ptrs ? (const pulsar_mxkv_pack_t *)index_bank_ptrs[sid_b] : index_comp;
-    const uint64_t comp_base = index_bank_ptrs ? 0u
-                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
-    float total = 0.0f;
-    for (uint32_t h = 0; h < n_head; h++) {
-        const uint64_t q_row = (uint64_t)t * n_head + h;
-        float dot = 0.0f;
-        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
-            dot += idx_comp_load_dev(q, q_row, d, head_dim) *
-                   idx_comp_load_dev(index_src, comp_base + c, d, head_dim);
-        __shared__ float partial[256];
-        partial[threadIdx.x] = dot;
-        __syncthreads();
-        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-            __syncthreads();
-        }
-        total += fmaxf(partial[0], 0.0f) * weights[(uint64_t)t * n_head + h];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = total * scale;
-}
-
-
-
 __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
     enum { THREADS = 1024 };
     __shared__ float sm_val[THREADS];
@@ -163,7 +45,6 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
 }
 
 
-
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -183,11 +64,9 @@ __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scor
 }
 
 
-
 __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
-
 
 
 /* Apply one bitonic compare-exchange to a single element.
@@ -213,7 +92,6 @@ __device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
         oi = pi;
     }
 }
-
 
 
 /* Bitonic sort of SORT_N (score,index) pairs held in registers, 4 elements per
@@ -290,12 +168,10 @@ __device__ __forceinline__ static void topk_bitonic_sort_regs4(
 }
 
 
-
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
 }
-
 
 
 /* The radix key must induce the SAME order as topk_score_better, which
@@ -312,7 +188,6 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     if (v == 0.0f) v = 0.0f;
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
-
 
 
 __global__ static void indexer_topk_8192_cub_kernel(
@@ -354,7 +229,6 @@ __global__ static void indexer_topk_8192_cub_kernel(
         }
     }
 }
-
 
 
 __global__ static void indexer_topk_1024_kernel(
@@ -404,7 +278,6 @@ __global__ static void indexer_topk_1024_kernel(
 
     if (tid < top_k) selected[(uint64_t)t * top_k + tid] = idxs[tid];
 }
-
 
 
 template <uint32_t SORT_N>
@@ -463,7 +336,6 @@ __global__ static void indexer_topk_pow2_kernel(
 }
 
 
-
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
@@ -520,7 +392,6 @@ __global__ static void indexer_topk_pow2_u16_kernel(
 }
 
 
-
 template <uint32_t SORT_N>
 __launch_bounds__(1024) __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t *candidates,
@@ -565,7 +436,6 @@ __launch_bounds__(1024) __global__ static void indexer_topk_chunk_pow2_kernel(
 }
 
 
-
 template <uint32_t SORT_N>
 __launch_bounds__(1024) __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t *selected,
@@ -606,7 +476,6 @@ __launch_bounds__(1024) __global__ static void indexer_topk_merge_pow2_kernel(
         if (i < top_k) selected[(uint64_t)t * top_k + i] = x[m];
     }
 }
-
 
 
 template <uint32_t SORT_N>
@@ -662,8 +531,6 @@ __launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kern
 }
 
 
-
-
 /* Configure indexer_topk_8192_cub_kernel's opt-in dynamic shared memory ONCE and
  * cache the result. The device, its max-optin-smem, and the per-function attribute
  * are process-invariant, so the cudaGetDevice + cudaDeviceGetAttribute +
@@ -692,7 +559,6 @@ static int indexer_topk_cub_smem(void) {
 }
 
 
-
 static int indexer_scores_launch(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -705,39 +571,25 @@ static int indexer_scores_launch(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        uint32_t                causal,
-        const pulsar_gpu_tensor *positions,
-        const pulsar_gpu_tensor *seq_id,
-        const pulsar_gpu_tensor *index_bank_ptrs,
-        uint32_t                comp_cap,
-        uint32_t                n_banks) {
-    /* Descriptor (banked) mode: both per-row arrays or neither; the comp
-     * cache operand is the whole bank pool, so the byte bound scales by
-     * n_banks * comp_cap rows and the uint32 row ABI (seq*cap + local) must
-     * not overflow.  Banked scans are always causal with a real ratio (the
-     * per-row visible count derives from position).  The scalar n_comp is
-     * the cross-bank superset: scan/grid bound and scores-row stride only,
-     * never a bank address.  Rejections are fail-loud: a silent 0 return
-     * looks like a generic launch failure to the driver. */
-    const int descr = positions != NULL || seq_id != NULL;
-    if (descr &&
-        (!positions || !seq_id || n_banks == 0 || ratio == 0 || !causal ||
-         comp_cap < n_comp ||
-         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         (uint64_t)n_banks * comp_cap > 4294967296ull)) {
-        fprintf(stderr,
-                "pulsar: banked indexer scores rejected: bad descriptor args "
-                "(n_tokens=%u n_banks=%u comp_cap=%u n_comp=%u ratio=%u causal=%u)\n",
-                n_tokens, n_banks, comp_cap, n_comp, ratio, causal);
-        return 0;
-    }
-    /* Per-bank split: index_comp is bank 0's comp_cap-row allocation when the
-     * base-pointer table is present (see attention_decode_batch_launch). */
-    const uint64_t comp_rows_min = (descr && index_bank_ptrs) ? (uint64_t)comp_cap
-                                 : descr ? (uint64_t)n_banks * comp_cap
-                                         : (uint64_t)n_comp;
-    const uint64_t comp_bytes = comp_rows_min * PULSAR_MXKV_FP4_ROWBYTES(128u);
+        uint32_t                causal) {
+    /* ONE scorer (L173, L176): the block-scaled MXFP4 tier
+     * (src/cuda/pulsar_cuda_indexer_mxfp4.cu) feeds the stored MXFP4 rows
+     * straight to the SM120 tensor cores, for every row count.  Everything
+     * this file once dispatched around it is gone: the one-row SIMT kernel
+     * (L173), and the generic per-(comp,row) kernel with its descriptor
+     * (banked) arm -- the engine scores a banked span as same-bank runs
+     * through pulsar_gpu_indexer_scores_decode_run_tensor and REFUSES a span
+     * whose runs are not consecutive positions (gpu_prefill.cpp), so the
+     * descriptor arm's only caller was the smoke test that compared it with
+     * itself, and the generic kernel's only remaining shapes were that test's
+     * 4-head fixtures.  A shape the tier does not take is refused by name.
+     *
+     * D5's cross-tier operand unification is structural: Q arrives as the
+     * producer's packed E2M1 rows (L090.4), the tier decodes the same bytes
+     * the store wrote; no per-entry round-trip.  FIDELITY: the suite-v1 KL
+     * run cleared the original flip; tests/idx_quant_fidelity.cc's top-k
+     * overlap was the component evidence. */
+    const uint64_t comp_bytes = (uint64_t)n_comp * PULSAR_MXKV_FP4_ROWBYTES(128u);
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         head_dim != 128u ||   /* packed rows are the 68-byte head_dim-128 layout */
@@ -745,9 +597,9 @@ static int indexer_scores_launch(
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < comp_bytes ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
-        fprintf(stderr, "pulsar: indexer scores rejected: n_tokens=%u n_comp=%u head_dim=%u comp rows needed=%llu "
+        fprintf(stderr, "pulsar: indexer scores rejected: n_tokens=%u n_comp=%u head_dim=%u "
                         "(index_comp %llu B, scores %llu B) -- refusing\n",
-                n_tokens, n_comp, head_dim, (unsigned long long)comp_rows_min,
+                n_tokens, n_comp, head_dim,
                 (unsigned long long)(index_comp ? index_comp->bytes : 0ull),
                 (unsigned long long)(scores ? scores->bytes : 0ull));
         return 0;
@@ -756,92 +608,26 @@ static int indexer_scores_launch(
         fprintf(stderr, "pulsar: indexer scores rejected: causal scan with compression ratio 0 -- refusing\n");
         return 0;
     }
-    const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
-    const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
-    const void * const *index_bank_ptrs_ptr =
-        (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
-    const uint32_t kernel_n_banks = descr ? n_banks : 1u;
-    /* D5's cross-tier operand unification is now structural: Q arrives as the
-     * producer's packed E2M1 rows (L090.4), every tier decodes the same bytes,
-     * and the per-entry E4M3 round-trip that used to force this -- an identity
-     * on values already crushed to the FP4 grid -- is deleted with the f32
-     * container it patched over.
-     *
-     * ONE scorer for every row count (L173): a one-row launch used to take a
-     * SIMT kernel (one block per compressed row) and every other count the
-     * block-scaled tier below -- the L161 shape one layer upstream of the
-     * selection.  Measured 2026-09-04 on identical packed operands: the tier
-     * at one row is 6.6-8.1 us flat from 600 to 8300 compressed rows where the
-     * SIMT kernel grew from 12.6 to 115 us, the scores agree to ~1e-7 and the
-     * top-512 sets are identical at every width.  The SIMT kernel is gone;
-     * the banked lane sends one-row runs through the tier too
-     * (gpu_prefill.cpp, the indexer span). */
-    /* Block-scaled tier (src/cuda/pulsar_cuda_indexer_mxfp4.cu): feeds the
-     * stored MXFP4 rows straight to the SM120 tensor cores instead of
-     * dequantising them to fp16 first.  3.4x the WMMA tier at n_comp=512,
-     * n_tokens=512 on a locked clock.
-     *
-     * FIDELITY: none changed on this path any more.  This paragraph used to
-     * say "quantises Q to E4M3" -- true before L090.4; today the tier consumes
-     * the producer's packed E2M1 nibbles directly (idx_spread4 re-containers
-     * bytes: no amax, no rounding, no second scale -- see
-     * pulsar_cuda_indexer_mxfp4.cu).  The suite-v1 KL run cleared the ORIGINAL
-     * flip; tests/idx_quant_fidelity.cc's top-k overlap was the component
-     * evidence.  (Stale claim found by L106 V8.)
-     *
-     * The shape conditions are checked HERE rather than read off the
-     * launcher's return, so its 0 means a real allocation or launch failure.
-     * Falling through on 0 would turn either into a silent demotion to the
-     * slower kernel -- the same fail-open shape the type-tag dispatches keep
-     * getting bitten by. */
-    if (descr && n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        /* The engine scores a banked one-row run through the tier in scalar
-         * mode on the bank's view (pulsar_gpu_indexer_scores_decode_run_tensor);
-         * a descriptor launch at this shape would reach the generic kernel, a
-         * second arithmetic for a row the tier serves (L173).  No caller. */
-        fprintf(stderr, "pulsar: indexer scores: a one-row descriptor launch at n_head 64 / head_dim 128 has no "
-                        "kernel here -- score the run through the tier on the bank's view (decode_run); refusing\n");
+    if (n_head != 64u) {
+        fprintf(stderr, "pulsar: indexer scores: n_head %u has no kernel (the MXFP4 tier tiles 64 heads) -- refusing\n",
+                n_head);
         return 0;
     }
-    if (!descr && head_dim == 128u && n_head == 64u) {
-        /* Say so once: this tier changes the numbers, so "did it engage" must
-         * be answerable from a log rather than inferred from a timing delta. */
-        static int announced = 0;
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr, "pulsar: indexer scorer = block-scaled MXFP4 tier "
-                            "(packed E2M1 Q, consumed natively)\n");
-        }
-        return pulsar_gpu_indexer_scores_mxfp4(
-                (float *)scores->ptr, (const pulsar_mxkv_pack_t *)q->ptr,
-                (const float *)weights->ptr,
-                (const pulsar_mxkv_pack_t *)index_comp->ptr,
-                n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
-                causal ? 1 : 0);
+    /* Say so once: this tier changes the numbers, so "did it engage" must be
+     * answerable from a log rather than inferred from a timing delta. */
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: indexer scorer = block-scaled MXFP4 tier "
+                        "(packed E2M1 Q, consumed natively; every row count)\n");
     }
-
-    /* Everything else goes to the generic per-(comp,row) kernel: shapes the
-     * MXFP4 tier does not take, and descriptor (banked) batches of more than
-     * one row.  The engine's banked lane never sends the latter: it scores
-     * each bank run through the tier in scalar mode (gpu_prefill.cpp, the
-     * indexer span) and refuses a span whose runs are not consecutive
-     * positions; the multi-row descriptor arm is reached by the smoke's
-     * generic-kernel identity check (tests/cuda_long_context_smoke.cpp,
-     * mb_idx_run_case at n_head 4).  Whether this kernel and the tier agree
-     * to the bit on the same shape is not asserted anywhere. */
-    dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                         (const pulsar_mxkv_pack_t *)q->ptr,
-                                         (const float *)weights->ptr,
-                                         (const pulsar_mxkv_pack_t *)index_comp->ptr,
-                                         n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0,
-                                         positions_ptr, seq_id_ptr,
-                                         index_bank_ptrs_ptr,
-                                         comp_cap, kernel_n_banks);
-    return cuda_ok(cudaGetLastError(), "indexer scores launch");
+    return pulsar_gpu_indexer_scores_mxfp4(
+            (float *)scores->ptr, (const pulsar_mxkv_pack_t *)q->ptr,
+            (const float *)weights->ptr,
+            (const pulsar_mxkv_pack_t *)index_comp->ptr,
+            n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
+            causal ? 1 : 0);
 }
-
 
 
 int pulsar_gpu_indexer_score_one_tensor(
@@ -854,13 +640,8 @@ int pulsar_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0,
-                                 NULL, NULL, NULL, 0, 1);
+                                 n_head, head_dim, 1, scale, 0);
 }
-
-
-
-
 
 
 int pulsar_gpu_indexer_scores_decode_batch_tensor(
@@ -874,17 +655,10 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale,
-        const pulsar_gpu_tensor *positions,
-        const pulsar_gpu_tensor *seq_id,
-        const pulsar_gpu_tensor *index_bank_ptrs,
-        uint32_t                comp_cap,
-        uint32_t                n_banks) {
+        float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
-                                 n_head, head_dim, ratio, scale, 1,
-                                 positions, seq_id, index_bank_ptrs, comp_cap, n_banks);
+                                 n_head, head_dim, ratio, scale, 1);
 }
-
 
 
 int pulsar_gpu_indexer_scores_decode_run_tensor(
@@ -925,7 +699,6 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
             (const pulsar_mxkv_pack_t *)bank_index_comp->ptr,
             n_comp, run_n, run_pos0, n_head, head_dim, ratio, scale, 1);
 }
-
 
 
 int pulsar_gpu_indexer_topk_tensor(
@@ -1101,7 +874,6 @@ int pulsar_gpu_indexer_topk_tensor(
 }
 
 
-
 int pulsar_gpu_argmax_tensor(
         pulsar_gpu_tensor       *out_idx,
         const pulsar_gpu_tensor *logits,
@@ -1116,9 +888,6 @@ int pulsar_gpu_argmax_tensor(
                                n_vocab);
     return cuda_ok(cudaGetLastError(), "argmax launch");
 }
-
-
-
 
 
 /* ===== MXFP8 (E4M3 + per-32 E8M0) weight matmul via cuBLASLt block-scaling.

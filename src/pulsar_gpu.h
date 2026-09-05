@@ -292,23 +292,15 @@ int pulsar_gpu_indexer_score_one_tensor(
         float                   scale);
 
 
-/** Banked (multi-session) mode: positions/seq_id are per-row int32 device
- * arrays (row t's absolute position and TRUE bank id), comp_cap the per-bank
- * compressed-row stride, n_banks the pool size; the comp cache operand is
- * the whole bank pool.  Per-row visible count = (qpos+1)/ratio (the engine's
- * emit-before-read rule); rows past it (and dead rows, seq_id out of pool)
- * score -INF.  Scalar n_comp = cross-bank superset (scan bound + scores-row
- * stride only).  NULL/NULL/0/1 = classic single-cache behavior bit-exactly.
- * Banked multi-token rows run the generic kernel (the WMMA tier stays
- * single-bank).  A banked ONE-row descriptor launch at n_head 64 / head_dim
- * 128 is refused here (L173: the direct-one kernel is gone and the generic
- * kernel would be a second arithmetic for a row the tier serves); the engine
- * scores such a run through the tier in scalar mode on the bank's view via
- * pulsar_gpu_indexer_scores_decode_run_tensor.
- * L121: the engine now splits banked multi-token spans into same-bank
- * consecutive-position runs and feeds each through the run entry below
- * (block-scaled MXFP4 tier); this generic path remains the fallback for
- * non-conforming spans. */
+/** Score a causal prefill/decode span through the block-scaled MXFP4 tier:
+ * row t sees compressed rows < (pos0 + t + 1) / ratio, the rest -INF.  Single
+ * cache operand.  The engine scores a BANKED span as same-bank consecutive-
+ * position runs through pulsar_gpu_indexer_scores_decode_run_tensor below
+ * (and refuses a span whose runs are not consecutive); the descriptor
+ * (positions/seq_id/bank-table) arm this entry once carried, and the generic
+ * per-(comp,row) kernel behind it, served no engine shape and are gone
+ * (L176).  n_head must be 64 and head_dim 128 -- the tier's shape; anything
+ * else is refused by name. */
 int pulsar_gpu_indexer_scores_decode_batch_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -320,12 +312,7 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale,
-        const pulsar_gpu_tensor *positions,
-        const pulsar_gpu_tensor *seq_id,
-        const pulsar_gpu_tensor *index_bank_ptrs,
-        uint32_t                comp_cap,
-        uint32_t                n_banks);
+        float                   scale);
 
 /** L121: score ONE same-bank consecutive-position run of a banked decode span
  * through the block-scaled MXFP4 tier.  All tensor views are positioned at

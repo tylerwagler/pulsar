@@ -1031,137 +1031,6 @@ done:
  * MXFP4-packed (68 B/row) cache formats.
  * ------------------------------------------------------------------------- */
 
-static int mb_idx_run_case(const char *label,
-                           const mb_row *rows, uint32_t n_rows,
-                           pulsar_gpu_tensor *index_slab, uint32_t comp_cap,
-                           uint32_t n_comp_superset, uint32_t ratio,
-                           uint32_t n_banks, uint32_t n_head, uint32_t head_dim,
-                           uint64_t index_bank_bytes, uint32_t top_k) {
-    const uint64_t q_row = (uint64_t)n_head * head_dim;
-    const float scale = 0.125f;
-    float *q_host = (float *)malloc((uint64_t)n_rows * q_row * sizeof(float));
-    float *w_host = (float *)malloc((uint64_t)n_rows * n_head * sizeof(float));
-    float *out_batch = (float *)malloc((uint64_t)n_rows * n_comp_superset * sizeof(float));
-    float *out_ref = (float *)malloc((uint64_t)n_comp_superset * sizeof(float));
-    uint32_t *sel_batch = (uint32_t *)malloc((uint64_t)n_rows * top_k * sizeof(uint32_t));
-    uint32_t *sel_ref = (uint32_t *)malloc((uint64_t)top_k * sizeof(uint32_t));
-    int32_t *pos_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
-    int32_t *sid_host = (int32_t *)malloc(n_rows * sizeof(int32_t));
-    const uint64_t qp_row = (uint64_t)n_head * 68u;   /* packed rows per token-row */
-    uint8_t *qp_host = (uint8_t *)malloc((uint64_t)n_rows * qp_row);
-    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc((uint64_t)n_rows * qp_row);
-    pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc((uint64_t)n_rows * n_head * sizeof(float));
-    pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc((uint64_t)n_rows * n_comp_superset * sizeof(float));
-    pulsar_gpu_tensor *scores_ref = pulsar_gpu_tensor_alloc((uint64_t)n_comp_superset * sizeof(float));
-    pulsar_gpu_tensor *sel = pulsar_gpu_tensor_alloc((uint64_t)n_rows * top_k * sizeof(uint32_t));
-    pulsar_gpu_tensor *sel_ref_t = pulsar_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
-    pulsar_gpu_tensor *positions = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
-    pulsar_gpu_tensor *seq_id = pulsar_gpu_tensor_alloc(n_rows * sizeof(int32_t));
-    int rc = 1;
-    if (!q_host || !qp_host || !w_host || !out_batch || !out_ref || !sel_batch || !sel_ref ||
-        !pos_host || !sid_host || !q || !w || !scores || !scores_ref || !sel ||
-        !sel_ref_t || !positions || !seq_id) goto done;
-    mb_rng_state = 0x1d0b5u;
-    for (uint64_t i = 0; i < (uint64_t)n_rows * q_row; i++) q_host[i] = mb_rand() * 0.5f;
-    for (uint64_t i = 0; i < (uint64_t)n_rows * n_head; i++) w_host[i] = mb_rand() * 0.5f + 0.75f;
-    for (uint32_t r = 0; r < n_rows; r++) {
-        pos_host[r] = (int32_t)rows[r].qpos;
-        sid_host[r] = (int32_t)rows[r].bank;
-    }
-    mb_pack_q_rows(q_host, qp_host, (uint64_t)n_rows * n_head);
-    if (!pulsar_gpu_tensor_write(q, 0, qp_host, (uint64_t)n_rows * qp_row) ||
-        !pulsar_gpu_tensor_write(w, 0, w_host, (uint64_t)n_rows * n_head * sizeof(float)) ||
-        !pulsar_gpu_tensor_write(positions, 0, pos_host, n_rows * sizeof(int32_t)) ||
-        !pulsar_gpu_tensor_write(seq_id, 0, sid_host, n_rows * sizeof(int32_t))) goto done;
-
-    /* Banked launch: all rows, mixed banks, one call. */
-    if (!pulsar_gpu_indexer_scores_decode_batch_tensor(scores, q, w, index_slab,
-                                                    n_comp_superset, n_rows, 0,
-                                                    n_head, head_dim, ratio, scale,
-                                                    positions, seq_id, NULL, comp_cap, n_banks) ||
-        !pulsar_gpu_indexer_topk_tensor(sel, scores, n_comp_superset, n_rows, top_k) ||
-        !pulsar_gpu_synchronize() ||
-        !pulsar_gpu_tensor_read(scores, 0, out_batch,
-                             (uint64_t)n_rows * n_comp_superset * sizeof(float)) ||
-        !pulsar_gpu_tensor_read(sel, 0, sel_batch,
-                             (uint64_t)n_rows * top_k * sizeof(uint32_t))) {
-        fprintf(stderr, "multibank indexer %s: banked launch failed\n", label);
-        goto done;
-    }
-
-    /* Per-row single-session references against the bank's slab view: the
-     * classic scalar path (NULL descriptors) with pos0 = qpos and the SAME
-     * superset n_comp (the scalar-path causal clamp is already per-row
-     * (pos0+t+1)/ratio, so the -INF tail pattern must match exactly).  A
-     * 1-row launch with these head counts stays on the same generic kernel
-     * (the direct-one tier requires n_head 64). */
-    for (uint32_t r = 0; r < n_rows; r++) {
-        const mb_row *row = &rows[r];
-        pulsar_gpu_tensor *bank_view = pulsar_gpu_tensor_view(
-                index_slab, (uint64_t)row->bank * index_bank_bytes, index_bank_bytes);
-        pulsar_gpu_tensor *q_view = pulsar_gpu_tensor_view(q, (uint64_t)r * qp_row,
-                                                     qp_row);
-        pulsar_gpu_tensor *w_view = pulsar_gpu_tensor_view(w, (uint64_t)r * n_head * sizeof(float),
-                                                     (uint64_t)n_head * sizeof(float));
-        int ok = bank_view && q_view && w_view &&
-                 pulsar_gpu_indexer_scores_decode_batch_tensor(scores_ref, q_view, w_view,
-                                                            bank_view, n_comp_superset, 1,
-                                                            row->qpos, n_head, head_dim,
-                                                            ratio, scale,
-                                                            NULL, NULL, NULL, 0, 1) &&
-                 pulsar_gpu_indexer_topk_tensor(sel_ref_t, scores_ref, n_comp_superset, 1, top_k) &&
-                 pulsar_gpu_synchronize() &&
-                 pulsar_gpu_tensor_read(scores_ref, 0, out_ref,
-                                     (uint64_t)n_comp_superset * sizeof(float)) &&
-                 pulsar_gpu_tensor_read(sel_ref_t, 0, sel_ref,
-                                     (uint64_t)top_k * sizeof(uint32_t));
-        pulsar_gpu_tensor_free(w_view);
-        pulsar_gpu_tensor_free(q_view);
-        pulsar_gpu_tensor_free(bank_view);
-        if (!ok) {
-            fprintf(stderr, "multibank indexer %s: reference launch failed (row %u)\n", label, r);
-            goto done;
-        }
-        if (memcmp(out_ref, out_batch + (uint64_t)r * n_comp_superset,
-                   (uint64_t)n_comp_superset * sizeof(float)) != 0) {
-            fprintf(stderr, "multibank indexer %s: scores row %u (bank %u pos %u) != single-session\n",
-                    label, r, row->bank, row->qpos);
-            goto done;
-        }
-        if (memcmp(sel_ref, sel_batch + (uint64_t)r * top_k,
-                   (uint64_t)top_k * sizeof(uint32_t)) != 0) {
-            fprintf(stderr, "multibank indexer %s: top-k row %u (bank %u pos %u) != single-session\n",
-                    label, r, row->bank, row->qpos);
-            goto done;
-        }
-        /* Top-k must stay inside the row's own visible frontier whenever it
-         * has at least top_k visible rows (shorter rows legitimately carry
-         * -INF losers, which the consuming attention kernel drops per row). */
-        const uint32_t visible = (row->qpos + 1u) / ratio < n_comp_superset
-            ? (row->qpos + 1u) / ratio : n_comp_superset;
-        if (visible >= top_k) {
-            for (uint32_t k = 0; k < top_k; k++) {
-                if (sel_batch[(uint64_t)r * top_k + k] >= visible) {
-                    fprintf(stderr, "multibank indexer %s: top-k row %u selected id %u >= visible %u\n",
-                            label, r, sel_batch[(uint64_t)r * top_k + k], visible);
-                    goto done;
-                }
-            }
-        }
-    }
-    printf("  multibank indexer %s: %u rows across %u banks -> byte-identical (scores + top-k)\n",
-           label, n_rows, n_banks);
-    rc = 0;
-
-done:
-    pulsar_gpu_tensor_free(seq_id); pulsar_gpu_tensor_free(positions);
-    pulsar_gpu_tensor_free(sel_ref_t); pulsar_gpu_tensor_free(sel);
-    pulsar_gpu_tensor_free(scores_ref); pulsar_gpu_tensor_free(scores);
-    pulsar_gpu_tensor_free(w); pulsar_gpu_tensor_free(q);
-    free(sid_host); free(pos_host); free(sel_ref); free(sel_batch);
-    free(out_ref); free(out_batch); free(w_host); free(qp_host); free(q_host);
-    return rc;
-}
 
 /* L173: the banked one-row indexer run (the tier in scalar mode on the bank's
  * view, pulsar_gpu_indexer_scores_decode_run_tensor -- the production path for
@@ -1231,12 +1100,6 @@ static int check_multibank_indexer(void) {
     const uint32_t head_dim = 128;
     int rc = 1;
 
-    /* Rows: bank 0 deep (qpos 100 -> visible 25 == superset), bank 1 at the
-     * EMIT boundary qpos 39 (visible (39+1)/4 = 10; a floor(39/4) = 9 bug
-     * loses score row 9 -> teeth), bank 1 at qpos 37 (visible 9), and bank 1
-     * at qpos 17 (visible 4 < top_k 8: the -INF losers case). */
-    const mb_row rows[4] = { {0, 100, 0}, {1, 39, 0}, {1, 37, 0}, {1, 17, 0} };
-
     /* MXFP4-packed cache (production format): synthetic packed rows — 64
      * nibble bytes + 4 E8M0 scale bytes constrained to a sane exponent range
      * (the dequant is well-defined for any codes; references and banked
@@ -1257,16 +1120,13 @@ static int check_multibank_indexer(void) {
                 host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
             }
             if (pulsar_gpu_tensor_write(slab, 0, host, total)) {
-                case_rc = mb_idx_run_case("fp4", rows, 4, slab, comp_cap,
-                                          n_comp_sup, ratio, n_banks, 4, head_dim,
-                                          bank_bytes, 8);
-                /* One-row bank run at the tier's shape (n_head 64): the n_head=4
-                 * case above dispatches the generic kernel; production scores
-                 * a one-row bank run through the tier on the bank's view, and
-                 * that must equal the classic one-row scorer (L173).  Emit-
-                 * boundary qpos 39 as visibility teeth (visible 10 of 25). */
-                if (case_rc == 0)
-                    case_rc = mb_idx_direct_one_case(slab, n_comp_sup, ratio, head_dim, bank_bytes, 1u, 39u);
+                /* The one banked indexer shape production has: a one-row bank
+                 * run through the tier on the bank's view, which must equal
+                 * the classic one-row scorer (L173).  The descriptor-batch
+                 * cases that stood here compared the deleted generic kernel
+                 * with itself at 4 heads (L176).  Emit-boundary qpos 39 as
+                 * visibility teeth (visible 10 of 25). */
+                case_rc = mb_idx_direct_one_case(slab, n_comp_sup, ratio, head_dim, bank_bytes, 1u, 39u);
             }
         }
         pulsar_gpu_tensor_free(slab);
@@ -1276,72 +1136,6 @@ static int check_multibank_indexer(void) {
 
 
 
-    /* Dead-row guard: an out-of-pool seq_id must produce an all -INF score
-     * row (fail-visible) while its batchmate row scores normally. */
-    {
-        const uint32_t n_head = 4;
-        const uint64_t q_row = (uint64_t)n_head * head_dim;
-        /* L106 K9: this slab was built as f32 rows (512 B/row) and handed to a
-         * reader that decodes 68 B MXKV-FP4 rows.  The 7.5x oversize meant
-         * nothing faulted, and the dead-row assertion (all -INF) is
-         * insensitive to garbage scores on the live row -- the case was green
-         * while measuring nothing.  Build packed rows exactly as the fp4
-         * sibling above does. */
-        const uint64_t row_bytes = 68;   /* PULSAR_MXKV_FP4_ROWBYTES(128), as the fp4 sibling above */
-        const uint64_t count = (uint64_t)n_banks * comp_cap * row_bytes;
-        uint8_t *host = (uint8_t *)malloc(count);
-        float *q_host = (float *)malloc(2 * q_row * sizeof(float));
-        float *w_host = (float *)malloc(2 * n_head * sizeof(float));
-        float *out = (float *)malloc(2 * (uint64_t)n_comp_sup * sizeof(float));
-        const int32_t pos_host[2] = {100, 37};
-        const int32_t sid_host[2] = {-1, 1};
-        pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(count);
-        uint8_t qp_host2[2 * 64 * 68];   /* n_head<=64 packed rows x 2 tokens */
-        pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(2 * (uint64_t)n_head * 68u);
-        pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc(2 * n_head * sizeof(float));
-        pulsar_gpu_tensor *scores = pulsar_gpu_tensor_alloc(2 * (uint64_t)n_comp_sup * sizeof(float));
-        pulsar_gpu_tensor *p = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
-        pulsar_gpu_tensor *s = pulsar_gpu_tensor_alloc(2 * sizeof(int32_t));
-        int dead_rc = 1;
-        if (host && q_host && w_host && out && slab && q && w && scores && p && s) {
-            mb_rng_state = 0xdeadf00u;
-            for (uint64_t i = 0; i < count; i++) {
-                const uint64_t in_row = i % row_bytes;
-                const uint32_t r8 = (uint32_t)(mb_rng_state >> 16) & 0xffu;
-                mb_rng_state = mb_rng_state * 1664525u + 1013904223u;
-                host[i] = in_row < 64 ? (uint8_t)r8 : (uint8_t)(115u + (r8 & 15u));
-            }
-            for (uint64_t i = 0; i < 2 * q_row; i++) q_host[i] = mb_rand() * 0.5f;
-            for (uint64_t i = 0; i < 2 * n_head; i++) w_host[i] = 1.0f;
-            if (pulsar_gpu_tensor_write(slab, 0, host, count) &&
-                (mb_pack_q_rows(q_host, qp_host2, 2 * (uint64_t)n_head), 1) &&
-                pulsar_gpu_tensor_write(q, 0, qp_host2, 2 * (uint64_t)n_head * 68u) &&
-                pulsar_gpu_tensor_write(w, 0, w_host, 2 * n_head * sizeof(float)) &&
-                pulsar_gpu_tensor_write(p, 0, pos_host, sizeof(pos_host)) &&
-                pulsar_gpu_tensor_write(s, 0, sid_host, sizeof(sid_host)) &&
-                pulsar_gpu_indexer_scores_decode_batch_tensor(scores, q, w, slab,
-                                                           n_comp_sup, 2, 0,
-                                                           n_head, head_dim, ratio, 0.125f,
-                                                           p, s, NULL, comp_cap, n_banks) &&
-                pulsar_gpu_synchronize() &&
-                pulsar_gpu_tensor_read(scores, 0, out, 2 * (uint64_t)n_comp_sup * sizeof(float))) {
-                dead_rc = 0;
-                for (uint32_t c = 0; c < n_comp_sup; c++) {
-                    if (!(out[c] == -INFINITY)) {
-                        fprintf(stderr, "multibank indexer dead-row: finite score at %u\n", c);
-                        dead_rc = 1;
-                        break;
-                    }
-                }
-                if (dead_rc == 0)
-                    printf("  multibank indexer dead-row: out-of-pool seq_id -> all -INF scores\n");
-            }
-        }
-        pulsar_gpu_tensor_free(s); pulsar_gpu_tensor_free(p); pulsar_gpu_tensor_free(scores);
-        pulsar_gpu_tensor_free(w); pulsar_gpu_tensor_free(q); pulsar_gpu_tensor_free(slab);
-        free(out); free(w_host); free(q_host); free(host);
-        if (dead_rc != 0) goto done;
-    }
     rc = 0;
 done:
     return rc;

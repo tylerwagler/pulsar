@@ -428,11 +428,7 @@ static bool gpu_graph_indexed_attention_span(
                                                           PULSAR_N_INDEXER_HEAD,
                                                           PULSAR_N_INDEXER_HEAD_DIM,
                                                           ratio,
-                                                          index_scale,
-                                                          sp_view, ss_view,
-                                                          op->index_bases,
-                                                          op->comp_cap,
-                                                          op->n_banks) != 0;
+                                                          index_scale) != 0;
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("indexer_scores", g->indexer_scores,
