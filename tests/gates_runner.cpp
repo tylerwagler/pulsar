@@ -274,6 +274,9 @@ int main(int argc, char **argv) {
     /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
     const gate_spec group_depth1[] = {
         {"cuda-dspark-batch-gate-depth1", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "1", NULL}},
+        /* L177: the widest admissible speculative step -- 3 banks x (1 + 4) = 15
+         * rows, one under PULSAR_SPEC_ROW_BUDGET -- batched == serialized. */
+        {"cuda-dspark-batch-gate-depth4", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "4", NULL}},
     };
     /* Configuration B: drafter off.  Configuration C: drafter off + prefill
      * chunk 4096, and the environment scrub -- last. */

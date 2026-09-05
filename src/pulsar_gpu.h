@@ -104,12 +104,23 @@
 #define PULSAR_SHARED_ACT_ELT_SIZE 2u
 #define PULSAR_SHARED_ACT_ELT_FMT  PULSAR_ELT_F16   /* f16 staging; runtime-esz consumers */
 
-/** spec_logits row capacity: the per-forward ROW BUDGET of the batched lane,
- * NOT prefill_cap.  One shared forward carries every co-scheduled session's
- * verify row plus its draft rows, so the server's ranked allocator fits draft
- * depths to PULSAR_SPEC_LOGITS_ROWS - n_live and refuses a demand above it
- * (server_sched.cpp); the multiseq ALL_ROWS head refuses n_rows above it
- * (session_multiseq.cpp), and a plain PULSAR_MSEQ_MAX-row step must fit
+/** The batched speculative lane's per-forward ROW BUDGET: the most rows one
+ * shared verify forward may carry (each co-scheduled session's committed row
+ * plus its draft rows).  It is the M-neutral range, PULSAR_GPU_MNEUTRAL_ROWS_MAX:
+ * at or under it every row is a decode row on the width-neutral GEMV arm, so
+ * a session's verify numerics do not depend on who else is drafting.  L117
+ * (2026-08-27) raised the budget to 32 with the slab; past 16 the step's
+ * row-kind inference found no single-row runs, declared zero decode rows, and
+ * every row ran on the tensor-core arm -- a bank's numerics then depended on
+ * the batch width (Tyler, 2026-09-05: budget back to 16; L177).  The server's
+ * allocator fits draft depths to this and the ALL_ROWS head refuses above it. */
+#define PULSAR_SPEC_ROW_BUDGET PULSAR_GPU_MNEUTRAL_ROWS_MAX
+
+/** spec_logits row CAPACITY (>= PULSAR_SPEC_ROW_BUDGET, asserted in imatrix.cpp):
+ * the slab the batched lane's head writes,
+ * NOT prefill_cap.  The budget the lane admits against is PULSAR_SPEC_ROW_BUDGET
+ * above (server_sched.cpp fits draft depths to it, session_multiseq.cpp's ALL_ROWS
+ * head refuses above it); a plain PULSAR_MSEQ_MAX-row step must fit
  * (static_assert PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS, imatrix.cpp).
  * spec_logits, dspark_prefilter_sel, dspark_row_meta and spec_compact_host
  * are all sized by this one constant (gpu_diag.cpp) -- guards on row indices

@@ -127,13 +127,17 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
     for (uint32_t k = 0; k < n_rows; k++)
         if (k + 1 == n_rows || reqs[k + 1].bank != reqs[k].bank) n_runs++;
     /* Inc 6 (ALL_ROWS): one logit row PER BATCH ROW, for the batched spec
-     * verify's accept walk. The head writes spec_logits, which holds
-     * PULSAR_SPEC_LOGITS_ROWS rows -- refuse louder rather than truncate. */
+     * verify's accept walk.  The step may carry at most PULSAR_SPEC_ROW_BUDGET
+     * rows -- the M-neutral range, so every row is a decode row on the
+     * width-neutral arm and no session's numerics depend on the batch width
+     * (L177).  Above it the step is refused by name, never run on the
+     * tensor-core arm the row-kind inference would otherwise choose. */
     const uint32_t head_rows =
         (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) ? n_rows : n_runs;
-    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS && n_rows > PULSAR_SPEC_LOGITS_ROWS) {
-        PULSAR_MIXED_ERR("mixed decode: ALL_ROWS caps at %u rows (n_rows=%u)",
-                      (unsigned)PULSAR_SPEC_LOGITS_ROWS, n_rows);
+    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS && n_rows > PULSAR_SPEC_ROW_BUDGET) {
+        PULSAR_MIXED_ERR("mixed decode: a speculative verify step carries at most %u rows "
+                         "(the M-neutral range; n_rows=%u) -- refusing",
+                      (unsigned)PULSAR_SPEC_ROW_BUDGET, n_rows);
         return 1;
     }
     if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)head_rows * PULSAR_N_VOCAB) {

@@ -1061,6 +1061,8 @@ int gpu_graph_decode_multiseq_batch(
      * (the inc-1/inc-2 gates must stay green). */
     static_assert(PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS,
                   "one last-row logit per bank run must fit the spec_logits slab");
+    static_assert(PULSAR_SPEC_ROW_BUDGET <= PULSAR_SPEC_LOGITS_ROWS,
+                  "the batched lane's row budget must fit the spec_logits slab");
     int last_idx[PULSAR_MSEQ_MAX];
     uint32_t n_runs = 0;
     for (uint32_t t = 0; t < n_active; t++) {

@@ -1923,7 +1923,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
              * pre-allocator lane; the ranked allocation engages ONLY on
              * overflow, where the old behavior (arbitrary whole-bank
              * sit-out) was itself partner-coupled and strictly worse. */
-            k_overflow = demand > PULSAR_SPEC_LOGITS_ROWS;
+            k_overflow = demand > (int)PULSAR_SPEC_ROW_BUDGET;
             if (k_overflow) {
                 /* L117 (L049 inc 2): under overflow the ranked admission also
                  * consults the COST TABLE — stop admitting once the next
@@ -1947,7 +1947,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                                   s->spec_ms_per_tok_ema : 45.0f;
                 const float thr = marginal_ms / ema;
                 s->w_spec_overflow_rounds++;
-                int budget = (int)PULSAR_SPEC_LOGITS_ROWS - n_live;
+                int budget = (int)PULSAR_SPEC_ROW_BUDGET - n_live;
                 while (budget > 0) {
                     int bi = -1;
                     float bv = -1.0f;
@@ -2000,7 +2000,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             const uint32_t k_cap_rows = k_overflow
                 ? 1u + (uint32_t)k_alloc[i]
                 : pulsar_session_spec_next_rows_max(pool);
-            if (rows + k_cap_rows > PULSAR_SPEC_LOGITS_ROWS) {
+            if (rows + k_cap_rows > PULSAR_SPEC_ROW_BUDGET) {
                 /* Over the shared-forward row budget even at the allocated
                  * K (can only happen when an earlier bank EOS'd/errored and
                  * the sweep shape shifted): sit this sweep out BEFORE the
@@ -2041,7 +2041,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                 g->phase = GEN_FINISH;
                 continue;
             }
-            if (rows + pulsar_spec_round_n_rows(rounds[i]) > PULSAR_SPEC_LOGITS_ROWS) {
+            if (rows + pulsar_spec_round_n_rows(rounds[i]) > PULSAR_SPEC_ROW_BUDGET) {
                 /* Unreachable: the pre-begin budget check bounds n_batch from
                  * above (begin only trims). Defensive backstop, checked
                  * BEFORE fill_reqs writes, so a future change to begin's row
