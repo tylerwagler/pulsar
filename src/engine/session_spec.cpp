@@ -277,19 +277,23 @@ static void spec_frontier_free(pulsar_spec_frontier *f) {
 /* Build the batched-copy descriptor tables for the frontier snapshot/restore
  * copy sets. All source/destination tensors are fixed allocations, so the
  * tables are built once and replayed with one kernel launch per direction
- * (previously ~126 cudaMemcpy launches per snapshot, again per restore). A
- * NULL handle (prepare rejected a size, or alloc failed) keeps the loop path. */
-static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
-    if (g->spec_frontier_copy_init) return;
-    /* ⚠ THE FLAG IS SET ON SUCCESS, NOT ON ENTRY.  It used to be set here, before
-     * either prepare() below was attempted, so a single transient failure latched
-     * it forever: every later snapshot AND restore silently fell to the ~126-copy
-     * loop path (252 per accepted step), with nothing logged and no way back.  A
-     * fallback that can only be entered and never left is indistinguishable from
-     * the fast path being gone.  Leaving the flag clear on failure costs one
-     * retry per snapshot -- and prepare() only builds descriptor tables, which is
-     * far cheaper than the loop it avoids, so retrying is strictly better than
-     * staying degraded. */
+ * (~126 cudaMemcpy launches per snapshot, again per restore, before them).
+ *
+ * This is the ONE copy path (L190 D5).  prepare() rejects only impossible
+ * states -- a NULL or undersized tensor, a byte count that is not a multiple
+ * of 16 (every tensor here is a 256 B-aligned allocation) -- and device
+ * allocation failure; on either the snapshot FAILS, loudly.  The per-tensor
+ * cudaMemcpy loop it used to fall back to was a second implementation
+ * selected exactly when something was wrong, announced once, and never
+ * exercised by a gate; it is deleted.  Returns false with the flag left
+ * clear, so the next snapshot retries a transient allocation failure.
+ *
+ * ⚠ THE FLAG IS SET ON SUCCESS, NOT ON ENTRY.  It used to be set here, before
+ * either prepare() below was attempted, so a single transient failure latched
+ * the degraded state forever with nothing logged and no way back.  prepare()
+ * only builds descriptor tables, so retrying is cheap. */
+static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
+    if (g->spec_frontier_copy_init) return true;
     pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
     pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
     uint64_t bytes[PULSAR_MAX_LAYER * 4];
@@ -310,70 +314,46 @@ static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
         }
     }
     if (n == 0) {
-        /* No compressed layers: there is genuinely nothing to copy, and the loop
-         * path below is equally empty. Done, not degraded. */
+        /* No compressed layers: there is genuinely nothing to copy (copy_n
+         * stays 0 and the run is skipped). Done, not degraded. */
         g->spec_frontier_copy_init = 1;
-        return;
+        return true;
     }
     void *snap = pulsar_gpu_batched_copy_prepare(dst, src, bytes, n);
     /* restore = the same set with src/dst swapped */
     void *restore = pulsar_gpu_batched_copy_prepare(src, dst, bytes, n);
     if (!snap || !restore) {
-        /* Take neither: a snapshot batched but a restore looped (or the reverse)
-         * would be a correctness hazard, not just a slow path. */
+        /* Take neither: the two directions must be the same copy set. */
         pulsar_gpu_batched_copy_free(snap);
         pulsar_gpu_batched_copy_free(restore);
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING spec frontier batched-copy prepare failed "
-                    "(%u descriptors, max %llu B) -- falling back to the per-tensor "
-                    "copy loop for this snapshot; will retry on the next one\n",
-                    n, (unsigned long long)mx);
-        }
-        return;                      /* init stays 0 -- the next call retries */
+        fprintf(stderr,
+                "pulsar: spec frontier batched-copy prepare failed (%u descriptors, max %llu B) "
+                "-- refusing the snapshot (no per-tensor copy loop; L190)\n",
+                n, (unsigned long long)mx);
+        return false;                /* init stays 0 -- the next call retries */
     }
     g->spec_snap_copies = snap;
     g->spec_restore_copies = restore;
     g->spec_frontier_copy_n = n;
     g->spec_frontier_copy_max_bytes = mx;
     g->spec_frontier_copy_init = 1;
+    return true;
 }
 
 static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     memset(f, 0, sizeof(*f));
     pulsar_gpu_graph *g = &s->graph;
-    spec_frontier_copy_tables_init(g);
+    if (!spec_frontier_copy_tables_init(g)) return false;
 
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         f->n_comp[il] = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
         f->n_index_comp[il] = gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il);
     }
-    if (ok && g->spec_snap_copies) {
+    if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
                                       g->spec_frontier_copy_n,
                                       g->spec_frontier_copy_max_bytes) != 0;
-    } else {
-        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = pulsar_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
-                                       g->layer_attn_state_kv[il], 0, ab) != 0 &&
-                 pulsar_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
-                                       g->layer_attn_state_score[il], 0, ab) != 0;
-            if (ratio == 4) {
-                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-                ok = ok &&
-                     pulsar_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
-                                           g->layer_index_state_kv[il], 0, ib) != 0 &&
-                     pulsar_gpu_tensor_copy(g->spec_index_state_score[il], 0,
-                                           g->layer_index_state_score[il], 0, ib) != 0;
-            }
-        }
-    }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
     if (ok) return true;
@@ -386,33 +366,24 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
 
 static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
+    /* The tables cache the CURRENT bank's state pointers and
+     * gpu_graph_bank_repoint drops them, so in the batched lane a round's
+     * restore usually finds them gone: the server switches banks between
+     * round_begin (snapshot) and round_end, and switches back before calling
+     * here.  Rebuild for the bank that is live now -- the round's own -- the
+     * same path the snapshot took.  Until L190 this case silently ran the
+     * per-tensor loop, i.e. with two or more banks live the production restore
+     * WAS the fallback. */
+    if (!spec_frontier_copy_tables_init(g)) return false;
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = f->n_comp[il];
         gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = f->n_index_comp[il];
     }
-    if (ok && g->spec_restore_copies) {
+    if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
                                       g->spec_frontier_copy_n,
                                       g->spec_frontier_copy_max_bytes) != 0;
-    } else {
-        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = pulsar_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                       g->spec_attn_state_kv[il], 0, ab) != 0 &&
-                 pulsar_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                       g->spec_attn_state_score[il], 0, ab) != 0;
-            if (ok && ratio == 4) {
-                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-                ok = pulsar_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                           g->spec_index_state_kv[il], 0, ib) != 0 &&
-                     pulsar_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                           g->spec_index_state_score[il], 0, ib) != 0;
-            }
-        }
-    }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
     return ok;
@@ -793,8 +764,9 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
          * one small block and the host skips the 129k-expf normaliser pass
          * that idled the GPU ~630 us per draft position. The built q is stored
          * for the residual (dspark_pending_qn), so the walk skips the rebuild
-         * too. Any other shape, an overflowing candidate set or a refused build
-         * falls through to the full-row path, unchanged. */
+         * too. Any other shape, or a candidate set wider than the compact
+         * block, reads the full row; a device failure or a refused candidate
+         * block ends the draft (L190 D3). */
         pulsar_sample_dist q;
         bool q_built = false;
         s->spec.dspark_pending_qn[pos] = 0;
@@ -805,18 +777,38 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
              * comparison decides membership, this only bounds the read */
             const float delta = (float)((double)temperature * (log((double)min_p) - 1e-3));
             int32_t sel[PULSAR_DSPARK_PREFILTER_ROW_I32];
-            if (pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, dspark_logits, 0, 1u,
-                                               vocab_size, vocab_size, delta,
-                                               PULSAR_DSPARK_PREFILTER_CAP) &&
-                pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel, sizeof(sel))) {
-                const uint32_t n_sel = (uint32_t)sel[0];
+            /* The shape is in the sparse contract, so from here a device
+             * failure is a failure: the prefilter launch, its readback, a row
+             * with no finite logit (n_sel == 0) or a candidate block the host
+             * build refuses all end the draft loudly.  A row with MORE
+             * candidates above the floor than the compact block holds is the
+             * one genuine ineligibility and reads the full row below (L190
+             * D3, the L174 class: a device error used to read as the slower
+             * path). */
+            if (!pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, dspark_logits, 0, 1u,
+                                                vocab_size, vocab_size, delta,
+                                                PULSAR_DSPARK_PREFILTER_CAP) ||
+                !pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel, sizeof(sel))) {
+                fprintf(stderr, "pulsar: dspark min-p prefilter failed at draft position %u -- "
+                                "no drafts this round (no full-row fallback; L190)\n", pos);
+                draft_ok = false;
+                break;
+            }
+            const uint32_t n_sel = (uint32_t)sel[0];
+            if (n_sel <= PULSAR_DSPARK_PREFILTER_CAP) {
                 float max_logit;
                 memcpy(&max_logit, &sel[2], sizeof(max_logit));
-                if (n_sel > 0 && n_sel <= PULSAR_DSPARK_PREFILTER_CAP)
-                    q_built = pulsar_sample_dist_build_prefiltered(
-                                  sel + 3, (const float *)(sel + 3 + PULSAR_DSPARK_PREFILTER_CAP),
-                                  n_sel, max_logit, temperature, min_p,
-                                  &s->sample_scratch, &q) != 0;
+                if (n_sel == 0 ||
+                    !pulsar_sample_dist_build_prefiltered(
+                        sel + 3, (const float *)(sel + 3 + PULSAR_DSPARK_PREFILTER_CAP),
+                        n_sel, max_logit, temperature, min_p, &s->sample_scratch, &q)) {
+                    fprintf(stderr, "pulsar: dspark min-p prefilter handed %u candidates at draft "
+                                    "position %u and the build refused them -- no drafts this "
+                                    "round (L190)\n", n_sel, pos);
+                    draft_ok = false;
+                    break;
+                }
+                q_built = true;
             }
             if (q_built && q.n <= PULSAR_DSPARK_QDIST_CAP) {
                 s->spec.dspark_pending_qn[pos] = q.n;
@@ -877,7 +869,8 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
              * pattern already retired in gpu_decode's dspark projection. */
             pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
             pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
-            if (conf_dev && tok_dev &&
+            const bool scored =
+                conf_dev && tok_dev &&
                 (defer_harvest
                      /* device-to-device: the ids are already in the chain
                       * array; a host write here would force the read this
@@ -894,17 +887,24 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                                       w->markov_w1->type == PULSAR_TENSOR_BF16,
                                                       w->confidence_proj->type == PULSAR_TENSOR_BF16) &&
                 (defer_harvest ||
-                 pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float)))) {
-                if (defer_harvest) {
-                    conf_deferred = true;   /* harvest reads + trims later */
-                } else {
-                    have_conf = true;
-                    if (tau > 0.0f) {
-                        uint32_t k = 0;
-                        while (k < n_draft && conf[k] >= tau) k++;
-                        keep = k;   /* 0 pending = next step is a plain n=1 forward */
-                    }
-                }
+                 pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float)));
+            if (!scored) {
+                /* L190 D4: with tau > 0 the trim is scheduled; a scoring or
+                 * readback failure used to keep the untrimmed chain and feed
+                 * -1 to the depth controller without a word.  The round
+                 * drafts nothing instead, and says so. */
+                fprintf(stderr, "pulsar: dspark confidence scoring failed for %u drafts -- "
+                                "no drafts this round (the tau trim is not skipped silently; L190)\n",
+                        n_draft);
+                return 0;
+            }
+            if (defer_harvest) {
+                conf_deferred = true;   /* harvest reads + trims later */
+            } else {
+                have_conf = true;
+                uint32_t k = 0;
+                while (k < n_draft && conf[k] >= tau) k++;
+                keep = k;   /* 0 pending = next step is a plain n=1 forward */
             }
         }
     }
@@ -940,9 +940,10 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
 }
 
 /* L108 P2: lazy completion of a device-chained greedy draft. Mirrors the
- * immediate path's semantics exactly: conf-read failure -> untrimmed keep
- * (have_conf=false there), ids-read failure -> 0 pendings (best-effort
- * contract, next step is a plain forward). Merge marker for L107: when the
+ * immediate path's semantics: a failed ids or confidence readback drops the
+ * chain (0 pendings, the next step is a plain forward) and says so -- never
+ * an untrimmed keep with -1 conf fed to the controller (L190 D4).  Merge
+ * marker for L107: when the
  * adaptive-depth controller lands, its unconditional dspark_pending_conf
  * store must be replicated here. */
 void pulsar_session_spec_chain_harvest(pulsar_session *s) {
@@ -954,15 +955,26 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s) {
     int32_t ids[17];
     if (!g->dspark_refined_ids ||
         !pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t), ids + 1,
-                                (uint64_t)n_draft * sizeof(int32_t)))
+                                (uint64_t)n_draft * sizeof(int32_t))) {
+        fprintf(stderr, "pulsar: dspark chain harvest: draft ids readback failed -- "
+                        "the chain is dropped (0 pendings)\n");
+        s->spec.dspark_n_pending = 0;
         return;
+    }
     uint32_t keep = n_draft;
     float conf[16];
-    bool have_conf = false;
-    if (s->spec.dspark_chain_conf &&
-        pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, conf,
-                               (uint64_t)n_draft * sizeof(float))) {
-        have_conf = true;
+    const bool have_conf = s->spec.dspark_chain_conf;
+    if (have_conf) {
+        if (!pulsar_gpu_tensor_read(g->dspark_conf_scores, 0, conf,
+                                    (uint64_t)n_draft * sizeof(float))) {
+            /* L190 D4: this used to keep the untrimmed chain and feed -1 to
+             * the depth controller without a word; a chain whose confidence
+             * cannot be read is dropped, and said so. */
+            fprintf(stderr, "pulsar: dspark chain harvest: confidence readback failed -- "
+                            "the chain is dropped (0 pendings)\n");
+            s->spec.dspark_n_pending = 0;
+            return;
+        }
         const float tau = dspark_conf_sched_tau();
         if (tau > 0.0f) {
             uint32_t k = 0;
@@ -998,6 +1010,10 @@ typedef struct {
     /* results, filled by the batched redraft; committed into the bank's shadow
      * by pulsar_session_spec_redraft_commit under the server's bank switch */
     bool     done;
+    /** L190 C2: the "past the drafter batch cap" line was said for this round
+     * object; survives spec_round_begin's reset (like qrows) so it is said
+     * once per affected round, not once per process or once per step. */
+    bool     cap_said;
     bool     sample_drafts;
     uint32_t keep;
     bool     have_conf;
@@ -1051,8 +1067,10 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         /* the round is reused across rounds; its redraft record's lazily-owned
          * fallback rows (L150) survive the reset, everything else is cleared */
         float *qrows = r->redraft.qrows;
+        const bool cap_said = r->redraft.cap_said;
         memset(r, 0, sizeof(*r));
         r->redraft.qrows = qrows;
+        r->redraft.cap_said = cap_said;
     }
     /* L149 phase 2: accumulate, for the step this round will ride, whether
      * every round is in the sparse min-p contract and the most permissive
@@ -2003,27 +2021,45 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                      refined_s, ids_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
                      dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
                      (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_bf16);
-            bool have_sel = false;
-            if (ok && all_sparse)
-                have_sel = pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, refined_s, 0,
-                                                          (uint32_t)n_s, vocab_size, vocab_size,
-                                                          delta, PULSAR_DSPARK_PREFILTER_CAP) &&
-                           pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel,
-                                                  (uint64_t)n_s * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+            if (ok && all_sparse &&
+                !(pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, refined_s, 0,
+                                                 (uint32_t)n_s, vocab_size, vocab_size,
+                                                 delta, PULSAR_DSPARK_PREFILTER_CAP) &&
+                  pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0, sel,
+                                         (uint64_t)n_s * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t)))) {
+                /* every sampled round here is in the sparse contract: a device
+                 * failure is a failure, not a full-row read (L190 D3) */
+                fprintf(stderr, "pulsar: dspark batched min-p prefilter failed at draft position %u "
+                                "-- refusing the batch (no full-row fallback; L190)\n", pos);
+                ok = false;
+            }
             for (int j = n_g; j < n_sel && ok; j++) {
                 spec_redraft_req *q = &rounds[order[j]]->redraft;
                 if (pos >= q->n_draft) continue;
                 pulsar_sample_dist qd;
                 bool built = false;
-                if (have_sel) {
+                if (all_sparse) {
                     const int32_t *h = sel + (size_t)(j - n_g) * PULSAR_DSPARK_PREFILTER_ROW_I32;
                     const uint32_t n_c = (uint32_t)h[0];
-                    float max_logit;
-                    memcpy(&max_logit, &h[2], sizeof(max_logit));
-                    if (n_c > 0 && n_c <= PULSAR_DSPARK_PREFILTER_CAP)
-                        built = pulsar_sample_dist_build_prefiltered(
-                                    h + 3, (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP), n_c,
-                                    max_logit, q->temperature, q->min_p, &s->sample_scratch, &qd) != 0;
+                    /* n_c > cap: more candidates above the floor than the
+                     * compact block holds -- the one genuine ineligibility;
+                     * the full row is read below.  Anything else the build
+                     * refuses is a broken device result. */
+                    if (n_c <= PULSAR_DSPARK_PREFILTER_CAP) {
+                        float max_logit;
+                        memcpy(&max_logit, &h[2], sizeof(max_logit));
+                        if (n_c == 0 ||
+                            !pulsar_sample_dist_build_prefiltered(
+                                h + 3, (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP), n_c,
+                                max_logit, q->temperature, q->min_p, &s->sample_scratch, &qd)) {
+                            fprintf(stderr, "pulsar: dspark batched min-p prefilter handed %u "
+                                            "candidates at draft position %u and the build refused "
+                                            "them -- refusing the batch (L190)\n", n_c, pos);
+                            ok = false;
+                            break;
+                        }
+                        built = true;
+                    }
                 }
                 if (built && qd.n <= PULSAR_DSPARK_QDIST_CAP) {
                     q->qn[pos] = qd.n;
@@ -2146,20 +2182,6 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
      * and in the bank arrays */
     int order[PULSAR_DSPARK_BANKS_MAX];
     int n_sel = 0, n_g = 0;
-    if (n > (int)PULSAR_DSPARK_BANKS_MAX) {
-        /* The drafter's batch buffers hold PULSAR_DSPARK_BANKS_MAX banks; the
-         * scheduler can pass up to PULSAR_MSEQ_MAX live rounds under an
-         * operator PULSAR_MSEQ_BANKS pin (auto-size stops at 8).  Rounds past
-         * the cap never get done = true and take base-only rounds for the
-         * rest of the request -- say so once instead of silently (L177). */
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "pulsar: redraft batch: %d live rounds but the drafter batch holds %u banks -- "
-                            "rounds past the cap draft nothing this request (raise nothing: pin fewer banks)\n",
-                    n, (unsigned)PULSAR_DSPARK_BANKS_MAX);
-        }
-    }
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < n && n_sel < (int)PULSAR_DSPARK_BANKS_MAX; i++) {
             spec_redraft_req *q = &rounds[i]->redraft;
@@ -2170,6 +2192,24 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
             order[n_sel++] = i;
             if (!sampled) n_g++;
         }
+    /* The drafter's batch buffers hold PULSAR_DSPARK_BANKS_MAX banks; the
+     * scheduler can pass more live rounds under an operator PULSAR_MSEQ_BANKS
+     * pin (auto-size stops at 8).  A round past the cap never gets done = true
+     * and takes base-only steps.  That is a per-ROUND condition, so it is said
+     * once per affected round object (the flag survives round_begin's reset,
+     * like qrows) -- not once per process, which after the first hid every
+     * later request it hit (L177 -> L190 C2). */
+    for (int i = 0; i < n; i++) {
+        spec_redraft_req *q = &rounds[i]->redraft;
+        if (!q->valid || q->n_draft == 0 || q->cap_said) continue;
+        bool picked = false;
+        for (int j = 0; j < n_sel && !picked; j++) picked = order[j] == i;
+        if (picked) continue;
+        q->cap_said = true;
+        fprintf(stderr, "pulsar: redraft batch: %d live rounds but the drafter batch holds %u banks -- "
+                        "round %d drafts nothing while that many are live (pin fewer banks)\n",
+                n, (unsigned)PULSAR_DSPARK_BANKS_MAX, i);
+    }
     if (n_sel == 0) return 0;
     (void)n_g;
 

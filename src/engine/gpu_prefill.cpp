@@ -2722,7 +2722,16 @@ bool gpu_graph_encode_layer_batch(
     if (ok && g->dspark_capture_batch_n) {
         for (int slot = 0; slot < 3; slot++) {
             if (il != g->dspark_target_layer_ids[slot]) continue;
-            if (!g->dspark_target_h_batch[slot]) break;
+            if (!g->dspark_target_h_batch[slot]) {
+                /* L190 D2: the anchor layer matched but its capture buffer is
+                 * missing.  Breaking with ok untouched let the round seed from
+                 * STALE rows and lose acceptance silently -- the class
+                 * gpu_decode.cpp's KV seed documents. */
+                fprintf(stderr, "pulsar: drafter anchor capture: layer %u is anchor slot %d but "
+                                "its batch buffer is not allocated -- refusing\n", il, slot);
+                ok = false;
+                break;
+            }
             uint32_t cap_n = g->dspark_capture_batch_n;
             if (cap_n > n_tokens) cap_n = n_tokens;
             if (!pulsar_gpu_dspark_hc_mean_reduce_batch(g->dspark_target_h_batch[slot],
@@ -2739,7 +2748,14 @@ bool gpu_graph_encode_layer_batch(
     if (ok && g->dspark_bulk_n) {
         for (int slot = 0; slot < 3; slot++) {
             if (il != g->dspark_target_layer_ids[slot]) continue;
-            if (!g->dspark_bulk_h[slot]) break;
+            if (!g->dspark_bulk_h[slot]) {
+                /* same class as the verify capture above: armed with a
+                 * missing buffer is an impossible state, not a skip */
+                fprintf(stderr, "pulsar: drafter bulk capture: layer %u is anchor slot %d but "
+                                "its bulk buffer is not allocated -- refusing\n", il, slot);
+                ok = false;
+                break;
+            }
             uint32_t cap_n = g->dspark_bulk_n;
             if (cap_n > n_tokens) cap_n = n_tokens;
             if (!pulsar_gpu_dspark_hc_mean_reduce_batch(g->dspark_bulk_h[slot],
