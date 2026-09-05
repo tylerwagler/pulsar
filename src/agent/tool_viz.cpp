@@ -811,7 +811,7 @@ struct agent_stream_think_sink {
     /** DSML bytes are not prose: no tag recognition while a block is parsed. */
     bool tags_enabled() const { return !sr->dsml_active; }
     /** <think> consumed: release a held marker tail in the pre-think state. */
-    void think_open_tag() { agent_stream_flush_start_tail(sr); }
+    void think_open_tag() { sr->post_think_gap = false; agent_stream_flush_start_tail(sr); }
     /** </think> consumed: release the tail, drop the dim style, arm the gap. */
     void think_close_tag() {
         agent_stream_flush_start_tail(sr);

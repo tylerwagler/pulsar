@@ -723,6 +723,9 @@ bool gpu_graph_prefill_chunked_range(
     for (uint32_t pos0 = start; pos0 < end; ) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
+            /* L188: drain (and consume the non-finite flag) before handing the
+             * stream to whatever runs next */
+            (void)pulsar_gpu_synchronize();
             return true;
         }
         const uint32_t remaining = end - pos0;
@@ -792,6 +795,9 @@ bool gpu_graph_prefill_chunked_range(
         }
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
+            /* L188: drain (and consume the non-finite flag) before handing the
+             * stream to whatever runs next */
+            (void)pulsar_gpu_synchronize();
             return true;
         }
         pos0 = chunk_end;

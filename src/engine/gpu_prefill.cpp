@@ -91,7 +91,16 @@ bool gpu_graph_upload_prompt_tokens(
     }
 
     int32_t *tokens = (int32_t *)xmalloc((size_t)n_tokens * sizeof(tokens[0]));
-    for (uint32_t i = 0; i < n_tokens; i++) tokens[i] = prompt->v[pos0 + i];
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        tokens[i] = prompt->v[pos0 + i];
+        /* L188: the embed kernel clamps a negative id to 0 -- refuse it here */
+        if (tokens[i] < 0 || tokens[i] >= (int32_t)PULSAR_N_VOCAB) {
+            fprintf(stderr, "pulsar: prefill token %d at position %u is not a vocab id -- refusing\n",
+                    tokens[i], pos0 + i);
+            free(tokens);
+            return false;
+        }
+    }
 
     const bool ok = pulsar_gpu_tensor_write(out_tokens,
                                            0,

@@ -949,6 +949,10 @@ int pulsar_gpu_init(void) {
 
 void pulsar_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    {   /* L188: the flag is process state; a later engine open must start clear */
+        uint32_t nf_layer = 0u; const char *nf_arm = NULL;
+        (void)pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -1583,7 +1587,19 @@ int pulsar_gpu_end_commands(void) {
 
 int pulsar_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
-    return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+    if (!cuda_ok(cudaDeviceSynchronize(), "synchronize")) return 0;
+    /* L188: the failure and cancel paths drain here rather than through
+     * pulsar_gpu_end_commands; a routed-expert non-finite flag set by a step
+     * that did not complete would otherwise survive into the next step -- of
+     * another bank, another request -- and be charged to it.  Consume it
+     * here too, by name. */
+    uint32_t nf_layer = 0u;
+    const char *nf_arm = NULL;
+    const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
+    if (nf > 0)
+        fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) in a step that did not "
+                        "complete -- flag cleared (L188)\n", nf_layer, nf_arm);
+    return nf >= 0;
 }
 
 

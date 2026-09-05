@@ -244,6 +244,8 @@ enum {
     PULSAR_MAX_HC               = 4,
     PULSAR_MAX_HC_SINKHORN_ITER = 20,
 };
+/* L188: the routed-MoE non-finite flag packs layer_index + 1 into 8 bits (pulsar_cuda_moe.cu) */
+static_assert(PULSAR_MAX_LAYER < 255, "the non-finite flag's layer field is 8 bits");
 
 typedef enum {
     PULSAR_VARIANT_FLASH = 0,

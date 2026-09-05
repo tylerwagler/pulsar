@@ -1356,6 +1356,15 @@ int pulsar_session::eval(int token, char *err, size_t errlen) {
         return 1;
     }
     pulsar_engine *e = s->engine;
+    /* L188: a refused sample is -1 (PULSAR_SAMPLE_REFUSED); the embed kernel
+     * would clamp it to token 0 and the step would look like a good one.  The
+     * check lives HERE, once, for every caller that feeds a sampled token back
+     * (server lanes, CLI, agent, eval): a non-id fails the request. */
+    if (token < 0 || token >= pulsar_engine_vocab_size(e)) {
+        snprintf(err, errlen, "eval: token %d is not a vocab id (a refused sample must fail the "
+                              "request, not be evaluated)", token);
+        return 1;
+    }
     /* Steady-state decode must reuse preallocated scratch, never touch the host
      * heap. The guard is a no-op unless PULSAR_ALLOC_GUARD is set, so this is
      * free in production; armed, it makes any xmalloc/xrealloc inside the decode
