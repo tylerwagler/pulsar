@@ -117,6 +117,20 @@ static char *imatrix_trim_block(char *p, char *end) {
 }
 
 
+/* The prompt delimiter is a LINE: it matches only at the start of the dataset
+ * or right after a '\n', so a prompt that quotes the marker mid-line is not
+ * split there (upstream antirez/ds4 0a62b396). */
+static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker) {
+    const size_t marker_len = strlen(marker);
+    char *p = cursor;
+    while ((p = strstr(p, marker)) != NULL) {
+        if (p == dataset || p[-1] == '\n') return p;
+        p += marker_len;
+    }
+    return NULL;
+}
+
+
 int pulsar_engine::collect_imatrix(const char *dataset_path,
                                const char *output_path,
                                int ctx_size,
@@ -168,7 +182,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (*cursor) {
         char *start = cursor;
-        char *marker = strstr(cursor, marker_lit);
+        char *marker = imatrix_find_marker(dataset, cursor, marker_lit);
         if (marker) {
             char *nl = strchr(marker, '\n');
             if (!nl) break;
@@ -177,7 +191,7 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
             break;
         }
 
-        char *next = strstr(start, marker_lit);
+        char *next = imatrix_find_marker(dataset, start, marker_lit);
         char *end = next ? next : dataset + dataset_len;
         char saved = *end;
         char *prompt_text = imatrix_trim_block(start, end);
