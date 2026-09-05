@@ -91,6 +91,10 @@ bool ds4q_can_quantize(ds4q_type type);
 int64_t ds4q_block_size(ds4q_type type);
 size_t ds4q_row_size(ds4q_type type, int64_t ne);
 bool ds4q_requires_imatrix(ds4q_type type);
+/* Whether the quantizer for `type` reads an imatrix at all (Q2_K weights its
+ * fit with one; IQ2_XXS cannot run without one).  MXFP4/MXFP8/BF16 targets
+ * never look one up, so --imatrix-strict does not apply to them. */
+bool ds4q_uses_imatrix(ds4q_type type);
 void ds4q_dequantize_iq2_xxs(const void *blocks, float *out, int64_t n);
 
 /* ---- IQ2_XXS_SOA (type 42) -------------------------------------------------

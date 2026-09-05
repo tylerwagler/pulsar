@@ -24,21 +24,21 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q5_1]    = { "q5_1",    32,  24, false, false },
     [DS4Q_TYPE_Q8_0]    = { "q8_0",    32,  34, false, false },
     [DS4Q_TYPE_Q8_1]    = { "q8_1",    32,  36, false, false },
-    [DS4Q_TYPE_Q2_K]    = { "q2_K",  QK_K,  84, true,  false },
+    [DS4Q_TYPE_Q2_K]    = { "q2_K",  QK_K,  84, true,  false, true },
     [DS4Q_TYPE_Q3_K]    = { "q3_K",  QK_K, 110, false, false },
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
     [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
     [DS4Q_TYPE_FP8_E4M3]= { "fp8_e4m3", 32,  33, true,  false },
-    [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
+    [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true,  true },
     /* Same block size and type size as type 16 -- SoA is a pure permutation of
      * the same 66 B/block, so ds4q_row_size() and every byte accounting path
      * work unchanged.  Not a quantizer target itself: produced by repacking a
      * type-16 tensor, so requires_imatrix is inherited at the source step. */
-    [DS4Q_TYPE_IQ2_XXS_SOA] = { "iq2_xxs_soa", QK_K, 66, true, false },
-    [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
+    [DS4Q_TYPE_IQ2_XXS_SOA] = { "iq2_xxs_soa", QK_K, 66, true, false, true },
+    [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true,  true },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
-    [DS4Q_TYPE_IQ1_S]   = { "iq1_s",   QK_K,  50, false, true  },
+    [DS4Q_TYPE_IQ1_S]   = { "iq1_s",   QK_K,  50, false, true,  true },
     [DS4Q_TYPE_IQ4_NL]  = { "iq4_nl",     32,  18, false, false },
     [DS4Q_TYPE_IQ3_S]   = { "iq3_s",   QK_K, 110, false, false },
     [DS4Q_TYPE_IQ2_S]   = { "iq2_s",   QK_K,  82, false, false },
@@ -359,6 +359,13 @@ bool ds4q_requires_imatrix(ds4q_type type) {
     return ds4q_type_traits[type].requires_imatrix;
 }
 
+bool ds4q_uses_imatrix(ds4q_type type) {
+    if (type < 0 || type >= DS4Q_TYPE_COUNT) return false;
+    const ds4q_traits *tr = &ds4q_type_traits[type];
+    assert(!tr->requires_imatrix || tr->uses_imatrix);
+    return tr->uses_imatrix;
+}
+
 
 void ds4q_quantize_init(ds4q_type type) {
     if (type == DS4Q_TYPE_IQ2_XXS) {
@@ -369,17 +376,24 @@ void ds4q_quantize_init(ds4q_type type) {
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix) {
+    /* The traits table's uses_imatrix column is the authority the quantizer
+     * consults before looking an imatrix up; these asserts tie it to the
+     * kernels that actually read one. */
     if (type == DS4Q_TYPE_Q2_K) {
+        assert(ds4q_uses_imatrix(type));
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
+        assert(ds4q_uses_imatrix(type));
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
     }
     if (type == DS4Q_TYPE_FP8_E4M3) {
+        assert(!ds4q_uses_imatrix(type));
         (void)imatrix;
         return ds4q_quantize_fp8_e4m3(src, dst, start, nrows, ncols);
     }
     if (type == DS4Q_TYPE_MXFP4) {
+        assert(!ds4q_uses_imatrix(type));
         (void)imatrix;
         return ds4q_quantize_mxfp4(src, dst, start, nrows, ncols);
     }

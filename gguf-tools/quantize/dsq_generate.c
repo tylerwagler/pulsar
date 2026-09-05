@@ -195,8 +195,14 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         st_value_free(&w);
     }
     reap_permute_regular(reap, gguf_name, f32, n, tmpl->ne[0]);
-    const char *names[2] = { gguf_name, hf_name };
-    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    /* Only targets whose quantizer reads an imatrix look one up, so
+     * --imatrix-strict cannot fail on an MXFP4/MXFP8/BF16 tensor that the
+     * collector never had a reason to record (upstream 860e6731). */
+    const float *imat = NULL;
+    if (ds4q_uses_imatrix(target)) {
+        const char *names[2] = { gguf_name, hf_name };
+        imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    }
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
     free(f32);
     free(hf_name);
@@ -256,12 +262,16 @@ static void generate_one_expert(expert_job *j, int xid) {
     }
     int64_t n = 0;
     float *f32 = dequant_fp4_weight(&w, &s, &n);
-    const char *names[3] = { j->gguf_name, weight_name, NULL };
     /* The imatrix is keyed by ORIGINAL expert id against the ORIGINAL expert
      * count -- it was collected on the unpruned model. Looking it up by dense
      * slot would silently pair each survivor with another expert's statistics:
-     * quantization still succeeds, quality quietly degrades, no gate notices. */
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, src_xid, j->n_expert_orig);
+     * quantization still succeeds, quality quietly degrades, no gate notices.
+     * Only imatrix-reading targets look one up (see generate_regular_hf). */
+    const float *imat = NULL;
+    if (ds4q_uses_imatrix(j->target)) {
+        const char *names[2] = { j->gguf_name, weight_name };
+        imat = imatrix_find(j->imatrix, names, 2, j->ncols, src_xid, j->n_expert_orig);
+    }
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);

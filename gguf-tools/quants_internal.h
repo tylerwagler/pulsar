@@ -27,7 +27,8 @@ typedef struct {
     int64_t block_size;
     size_t type_size;
     bool can_quantize;
-    bool requires_imatrix;
+    bool requires_imatrix;  /* cannot be quantized without one */
+    bool uses_imatrix;      /* the quantizer reads one when given (superset of requires) */
 } ds4q_traits;
 
 extern const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT];

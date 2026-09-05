@@ -37,7 +37,7 @@ static void usage(const char *argv0) {
     printf("  --mse-probe FILE      MSE oracle: per-(tensor,format) imatrix-weighted error -> JSON\n");
     printf("  --probe-sample N      experts sampled per tensor for --mse-probe (default 8)\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
-    printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --imatrix-strict       fail if an imatrix-weighted target (q2_K, iq2_xxs) has no matching vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
