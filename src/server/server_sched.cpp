@@ -181,6 +181,7 @@ bool server::bank_switch(int bank) {
 int server::slot_frontier_pos(const session_slot *sl) const {
     const auto *s = this;
     if (!sl || !sl->provisioned) return 0;
+    if (!s->sess) return 0; /* host-only server (unit tests): no session to read */
     if (s->pool_banks > 0) return pulsar_session_bank_pos(s->sess, sl->bank);
     return pulsar_session_pos(s->sess);
 }
@@ -236,6 +237,13 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
  * suspenders MemAvailable floor still guards each provision. Returns NULL with
  * *refusal set on a full pool or a tight box (never on a create/admission
  * failure — there is no runtime create). */
+/* provision_bank's MemAvailable verdict (L179 branch 14). The FIRST bank is
+ * exempt (see the caller); from the second on, an unreadable gauge (avail ==
+ * 0) or a box below floor + marginal refuses. */
+static bool server_bank_floor_refuses(int n_provisioned, uint64_t avail, uint64_t marginal) {
+    return n_provisioned > 0 && (avail == 0 || !server_mem_floor_admits(avail, marginal));
+}
+
 session_slot *server::provision_bank(provision_refusal *refusal) {
     auto *s = this;
     *refusal = PROVISION_OK;
@@ -259,8 +267,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
     const uint64_t avail = server_mem_available_bytes();
-    if (n_provisioned > 0 &&
-        (avail == 0 || !server_mem_floor_admits(avail, s->bank_marginal_bytes))) {
+    if (server_bank_floor_refuses(n_provisioned, avail, s->bank_marginal_bytes)) {
         static bool warned; /* single worker thread */
         if (!warned) {
             warned = true;
@@ -1431,6 +1438,27 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
     return sl->active_job && g && g->phase == GEN_DECODE;
 }
 
+/* worker_main's lane select over the gathered decode set (L179 branch 2).
+ * 0 = idle, 3 = spec-batched (inc 6): every decoder can speculate, none has
+ * joined a plain batch (n_batched == 0 -- no lane switch mid-conversation)
+ * and the drafter is loaded; 2 = plain batched otherwise (L118: every n_dec
+ * >= 1 is a batch, a solo session is a batch of one). 1 is the retired
+ * classic lane: reachable only with n_dec >= 1 and no pool, which the
+ * gather loop never produces. Lane 3 keeps the spec_decode counters
+ * advancing; lane 2 does not. */
+static int server_pick_decode_lane(int pool_banks, bool has_dspark, session_slot *const *dec,
+                                   int n_dec, int n_batched) {
+    bool all_spec = has_dspark && n_dec >= 1 && n_batched == 0;
+    for (int i = 0; all_spec && i < n_dec; i++) {
+        const gen_state *dg = dec[i]->gen;
+        if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
+            all_spec = false;
+    }
+    const bool use_spec_batched = pool_banks > 0 && all_spec;
+    const bool use_batched = use_spec_batched || (pool_banks > 0 && n_dec >= 1);
+    return n_dec <= 0 ? 0 : (use_spec_batched ? 3 : (use_batched ? 2 : 1));
+}
+
 /* Tier-2 §5 batched decode quantum: ONE shared multiseq weight sweep drives up
  * to PULSAR_SERVER_DECODE_QUANTUM_TOKENS steps across every supplied decode slot.
  * Each slot samples its OWN logits row with its OWN sampler/RNG and streams
@@ -1658,11 +1686,17 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
  * clients (rows/L148.md). Saving it here, while its checkpoint is still valid,
  * is what bank_switch does on every hand-off; this is the hand-off the
  * batched quanta skipped. */
-static void park_live_bank(server *s, session_slot **dec, int n, const session_slot *extra) {
-    if (s->live_bank < 0 || s->live_bank >= s->pool_banks) return;
+static bool park_live_bank_needed(int live_bank, int pool_banks, session_slot *const *dec, int n,
+                                  const session_slot *extra) {
+    if (live_bank < 0 || live_bank >= pool_banks) return false;
     for (int i = 0; i < n; i++)
-        if (dec[i] && (int)dec[i]->bank == s->live_bank) return;
-    if (extra && (int)extra->bank == s->live_bank) return;
+        if (dec[i] && (int)dec[i]->bank == live_bank) return false;
+    if (extra && (int)extra->bank == live_bank) return false;
+    return true;
+}
+
+static void park_live_bank(server *s, session_slot **dec, int n, const session_slot *extra) {
+    if (!park_live_bank_needed(s->live_bank, s->pool_banks, dec, n, extra)) return;
     s->slots[s->live_bank].committed_pos = pulsar_session_pos(s->sess);
     pulsar_session_bank_state_save(s->sess, (uint32_t)s->live_bank);
 }
@@ -2232,34 +2266,44 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
  * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
  * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
  * when the flag is off, not in pool mode, or nothing qualifies. */
+/* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
+ * prefill chunk into a decode quantum whose banks already read a deep
+ * aggregate KV working set displaces bandwidth-saturated decode. Blocks while
+ * two or more active decoders' summed committed depth exceeds guard_rows;
+ * guard_rows <= 0 is the guard off. n_dec/deep are reported for the caller's
+ * log line (L179 branch 12). */
+static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int guard_rows,
+                                    int *n_dec_out, long *deep_out) {
+    if (guard_rows <= 0) return false;
+    long deep = 0;
+    int n_dec = 0;
+    for (int i = 0; i < n_slots; i++) {
+        const session_slot *dl = &slots[i];
+        if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING) {
+            deep += dl->committed_pos;
+            n_dec++;
+        }
+    }
+    if (n_dec_out) *n_dec_out = n_dec;
+    if (deep_out) *deep_out = deep;
+    return n_dec >= 2 && deep > (long)guard_rows;
+}
+
 session_slot *server::worker_find_fuse_prefill() {
     auto *s = this;
     if (!s->mixed_batch_enabled || s->pool_banks <= 0) return NULL;
-    /* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
-     * prefill chunk into a decode quantum whose banks already read a deep
-     * aggregate KV working set displaces bandwidth-saturated decode. Refuse
-     * to fuse while the active decode set's summed committed depth exceeds
-     * the threshold; those prefills take the classic (unfused) path instead. */
-    if (s->mixed_deep_guard_rows > 0) {
-        long deep = 0;
-        int n_dec = 0;
-        for (int i = 0; i < s->n_slots; i++) {
-            const session_slot *dl = &s->slots[i];
-            if (dl->provisioned && dl->active_job && dl->state == SLOT_DECODING) {
-                deep += dl->committed_pos;
-                n_dec++;
-            }
+    /* Those prefills take the classic (unfused) path instead. */
+    int n_dec = 0;
+    long deep = 0;
+    if (mixed_deep_guard_blocks(s->slots, s->n_slots, s->mixed_deep_guard_rows, &n_dec, &deep)) {
+        static long last_logged = -1;
+        if (deep != last_logged) {
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: fused lane paused by deep guard (%d decoders, %ld aggregate rows > %d)",
+                       n_dec, deep, s->mixed_deep_guard_rows);
+            last_logged = deep;
         }
-        if (n_dec >= 2 && deep > (long)s->mixed_deep_guard_rows) {
-            static long last_logged = -1;
-            if (deep != last_logged) {
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: fused lane paused by deep guard (%d decoders, %ld aggregate rows > %d)",
-                           n_dec, deep, s->mixed_deep_guard_rows);
-                last_logged = deep;
-            }
-            return NULL;
-        }
+        return NULL;
     }
     pulsar_session *pool = s->sess;
     for (int i = 0; i < s->n_slots; i++) {
@@ -2587,24 +2631,14 @@ void *worker_main(void *arg) {
          * decode lane, its A/B hatch, and the spec_max_live crossover are
          * DELETED (P4; parity evidence in rows/L118.md). Spec-batched when
          * every decoder can speculate, plain-batched otherwise. */
-        bool all_spec = pulsar_engine_has_dspark(s->engine) &&
-                        n_dec >= 1 && n_batched == 0;
-        for (int i = 0; all_spec && i < n_dec; i++) {
-            gen_state *dg = dec[i]->gen;
-            if (!dg || !dg->dspark_spec_enabled || dg->batch_active)
-                all_spec = false;
-        }
-        const bool use_spec_batched = s->pool_banks > 0 && all_spec;
-        const bool use_batched = use_spec_batched ||
-            (s->pool_banks > 0 && n_dec >= 1);
-
         /* Record the lane for /metrics. Only the spec lane runs the fused verify
          * loop, so this is what tells a scraper whether the spec_decode_*
          * counters describe the present or some earlier single-request stretch. */
-        /* lane 3 = spec-batched (inc 6): rounds through the shared forward,
-         * and -- unlike lane 2 -- the spec_decode counters KEEP advancing. */
-        s->w_decode_lane = n_dec <= 0 ? 0
-                         : (use_spec_batched ? 3 : (use_batched ? 2 : 1));
+        s->w_decode_lane = server_pick_decode_lane(s->pool_banks,
+                                                   pulsar_engine_has_dspark(s->engine),
+                                                   dec, n_dec, n_batched);
+        const bool use_spec_batched = s->w_decode_lane == 3;
+        const bool use_batched = s->w_decode_lane >= 2;
 
         if (use_batched) {
             /* plan-34 inc 5: when the fused lane is armed and a prefilling slot is

@@ -5631,6 +5631,197 @@ static void test_logprob_token_json_sanitizes_ill_formed_utf8(void) {
 }
 
 
+/* L179 branch 8 -- L116 tool-call admission to the batched decode lane.
+ * Invariant: a slot is admitted iff it is bound (active_job) AND has gen state
+ * in GEN_DECODE. The request's has_tools does NOT appear in the decision (a
+ * tool-call request rides the batched lane like any other; its forced-greedy
+ * payload span is the sampler's business), so the true and false rows of the
+ * table must be identical. */
+static void test_l179_tool_admission_is_bound_decode_only(void) {
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.j = &j;
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    static const gen_phase phases[] = {GEN_DECODE, GEN_PREFILL_MAIN, GEN_FINISH};
+    for (int bound = 0; bound < 2; bound++)
+    for (int has_gen = 0; has_gen < 2; has_gen++)
+    for (size_t pi = 0; pi < sizeof phases / sizeof phases[0]; pi++) {
+        sl.active_job = bound ? &j : NULL;
+        sl.gen = has_gen ? &g : NULL;
+        g.phase = phases[pi];
+        const bool want = bound && has_gen && phases[pi] == GEN_DECODE;
+        j.req.has_tools = false;
+        const bool no_tools = slot_is_batchable_decode(&sl);
+        j.req.has_tools = true;
+        const bool tools = slot_is_batchable_decode(&sl);
+        TEST_ASSERT(no_tools == want);
+        TEST_ASSERT(tools == no_tools);
+    }
+}
+
+/* L179 branch 12 -- fused-prefill deep-concurrency guard
+ * (worker_find_fuse_prefill). Invariant: the fuse is refused iff at least two
+ * provisioned, bound, SLOT_DECODING slots sum committed depth STRICTLY above
+ * guard_rows; one decoder never trips it however deep, and guard_rows == 0 is
+ * the guard off (the inline code skipped the whole block at 0). */
+static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
+    session_slot slots[4];
+    memset(slots, 0, sizeof slots);
+    const int rows = 4096;
+    for (int i = 0; i < 4; i++) {
+        slots[i].provisioned = true;
+        slots[i].active_job = (struct job *)&slots;
+        slots[i].state = SLOT_DECODING;
+        slots[i].bank = (uint32_t)i;
+    }
+    int n_dec = -1;
+    long deep = -1;
+    /* two decoders at exactly rows: admits (strict >) */
+    slots[0].committed_pos = rows / 2;
+    slots[1].committed_pos = rows / 2;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
+    TEST_ASSERT(n_dec == 2 && deep == rows);
+    /* one row over: refuses */
+    slots[1].committed_pos = rows / 2 + 1;
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
+    TEST_ASSERT(deep == rows + 1);
+    /* a lone decoder at 10x rows admits */
+    slots[0].committed_pos = 10 * rows;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 1, rows, NULL, NULL));
+    /* a second slot that is NOT decoding (prefilling / unbound /
+     * unprovisioned) is not a decoder */
+    slots[1].committed_pos = 10 * rows;
+    slots[1].state = SLOT_PREFILLING;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, NULL));
+    TEST_ASSERT(n_dec == 1);
+    slots[1].state = SLOT_DECODING;
+    slots[1].active_job = NULL;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
+    slots[1].active_job = (struct job *)&slots;
+    slots[1].provisioned = false;
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
+    slots[1].provisioned = true;
+    /* restored: two decoders 20x over the guard refuse... */
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, 2, rows, NULL, NULL));
+    /* ...and guard_rows == 0 never blocks (guard off) */
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, 0, NULL, NULL));
+    /* n_slots bounds the scan */
+    TEST_ASSERT(!mixed_deep_guard_blocks(slots, 1, rows, NULL, NULL));
+    TEST_ASSERT(mixed_deep_guard_blocks(slots, 4, rows, &n_dec, NULL));
+    TEST_ASSERT(n_dec == 4);
+}
+
+/* L179 branch 14 -- provision_bank's MemAvailable floor. Invariant: the FIRST
+ * bank (n_provisioned == 0) is never floor-refused, at any gauge reading
+ * including an unreadable one (a first-bank refusal is a worker hard-spin);
+ * from the second bank on, avail == 0 fails closed and the box must hold
+ * marginal + PULSAR_SERVER_MEM_FLOOR_BYTES (same boundary as
+ * server_mem_floor_admits). */
+static void test_l179_bank_floor_exempts_first_bank(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t GiB = 1024ull * MiB;
+    const uint64_t marginal = 2560ull * MiB;                 /* 2.5 GiB bank */
+    const uint64_t floor = marginal + PULSAR_SERVER_MEM_FLOOR_BYTES;
+    /* first bank: exempt everywhere */
+    TEST_ASSERT(!server_bank_floor_refuses(0, 0, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, floor, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, 1ull * GiB, marginal));
+    /* second bank onward: gauge and floor both bind */
+    TEST_ASSERT(server_bank_floor_refuses(1, 0, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(1, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(1, floor, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(3, 0, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(3, floor - 1, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(3, floor, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(3, 100ull * GiB, marginal));
+}
+
+/* L179 branch 4 -- park_live_bank before a batched quantum. Invariant: the
+ * live bank's checkpoint is saved iff the bank is real (0 <= live < pool)
+ * and belongs to NEITHER the decode set NOR the fused prefill slot; a bank
+ * the quantum is about to drive reconciles itself in the entry loop, and a
+ * no-live-bank (-1) or out-of-pool id has nothing to park. */
+static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
+    session_slot slots[4];
+    memset(slots, 0, sizeof slots);
+    for (int i = 0; i < 4; i++) slots[i].bank = (uint32_t)i;
+    session_slot *dec[2] = {&slots[0], &slots[1]};
+    const session_slot *pf = &slots[2];
+    const int pool = 4;
+    /* live bank is a decoder: no park */
+    TEST_ASSERT(!park_live_bank_needed(0, pool, dec, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(1, pool, dec, 2, pf));
+    /* live bank is the fused prefill slot: no park */
+    TEST_ASSERT(!park_live_bank_needed(2, pool, dec, 2, pf));
+    /* live bank is in neither: park */
+    TEST_ASSERT(park_live_bank_needed(2, pool, dec, 2, NULL));
+    TEST_ASSERT(park_live_bank_needed(3, pool, dec, 2, pf));
+    TEST_ASSERT(park_live_bank_needed(0, pool, dec, 0, NULL));
+    /* no live bank / out of pool: nothing to park */
+    TEST_ASSERT(!park_live_bank_needed(-1, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(pool, pool, dec, 2, pf));
+    TEST_ASSERT(!park_live_bank_needed(3, 0, dec, 0, NULL));
+    /* a NULL entry in dec is skipped, not dereferenced */
+    session_slot *holey[2] = {NULL, &slots[3]};
+    TEST_ASSERT(park_live_bank_needed(2, pool, holey, 2, NULL));
+    TEST_ASSERT(!park_live_bank_needed(3, pool, holey, 2, NULL));
+}
+
+/* L179 branch 2 -- worker_main's lane select (w_decode_lane). Invariant:
+ * lane 0 with no decoders; lane 3 (spec-batched) iff the drafter is loaded,
+ * no decoder has joined a plain batch (n_batched == 0) and EVERY decoder has
+ * spec enabled; lane 2 (plain batched) otherwise, including the L118 batch of
+ * one; a solo spec decoder is lane 3. Lane 1 is the retired classic lane,
+ * reachable only in the gather loop's impossible no-pool/decoders shape --
+ * asserted as what the code computes, not as a feature. */
+static void test_l179_lane_select_spec_needs_every_decoder(void) {
+    gen_state g[4];
+    memset(g, 0, sizeof g);
+    session_slot slots[4];
+    memset(slots, 0, sizeof slots);
+    session_slot *dec[4];
+    for (int i = 0; i < 4; i++) {
+        slots[i].gen = &g[i];
+        g[i].dspark_spec_enabled = true;
+        dec[i] = &slots[i];
+    }
+    const int pool = 4;
+    /* nothing to decode: idle */
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 0, 0) == 0);
+    /* four spec decoders: spec lane */
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 3);
+    /* one non-spec slot among four drags the group to plain */
+    g[2].dspark_spec_enabled = false;
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    g[2].dspark_spec_enabled = true;
+    /* a slot with no gen state likewise */
+    slots[3].gen = NULL;
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    slots[3].gen = &g[3];
+    /* a plain batch in flight locks the lane even when all spec */
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 1) == 2);
+    /* ...and a decoder that has joined the plain lane says so itself */
+    g[1].batch_active = true;
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 4, 0) == 2);
+    g[1].batch_active = false;
+    /* no drafter: plain */
+    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 4, 0) == 2);
+    /* L118 batch of one: a solo spec decoder is lane 3, solo plain lane 2 */
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 0) == 3);
+    TEST_ASSERT(server_pick_decode_lane(pool, false, dec, 1, 0) == 2);
+    TEST_ASSERT(server_pick_decode_lane(pool, true, dec, 1, 1) == 2);
+    /* no pool: idle with no decoders, else the retired classic code 1 */
+    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 0, 0) == 0);
+    TEST_ASSERT(server_pick_decode_lane(0, true, dec, 1, 0) == 1);
+    TEST_ASSERT(server_pick_decode_lane(0, false, dec, 4, 0) == 1);
+}
+
+
 
 static void pulsar_server_unit_tests_run(void) {
     test_logprob_token_json_sanitizes_ill_formed_utf8();
@@ -5764,6 +5955,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_demotes_superseded_continued();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_l179_tool_admission_is_bound_decode_only();
+    test_l179_deep_guard_blocks_two_deep_decoders();
+    test_l179_bank_floor_exempts_first_bank();
+    test_l179_park_live_bank_only_when_not_in_quantum();
+    test_l179_lane_select_spec_needs_every_decoder();
 }
 
 
