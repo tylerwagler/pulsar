@@ -223,8 +223,15 @@
  * 4096 x N + 4 (8196) / 4096 x 4 + 4 (16388): a 4-row final chunk, the
  * n_tok <= 8 window again. */
 #define MAX_DEPTHS 8u
-static uint32_t g_depths[MAX_DEPTHS] = { 512u, 2048u, 4096u, 4102u, 6144u, 8196u, 16388u };
-static uint32_t g_n_depths = 7u;
+static const uint32_t g_prefill_depths[] = { 512u, 2048u, 4096u, 4102u, 6144u, 8196u, 16388u };
+/* The ACTIVE depth list: the prefill set, or the decode-step set in decode
+ * mode.  Selected at GATE_ENTRY from the mode argument -- and reset there
+ * every time, because the runner calls this entry several times in ONE
+ * process (--check, then --check-decode, then --check-reference): a mode left
+ * armed by the previous call graded the reference against fifth-decode-step
+ * logits (KL 20, every argmax flipped -- the l179-gates battery, 2026-09-05). */
+static uint32_t g_depths[MAX_DEPTHS];
+static uint32_t g_n_depths = 0u;
 #define N_DEPTHS g_n_depths
 /* L181 (2026-09-05): the DECODE-STEP mode.  State a prefill writes for FUTURE
  * steps -- the ratio-4 compressor state, the drafter ring seed, the projection
@@ -1178,13 +1185,19 @@ int GATE_ENTRY(int argc, char **argv) {
                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
+    /* Mode state, set from THIS call's arguments and nothing else (see the
+     * note at g_depths: the runner reuses the process across modes). */
+    g_ref_prefill_chunk = 4096u;
     if (strcmp(argv[2], "--dump-decode") == 0 || strcmp(argv[2], "--check-decode") == 0) {
         g_decode = 1;
         g_blob_magic = BLOB_MAGIC_DECODE;
         g_n_depths = (uint32_t)(sizeof(g_decode_depths) / sizeof(g_decode_depths[0]));
         for (uint32_t i = 0; i < g_n_depths; i++) g_depths[i] = g_decode_depths[i];
     } else {
+        g_decode = 0;
         g_blob_magic = BLOB_MAGIC_PREFILL;
+        g_n_depths = (uint32_t)(sizeof(g_prefill_depths) / sizeof(g_prefill_depths[0]));
+        for (uint32_t i = 0; i < g_n_depths; i++) g_depths[i] = g_prefill_depths[i];
     }
     if (strcmp(argv[2], "--check-reference") == 0) {
         if (argc < 5) {
