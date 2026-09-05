@@ -10,6 +10,7 @@
  *      the block scale re-buckets, values may not).
  */
 #include "quants.h"
+#include "quants_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,40 @@ int main(void) {
 
     check_idempotent("fp8_e4m3", DS4Q_TYPE_FP8_E4M3, ds4q_dequantize_fp8_e4m3, x, N, NC);
     check_idempotent("mxfp4",    DS4Q_TYPE_MXFP4,    ds4q_dequantize_mxfp4,    x, N, NC);
+
+    /* K-quant refinement collapse (upstream antirez/ds4 ed5c1a92, L192).  In
+     * exact arithmetic a least-squares fit's intercept never reaches the block
+     * maximum, but with near-degenerate weights (zeros and a 1e23 dynamic
+     * range: what an imatrix column times sqrt(sigma2 + x^2) can produce) the
+     * normal-equation determinant is rounding noise and an accepted fit can
+     * set min = 0 >= max.  Every later step then divides by a non-positive
+     * range: iscale flips sign, all-negative x code as nmax, and the fit that
+     * mis-codes the outlier at index 10 as its neighbours wins on equal
+     * error.  The guard stops the loop at the collapse.  Inputs found by a
+     * 20M-trial search over the unguarded loop; without the guard L[10]
+     * comes back 3 (the same code as the -0.2 values), with it 0. */
+    {
+        const float xv[16] = {
+            -0.199877203f, -0.199877203f, -0.199877203f, -0.199877203f,
+            -0.199877203f, -0.199877203f, -0.199877203f, -0.199877203f,
+            -0.199877203f, -0.199877203f, -1.19987726f,  -0.199877203f,
+            -0.199877203f, -0.199877203f, -0.199877203f, -0.199877203f,
+        };
+        const float wv[16] = {
+            1.61155338e+10f, 355.506195f,    807180288.0f,    4.4922388e-05f,
+            993090304.0f,    7.19309619e+09f, 1.27754907e-11f, 3.6475544f,
+            3.50451501e-07f, 0.0f,            0.000257659791f, 2.2799686e+11f,
+            0.0f,            5.28423694e-11f, 3.49987349e-05f, 15618188.0f,
+        };
+        uint8_t L[16], Laux[16];
+        float mn = 0.0f;
+        float sc = ds4q_make_qkx3_quants(16, 3, xv, wv, L, &mn, Laux, -0.9f, 0.05f, 36, false);
+        CHECK(isfinite(sc) && isfinite(mn), "qkx3 collapse: non-finite scale %g / min %g", sc, mn);
+        CHECK(L[10] != L[0],
+              "qkx3 collapse: the -1.2 outlier (L[10]=%d) got the same code as the -0.2 values (L[0]=%d)",
+              L[10], L[0]);
+        CHECK(L[10] == 0, "qkx3 collapse: L[10]=%d, want 0", L[10]);
+    }
 
     /* Exactly-representable mxfp4 values must round-trip bit-perfectly,
      * including their signs. */
