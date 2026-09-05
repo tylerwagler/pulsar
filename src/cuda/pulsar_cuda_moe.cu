@@ -516,8 +516,8 @@ static int routed_moe_launch_mixed40(
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    const int caseA = (gate_type == 40u);       /* gate/up type-40, down MMQ-43 */
-    const int caseB = (down_type == 40u);       /* gate/up MMQ-43, down type-40 */
+    const int caseA = (gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4);   /* gate/up MXFP4, down MMQ */
+    const int caseB = (down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4);   /* gate/up MMQ, down MXFP4 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
     /* ...and the OTHER side must be type 43, the only non-cutlass expert format
      * left.  This is where the artifact's 7 mixed layers land (4x gate=40/
@@ -529,7 +529,7 @@ static int routed_moe_launch_mixed40(
      * dispatch below is a chain keyed on a type tag, and every silent misread
      * this file has produced came from such a chain ACCEPTING an unknown tag and
      * reading its bytes as the last arm's format.  An allowlist cannot do that. */
-    if ((caseA ? down_type : gate_type) != 43u) return 0;
+    if ((caseA ? down_type : gate_type) != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
@@ -924,7 +924,7 @@ static int routed_moe_try_mmq_gate_up(
      *      repack, no budget, and every tensor gets the fast path instead of
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
-    if (gate_type != 43u) return 0;   /* PULSAR_TENSOR_IQ2_XXS_MMQ, the only one */
+    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;   /* the only MMQ type */
     /* One-shot: ds4_mmq_init selects the device and populates the ggml
      * device-info singleton the MMQ launchers read. */
     static int mmq_ready = -1;
@@ -1023,7 +1023,7 @@ static int routed_moe_try_mmq_down(
         uint32_t n_total_expert,
         uint64_t pairs,
         const void *mid_q, const void *mid_sf, int mid_kbp) {
-    if (down_type != 43u) return 0;   /* PULSAR_TENSOR_IQ2_XXS_MMQ, the only one */
+    if (down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;   /* the only MMQ type */
     if (pairs > (uint64_t)INT32_MAX) return 0;
     if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
     /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
@@ -1091,7 +1091,7 @@ static int routed_moe_launch(
      * Anything else is refused rather than reinterpreted: a dispatch chain that
      * accepts an unknown tag does not fail, it reads the bytes as some other
      * format and returns plausible garbage. */
-    if (gate_type != 43u || down_type != 43u) return 0;
+    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ || down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;
 #ifndef PULSAR_HAVE_MMQ
     return 0;   /* no MMQ build -> type 43 is unreadable */
 #endif
@@ -1302,7 +1302,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             return (r1 && r2) ? 1 : 0;
         }
     }
-    if (gate_type == 40u && down_type == 40u) {
+    if (gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4 && down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4) {
         /* Which expert-FFN arithmetic a row gets is a numerics boundary: the
          * direct fp4 GEMV over the packed expert weights (4 launches per
          * layer, gate/up+swiglu, down, their E4M3 emits, no host sync, each
@@ -1398,7 +1398,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                                          selected, weights, n_total_expert, n_expert, clamp, x,
                                          n_tokens);
     }
-    if ((gate_type == 40u) != (down_type == 40u)) {
+    if ((gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4) != (down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4)) {
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
         return routed_moe_launch_mixed40(out, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,

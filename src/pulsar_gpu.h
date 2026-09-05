@@ -270,6 +270,16 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  * compressed-attention indexer that chooses visible compressed rows.
  */
 
+/** Routed-expert tensor type tags the CUDA MoE dispatch keys on.  The engine's
+ * tensor-type enum (pulsar_engine_internal.h) takes its values from HERE, so
+ * a tag can only ever be spelled once: the dispatch in pulsar_cuda_moe.cu
+ * chooses a kernel -- and an arithmetic -- by these numbers, and it used to
+ * carry them as bare literals at eight sites (L178). */
+enum {
+    PULSAR_GPU_TENSOR_CUTLASS_MXFP4 = 40,   /* MXFP4 experts: grouped CUTLASS / fp4 GEMV */
+    PULSAR_GPU_TENSOR_IQ2_XXS_MMQ   = 43,   /* IQ2_XXS experts: the vendored MMQ tier */
+};
+
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
         const pulsar_gpu_tensor *tokens,

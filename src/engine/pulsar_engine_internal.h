@@ -384,7 +384,7 @@ enum {
      * gguf_types[] table entry for this type exists only so tensor_type()
      * recognizes it; real per-expert offsets come from that helper, not
      * from the table's block_elems/block_bytes. */
-    PULSAR_TENSOR_CUTLASS_MXFP4 = 40,
+    PULSAR_TENSOR_CUTLASS_MXFP4 = PULSAR_GPU_TENSOR_CUTLASS_MXFP4,   /* one spelling: pulsar_gpu.h */
     /* MXFP8_LT: the pre-store of PULSAR_TENSOR_FP8_E4M3 (type 38). Identical E4M3
      * weights and E8M0 block scales, but stored in the EXACT device-side layout
      * the runtime otherwise builds at first use: de-interleaved [in,out]
@@ -431,7 +431,7 @@ enum {
      * cache is capacity-bound (~22.9 GiB budget vs ~35 GB to hold all 90+ IQ2
      * stacks), so it covered only part of the model and made the first prefill
      * frontier absorb the repack.  Pre-storing costs zero model growth. */
-    PULSAR_TENSOR_IQ2_XXS_MMQ = 43,
+    PULSAR_TENSOR_IQ2_XXS_MMQ = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ,       /* one spelling: pulsar_gpu.h */
 };
 
 /** One GGUF metadata entry, held as a key plus an OFFSET rather than a parsed
