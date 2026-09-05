@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 #include <cstring>
 #include "pulsar_gpu.h"
 #include "pulsar_cuda_internal.h"   /* pulsar_gpu_tensor::ptr -- the driver hands tensors, not raw pointers */
@@ -111,11 +112,13 @@ __global__ static void ft_relayout_sfb(TSFB tSFB, const uint8_t *sfb_base, const
 
 struct ft_ctx {
     int N, K, KB, KBp;
+    int m_max;                // rows the A side and the workspaces are sized for (L183: production M)
+    std::vector<char> checked;  // can_implement verified per M
     uint8_t *B_data;          // LT data slab, device
     uint8_t *lt_scale;        // LT swizzled scale slab, device
     ElementSF *B_sf;          // CUTLASS-layout SFB
-    uint8_t *A_data;          // [16, K] e4m3
-    ElementSF *A_sf;          // SFA for up to 128 rows
+    uint8_t *A_data;          // [m_max, K] e4m3
+    ElementSF *A_sf;          // SFA for rup(m_max, 128) rows
     void *ws64, *ws128;
     size_t ws64_bytes, ws128_bytes;
     unsigned long long sfb_mismatch;
@@ -128,11 +131,13 @@ static int ft_check(cudaError_t e, const char *what) {
 }
 
 extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_scale, int N, int K,
-                              unsigned long long *sfb_mismatch_out) {
+                              int m_max, unsigned long long *sfb_mismatch_out) {
     if (K % 128 != 0 || K < 128) { fprintf(stderr, "fixed-tile probe: K=%d not a multiple of 128\n", K); return nullptr; }
+    if (m_max < 1) { fprintf(stderr, "fixed-tile probe: m_max=%d\n", m_max); return nullptr; }
     ft_ctx *c = new ft_ctx();
-    memset(c, 0, sizeof *c);
     c->N = N; c->K = K; c->KB = K / 32; c->KBp = pulsar_mx_rup(c->KB, 4);
+    c->m_max = m_max;
+    c->checked.assign((size_t)m_max + 2u, 0);
     const size_t data_bytes = (size_t)N * K;
     const size_t lt_scale_bytes = (size_t)pulsar_mx_rup(N, 128) * c->KBp;
     if (ft_check(cudaMalloc(&c->B_data, data_bytes), "malloc B") ||
@@ -159,19 +164,22 @@ extern "C" ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_l
         cudaFree(d_mis);
     }
     if (sfb_mismatch_out) *sfb_mismatch_out = c->sfb_mismatch;
-    /* A side: 16 rows of data, SFA sized for the 128-row atom. */
-    auto lSFA = FT<128>::BlkCfg::tile_atom_to_shape_SFA(make_shape(128, N, K, 1));
-    if (ft_check(cudaMalloc(&c->A_data, (size_t)16 * K), "malloc A") ||
+    /* A side: m_max rows of data, SFA sized for the 128-row atom over m_max rows. */
+    auto lSFA = FT<128>::BlkCfg::tile_atom_to_shape_SFA(make_shape(pulsar_mx_rup(m_max, 128), N, K, 1));
+    if (ft_check(cudaMalloc(&c->A_data, (size_t)m_max * K), "malloc A") ||
         ft_check(cudaMalloc(&c->A_sf, (size_t)cosize(lSFA)), "malloc SFA") ||
         ft_check(cudaMemset(c->A_sf, 0, (size_t)cosize(lSFA)), "zero SFA")) return nullptr;
-    /* workspaces: max over M <= 16 */
-    for (int M = 1; M <= 16; M++) {
+    /* workspaces: max over the decode range and the top of the probed range */
+    auto consider = [&](int M) {
+        if (M < 1 || M > m_max) return;
         auto a64 = FT<64>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
         auto a128 = FT<128>::args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K);
         const size_t w64 = FT<64>::Gemm::get_workspace_size(a64), w128 = FT<128>::Gemm::get_workspace_size(a128);
         if (w64 > c->ws64_bytes) c->ws64_bytes = w64;
         if (w128 > c->ws128_bytes) c->ws128_bytes = w128;
-    }
+    };
+    for (int M = 1; M <= 16; M++) consider(M);
+    for (int M = m_max - 2; M <= m_max; M++) consider(M);
     if (c->ws64_bytes && ft_check(cudaMalloc(&c->ws64, c->ws64_bytes), "malloc ws64")) return nullptr;
     if (c->ws128_bytes && ft_check(cudaMalloc(&c->ws128, c->ws128_bytes), "malloc ws128")) return nullptr;
     return c;
@@ -186,17 +194,16 @@ static int ft_run_tn(ft_ctx *c, const float *x_dev, int M, float *D_dev) {
     if (cudaGetLastError() != cudaSuccess) return 10;
     auto a = FT<TN>::args(D_dev, c->A_data, c->A_sf, c->B_data, c->B_sf, M, c->N, c->K);
     typename FT<TN>::Gemm gemm;
-    static bool checked[17] = {};
-    if (!checked[M]) {
+    if (!c->checked[(size_t)M]) {
         if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
-        checked[M] = true;
+        c->checked[(size_t)M] = 1;
     }
     if (gemm.initialize(a, TN == 64 ? c->ws64 : c->ws128) != cutlass::Status::kSuccess) return 2;
     return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
 extern "C" int ft_run(ft_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
-    if (!c || !x || !D || M < 1 || M > 16) return 4;
+    if (!c || !x || !D || M < 1 || M > c->m_max) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
     const float *x_dev = (const float *)x->ptr;
     float *D_dev = (float *)D->ptr;
@@ -258,9 +265,11 @@ __global__ static void fb_f32_to_bf16(uint16_t *out, const float *x, uint64_t n)
 struct fb_ctx {
     int N, K;
     uint16_t *W;      // bf16 [N][K]
-    uint16_t *A;      // bf16 [16][K]
+    uint16_t *A;      // bf16 [m_max][K]
     void *ws64, *ws128;
     size_t ws64_bytes, ws128_bytes;
+    int m_max;
+    std::vector<char> checked;
 };
 
 template <int TN>
@@ -272,21 +281,26 @@ static typename FB<TN>::Gemm::Arguments fb_args(fb_ctx *c, const uint16_t *A, in
         (int64_t)c->K, (int64_t)c->K, (int64_t)c->N, (int64_t)c->N);
 }
 
-extern "C" fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K) {
+extern "C" fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K, int m_max) {
     if (K % 8 != 0 || N % 8 != 0) { fprintf(stderr, "fixed-tile probe (bf16): N=%d K=%d not multiples of 8\n", N, K); return nullptr; }
+    if (m_max < 1) { fprintf(stderr, "fixed-tile probe (bf16): m_max=%d\n", m_max); return nullptr; }
     fb_ctx *c = new fb_ctx();
-    memset(c, 0, sizeof *c);
     c->N = N; c->K = K;
+    c->m_max = m_max;
+    c->checked.assign((size_t)m_max + 2u, 0);
     const size_t wbytes = (size_t)N * K * 2;
     if (ft_check(cudaMalloc(&c->W, wbytes), "malloc W bf16") ||
         ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "copy W bf16") ||
-        ft_check(cudaMalloc(&c->A, (size_t)16 * K * 2), "malloc A bf16")) return nullptr;
-    for (int M = 1; M <= 16; M++) {
+        ft_check(cudaMalloc(&c->A, (size_t)m_max * K * 2), "malloc A bf16")) return nullptr;
+    auto consider = [&](int M) {
+        if (M < 1 || M > m_max) return;
         const size_t w64 = FB<64>::Gemm::get_workspace_size(fb_args<64>(c, nullptr, M, nullptr));
         const size_t w128 = FB<128>::Gemm::get_workspace_size(fb_args<128>(c, nullptr, M, nullptr));
         if (w64 > c->ws64_bytes) c->ws64_bytes = w64;
         if (w128 > c->ws128_bytes) c->ws128_bytes = w128;
-    }
+    };
+    for (int M = 1; M <= 16; M++) consider(M);
+    for (int M = m_max - 2; M <= m_max; M++) consider(M);
     if (c->ws64_bytes && ft_check(cudaMalloc(&c->ws64, c->ws64_bytes), "malloc ws64 bf16")) return nullptr;
     if (c->ws128_bytes && ft_check(cudaMalloc(&c->ws128, c->ws128_bytes), "malloc ws128 bf16")) return nullptr;
     return c;
@@ -299,17 +313,16 @@ static int fb_run_tn(fb_ctx *c, const float *x_dev, int M, float *D_dev) {
     if (cudaGetLastError() != cudaSuccess) return 10;
     typename FB<TN>::Gemm gemm;
     auto a = fb_args<TN>(c, c->A, M, D_dev);
-    static bool checked[17] = {};
-    if (!checked[M]) {
+    if (!c->checked[(size_t)M]) {
         if (gemm.can_implement(a) != cutlass::Status::kSuccess) return 1;
-        checked[M] = true;
+        c->checked[(size_t)M] = 1;
     }
     if (gemm.initialize(a, TN == 64 ? c->ws64 : c->ws128) != cutlass::Status::kSuccess) return 2;
     return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
 }
 
 extern "C" int fb_run(fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
-    if (!c || !x || !D || M < 1 || M > 16) return 4;
+    if (!c || !x || !D || M < 1 || M > c->m_max) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
     return tn == 64 ? fb_run_tn<64>(c, (const float *)x->ptr, M, (float *)D->ptr)
                     : fb_run_tn<128>(c, (const float *)x->ptr, M, (float *)D->ptr);

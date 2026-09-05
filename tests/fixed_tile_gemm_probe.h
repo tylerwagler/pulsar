@@ -14,7 +14,7 @@ struct ft_ctx;
  * sfb_mismatch_out receives how many (n, kb) scale bytes sit at a different
  * linear offset in the CUTLASS layout than in the LT slab (0 = same swizzle). */
 struct ft_ctx *ft_prepare(const uint8_t *host_lt_data, const uint8_t *host_lt_scale, int N, int K,
-                          unsigned long long *sfb_mismatch_out);
+                          int m_max, unsigned long long *sfb_mismatch_out);
 /** Quantise x[M,K] f32 (device) to the engine's E4M3 bytes and run the
  * fixed-tile GEMM with tile N = tn (64 or 128) into D[M,N] f32 (device).
  * Returns 0 on success, 1 = can_implement refused, 2/3 = init/run failed. */
@@ -26,7 +26,7 @@ void ft_release(struct ft_ctx *c);
  * into the mmap) and run a fixed 64 x tn x 32 mma.sync tile GEMM on the
  * engine's bf16-rounded activations.  Same return codes as ft_run. */
 struct fb_ctx;
-struct fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K);
+struct fb_ctx *fb_prepare(const uint8_t *host_w_bf16, int N, int K, int m_max);
 int fb_run(struct fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
 void fb_release(struct fb_ctx *c);
 #ifdef __cplusplus

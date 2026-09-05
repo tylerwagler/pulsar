@@ -20,7 +20,15 @@
  * Also printed: max |ft - engine| per shape, so the accumulation-order
  * distance to the engine's arm is on record.
  *
- * Host wall-clock around 40 launches + one sync per arm, as in the L151 sweep. */
+ * Host wall-clock around 40 launches + one sync per arm, as in the L151 sweep.
+ *
+ * L183 (`... MODEL LAYER prefill`): the PREFILL question.  Rows declared prefill
+ * (the tensor-core arm: cuBLASLt for MXFP8, the bf16 tensor-core matmul), M in
+ * {6, 7, 2048, 4096, 4097} -- the remainder chunk and the production chunk --
+ * and every arm's rows [0, M) byte-compared against the SAME rows of its
+ * 4097-row call.  A "NO" for the engine arm is the chunk-mate dependence L180
+ * measured; a "YES" for ft is the neutral-by-construction alternative, and the
+ * us columns are its price at production M. */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "fixed_tile_gemm_probe.h"
@@ -91,8 +99,9 @@ static double max_abs_diff(const std::vector<float> &a, const std::vector<float>
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [LAYER]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [LAYER] [prefill]\n", argv[0]); return 2; }
     const uint32_t il = argc > 2 ? (uint32_t)atoi(argv[2]) : 4u;
+    const bool prefill = argc > 3 && strcmp(argv[3], "prefill") == 0;
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
@@ -110,15 +119,23 @@ int main(int argc, char **argv) {
         {"ffn_gate_shexp", L->ffn_gate_shexp}, {"attn_q_a", L->attn_q_a},
         {"router (bf16)", L->ffn_gate_inp}, {"output head (bf16)", e->weights.output},
     };
-    const uint32_t Ms[] = {1, 2, 4, 5, 8, 9, 12, 16};
-    const int NM = (int)(sizeof(Ms) / sizeof(Ms[0]));
-    const uint32_t MMAX = 16;
-    const int reps = 40;
+    const uint32_t Ms_decode[] = {1, 2, 4, 5, 8, 9, 12, 16};
+    const uint32_t Ms_prefill[] = {6, 7, 2048, 4096, 4097};
+    const uint32_t *Ms = prefill ? Ms_prefill : Ms_decode;
+    const int NM = prefill ? (int)(sizeof(Ms_prefill) / sizeof(Ms_prefill[0]))
+                           : (int)(sizeof(Ms_decode) / sizeof(Ms_decode[0]));
+    const uint32_t MMAX = prefill ? 4097u : 16u;
+    const int reps = prefill ? 10 : 40;
     int rc = 0;
-    printf("layer %u; us per call (%d launches + 1 sync). engine = the dispatch with M rows declared decode "
-           "(GEMV/nt arms, <= %u rows); ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; "
-           "bf16: 64xTNx32 mma.sync)\n\n",
-           il, reps, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+    if (prefill)
+        printf("layer %u; PREFILL rows; us per call (%d launches + 1 sync). engine = the dispatch with M rows "
+               "declared prefill (tensor-core arm: cuBLASLt MXFP8 / bf16 matmul); ft64/ft128 = fixed CUTLASS tile. "
+               "neutral = rows [0,M) byte-identical to the same rows of the %u-row call\n\n", il, reps, MMAX);
+    else
+        printf("layer %u; us per call (%d launches + 1 sync). engine = the dispatch with M rows declared decode "
+               "(GEMV/nt arms, <= %u rows); ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; "
+               "bf16: 64xTNx32 mma.sync)\n\n",
+               il, reps, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         const pulsar_tensor *w = shapes[si].w;
         const bool is_bf16 = w->type == PULSAR_TENSOR_BF16;
@@ -145,12 +162,12 @@ int main(int argc, char **argv) {
         unsigned long long sfb_mismatch = 0;
         double wbytes;
         if (is_bf16) {
-            c.fb = fb_prepare(host, N, K);
+            c.fb = fb_prepare(host, N, K, (int)MMAX);
             if (!c.fb) { fprintf(stderr, "fb_prepare failed for %s\n", shapes[si].name); return 1; }
             wbytes = (double)K * (double)N * 2.0;
             printf("%s  K=%d N=%d  (%.1f MB bf16)\n", shapes[si].name, K, N, wbytes / 1e6);
         } else {
-            c.ft = ft_prepare(host, host + data_bytes, N, K, &sfb_mismatch);
+            c.ft = ft_prepare(host, host + data_bytes, N, K, (int)MMAX, &sfb_mismatch);
             if (!c.ft) { fprintf(stderr, "ft_prepare failed for %s\n", shapes[si].name); return 1; }
             wbytes = (double)K * (double)N * 1.03;
             printf("%s  K=%d N=%d  (%.1f MB)   SFB layout vs LT slab: %llu of %llu scale bytes at a different offset%s\n",
@@ -158,21 +175,32 @@ int main(int argc, char **argv) {
                    sfb_mismatch == 0 ? "  -> SAME swizzle, LT slab usable as SFB" : "  -> re-layout needed");
         }
         printf("  %5s | %9s | %9s %9s | %8s %8s | %10s | %s\n", "M", "engine", "ft64", "ft128",
-               "ft64GB/s", "ft128GBs", "|ft64-eng|", "neutral(ft64/ft128: rows==M16)");
-        /* neutrality references: the 16-row ft outputs */
-        std::vector<float> ref64, ref128, cur, ref_eng;
+               "ft64GB/s", "ft128GBs", "|ft64-eng|",
+               prefill ? "neutral(engine/ft64/ft128: rows==M4097)" : "neutral(engine/ft64/ft128: rows==M16)");
+        /* neutrality references: the MMAX-row outputs of every arm */
+        std::vector<float> ref64, ref128, cur, ref_eng, ref_eng_max;
         for (int tn = 64; tn <= 128; tn += 64) {
             c.tn = tn;
-            if (!ft_launch(&c, 16) || ft_sync() != 0) { fprintf(stderr, "ft%d at M=16 failed for %s\n", tn, shapes[si].name); rc = 1; break; }
-            if (!read_out(c.out, tn == 64 ? ref64 : ref128, (uint64_t)16 * N)) { rc = 1; break; }
+            if (!ft_launch(&c, MMAX) || ft_sync() != 0) { fprintf(stderr, "ft%d at M=%u failed for %s\n", tn, MMAX, shapes[si].name); rc = 1; break; }
+            if (!read_out(c.out, tn == 64 ? ref64 : ref128, (uint64_t)MMAX * N)) { rc = 1; break; }
         }
         if (rc) break;
+        if (!prefill && !pulsar_gpu_matmul_set_batch_decode_rows((int)MMAX)) { rc = 1; break; }
+        if (!engine_launch(&c, MMAX) || !pulsar_gpu_end_commands() || ft_sync() != 0) {
+            fprintf(stderr, "engine at M=%u failed for %s\n", MMAX, shapes[si].name); rc = 1; break;
+        }
+        (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+        if (!read_out(c.out, ref_eng_max, (uint64_t)MMAX * N)) { rc = 1; break; }
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
-            if (!pulsar_gpu_matmul_set_batch_decode_rows((int)M)) { rc = 1; break; }
+            if (!prefill && !pulsar_gpu_matmul_set_batch_decode_rows((int)M)) { rc = 1; break; }
             const double te = time_launches(engine_launch, &c, M, reps);
             (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
+            if (te < 0) { fprintf(stderr, "engine failed at M=%u for %s\n", M, shapes[si].name); rc = 1; break; }
             if (!read_out(c.out, ref_eng, (uint64_t)M * N)) { rc = 1; break; }
+            uint64_t bad_eng = 0;
+            for (uint64_t i = 0; i < (uint64_t)M * N; i++)
+                if (memcmp(&ref_eng[i], &ref_eng_max[i], sizeof(float)) != 0) bad_eng++;
             double tf[2] = {-1, -1}, deng = 0;
             uint64_t bad[2] = {0, 0};
             for (int ti = 0; ti < 2; ti++) {
@@ -186,10 +214,13 @@ int main(int argc, char **argv) {
                 if (ti == 0) deng = max_abs_diff(cur, ref_eng, (uint64_t)M * N);
             }
             if (rc) break;
-            printf("  %5u | %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e | %s / %s%s\n", M, te, tf[0], tf[1],
+            printf("  %5u | %9.1f | %9.1f %9.1f | %8.0f %8.0f | %10.3e | %s / %s / %s%s\n", M, te, tf[0], tf[1],
                    tf[0] > 0 ? wbytes / tf[0] / 1e3 : 0.0, tf[1] > 0 ? wbytes / tf[1] / 1e3 : 0.0, deng,
-                   bad[0] == 0 ? "YES" : "NO", bad[1] == 0 ? "YES" : "NO",
-                   (bad[0] || bad[1]) ? "  <-- rows differ from the 16-row call" : "");
+                   bad_eng == 0 ? "YES" : "NO", bad[0] == 0 ? "YES" : "NO", bad[1] == 0 ? "YES" : "NO",
+                   (bad_eng || bad[0] || bad[1]) ? "  <-- rows differ from the full-M call" : "");
+            if (bad_eng)
+                printf("        engine: %llu of %llu floats differ from the %u-row call\n",
+                       (unsigned long long)bad_eng, (unsigned long long)M * N, MMAX);
         }
         printf("\n");
         if (c.ft) ft_release(c.ft);
