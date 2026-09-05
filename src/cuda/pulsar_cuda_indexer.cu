@@ -44,27 +44,6 @@ __device__ static inline float idx_comp_load_dev(const pulsar_mxkv_pack_t *index
 
 
 
-/* Four consecutive Q values of one packed row as a float4, indexed in
- * FOUR-ELEMENT units (lane covers dims 4*lane..4*lane+3, one 32-block scale).
- * Same decode as idx_comp_load_dev; vectorized for the n=1 fast tier. */
-__device__ static inline float4 idx_q_load4(const pulsar_mxkv_pack_t *qp,
-                                            uint64_t row, uint32_t lane) {
-    const uint8_t *r = (const uint8_t *)qp + row * PULSAR_MXKV_FP4_ROWBYTES(128u);
-    const uint32_t d0 = lane * 4u;
-    const float scale = __uint_as_float((uint32_t)r[64u + (d0 >> 5u)] << 23);
-    const uint8_t b0 = r[d0 >> 1u], b1 = r[(d0 >> 1u) + 1u];
-    const uint8_t n0 = (uint8_t)(b0 & 0xfu), n1 = (uint8_t)(b0 >> 4);
-    const uint8_t n2 = (uint8_t)(b1 & 0xfu), n3 = (uint8_t)(b1 >> 4);
-    float4 v;
-    /* One decode per component -- this called the helper TWICE per component
-     * (once in each ternary arm) when it was written. */
-    v.x = idx_e2m1_decode(n0, scale);
-    v.y = idx_e2m1_decode(n1, scale);
-    v.z = idx_e2m1_decode(n2, scale);
-    v.w = idx_e2m1_decode(n3, scale);
-    return v;
-}
-
 /* positions/seq_id/comp_cap/n_banks (descriptor-aware indexer kernels): the
  * same per-row multi-session banking as the decode attention kernels
  * (pulsar_cuda_attention.cu — design adapted from the MIT-licensed Entrpi/ds4
@@ -144,93 +123,6 @@ __global__ static void indexer_scores_kernel(
 
 
 
-/* Descriptor-aware variant of the single-token fast tier: the banked entry
- * keeps this kernel (rather than forcing the generic per-(row,comp) kernel)
- * because its reduction order is what the classic single-token decode uses:
- * any per-session solo/banked comparison depends on the banked n_tokens==1 scan
- * being bit-identical to classic.  (The PULSAR_DECODE_DESCR byte-gate that
- * originally enforced this was removed in 7ffb086 -- nothing set it -- so the
- * property is now asserted only by the multiseq gates.)
- * (Documented deviation from the Tier-2 spec's "generic only" note; the WMMA
- * multi-token tier does stay single-bank.)  Descriptor semantics match
- * indexer_scores_kernel (one row, so positions[0]/seq_id[0]). */
-__global__ static void indexer_score_one_direct_kernel(
-        float *scores,
-        const pulsar_mxkv_pack_t *q,
-        const float *weights,
-        const pulsar_mxkv_pack_t *index_comp,
-        uint32_t n_comp,
-        uint32_t pos0,
-        uint32_t ratio,
-        float scale,
-        int causal,
-        const int32_t * __restrict__ positions,
-        const int32_t * __restrict__ seq_id,
-        const void * const * __restrict__ index_bank_ptrs,
-        uint32_t comp_cap,
-        uint32_t n_banks) {
-    const uint32_t c = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    if (c >= n_comp || tid >= 128u) return;
-    if (seq_id && (uint32_t)seq_id[0] >= n_banks) {
-        /* Dead/evicted row: fail-visible (see indexer_scores_kernel). */
-        if (tid == 0) scores[c] = -INFINITY;
-        return;
-    }
-    const uint32_t qpos = positions ? (uint32_t)positions[0] : pos0;
-    if (causal) {
-        const uint32_t visible = ratio ? (qpos + 1u) / ratio : n_comp;
-        if (c >= visible) {
-            if (tid == 0) scores[c] = -INFINITY;
-            return;
-        }
-    }
-    /* Per-bank index base (see indexer_scores_kernel). */
-    const uint32_t sid_b = seq_id ? (uint32_t)seq_id[0] : 0u;
-    const pulsar_mxkv_pack_t *index_src = index_bank_ptrs ? (const pulsar_mxkv_pack_t *)index_bank_ptrs[sid_b] : index_comp;
-    const uint64_t comp_base = index_bank_ptrs ? 0u
-                             : (seq_id ? (uint64_t)sid_b * comp_cap : 0u);
-
-    __shared__ float krow[128];
-    __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = idx_comp_load_dev(index_src, comp_base + c, tid, 128u);
-    __syncthreads();
-
-    /* Per-warp accumulation: warp w owns heads w, w+4, ..., w+60 and keeps a
-     * private running sum, so the loop needs no block-wide synchronization
-     * (the old version paid two __syncthreads() per 4-head group = 32 per
-     * row). One sync at the end combines the four warp totals. The reduction
-     * order changes by ~1 ULP vs the old serial accumulate, far below the
-     * model's run-to-run float-atomic nondeterminism. */
-    float wtotal = 0.0f;
-    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
-        const uint32_t h = h0 + warp;
-        const float4 qv = idx_q_load4(q, h, lane);
-        const float4 kv = ((const float4 *)krow)[lane];
-        float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-        dot = warp_sum_f32(dot);
-        if (lane == 0) wtotal += fmaxf(dot, 0.0f) * weights[h] * scale;
-    }
-    if (lane == 0) partial[warp] = wtotal;
-    __syncthreads();
-    if (tid == 0) scores[c] = partial[0] + partial[1] + partial[2] + partial[3];
-}
-
-
-
-
-
-
-/* Single-block argmax over n_vocab F32 logits. One block of 1024 threads
- * cooperatively scans the vocab, tracking a (best_v, best_idx) pair per
- * thread, then reduces in shared memory with value-keyed comparison.
- *
- * Tie-breaking: lower index wins, matching the host sample_argmax used by
- * the CPU reference path. Replaces the indexer-as-argmax workaround used
- * in the speculative top-id sites, which fell through to the legacy single-thread
- * indexer_topk_kernel at top_k=1, costing ~17.5 ms per call on n_vocab=129280. */
 __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
     enum { THREADS = 1024 };
     __shared__ float sm_val[THREADS];
@@ -871,19 +763,17 @@ static int indexer_scores_launch(
      * producer's packed E2M1 rows (L090.4), every tier decodes the same bytes,
      * and the per-entry E4M3 round-trip that used to force this -- an identity
      * on values already crushed to the FP4 grid -- is deleted with the f32
-     * container it patched over. */
-    if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const pulsar_mxkv_pack_t *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const pulsar_mxkv_pack_t *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0,
-                                                         positions_ptr, seq_id_ptr,
-                                                         index_bank_ptrs_ptr,
-                                                         comp_cap, kernel_n_banks);
-        return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
-    }
+     * container it patched over.
+     *
+     * ONE scorer for every row count (L173): a one-row launch used to take a
+     * SIMT kernel (one block per compressed row) and every other count the
+     * block-scaled tier below -- the L161 shape one layer upstream of the
+     * selection.  Measured 2026-09-04 on identical packed operands: the tier
+     * at one row is 6.6-8.1 us flat from 600 to 8300 compressed rows where the
+     * SIMT kernel grew from 12.6 to 115 us, the scores agree to ~1e-7 and the
+     * top-512 sets are identical at every width.  The SIMT kernel is gone;
+     * the banked lane sends one-row runs through the tier too
+     * (gpu_prefill.cpp, the indexer span). */
     /* Block-scaled tier (src/cuda/pulsar_cuda_indexer_mxfp4.cu): feeds the
      * stored MXFP4 rows straight to the SM120 tensor cores instead of
      * dequantising them to fp16 first.  3.4x the WMMA tier at n_comp=512,
@@ -902,6 +792,15 @@ static int indexer_scores_launch(
      * Falling through on 0 would turn either into a silent demotion to the
      * slower kernel -- the same fail-open shape the type-tag dispatches keep
      * getting bitten by. */
+    if (descr && n_tokens == 1u && head_dim == 128u && n_head == 64u) {
+        /* The engine scores a banked one-row run through the tier in scalar
+         * mode on the bank's view (pulsar_gpu_indexer_scores_decode_run_tensor);
+         * a descriptor launch at this shape would reach the generic kernel, a
+         * second arithmetic for a row the tier serves (L173).  No caller. */
+        fprintf(stderr, "pulsar: indexer scores: a one-row descriptor launch at n_head 64 / head_dim 128 has no "
+                        "kernel here -- score the run through the tier on the bank's view (decode_run); refusing\n");
+        return 0;
+    }
     if (!descr && head_dim == 128u && n_head == 64u) {
         /* Say so once: this tier changes the numbers, so "did it engage" must
          * be answerable from a log rather than inferred from a timing delta. */

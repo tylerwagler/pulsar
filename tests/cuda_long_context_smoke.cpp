@@ -1163,6 +1163,68 @@ done:
     return rc;
 }
 
+/* L173: the banked one-row indexer run (the tier in scalar mode on the bank's
+ * view, pulsar_gpu_indexer_scores_decode_run_tensor -- the production path for
+ * every one-row bank run) must equal the classic single-session one-row scorer
+ * (pulsar_gpu_indexer_score_one_tensor, n_comp = the visible count) byte for
+ * byte over the visible prefix, and mask the rest to -INF.  Same kernel, two
+ * entries, two masking rules; the old check compared a one-row DESCRIPTOR
+ * launch (now refused) against the scalar launch. */
+static int mb_idx_direct_one_case(pulsar_gpu_tensor *index_slab, uint32_t n_comp_superset,
+                                  uint32_t ratio, uint32_t head_dim, uint64_t index_bank_bytes,
+                                  uint32_t bank, uint32_t qpos) {
+    const uint32_t n_head = 64u;
+    const float scale = 0.125f;
+    const uint64_t q_row = (uint64_t)n_head * head_dim, qp_row = (uint64_t)n_head * 68u;
+    const uint32_t vis = (qpos + 1u) / ratio;
+    float *q_host = (float *)malloc(q_row * sizeof(float));
+    float *w_host = (float *)malloc(n_head * sizeof(float));
+    uint8_t *qp_host = (uint8_t *)malloc(qp_row);
+    float *run = (float *)malloc(n_comp_superset * sizeof(float));
+    float *one = (float *)malloc(vis * sizeof(float));
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(qp_row);
+    pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc(n_head * sizeof(float));
+    pulsar_gpu_tensor *s_run = pulsar_gpu_tensor_alloc(n_comp_superset * sizeof(float));
+    pulsar_gpu_tensor *s_one = pulsar_gpu_tensor_alloc(vis * sizeof(float));
+    pulsar_gpu_tensor *bank_view = pulsar_gpu_tensor_view(index_slab, (uint64_t)bank * index_bank_bytes, index_bank_bytes);
+    int rc = 1;
+    if (!q_host || !w_host || !qp_host || !run || !one || !q || !w || !s_run || !s_one || !bank_view) goto done;
+    mb_rng_state = 0x1d0b5u;
+    for (uint64_t i = 0; i < q_row; i++) q_host[i] = mb_rand() * 0.5f;
+    for (uint32_t h = 0; h < n_head; h++) w_host[h] = mb_rand() * 0.5f + 0.75f;
+    mb_pack_q_rows(q_host, qp_host, n_head);
+    if (!pulsar_gpu_tensor_write(q, 0, qp_host, qp_row) ||
+        !pulsar_gpu_tensor_write(w, 0, w_host, n_head * sizeof(float)) ||
+        !pulsar_gpu_indexer_scores_decode_run_tensor(s_run, q, w, bank_view, n_comp_superset, 1, qpos,
+                                                     n_head, head_dim, ratio, scale) ||
+        !pulsar_gpu_indexer_score_one_tensor(s_one, q, w, bank_view, vis, n_head, head_dim, scale) ||
+        !pulsar_gpu_synchronize() ||
+        !pulsar_gpu_tensor_read_f32(s_run, 0, run, n_comp_superset) ||
+        !pulsar_gpu_tensor_read_f32(s_one, 0, one, vis)) {
+        fprintf(stderr, "multibank indexer direct-one: launch failed\n");
+        goto done;
+    }
+    {
+        uint32_t nd = 0, tail_bad = 0;
+        for (uint32_t i = 0; i < vis; i++) nd += run[i] != one[i];
+        for (uint32_t i = vis; i < n_comp_superset; i++) tail_bad += run[i] != -INFINITY;
+        if (nd || tail_bad) {
+            fprintf(stderr, "multibank indexer direct-one: bank %u qpos %u: %u/%u visible scores differ between the "
+                            "one-row bank run and the classic one-row scorer, %u tail rows not -INF\n",
+                    bank, qpos, nd, vis, tail_bad);
+            goto done;
+        }
+        printf("  multibank indexer direct-one: bank %u qpos %u -> one-row bank run == classic one-row scorer "
+               "(%u visible rows byte-identical, %u masked)\n", bank, qpos, vis, n_comp_superset - vis);
+    }
+    rc = 0;
+done:
+    pulsar_gpu_tensor_free(bank_view); pulsar_gpu_tensor_free(s_one); pulsar_gpu_tensor_free(s_run);
+    pulsar_gpu_tensor_free(w); pulsar_gpu_tensor_free(q);
+    free(one); free(run); free(qp_host); free(w_host); free(q_host);
+    return rc;
+}
+
 static int check_multibank_indexer(void) {
     const uint32_t n_banks = 2, comp_cap = 32, ratio = 4;
     const uint32_t n_comp_sup = 25;   /* cross-bank superset */
@@ -1198,18 +1260,13 @@ static int check_multibank_indexer(void) {
                 case_rc = mb_idx_run_case("fp4", rows, 4, slab, comp_cap,
                                           n_comp_sup, ratio, n_banks, 4, head_dim,
                                           bank_bytes, 8);
-                /* fp4 direct-one fast tier (n_tokens == 1, n_head 64): the
-                 * n_head=4 case above dispatches the generic kernel, so the
-                 * banked fp4 DIRECT-ONE tier needs its own row (same slab;
-                 * emit-boundary qpos 39 as visibility teeth).  Reference is
-                 * the same scalar-mode dispatch on the bank's view. */
-                if (case_rc == 0) {
-                    const mb_row one[1] = { {1, 39, 0} };
-                    case_rc = mb_idx_run_case("fp4-direct-one", one, 1, slab,
-                                              comp_cap, n_comp_sup, ratio,
-                                              n_banks, 64, head_dim,
-                                              bank_bytes, 8);
-                }
+                /* One-row bank run at the tier's shape (n_head 64): the n_head=4
+                 * case above dispatches the generic kernel; production scores
+                 * a one-row bank run through the tier on the bank's view, and
+                 * that must equal the classic one-row scorer (L173).  Emit-
+                 * boundary qpos 39 as visibility teeth (visible 10 of 25). */
+                if (case_rc == 0)
+                    case_rc = mb_idx_direct_one_case(slab, n_comp_sup, ratio, head_dim, bank_bytes, 1u, 39u);
             }
         }
         pulsar_gpu_tensor_free(slab);

@@ -1045,7 +1045,7 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
  * @param keep_f32  write the dequantised values back into the f32 staging.
  *                  OBSERVER-ONLY -- consumers read the packed rows. Pass
  *                  gpu_graph_f32_store_observed_any() (L094).
- * @return 0 on success.
+ * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
         pulsar_gpu_tensor *x,

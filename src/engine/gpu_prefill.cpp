@@ -383,7 +383,12 @@ static bool gpu_graph_indexed_attention_span(
                         "positions (step_begin admits no such batch) -- refusing\n", il, sn);
         ok = false;
     }
-    if (ok && op->mseq && sn > 1u) {
+    /* Every banked span, one-row spans included, scores each bank run through
+     * the tier in scalar mode (L173: a one-row descriptor launch used to reach
+     * the deleted SIMT kernel; a one-row run here is the same arithmetic as
+     * the classic one-row decode, which is what solo-vs-banked comparisons
+     * depend on). */
+    if (ok && op->mseq) {
         for (uint32_t r0 = 0; ok && r0 < sn; ) {
             uint32_t rn = 1;
             while (r0 + rn < sn &&
