@@ -141,7 +141,7 @@ MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
 ifneq ($(strip $(MMQ_SRCS)),)
 MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
 endif
-LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h
+LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 
 # ---------------------------------------------------------------------------
@@ -1089,7 +1089,7 @@ gates:
 	exit $$rc
 
 # Ported C++ TUs (pulsar). One rule per source dir, mirroring the .c rules.
-src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h
+src/engine/%.o: src/engine/%.cpp src/engine/pulsar_engine_internal.h src/engine/cursor.hpp src/pulsar.h src/pulsar_gpu.h src/lib/pulsar_utf8.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
@@ -1101,7 +1101,7 @@ src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.
 src/agent/%.o: src/agent/%.cpp src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
-src/cli/%.o: src/cli/%.cpp src/pulsar.h src/lib/pulsar_help.h src/vendor/linenoise.h
+src/cli/%.o: src/cli/%.cpp src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp

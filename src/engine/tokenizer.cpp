@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -173,12 +174,21 @@ static char *byte_encode(pulsar_str in, uint64_t *out_len) {
 
 
 
-static int utf8_len_from_first_byte(uint8_t c) {
-    if (c < 0x80) return 1;
-    if ((c & 0xe0) == 0xc0) return 2;
-    if ((c & 0xf0) == 0xe0) return 3;
-    if ((c & 0xf8) == 0xf0) return 4;
-    return 1;
+/* Decode the UTF-8 sequence at s[pos] (strict rule: pulsar_utf8.h).  An
+ * ill-formed byte -- bad lead, bad or truncated continuation, Table 3-7
+ * violation -- is its own one-byte unit and decodes to its byte value.  Sets
+ * *next just past the consumed bytes. */
+static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
+    const unsigned char *p = (const unsigned char *)s + pos;
+    const int n = utf8_seq_ok(p, (size_t)(len - pos));
+    if (n <= 1) {
+        *next = pos + 1;
+        return p[0];
+    }
+    uint32_t cp = p[0] & (0x7fu >> n);
+    for (int i = 1; i < n; i++) cp = (cp << 6) | (p[i] & 0x3fu);
+    *next = pos + (uint64_t)n;
+    return cp;
 }
 
 
@@ -224,8 +234,8 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
     owned_str *sym = (owned_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
-        int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
-        if (off + (uint64_t)n > encoded_len) n = 1;
+        int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
+        if (n == 0) n = 1;
         if (n_sym == cap_sym) {
             cap_sym *= 2;
             sym = (owned_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
@@ -285,9 +295,8 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
 
 
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
-    int n = utf8_len_from_first_byte((uint8_t)s[pos]);
-    if (pos + (uint64_t)n > len) n = 1;
-    return pos + (uint64_t)n;
+    const int n = utf8_seq_ok((const unsigned char *)s + pos, (size_t)(len - pos));
+    return pos + (uint64_t)(n ? n : 1);
 }
 
 
@@ -334,30 +343,6 @@ static bool utf8_is_cjk_hira_kata(uint32_t cp) {
 
 
 
-static uint32_t utf8_peek_one(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
-    const uint8_t c0 = (uint8_t)s[pos];
-    int n = utf8_len_from_first_byte(c0);
-    if (pos + (uint64_t)n > len) n = 1;
-    *next = pos + (uint64_t)n;
-
-    if (n == 1) return c0;
-    if (n == 2) {
-        return ((uint32_t)(c0 & 0x1f) << 6) |
-               ((uint32_t)((uint8_t)s[pos + 1] & 0x3f));
-    }
-    if (n == 3) {
-        return ((uint32_t)(c0 & 0x0f) << 12) |
-               ((uint32_t)((uint8_t)s[pos + 1] & 0x3f) << 6) |
-               ((uint32_t)((uint8_t)s[pos + 2] & 0x3f));
-    }
-    return ((uint32_t)(c0 & 0x07) << 18) |
-           ((uint32_t)((uint8_t)s[pos + 1] & 0x3f) << 12) |
-           ((uint32_t)((uint8_t)s[pos + 2] & 0x3f) << 6) |
-           ((uint32_t)((uint8_t)s[pos + 3] & 0x3f));
-}
-
-
-
 static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
     (void)len;
     uint8_t c = (uint8_t)s[pos];
@@ -388,7 +373,7 @@ static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos)
 static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     if ((uint8_t)s[pos] < 128) return false;
     uint64_t next = pos;
-    uint32_t cp = utf8_peek_one(s, len, pos, &next);
+    uint32_t cp = utf8_decode_at(s, len, pos, &next);
     return utf8_is_cjk_hira_kata(cp);
 }
 
@@ -768,36 +753,6 @@ void pulsar_vocab::dump_tokens(const token_vec *tokens) const {
 
 
 
-static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
-    const uint8_t c = (uint8_t)s[*pos];
-    if (c < 0x80 || *pos + 1 >= len) {
-        (*pos)++;
-        return c;
-    }
-    if ((c & 0xe0) == 0xc0 && *pos + 1 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x1f) << 6) | ((uint8_t)s[*pos + 1] & 0x3f);
-        *pos += 2;
-        return cp;
-    }
-    if ((c & 0xf0) == 0xe0 && *pos + 2 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x0f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 2] & 0x3f);
-        *pos += 3;
-        return cp;
-    }
-    if ((c & 0xf8) == 0xf0 && *pos + 3 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x07) << 18) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 2] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 3] & 0x3f);
-        *pos += 4;
-        return cp;
-    }
-    (*pos)++;
-    return c;
-}
-
 
 
 static int gpt2_codepoint_to_byte(uint32_t cp) {
@@ -850,7 +805,7 @@ char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
     size_t n = 0;
     uint64_t pos = 0;
     while (pos < s.len) {
-        uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
+        uint32_t cp = utf8_decode_at(s.ptr, s.len, pos, &pos);
         int b = gpt2_codepoint_to_byte(cp);
         if (b >= 0) out[n++] = (char)b;
     }

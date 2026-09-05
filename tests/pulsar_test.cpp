@@ -18,6 +18,7 @@
 #include "../src/server/http_server.cpp"
 #include "../src/server/cli_main.cpp"
 #include "../src/server/server_tests.cpp"
+#include "../src/lib/pulsar_utf8.h"
 /* engine internals: the sampler byte-exactness gate builds distributions
  * directly and pins them against a copy of the pre-radix implementation. */
 #include "../src/engine/pulsar_engine_internal.h"
@@ -2564,6 +2565,77 @@ static void test_api_logprobs_parse_validation(void) {
 
 
 
+/* src/lib/pulsar_utf8.h is the ONE UTF-8 well-formedness rule (L187): the
+ * tokenizer, the agent renderer and the CLI's JSON writer all call it.  Pin the
+ * strict lead ranges and the Table 3-7 second-byte constraints, including the
+ * cases the tokenizer's old bitmask got wrong (0xC0/0xC1 and 0xF5-0xF7 taken
+ * as leads, continuation bytes never checked). */
+static void test_lib_utf8(void) {
+    TEST_ASSERT(utf8_seq_len(0x41) == 1);
+    TEST_ASSERT(utf8_seq_len(0x7f) == 1);
+    TEST_ASSERT(utf8_seq_len(0x80) == 0);
+    TEST_ASSERT(utf8_seq_len(0xbf) == 0);
+    TEST_ASSERT(utf8_seq_len(0xc0) == 0);
+    TEST_ASSERT(utf8_seq_len(0xc1) == 0);
+    TEST_ASSERT(utf8_seq_len(0xc2) == 2);
+    TEST_ASSERT(utf8_seq_len(0xdf) == 2);
+    TEST_ASSERT(utf8_seq_len(0xe0) == 3);
+    TEST_ASSERT(utf8_seq_len(0xef) == 3);
+    TEST_ASSERT(utf8_seq_len(0xf0) == 4);
+    TEST_ASSERT(utf8_seq_len(0xf4) == 4);
+    TEST_ASSERT(utf8_seq_len(0xf5) == 0);
+    TEST_ASSERT(utf8_seq_len(0xf7) == 0);
+    TEST_ASSERT(utf8_seq_len(0xff) == 0);
+
+    static const unsigned char ascii[] = {'a'};
+    static const unsigned char e_acute[] = {0xc3, 0xa9};
+    static const unsigned char euro[] = {0xe2, 0x82, 0xac};
+    static const unsigned char grin[] = {0xf0, 0x9f, 0x98, 0x80};
+    TEST_ASSERT(utf8_seq_ok(ascii, 1) == 1);
+    TEST_ASSERT(utf8_seq_ok(e_acute, 2) == 2);
+    TEST_ASSERT(utf8_seq_ok(euro, 3) == 3);
+    TEST_ASSERT(utf8_seq_ok(grin, 4) == 4);
+    /* a longer buffer does not change the answer; a shorter one truncates */
+    TEST_ASSERT(utf8_seq_ok(euro, 3 + 5) == 3 || utf8_seq_ok(euro, 3) == 3);
+    TEST_ASSERT(utf8_seq_ok(e_acute, 1) == 0);
+    TEST_ASSERT(utf8_seq_ok(euro, 2) == 0);
+    TEST_ASSERT(utf8_seq_ok(grin, 3) == 0);
+    TEST_ASSERT(utf8_seq_ok(grin, 0) == 0);
+
+    static const unsigned char bad_cont2[] = {0xc3, 0x41};
+    static const unsigned char bad_cont3[] = {0xe2, 0x82, 0x41};
+    static const unsigned char bad_cont4[] = {0xf0, 0x9f, 0x98, 0xc0};
+    static const unsigned char lone_cont[] = {0xa9, 0x41};
+    static const unsigned char overlong2[] = {0xc0, 0x80};
+    static const unsigned char overlong2b[] = {0xc1, 0xbf};
+    static const unsigned char f5_lead[] = {0xf5, 0x80, 0x80, 0x80};
+    TEST_ASSERT(utf8_seq_ok(bad_cont2, 2) == 0);
+    TEST_ASSERT(utf8_seq_ok(bad_cont3, 3) == 0);
+    TEST_ASSERT(utf8_seq_ok(bad_cont4, 4) == 0);
+    TEST_ASSERT(utf8_seq_ok(lone_cont, 2) == 0);
+    TEST_ASSERT(utf8_seq_ok(overlong2, 2) == 0);
+    TEST_ASSERT(utf8_seq_ok(overlong2b, 2) == 0);
+    TEST_ASSERT(utf8_seq_ok(f5_lead, 4) == 0);
+
+    /* Table 3-7 second-byte windows: E0 A0-BF, ED 80-9F, F0 90-BF, F4 80-8F */
+    static const unsigned char e0_low[] = {0xe0, 0x9f, 0xbf};
+    static const unsigned char e0_ok[] = {0xe0, 0xa0, 0x80};
+    static const unsigned char ed_ok[] = {0xed, 0x9f, 0xbf};
+    static const unsigned char ed_surrogate[] = {0xed, 0xa0, 0x80};
+    static const unsigned char f0_low[] = {0xf0, 0x8f, 0xbf, 0xbf};
+    static const unsigned char f0_ok[] = {0xf0, 0x90, 0x80, 0x80};
+    static const unsigned char f4_ok[] = {0xf4, 0x8f, 0xbf, 0xbf};
+    static const unsigned char f4_high[] = {0xf4, 0x90, 0x80, 0x80};
+    TEST_ASSERT(utf8_seq_ok(e0_low, 3) == 0);
+    TEST_ASSERT(utf8_seq_ok(e0_ok, 3) == 3);
+    TEST_ASSERT(utf8_seq_ok(ed_ok, 3) == 3);
+    TEST_ASSERT(utf8_seq_ok(ed_surrogate, 3) == 0);
+    TEST_ASSERT(utf8_seq_ok(f0_low, 4) == 0);
+    TEST_ASSERT(utf8_seq_ok(f0_ok, 4) == 4);
+    TEST_ASSERT(utf8_seq_ok(f4_ok, 4) == 4);
+    TEST_ASSERT(utf8_seq_ok(f4_high, 4) == 0);
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
@@ -2597,6 +2669,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
+    {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

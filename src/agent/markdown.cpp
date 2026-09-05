@@ -1,4 +1,5 @@
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -91,16 +92,6 @@ void renderer_reset_color(agent_token_renderer *r) {
 
 
 
-static size_t renderer_utf8_need(unsigned char c) {
-    if (c < 0x80) return 1;
-    if (c >= 0xc2 && c <= 0xdf) return 2;
-    if (c >= 0xe0 && c <= 0xef) return 3;
-    if (c >= 0xf0 && c <= 0xf4) return 4;
-    return 1;
-}
-
-
-
 static bool renderer_has_text_attrs(agent_token_renderer *r) {
     return r->in_think || r->md_bold || r->md_italic ||
            r->md_inline_code || r->md_code_block;
@@ -169,14 +160,15 @@ static void renderer_write_char_raw(agent_token_renderer *r, char c) {
         renderer_flush_utf8(r);
     }
 
-    size_t need = renderer_utf8_need(uc);
-    if (need == 1) {
+    /* A byte that cannot lead a sequence (utf8_seq_len 0) is its own unit. */
+    const int need = utf8_seq_len(uc);
+    if (need <= 1) {
         renderer_write_complete_char_raw(r, &c, 1);
         return;
     }
     r->utf8_pending[0] = c;
     r->utf8_pending_len = 1;
-    r->utf8_pending_need = need;
+    r->utf8_pending_need = (size_t)need;
 }
 
 

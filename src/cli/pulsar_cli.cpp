@@ -1,6 +1,7 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
 #include "pulsar_argparse.h"
+#include "pulsar_utf8.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -451,24 +452,9 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
 static bool json_utf8_valid(const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
-        unsigned char c = (unsigned char)s[i++];
-        if (c < 0x80) continue;
-        int need = 0;
-        if (c >= 0xc2 && c <= 0xdf) need = 1;
-        else if (c >= 0xe0 && c <= 0xef) need = 2;
-        else if (c >= 0xf0 && c <= 0xf4) need = 3;
-        else return false;
-        if (i + (size_t)need > n) return false;
-        unsigned char c1 = (unsigned char)s[i];
-        if (c == 0xe0 && c1 < 0xa0) return false;
-        if (c == 0xed && c1 >= 0xa0) return false;
-        if (c == 0xf0 && c1 < 0x90) return false;
-        if (c == 0xf4 && c1 >= 0x90) return false;
-        for (int j = 0; j < need; j++) {
-            unsigned char cc = (unsigned char)s[i + (size_t)j];
-            if ((cc & 0xc0) != 0x80) return false;
-        }
-        i += (size_t)need;
+        const int k = utf8_seq_ok((const unsigned char *)s + i, n - i);
+        if (k == 0) return false;
+        i += (size_t)k;
     }
     return true;
 }
