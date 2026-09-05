@@ -414,6 +414,29 @@ static int divergent_route_decision(bool have_best, int best_common, int frontie
     return any_active ? ROUTE_QUEUE : ROUTE_IN_PLACE;
 }
 
+/* Warm-advance-in-place (L179 branch 5): at a pool full of LIVE banks a PARTIAL
+ * fork consumes the requester's OWN trunk (pulsar_session_bank_fork_partial with
+ * src == dst, the engine's documented truncate-reuse degenerate) instead of
+ * evicting anyone -- this is what makes capacity == banks work. Eligible iff no
+ * destination was provisioned, the route is a partial cut (a FULL fork has no
+ * cut and only ever forks into a distinct bank) and the refusal was POOL_FULL:
+ * any other refusal (admission, mem floor, create fail) is not a "full of live
+ * banks" verdict and falls through to the cold path. */
+static bool warm_inplace_eligible(bool have_dst, bool partial, provision_refusal fr) {
+    return !have_dst && partial && fr == PROVISION_REFUSED_POOL_FULL;
+}
+
+/* The commit after a successful in-place cut. The cut moved the frontier
+ * BACKWARD to the engine's R-aligned resume position; the pre-truncation
+ * continued-store watermark would then refuse every continued disk checkpoint
+ * until the new conversation outgrows the old frontier (gen_begin only resets
+ * it when cached == 0, which a successful cut is exactly not) -- so it is
+ * reset here, with the committed position. Nothing else on the slot moves. */
+static void warm_inplace_commit(session_slot *sl, int resume_pos) {
+    sl->committed_pos = resume_pos;
+    sl->continued_last_store_tokens = 0;
+}
+
 /* Route the job to a slot. Preferences, in order:
  *   1. A live-tool-state continuation binds to the slot that owns its call
  *      ids (waiting for it if busy — running it elsewhere could only 409).
@@ -667,27 +690,18 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
              * case has a strictly better option below — advance IN PLACE. */
             dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
         }
-        if (!dst && partial && fr == PROVISION_REFUSED_POOL_FULL) {
-            /* Pool full of LIVE banks: consume the requester's OWN trunk
-             * instead of evicting anyone — pulsar_session_bank_fork_partial
-             * with src == dst is the engine's documented in-place
-             * truncate-reuse degenerate (cut to the R-aligned common, then
-             * re-prefill only the suffix).  This is what makes capacity ==
-             * banks WORK: every returning conversation advances its own bank
-             * warm, nobody's state dies.  The trunk is not preserved for
-             * siblings — at a full pool that luxury costs another
+        if (warm_inplace_eligible(dst != NULL, partial, fr)) {
+            /* Pool full of LIVE banks: consume the requester's OWN trunk (see
+             * warm_inplace_eligible) -- cut to the R-aligned common, then
+             * re-prefill only the suffix. Every returning conversation advances
+             * its own bank warm, nobody's state dies. The trunk is not
+             * preserved for siblings — at a full pool that luxury costs another
              * conversation its warmth. */
             const int rc = pulsar_session_bank_fork_partial(
                     s->sess, best->bank, best->bank,
                     j->req.prompt.v, j->req.prompt.len, best_common);
             if (rc == 0) {
-                best->committed_pos = pulsar_session_bank_pos(s->sess, best->bank);
-                /* The cut moved the frontier BACKWARD; the pre-truncation
-                 * continued-store watermark would refuse every continued disk
-                 * checkpoint until the new conversation outgrows the old
-                 * frontier (gen_begin only resets it when cached == 0, which
-                 * a successful cut is exactly not). */
-                best->continued_last_store_tokens = 0;
+                warm_inplace_commit(best, pulsar_session_bank_pos(s->sess, best->bank));
                 server_log(PULSAR_LOG_DEFAULT,
                            "pulsar-server: warm-advance-in-place: bank %u cut "
                            "(frontier %d, common %d) resume %d; no eviction",
@@ -1005,6 +1019,30 @@ bool server::worker_eviction_could_help(const job *j,
  * eviction itself proceeds, and the response always belongs to the right
  * conversation because the freed KV can never be read again. Returns false
  * when nothing is evictable. Worker thread only. */
+/* The eviction reset (L179 branch 11): the slot becomes a reusable hole --
+ * unprovisioned, SLOT_EVICTED, no gen/job, no ctx, no ledger cost, no
+ * scheduler bookkeeping, no continued-store watermark. Only these move: the
+ * bank id stays (slot i -> bank i for the pool's life), `spilled` stays for
+ * the caller's spill-file/physical reconciliation right after, committed_pos
+ * stays (slot_frontier_pos reads 0 for an unprovisioned slot and provision
+ * zeroes it on reuse), and the protocol live bindings are the caller's to
+ * clear AFTER the snapshot store (their keying reads them). Returns the ctx
+ * the slot was admitted for, for the caller's log line. */
+static int evict_reset_slot_fields(session_slot *sl) {
+    const int evicted_ctx = sl->ctx_size;
+    sl->provisioned = false;
+    sl->gen = NULL;
+    sl->active_job = NULL;
+    sl->state = SLOT_EVICTED;
+    sl->ctx_size = 0;
+    sl->est_cost_bytes = 0;
+    sl->tokens_emitted = 0;
+    sl->prefill_counted = 0;
+    sl->last_serviced_us = 0;
+    sl->continued_last_store_tokens = 0;
+    return evicted_ctx;
+}
+
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     auto *s = this;
     /* plan-33: protect any bank that is a live fork SOURCE mid-clone from disk
@@ -1061,17 +1099,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     pulsar_session_invalidate(s->sess);
     pulsar_session_bank_state_save(s->sess, (uint32_t)sl->bank);
     freed = committed; /* logical release; no allocator delta to verify */
-    const int evicted_ctx = sl->ctx_size;
-    sl->provisioned = false;
-    sl->gen = NULL;
-    sl->active_job = NULL;
-    sl->state = SLOT_EVICTED;
-    sl->ctx_size = 0;
-    sl->est_cost_bytes = 0;
-    sl->tokens_emitted = 0;
-    sl->prefill_counted = 0;
-    sl->last_serviced_us = 0;
-    sl->continued_last_store_tokens = 0;
+    const int evicted_ctx = evict_reset_slot_fields(sl);
     /* Tier-2 2b: a slot being evicted for reuse must not carry a stale guard-spill
      * flag or leave an orphan spill file (invariant: physical freed IFF spilled).
      * server_bank_switch above restored a spilled victim (physical present, flag
@@ -2479,6 +2507,35 @@ session_slot *server::worker_find_fuse_prefill() {
  * gen_stream_begin), so this never reimplements that handoff. Reconciliation of
  * pf's bank is the exact recipe the decode lane uses (bank_state_restore +
  * note_committed_tokens). */
+
+/* LEVER 1 (L179 branch 10): how many of a fused step's runs get a head. On an
+ * INTERMEDIATE prefill sub-chunk (kthis > 0 rows that do not reach len this
+ * step) with decode banks to head (m > 0), only the m decode runs' logits are
+ * emitted -- the prefill run's intermediate logits are unused and the head
+ * takes the single-block identity path (no two-block resync, no wasted
+ * prefill head). On the FINAL sub-chunk (pos_now + kthis == len), a pure-decode
+ * step (kthis == 0) or a prefill-only step (m == 0) the cap is 0 = every run
+ * (the prefill head IS consumed). */
+static uint32_t mixed_head_cap(int kthis, int m, int pos_now, int len) {
+    return (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
+}
+
+/* The verdict on a fused step's rc (L179 branch 10). rc == 1 is the engine's
+ * RECOVERABLE reject (nothing committed); when the step folded prefill rows
+ * (kthis > 0) the reject is charged to the prefill run -- e.g. its bank's
+ * frontier is not position-true after a cache-warm resume -- and the prefill
+ * stops folding (no_fuse: classic from now on). The co-scheduled decode banks
+ * are not harmed: with m > 0 the step is RETRIED decode-only, with m == 0 the
+ * quantum STOPS (only the prefill was in it). rc == 0, a hard failure, and a
+ * recoverable reject on a pure-decode step (kthis == 0) all PROCEED to the
+ * caller's normal rc handling. */
+enum mixed_step_verdict { MIXED_PROCEED, MIXED_GIVEUP_RETRY_DECODE, MIXED_GIVEUP_STOP };
+
+static int mixed_prefill_giveup(int rc, int kthis, int m) {
+    if (rc != 1 || kthis <= 0) return MIXED_PROCEED;
+    return m > 0 ? MIXED_GIVEUP_RETRY_DECODE : MIXED_GIVEUP_STOP;
+}
+
 void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf) {
     auto *s = this;
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
@@ -2594,26 +2651,20 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 
         char err[96];
         uint32_t n_runs = 0;
-        /* LEVER 1: on an INTERMEDIATE prefill sub-chunk (prefill does not reach len
-         * this step, and there are decode banks to head), emit ONLY the decode banks'
-         * logits (max_head_runs = m) — the prefill run's intermediate logits are
-         * unused, and the head takes the single-block identity path (no two-block
-         * resync, no wasted prefill head). On the FINAL sub-chunk (pos_now+kthis==len)
-         * OR a pure-decode step, pass 0 = all runs (the prefill head IS consumed). */
-        const uint32_t head_cap =
-            (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
+        /* LEVER 1: the head cap is mixed_head_cap's (see it). */
+        const uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
         int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
                 (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
-        if (rc == 1 && kthis > 0) {
-            /* RECOVERABLE reject (nothing committed) caused by the PREFILL run — e.g.
-             * its bank's frontier is not position-true (a cache-warm resume). Do NOT
-             * harm the co-scheduled decode banks: stop folding this prefill (route it
-             * classic via no_fuse) and retry this step DECODE-ONLY. */
+        const int verdict = mixed_prefill_giveup(rc, kthis, m);
+        if (verdict != MIXED_PROCEED) {
+            /* RECOVERABLE reject charged to the PREFILL run (see
+             * mixed_prefill_giveup): stop folding this prefill (classic via
+             * no_fuse); the co-scheduled decode banks retry this step alone. */
             pf_giveup = true; pg->no_fuse = true;
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
                        "from now on; the %d decode bank(s) retry this step alone", err, m);
-            if (m > 0) {
+            if (verdict == MIXED_GIVEUP_RETRY_DECODE) {
                 rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
                         (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
             } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */

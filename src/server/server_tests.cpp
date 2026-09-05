@@ -6151,6 +6151,144 @@ static void test_l179_divergent_route_four_ways(void) {
     TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) != ROUTE_NOT_DIVERGENT);
 }
 
+/* L179 branch 5 -- choose_slot_for_job's warm-advance-in-place at a full pool
+ * (warm_inplace_eligible + warm_inplace_commit). Invariant: the src == dst
+ * partial cut is taken iff NO destination was provisioned AND the route is a
+ * PARTIAL cut AND the refusal was POOL_FULL; a full fork, a provisioned
+ * destination, or any other refusal never advances in place. The commit
+ * moves exactly two fields: committed_pos to the engine's resume position
+ * and the continued-store watermark to 0 (the cut moved the frontier
+ * backward; a stale watermark would refuse every continued checkpoint). */
+static void test_l179_warm_inplace_only_partial_at_full_pool(void) {
+    /* the one eligible shape */
+    TEST_ASSERT(warm_inplace_eligible(false, true, PROVISION_REFUSED_POOL_FULL));
+    /* a destination was provisioned: fork into it, never in place */
+    TEST_ASSERT(!warm_inplace_eligible(true, true, PROVISION_REFUSED_POOL_FULL));
+    TEST_ASSERT(!warm_inplace_eligible(true, true, PROVISION_OK));
+    /* a full fork has no cut: never in place, whatever the refusal */
+    TEST_ASSERT(!warm_inplace_eligible(false, false, PROVISION_REFUSED_POOL_FULL));
+    TEST_ASSERT(!warm_inplace_eligible(false, false, PROVISION_OK));
+    /* every other refusal is not a "pool full of live banks" verdict */
+    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_OK));
+    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_ADMISSION));
+    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_MEM_FLOOR));
+    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_CREATE_FAIL));
+
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    sl.provisioned = true;
+    sl.bank = 3;
+    sl.committed_pos = 165045;               /* the old frontier */
+    sl.continued_last_store_tokens = 160000; /* a watermark ABOVE the cut */
+    sl.state = SLOT_IDLE;
+    sl.ctx_size = 262144;
+    sl.est_cost_bytes = 7;
+    sl.tokens_emitted = 11;
+    sl.prefill_counted = 13;
+    sl.last_serviced_us = 17;
+    warm_inplace_commit(&sl, 164800);        /* the R-aligned cut of common 164812 */
+    TEST_ASSERT(sl.committed_pos == 164800);
+    TEST_ASSERT(sl.continued_last_store_tokens == 0);
+    /* nothing else on the slot moved */
+    TEST_ASSERT(sl.provisioned && sl.bank == 3 && sl.state == SLOT_IDLE);
+    TEST_ASSERT(sl.ctx_size == 262144 && sl.est_cost_bytes == 7 && sl.tokens_emitted == 11);
+    TEST_ASSERT(sl.prefill_counted == 13 && sl.last_serviced_us == 17);
+}
+
+/* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
+ * Invariant: the evicted slot is a reusable hole -- unprovisioned,
+ * SLOT_EVICTED, no gen, no job, ctx 0, ledger cost 0, no scheduler
+ * bookkeeping (tokens_emitted, prefill_counted, last_serviced_us), no
+ * continued-store watermark -- and the return value is the ctx it was
+ * admitted for (the log line's). The bank id and `spilled` are NOT the
+ * reset's to touch: slot i -> bank i is fixed, and the caller reconciles the
+ * spill file / physical against `spilled` right after. */
+static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    job fake_job;
+    gen_state fake_gen;
+    memset(&fake_job, 0, sizeof fake_job);
+    memset(&fake_gen, 0, sizeof fake_gen);
+    sl.provisioned = true;
+    sl.bank = 5;
+    sl.committed_pos = 4096;
+    sl.active_job = &fake_job;
+    sl.gen = &fake_gen;
+    sl.state = SLOT_DECODING;
+    sl.ctx_size = 131072;
+    sl.est_cost_bytes = 9ull << 30;
+    sl.tokens_emitted = 777;
+    sl.prefill_counted = 4000;
+    sl.last_serviced_us = 123456789ull;
+    sl.continued_last_store_tokens = 3072;
+    sl.spilled = true;
+    TEST_ASSERT(evict_reset_slot_fields(&sl) == 131072);
+    TEST_ASSERT(!sl.provisioned);
+    TEST_ASSERT(sl.gen == NULL);
+    TEST_ASSERT(sl.active_job == NULL);
+    TEST_ASSERT(sl.state == SLOT_EVICTED);
+    TEST_ASSERT(sl.ctx_size == 0);
+    TEST_ASSERT(sl.est_cost_bytes == 0);
+    TEST_ASSERT(sl.tokens_emitted == 0);
+    TEST_ASSERT(sl.prefill_counted == 0);
+    TEST_ASSERT(sl.last_serviced_us == 0);
+    TEST_ASSERT(sl.continued_last_store_tokens == 0);
+    /* the caller's facts survive the reset */
+    TEST_ASSERT(sl.bank == 5);
+    TEST_ASSERT(sl.spilled);
+    /* an already-empty slot resets to the same hole and reports ctx 0 */
+    session_slot empty;
+    memset(&empty, 0, sizeof empty);
+    empty.bank = 2;
+    TEST_ASSERT(evict_reset_slot_fields(&empty) == 0);
+    TEST_ASSERT(!empty.provisioned && empty.state == SLOT_EVICTED && empty.bank == 2);
+}
+
+/* L179 branch 10 -- the fused mixed quantum's head cap (mixed_head_cap).
+ * Invariant: the cap is m (decode runs only) iff the step folds prefill rows
+ * (kthis > 0) that do NOT reach len (pos_now + kthis < len) and there are
+ * decode banks to head (m > 0); the FINAL sub-chunk, a pure-decode step and a
+ * prefill-only step all pass 0 = every run, so the prefill head that IS
+ * consumed is never dropped. */
+static void test_l179_mixed_head_cap_drops_only_intermediate_prefill_head(void) {
+    /* 3 decoders + a 16-row sub-chunk from 100 of a 1000-token prompt: cap 3 */
+    TEST_ASSERT(mixed_head_cap(16, 3, 100, 1000) == 3u);
+    /* the same shape one row short of the end: still intermediate */
+    TEST_ASSERT(mixed_head_cap(16, 3, 983, 1000) == 3u);
+    /* the FINAL sub-chunk lands exactly on len: every run */
+    TEST_ASSERT(mixed_head_cap(16, 3, 984, 1000) == 0u);
+    /* a short final tail (kthis clipped to len - pos_now): every run */
+    TEST_ASSERT(mixed_head_cap(7, 3, 993, 1000) == 0u);
+    /* pure-decode step (the prefill gave up or is done): every run */
+    TEST_ASSERT(mixed_head_cap(0, 3, 100, 1000) == 0u);
+    /* prefill-only step (no decoder had a valid feed): every run */
+    TEST_ASSERT(mixed_head_cap(16, 0, 100, 1000) == 0u);
+    /* one decoder, one prefill row, deep inside the prompt: cap 1 */
+    TEST_ASSERT(mixed_head_cap(1, 1, 1, 1000) == 1u);
+}
+
+/* L179 branch 10 -- the fused step's give-up verdict (mixed_prefill_giveup).
+ * Invariant: only the engine's RECOVERABLE reject (rc == 1) on a step that
+ * folded prefill rows (kthis > 0) gives the prefill up; with decode banks in
+ * the step (m > 0) they RETRY decode-only, with none the quantum STOPS. A
+ * clean step, a hard failure (rc < 0 or any other nonzero), and a recoverable
+ * reject on a pure-decode step (nothing to charge the prefill with) all
+ * PROCEED to the caller's normal rc handling. */
+static void test_l179_mixed_giveup_only_on_recoverable_prefill_reject(void) {
+    TEST_ASSERT(mixed_prefill_giveup(0, 16, 3) == MIXED_PROCEED);
+    TEST_ASSERT(mixed_prefill_giveup(0, 0, 3) == MIXED_PROCEED);
+    TEST_ASSERT(mixed_prefill_giveup(-1, 16, 3) == MIXED_PROCEED);
+    TEST_ASSERT(mixed_prefill_giveup(2, 16, 3) == MIXED_PROCEED);
+    /* a recoverable reject with no prefill rows in the step is the decoders' */
+    TEST_ASSERT(mixed_prefill_giveup(1, 0, 3) == MIXED_PROCEED);
+    /* the prefill is charged: decoders retry alone */
+    TEST_ASSERT(mixed_prefill_giveup(1, 16, 3) == MIXED_GIVEUP_RETRY_DECODE);
+    TEST_ASSERT(mixed_prefill_giveup(1, 1, 1) == MIXED_GIVEUP_RETRY_DECODE);
+    /* the prefill was alone in the step: nothing to retry, stop */
+    TEST_ASSERT(mixed_prefill_giveup(1, 16, 0) == MIXED_GIVEUP_STOP);
+}
+
 
 
 static void pulsar_server_unit_tests_run(void) {
@@ -6297,6 +6435,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l179_divergent_route_four_ways();
+    test_l179_warm_inplace_only_partial_at_full_pool();
+    test_l179_evict_reset_leaves_a_reusable_hole();
+    test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
+    test_l179_mixed_giveup_only_on_recoverable_prefill_reject();
 }
 
 
