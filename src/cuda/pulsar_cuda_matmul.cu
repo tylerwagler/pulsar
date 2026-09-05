@@ -1,3 +1,4 @@
+#include <atomic>
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 
@@ -74,9 +75,13 @@ __global__ static void matmul_nt_kernel(
      * row (the 1 GB head at NT=16: 129280 rows x 128 KB = 16 GB of L2 traffic
      * per call, +0.5 ms per row in the L151 sweep).  With R rows per block the
      * per-token activation loads are issued once and applied to R weight rows.
-     * R is a per-shape constant (out_dim), never the batch; the per-(row,
-     * token) FMA sequence and the 256-wide tree reduction below are exactly
-     * the R=1 kernel's, so every output is bit-identical at every M. */
+     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 1 up to 4 rows, 2 up to 8,
+     * 4 above, capped by out_dim) -- that is allowed because R never changes
+     * a (row, token) accumulator's sequence: the per-(row, token) FMA
+     * sequence and the 256-wide tree reduction below are exactly the R=1
+     * kernel's, so every output is bit-identical at every M and every R.
+     * (This comment said "R is a per-shape constant, never the batch" until
+     * L191; the argument at nt_rows_per_block was the correct one.) */
     const uint64_t row0 = (uint64_t)blockIdx.x * R;
     if (row0 >= out_dim) return;
 
@@ -595,11 +600,45 @@ static std::unordered_map<uint64_t, fp8_mx_weight> g_fp8_mx_by_offset;
 static std::unordered_set<uint64_t> g_mxfp8_lt_offsets;
 
 /* Direct-mapped front cache for cuda_fp8_mx_weight (file-scope so backend
- * cleanup can invalidate it together with g_fp8_mx_by_offset). */
+ * cleanup can invalidate it together with g_fp8_mx_by_offset).
+ *
+ * L191: the tag and the pointer are one entry written in a fixed order --
+ * pointer first, then tag with release; readers load the tag with acquire and
+ * only then the pointer -- so a reader that matches the tag never pairs it
+ * with the previous entry's pointer.  The weight caches are process-global on
+ * purpose (one model, arena-owned device copies shared by every submitting
+ * thread, cleared at engine close), so they are NOT thread_local: a per-thread
+ * copy would resolve and convert every weight once per thread. */
 constexpr uint32_t FP8_FC = 2048u;
-static uint64_t g_fp8_fc_off[FP8_FC];  ///< zero-init; real offsets are never 0
-static const fp8_mx_weight *g_fp8_fc_ptr[FP8_FC];
+struct fp8_fc_entry {
+    std::atomic<uint64_t> tag;                  ///< 0 = empty; real offsets are never 0
+    std::atomic<const fp8_mx_weight *> ptr;
+};
+static fp8_fc_entry g_fp8_fc[FP8_FC];
 
+
+/* F32-source -> bf16 weight copies (f32_weight_bf16_resolve below), keyed by
+ * the full identity of the weight (L191).  Declared here so
+ * cuda_fp8_weight_cache_clear can clear them with the fp8 caches. */
+struct f32w_key {
+    const void *model_map;
+    uint64_t offset, in_dim, out_dim;
+    bool operator==(const f32w_key &o) const {
+        return model_map == o.model_map && offset == o.offset && in_dim == o.in_dim && out_dim == o.out_dim;
+    }
+};
+struct f32w_key_hash {
+    size_t operator()(const f32w_key &k) const {
+        uint64_t h = (uint64_t)(uintptr_t)k.model_map * 0x9E3779B97F4A7C15ull;
+        h ^= k.offset + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h ^= (k.in_dim << 32 | k.out_dim) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return (size_t)h;
+    }
+};
+static std::unordered_map<f32w_key, uint16_t *, f32w_key_hash> g_f32w_bf16;
+constexpr uint32_t F32W_FC = 8u;
+struct f32w_fc_entry { f32w_key key; const uint16_t *ptr; };
+static f32w_fc_entry g_f32w_fc[F32W_FC];
 
 /* lazily de-interleave + swizzle an MXFP8 weight into device buffers, cached by offset. */
 static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t offset, uint64_t weight_bytes,
@@ -610,17 +649,16 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
      * collision just falls through (benign), and the cached pointer is
      * re-validated (map references are stable across inserts). */
     constexpr uint32_t FC = FP8_FC;
-    uint64_t *fc_off = g_fp8_fc_off;
-    const fp8_mx_weight **fc_ptr = g_fp8_fc_ptr;
-    const uint32_t slot = (uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u));
-    if (offset != 0 && fc_off[slot] == offset) {
-        const fp8_mx_weight *p = fc_ptr[slot];
+    fp8_fc_entry *fc = &g_fp8_fc[(uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u))];
+    if (offset != 0 && fc->tag.load(std::memory_order_acquire) == offset) {
+        const fp8_mx_weight *p = fc->ptr.load(std::memory_order_relaxed);
         if (p && p->host_base == model_map && p->in_dim == in_dim && p->out_dim == out_dim) return p;
     }
     auto it = g_fp8_mx_by_offset.find(offset);
     if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
         it->second.in_dim == in_dim && it->second.out_dim == out_dim) {
-        fc_off[slot] = offset; fc_ptr[slot] = &it->second;
+        fc->ptr.store(&it->second, std::memory_order_relaxed);
+        fc->tag.store(offset, std::memory_order_release);
         return &it->second;
     }
     int KB = (int)(in_dim / 32), KBp = mx_rup(KB, 4);
@@ -641,7 +679,8 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
             fp8_mx_weight w = { model_map, offset, in_dim, out_dim, ltdata, ltscale };
             g_fp8_mx_by_offset[offset] = w;
             const fp8_mx_weight *wp = &g_fp8_mx_by_offset[offset];
-            fc_off[slot] = offset; fc_ptr[slot] = wp;
+            fc->ptr.store(wp, std::memory_order_relaxed);
+            fc->tag.store(offset, std::memory_order_release);
             (void)label;
             return wp;
         }
@@ -1830,11 +1869,18 @@ void pulsar_gpu_register_fp8_lt_weight(uint64_t weight_offset) { g_mxfp8_lt_offs
  * which the loader now refuses. */
 void cuda_fp8_weight_cache_clear(void) {
     g_fp8_mx_by_offset.clear();
-    memset(g_fp8_fc_off, 0, sizeof(g_fp8_fc_off));
-    memset(g_fp8_fc_ptr, 0, sizeof(g_fp8_fc_ptr));
+    for (uint32_t i = 0; i < FP8_FC; i++) {
+        g_fp8_fc[i].ptr.store(NULL, std::memory_order_relaxed);
+        g_fp8_fc[i].tag.store(0, std::memory_order_release);
+    }
     /* per-load registrations; the next engine open re-registers its own set */
     g_fp8_offsets.clear();
     g_mxfp8_lt_offsets.clear();
+    /* L191: the F32-source -> bf16 copies were never cleared -- a second engine
+     * open in one process served the first model's converted weights. */
+    for (auto &kv : g_f32w_bf16) (void)cudaFree(kv.second);
+    g_f32w_bf16.clear();
+    for (uint32_t i = 0; i < F32W_FC; i++) { g_f32w_fc[i].key = f32w_key{}; g_f32w_fc[i].ptr = NULL; }
 }
 
 
@@ -1870,7 +1916,12 @@ void cuda_fp8_weight_cache_clear(void) {
  * depth that moves whenever a prefill row leaves the tensor-core arm.
  * Set once at the lane's entry, restored on exit -- never on a per-token
  * path (pulsar_decode_rows_scope in the engine). */
-static int g_batch_decode_rows = 0;
+/* thread_local (L191): every dispatcher below reads this to choose the
+ * arithmetic arm; a second submitting thread setting its own lane's row count
+ * must not flip a concurrent decode onto the tensor-core arm.  The engine sets
+ * it on the lane's entry thread and dispatches from that thread
+ * (pulsar_decode_rows_scope). */
+static thread_local int g_batch_decode_rows = 0;
 int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
     /* Refuse, do not warn: decode rows past the cap would take a
      * batch-shape-dependent GEMM.  The engine static_asserts PULSAR_MSEQ_MAX
@@ -2340,21 +2391,24 @@ int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map,
  * Priced by the 2026-08-25 fusion survey: this family was 14.4% of decode
  * GPU time (verify-batch NT kernels) + 6.2% of prefill (SIMT sgemm).
  *
- * The copy is converted ONCE per weight (immutable, keyed by offset --
- * same pattern as g_fp8_mx_by_offset next door) and lives beside the mmap:
- * the full F32 family is ~130 MiB of f32, so ~65 MiB of bf16 copies. */
+ * The copy is converted ONCE per weight (immutable) and lives beside the mmap:
+ * the full F32 family is ~130 MiB of f32, so ~65 MiB of bf16 copies.
+ *
+ * L191: keyed by (model_map, offset, in_dim, out_dim), not offset alone -- the
+ * same offset in a second model, or the same bytes read at another shape, must
+ * not be served the first conversion -- and cleared with the other weight
+ * caches (cuda_fp8_weight_cache_clear), which it never was.  Process-global
+ * like g_fp8_mx_by_offset, for the same reason (see the note there). */
 static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
                                                uint64_t model_size,
                                                uint64_t offset,
                                                uint64_t in_dim, uint64_t out_dim) {
-    static std::unordered_map<uint64_t, uint16_t *> g_f32w_bf16;
-    static uint64_t fc_off[4] = {~0ull, ~0ull, ~0ull, ~0ull};
-    static const uint16_t *fc_ptr[4] = {};
-    const int slot = (int)(offset & 3u);
-    if (fc_off[slot] == offset) return fc_ptr[slot];
-    auto it = g_f32w_bf16.find(offset);
+    const f32w_key key{model_map, offset, in_dim, out_dim};
+    f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)(offset & (F32W_FC - 1u))];
+    if (fc->ptr && fc->key == key) return fc->ptr;
+    auto it = g_f32w_bf16.find(key);
     if (it != g_f32w_bf16.end()) {
-        fc_off[slot] = offset; fc_ptr[slot] = it->second;
+        fc->key = key; fc->ptr = it->second;
         return it->second;
     }
     const uint64_t n = in_dim * out_dim;
@@ -2372,9 +2426,9 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
         return NULL;
     }
     f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, src, n);
-    if (cudaGetLastError() != cudaSuccess) { (void)cudaFree(dst); return NULL; }
-    g_f32w_bf16[offset] = dst;
-    fc_off[slot] = offset; fc_ptr[slot] = dst;
+    if (!cuda_ok(cudaGetLastError(), "f32->bf16 weight convert launch")) { (void)cudaFree(dst); return NULL; }
+    g_f32w_bf16[key] = dst;
+    fc->key = key; fc->ptr = dst;
     static uint64_t total = 0;
     total += n * 2;
     static int announced = 0;
