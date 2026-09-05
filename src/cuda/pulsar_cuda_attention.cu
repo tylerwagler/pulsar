@@ -224,7 +224,11 @@ static int attention_decode_batch_launch(
         false) {
         return 0;
     }
-    if (n_comp != 0 && ratio == 0) return 0;
+    if (n_comp != 0 && ratio == 0) {
+        fprintf(stderr, "pulsar: decode attention: %u compressed rows with compression ratio 0 -- "
+                        "the visible compressed count is (pos+1)/ratio; refusing\n", n_comp);
+        return 0;
+    }
     const int32_t *positions_ptr = descr ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_id_ptr = descr ? (const int32_t *)seq_id->ptr : NULL;
     /* Per-bank comp base-pointer table (descriptor mode only; NULL → the kernel's
@@ -440,16 +444,17 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * id outside the row's visible prefix, and folds rows through an online
      * softmax that is correct for ANY permutation; but the fold is
      * order-dependent in floating point, so the ORDER of topk[] is part of the
-     * arithmetic (measured 2026-08-13: max |dlogit| 5.44 sorted vs unsorted).
-     * Multi-row batches sort by id so the fold order is a function of the SET
-     * selected, not of which n_comp-bucketed ranking kernel (1024 / pow2 /
-     * CUB) produced it.  One-row steps fold in ranking order: that is the
-     * order the B300 reference prefers (L167, 2026-09-04: sorting the one-row
-     * fold moved story depth 4102 8.4% further from the source), and the
-     * reference decides.  The two orders are a known 1-row-vs-N-row split,
-     * open as rows/L170.md; top_k != 512 is a shape the sort kernel does not
-     * take, so those ids fold in ranking order for every row count. */
-    if (n_tokens > 1u && top_k == 512u) {
+     * arithmetic.  Sort by id at EVERY row count (L170): the fold order is then
+     * a function of the SET selected, not of which n_comp-bucketed ranking
+     * kernel (1024 / pow2 / CUB) produced it and not of the batch width.  It
+     * used to sort only n_tokens > 1, and that was a live 1-row-vs-N-row split
+     * of the L161 class: at 2217 tokens of context (selection engaged) a 1-row
+     * decode step and a 2-row step differed on all 129280 logits (max |dlogit|
+     * 2.81); cuda-row-neutrality-gate-deep holds that shape.  The B300
+     * reference is indifferent (prefill never takes a one-row indexed step).
+     * top_k != 512 is a shape the sort kernel does not take; those ids fold in
+     * ranking order for every row count, one order still. */
+    if (top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;

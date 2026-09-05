@@ -250,6 +250,11 @@ int main(int argc, char **argv) {
         {"cuda-mixed-neutrality-gate-wide", gate_mixed_neutrality_gate_main, 13, "PULSAR_GATE_NDEC", "12", {NULL}},
         {"cuda-spec-sampling-gate",   gate_spec_sampling_gate_main,    16, NULL, NULL, {"0.95", "0", "1250", NULL}},
         {"cuda-row-neutrality-gate",  gate_mseq_short_ctx_probe_main,   2, NULL, NULL, {NULL}},
+        /* L170: the same probe past 2048 tokens, where the top-k selection is
+         * engaged and the indexed fold order is what 1-row and N-row steps
+         * must share (filler 1100 -> ~2217 tokens).  Mutation-validated: the
+         * n_tokens > 1 sort condition fails it on all 129280 logits. */
+        {"cuda-row-neutrality-gate-deep", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"1100", NULL}},
     };
     /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
     const gate_spec group_depth1[] = {
