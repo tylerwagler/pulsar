@@ -8,6 +8,7 @@
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
 #include "pulsar_think_scan.hpp"
+#include "pulsar_dsml.h"
 #include "linenoise.h"
 
 #include <errno.h>

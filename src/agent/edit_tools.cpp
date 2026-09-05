@@ -422,9 +422,87 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 
 
 
+/* L184: the agent's parser and detector recognise every syntax in the shared
+ * table (canonical, first-bar-omitted, plain XML), decode attribute values
+ * and string parameter values with the server's entity decoder, and still
+ * accept the lenient closing-tag variants. */
+static void test_agent_dsml_parser_recognises_every_syntax(void) {
+    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 3);
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        char text[1024];
+        snprintf(text, sizeof text,
+                 "%s\n%s name=\"a&amp;b\">\n%s name=\"command\" string=\"true\">ls &amp;&amp; pwd &lt;x%s\n"
+                 "%s name=\"timeout\" string=\"false\">10%s\n%s\n%s",
+                 syn->tool_calls_start, syn->invoke_start, syn->param_start, syn->param_end,
+                 syn->param_start, syn->param_end, syn->invoke_end, syn->tool_calls_end);
+
+        /* the parser, from SEARCH: every opener is found, every body tag parsed */
+        agent_dsml_parser p;
+        memset(&p, 0, sizeof p);
+        p.state = AGENT_DSML_SEARCH;
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+        AGENT_TEST_ASSERT(p.calls.len == 1);
+        if (p.calls.len == 1) {
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "a&b"));           /* attribute decoded */
+            const char *cmd = agent_tool_arg_value(&p.calls.v[0], "command");
+            AGENT_TEST_ASSERT(cmd && !strcmp(cmd, "ls && pwd <x"));         /* string value decoded */
+            const char *to = agent_tool_arg_value(&p.calls.v[0], "timeout");
+            AGENT_TEST_ASSERT(to && !strcmp(to, "10"));
+        }
+        agent_dsml_parser_free(&p);
+
+        /* the streaming detector: the tool_calls opener completes for every row */
+        bool complete = false, implicit = true;
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->tool_calls_start,
+                                                        strlen(syn->tool_calls_start),
+                                                        &complete, &implicit));
+        AGENT_TEST_ASSERT(complete && !implicit);
+        /* one byte short: held, not complete */
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->tool_calls_start,
+                                                        strlen(syn->tool_calls_start) - 1,
+                                                        &complete, &implicit));
+        AGENT_TEST_ASSERT(!complete);
+        /* a bare invoke opener starts a block only in the marker-bearing spellings */
+        const bool marker_bearing = strstr(syn->invoke_start, PULSAR_DSML_SHORT) != NULL;
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->invoke_start, strlen(syn->invoke_start),
+                                                        &complete, &implicit) == marker_bearing);
+        if (marker_bearing) AGENT_TEST_ASSERT(complete && implicit);
+
+        /* a streamed partial close of this row's parameter tag is recognised */
+        size_t part = strlen(syn->param_end) - 1;
+        AGENT_TEST_ASSERT(agent_dsml_parameter_close_tail(syn->param_end, part, &complete) && !complete);
+        AGENT_TEST_ASSERT(agent_dsml_parameter_close_tail(syn->param_end, part + 1, &complete) && complete);
+    }
+    /* the lenient close variants: whitespace and a stray bar before '>' */
+    agent_dsml_parser p;
+    memset(&p, 0, sizeof p);
+    agent_dsml_start(&p);
+    const char *body =
+        "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+        PULSAR_PARAM_START " name=\"command\" string=\"true\">pwd</" PULSAR_DSML "parameter ｜ >\n"
+        "</" PULSAR_DSML "invoke\n>\n" PULSAR_TOOL_CALLS_END;
+    agent_dsml_feed(&p, body, strlen(body));
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1 && !strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "pwd"));
+    agent_dsml_parser_free(&p);
+    /* a bare "</" in a value does not arm the argmax force; a marker does */
+    memset(&p, 0, sizeof p);
+    agent_dsml_start(&p);
+    const char *partial = "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                          PULSAR_PARAM_START " name=\"command\" string=\"true\">echo </";
+    agent_dsml_feed(&p, partial, strlen(partial));
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE && !p.param_close_prefix);
+    agent_dsml_feed(&p, PULSAR_DSML_SHORT, strlen(PULSAR_DSML_SHORT));   /* "</DSML｜" */
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE && p.param_close_prefix);
+    agent_dsml_parser_free(&p);
+}
+
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_dsml_parser_recognises_every_syntax();
 }
 
 

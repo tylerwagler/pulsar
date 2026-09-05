@@ -243,7 +243,7 @@ pulsar-bench: src/cli/pulsar_bench.o src/lib/pulsar_help.o $(CORE_OBJS)
 pulsar-eval: src/cli/pulsar_eval.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
-pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
+pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
@@ -1312,8 +1312,8 @@ tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pul
 pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
-pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
+pulsar_agent_test: tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_agent_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/lib/pulsar_dsml.o src/vendor/linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 # TP transport-core unit test (branch tensor_parallel, slice 1).  Host-only:
 # no CUDA, no sockets -- builds and runs with plain g++.  Pins the slab

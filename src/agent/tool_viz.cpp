@@ -638,30 +638,28 @@ static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
 
 
 
+/* Is `tail` (the bytes held since a '<') a prefix of -- or exactly -- an
+ * opener the detector accepts?  Every syntax's tool_calls opener counts.  A
+ * bare invoke opener also starts a block (the model often knows it wants a
+ * tool but forgets the outer wrapper), but only in the marker-bearing
+ * spellings: a plain "<invoke" is ordinary XML in prose. */
 static bool agent_stream_dsml_start_match(const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
-    static const char canonical[] = "<｜DSML｜tool_calls>";
-    static const char missing_bar[] = "<DSML｜tool_calls>";
-    static const char invoke[] = "<｜DSML｜invoke";
-    static const char invoke_missing_bar[] = "<DSML｜invoke";
-    struct {
-        const char *text;
-        bool implicit_invoke;
-    } forms[] = {
-        {canonical, false},
-        {missing_bar, false},
-        {invoke, true},
-        {invoke_missing_bar, true},
-    };
     *complete = false;
     *implicit_invoke = false;
-    for (size_t i = 0; i < sizeof(forms)/sizeof(forms[0]); i++) {
-        size_t form_len = strlen(forms[i].text);
-        if (len <= form_len && memcmp(forms[i].text, tail, len) == 0) {
-            *complete = len == form_len;
-            *implicit_invoke = forms[i].implicit_invoke;
-            return true;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        const bool marker_bearing = strstr(syn->invoke_start, PULSAR_DSML_SHORT) != NULL;
+        const char *forms[2] = {syn->tool_calls_start, marker_bearing ? syn->invoke_start : NULL};
+        for (size_t f = 0; f < 2; f++) {
+            if (!forms[f]) continue;
+            size_t form_len = strlen(forms[f]);
+            if (len <= form_len && memcmp(forms[f], tail, len) == 0) {
+                *complete = len == form_len;
+                *implicit_invoke = f == 1;
+                return true;
+            }
         }
     }
     return false;
@@ -690,10 +688,10 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
     }
     d->tail[d->len++] = c;
 
-    static const char fullwidth_marker[] = "｜DSML｜";
-    static const char ascii_marker[] = "|DSML|";
-    static const char missing_open[] = "<DSML｜";
-    static const char missing_close[] = "</DSML｜";
+    static const char fullwidth_marker[] = PULSAR_DSML;
+    static const char ascii_marker[] = "|DSML|";   /* an ASCII-bar typo, not a syntax */
+    static const char missing_open[] = "<" PULSAR_DSML_SHORT;
+    static const char missing_close[] = "</" PULSAR_DSML_SHORT;
     return agent_tail_matches(d->tail, d->len,
                               fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
            agent_tail_matches(d->tail, d->len,
@@ -731,8 +729,8 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
  * the DSML detector.  The detector must hold short prefixes because the model
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
-    static const char start[] = "<｜DSML｜tool_calls>";
-    static const char canonical_invoke[] = "<｜DSML｜invoke";
+    const char *start = PULSAR_DSML_CANONICAL->tool_calls_start;
+    const char *canonical_invoke = PULSAR_DSML_CANONICAL->invoke_start;
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     agent_stream_note_thinking_dsml_byte(sr, c);
 
@@ -764,7 +762,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * tool but forgets the outer wrapper. */
                 agent_stream_start_dsml(sr, sr->renderer->think.in_think);
                 if (implicit_invoke) {
-                    for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
+                    for (size_t i = 0; i < strlen(canonical_invoke); i++)
                         agent_stream_feed_dsml_byte(sr, canonical_invoke[i]);
                 }
             }
