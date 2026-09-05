@@ -141,12 +141,13 @@ int main(int argc, char **argv) {
         {"router (bf16)", L->ffn_gate_inp}, {"output head (bf16)", e->weights.output},
         {"attn_compressor_kv (plain)", comp_kv}, {"attn_compressor_gate (plain)", comp_gate},
         {"indexer_compressor_kv (plain)", icomp_kv},
+        {"hc_attn_fn (bf16, the HC mix)", L->hc_attn_fn},
     };
     const size_t n_shapes = prefill ? sizeof(shapes_all) / sizeof(shapes_all[0])
-                                    : sizeof(shapes_all) / sizeof(shapes_all[0]) - 3u;
+                                    : sizeof(shapes_all) / sizeof(shapes_all[0]) - 4u;
     shape_t *shapes = shapes_all;
     const uint32_t Ms_decode[] = {1, 2, 4, 5, 8, 9, 12, 16};
-    const uint32_t Ms_prefill[] = {6, 7, 2048, 4096, 4097};
+    const uint32_t Ms_prefill[] = {6, 7, 2048, 2049, 4091, 4096, 4097};
     const uint32_t *Ms = prefill ? Ms_prefill : Ms_decode;
     const int NM = prefill ? (int)(sizeof(Ms_prefill) / sizeof(Ms_prefill[0]))
                            : (int)(sizeof(Ms_decode) / sizeof(Ms_decode[0]));
