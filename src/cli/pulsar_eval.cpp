@@ -1,6 +1,7 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
 #include "pulsar_argparse.h"
+#include "pulsar_think_scan.hpp"
 
 /* pulsar-eval: small built-in benchmark integration test.
  *
@@ -1396,9 +1397,7 @@ typedef struct {
 
     byte_buf stream;        ///< generated text of the active case
     style_buf styles;       ///< per-byte style codes for `stream`
-    bool in_think;          ///< the generation is inside a reasoning block
-    char pending_tag[16];   ///< partial `<think>`/`</think>` tag split across tokens
-    size_t pending_tag_len; ///< bytes held in pending_tag
+    pulsar_think_scanner think; ///< <think> tag state: in_think styles `stream`, held tag prefix
 } eval_ui;
 
 static eval_ui *global_ui;
@@ -2059,8 +2058,8 @@ static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     ui->stream.len = 0;
     if (ui->stream.v) ui->stream.v[0] = '\0';
     ui->styles.len = 0;
-    ui->in_think = in_think;
-    ui->pending_tag_len = 0;
+    ui->think = {};
+    ui->think.in_think = in_think;
     ui->generated = 0;
     ui->prefill_current = 0;
     ui->prefill_total = 0;
@@ -2074,63 +2073,34 @@ static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     tui_draw_question_preview(ui, tc);
 }
 
-static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
-}
-
-static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
-
 static void stream_append_visible(eval_ui *ui, const char *p, size_t n) {
     buf_append(&ui->stream, p, n);
-    style_append(&ui->styles, ui->in_think ? 1 : 0, n);
+    style_append(&ui->styles, ui->think.in_think ? 1 : 0, n);
 }
 
-static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, bool finish) {
-    const char *open = "<think>";
-    const char *close = "</think>";
-    size_t total = ui->pending_tag_len + len;
-    char *tmp = (char *)malloc(total ? total : 1);
-    if (!tmp) {
-        fprintf(stderr, "pulsar-eval: out of memory\n");
-        exit(1);
+/** The eval TUI's sink for pulsar_think_scan: bytes land in `stream` with a
+ * per-byte style, the reply starts on the line after </think>. */
+struct eval_think_sink {
+    eval_ui *ui;    ///< the TUI whose stream buffer receives the bytes
+    /** No DSML lane here: tags are always prose markers. */
+    bool tags_enabled() const { return true; }
+    /** Nothing to do at <think>: the next byte takes the thinking style. */
+    void think_open_tag() {}
+    /** Nothing to undo at </think>: styles are per byte. */
+    void think_close_tag() {}
+    /** Whether the stream buffer is empty or ends in '\n'. */
+    bool at_line_start() const {
+        return ui->stream.len == 0 || ui->stream.v[ui->stream.len - 1] == '\n';
     }
-    if (ui->pending_tag_len) memcpy(tmp, ui->pending_tag, ui->pending_tag_len);
-    if (len) memcpy(tmp + ui->pending_tag_len, text, len);
-    ui->pending_tag_len = 0;
+    /** Newline in the reply style. */
+    void newline() { stream_append_visible(ui, "\n", 1); }
+    /** One byte in the current style. */
+    void text(char c) { stream_append_visible(ui, &c, 1); }
+};
 
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = tmp + i;
-        size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, open)) {
-            ui->in_think = true;
-            i += strlen(open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, close)) {
-            ui->in_think = false;
-            stream_append_visible(ui, "\n", 1);
-            i += strlen(close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, open) ||
-             bytes_is_partial_prefix(cur, rem, close)))
-        {
-            if (rem < sizeof(ui->pending_tag)) {
-                memcpy(ui->pending_tag, cur, rem);
-                ui->pending_tag_len = rem;
-            }
-            break;
-        }
-        stream_append_visible(ui, cur, 1);
-        i++;
-    }
-    free(tmp);
+static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, bool finish) {
+    eval_think_sink sink = { ui };
+    pulsar_think_scan(&ui->think, text, len, finish, 0, sink);
 }
 
 /** A line located in a buffer, as byte offsets. */
@@ -3782,7 +3752,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
-            double paused_sec = tui_wait_if_paused(ui, ui->in_think ? "thinking" : "answer");
+            double paused_sec = tui_wait_if_paused(ui, ui->think.in_think ? "thinking" : "answer");
             if (paused_sec > 0.0) {
                 ui->phase_start_sec += paused_sec;
                 t0 += paused_sec;
@@ -3893,7 +3863,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
 
         if (tty) {
             stream_append_token_text(ui, text, len, false);
-            tui_refresh(ui, ui->in_think ? "thinking" : "answer");
+            tui_refresh(ui, ui->think.in_think ? "thinking" : "answer");
         } else {
             if (plain_in_think && strstr(raw.v ? raw.v : "", "</think>")) {
                 plain_in_think = false;

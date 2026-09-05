@@ -12,20 +12,6 @@
  * streaming detector so the actual tool parser stays small and predictable.
  */
 
-bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
-}
-
-
-
-bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
-
-
-
 static void agent_tool_call_free(agent_tool_call *c) {
     if (!c) return;
     free(c->name);

@@ -436,7 +436,6 @@ static void agent_history_render_assistant(agent_worker *w,
     agent_token_renderer renderer = {
         .engine = w->engine,
         .worker = w,
-        .format_thinking = true,
         /* History replay should look like the original live output: the user is
          * switching back to a session, not reading a different transcript
          * format.  Tool calls are still dry-rendered below, so replay never

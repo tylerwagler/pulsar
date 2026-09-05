@@ -186,9 +186,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_token_renderer renderer = {
             .engine = w->engine,
             .worker = w,
-            .format_thinking = pulsar_think_mode_enabled(think_mode),
             .format_markdown = use_color,
-            .in_think = pulsar_think_mode_enabled(think_mode),
+            .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
             .use_color = use_color,
             .last_output_newline = true,
         };
@@ -196,7 +195,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_stream_renderer stream = {
             .renderer = &renderer,
             .parser = &dsml,
-            .in_think = pulsar_think_mode_enabled(think_mode),
         };
         agent_edit_upto_forcer upto_forcer = {0};
         bool got_tool = false;

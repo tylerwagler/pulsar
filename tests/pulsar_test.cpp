@@ -19,6 +19,8 @@
 #include "../src/server/cli_main.cpp"
 #include "../src/server/server_tests.cpp"
 #include "../src/lib/pulsar_utf8.h"
+#include "../src/lib/pulsar_think_scan.hpp"
+#include <ctype.h>
 /* engine internals: the sampler byte-exactness gate builds distributions
  * directly and pins them against a copy of the pre-radix implementation. */
 #include "../src/engine/pulsar_engine_internal.h"
@@ -2636,6 +2638,121 @@ static void test_lib_utf8(void) {
     TEST_ASSERT(utf8_seq_ok(f4_high, 4) == 0);
 }
 
+/* src/lib/pulsar_think_scan.hpp is the ONE <think> tag scanner behind the CLI,
+ * the eval TUI and the agent (L187).  A recording sink: thinking bytes come
+ * back upper-cased, the tag events as [O] / [C] markers.  Like the real sinks
+ * (whose close hook writes only an SGR reset) the markers do not count as
+ * output for the line-start question; text and newlines do. */
+struct test_think_sink {
+    const pulsar_think_scanner *s;
+    char out[256];
+    size_t len;
+    bool tags;
+    bool wrote_any;   ///< a text byte or newline has been written
+    char last;        ///< the last text byte or newline written
+    void put(char c) {
+        if (len + 1 < sizeof(out)) out[len++] = c;
+        out[len] = '\0';
+    }
+    void emit(char c) {
+        put(c);
+        wrote_any = true;
+        last = c;
+    }
+    void put_marker(const char *p) { while (*p) put(*p++); }
+    bool tags_enabled() const { return tags; }
+    void think_open_tag() { put_marker("[O]"); }
+    void think_close_tag() { put_marker("[C]"); }
+    bool at_line_start() const { return !wrote_any || last == '\n'; }
+    void newline() { emit('\n'); }
+    void text(char c) { emit(s->in_think ? (char)toupper((unsigned char)c) : c); }
+};
+
+static void test_think_feed(pulsar_think_scanner *s, test_think_sink *k, int blank,
+                            const char *const *pieces, bool finish) {
+    for (; *pieces; pieces++) pulsar_think_scan(s, *pieces, strlen(*pieces), false, blank, *k);
+    if (finish) pulsar_think_scan(s, NULL, 0, true, blank, *k);
+}
+
+static void test_lib_think_scan(void) {
+    static const char *const split[] = {"<thi", "nk>hi", " there</th", "ink>yo", NULL};
+    {   /* tags split across token pieces; blank_lines 0 = the CLI's spacing */
+        pulsar_think_scanner s = {};
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = true;
+        test_think_feed(&s, &k, 0, split, true);
+        TEST_ASSERT(!strcmp(k.out, "[O]HI THERE[C]\nyo"));
+        TEST_ASSERT(!s.in_think && s.pending_len == 0);
+    }
+    {   /* blank_lines 1 = the agent's: a blank line between reasoning and reply */
+        pulsar_think_scanner s = {};
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = true;
+        test_think_feed(&s, &k, 1, split, true);
+        TEST_ASSERT(!strcmp(k.out, "[O]HI THERE[C]\n\nyo"));
+    }
+    {   /* already at a line start when </think> lands: no doubled newline */
+        static const char *const at_ls[] = {"<think>x\n</think>y", NULL};
+        pulsar_think_scanner s0 = {}, s1 = {};
+        test_think_sink k0 = {}, k1 = {};
+        k0.s = &s0;
+        k0.tags = true;
+        k1.s = &s1;
+        k1.tags = true;
+        test_think_feed(&s0, &k0, 0, at_ls, true);
+        test_think_feed(&s1, &k1, 1, at_ls, true);
+        TEST_ASSERT(!strcmp(k0.out, "[O]X\n[C]y"));
+        TEST_ASSERT(!strcmp(k1.out, "[O]X\n[C]\ny"));
+    }
+    {   /* a '<' that cannot become a tag is prose; a prefix that still could
+         * is held until the next piece decides, and released as prose at finish */
+        static const char *const prose[] = {"a<b", "c<th", NULL};
+        pulsar_think_scanner s = {};
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = true;
+        test_think_feed(&s, &k, 0, prose, false);
+        TEST_ASSERT(!strcmp(k.out, "a<bc"));
+        TEST_ASSERT(s.pending_len == 3 && !memcmp(s.pending, "<th", 3));
+        pulsar_think_scan(&s, NULL, 0, true, 0, k);
+        TEST_ASSERT(!strcmp(k.out, "a<bc<th"));
+        TEST_ASSERT(s.pending_len == 0);
+    }
+    {   /* a held prefix completes into a tag with the next piece */
+        static const char *const held[] = {"a<", "/think>b", NULL};
+        pulsar_think_scanner s = {};
+        s.in_think = true;
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = true;
+        test_think_feed(&s, &k, 0, held, true);
+        TEST_ASSERT(!strcmp(k.out, "A[C]\nb"));
+    }
+    {   /* tags disabled (the agent inside a DSML block): tag bytes are text */
+        static const char *const raw[] = {"<think>", NULL};
+        pulsar_think_scanner s = {};
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = false;
+        test_think_feed(&s, &k, 0, raw, true);
+        TEST_ASSERT(!strcmp(k.out, "<think>"));
+        TEST_ASSERT(!s.in_think);
+    }
+    {   /* generation that starts inside thinking (the assistant prefix already
+         * emitted <think>): the scanner is seeded with in_think */
+        static const char *const seeded[] = {"hm</think>ok", NULL};
+        pulsar_think_scanner s = {};
+        s.in_think = true;
+        test_think_sink k = {};
+        k.s = &s;
+        k.tags = true;
+        test_think_feed(&s, &k, 0, seeded, true);
+        TEST_ASSERT(!strcmp(k.out, "HM[C]\nok"));
+    }
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
@@ -2670,6 +2787,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
+    {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

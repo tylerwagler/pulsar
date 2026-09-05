@@ -2,6 +2,7 @@
 #include "pulsar_help.h"
 #include "pulsar_argparse.h"
 #include "pulsar_utf8.h"
+#include "pulsar_think_scan.hpp"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -206,23 +207,11 @@ typedef struct {
     pulsar_engine *engine;      ///< for detokenising
     FILE *fp;                   ///< output sink
     bool format_thinking;       ///< style reasoning blocks distinctly
-    bool in_think;              ///< currently inside a reasoning block
+    pulsar_think_scanner think; ///< <think> tag state: in_think styles text, held tag prefix
     bool color_open;            ///< an SGR sequence is open and must be closed
     bool use_color;             ///< the sink accepts ANSI colour
     bool last_output_newline;   ///< last byte written was '\n'
-    char pending[16];           ///< bytes withheld while a tag may be forming
-    size_t pending_len;         ///< bytes held in `pending`
 } token_printer;
-
-static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
-}
-
-static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
 
 static void token_printer_set_grey(token_printer *p) {
     if (p->use_color && !p->color_open) {
@@ -239,55 +228,32 @@ static void token_printer_reset_color(token_printer *p) {
 }
 
 static void token_printer_write_char(token_printer *p, char c) {
-    if (p->in_think) token_printer_set_grey(p);
+    if (p->think.in_think) token_printer_set_grey(p);
     fputc((unsigned char)c, p->fp);
     p->last_output_newline = c == '\n';
 }
 
+/** The CLI's sink for pulsar_think_scan: grey thinking text, the reply starts
+ * on the line after </think> (no blank line). */
+struct token_printer_think_sink {
+    token_printer *p;   ///< the printer being driven
+    /** The CLI has no DSML lane: tags are always prose markers. */
+    bool tags_enabled() const { return true; }
+    /** Nothing to do at <think>: the next text byte turns grey. */
+    void think_open_tag() {}
+    /** Close the grey SGR run. */
+    void think_close_tag() { token_printer_reset_color(p); }
+    /** Whether the last byte printed was '\n'. */
+    bool at_line_start() const { return p->last_output_newline; }
+    /** Raw newline. */
+    void newline() { token_printer_write_char(p, '\n'); }
+    /** One byte of prose or thinking text. */
+    void text(char c) { token_printer_write_char(p, c); }
+};
+
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = p->pending_len + len;
-    char *buf = (char *)malloc(total ? total : 1);
-    if (!buf) return;
-    if (p->pending_len) memcpy(buf, p->pending, p->pending_len);
-    if (len) memcpy(buf + p->pending_len, text, len);
-    p->pending_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = buf + i;
-        const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
-            p->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, think_close)) {
-            p->in_think = false;
-            token_printer_reset_color(p);
-            if (!p->last_output_newline) {
-                fputc('\n', p->fp);
-                p->last_output_newline = true;
-            }
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(p->pending)) {
-                memcpy(p->pending, cur, rem);
-                p->pending_len = rem;
-            }
-            break;
-        }
-        token_printer_write_char(p, cur[0]);
-        i++;
-    }
-
-    free(buf);
+    token_printer_think_sink sink = { p };
+    pulsar_think_scan(&p->think, text, len, finish, 0, sink);
 }
 
 static void token_printer_finish(token_printer *p) {
@@ -348,7 +314,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
         .engine = engine,
         .fp = stdout,
         .format_thinking = pulsar_think_mode_enabled(think_mode),
-        .in_think = pulsar_think_mode_enabled(think_mode),
+        .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
@@ -1082,7 +1048,7 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
             .engine = engine,
             .fp = stdout,
             .format_thinking = pulsar_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .in_think = pulsar_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+            .think = {.in_think = pulsar_think_mode_enabled(cli_effective_think_mode(&cfg->gen))},
             .use_color = isatty(fileno(stdout)) != 0,
             .last_output_newline = true,
         };
@@ -1276,7 +1242,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         .engine = engine,
         .fp = stdout,
         .format_thinking = pulsar_think_mode_enabled(think_mode),
-        .in_think = pulsar_think_mode_enabled(think_mode),
+        .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };

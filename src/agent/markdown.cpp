@@ -93,7 +93,7 @@ void renderer_reset_color(agent_token_renderer *r) {
 
 
 static bool renderer_has_text_attrs(agent_token_renderer *r) {
-    return r->in_think || r->md_bold || r->md_italic ||
+    return r->think.in_think || r->md_bold || r->md_italic ||
            r->md_inline_code || r->md_code_block;
 }
 
@@ -101,7 +101,7 @@ static bool renderer_has_text_attrs(agent_token_renderer *r) {
 
 static void renderer_set_text_attrs(agent_token_renderer *r) {
     if (!r->use_color) return;
-    if (r->in_think) {
+    if (r->think.in_think) {
         renderer_set_grey(r);
         return;
     }
@@ -1146,7 +1146,7 @@ static void renderer_markdown_finish(agent_token_renderer *r) {
 
 
 void renderer_write_char(agent_token_renderer *r, char c) {
-    if (!r->format_markdown || r->in_think) {
+    if (!r->format_markdown || r->think.in_think) {
         renderer_markdown_emit_pending_literals(r);
         renderer_write_char_raw(r, c);
         return;
@@ -1156,58 +1156,7 @@ void renderer_write_char(agent_token_renderer *r, char c) {
 
 
 
-/* Render assistant text while hiding <think> tags and dimming thinking text.
- * The function is also responsible for not prematurely emitting a partial
- * control tag split across model tokens. */
-static void renderer_process(agent_token_renderer *r, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = r->pending_len + len;
-    char *buf = (char *)agent_xmalloc(total ? total : 1);
-    if (r->pending_len) memcpy(buf, r->pending, r->pending_len);
-    if (len) memcpy(buf + r->pending_len, text, len);
-    r->pending_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = buf + i;
-        size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
-            r->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, think_close)) {
-            r->in_think = false;
-            renderer_reset_color(r);
-            if (!r->last_output_newline) renderer_write(r, "\n", 1);
-            renderer_write(r, "\n", 1);
-            r->last_output_newline = true;
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(r->pending)) {
-                memcpy(r->pending, cur, rem);
-                r->pending_len = rem;
-            }
-            break;
-        }
-        renderer_write_char(r, cur[0]);
-        i++;
-    }
-    free(buf);
-}
-
-
-
 void renderer_finish(agent_token_renderer *r) {
-    if (r->format_thinking) {
-        renderer_process(r, NULL, 0, true);
-    }
     renderer_markdown_finish(r);
     renderer_flush_utf8(r);
     renderer_reset_color(r);

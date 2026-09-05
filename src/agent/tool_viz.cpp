@@ -708,7 +708,7 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
 
 static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
                                                  char c) {
-    if (!sr->in_think || sr->dsml_in_think) return;
+    if (!sr->renderer->think.in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->think_dsml, c))
         sr->dsml_in_think = true;
 }
@@ -718,7 +718,7 @@ static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
 static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
                                               char c) {
     if (sr->parser->state == AGENT_DSML_ERROR) return;
-    if (sr->dsml_active || sr->in_think || sr->dsml_in_think) return;
+    if (sr->dsml_active || sr->renderer->think.in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->plain_dsml, c)) {
         agent_stream_malformed_dsml(
             sr, "DSML markup outside a valid tool_calls block");
@@ -762,7 +762,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
-                agent_stream_start_dsml(sr, sr->in_think);
+                agent_stream_start_dsml(sr, sr->renderer->think.in_think);
                 if (implicit_invoke) {
                     for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
                         agent_stream_feed_dsml_byte(sr, canonical_invoke[i]);
@@ -804,15 +804,36 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
  * parser continue building executable calls, and paints semantic tool output
  * from parser state changes.  The sampled transcript remains unchanged: only
  * the terminal projection is rewritten. */
-void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = sr->pending_len + len;
-    char *buf = (char *)agent_xmalloc(total ? total : 1);
-    if (sr->pending_len) memcpy(buf, sr->pending, sr->pending_len);
-    if (len) memcpy(buf + sr->pending_len, text, len);
-    sr->pending_len = 0;
+/** The agent's sink for pulsar_think_scan: tags are prose only outside a DSML
+ * block; a held DSML start tail flushes before the reasoning state flips; the
+ * blank line owed after </think> is swallowed by agent_stream_normal_byte
+ * while post_think_gap is set. */
+struct agent_stream_think_sink {
+    agent_stream_renderer *sr;  ///< the stream being projected
+    /** DSML bytes are not prose: no tag recognition while a block is parsed. */
+    bool tags_enabled() const { return !sr->dsml_active; }
+    /** <think> consumed: release a held marker tail in the pre-think state. */
+    void think_open_tag() { agent_stream_flush_start_tail(sr); }
+    /** </think> consumed: release the tail, drop the dim style, arm the gap. */
+    void think_close_tag() {
+        agent_stream_flush_start_tail(sr);
+        renderer_reset_color(sr->renderer);
+        sr->post_think_gap = true;
+    }
+    /** Whether the renderer's last byte was a newline. */
+    bool at_line_start() const { return sr->renderer->last_output_newline; }
+    /** Raw newline, outside markdown (renderer_write tracks last_output_newline). */
+    void newline() { renderer_write(sr->renderer, "\n", 1); }
+    /** One byte: into the DSML parser while a block is open, else the normal
+     * route -- thinking bytes included, so an accidental in-think tool stanza
+     * is suppressed cleanly instead of shown raw or, worse, executed. */
+    void text(char c) {
+        if (sr->dsml_active) agent_stream_feed_dsml_byte(sr, c);
+        else agent_stream_normal_byte(sr, c);
+    }
+};
 
+void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
     /* The UI may reset terminal attributes while redrawing the editable prompt
      * between generated chunks.  If a DSML parameter is still streaming, make
      * each new token fragment self-contained by restoring the active parameter
@@ -821,56 +842,8 @@ void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, 
     if (len) agent_tool_viz_restore_param_color(sr);
     if (len && !sr->dsml_active) renderer_restore_text_attrs(sr->renderer);
 
-    size_t i = 0;
-    while (i < total) {
-        char *cur = buf + i;
-        size_t rem = total - i;
-        if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_open)) {
-            agent_stream_flush_start_tail(sr);
-            sr->post_think_gap = false;
-            sr->in_think = true;
-            sr->renderer->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_close)) {
-            agent_stream_flush_start_tail(sr);
-            sr->in_think = false;
-            sr->renderer->in_think = false;
-            renderer_reset_color(sr->renderer);
-            if (!sr->renderer->last_output_newline)
-                renderer_write(sr->renderer, "\n", 1);
-            renderer_write(sr->renderer, "\n", 1);
-            sr->renderer->last_output_newline = true;
-            sr->post_think_gap = true;
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && !sr->dsml_active && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(sr->pending)) {
-                memcpy(sr->pending, cur, rem);
-                sr->pending_len = rem;
-            }
-            break;
-        }
-
-        if (sr->dsml_active) {
-            agent_stream_feed_dsml_byte(sr, cur[0]);
-        } else if (sr->in_think) {
-            /* Tool calls are executable only after thinking has closed.  Still
-             * route thinking bytes through the DSML start detector so an
-             * accidental in-think tool stanza can be suppressed cleanly instead
-             * of being shown as raw markup or, worse, executed. */
-            agent_stream_normal_byte(sr, cur[0]);
-        } else {
-            agent_stream_normal_byte(sr, cur[0]);
-        }
-        i++;
-    }
-    free(buf);
+    agent_stream_think_sink sink = { sr };
+    pulsar_think_scan(&sr->renderer->think, text, len, finish, 1, sink);
 
     if (finish) {
         agent_stream_flush_start_tail(sr);

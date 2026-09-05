@@ -7,6 +7,7 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
+#include "pulsar_think_scan.hpp"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -316,9 +317,11 @@ typedef struct agent_syntax agent_syntax;
 typedef struct {
     pulsar_engine *engine;      ///< engine handle, for detokenising
     agent_worker *worker;       ///< owning worker (output routing, capture)
-    bool format_thinking;       ///< style reasoning blocks distinctly
     bool format_markdown;       ///< apply markdown styling at all
-    bool in_think;              ///< currently inside a reasoning block
+    /** <think> tag state, fed by agent_stream_text: `think.in_think` selects the
+     * dimmed reasoning style, `think.pending` holds a tag prefix split across
+     * tokens. */
+    pulsar_think_scanner think;
     bool color_open;            ///< an SGR colour sequence is open and must be closed
     bool use_color;             ///< the sink accepts ANSI colour
     bool last_output_newline;   ///< last byte written was '\n' (drives spacing decisions)
@@ -354,8 +357,6 @@ typedef struct {
     size_t md_code_line_len;            ///< bytes used
     size_t md_code_line_cap;            ///< bytes allocated
 
-    char pending[16];                   ///< bytes withheld pending a formatting decision
-    size_t pending_len;                 ///< bytes used in `pending`
     char utf8_pending[4];               ///< partial UTF-8 sequence split across tokens
     size_t utf8_pending_len;            ///< continuation bytes received so far
     size_t utf8_pending_need;           ///< total bytes this sequence requires
@@ -503,7 +504,6 @@ typedef struct {
     agent_dsml_parser *parser;       ///< tool-call parser fed the same bytes
     agent_tool_visualizer viz;       ///< live tool-call display
 
-    bool in_think;                   ///< inside the reasoning region
     bool dsml_active;                ///< a DSML block is being parsed
     /** The active DSML block was opened INSIDE the thinking region. It is
      * still displayed, but it is not a real tool call -- the model is
@@ -513,8 +513,6 @@ typedef struct {
      * cursor-control escapes, which must never leak into a pipe or a file. */
     bool replay;
 
-    char pending[16];                ///< bytes withheld pending a routing decision
-    size_t pending_len;              ///< bytes held in `pending`
     /** Bytes of a POSSIBLE opening marker held back from display. A lone '<'
      * is too common in prose to act on; past the second byte the held prefix is
      * specifically DSML-shaped, and sampling is forced to argmax. */
@@ -876,8 +874,6 @@ void agent_trace_tokens(agent_worker *w, const char *label,
                                const pulsar_tokens *tokens, int start);
 void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
-bool bytes_has_prefix(const char *p, size_t n, const char *prefix);
-bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix);
 const char *agent_tool_arg_value(const agent_tool_call *call, const char *name);
 void agent_dsml_parser_free(agent_dsml_parser *p);
 void agent_dsml_parser_reset(agent_dsml_parser *p);
