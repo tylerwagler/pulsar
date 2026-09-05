@@ -35,6 +35,7 @@ int fb_emit_plane(const pulsar_gpu_tensor *x, int M, int K, void *xb);
  * neutral arm for the plain-weight family; heuristic per M like the engine's
  * shape cache.  Same return codes as ft_run. */
 struct lt_ctx *lt_prepare(const uint16_t *host_w_bf16, int N, int K, int m_max);
+int lt_emit_plane(struct lt_ctx *c, const pulsar_gpu_tensor *x, int M);   /* once per shape, before lt_run */
 int lt_run(struct lt_ctx *c, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
 void lt_release(struct lt_ctx *c);
 void fb_release(struct fb_ctx *c);

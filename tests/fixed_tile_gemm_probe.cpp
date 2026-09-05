@@ -214,6 +214,9 @@ int main(int argc, char **argv) {
             if (prefill) {
                 c.lt = lt_prepare(wb, N, K, (int)MMAX);
                 if (!c.lt) { fprintf(stderr, "lt_prepare failed for %s\n", shapes[si].name); return 1; }
+                if (lt_emit_plane(c.lt, c.x, (int)MMAX) != 0 || ft_sync() != 0) {
+                    fprintf(stderr, "lt plane emit failed for %s\n", shapes[si].name); return 1;
+                }
             }
             wbytes = (double)K * (double)N * 2.0;
             printf("%s  K=%d N=%d  (%.1f MB bf16%s)\n", shapes[si].name, K, N, wbytes / 1e6, is_f32 ? " copy of F32" : "");

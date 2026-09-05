@@ -394,12 +394,19 @@ extern "C" lt_ctx *lt_prepare(const uint16_t *host_w_bf16, int N, int K, int m_m
     return c;
 }
 
+/* The plane is emitted ONCE per shape (the engine's arm reads a plane a producer
+ * emitted earlier; converting inside the timed call charged the arm ~16M
+ * floats of conversion at 4096 rows -- half its measured time). */
+extern "C" int lt_emit_plane(lt_ctx *c, const pulsar_gpu_tensor *x, int M) {
+    if (!c || !x || M < 1 || M > c->m_max || x->bytes < (uint64_t)M * c->K * sizeof(float)) return 4;
+    const uint64_t n = (uint64_t)M * c->K;
+    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, (const float *)x->ptr, n);
+    return cudaGetLastError() == cudaSuccess ? 0 : 10;
+}
+
 extern "C" int lt_run(lt_ctx *c, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
     if (!c || !x || !D || M < 1 || M > c->m_max) return 4;
     if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
-    const uint64_t n = (uint64_t)M * c->K;
-    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, (const float *)x->ptr, n);
-    if (cudaGetLastError() != cudaSuccess) return 10;
     cublasLtMatrixLayout_t lb, ld;
     if (cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, c->K, M, c->K) != CUBLAS_STATUS_SUCCESS) return 6;
     if (cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, c->N, M, c->N) != CUBLAS_STATUS_SUCCESS) { cublasLtMatrixLayoutDestroy(lb); return 6; }
