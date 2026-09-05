@@ -5821,6 +5821,336 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
     TEST_ASSERT(server_pick_decode_lane(0, false, dec, 4, 0) == 1);
 }
 
+/* Geometric survival for one bank: np pendings at per-position confidence c,
+ * surv[j] = c^(j+1) -- the cumprod spec_alloc_rows' caller derives from the
+ * drafter carry. */
+static void l179_fill_surv(float surv[][16], uint32_t *npend, int i, uint32_t np, float c) {
+    float p = 1.0f;
+    npend[i] = np;
+    for (uint32_t j = 0; j < np; j++) {
+        p *= c;
+        surv[i][j] = p;
+    }
+}
+
+/* L179 branch 1 -- the L117 cross-bank K allocator (spec_alloc_rows).
+ * Invariants: (a) ISOLATION -- while base rows + every pending fit
+ * PULSAR_SPEC_ROW_BUDGET the allocator returns 0 and admits every bank whole
+ * (k_alloc[i] == npend[i]) at ANY threshold, so a stale partner carry can
+ * never shape this bank's round; (b) OVERFLOW -- it returns 1, each bank
+ * gets a prefix (k_alloc[i] <= npend[i]), the base rows plus the admitted
+ * rows spend the budget exactly, and the admitted set is the global best:
+ * no admitted candidate scores below any unadmitted one; (c) the COST-TABLE
+ * cut -- once the best remaining candidate is below thr admission stops,
+ * *thr_cut_rows counts what it left, and the budget may go unspent. */
+static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
+    const int B = (int)PULSAR_SPEC_ROW_BUDGET;
+    float surv[PULSAR_SESSION_POOL_CAP][16];
+    uint32_t npend[PULSAR_SESSION_POOL_CAP];
+    int k_alloc[PULSAR_SESSION_POOL_CAP];
+    int cut = -1;
+    memset(surv, 0, sizeof surv);
+    memset(npend, 0, sizeof npend);
+    const float thr_fallback = 6.0f / 45.0f;   /* spec_ms_per_tok_ema unset */
+    const float thr_live = 6.0f / 30.0f;       /* a live EMA of 30 ms/tok */
+
+    /* (a) demand 3 + 12 = 15 < 16, one bank with hopeless confidence, a
+     * fourth bank not decoding (npend 0): everything admitted, no cut. */
+    l179_fill_surv(surv, npend, 0, 4, 0.95f);
+    l179_fill_surv(surv, npend, 1, 5, 0.01f);
+    l179_fill_surv(surv, npend, 2, 3, 0.80f);
+    npend[3] = 0;
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_live, k_alloc, &cut) == 0);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
+    TEST_ASSERT(cut == 0);
+    /* demand exactly the budget (3 + 13 = 16) still fits */
+    l179_fill_surv(surv, npend, 1, 6, 0.01f);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, 0.99f, k_alloc, &cut) == 0);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
+    TEST_ASSERT(cut == 0);
+
+    /* (b) demand 3 + 17 = 20 > 16 with every survival above thr: ranked. The
+     * 13 rows go to the 13 highest survivals: bank 0 (0.95^k) all 6,
+     * bank 1 (0.9^k) 5, bank 2 (0.8^k) 2. */
+    l179_fill_surv(surv, npend, 0, 6, 0.95f);
+    l179_fill_surv(surv, npend, 1, 6, 0.90f);
+    l179_fill_surv(surv, npend, 2, 5, 0.80f);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_fallback, k_alloc, &cut) == 1);
+    TEST_ASSERT(cut == 0);
+    int admitted = 0;
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(k_alloc[i] >= 0 && k_alloc[i] <= (int)npend[i]);
+        admitted += k_alloc[i];
+    }
+    TEST_ASSERT(3 + admitted == B);
+    TEST_ASSERT(k_alloc[0] == 6 && k_alloc[1] == 5 && k_alloc[2] == 2 && k_alloc[3] == 0);
+    /* global best: the weakest admitted row beats the strongest unadmitted */
+    float min_admitted = 2.0f, max_unadmitted = -1.0f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < k_alloc[i]; j++)
+            if (surv[i][j] < min_admitted) min_admitted = surv[i][j];
+        if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > max_unadmitted)
+            max_unadmitted = surv[i][k_alloc[i]];
+    }
+    TEST_ASSERT(min_admitted >= max_unadmitted);
+
+    /* (c) thr above every survival: nothing admitted, all 17 rows cut */
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, 0.99f, k_alloc, &cut) == 1);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 0);
+    TEST_ASSERT(cut == 17);
+    /* partial cut at the live threshold: demand 3 + 15 = 18 > 16, budget 13,
+     * but only 5 + 5 + 2 rows survive above 0.2 (bank 2 at 0.5^k: 0.5, 0.25,
+     * then 0.125) -- the cut fires with budget left, bank 2's other 3 rows
+     * are the cut count, and the budget goes unspent. */
+    l179_fill_surv(surv, npend, 0, 5, 0.95f);
+    l179_fill_surv(surv, npend, 1, 5, 0.90f);
+    l179_fill_surv(surv, npend, 2, 5, 0.50f);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, thr_live, k_alloc, &cut) == 1);
+    TEST_ASSERT(k_alloc[0] == 5 && k_alloc[1] == 5 && k_alloc[2] == 2 && k_alloc[3] == 0);
+    TEST_ASSERT(cut == 3);
+    TEST_ASSERT(3 + 12 < B);
+}
+
+/* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
+ * three batched lanes (lane_should_abandon). Invariant: a slot is abandoned
+ * iff its gen state is GEN_DECODE, its client fd reports a hang-up
+ * (gen_client_disconnected), and -- when the lane requires it (plain, mixed)
+ * -- batch_feed_valid is set; the spec lane passes require=false. A live
+ * peer never abandons in any phase; GEN_PREFILL_MAIN / GEN_FINISH never do;
+ * a NULL gen or a negative fd never does. */
+static void test_l179_lane_abandon_needs_decode_and_hangup(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    static const gen_phase phases[] = {GEN_DECODE, GEN_PREFILL_MAIN, GEN_FINISH};
+    /* live peer: never, whatever the phase / flags */
+    for (size_t pi = 0; pi < sizeof phases / sizeof phases[0]; pi++)
+    for (int require = 0; require < 2; require++)
+    for (int valid = 0; valid < 2; valid++) {
+        g.phase = phases[pi];
+        g.batch_feed_valid = valid != 0;
+        TEST_ASSERT(!lane_should_abandon(&g, require != 0, sv[0]));
+    }
+    /* peer hangs up */
+    close(sv[1]);
+    for (size_t pi = 0; pi < sizeof phases / sizeof phases[0]; pi++)
+    for (int require = 0; require < 2; require++)
+    for (int valid = 0; valid < 2; valid++) {
+        g.phase = phases[pi];
+        g.batch_feed_valid = valid != 0;
+        const bool want = phases[pi] == GEN_DECODE && (!require || valid);
+        TEST_ASSERT(lane_should_abandon(&g, require != 0, sv[0]) == want);
+    }
+    /* the spec lane (require=false) abandons a dead decoder with no feed;
+     * the plain/mixed lanes (require=true) do not */
+    g.phase = GEN_DECODE;
+    g.batch_feed_valid = false;
+    TEST_ASSERT(lane_should_abandon(&g, false, sv[0]));
+    TEST_ASSERT(!lane_should_abandon(&g, true, sv[0]));
+    /* no gen state / no fd: never */
+    TEST_ASSERT(!lane_should_abandon(NULL, false, sv[0]));
+    TEST_ASSERT(!lane_should_abandon(&g, false, -1));
+    close(sv[0]);
+}
+
+/* L179 branch 6 (i) -- fork_make_room's LRU-superseded victim scan
+ * (superseded_pick_core). Invariant: slot a is picked only if it is
+ * eligible, unprotected, has history (hist_len > 0) and some OTHER slot k is
+ * STRICTLY longer (frontier[k] > hist_len[a]) with a's whole history as its
+ * prefix (common[a][k] >= hist_len[a]); among such slots the smallest
+ * last_us wins (first index on a tie); a plain-LRU idle slot that nothing
+ * supersedes is never picked over a superseded one; no supersession is -1. */
+static void test_l179_superseded_pick_prefers_redundant_history(void) {
+    enum { N = 4 };
+    bool protect[N] = {false, false, false, false};
+    bool eligible[N] = {true, true, true, true};
+    int hist_len[N] = {100, 300, 50, 0};
+    int frontier[N] = {100, 300, 50, 0};
+    uint64_t last_us[N] = {10, 20, 5, 1};   /* slot 2 is the LRU with history */
+    int rows[N][N];
+    const int *common[N];
+    for (int i = 0; i < N; i++) {
+        common[i] = rows[i];
+        for (int k = 0; k < N; k++) rows[i][k] = -1;
+    }
+    /* slot 1's history extends slot 0's whole 100 tokens; slot 2 shares only
+     * 30 with either: the superseded slot 0 is picked over the LRU slot 2 */
+    rows[0][1] = 100;
+    rows[2][0] = 30;
+    rows[2][1] = 30;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
+    TEST_ASSERT(superseded_pick_core(N, NULL, eligible, hist_len, frontier, common, last_us) == 0);
+    /* protected or ineligible: never picked, and nothing else qualifies */
+    protect[0] = true;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    protect[0] = false;
+    eligible[0] = false;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    eligible[0] = true;
+    /* the superseder's own eligibility is irrelevant -- only its frontier */
+    eligible[1] = false;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
+    eligible[1] = true;
+    /* two superseded slots: LRU wins (slot 2 at 5 us over slot 0 at 10 us) */
+    rows[2][0] = 50;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 2);
+    rows[2][0] = 30;
+    /* strictly longer: a superseder at EXACTLY a's length does not count */
+    frontier[1] = 100;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    frontier[1] = 300;
+    /* a's whole history must be the prefix: 99 of 100 is not */
+    rows[0][1] = 99;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    rows[0][1] = 100;
+    /* an empty bank is plain LRU's business even though common >= 0 holds */
+    rows[3][1] = 0;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
+    /* no supersession anywhere: -1 */
+    rows[0][1] = -1;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    /* a slot never supersedes itself (the diagonal is skipped) */
+    rows[0][0] = 100;
+    frontier[0] = 200;
+    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+}
+
+/* L179 branch 6 (ii) -- the eviction overlay's usability rule
+ * (warm_match_usable, worker_protect_queued_warm_matches). Invariant: a
+ * queued job's best match protects its bank iff best_common >=
+ * warm_partial_min AND (best_common == frontier -- a full fork, no ring probe
+ * -- OR the partial cut is ring-feasible, feasible_rc == PULSAR_FORK_OK). A
+ * ring-scrolled or otherwise infeasible cut is dead warmth and stays
+ * evictable; below the minimum nothing is protected. */
+static void test_l179_warm_match_usable_rule(void) {
+    const int min = 64;
+    /* partial cut at / above the minimum, ring feasible: usable */
+    TEST_ASSERT(warm_match_usable(min, min, 500, PULSAR_FORK_OK));
+    TEST_ASSERT(warm_match_usable(200, min, 500, PULSAR_FORK_OK));
+    /* below the minimum: not, even when feasible */
+    TEST_ASSERT(!warm_match_usable(min - 1, min, 500, PULSAR_FORK_OK));
+    TEST_ASSERT(!warm_match_usable(0, min, 500, PULSAR_FORK_OK));
+    /* ring-scrolled (or any other refusal): dead warmth */
+    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_RING_SCROLLED));
+    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_EVICTED));
+    TEST_ASSERT(!warm_match_usable(200, min, 500, PULSAR_FORK_SHALLOW));
+    /* full fork at the frontier: usable regardless of the probe value */
+    TEST_ASSERT(warm_match_usable(500, min, 500, PULSAR_FORK_OK));
+    TEST_ASSERT(warm_match_usable(500, min, 500, PULSAR_FORK_RING_SCROLLED));
+    /* ...but a full match below the minimum is still not */
+    TEST_ASSERT(!warm_match_usable(min - 1, min, min - 1, PULSAR_FORK_OK));
+}
+
+/* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
+ * pulsar_session_bank_fork_pinned reads false, bank_touched_kv_bytes 0).
+ * Invariant: bank 0 is never a victim; nothing in the live decode set is;
+ * unprovisioned, spilled and bound slots are skipped; among the rest the
+ * smallest last_serviced_us wins (touched-bytes tie-break, then first
+ * index); no candidate is -1. */
+static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    s.n_slots = 5;
+    static const uint64_t us[5] = {1, 40, 30, 20, 10};   /* bank 0 the oldest */
+    for (int i = 0; i < 5; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].last_serviced_us = us[i];
+    }
+    session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
+    /* bank 0 (LRU) is pinned, 3 and 4 are live: LRU of {1, 2} is 2 */
+    TEST_ASSERT(s.guard_pick_victim(dec, 2) == 2);
+    /* only 2 live: LRU of {1, 3, 4} is 4 */
+    dec[0] = &s.slots[2];
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 4);
+    /* a spilled bank is skipped: {1, 3} -> 3 */
+    s.slots[4].spilled = true;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 3);
+    /* an unprovisioned one too: {1} -> 1 */
+    s.slots[3].provisioned = false;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == 1);
+    /* a bound one too: nothing left -> -1 */
+    s.slots[1].active_job = (struct job *)&s;
+    TEST_ASSERT(s.guard_pick_victim(dec, 1) == -1);
+    /* with no decode set slot 2 is idle again and is the only candidate;
+     * bank 0 (still the oldest) is still never picked */
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 2);
+    s.slots[1].active_job = NULL;
+    /* tie on last_serviced_us across 1, 2, 3 (touched is 0 for every bank
+     * here): first index */
+    s.slots[3].provisioned = true;
+    s.slots[2].last_serviced_us = us[1];
+    s.slots[3].last_serviced_us = us[1];
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 1);
+    /* a one-slot pool has no victim */
+    s.n_slots = 1;
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == -1);
+}
+
+/* L179 branch 7 (ii) -- guard_maybe_evict's control law (guard_spill_plan).
+ * Invariant: 0 spills when touched + delta fits the bound; otherwise the
+ * MINIMUM number of LRU victims whose touched bytes bring the projection
+ * back under the bound (finding 2: never the whole idle set); with the
+ * victims exhausted and the breach still standing it returns n_victims --
+ * every spill it can do -- and with no victim at all 0, both of which the
+ * caller follows with back-pressure. A drop larger than the running total
+ * saturates at zero. */
+static void test_l179_guard_spill_plan_is_minimum(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    const uint64_t drops[3] = {GiB, GiB, GiB};
+    /* fits (exactly at the bound): no spill */
+    TEST_ASSERT(guard_spill_plan(10 * GiB, GiB, 11 * GiB, drops, 3) == 0);
+    /* breach by one byte, three victims available: exactly one spill */
+    TEST_ASSERT(guard_spill_plan(10 * GiB + 1, GiB, 11 * GiB, drops, 3) == 1);
+    /* breach that one victim cannot clear: two */
+    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, drops, 3) == 2);
+    /* breach with no victim: nothing to spill (caller back-pressures) */
+    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, NULL, 0) == 0);
+    /* victims exhausted while still breaching: all three (caller back-pressures) */
+    TEST_ASSERT(guard_spill_plan(20 * GiB, GiB, 11 * GiB, drops, 3) == 3);
+    /* a hollow victim (nothing resident) does not clear the breach by itself */
+    const uint64_t hollow[2] = {0, GiB};
+    TEST_ASSERT(guard_spill_plan(10 * GiB + 1, GiB, 11 * GiB, hollow, 2) == 2);
+    /* a drop above the running total saturates instead of wrapping */
+    const uint64_t huge[1] = {100 * GiB};
+    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, huge, 1) == 1);
+    /* growth alone can breach an empty pool: nothing resident to drop, so
+     * every victim is "spilled" to no effect and the caller back-pressures */
+    TEST_ASSERT(guard_spill_plan(0, 2 * GiB, GiB, drops, 3) == 3);
+}
+
+/* L179 branch 3 -- choose_slot_for_job's cross-wire divergent route
+ * (divergent_route_decision). Invariant: no best, or best_common >=
+ * frontier (a linear continuation), is NOT_DIVERGENT; a divergent match
+ * (best_common < frontier) routes to a FRESH bank when one was provisioned,
+ * else QUEUEs while any job is active (its finish frees a bank, and there is
+ * a live reader to protect), else continues IN_PLACE (no bank will ever
+ * free and nothing live can be corrupted -- the deadlock-avoidance
+ * fallthrough). */
+static void test_l179_divergent_route_four_ways(void) {
+    /* linear continuation / past the frontier: not divergent, whatever else */
+    TEST_ASSERT(divergent_route_decision(true, 500, 500, false, true) == ROUTE_NOT_DIVERGENT);
+    TEST_ASSERT(divergent_route_decision(true, 500, 500, true, false) == ROUTE_NOT_DIVERGENT);
+    TEST_ASSERT(divergent_route_decision(true, 600, 500, true, true) == ROUTE_NOT_DIVERGENT);
+    /* no best: not divergent even with a would-be divergent geometry */
+    TEST_ASSERT(divergent_route_decision(false, 0, 0, true, true) == ROUTE_NOT_DIVERGENT);
+    TEST_ASSERT(divergent_route_decision(false, 5, 500, false, true) == ROUTE_NOT_DIVERGENT);
+    /* divergent with a fresh bank: FRESH, active or not */
+    TEST_ASSERT(divergent_route_decision(true, 7, 500, true, true) == ROUTE_FRESH);
+    TEST_ASSERT(divergent_route_decision(true, 7, 500, true, false) == ROUTE_FRESH);
+    /* divergent, pool full, a live job: QUEUE */
+    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, true) == ROUTE_QUEUE);
+    TEST_ASSERT(divergent_route_decision(true, 499, 500, false, true) == ROUTE_QUEUE);
+    /* divergent, pool full, nothing running: IN_PLACE */
+    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) == ROUTE_IN_PLACE);
+    TEST_ASSERT(divergent_route_decision(true, 0, 1, false, false) == ROUTE_IN_PLACE);
+    /* the caller's first probe (no fresh, no active) is a divergence test:
+     * it must never read NOT_DIVERGENT for a divergent match */
+    TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) != ROUTE_NOT_DIVERGENT);
+}
+
 
 
 static void pulsar_server_unit_tests_run(void) {
@@ -5960,6 +6290,13 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_bank_floor_exempts_first_bank();
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
+    test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
+    test_l179_lane_abandon_needs_decode_and_hangup();
+    test_l179_superseded_pick_prefers_redundant_history();
+    test_l179_warm_match_usable_rule();
+    test_l179_guard_victim_skips_pinned_live_spilled();
+    test_l179_guard_spill_plan_is_minimum();
+    test_l179_divergent_route_four_ways();
 }
 
 

@@ -382,6 +382,38 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 
 
 
+/* CROSS-WIRE ROOT FIX (L179 branch 3): the router's divergent-match verdict.
+ * In-place continuation is safe ONLY for a linear extension of THIS bank's
+ * own conversation (best_common == frontier). When best_common < frontier the
+ * bank holds a DIFFERENT conversation past the shared prefix (typically just
+ * the system-prompt header); continuing in place REWINDS-and-clobbers it. On
+ * the shared pool session that conversation is often still live under
+ * concurrency, so the two interleave and a request decodes another's KV (the
+ * cross-wire). Deep divergent matches (best_common >= warm_partial_min)
+ * already FORKED and never reach here.
+ *   NOT_DIVERGENT : no best, or best_common >= frontier -- the caller
+ *                   continues on best as before.
+ *   FRESH         : divergent and a fresh bank was provisioned (the shared
+ *                   prefix is cheap and prefix-cached): route there.
+ *   QUEUE         : divergent, no fresh bank, and some job is active: queue
+ *                   rather than clobber -- the active job frees a bank as it
+ *                   finishes AND there is a live conversation worth protecting.
+ *   IN_PLACE      : divergent, no fresh bank, NOTHING active: no bank will
+ *                   ever free (idle banks may all be protected), so queuing
+ *                   would LIVE-LOCK the worker -- and with no live reader there
+ *                   is nothing to corrupt -- so continue in place (progress
+ *                   over warmth). The corruption only ever happened while a
+ *                   concurrent conversation was live.
+ * The side effects (provisioning, the log line, *refusal) stay in the caller. */
+enum divergent_route { ROUTE_NOT_DIVERGENT, ROUTE_FRESH, ROUTE_QUEUE, ROUTE_IN_PLACE };
+
+static int divergent_route_decision(bool have_best, int best_common, int frontier,
+                                    bool provisioned_fresh, bool any_active) {
+    if (!have_best || best_common >= frontier) return ROUTE_NOT_DIVERGENT;
+    if (provisioned_fresh) return ROUTE_FRESH;
+    return any_active ? ROUTE_QUEUE : ROUTE_IN_PLACE;
+}
+
 /* Route the job to a slot. Preferences, in order:
  *   1. A live-tool-state continuation binds to the slot that owns its call
  *      ids (waiting for it if busy — running it elsewhere could only 409).
@@ -705,42 +737,31 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                    "pulsar-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
                    full ? "full" : "partial", best->bank, best_common);
     }
-    /* CROSS-WIRE ROOT FIX: in-place continuation is safe ONLY for a linear
-     * extension of THIS bank's own conversation (best_common == frontier). When
-     * best_common < frontier the bank holds a DIFFERENT conversation past the
-     * shared prefix (typically just the system-prompt header); continuing in place
-     * REWINDS-and-clobbers it. On the shared pool session that conversation is
-     * often still live under concurrency, so the two interleave and a request
-     * decodes another's KV (the cross-wire). Provision a FRESH bank instead (the
-     * shared prefix is cheap and prefix-cached); queue if the pool is full so a
-     * non-active bank can be evicted. Deep divergent matches (best_common >=
-     * warm_partial_min) already FORKED above and never reach here. */
-    if (best && best_common < frontier) {
+    /* CROSS-WIRE ROOT FIX: the verdict is divergent_route_decision's (see it
+     * for the four routes); the provisioning, the log line and *refusal are
+     * this caller's. */
+    if (divergent_route_decision(best != NULL, best_common, frontier, false, false)
+            != ROUTE_NOT_DIVERGENT) {
         session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
-        if (fresh) {
+        bool any_active = false;
+        for (int i = 0; i < s->n_slots; i++)
+            if (s->slots[i].active_job) { any_active = true; break; }
+        switch (divergent_route_decision(best != NULL, best_common, frontier, fresh != NULL,
+                                         any_active)) {
+        case ROUTE_FRESH:
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: divergent match bank %u (common %d < frontier %d): "
                        "fresh bank %u, no in-place clobber",
                        best->bank, best_common, frontier, fresh->bank);
             *clobbers = false;
             return fresh;
-        }
-        /* Provision failed (pool full). Queue to avoid an in-place clobber ONLY
-         * when an active job is running: then the queue drains as it finishes AND
-         * there is a live conversation on the pool worth protecting. When NOTHING
-         * is running, no bank will ever free (idle banks may all be protected), so
-         * queuing would LIVE-LOCK the worker — and with no live reader there is
-         * nothing to corrupt — so fall through to in-place continuation (progress
-         * over warmth). This is the safe half of the cross-wire guard: the
-         * corruption only ever happened while a concurrent conversation was live. */
-        bool any_active = false;
-        for (int i = 0; i < s->n_slots; i++)
-            if (s->slots[i].active_job) { any_active = true; break; }
-        if (any_active) {
+        case ROUTE_QUEUE:
             if (*refusal == PROVISION_OK) *refusal = PROVISION_REFUSED_POOL_FULL;
             return NULL;   /* an active job will free a bank; worker retries */
+        case ROUTE_IN_PLACE:
+        case ROUTE_NOT_DIVERGENT:
+            break;         /* in place: no live reader; a queue would deadlock */
         }
-        /* else: fall through to in-place (no live reader; queue would deadlock) */
     }
     *clobbers = best_clobbers_warm_state;
     return best;
@@ -886,6 +907,20 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
  * in its stead. Best-effort by contract: callers retry without this overlay
  * when it leaves no victim, so binding always progresses. Worker thread only
  * (slot_common_prefix reads engine host carries). */
+
+/* The overlay's usability rule (L179 branch 6): a queued job's best match
+ * protects its bank iff best_common >= warm_partial_min AND it is either a
+ * full fork (best_common == frontier) or a partial cut the raw ring can still
+ * replay (feasible_rc == PULSAR_FORK_OK). A ring-scrolled cut is dead warmth
+ * and stays evictable; best_common == prompt.len (bank holds the whole
+ * prompt) rides the partial predicate too -- conservative, never protects
+ * dead warmth. */
+static bool warm_match_usable(int best_common, int warm_partial_min, int frontier,
+                              int feasible_rc) {
+    if (best_common < warm_partial_min) return false;
+    return best_common == frontier || feasible_rc == PULSAR_FORK_OK;
+}
+
 void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL_CAP]) {
     auto *s = this;
     if (s->pool_banks <= 0) return;
@@ -905,16 +940,17 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
             const int common = s->slot_common_prefix(sl, &q->req.prompt);
             if (common > best_common) { best_common = common; best_i = k; }
         }
-        if (best_i < 0 || best_common < s->warm_partial_min) continue;
+        if (best_i < 0) continue;
         const session_slot *sl = &s->slots[best_i];
         const int frontier = s->slot_frontier_pos(sl);
-        /* Usable = a full fork (exact frontier) or a ring-feasible partial cut.
-         * best_common == prompt.len (bank contains the whole prompt) rides the
-         * partial predicate too: conservative, never protects dead warmth. */
-        const bool usable = best_common == frontier ||
-            pulsar_session_bank_fork_partial_feasible(s->sess, sl->bank,
-                                                   best_common) == PULSAR_FORK_OK;
-        if (usable) protect[best_i] = true;
+        /* The ring probe is only consulted for a PARTIAL cut at/above the
+         * minimum; a full fork or a below-minimum match needs none. */
+        const bool probe = best_common >= s->warm_partial_min && best_common != frontier;
+        const int feasible_rc = probe
+            ? pulsar_session_bank_fork_partial_feasible(s->sess, sl->bank, best_common)
+            : PULSAR_FORK_OK;
+        if (warm_match_usable(best_common, s->warm_partial_min, frontier, feasible_rc))
+            protect[best_i] = true;
     }
 }
 
@@ -1077,36 +1113,64 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
  * least. Returns such a slot's index (the least-recently-served among them), or
  * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
  * host-carry reads routing already uses on idle banks; no CUDA, no install). */
+/* The supersession scan itself (L179 branch 6), over injected per-slot facts:
+ * a is a CANDIDATE iff eligible[a] (provisioned, idle, not fork-pinned -- the
+ * caller's engine reads), not protected, and hist_len[a] > 0 (an empty bank
+ * is plain LRU's business). Slot k SUPERSEDES a iff frontier[k] > hist_len[a]
+ * (k is strictly longer; an unprovisioned k has frontier 0) AND common[a][k]
+ * >= hist_len[a] (a's whole history is k's prefix). Among superseded
+ * candidates the least-recently-served (smallest last_us, first index on a
+ * tie) wins; -1 when none is superseded. common[a] may be NULL for a
+ * non-candidate row and common[a][k] is only read once frontier[k] >
+ * hist_len[a] holds (the caller fills it under the same test). */
+static int superseded_pick_core(int n_slots, const bool *protect, const bool *eligible,
+                                const int *hist_len, const int *frontier,
+                                const int *const *common, const uint64_t *last_us) {
+    int victim = -1;
+    for (int i = 0; i < n_slots; i++) {
+        if (!eligible[i] || (protect && protect[i]) || hist_len[i] <= 0) continue;
+        bool superseded = false;
+        for (int k = 0; k < n_slots && !superseded; k++) {
+            if (k == i) continue;
+            if (frontier[k] > hist_len[i] && common[i][k] >= hist_len[i]) superseded = true;
+        }
+        if (!superseded) continue;
+        if (victim < 0 || last_us[i] < last_us[victim]) victim = i;
+    }
+    return victim;
+}
+
 int server::pick_superseded_idle(const bool *protect) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     if (!pool) return -1;
-    int victim = -1;
+    bool eligible[PULSAR_SESSION_POOL_CAP];
+    int hist_len[PULSAR_SESSION_POOL_CAP];
+    int frontier[PULSAR_SESSION_POOL_CAP];
+    uint64_t last_us[PULSAR_SESSION_POOL_CAP];
+    const pulsar_tokens *hist[PULSAR_SESSION_POOL_CAP];
+    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+    const int *common[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->n_slots; i++) {
-        session_slot *a = &s->slots[i];
-        if (!a->provisioned || a->active_job || (protect && protect[i])) continue;
-        if (pulsar_session_bank_fork_pinned(pool, a->bank)) continue;
-        const pulsar_tokens *at = pulsar_session_bank_tokens(pool, a->bank);
-        if (!at || at->len == 0) continue;              /* empty: LRU handles it */
-        bool superseded = false;
-        for (int k = 0; k < s->n_slots && !superseded; k++) {
-            if (k == i) continue;
-            session_slot *b = &s->slots[k];
-            if (!b->provisioned) continue;
-            /* b supersedes a iff a's whole history is b's prefix AND b is strictly
-             * longer (b can reconstruct everything a holds). */
-            if (s->slot_frontier_pos(b) > at->len &&
-                pulsar_session_bank_common_prefix(pool, b->bank, at) >= at->len) {
-                superseded = true;
-            }
-        }
-        if (!superseded) continue;
-        if (victim < 0 ||
-            a->last_serviced_us < s->slots[victim].last_serviced_us) {
-            victim = i;
-        }
+        const session_slot *a = &s->slots[i];
+        eligible[i] = a->provisioned && !a->active_job &&
+                      !pulsar_session_bank_fork_pinned(pool, a->bank);
+        hist[i] = eligible[i] ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
+        hist_len[i] = hist[i] ? hist[i]->len : 0;
+        frontier[i] = s->slot_frontier_pos(a);      /* 0 when unprovisioned */
+        last_us[i] = a->last_serviced_us;
+        common[i] = common_rows[i];
     }
-    return victim;
+    /* Host-carry prefix reads (the same reads routing does on idle banks; no
+     * CUDA), only where the core will look: candidate rows, strictly-longer
+     * columns. */
+    for (int i = 0; i < s->n_slots; i++) {
+        if (!eligible[i] || (protect && protect[i]) || hist_len[i] <= 0) continue;
+        for (int k = 0; k < s->n_slots; k++)
+            common_rows[i][k] = (k != i && frontier[k] > hist_len[i])
+                ? pulsar_session_bank_common_prefix(pool, s->slots[k].bank, hist[i]) : -1;
+    }
+    return superseded_pick_core(s->n_slots, protect, eligible, hist_len, frontier, common, last_us);
 }
 
 /* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
@@ -1626,6 +1690,43 @@ int server::guard_pick_victim(session_slot **dec, int n) {
     return best;
 }
 
+/* The guard's control law (L179 branch 7): how many spills a projected breach
+ * needs. projected = touched + delta; no breach (projected <= bound) is 0.
+ * Otherwise victims are spilled in the given (LRU) order, each dropping its
+ * per_victim_drop from touched, until the projection fits -- the MINIMUM
+ * number (usually ONE), never the whole idle set (finding 2: the cascade bug).
+ * With the victims exhausted and the breach still standing it returns
+ * n_victims -- the count it CAN do; the caller spills those and then
+ * back-pressures (proceeds and lets the MemAvailable floor guard), so with no
+ * victims at all it returns 0 and spills nothing. */
+static int guard_spill_plan(uint64_t touched, uint64_t delta, uint64_t bound,
+                            const uint64_t *per_victim_drop, int n_victims) {
+    int k = 0;
+    while (touched + delta > bound && k < n_victims) {
+        const uint64_t drop = per_victim_drop[k++];
+        touched = drop >= touched ? 0 : touched - drop;
+    }
+    return k;
+}
+
+/* Every guard victim in pick order: guard_pick_victim is the ONE authority
+ * for the filter and the LRU key; the slots already ordered are appended to
+ * its live-exclusion set so each call yields the next. At most n_slots
+ * entries. */
+static int guard_victim_order(server *s, session_slot **dec, int n, int *order) {
+    session_slot *excl[2 * PULSAR_SESSION_POOL_CAP];
+    for (int i = 0; i < n; i++) excl[i] = dec[i];
+    int m = 0;
+    while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
+        const int vi = s->guard_pick_victim(excl, n + m);
+        if (vi < 0) break;
+        order[m] = vi;
+        excl[n + m] = &s->slots[vi];
+        m++;
+    }
+    return m;
+}
+
 void server::guard_maybe_evict(session_slot **dec, int n) {
     auto *s = this;
     if (!s->guard_enabled || s->pool_banks <= 0 || n <= 0) return;
@@ -1634,34 +1735,41 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
             pool, (uint32_t)PULSAR_SERVER_DECODE_QUANTUM_TOKENS);
     const uint64_t delta = (uint64_t)n * dpb;      /* all n live banks grow */
     const uint64_t bound = s->guard_touched_budget;
-    /* Finding 2: free_physical zeroes a spilled bank's frontier so touched drops
-     * after each spill — the loop then re-evaluates and evicts exactly the minimum
+    /* Finding 2: free_physical zeroes a spilled bank's frontier, so a spill
+     * drops touched by exactly that bank's touched bytes (the pool gauge IS
+     * the per-bank sum, gpu_graph_touched_kv_bytes). guard_spill_plan walks
+     * that arithmetic over the LRU victim order and evicts exactly the minimum
      * (usually ONE) per breach, NOT the whole idle set (the cascade bug). The
      * per-quantum count log lets the smoke assert no cascade. */
+    int order[PULSAR_SESSION_POOL_CAP];
+    uint64_t drop[PULSAR_SESSION_POOL_CAP];
+    const int n_victims = guard_victim_order(s, dec, n, order);
+    for (int k = 0; k < n_victims; k++)
+        drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+    const int plan = guard_spill_plan(pulsar_session_touched_kv_bytes(pool), delta, bound,
+                                      drop, n_victims);
     int spilled_this_quantum = 0;
-    for (;;) {
-        const uint64_t projected = pulsar_session_touched_kv_bytes(pool) + delta;
-        if (projected <= bound) break;             /* fits */
-        const int vi = s->guard_pick_victim(dec, n);
-        if (vi < 0) {
-            /* No idle victim: back-pressure — proceed and let the live floor guard.
-             * (Evicting a LIVE growing bank would thrash; the MemAvailable watchdog
-             * is the hard backstop.) */
-            static uint64_t last_warn_us;
-            const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
-            if (now_us - last_warn_us > 5000000ull) {
-                last_warn_us = now_us;
-                const double gib = 1024.0 * 1024.0 * 1024.0;
-                server_log(PULSAR_LOG_WARNING,
-                    "pulsar-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
-                    "idle victim — back-pressure (MemAvailable floor is the backstop)",
-                    (double)projected / gib, (double)bound / gib);
-            }
-            break;
-        }
-        if (!s->spill_bank(&s->slots[vi])) break;   /* spill failed — stop */
+    for (int k = 0; k < plan; k++) {
+        if (!s->spill_bank(&s->slots[order[k]])) break;   /* spill failed — stop */
         spilled_this_quantum++;
         s->count_metric(&s->m_spills);
+    }
+    if (spilled_this_quantum == n_victims) {
+        /* Every idle victim is spilled (or there was none): if the breach still
+         * stands, back-pressure — proceed and let the live floor guard.
+         * (Evicting a LIVE growing bank would thrash; the MemAvailable watchdog
+         * is the hard backstop.) */
+        const uint64_t projected = pulsar_session_touched_kv_bytes(pool) + delta;
+        static uint64_t last_warn_us;
+        const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
+        if (projected > bound && now_us - last_warn_us > 5000000ull) {
+            last_warn_us = now_us;
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            server_log(PULSAR_LOG_WARNING,
+                "pulsar-server: guard: projected touched %.2f GiB > budget %.2f GiB but NO "
+                "idle victim — back-pressure (MemAvailable floor is the backstop)",
+                (double)projected / gib, (double)bound / gib);
+        }
     }
     if (spilled_this_quantum > 0) {
         server_log(PULSAR_LOG_DEFAULT,
@@ -1701,6 +1809,20 @@ static void park_live_bank(server *s, session_slot **dec, int n, const session_s
     pulsar_session_bank_state_save(s->sess, (uint32_t)s->live_bank);
 }
 
+/* L118 per-quantum client-liveness poll, shared by the three batched lanes
+ * (L179 branch 13). A slot is abandoned iff it is mid-decode (GEN_DECODE),
+ * its client has hung up (gen_client_disconnected: POLLRDHUP on fd) and --
+ * on the lanes that ask for it -- its batch_feed is valid. The plain and
+ * mixed lanes require batch_feed_valid (their abandon path also clears it,
+ * so the pending commit is dropped exactly once); the spec lane does not
+ * (its per-slot epilogue finishes a dead client through the normal path).
+ * The asymmetry is the caller's, stated at each call. */
+static bool lane_should_abandon(const gen_state *g, bool require_batch_feed, int fd) {
+    if (!g || g->phase != GEN_DECODE) return false;
+    if (require_batch_feed && !g->batch_feed_valid) return false;
+    return gen_client_disconnected(fd);
+}
+
 void server::worker_batched_decode_quantum(session_slot **dec, int n) {
     auto *s = this;
     if (n <= 0) return;
@@ -1723,8 +1845,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
      * cadence. */
     for (int i = 0; i < n; i++) {
         gen_state *pg = dec[i]->gen;
-        if (pg && pg->phase == GEN_DECODE && pg->batch_feed_valid &&
-            gen_client_disconnected(pg->j->fd)) {
+        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/true, pg->j->fd)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: client disconnected, abandoning generation after %d tokens",
                        pg->completion);
@@ -1852,6 +1973,64 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
 }
 
 
+/* L049 increment 1 / L117: confidence-ranked cross-bank K allocation for the
+ * spec lane's shared forward (L179 branch 1). surv[i][j] is bank i's survival
+ * (cumprod of drafter confidences) at pending position j, npend[i] its pending
+ * count (0 for a bank not in GEN_DECODE), n_live the number of decoding banks
+ * (one base row each). Returns 1 on OVERFLOW (base rows + every pending >
+ * PULSAR_SPEC_ROW_BUDGET), else 0.
+ *
+ * ISOLATION INVARIANT (the lane gate caught the first version of this
+ * violating it): the carry-derived pending counts can be stale or inherited
+ * from a bank's PREVIOUS request, so a cap derived from them must never bind
+ * when the budget does not -- otherwise a bank's round shape couples to its
+ * partner's bank history. When everything fits, every bank is admitted whole
+ * (k_alloc[i] == npend[i]) and the caller applies the old unconditional cap,
+ * so the sweep is bit-identical to the pre-allocator lane; the ranked
+ * allocation engages ONLY on overflow, where the old behavior (arbitrary
+ * whole-bank sit-out) was itself partner-coupled and strictly worse.
+ *
+ * Under overflow: admit the global best (bank, position) until the row budget
+ * (PULSAR_SPEC_ROW_BUDGET - n_live) is spent; survival is monotone within a
+ * bank so each bank's admitted set is a prefix. The cost table (L117/L136)
+ * stops admission once the best remaining candidate's survival is below thr
+ * (= marginal row ms / live ms-per-token EMA): every remaining candidate is
+ * then <= it, and *thr_cut_rows counts the rows that cut left unadmitted (0
+ * when the cut did not fire). */
+static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n, int n_live,
+                           float thr, int *k_alloc, int *thr_cut_rows) {
+    uint32_t demand = (uint32_t)n_live;
+    for (int i = 0; i < n; i++) demand += npend[i];
+    *thr_cut_rows = 0;
+    const bool overflow = demand > (int)PULSAR_SPEC_ROW_BUDGET;
+    if (!overflow) {
+        for (int i = 0; i < n; i++) k_alloc[i] = (int)npend[i];
+        return 0;
+    }
+    for (int i = 0; i < n; i++) k_alloc[i] = 0;
+    int budget = (int)PULSAR_SPEC_ROW_BUDGET - n_live;
+    while (budget > 0) {
+        int bi = -1;
+        float bv = -1.0f;
+        for (int i = 0; i < n; i++) {
+            if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > bv) {
+                bv = surv[i][k_alloc[i]];
+                bi = i;
+            }
+        }
+        if (bi < 0) break;
+        if (bv < thr) {
+            /* L136: everything left is priced out by the cost table while
+             * budget remains -- the only rows whose fate marginal_ms decides. */
+            for (int i = 0; i < n; i++) *thr_cut_rows += (int)npend[i] - k_alloc[i];
+            break;
+        }
+        k_alloc[bi]++;
+        budget--;
+    }
+    return 1;
+}
+
 /* plan-34 inc 6: the SPEC batched quantum. Same skeleton as
  * worker_batched_decode_quantum, but each sweep runs one speculative ROUND
  * per bank instead of one token: per bank under its restored state we draw
@@ -1883,7 +2062,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
      * final write fails harmlessly on the dead fd). */
     for (int i = 0; i < n; i++) {
         gen_state *pg = dec[i]->gen;
-        if (pg && pg->phase == GEN_DECODE && gen_client_disconnected(pg->j->fd)) {
+        if (pg && lane_should_abandon(pg, /*require_batch_feed=*/false, pg->j->fd)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: client disconnected, abandoning generation after %d tokens",
                        pg->completion);
@@ -1929,9 +2108,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
             float surv[PULSAR_SESSION_POOL_CAP][16];
             uint32_t npend[PULSAR_SESSION_POOL_CAP];
             int n_live = 0;
-            uint32_t demand = 0;
             for (int i = 0; i < n; i++) {
-                k_alloc[i] = 0;
                 npend[i] = 0;
                 gen_state *ag = dec[i]->gen;
                 if (!ag || ag->phase != GEN_DECODE) continue;
@@ -1945,66 +2122,32 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n) {
                     surv[i][j2] = p;
                 }
                 npend[i] = np;
-                demand += 1u + np;
             }
-            /* ISOLATION INVARIANT (the lane gate caught the first version of
-             * this violating it): the carry-derived pending counts can be
-             * stale or inherited from a bank's PREVIOUS request, so a cap
-             * derived from them must never bind when the budget does not --
-             * otherwise a bank's round shape couples to its partner's bank
-             * history. When everything fits, every bank gets the old
-             * unconditional cap and the sweep is bit-identical to the
-             * pre-allocator lane; the ranked allocation engages ONLY on
-             * overflow, where the old behavior (arbitrary whole-bank
-             * sit-out) was itself partner-coupled and strictly worse. */
-            k_overflow = demand > (int)PULSAR_SPEC_ROW_BUDGET;
-            if (k_overflow) {
-                /* L117 (L049 inc 2): under overflow the ranked admission also
-                 * consults the COST TABLE — stop admitting once the next
-                 * candidate's survival is worth less than a marginal row
-                 * costs (value denominator = live EMA of ms per emitted
-                 * token).  Binds ONLY under overflow — when everything fits
-                 * the old unconditional cap is byte-identical (isolation
-                 * invariant, see the lane-gate note above). vLLM #47808 is
-                 * the same design upstream.
-                 * L111/L121 established the cost is DEPTH-FLAT (the old
-                 * 8.4→11 ramp was the naive score kernel's rows x depth
-                 * term, not a property of the engine).  L136 refresh
-                 * (ROWCOST 2026-08-31, dev 87eec09): 6.4 ms/row @2048,
-                 * 5.9 @24576 — the 8.0 measured on 08-27 predated L129's
-                 * MoE fusion, which moved the whole sweep ~9%.  A stage
-                 * decomposition (L134) puts ~83% of this in routed-MoE
-                 * expert compute, so expect the number to move with MoE
-                 * kernel work, not with KV/indexer work. */
-                const float marginal_ms = 6.0f;
-                const float ema = s->spec_ms_per_tok_ema > 1.0f ?
-                                  s->spec_ms_per_tok_ema : 45.0f;
-                const float thr = marginal_ms / ema;
-                s->w_spec_overflow_rounds++;
-                int budget = (int)PULSAR_SPEC_ROW_BUDGET - n_live;
-                while (budget > 0) {
-                    int bi = -1;
-                    float bv = -1.0f;
-                    for (int i = 0; i < n; i++) {
-                        if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > bv) {
-                            bv = surv[i][k_alloc[i]];
-                            bi = i;
-                        }
-                    }
-                    if (bi < 0) break;
-                    if (bv < thr) {
-                        /* L136: everything left is priced out by the cost
-                         * table while budget remains — the only rows whose
-                         * fate marginal_ms decides (survival is monotone,
-                         * so all remaining candidates are <= bv < thr). */
-                        for (int i = 0; i < n; i++)
-                            s->w_spec_thr_cut_rows += npend[i] - (uint32_t)k_alloc[i];
-                        break;
-                    }
-                    k_alloc[bi]++;
-                    budget--;
-                }
-            }
+            /* L117 (L049 inc 2): under overflow the ranked admission also
+             * consults the COST TABLE — stop admitting once the next
+             * candidate's survival is worth less than a marginal row
+             * costs (value denominator = live EMA of ms per emitted
+             * token).  Binds ONLY under overflow — when everything fits
+             * the old unconditional cap is byte-identical (isolation
+             * invariant, see spec_alloc_rows). vLLM #47808 is the same
+             * design upstream.
+             * L111/L121 established the cost is DEPTH-FLAT (the old
+             * 8.4→11 ramp was the naive score kernel's rows x depth
+             * term, not a property of the engine).  L136 refresh
+             * (ROWCOST 2026-08-31, dev 87eec09): 6.4 ms/row @2048,
+             * 5.9 @24576 — the 8.0 measured on 08-27 predated L129's
+             * MoE fusion, which moved the whole sweep ~9%.  A stage
+             * decomposition (L134) puts ~83% of this in routed-MoE
+             * expert compute, so expect the number to move with MoE
+             * kernel work, not with KV/indexer work. */
+            const float marginal_ms = 6.0f;
+            const float ema = s->spec_ms_per_tok_ema > 1.0f ?
+                              s->spec_ms_per_tok_ema : 45.0f;
+            int thr_cut_rows = 0;
+            k_overflow = spec_alloc_rows(surv, npend, n, n_live, marginal_ms / ema,
+                                         k_alloc, &thr_cut_rows) != 0;
+            if (k_overflow) s->w_spec_overflow_rounds++;
+            s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
         }
         /* ---- assemble: per bank, base draw + round begin + rows ---------- */
         uint32_t rows = 0;
@@ -2348,8 +2491,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
      * continued-store caveat as the plain lane). */
     for (int i = 0; i < n; i++) {
         gen_state *lg = dec[i]->gen;
-        if (lg && lg->phase == GEN_DECODE && lg->batch_feed_valid &&
-            gen_client_disconnected(lg->j->fd)) {
+        if (lg && lane_should_abandon(lg, /*require_batch_feed=*/true, lg->j->fd)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: client disconnected, abandoning generation after %d tokens",
                        lg->completion);
