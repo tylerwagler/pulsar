@@ -628,6 +628,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    /* L183 census taps: the carrier the layer starts from, the mix GEMM's
+     * rows, and (below) the split coefficients -- the three per-row inputs of
+     * hc_attn_post that had no dump. */
+    if (ok) gpu_graph_debug_dump_hc_tensor("hc_cur", g->batch_cur_hc, (uint64_t)n_tokens * hc_dim, il, pos0);
+    if (ok) gpu_graph_debug_dump_tensor("hc_mix_raw", hc_mix_view, (uint64_t)n_tokens * mix_hc, il, pos0);
     {
         /* ...and the E4M3 encoding too: batch_attn_norm feeds seven MXFP8
          * projections, every one of which would otherwise wait on a separate
@@ -2259,6 +2264,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                             PULSAR_N_EMBD,
                                             PULSAR_N_HC) != 0;
     }
+    if (ok) gpu_graph_debug_dump_tensor("hc_split_coef", hc_split_view, (uint64_t)n_tokens * mix_hc, il, pos0);
     if (ok) {
         gpu_graph_debug_dump_hc_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
