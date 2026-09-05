@@ -520,7 +520,7 @@ static void weights_validate_layout(
         tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, PULSAR_N_EMBD, 0);
 
         if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
+            const uint32_t coff = pulsar_compress_coff(ratio);
             const uint64_t comp_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
             tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, ratio, 0);
             tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, comp_width, 0);

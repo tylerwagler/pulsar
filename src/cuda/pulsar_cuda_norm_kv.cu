@@ -837,7 +837,7 @@ __global__ static void compressor_store_kernel(
         uint32_t ratio,
         uint32_t pos0,
         uint32_t n_tokens) {
-    uint32_t coff = ratio == 4u ? 2u : 1u;
+    uint32_t coff = pulsar_compress_coff(ratio);
     uint32_t width = coff * head_dim;
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * width;
@@ -899,7 +899,7 @@ __global__ static void compressor_prefill_pool_kernel(
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t c = blockIdx.y;
     if (d >= head_dim || c >= n_comp) return;
-    uint32_t coff = ratio == 4u ? 2u : 1u;
+    uint32_t coff = pulsar_compress_coff(ratio);
     uint32_t width = coff * head_dim;
     float vals[128];
     float scores[128];
@@ -959,7 +959,7 @@ __global__ static void compressor_update_pool_kernel(
         uint32_t ratio) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
-    uint32_t coff = ratio == 4u ? 2u : 1u;
+    uint32_t coff = pulsar_compress_coff(ratio);
     uint32_t width = coff * head_dim;
     float vals[128];
     float scores[128];
@@ -1516,7 +1516,7 @@ int pulsar_gpu_compressor_store_batch_tensor(
         (ape_type != 0u && ape_type != 1u)) {
         return 0;
     }
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t coff = pulsar_compress_coff(ratio);
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
@@ -1562,7 +1562,7 @@ int pulsar_gpu_compressor_shift_ratio4_tensor(
         pulsar_gpu_tensor *state_score,
         uint32_t           head_dim) {
     if (!state_kv || !state_score || head_dim == 0) return 0;
-    const uint32_t width = 2u * head_dim;   /* ratio-4 coff = 2 */
+    const uint32_t width = pulsar_compress_coff(4u) * head_dim;   /* this entry is ratio-4 only */
     const uint64_t state_bytes = 8ull * width * sizeof(float);
     if (state_kv->bytes < state_bytes || state_score->bytes < state_bytes) return 0;
     const uint64_t half = 4ull * width;
@@ -1606,7 +1606,7 @@ int pulsar_gpu_compressor_update_tensor(
         (norm_type != 0u && norm_type != 30u)) {
         return 0;
     }
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t coff = pulsar_compress_coff(ratio);
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     const uint32_t emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
@@ -1697,7 +1697,7 @@ int pulsar_gpu_compressor_prefill_tensor(
         return 0;
     }
 
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t coff = pulsar_compress_coff(ratio);
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     const uint32_t n_comp = n_tokens / ratio;

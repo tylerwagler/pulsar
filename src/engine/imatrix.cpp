@@ -196,7 +196,7 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = pulsar_compress_coff(ratio);
         const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
         if (!gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;

@@ -393,7 +393,7 @@ static bool gpu_graph_bank_slabs_alloc(
         ok = b->raw[il] != NULL;
         if (!ok || ratio == 0) continue;
 
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = pulsar_compress_coff(ratio);
         const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
         const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
@@ -1619,7 +1619,7 @@ bool gpu_graph_alloc_raw_cap(
                     (uint64_t)raw_cap * raw_row_bytes_pack);
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
+            const uint32_t coff = pulsar_compress_coff(ratio);
             const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             const uint64_t comp_row_bytes = gpu_graph_attn_comp_cache_row_bytes();

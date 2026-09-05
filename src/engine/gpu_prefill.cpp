@@ -1031,7 +1031,7 @@ bool gpu_graph_encode_layer_attention_batch(
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = pulsar_compress_coff(ratio);
         const uint32_t comp_width = coff * PULSAR_N_HEAD_DIM;
         const bool have_attn_comp = layer->attn_compressor_kv && layer->attn_compressor_gate &&
                                     layer->attn_compressor_ape && layer->attn_compressor_norm;
@@ -2767,7 +2767,7 @@ bool gpu_graph_dspark_compressor_rollforward(
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const pulsar_layer_weights *layer = &weights->layer[il];
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = pulsar_compress_coff(ratio);
         const uint32_t comp_width = coff * PULSAR_N_HEAD_DIM;
         const uint32_t index_width = 2u * PULSAR_N_INDEXER_HEAD_DIM;
         const float freq_base = layer_rope_freq_base(il);

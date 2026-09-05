@@ -280,6 +280,19 @@ enum {
     PULSAR_GPU_TENSOR_IQ2_XXS_MMQ   = 43,   /* IQ2_XXS experts: the vendored MMQ tier */
 };
 
+/** Compressor input-width multiplier for a layer's compress ratio: the
+ * ratio-4 compressor consumes a [kv | score]-style 2 x head_dim row (its state
+ * is 8 = 2 x ratio rows, two groups), every other ratio a plain head_dim row.
+ * This sets comp_width -- the row stride of the projection scratch, the state
+ * lanes and the payload -- and was spelled `ratio == 4 ? 2u : 1u` at fourteen
+ * sites across the engine and the kernels (L178).  One definition, both sides. */
+#if defined(__CUDACC__)
+#define PULSAR_GPU_HD __host__ __device__   /* the helper is called from kernels too */
+#else
+#define PULSAR_GPU_HD
+#endif
+static inline PULSAR_GPU_HD uint32_t pulsar_compress_coff(uint32_t ratio) { return ratio == 4u ? 2u : 1u; }
+
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
         const pulsar_gpu_tensor *tokens,

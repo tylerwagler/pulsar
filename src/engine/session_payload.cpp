@@ -111,14 +111,14 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
 
 
 static uint64_t layer_attn_state_bytes(uint32_t ratio) {
-    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t coff = pulsar_compress_coff(ratio);
     return (uint64_t)coff * PULSAR_N_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
 
 
 static uint64_t layer_index_state_bytes(uint32_t ratio) {
-    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t coff = pulsar_compress_coff(ratio);
     return (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
