@@ -711,9 +711,9 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * deterministic accept rule, which needs no q. */
     const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
     if (sample_drafts) {
-        /* n_draft rows, not 16: the depth is fixed per engine
-         * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
-         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
+        /* n_draft rows, not the whole PULSAR_SPEC_LOGITS_ROWS slab: the depth is
+         * bounded per engine, so this is ~n_draft x 0.5 MB per session rather
+         * than the slab's ~16.5 MB. Grow-only, so a depth change is still safe. */
         const uint32_t need = n_draft * PULSAR_N_VOCAB;
         if (s->dspark_pending_qrows_cap < need) {
             free(s->dspark_pending_qrows);
@@ -721,7 +721,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
             s->dspark_pending_qrows_cap = need;
         }
     }
-    /* spec_logits rows are PULSAR_N_VOCAB wide (allocated 16*PULSAR_N_VOCAB,
+    /* spec_logits rows are PULSAR_N_VOCAB wide (allocated PULSAR_SPEC_LOGITS_ROWS*PULSAR_N_VOCAB,
      * written and read elsewhere at that stride via gpu_graph_read_spec_logits_row).
      * Stride the row view by the TARGET vocab, not the drafter's vocab_size:
      * they are equal on the shipped drafter (markov head 129280 == N_VOCAB), so

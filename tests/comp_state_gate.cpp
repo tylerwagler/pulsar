@@ -317,6 +317,22 @@ int GATE_ENTRY(int argc, char **argv) {
             }
             printf("short prompt L=%d: %d compressor states checked, placement%s\n", L, checked, g_fail ? " FAIL" : " OK");
         }
+        /* L177: the speculative compact-prefilter slab must hold every row the
+         * lane can admit (PULSAR_SPEC_LOGITS_ROWS).  It held 16 after the L117
+         * budget went to 32; the host mirror is sized by the constant. */
+        {
+            pulsar_gpu_graph *g = &s->graph;
+            const uint64_t need = (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t);
+            const uint64_t have = g->dspark_prefilter_sel ? pulsar_gpu_tensor_bytes(g->dspark_prefilter_sel) : 0ull;
+            if (have < need) {
+                printf("  FAIL spec compact-prefilter slab holds %llu of the %u admitted rows (%llu < %llu bytes)\n",
+                       (unsigned long long)(have / ((uint64_t)PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t))),
+                       (unsigned)PULSAR_SPEC_LOGITS_ROWS, (unsigned long long)have, (unsigned long long)need);
+                g_fail = 1;
+            } else {
+                printf("spec compact-prefilter slab: %u rows, matches the lane's row budget  OK\n", (unsigned)PULSAR_SPEC_LOGITS_ROWS);
+            }
+        }
         /* L171: ring aliasing after a 9-token whole prompt */
         {
             if (sync_prefix(s, &prompt, L_RING, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L_RING, err); goto done; }

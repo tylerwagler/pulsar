@@ -1763,7 +1763,7 @@ bool gpu_graph_alloc_raw_cap(
     g->output_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->logits = pulsar_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->prefill_tokens = pulsar_gpu_tensor_alloc(pc * sizeof(int32_t));
-    /* Shared multi-row logits slab (16 rows).  Unconditional, NOT gated on
+    /* Shared multi-row logits slab (PULSAR_SPEC_LOGITS_ROWS rows).  Unconditional, NOT gated on
      * speculation: every batched multi-row output head writes its rows here —
      * the DSpark draft/verify passes, gpu_graph_verify_suffix_tops, and the
      * Tier-2 batched multi-session decode driver.  It used to be allocated
@@ -2016,8 +2016,15 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         ok = ok && g->dspark_bank_meta;
         g->dspark_embed_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
         g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
+        /* One compact block per admitted speculative row: the lane admits up
+         * to PULSAR_SPEC_LOGITS_ROWS rows per forward and the host mirror below
+         * is sized by the same constant.  This slab stayed at 16 rows after
+         * L117 raised the budget to 32 (L177): at 3 drafting clients x depth 5
+         * = 18 rows the prefilter refused, and once L174 removed the silent
+         * full-readback fallback that refusal failed the whole co-scheduled
+         * forward. */
         g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
-            16ull * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
+            (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
         g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
         ok = ok && g->dspark_row_meta;
         g->spec_compact_host = (int32_t *)xmalloc(
