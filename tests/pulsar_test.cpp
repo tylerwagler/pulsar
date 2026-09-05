@@ -1687,6 +1687,7 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
                                                cfg->min_p, &r3, &plain_scratch) == PULSAR_SAMPLE_REFUSED);
                 TEST_ASSERT(r2 == 0xABCD0000u && r3 == r2);
+                refused++;
                 checked++;
                 continue;
             }
