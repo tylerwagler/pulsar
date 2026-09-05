@@ -647,7 +647,9 @@ bool gpu_graph_encode_layer_attention_batch(
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_attn_norm, n_tokens, PULSAR_N_EMBD,
                                                         &attn_norm_q, &attn_norm_sf,
                                                         &attn_norm_kbp)) {
-            attn_norm_q = NULL; attn_norm_sf = NULL; attn_norm_kbp = 0;
+            fprintf(stderr, "pulsar: attn_norm: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n",
+                    n_tokens, (unsigned)PULSAR_N_EMBD);
+            ok = false;
         }
         /* ...and the bf16 copy: batch_attn_norm also feeds the BF16-weight
          * compressors and indexer_proj, which staged their own convert. */
@@ -765,7 +767,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                         (uint64_t)q_rank,
                                                         &qr_norm_q, &qr_norm_sf,
                                                         &qr_norm_kbp)) {
-            qr_norm_q = NULL; qr_norm_sf = NULL; qr_norm_kbp = 0;
+            fprintf(stderr, "pulsar: qr_norm: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n",
+                    n_tokens, (unsigned)q_rank);
+            ok = false;
         }
         /* DEAD-STORE ELIMINATION.  Both readers of batch_qr_norm are MXFP8
          * GEMMs (attn_q_b below, and the indexer's q_b) and both take the
@@ -2370,7 +2374,9 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD,
                                                         &ffn_norm_q, &ffn_norm_sf,
                                                         &ffn_norm_kbp)) {
-            ffn_norm_q = NULL; ffn_norm_sf = NULL; ffn_norm_kbp = 0;
+            fprintf(stderr, "pulsar: ffn_norm: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n",
+                    n_tokens, (unsigned)PULSAR_N_EMBD);
+            ok = false;
         }
         /* ...and the bf16 copy for the router's BF16 GEMM (ffn_gate_inp). */
         if (ok && !pulsar_gpu_bf16_act_slot(g->batch_ffn_norm, n_tokens, PULSAR_N_EMBD,
@@ -2506,7 +2512,9 @@ bool gpu_graph_encode_layer_ffn_batch(
         if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_shared_mid, n_tokens, \
                                                         (uint64_t)shared_dim, \
                                                         &shmid_q, &shmid_sf, &shmid_kbp)) { \
-            shmid_q = NULL; shmid_sf = NULL; shmid_kbp = 0; \
+            fprintf(stderr, "pulsar: shared_mid: no E4M3 slot (n_tok=%u in_dim=%u) -- refusing (L189)\n", \
+                    n_tokens, (unsigned)shared_dim); \
+            ok = false; \
         } \
         /* DEAD-STORE ELIMINATION. batch_shared_mid's only reader is the MXFP8 \
          * shared_down GEMM immediately below, and the swiglu epilogue hands it \
@@ -2787,6 +2795,21 @@ bool gpu_graph_encode_layer_batch(
  * committed positions' rows from identical state; rejected rows are position-
  * addressed and get overwritten). Counters are set by formula. The pooled-row
  * emit goes to a scratch sink (cache rows are already correct). */
+/* L189: a rollforward that stops at layer il leaves layers 0..il-1 advanced to
+ * pos0+n_positions and layers il.. at the restored frontier -- the pool state
+ * is HALF-ADVANCED and no per-layer commit can undo the layers already
+ * rolled (their update kernels are recurrent).  The exit therefore names the
+ * layer, position and kernel, and says so; the caller (session_spec.cpp,
+ * "DSpark fused state update failed") invalidates the checkpoint, which is
+ * what makes the half-advanced state unreachable. */
+static bool rollforward_fail(uint32_t il, uint32_t pos, const char *what) {
+    fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- layers 0..%u are "
+                    "advanced to the committed frontier, layers %u.. are not: the pool state is "
+                    "half-advanced and the caller must invalidate the checkpoint (it does)\n",
+            il, pos, what, il == 0u ? 0u : il - 1u, il);
+    return false;
+}
+
 bool gpu_graph_dspark_compressor_rollforward(
         pulsar_gpu_graph  *g,
         const pulsar_model  *model,
@@ -2794,9 +2817,18 @@ bool gpu_graph_dspark_compressor_rollforward(
         uint32_t          pos0,
         uint32_t          n_positions,
         uint32_t          save_row0) {
-    if (!g || !model || !weights) return false;
+    if (!g || !model || !weights) {
+        fprintf(stderr, "pulsar: compressor rollforward: NULL graph/model/weights -- refusing\n");
+        return false;
+    }
     if (n_positions == 0) return true;
-    if (save_row0 + n_positions > PULSAR_SPEC_LOGITS_ROWS + 1u || !g->spec_comp_scratch_row) return false;
+    if (save_row0 + n_positions > PULSAR_SPEC_LOGITS_ROWS + 1u || !g->spec_comp_scratch_row) {
+        fprintf(stderr, "pulsar: compressor rollforward: save rows %u+%u exceed the %u-row save slab, or no "
+                        "scratch row (%d) -- refusing before any layer moved\n",
+                save_row0, n_positions, (unsigned)PULSAR_SPEC_LOGITS_ROWS + 1u,
+                g->spec_comp_scratch_row != NULL);
+        return false;
+    }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -2811,7 +2843,8 @@ bool gpu_graph_dspark_compressor_rollforward(
         if (ext_factor != 0.0f && freq_scale > 0.0f) {
             attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
         }
-        if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il]) return false;
+        if (!g->spec_comp_kv_save[il] || !g->spec_comp_sc_save[il])
+            return rollforward_fail(il, pos0, "no saved compressor projections for this layer");
         for (uint32_t t = 0; t < n_positions; t++) {
             const uint32_t pos = pos0 + t;
             pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->spec_comp_kv_save[il], save_row0 + t, comp_width);
@@ -2820,7 +2853,7 @@ bool gpu_graph_dspark_compressor_rollforward(
             if (ratio == 128u && !gpu_graph_r128_undo_capture(g, il, pos)) {
                 pulsar_gpu_tensor_free(sc_view);
                 pulsar_gpu_tensor_free(kv_view);
-                return false;
+                return rollforward_fail(il, pos, "ratio-128 undo capture");
             }
             bool ok = kv_view && sc_view &&
                 pulsar_gpu_compressor_update_tensor(kv_view, sc_view,
@@ -2841,11 +2874,14 @@ bool gpu_graph_dspark_compressor_rollforward(
              * ONE-STATE-MODEL stage 3 contract at gpu_graph_store_commits
              * names it; a fully accepted round has no rollforward and
              * deposits nothing, by decision). */
+            const bool attn_updated = ok;
             if (ok && ratio == 4)
                 ok = gpu_graph_proj_ring_deposit(g, il, pos, kv_view, sc_view, false);
             pulsar_gpu_tensor_free(sc_view);
             pulsar_gpu_tensor_free(kv_view);
-            if (!ok) return false;
+            if (!ok)
+                return rollforward_fail(il, pos, attn_updated ? "attention projection-ring deposit"
+                                                              : "attention compressor update (row view or kernel)");
             if (ratio == 4 && g->spec_icomp_kv_save[il]) {
                 pulsar_gpu_tensor *ikv = gpu_graph_tensor_row_view(g->spec_icomp_kv_save[il], save_row0 + t, index_width);
                 pulsar_gpu_tensor *isc = gpu_graph_tensor_row_view(g->spec_icomp_sc_save[il], save_row0 + t, index_width);
@@ -2863,11 +2899,14 @@ bool gpu_graph_dspark_compressor_rollforward(
                             freq_base, freq_scale, ext_factor, attn_factor,
                             PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                             PULSAR_RMS_EPS) != 0;
+                const bool idx_updated = ok;
                 if (ok)
                     ok = gpu_graph_proj_ring_deposit(g, il, pos, ikv, isc, true);
                 pulsar_gpu_tensor_free(isc);
                 pulsar_gpu_tensor_free(ikv);
-                if (!ok) return false;
+                if (!ok)
+                    return rollforward_fail(il, pos, idx_updated ? "indexer projection-ring deposit"
+                                                                 : "indexer compressor update (row view or kernel)");
             }
         }
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = (pos0 + n_positions) / ratio;

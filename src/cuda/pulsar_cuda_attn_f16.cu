@@ -772,6 +772,19 @@ static void attn_f16_kernel(
  * "return 0" and the kernel would look like a permanent shape-gate refusal.
  * The host question is a runtime one: does this device actually have the
  * m16n8k16 tensor cores?  Ask the driver, once. */
+/* L189: every launcher precondition names itself and its values when it
+ * refuses.  The dispatcher prints a generic "fp16 ... FAILED" after a 0 from
+ * here; WHICH check failed was invisible, and that is what cost three days on
+ * L032 (the comp_cap check below). */
+#define AF16_REQUIRE(what, cond, fmt, ...)                                              \
+    do {                                                                                \
+        if (!(cond)) {                                                                  \
+            fprintf(stderr, "pulsar: attn f16 %s rejected: !(%s) [" fmt "]\n", what,    \
+                    #cond, __VA_ARGS__);                                                \
+            return 0;                                                                   \
+        }                                                                               \
+    } while (0)
+
 static int af16_device_supported(void) {
     static int ok = -1;
     if (ok < 0) {
@@ -844,7 +857,8 @@ int pulsar_gpu_attention_f16_prefill_mx(
         uint32_t gact_tok0, uint32_t gact_ntok,
         const int *positions, const pulsar_gpu_q_prep *q_prep) {
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
-    if (!heads || !sinks || !q || !raw_kv) return 0;
+    AF16_REQUIRE("prefill", heads && sinks && q && raw_kv, "heads=%d sinks=%d q=%d raw_kv=%d",
+                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL);
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {
@@ -859,16 +873,19 @@ int pulsar_gpu_attention_f16_prefill_mx(
         qp = *q_prep;
     }
 
-    if (head_dim != AF16_DIM) return 0;
-    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
-    if (n_tokens == 0u) return 0;
-    if (n_comp != 0u && !comp_kv) return 0;
-    if (!af16_device_supported()) return 0;
+    AF16_REQUIRE("prefill", head_dim == AF16_DIM, "head_dim=%u built=%u", head_dim, (unsigned)AF16_DIM);
+    AF16_REQUIRE("prefill", n_head != 0u && (n_head % AF16_HPB) == 0u, "n_head=%u heads/block=%u",
+                 n_head, (unsigned)AF16_HPB);
+    AF16_REQUIRE("prefill", n_tokens != 0u, "n_tokens=%u", n_tokens);
+    AF16_REQUIRE("prefill", n_comp == 0u || comp_kv, "n_comp=%u comp_kv=%d", n_comp, comp_kv != NULL);
+    AF16_REQUIRE("prefill", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
     /* Same packed-geometry contract the indexed entry enforces: the rope tail
      * must fit and the nope span must divide the scale block, or attn_pack_ld
      * walks rows that are not there. */
-    if (head_dim <= PULSAR_ATTN_PACK_NROT ||
-        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0) return 0;
+    AF16_REQUIRE("prefill", head_dim > PULSAR_ATTN_PACK_NROT &&
+                            ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) == 0,
+                 "head_dim=%u nrot=%u nv_block=%u", head_dim, (unsigned)PULSAR_ATTN_PACK_NROT,
+                 (unsigned)PULSAR_KV4_NV_BLOCK);
     /* The epilogue's grouped index math assumes whole heads per group and that
      * the nope/rope split falls on an MX block boundary (so rope_tail can own
      * the tail blocks without either side touching the other's).  Refuse the
@@ -879,7 +896,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
                         "n_nope=%u\n", n_head, n_groups, n_nope);
         return 0;
     }
-    if (!af16_dynsmem_ok()) return 0;
+    AF16_REQUIRE("prefill", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
     /* Dense mode: `positions` reaches the kernel for the fused Q rope only
@@ -964,7 +981,9 @@ int pulsar_gpu_attention_f16_indexed(
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
     pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
-    if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
+    AF16_REQUIRE("indexed", heads && sinks && q && raw_kv && comp_kv,
+                 "heads=%d sinks=%d q=%d raw_kv=%d comp_kv=%d",
+                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL, comp_kv != NULL);
     pulsar_gpu_q_prep qp;
     memset(&qp, 0, sizeof qp);
     if (q_prep) {
@@ -980,7 +999,8 @@ int pulsar_gpu_attention_f16_indexed(
     }
 
     /* Descriptors are all-or-nothing, as in the dispatcher's own check. */
-    if ((positions != NULL) != (seq_id != NULL)) return 0;
+    AF16_REQUIRE("indexed", (positions != NULL) == (seq_id != NULL), "positions=%d seq_id=%d",
+                 positions != NULL, seq_id != NULL);
     /* comp_cap is the PER-BANK comp-row stride, so it is only meaningful when
      * there are compressed rows to address.  Requiring it unconditionally under
      * descriptors rejected the legitimate n_comp == 0 case -- which is what
@@ -988,17 +1008,20 @@ int pulsar_gpu_attention_f16_indexed(
      * returned 0, the caller correctly refused to fall through, and the whole
      * mixed run died with 'multiseq step_end FAILED'.  A banked batch whose
      * visible comp prefix is empty is normal, not a bug. */
-    if (positions && (n_banks == 0u || (n_comp != 0u && comp_cap == 0u))) return 0;
-    if (head_dim != AF16_DIM) return 0;
-    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
-    if (n_tokens == 0u || raw_cap == 0u) return 0;
-    if (topk && top_k == 0u) return 0;      /* a table with no budget is a bug */
+    AF16_REQUIRE("indexed", !positions || (n_banks != 0u && (n_comp == 0u || comp_cap != 0u)),
+                 "banked: n_banks=%u n_comp=%u comp_cap=%u", n_banks, n_comp, comp_cap);
+    AF16_REQUIRE("indexed", head_dim == AF16_DIM, "head_dim=%u built=%u", head_dim, (unsigned)AF16_DIM);
+    AF16_REQUIRE("indexed", n_head != 0u && (n_head % AF16_HPB) == 0u, "n_head=%u heads/block=%u",
+                 n_head, (unsigned)AF16_HPB);
+    AF16_REQUIRE("indexed", n_tokens != 0u && raw_cap != 0u, "n_tokens=%u raw_cap=%u", n_tokens, raw_cap);
+    /* a table with no budget is a bug */
+    AF16_REQUIRE("indexed", !topk || top_k != 0u, "topk=%d top_k=%u", topk != NULL, top_k);
     /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
      * is what sRawRows[256] must hold; the kernel caps it at 256
      * (PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP, which the dispatcher's descriptor
      * check enforces on `window`). */
-    if (!af16_device_supported()) return 0;
-    if (!af16_dynsmem_ok()) return 0;
+    AF16_REQUIRE("indexed", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
+    AF16_REQUIRE("indexed", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
     attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
                                             (const int32_t *)topk,

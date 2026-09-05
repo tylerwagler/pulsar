@@ -875,23 +875,21 @@ static bool act_slot_a8_declared_short(const void *ptr, uint64_t need, uint64_t 
 }
 
 /* NO E4M3 encoding exists for this activation and none was declared: refuse,
- * once per (in,out) shape. */
+ * printed once per (in,out) shape, counted on every call (pulsar_shape_once;
+ * the old 16-entry table went silent at the 17th shape -- L189). */
 static int act_a8_missing_fail(const char *what, uint64_t need,
                                uint64_t in_dim, uint64_t out_dim) {
-    static uint64_t seen[16] = {0};
-    static int n_seen = 0;
-    const uint64_t key = (in_dim << 32) ^ out_dim;
-    int known = 0;
-    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
-    if (!known && n_seen < 16) {
-        seen[n_seen++] = key;
+    static pulsar_shape_once seen = {};
+    if (pulsar_shape_once_first(&seen, pulsar_shape_key(in_dim, out_dim), "act_a8_missing_fail")) {
         fprintf(stderr,
                 "pulsar: NO E4M3 ENCODING for the activation of %s (in_dim=%llu out_dim=%llu "
                 "n_tok=%llu) -- no producer armed the slot.  Arm the activation "
                 "(pulsar_gpu_mxfp8_act_cache_arm) and have its producer emit E4M3 "
-                "(pulsar_gpu_mxfp8_act_cache_encode_f32 for a synthesised x).  Refusing.\n",
+                "(pulsar_gpu_mxfp8_act_cache_encode_f32 for a synthesised x).  Refusing "
+                "(refusal #%llu of this kind).\n",
                 what ? what : "?", (unsigned long long)in_dim,
-                (unsigned long long)out_dim, (unsigned long long)need);
+                (unsigned long long)out_dim, (unsigned long long)need,
+                (unsigned long long)seen.n_calls);
     }
     return 0;
 }
@@ -901,20 +899,16 @@ static int act_a8_missing_fail(const char *what, uint64_t need,
  * in_dim-only key would report one and hide the rest. */
 static int act_a8_contract_fail(const char *what, uint64_t need,
                                 uint64_t in_dim, uint64_t out_dim) {
-    static uint64_t seen[16] = {0};
-    static int n_seen = 0;
-    const uint64_t key = (in_dim << 32) ^ out_dim;
-    int known = 0;
-    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
-    if (!known && n_seen < 16) {
-        seen[n_seen++] = key;
+    static pulsar_shape_once seen = {};
+    if (pulsar_shape_once_first(&seen, pulsar_shape_key(in_dim, out_dim), "act_a8_contract_fail")) {
         fprintf(stderr,
                 "pulsar: A8 CONTRACT VIOLATION in %s -- the producer declared E4M3 for "
                 "this activation but the cached block is narrower than the %llu rows "
                 "asked for (in_dim=%llu out_dim=%llu).  Refusing to silently multiply "
-                "against f32 instead.\n",
+                "against f32 instead (refusal #%llu of this kind).\n",
                 what, (unsigned long long)need,
-                (unsigned long long)in_dim, (unsigned long long)out_dim);
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)seen.n_calls);
     }
     return 0;  ///< every consumer of this returns int; 0 = launch failed
 }
@@ -1059,12 +1053,22 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          uint64_t n_tok, uint64_t in_dim,
                                          void **data_out, void **scale_out,
                                          int *sf_pitch) {
+    /* Every refusal below is named (L189): the callers used to reset their
+     * pointers to NULL and continue, and the miss surfaced layers later under
+     * the consuming GEMM's name. */
     if (!x || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0 ||
         !data_out || !scale_out || !sf_pitch) {
+        fprintf(stderr, "pulsar: E4M3 act slot: bad request (x=%d n_tok=%llu in_dim=%llu; in_dim must be a "
+                        "non-zero multiple of 32, every out pointer non-NULL) -- refusing\n",
+                x != NULL, (unsigned long long)n_tok, (unsigned long long)in_dim);
         return 0;
     }
     mxfp8_act_cache_t *s = act_slot_acquire(x->ptr, n_tok, in_dim);
-    if (!s) return 0;
+    if (!s) {
+        fprintf(stderr, "pulsar: E4M3 act slot: no slot for buffer %p (n_tok=%llu in_dim=%llu) -- refusing\n",
+                x->ptr, (unsigned long long)n_tok, (unsigned long long)in_dim);
+        return 0;
+    }
     const int ntok = (int)n_tok;
     const int KBp  = pulsar_mx_kbp((int)in_dim);
     const size_t sx_bytes = pulsar_mx_sf_slab_bytes(ntok, KBp);
@@ -1072,12 +1076,18 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                  (size_t)(n_tok * in_dim), "act data") ||
         !mxfp8_act_cache_reserve((void **)&s->sx, &s->sx_cap,
                                  sx_bytes, "act scale")) {
+        fprintf(stderr, "pulsar: E4M3 act slot: device reserve failed (data %llu B, scale %llu B; "
+                        "n_tok=%llu in_dim=%llu) -- refusing\n",
+                (unsigned long long)(n_tok * in_dim), (unsigned long long)sx_bytes,
+                (unsigned long long)n_tok, (unsigned long long)in_dim);
         return 0;
     }
     /* The quantizer memsets the scale slab because pulsar_mx_sfoff leaves holes when
      * rows/blocks are not multiples of 128/4; a producer filling only the live
-     * (row, kb) pairs must do the same or the GEMM reads stale swizzle slots. */
-    if (cudaMemsetAsync(s->sx, 0, sx_bytes, 0) != cudaSuccess) return 0;
+     * (row, kb) pairs must do the same or the GEMM reads stale swizzle slots.
+     * cuda_ok: an unchecked failure here left the error sticky for the next
+     * unrelated check to report under its own name (L189). */
+    if (!cuda_ok(cudaMemsetAsync(s->sx, 0, sx_bytes, 0), "E4M3 act slot scale-slab memset")) return 0;
     *data_out  = s->xq;
     *scale_out = s->sx;
     *sf_pitch  = KBp;
@@ -2023,13 +2033,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                          * shape, exactly like the n==1 twin: a gate PASS cannot
                          * tell "the A8 arm ran" from "the A8 arm never ran", and
                          * a silently-missed cache would look identical. */
-                        static uint64_t seen_nt[16] = {0};
-                        static int n_seen_nt = 0;
-                        const uint64_t key = (in_dim << 32) ^ out_dim;
-                        int known = 0;
-                        for (int i = 0; i < n_seen_nt; i++) if (seen_nt[i] == key) { known = 1; break; }
-                        if (!known && n_seen_nt < 16) {
-                            seen_nt[n_seen_nt++] = key;
+                        static pulsar_shape_once seen_nt = {};
+                        if (pulsar_shape_once_first(&seen_nt, pulsar_shape_key(in_dim, out_dim),
+                                                    "verify-batch GEMV W8A8 announce")) {
                             fprintf(stderr, "pulsar: verify-batch GEMV W8A8 (E4M3 acts) for "
                                             "in_dim=%llu out_dim=%llu\n",
                                     (unsigned long long)in_dim, (unsigned long long)out_dim);
@@ -2106,13 +2112,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                      * an in_dim-only key reported the first and silently hid the
                      * other two -- an under-reporting diagnostic, which is the
                      * one failure mode a diagnostic must not have. */
-                    static uint64_t seen[16] = {0};
-                    static int n_seen = 0;
-                    const uint64_t key = (in_dim << 32) ^ out_dim;
-                    int known = 0;
-                    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { known = 1; break; }
-                    if (!known && n_seen < 16) {
-                        seen[n_seen++] = key;
+                    static pulsar_shape_once seen = {};
+                    if (pulsar_shape_once_first(&seen, pulsar_shape_key(in_dim, out_dim),
+                                                "decode GEMV W8A8 announce")) {
                         fprintf(stderr, "pulsar: decode GEMV W8A8 (E4M3 acts) for "
                                         "in_dim=%llu out_dim=%llu\n",
                                 (unsigned long long)in_dim, (unsigned long long)out_dim);

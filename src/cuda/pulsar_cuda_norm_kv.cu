@@ -1175,12 +1175,8 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         return 0;
     }
     if (q_skip_f32) {
-        static uint32_t seen_n[8] = {0};
-        static int n_seen = 0;
-        int known = 0;
-        for (int i = 0; i < n_seen; i++) if (seen_n[i] == q_n) { known = 1; break; }
-        if (!known && n_seen < 8) {
-            seen_n[n_seen++] = q_n;
+        static pulsar_shape_once seen = {};
+        if (pulsar_shape_once_first(&seen, pulsar_shape_key(q_n, 0u), "qr_norm f32 skip announce")) {
             fprintf(stderr, "pulsar: qr_norm f32 store SKIPPED (q_n=%u rows=%u, %.1f MiB)\n",
                     q_n, rows, (double)q_n * rows * sizeof(float) / (1024.0 * 1024.0));
         }

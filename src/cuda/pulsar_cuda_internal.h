@@ -421,6 +421,58 @@ extern int g_cublas_ready;
 extern cublasLtHandle_t g_cublaslt;
 extern std::unordered_set<uint64_t> g_fp8_offsets;
 
+/* ---- once-per-shape bookkeeping that never goes quiet (L189) ----
+ *
+ * The announce and refusal lines that prove which arm ran (rule 5) and which
+ * precondition refused (rule 9) are printed once per distinct shape.  Until
+ * L189 every such site kept `static uint64_t seen[16]` and stopped RECORDING
+ * at the 17th shape, so a new shape after sixteen was neither printed nor
+ * counted -- a refusal in silence, forever, at exactly the instrument
+ * ENGINEERING-RULES.md section 1 names as the enforcement mechanism.
+ *
+ * This table records every distinct key it is given (open-addressed, 256
+ * slots, one probe on the hot repeat) and counts EVERY call.  When it is full
+ * it says so once, with the running call count, and keeps counting; the
+ * caller's own return value (refuse / launch) is never affected. */
+#define PULSAR_SHAPE_ONCE_CAP 256u
+struct pulsar_shape_once {
+    uint64_t keys[PULSAR_SHAPE_ONCE_CAP];   ///< 0 = empty; stored keys carry bit 63 so none is 0
+    uint32_t n_keys;                         ///< distinct shapes recorded
+    uint64_t n_calls;                        ///< every call, listed or not
+    int      full_said;                      ///< the "further shapes not listed" line printed
+};
+
+/** The (a, b) shape pair as a table key -- (in_dim, out_dim), (q_n, 0), ... */
+static inline uint64_t pulsar_shape_key(uint64_t a, uint64_t b) {
+    return (a << 32) ^ b;
+}
+
+/** Count this call; return 1 exactly once per distinct `key` (the caller then
+ * prints its line, which may quote t->n_calls).  A full table prints once, with
+ * `what` and the call count, that further shapes are not listed, and returns 0. */
+static inline int pulsar_shape_once_first(pulsar_shape_once *t, uint64_t key, const char *what) {
+    t->n_calls++;
+    const uint64_t k = key | (1ull << 63);
+    uint32_t i = (uint32_t)((k ^ (k >> 29) ^ (k >> 47)) & (PULSAR_SHAPE_ONCE_CAP - 1u));
+    for (uint32_t probe = 0; probe < PULSAR_SHAPE_ONCE_CAP; probe++) {
+        const uint64_t cur = t->keys[i];
+        if (cur == k) return 0;
+        if (cur == 0) {
+            t->keys[i] = k;
+            t->n_keys++;
+            return 1;
+        }
+        i = (i + 1u) & (PULSAR_SHAPE_ONCE_CAP - 1u);
+    }
+    if (!t->full_said) {
+        t->full_said = 1;
+        fprintf(stderr, "pulsar: %s: %u distinct shapes recorded, table full -- further shapes are NOT "
+                        "listed (calls so far: %llu; every call is still counted)\n",
+                what, t->n_keys, (unsigned long long)t->n_calls);
+    }
+    return 0;
+}
+
 /* ---- shared host functions ---- */
 
 #include "pulsar_cuda_scratch.h"   /* cuda_tmp_alloc + the slotted bump arena */

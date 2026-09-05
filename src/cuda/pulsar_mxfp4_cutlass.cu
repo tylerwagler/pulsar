@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include "pulsar_gpu.h"
+#include "pulsar_cuda_internal.h"   /* cuda_ok: every launch and memset on the hot path is checked here (L189) */
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
@@ -192,7 +193,7 @@ static int swiglu_pack_activation(uint8_t *A_data, ElementSF *A_sf,
     fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3 fused (M=%d K=%d)\n", M, K);
   }
   swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(A_data, tSFA, gate, up, w, clamp, M, K);
-  return 0;
+  return cuda_ok(cudaGetLastError(), "grouped MoE swiglu->E4M3 pack launch") ? 0 : 1;
 }
 
 /* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
@@ -238,14 +239,16 @@ __global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
   tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[pulsar_mx_sfoff(src, kb, src_kbp)]);
 }
 
-static void gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
-                                   const void *src_q, const void *src_sf, int src_kbp,
-                                   const int32_t *row_src, int M, int K){
+/* Returns 0 on success, 1 when the gather launch failed (named; L189). */
+static int gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
+                                  const void *src_q, const void *src_sf, int src_kbp,
+                                  const int32_t *row_src, int M, int K){
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
   const int nb = M * (K / 32), t = 128, b = (nb + t - 1) / t;
   gather_act_e4m3_kernel<<<b,t>>>(A_data, tSFA, (const uint8_t*)src_q, (const uint8_t*)src_sf,
                                   src_kbp, row_src, M, K);
+  return cuda_ok(cudaGetLastError(), "grouped MoE E4M3 activation gather launch") ? 0 : 1;
 }
 
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
@@ -431,9 +434,28 @@ static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int 
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta  = 0.0f;
   GGemm gemm;
-  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 1;
-  if (gemm.initialize(args, workspace) != cutlass::Status::kSuccess) return 2;
-  return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+  /* Each failure is named (L189): the callers fold every non-zero into "grouped
+   * GEMM failed", and an unchecked launch error used to surface under the NEXT
+   * kernel's cuda_ok. */
+  cutlass::Status st = gemm.can_implement(args);
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM can_implement refused (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 1;
+  }
+  st = gemm.initialize(args, workspace);
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM initialize failed (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 2;
+  }
+  st = gemm.run();
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM run failed (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 3;
+  }
+  return cuda_ok(cudaGetLastError(), "grouped CUTLASS GEMM launch") ? 0 : 4;
 }
 
 /** Byte offsets carving one scratch allocation for the GROUPED (MoE) FFN.
@@ -518,8 +540,10 @@ int pulsar_cutlass_grouped_moe(
   void *ws_gu = L.ws_bytes ? (void*)(scratch + L.ws_gu_off) : nullptr;
   void *ws_dn = L.ws_bytes ? (void*)(scratch + L.ws_dn_off) : nullptr;
 
-  cudaMemsetAsync(xSF, 0, L.xSF_bytes);
-  cudaMemsetAsync(midSF, 0, L.midSF_bytes);
+  /* A missed zeroing here reads stale swizzle slots in the GEMM (see the E4M3
+   * slot note in pulsar_cuda_matmul.cu) -- so the memsets are checked (L189). */
+  if (!cuda_ok(cudaMemsetAsync(xSF, 0, L.xSF_bytes), "grouped MoE xSF memset")) return 3;
+  if (!cuda_ok(cudaMemsetAsync(midSF, 0, L.midSF_bytes), "grouped MoE midSF memset")) return 3;
 
   // Fill the whole padded A operand once (one global SF layout; per-group slices below).
   // The A operand is the E4M3 the producing norm emitted, permuted into the
@@ -530,7 +554,7 @@ int pulsar_cutlass_grouped_moe(
     return -2;
   }
   (void)x_gathered;
-  gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim);
+  if (gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim) != 0) return 3;
 
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   long pmt_in  = grouped_per_mtile_sfA(in_dim);
@@ -540,17 +564,20 @@ int pulsar_cutlass_grouped_moe(
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
       gate_w,gate_stride,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (gate)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
       up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (up)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   if (swiglu_pack_activation(midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
       down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (down)")) return 3;
   if (run_grouped_gemm(n_total_expert, dn, ws_dn, sm) != 0) return 3;
   return 0;
 }
@@ -602,7 +629,7 @@ int pulsar_cutlass_grouped_proj(
    * whole encode (it used to pack the identical values twice). g_build_arrays
    * only READS xA/xSF, so nothing between the calls can have touched them. */
   if (!reuse_packed_a) {
-    cudaMemsetAsync(xSF, 0, xSF_bytes);
+    if (!cuda_ok(cudaMemsetAsync(xSF, 0, xSF_bytes), "grouped projection xSF memset")) return 3;
     /* Producer handover (L089): when the norm already emitted these rows as
      * E4M3, permute THOSE bytes into the CUTLASS layout instead of gathering
      * f32 and re-encoding it.  Identical shape to pulsar_cutlass_grouped_moe's
@@ -616,13 +643,14 @@ int pulsar_cutlass_grouped_proj(
       return -2;
     }
     (void)x_gathered;
-    gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim);
+    if (gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim) != 0) return 3;
   }
   long pmt = grouped_per_mtile_sfA(in_dim);
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   g_build_arrays<<<bb,bt>>>(g.prob, g.ptrA,g.dA,g.ptrSFA,g.lSFA, g.ptrB,g.dB,g.ptrSFB,g.lSFB,
       g.ptrC,g.dC,g.ptrD,g.dD, counts, padded_offsets, xA,(const uint8_t*)xSF, pmt,
       W_base, W_stride, W_data_bytes, out, out_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped projection g_build_arrays")) return 3;
   return run_grouped_gemm(n_total_expert, g, ws, sm) == 0 ? 0 : 3;
 }
 
