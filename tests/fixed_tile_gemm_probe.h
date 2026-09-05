@@ -31,6 +31,12 @@ int fb_run(struct fb_ctx *c, int tn, const pulsar_gpu_tensor *x, int M, pulsar_g
 /* L183: emit the engine-format bf16 activation plane for x's first M rows into xb
  * (the slot from pulsar_gpu_bf16_act_slot), so the engine's bf16 arm has a producer. */
 int fb_emit_plane(const pulsar_gpu_tensor *x, int M, int K, void *xb);
+/* L183: cuBLASLt bf16 with the reduction scheme pinned to NONE -- the candidate
+ * neutral arm for the plain-weight family; heuristic per M like the engine's
+ * shape cache.  Same return codes as ft_run. */
+struct lt_ctx *lt_prepare(const uint16_t *host_w_bf16, int N, int K, int m_max);
+int lt_run(struct lt_ctx *c, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D);
+void lt_release(struct lt_ctx *c);
 void fb_release(struct fb_ctx *c);
 #ifdef __cplusplus
 }

@@ -59,7 +59,8 @@ typedef struct {
     pulsar_gpu_tensor *x, *out;
     uint64_t in_dim, out_dim;
     ft_ctx *ft;     /* MXFP8 arm */
-    fb_ctx *fb;     /* bf16 arm */
+    fb_ctx *fb;     /* bf16 fixed-tile arm */
+    lt_ctx *lt;     /* L183: cuBLASLt bf16, reduction NONE (prefill mode, plain weights) */
     int tn;
 } ctx_t;
 
@@ -68,8 +69,23 @@ static bool engine_launch(void *v, uint32_t M) {
     if (c->w->type == PULSAR_TENSOR_BF16)
         return pulsar_gpu_matmul_bf16_tensor(c->out, c->e->model.map, c->e->model.size,
                                              c->w->abs_offset, c->in_dim, c->out_dim, c->x, M) != 0;
+    if (c->w->type == PULSAR_TENSOR_F32)
+        return pulsar_gpu_matmul_f32_tensor(c->out, c->e->model.map, c->e->model.size,
+                                            c->w->abs_offset, c->in_dim, c->out_dim, c->x, M) != 0;
     return pulsar_gpu_matmul_mxfp8_tensor(c->out, c->e->model.map, c->e->model.size,
                                           c->w->abs_offset, c->in_dim, c->out_dim, c->x, M) != 0;
+}
+static bool lt_launch(void *v, uint32_t M) {
+    ctx_t *c = (ctx_t *)v;
+    return lt_run(c->lt, c->x, (int)M, c->out) == 0;
+}
+/* host RNE f32 -> bf16, for the plain F32 weights' bf16 copy (the engine converts once at load) */
+static uint16_t f32_to_bf16_host(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t)(u >> 16);   /* inf/nan: truncate */
+    const uint32_t lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    return (uint16_t)(u >> 16);
 }
 static bool ft_launch(void *v, uint32_t M) {
     ctx_t *c = (ctx_t *)v;
@@ -114,11 +130,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "layer %u lacks a needed tensor\n", il);
         return 1;
     }
-    struct { const char *name; const pulsar_tensor *w; } shapes[] = {
+    /* L183 prefill mode adds the plain-weight family the census found M-dependent:
+     * the router and the compressor projections (F32 source, bf16 copy). */
+    const pulsar_tensor *comp_kv = L->attn_compressor_kv, *comp_gate = L->attn_compressor_gate,
+                        *icomp_kv = L->indexer_compressor_kv;
+    struct shape_t { const char *name; const pulsar_tensor *w; };
+    shape_t shapes_all[] = {
         {"attn_q_b", L->attn_q_b}, {"attn_output_b", L->attn_output_b},
         {"ffn_gate_shexp", L->ffn_gate_shexp}, {"attn_q_a", L->attn_q_a},
         {"router (bf16)", L->ffn_gate_inp}, {"output head (bf16)", e->weights.output},
+        {"attn_compressor_kv (plain)", comp_kv}, {"attn_compressor_gate (plain)", comp_gate},
+        {"indexer_compressor_kv (plain)", icomp_kv},
     };
+    const size_t n_shapes = prefill ? sizeof(shapes_all) / sizeof(shapes_all[0])
+                                    : sizeof(shapes_all) / sizeof(shapes_all[0]) - 3u;
+    shape_t *shapes = shapes_all;
     const uint32_t Ms_decode[] = {1, 2, 4, 5, 8, 9, 12, 16};
     const uint32_t Ms_prefill[] = {6, 7, 2048, 4096, 4097};
     const uint32_t *Ms = prefill ? Ms_prefill : Ms_decode;
@@ -136,10 +162,12 @@ int main(int argc, char **argv) {
                "(GEMV/nt arms, <= %u rows); ft64/ft128 = fixed CUTLASS tile (MXFP8: 128xTNx128 block-scaled; "
                "bf16: 64xTNx32 mma.sync)\n\n",
                il, reps, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
-    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+    for (size_t si = 0; si < n_shapes; si++) {
         const pulsar_tensor *w = shapes[si].w;
-        const bool is_bf16 = w->type == PULSAR_TENSOR_BF16;
-        if (!is_bf16 && w->type != PULSAR_TENSOR_MXFP8_LT) { printf("%s: type %u is neither MXFP8_LT nor BF16, skipped\n\n", shapes[si].name, (unsigned)w->type); continue; }
+        if (!w) { printf("%s: absent at layer %u, skipped\n\n", shapes[si].name, il); continue; }
+        const bool is_f32 = w->type == PULSAR_TENSOR_F32;
+        const bool is_bf16 = w->type == PULSAR_TENSOR_BF16 || is_f32;   /* the plain family: one bf16 core */
+        if (!is_bf16 && w->type != PULSAR_TENSOR_MXFP8_LT) { printf("%s: type %u is neither MXFP8_LT nor plain, skipped\n\n", shapes[si].name, (unsigned)w->type); continue; }
         ctx_t c;
         memset(&c, 0, sizeof c);
         c.e = e; c.w = w; c.in_dim = w->dim[0]; c.out_dim = w->dim[1];
@@ -172,11 +200,23 @@ int main(int argc, char **argv) {
         const size_t data_bytes = (size_t)N * K;
         unsigned long long sfb_mismatch = 0;
         double wbytes;
+        std::vector<uint16_t> wb16;
         if (is_bf16) {
-            c.fb = fb_prepare(host, N, K, (int)MMAX);
+            const uint16_t *wb = (const uint16_t *)host;
+            if (is_f32) {
+                wb16.resize((size_t)N * K);
+                const float *wf = (const float *)host;
+                for (size_t i = 0; i < wb16.size(); i++) wb16[i] = f32_to_bf16_host(wf[i]);
+                wb = wb16.data();
+            }
+            c.fb = fb_prepare((const uint8_t *)wb, N, K, (int)MMAX);
             if (!c.fb) { fprintf(stderr, "fb_prepare failed for %s\n", shapes[si].name); return 1; }
+            if (prefill) {
+                c.lt = lt_prepare(wb, N, K, (int)MMAX);
+                if (!c.lt) { fprintf(stderr, "lt_prepare failed for %s\n", shapes[si].name); return 1; }
+            }
             wbytes = (double)K * (double)N * 2.0;
-            printf("%s  K=%d N=%d  (%.1f MB bf16)\n", shapes[si].name, K, N, wbytes / 1e6);
+            printf("%s  K=%d N=%d  (%.1f MB bf16%s)\n", shapes[si].name, K, N, wbytes / 1e6, is_f32 ? " copy of F32" : "");
         } else {
             c.ft = ft_prepare(host, host + data_bytes, N, K, (int)MMAX, &sfb_mismatch);
             if (!c.ft) { fprintf(stderr, "ft_prepare failed for %s\n", shapes[si].name); return 1; }
@@ -202,6 +242,11 @@ int main(int argc, char **argv) {
         }
         (void)pulsar_gpu_matmul_set_batch_decode_rows(0);
         if (!read_out(c.out, ref_eng_max, (uint64_t)MMAX * N)) { rc = 1; break; }
+        std::vector<float> ref_lt_max, cur_lt;
+        if (c.lt) {
+            if (!lt_launch(&c, MMAX) || ft_sync() != 0) { fprintf(stderr, "lt at M=%u failed for %s\n", MMAX, shapes[si].name); rc = 1; break; }
+            if (!read_out(c.out, ref_lt_max, (uint64_t)MMAX * N)) { rc = 1; break; }
+        }
         for (int mi = 0; mi < NM; mi++) {
             const uint32_t M = Ms[mi];
             if (!prefill && !pulsar_gpu_matmul_set_batch_decode_rows((int)M)) { rc = 1; break; }
@@ -232,10 +277,22 @@ int main(int argc, char **argv) {
             if (bad_eng)
                 printf("        engine: %llu of %llu floats differ from the %u-row call\n",
                        (unsigned long long)bad_eng, (unsigned long long)M * N, MMAX);
+            if (c.lt) {
+                const double tl = time_launches(lt_launch, &c, M, reps);
+                if (tl < 0) { fprintf(stderr, "lt failed at M=%u for %s\n", M, shapes[si].name); rc = 1; break; }
+                if (!read_out(c.out, cur_lt, (uint64_t)M * N)) { rc = 1; break; }
+                uint64_t bad_lt = 0;
+                for (uint64_t i = 0; i < (uint64_t)M * N; i++)
+                    if (memcmp(&cur_lt[i], &ref_lt_max[i], sizeof(float)) != 0) bad_lt++;
+                const double dl = max_abs_diff(cur_lt, ref_eng, (uint64_t)M * N);
+                printf("        lt-NONE: %9.1f us  (%.2fx engine)  neutral %s  max|lt-engine| %.3e\n",
+                       tl, te > 0 ? tl / te : 0.0, bad_lt == 0 ? "YES" : "NO", dl);
+            }
         }
         printf("\n");
         if (c.ft) ft_release(c.ft);
         if (c.fb) fb_release(c.fb);
+        if (c.lt) lt_release(c.lt);
         pulsar_gpu_tensor_free(c.x);
         pulsar_gpu_tensor_free(c.out);
         if (rc) break;

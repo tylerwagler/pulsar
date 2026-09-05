@@ -10,6 +10,7 @@
 //
 // PRICING ONLY.  Nothing here is reachable from the engine.
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -343,5 +344,91 @@ extern "C" void fb_release(fb_ctx *c) {
     cudaFree(c->W); cudaFree(c->A);
     if (c->ws64) cudaFree(c->ws64);
     if (c->ws128) cudaFree(c->ws128);
+    delete c;
+}
+
+
+/* L183: the candidate neutral arm for the PLAIN-weight family -- cuBLASLt bf16
+ * with CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK = NONE, the same preference
+ * the engine's MXFP8 arm sets (matmul.cu).  Heuristic per M, like the engine's
+ * shape cache; the point of the mask is that every candidate accumulates over K
+ * in a fixed order, so which one the heuristic picks cannot change the bytes.
+ * Timed against the engine's cublasGemmEx(CUBLAS_GEMM_DEFAULT) on the same
+ * bf16 plane to price the split-K it gives up at small M. */
+struct lt_ctx {
+    int N, K, m_max;
+    uint16_t *W;      // bf16 [N][K], device
+    uint16_t *A;      // bf16 [m_max][K], device (the probe's plane)
+    cublasLtHandle_t h;
+    cublasLtMatmulDesc_t op;
+    cublasLtMatrixLayout_t la;
+    cublasLtMatmulPreference_t pf;
+    void *ws; size_t wz;
+    std::vector<char> have;
+    std::vector<cublasLtMatmulAlgo_t> algo;
+};
+
+extern "C" lt_ctx *lt_prepare(const uint16_t *host_w_bf16, int N, int K, int m_max) {
+    if (m_max < 1) return nullptr;
+    lt_ctx *c = new lt_ctx();
+    c->N = N; c->K = K; c->m_max = m_max;
+    c->have.assign((size_t)m_max + 2u, 0);
+    c->algo.resize((size_t)m_max + 2u);
+    const size_t wbytes = (size_t)N * K * 2;
+    if (ft_check(cudaMalloc(&c->W, wbytes), "lt malloc W") ||
+        ft_check(cudaMemcpy(c->W, host_w_bf16, wbytes, cudaMemcpyHostToDevice), "lt copy W") ||
+        ft_check(cudaMalloc(&c->A, (size_t)m_max * K * 2), "lt malloc A")) return nullptr;
+    c->wz = 32ull << 20;
+    if (ft_check(cudaMalloc(&c->ws, c->wz), "lt malloc ws")) return nullptr;
+    if (cublasLtCreate(&c->h) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "lt: handle\n"); return nullptr; }
+    if (cublasLtMatmulDescCreate(&c->op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(c->op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof tA);
+    cublasLtMatmulDescSetAttribute(c->op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof tB);
+    /* A = W^T: stored [N][K] row-major == column-major K x N, ld = K */
+    if (cublasLtMatrixLayoutCreate(&c->la, CUDA_R_16BF, K, N, K) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    if (cublasLtMatmulPreferenceCreate(&c->pf) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    cublasLtMatmulPreferenceSetAttribute(c->pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &c->wz, sizeof c->wz);
+    uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+    cublasLtMatmulPreferenceSetAttribute(c->pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof red);
+    return c;
+}
+
+extern "C" int lt_run(lt_ctx *c, const pulsar_gpu_tensor *x, int M, pulsar_gpu_tensor *D) {
+    if (!c || !x || !D || M < 1 || M > c->m_max) return 4;
+    if (x->bytes < (uint64_t)M * c->K * sizeof(float) || D->bytes < (uint64_t)M * c->N * sizeof(float)) return 5;
+    const uint64_t n = (uint64_t)M * c->K;
+    fb_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256>>>(c->A, (const float *)x->ptr, n);
+    if (cudaGetLastError() != cudaSuccess) return 10;
+    cublasLtMatrixLayout_t lb, ld;
+    if (cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, c->K, M, c->K) != CUBLAS_STATUS_SUCCESS) return 6;
+    if (cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, c->N, M, c->N) != CUBLAS_STATUS_SUCCESS) { cublasLtMatrixLayoutDestroy(lb); return 6; }
+    int rc = 0;
+    if (!c->have[(size_t)M]) {
+        cublasLtMatmulHeuristicResult_t hr; int got = 0;
+        if (cublasLtMatmulAlgoGetHeuristic(c->h, c->op, c->la, lb, ld, ld, c->pf, 1, &hr, &got) != CUBLAS_STATUS_SUCCESS || got == 0) {
+            fprintf(stderr, "lt: no NONE-reduction algo for M=%d N=%d K=%d\n", M, c->N, c->K);
+            rc = 7;
+        } else { c->algo[(size_t)M] = hr.algo; c->have[(size_t)M] = 1; }
+    }
+    if (rc == 0) {
+        const float al = 1.0f, be = 0.0f;
+        cublasStatus_t st = cublasLtMatmul(c->h, c->op, &al, c->W, c->la, c->A, lb, &be,
+                                           (float *)D->ptr, ld, (float *)D->ptr, ld,
+                                           &c->algo[(size_t)M], c->ws, c->wz, 0);
+        if (st != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "lt: matmul failed (%d) at M=%d\n", (int)st, M); rc = 8; }
+    }
+    cublasLtMatrixLayoutDestroy(lb);
+    cublasLtMatrixLayoutDestroy(ld);
+    return rc;
+}
+
+extern "C" void lt_release(lt_ctx *c) {
+    if (!c) return;
+    cublasLtMatmulPreferenceDestroy(c->pf);
+    cublasLtMatrixLayoutDestroy(c->la);
+    cublasLtMatmulDescDestroy(c->op);
+    cublasLtDestroy(c->h);
+    cudaFree(c->W); cudaFree(c->A); cudaFree(c->ws);
     delete c;
 }
