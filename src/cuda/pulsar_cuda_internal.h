@@ -416,8 +416,6 @@ struct fp8_mx_weight {
 
 /* ---- shared host globals ---- */
 
-extern cublasHandle_t g_cublas;
-extern int g_cublas_ready;
 extern cublasLtHandle_t g_cublaslt;
 extern std::unordered_set<uint64_t> g_fp8_offsets;
 
@@ -484,7 +482,6 @@ void cuda_fp8_weight_cache_clear(void);
 int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm);
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
 int cuda_ok(cudaError_t err, const char *what);
-int cublas_ok(cublasStatus_t st, const char *what);
 
 /* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */
 

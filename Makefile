@@ -1034,6 +1034,7 @@ GATE_TARGETS = unit-test-gate \
 # and watch after every edit.  These four are the ones that actually catch a
 # numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
+#   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
 #   cuda-frontier-gate       frontier logits across banks
 #   cuda-mixed-neutrality-gate  the small-n_tok / m-neutral split shapes
 #   cuda-attn-gates          attention kernel + bank isolation

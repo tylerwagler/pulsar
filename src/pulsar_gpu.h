@@ -1294,8 +1294,9 @@ int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
-/** Rebuild the 8-row ratio-4 compressor state from a chunk's tail, already
- *  projected as DECODE rows: `kv_tail`/`sc_tail` hold the last complete group
+/** Rebuild the 8-row ratio-4 compressor state from a chunk's tail -- the
+ *  chunk's own kv / score projections (the prefill arm, M-neutral since L183):
+ *  `kv_tail`/`sc_tail` hold the last complete group
  *  (`n_full` = 4 rows, or 0 when the chunk has none) followed by the partial
  *  group (`rem` = 0..3 rows), in position order; `pos0` is the position of tail
  *  row 0 and must be ratio-aligned.  Lays them out exactly as

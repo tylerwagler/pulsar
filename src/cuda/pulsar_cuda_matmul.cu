@@ -2236,8 +2236,98 @@ int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map
  * pointer straight into the mmap) and pulsar_gpu_matmul_f32_tensor (F32-source
  * storage, pointer into the once-converted bf16 copy -- see
  * f32_weight_bf16_resolve).  Everything numeric lives HERE, so the two weight
- * families cannot drift: same activation cache, same NT/GemmEx/GEMV arms,
+ * families cannot drift: same activation cache, same NT/cuBLASLt/GEMV arms,
  * same M-independence contract. */
+/* L183: the prefill arm of the plain-weight family (router, compressor kv/gate,
+ * output head -- bf16 source, or F32 source through its once-converted bf16
+ * copy) runs cuBLASLt with the reduction scheme pinned to NONE, the contract the
+ * MXFP8 arm already had (cuda_matmul_fp8_mx_window).  Every candidate kernel
+ * then accumulates over K in one fixed order, so the bytes a row gets cannot
+ * depend on how many rows share the call.  cublasGemmEx(CUBLAS_GEMM_DEFAULT)
+ * sat here until 2026-09-05 and was free to pick split-K for these tall-skinny
+ * shapes below ~4095 rows -- and did: the router and the compressor
+ * projections gave a token different bytes in a 6-row chunk and a 4097-row
+ * chunk (L183 census), which is what made a prompt's logits depend on its
+ * chunking (L180) and a warm-fork resume a different computation from a cold
+ * prefill.  Measured on the real shapes: same bytes and within noise at 4096
+ * rows (that kernel class already ran there), +9 us per call on the N=256
+ * shapes at small M -- under a millisecond per prompt.  Shape-keyed cache as
+ * the MXFP8 arm's: desc/layout/heuristic once per (in, out, ntok). */
+static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
+                          uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    if (!cublaslt_ensure()) {
+        fprintf(stderr, "pulsar: bf16 GEMM on prefill rows: cuBLASLt handle not ready -- refusing\n");
+        return 0;
+    }
+    struct bf16_lt_cache {
+        uint64_t in_dim, out_dim; int ntok; int valid;
+        cublasLtMatmulDesc_t op;
+        cublasLtMatrixLayout_t la, lb, ld;
+        cublasLtMatmulHeuristicResult_t h;
+    };
+    /* thread_local for the reason the MXFP8 cache is: eviction destroys the
+     * descriptors in the slot it takes. */
+    static thread_local bf16_lt_cache cache[16];
+    static thread_local int cache_next;
+    const int ntok = (int)n_tok;
+    const size_t wz = 32u << 20;
+    bf16_lt_cache *e = NULL;
+    for (int i = 0; i < 16; i++) {
+        if (cache[i].valid && cache[i].in_dim == in_dim && cache[i].out_dim == out_dim && cache[i].ntok == ntok) {
+            e = &cache[i]; break;
+        }
+    }
+    if (!e) {
+        bf16_lt_cache ne = {};
+        ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
+        if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+        /* the same geometry cublasGemmEx had: D(out x ntok) = W^T(out x in) . X(in x ntok) */
+        cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_16BF, in_dim, out_dim, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_16BF, in_dim, ntok, in_dim);
+        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, out_dim, ntok, out_dim);
+        cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
+        cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
+        {
+            uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
+        }
+        int got = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
+        cublasLtMatmulPreferenceDestroy(pf);
+        if (hs != CUBLAS_STATUS_SUCCESS || !got) {
+            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
+            cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
+            fprintf(stderr, "pulsar: bf16 GEMM on prefill rows (n_tok=%llu in_dim=%llu out_dim=%llu): no "
+                            "fixed-order cuBLASLt kernel -- refusing\n",
+                    (unsigned long long)n_tok, (unsigned long long)in_dim, (unsigned long long)out_dim);
+            return 0;
+        }
+        ne.valid = 1;
+        e = &cache[cache_next];
+        cache_next = (cache_next + 1) & 15;
+        if (e->valid) {
+            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
+            cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
+        }
+        *e = ne;
+    }
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, wz, "bf16 lt scratch")) return 0;
+    void *ws = cuda_arena_take(&ar, wz, 256);
+    if (!ws) return 0;
+    const float al = 1.0f, be = 0.0f;
+    cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, w, e->la, xb, e->lb, &be,
+                                       out, e->ld, out, e->ld, &e->h.algo, ws, wz, cudaStreamPerThread);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "pulsar: cuBLASLt bf16 matmul failed: status %d\n", (int)st);
+        return 0;
+    }
+    return 1;
+}
+
 static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
                             uint64_t in_dim, uint64_t out_dim,
                             const pulsar_gpu_tensor *x, uint64_t n_tok) {
@@ -2306,29 +2396,12 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * and was the bug. */
     {
         /* Row kind (see the header at g_batch_decode_rows): prefill rows take
-         * cublasGemmEx at any n_tok, one included; decode rows take the nt
-         * kernels at 2..cap and the one-row kernel below at 1. */
+         * the fixed-order cuBLASLt arm at any n_tok, one included (L183);
+         * decode rows take the nt kernels at 2..cap and the one-row kernel
+         * below at 1. */
         const int decode_kind = g_batch_decode_rows > 0;
         if (!decode_kind) {
-            if (!g_cublas_ready) {
-                fprintf(stderr, "pulsar: bf16 GEMM on prefill rows (n_tok=%llu in_dim=%llu out_dim=%llu): "
-                                "cuBLAS handle not ready -- refusing\n", (unsigned long long)n_tok,
-                        (unsigned long long)in_dim, (unsigned long long)out_dim);
-                return 0;
-            }
-            const uint16_t *xb = (const uint16_t *)xb16;
-            const float alpha = 1.0f;
-            const float beta = 0.0f;
-            cublasStatus_t st = cublasGemmEx(g_cublas,
-                                             CUBLAS_OP_T, CUBLAS_OP_N,
-                                             (int)out_dim, (int)n_tok, (int)in_dim,
-                                             &alpha,
-                                             w, CUDA_R_16BF, (int)in_dim,
-                                             xb, CUDA_R_16BF, (int)in_dim,
-                                             &beta,
-                                             out->ptr, CUDA_R_32F, (int)out_dim,
-                                             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-            return cublas_ok(st, "bf16 matmul");
+            return bf16_lt_matmul(out->ptr, w, (const uint16_t *)xb16, in_dim, out_dim, n_tok);
         }
         if (n_tok >= 2) {
             #define PULSAR_NT_LAUNCH_R(N, RR) matmul_nt_kernel<N, RR, __nv_bfloat16, __nv_bfloat16><<<g, 256>>>( \

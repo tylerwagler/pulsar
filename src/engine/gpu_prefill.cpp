@@ -112,16 +112,19 @@ bool gpu_graph_upload_prompt_tokens(
 
 
 
-/* Rebuild the ratio-4 compressor state from a chunk's tail, re-projected as
- * DECODE rows (the M-independent arm, n <= 7): the state is what the decode
- * path would have stored for those positions, so the window a following
- * decode token folds into is built by the decode kernels rather than by the
- * chunk's tensor-core projection.  The tail is the last COMPLETE group of four
- * (when the chunk has one) plus the partial group of rem = n_tokens % 4 rows;
- * pulsar_gpu_compressor_prefill_state_ratio4_tensor lays them out as the
- * decode store does (rows 0..3 complete, 4 + phase partial).  Until L168 the
- * tail was the last four rows written at 0..3 regardless of alignment, which
- * dropped the partial group for every whole prompt with n_tokens % 4 != 0.
+/* Rebuild the ratio-4 compressor state from a chunk's tail: the last COMPLETE
+ * group of four (when the chunk has one) plus the partial group of
+ * rem = n_tokens % 4 rows, taken from the chunk's OWN kv / score projections
+ * (batch_comp_kv/_sc, the prefill arm).  pulsar_gpu_compressor_prefill_state_ratio4_tensor
+ * lays them out as the decode store does (rows 0..3 complete, 4 + phase
+ * partial).  Until L168 the tail was the last four rows written at 0..3
+ * regardless of alignment, which dropped the partial group for every whole
+ * prompt with n_tokens % 4 != 0.  Until L183 the tail was RE-PROJECTED on the
+ * decode arm (the nt kernels, 4..7 rows) in the name of parity with the decode
+ * store; that arm gave different bytes at 4 and at 5 rows for the plain
+ * weights, so the state depended on the chunk's remainder and no parity was
+ * had.  The prefill arm is M-neutral since L183: the rows a chunk projected
+ * are the rows any chunking would have projected, and the state copies them.
  * Chunk starts are ratio-aligned at every caller (chunk multiples, or 0); an
  * unaligned start is refused, not laid out by the wrong phase. */
 static bool gpu_graph_refresh_ratio4_compressor_state(
@@ -129,8 +132,6 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
         const pulsar_model  *model,
         pulsar_gpu_tensor *state_kv,
         pulsar_gpu_tensor *state_score,
-        const pulsar_tensor *kv_weight,
-        const pulsar_tensor *score_weight,
         const pulsar_tensor *ape,
         uint32_t          head_dim,
         uint32_t          width,
@@ -145,7 +146,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                         "(n_tokens=%u) -- refusing\n", pos0, n_tokens);
         return false;
     }
-    if (!g || !model || !state_kv || !state_score || !kv_weight || !score_weight || !ape ||
+    if (!g || !model || !state_kv || !state_score || !ape ||
         head_dim == 0 || width == 0) {
         return false;
     }
@@ -153,38 +154,17 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
     const uint32_t n_full = n_tokens >= 4u ? 4u : 0u;
     const uint32_t n_tail = n_full + rem;
 
-    /* Re-project the tail rows as decode rows into comp_tail_kv/_sc.  The
-     * chunk's own projections sit in batch_comp_kv/_sc, from the prefill
-     * (tensor-core) arm, whose accumulation order differs -- and they must
-     * stay there: gpu_graph_proj_ring_deposit_tail reads that buffer's last
-     * eight rows AFTER this rebuild.  Writing the re-projection into
-     * batch_comp_kv rows 0..n_tail-1 handed the ring tail tokens under head
-     * positions for every 5..11-token chunk (L171). */
-    pulsar_decode_rows_scope rows(n_tail);
-    if (!rows.ok()) return false;
-    pulsar_gpu_tensor *tail_hc = pulsar_gpu_tensor_view(
-            g->batch_attn_norm,
-            (uint64_t)(n_tokens - n_tail) * PULSAR_N_EMBD * sizeof(float),
-            (uint64_t)n_tail * PULSAR_N_EMBD * sizeof(float));
-    bool ok = tail_hc != NULL;
-    if (ok) {
-        ok = gpu_graph_matmul_plain_tensor(g->comp_tail_kv,
-                                              model,
-                                              kv_weight,
-                                         PULSAR_N_EMBD,
-                                         width,
-                                         tail_hc,
-                                         n_tail) != 0;
-    }
-    if (ok) {
-        ok = gpu_graph_matmul_plain_tensor(g->comp_tail_sc,
-                                             model,
-                                             score_weight,
-                                         PULSAR_N_EMBD,
-                                         width,
-                                         tail_hc,
-                                         n_tail) != 0;
-    }
+    /* The tail rows are copied out of batch_comp_kv/_sc into comp_tail_kv/_sc
+     * rather than read in place: gpu_graph_proj_ring_deposit_tail reads that
+     * buffer's last eight rows AFTER this rebuild, and the rebuild kernel must
+     * not write there (L171: writing into batch_comp_kv rows 0..n_tail-1
+     * handed the ring tail tokens under head positions for every 5..11-token
+     * chunk).  Stream-ordered async copies: the consumer is the rebuild kernel
+     * on the same stream. */
+    const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t src_off = (uint64_t)(n_tokens - n_tail) * row_bytes;
+    bool ok = pulsar_gpu_tensor_copy_async(g->comp_tail_kv, 0, g->batch_comp_kv, src_off, (uint64_t)n_tail * row_bytes) != 0 &&
+              pulsar_gpu_tensor_copy_async(g->comp_tail_sc, 0, g->batch_comp_sc, src_off, (uint64_t)n_tail * row_bytes) != 0;
     if (ok) {
         ok = pulsar_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
                                                               state_score,
@@ -199,7 +179,6 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                                               n_full,
                                                               rem) != 0;
     }
-    pulsar_gpu_tensor_free(tail_hc);
     return ok;
 }
 
@@ -1151,8 +1130,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      model,
                                                                      g->layer_attn_state_kv[il],
                                                                      g->layer_attn_state_score[il],
-                                                                     layer->attn_compressor_kv,
-                                                                     layer->attn_compressor_gate,
                                                                      layer->attn_compressor_ape,
                                                                      PULSAR_N_HEAD_DIM,
                                                                      comp_width,
@@ -1288,7 +1265,6 @@ bool gpu_graph_encode_layer_attention_batch(
                 if (ok && ratio == 4) {
                     ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
                             st_kv, st_sc,
-                            layer->attn_compressor_kv, layer->attn_compressor_gate,
                             layer->attn_compressor_ape, PULSAR_N_HEAD_DIM, comp_width,
                             pos0, n_tokens);
                 }
@@ -1583,8 +1559,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      model,
                                                                      g->layer_index_state_kv[il],
                                                                      g->layer_index_state_score[il],
-                                                                     layer->indexer_compressor_kv,
-                                                                     layer->indexer_compressor_gate,
                                                                      layer->indexer_compressor_ape,
                                                                      PULSAR_N_INDEXER_HEAD_DIM,
                                                                      index_width,
@@ -1700,7 +1674,6 @@ bool gpu_graph_encode_layer_attention_batch(
                     if (ok) {
                         ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
                                 ist_kv, ist_sc,
-                                layer->indexer_compressor_kv, layer->indexer_compressor_gate,
                                 layer->indexer_compressor_ape, PULSAR_N_INDEXER_HEAD_DIM,
                                 index_width, pos0, n_tokens);
                     }

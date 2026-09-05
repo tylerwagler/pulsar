@@ -46,10 +46,8 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 
 
-cublasHandle_t g_cublas;
 
 
-int g_cublas_ready;
 
 
 
@@ -862,11 +860,6 @@ static void cuda_model_range_release_all(void) {
 
 
 
-int cublas_ok(cublasStatus_t st, const char *what) {
-    if (st == CUBLAS_STATUS_SUCCESS) return 1;
-    fprintf(stderr, "pulsar: cuBLAS %s failed: status %d\n", what, (int)st);
-    return 0;
-}
 
 
 
@@ -909,39 +902,11 @@ int pulsar_gpu_init(void) {
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
     }
-    if (!g_cublas_ready) {
-        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        /* The whole build uses the per-thread default stream (Makefile
-         * --default-stream per-thread) so the decode tape is capturable into
-         * a CUDA graph; cuBLAS must launch onto the same stream. */
-        (void)cublasSetStream(g_cublas, cudaStreamPerThread);
-        /* f32 MEANS f32 on every cuBLAS call (Tyler, 2026-08-18).
-         *
-         * This line used to say CUBLAS_TF32_TENSOR_OP_MATH, set once at handle
-         * creation with no comment and no measurement, which silently gave a
-         * 10-bit mantissa to every f32 GEMM that reaches cuBLAS:
-         *   - pulsar_gpu_matmul_f32_tensor above the nt cap (n_tok > 4), which
-         *     prefill runs for every F32 weight including the compressor
-         *     projections, so it reached the COMPRESSED KV;
-         *   - attention's four cublasSgemmStridedBatched arms (since deleted).
-         * Neither call site chose it or could see it.
-         *
-         * It also made the width-4 nt cap a PRECISION cliff on top of the
-         * M-independence contract it was actually there to express: true f32 at
-         * widths 1..4, TF32 above, same weight.  One threshold, two unrelated
-         * meanings.  The contract stays; the precision change goes.
-         *
-         * Set explicitly rather than deleted: DEFAULT_MATH is the cuBLAS default,
-         * but stating it records the decision so the TF32 line does not come back
-         * as a free-looking speedup.
-         *
-         * ⚠ This is a DELIBERATE NUMERICS CHANGE.  It moves every prefill logit
-         * and the compressed KV bytes, so PREFILL_BASELINE_REF moves with it --
-         * that is what the re-baseline in the next commit is for, and why this
-         * is not a cleanup. */
-        (void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
-        g_cublas_ready = 1;
-    }
+    /* No classic cuBLAS handle since L183: the last cublasGemmEx (the
+     * plain-weight prefill arm) moved to cuBLASLt, which every GEMM now uses
+     * and whose handle matmul.cu creates on first use.  The Lt descs say
+     * CUBLAS_COMPUTE_32F -- f32 MEANS f32 (Tyler, 2026-08-18): no TF32 math
+     * mode exists to set. */
     return 1;
 }
 
@@ -952,11 +917,6 @@ void pulsar_gpu_cleanup(void) {
     {   /* L188: the flag is process state; a later engine open must start clear */
         uint32_t nf_layer = 0u; const char *nf_arm = NULL;
         (void)pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
-    }
-    if (g_cublas_ready) {
-        (void)cublasDestroy(g_cublas);
-        g_cublas_ready = 0;
-        g_cublas = NULL;
     }
     /* Invalidate the fp8 weight-pointer cache BEFORE freeing the model arenas
      * it points into -- a later engine open in this process would otherwise be
