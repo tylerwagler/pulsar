@@ -375,7 +375,8 @@ static void attn_f16_kernel(
     __shared__ float  sM[AF16_HPB], sL[AF16_HPB];
 
     /* ---- Q fragments, once, into registers -----------------------------
-     * Warp w owns k-steps [ (w>>1)*KPW, +KPW ) of head-block M=16.  Q is
+     * Warp w works job = w & 3 (M-tile, n-tile) and k-group kgrp = w >> 2,
+     * owning k-steps [ kgrp*AF16_KPW, +AF16_KPW ) of its M-tile.  Q is
      * constant for the whole kernel, so this is loaded once and never re-read;
      * that is the entire reason phase 1 splits k rather than n. */
     /* 4 jobs = 2 M-tiles x 2 n-tiles; 4 warps split k within each job. */

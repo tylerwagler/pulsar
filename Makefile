@@ -973,6 +973,11 @@ GATE_TARGETS = unit-test-gate \
 	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates \
 	cuda-runner-gate
+# Every gate target is phony, declared HERE where the list is defined (the
+# .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
+# file named like a gate would otherwise satisfy make and print nothing -- the
+# silent-PASS shape the tracked-binary incident documented (L178).
+.PHONY: $(GATE_TARGETS) cuda-mseq-rewind-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- 17 gates, each loading ~76 GiB of weights, with

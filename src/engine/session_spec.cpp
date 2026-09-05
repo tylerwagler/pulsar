@@ -704,12 +704,13 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
      * pulsar_sample_dist_draw would still consume an rng word and shift the
      * stream). It is also the fast path we do not want to slow down.
      *
-     * The vocab check is a correctness guard, not an optimization: p is built
-     * over PULSAR_N_VOCAB target logits and q over the drafter's vocab_size. If
-     * they disagree the two are not distributions over the same space (and the
-     * row copy would overrun), so fall back to argmax proposals + the
-     * deterministic accept rule, which needs no q. */
-    const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
+     * The proposal rule follows the temperature alone.  p is built over
+     * PULSAR_N_VOCAB target logits and q over the drafter's vocab, and those
+     * are the same space by construction: dspark_weights_validate_layout dies
+     * at load on a support model whose vocab differs.  A `vocab_size ==
+     * PULSAR_N_VOCAB` clause used to sit here and read as a live fallback to
+     * argmax proposals; it could never be false past load (L176). */
+    const bool sample_drafts = temperature > 0.0f;
     if (sample_drafts) {
         /* n_draft rows, not the whole PULSAR_SPEC_LOGITS_ROWS slab: the depth is
          * bounded per engine, so this is ~n_draft x 0.5 MB per session rather
@@ -1209,9 +1210,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      *     was drawn from a temperature-matched q_i, so accept w.p.
      *     min(1, p_i/q_i) and on rejection draw the residual (p_i - q_i)+.
      *     Acceptance is NOT capped at p_i(mode).
-     *   - argmax proposal (drafter/target vocab mismatch fallback): the
-     *     deterministic rule — accept w.p. p_i(pend[i]), residual p_i with
-     *     pend[i] excluded. Capped at p_i(mode).
+     *   - argmax proposal (temperature == 0): the deterministic rule -- accept
+     *     w.p. p_i(pend[i]), residual p_i with pend[i] excluded. Capped at
+     *     p_i(mode).
      * The rejected row's replacement becomes the carry token. All three paths
      * yield the exact per-token target distribution. */
     int carry_tok = -1;
@@ -2057,10 +2058,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
 int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds,
                                       const uint32_t *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
-    pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = &s->graph;
-    const pulsar_dspark_weights *w = &e->dspark_weights;
-    const uint32_t vocab_size = w->vocab_size;
     if (!rounds || !banks || !rngs || n <= 0) return 0;
     if (!g->dspark_markov_logits || !g->dspark_refined_ids ||
         !g->dspark_bank_meta || !g->dspark_conf_scores || !g->dspark_conf_tokens ||
@@ -2072,11 +2070,25 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
      * and in the bank arrays */
     int order[PULSAR_DSPARK_BANKS_MAX];
     int n_sel = 0, n_g = 0;
+    if (n > (int)PULSAR_DSPARK_BANKS_MAX) {
+        /* The drafter's batch buffers hold PULSAR_DSPARK_BANKS_MAX banks; the
+         * scheduler can pass up to PULSAR_MSEQ_MAX live rounds under an
+         * operator PULSAR_MSEQ_BANKS pin (auto-size stops at 8).  Rounds past
+         * the cap never get done = true and take base-only rounds for the
+         * rest of the request -- say so once instead of silently (L177). */
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "pulsar: redraft batch: %d live rounds but the drafter batch holds %u banks -- "
+                            "rounds past the cap draft nothing this request (raise nothing: pin fewer banks)\n",
+                    n, (unsigned)PULSAR_DSPARK_BANKS_MAX);
+        }
+    }
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < n && n_sel < (int)PULSAR_DSPARK_BANKS_MAX; i++) {
             spec_redraft_req *q = &rounds[i]->redraft;
             if (!q->valid || q->n_draft == 0) continue;
-            const bool sampled = q->temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
+            const bool sampled = q->temperature > 0.0f;   /* vocab pinned at load; see the drafting loop */
             if ((pass == 0) != !sampled) continue;
             q->sample_drafts = sampled;
             order[n_sel++] = i;

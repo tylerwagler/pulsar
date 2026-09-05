@@ -787,6 +787,20 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
+     * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
+     * clamps kstep to 1 and the step exceeds the chunk cap on every quantum
+     * (every decode slot errors, then the decode-only retry errors too).
+     * PULSAR_CUDA_PREFILL_CHUNK accepts any value >= 1, so refuse the pooled
+     * configuration here instead (L177). */
+    if (s.pool_banks && cfg.engine.prefill_chunk != 0 &&
+        cfg.engine.prefill_chunk < (uint32_t)PULSAR_SESSION_POOL_CAP + 1u) {
+        server_log(PULSAR_LOG_ERROR,
+                   "pulsar-server: prefill_chunk %u is below the pooled minimum %d "
+                   "(PULSAR_SESSION_POOL_CAP + 1): the batched lanes cannot fit a step -- refusing to start",
+                   cfg.engine.prefill_chunk, PULSAR_SESSION_POOL_CAP + 1);
+        return 1;
+    }
     s.live_bank = 0;
     /* L118 (everything is a batch): the three-way scheduler, its
      * spec_max_live crossover knob (PULSAR_SERVER_SPEC_MAX_LIVE), and the

@@ -2484,11 +2484,6 @@ bool gpu_graph_env_flag(const char *name, int *cache);
  * PULSAR_PREFILL_SLICE env override went with L159 inc 4).
  */
 uint32_t gpu_graph_prefill_slice(void);
-/* True when PULSAR_IDX_FP4 is set (cached). When on, the ratio-4 indexer
- * compressed cache is stored MXKV-FP4-packed (PULSAR_ENGINE_IDXFP4_ROWBYTES/row,
- * 7.5x smaller than f32) and the indexer score kernels read it packed.  The
- * cache rows are QAT-roundtripped to exactly these fp4 values in both modes,
- * so scores and outputs are bit-identical; only storage and traffic change. */
 /** Comp-cache row stride in bytes for the active storage format (pack-aware). */
 uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
 pulsar_gpu_tensor *gpu_graph_attn_comp_update_target(

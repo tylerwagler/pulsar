@@ -264,6 +264,9 @@ int main(int argc, char **argv) {
          * prefill has the decode store's layout (complete group at 0..3,
          * partial rows at 4 + phase) and its content, at r = 1, 2, 3. */
         {"cuda-comp-state-gate",      gate_comp_state_gate_main,        1, NULL, NULL, {NULL}},
+        /* L175: the same assertions on the banked layout (per-layer caches are
+         * bank views with a pool, owning allocations without one). */
+        {"cuda-comp-state-gate-banked", gate_comp_state_gate_main,      2, NULL, NULL, {NULL}},
     };
     /* Configuration D: drafter depth 1 (the gate sets dspark_draft_tokens). */
     const gate_spec group_depth1[] = {
