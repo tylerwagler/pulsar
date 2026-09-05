@@ -20,7 +20,10 @@
  * A one-ulp kernel change shows as a 1e-4 move; two points is unambiguous.
  *
  * Both p and q are built with the production sampling transform (temperature
- * 1.0, top_k 0, top_p 1.0, min_p 0.05), the shape the served lane runs.
+ * 1.0, top_k 0, top_p 1.0, min_p 0.05), the shape the served lane runs.  The
+ * corpus is tests/teacher_forced_corpus.txt, a FROZEN snapshot of three
+ * engineering documents (never edit it: the numbers are only comparable over
+ * the same tokens).
  *
  *   ./tests/spec_teacher_forced_probe MODEL [positions=2000] [start=512]
  */
@@ -99,12 +102,17 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_session *s = NULL;
     pulsar_spec_round *r = NULL;
     pulsar_tokens toks; memset(&toks, 0, sizeof toks);
-    float *logits = NULL;
+    float *logits = NULL, *prow = NULL;
     pulsar_sample_scratch scratch; memset(&scratch, 0, sizeof scratch);
     {
         size_t text_len = 0;
-        char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-        if (!text) { fprintf(stderr, "prompt file read failed (run from the repo root)\n"); goto done; }
+        /* NOT the long-context story blob: that file is a needle-in-haystack
+         * prompt whose passages repeat 38 times, and a drafter with a 128-row
+         * window nails a repeat (draft == truth climbed to 0.87 over 2000
+         * positions).  The corpus is a frozen snapshot of three engineering
+         * documents -- natural, non-repeating prose, ~8k tokens. */
+        char *text = read_file("tests/teacher_forced_corpus.txt", &text_len);
+        if (!text) { fprintf(stderr, "corpus read failed (run from the repo root)\n"); goto done; }
         pulsar_tokenize_text(e, text, &toks);
         free(text);
         /* the forced carry may run up to 17 tokens past the last measured position */
@@ -124,8 +132,9 @@ int GATE_ENTRY(int argc, char **argv) {
         const int width = pulsar_engine_logits_width(e);
         const int eos = pulsar_token_eos(e);
         logits = (float *)malloc((size_t)17 * (size_t)width * sizeof(float));
+        prow = (float *)malloc((size_t)width * sizeof(float));
         r = pulsar_spec_round_new();
-        if (!logits || !r) goto done;
+        if (!logits || !prow || !r) goto done;
 
         char err[256];
         {
@@ -186,10 +195,19 @@ int GATE_ENTRY(int argc, char **argv) {
                 if (have_q) pulsar_sample_dist_free(&qd);
                 goto done;
             }
-            /* p: the target after `first`, row 0 of the block, production transform */
+            /* p: the target after `first` = the round's row 0, read from the
+             * device: with the compact block armed the host block is not the
+             * row (L149 phase 2 -- round_end reads the compact headers and
+             * fetches a full row only when it needs one), and a uniform p is
+             * exactly what an unwritten block measured as (E[accept] 1.6e-5). */
             if (have_q) {
+                if (!gpu_graph_read_spec_logits_row(&s->graph, 0u, prow)) {
+                    fprintf(stderr, "spec logits row 0 read failed at %d\n", pos);
+                    pulsar_sample_dist_free(&qd);
+                    goto done;
+                }
                 pulsar_sample_dist pd; memset(&pd, 0, sizeof pd);
-                if (!pulsar_sample_dist_build(logits, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &pd)) {
+                if (!pulsar_sample_dist_build(prow, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &pd)) {
                     fprintf(stderr, "p build failed at %d\n", pos);
                     pulsar_sample_dist_free(&qd);
                     goto done;
@@ -256,6 +274,7 @@ int GATE_ENTRY(int argc, char **argv) {
 done:
     pulsar_sample_scratch_free(&scratch);
     free(logits);
+    free(prow);
     if (r) pulsar_spec_round_free(r);
     pulsar_tokens_free(&toks);
     if (s) pulsar_session_free(s);
