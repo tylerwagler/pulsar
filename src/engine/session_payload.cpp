@@ -845,6 +845,7 @@ int pulsar_session::load_snapshot(const pulsar_session_snapshot *snap, char *err
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
     }
+    gpu_graph_grid_snapshot_drop(&s->graph, gpu_graph_cur_bank(&s->graph));   /* L183: new history */
     if (snap->len > (uint64_t)SIZE_MAX) {
         payload_set_err(err, errlen, "session snapshot is too large for this platform");
         return 1;

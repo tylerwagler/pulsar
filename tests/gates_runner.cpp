@@ -60,6 +60,7 @@ int gate_mixed_neutrality_gate_main(int, char **);
 int gate_spec_sampling_gate_main(int, char **);
 int gate_mseq_short_ctx_probe_main(int, char **);
 int gate_comp_state_gate_main(int, char **);
+int gate_chunk_neutrality_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
@@ -293,6 +294,11 @@ int main(int argc, char **argv) {
      * blind to.  Same binary, same env scrub, so it runs beside the prefill gate. */
     const gate_spec prefill_decode = {"cuda-prefill-decode-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                       {"--check-decode", decode_baseline, decode_ref, NULL}};
+    /* L183: the same tokens under four chunkings (cold, 6-row first chunk, two
+     * mid-size chunks, off-grid warm resume) give byte-identical frontier and
+     * next-step logits.  Same engine config as the prefill gate (chunk 4096,
+     * drafter off), so it runs beside it. */
+    const gate_spec chunk_neutrality = {"cuda-chunk-neutrality-gate", gate_chunk_neutrality_gate_main, 1, NULL, NULL, {NULL}};
     const gate_spec ref_story = {"cuda-reference-gate-story", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                  {"--check-reference", story_ref, story_tok, ref_tol, "--known-high", "512,30464",
                                   NULL}};
@@ -308,7 +314,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) RUN(group_default[i]);
     for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) RUN(group_depth1[i]);
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
-    RUN(prefill); RUN(prefill_decode);
+    RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality);
     if (have_ref) {
         /* --known-flip and --kl-baseline are appended per blob: the story blob
          * carries a documented argmax flip at 512; the KL budgets grade

@@ -759,6 +759,16 @@ typedef struct {
      * exactly like the live-state views (repoint already drops the baked
      * batched-copy tables, so the snapshot fast path re-prepares per bank).
      * NULL when the pool is spec-less. */
+    /** L183: the GRID snapshot lanes -- the compressor state as it stood when a
+     *  prefill chunk ended on the chunk grid (a multiple of prefill_cap), one
+     *  lane per bank, same shape as the live state lanes.  A resume recomputes
+     *  from the last grid boundary at or below its checkpoint so that its chunk
+     *  boundaries are the cold prefill's; the state the resumed chunk folds
+     *  into is this snapshot.  Always allocated (small). */
+    pulsar_gpu_tensor *grid_askv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *grid_assc[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *grid_iskv[PULSAR_MAX_LAYER];  ///< ratio-4 layers only
+    pulsar_gpu_tensor *grid_issc[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention KV; NULL when the pool is spec-less
     pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention score
     pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer KV
@@ -887,6 +897,16 @@ typedef struct {
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
      * saved frontiers. */
+    /** L183: pool-less twins of the grid snapshot lanes (NULL when banked --
+     *  the banked snapshot lives in banks.grid_*); see gpu_graph_grid_snapshot_save. */
+    pulsar_gpu_tensor *grid_attn_state_kv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *grid_attn_state_score[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *grid_index_state_kv[PULSAR_MAX_LAYER];
+    pulsar_gpu_tensor *grid_index_state_score[PULSAR_MAX_LAYER];
+    /** L183: the grid position each bank's snapshot was taken at; 0 = none
+     *  (a snapshot at position 0 is meaningless: a resume from 0 is a cold
+     *  prefill).  Indexed by bank, index 0 for a pool-less graph. */
+    uint32_t grid_snap_pos[PULSAR_MSEQ_MAX];
     pulsar_gpu_tensor *spec_attn_state_kv[PULSAR_MAX_LAYER];     ///< saved attention compressed KV frontier, per layer
     pulsar_gpu_tensor *spec_attn_state_score[PULSAR_MAX_LAYER];  ///< saved attention compressed scores, per layer
     pulsar_gpu_tensor *spec_index_state_kv[PULSAR_MAX_LAYER];    ///< saved indexer compressed KV frontier, per layer
@@ -2736,6 +2756,18 @@ bool gpu_graph_verify_suffix_tops(
         int                   *row_tops,
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
+
+/** L183 grid snapshot (see pulsar_bank_slabs::grid_askv).  save: copy the live
+ *  bank's compressor state lanes (attention every compressing layer, indexer on
+ *  ratio-4 layers) into the bank's grid lane and stamp `pos` (a multiple of
+ *  prefill_cap, > 0).  restore: the reverse, only if the bank's stamp is `pos`
+ *  (else false, nothing touched).  drop: forget a bank's snapshot (its history
+ *  changed: invalidate, payload load, disk restore, a rewind below the stamp).
+ *  pos: the stamp, 0 = none. */
+bool     gpu_graph_grid_snapshot_save(pulsar_gpu_graph *g, uint32_t pos);
+bool     gpu_graph_grid_snapshot_restore(pulsar_gpu_graph *g, uint32_t pos);
+void     gpu_graph_grid_snapshot_drop(pulsar_gpu_graph *g, uint32_t bank);
+uint32_t gpu_graph_grid_snapshot_pos(const pulsar_gpu_graph *g, uint32_t bank);
 /** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
  * spec_logits rows [row0, row0+n_rows) and read the compact block into
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to

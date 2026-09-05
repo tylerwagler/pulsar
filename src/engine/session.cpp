@@ -845,6 +845,42 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             }
             if (ahead) s->rewind(s->checkpoint.len);
         }
+        /* L183: a resume is a COLD PREFILL FROM THE LAST GRID BOUNDARY.  A prefill
+         * chunk's bytes depend on the chunk's row count, on a row's offset within
+         * the call (the tall-K HC-mix kernel) and on where the compressed rows a
+         * chunk attends were split (the mixed attention tier) -- measured L180,
+         * L183.  So a suffix evaluated from an off-grid checkpoint is a different
+         * computation from the cold prefill of the same tokens, and a warm-fork
+         * resume served different logits than a fresh request would.  The rule:
+         * rewind to G = the last multiple of the chunk grid at or below the
+         * checkpoint, restore the compressor state the prefill snapshotted when
+         * it crossed G, and evaluate [G, N) -- the chunker cuts on the absolute
+         * grid, so every chunk boundary is the cold prefill's and every kernel
+         * sees the call it would have seen.  Cost: up to prefill_cap - 1 tokens
+         * recomputed per resume (measured 2026-09-05: 1.75 s average at 4096;
+         * Tyler chose 4096 over the -10% prefill of a 2048 grid).  Without a
+         * snapshot at G (a bank restored from disk, a fresh pool slot) the
+         * resume IS the cold prefill from 0 -- the same computation, slower,
+         * said once. */
+        if (prompt->len > s->checkpoint.len && s->prefill_cap != 0 &&
+            (uint32_t)s->checkpoint.len % s->prefill_cap != 0) {
+            const uint32_t grid = ((uint32_t)s->checkpoint.len / s->prefill_cap) * s->prefill_cap;
+            const uint32_t bank = gpu_graph_cur_bank(&s->graph);
+            if (grid != 0 && gpu_graph_grid_snapshot_pos(&s->graph, bank) == grid) {
+                s->rewind((int)grid);
+                if (!gpu_graph_grid_snapshot_restore(&s->graph, grid)) {
+                    snprintf(err, errlen, "grid snapshot restore at %u failed", grid);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+            } else {
+                if (grid != 0) {
+                    fprintf(stderr, "pulsar: resume at %d has no grid snapshot at %u on bank %u -- "
+                                    "prefilling the prompt from 0\n", s->checkpoint.len, grid, bank);
+                }
+                s->rewind(0);
+            }
+        }
         const int suffix = prompt->len - s->checkpoint.len;
         if (suffix > 0) {
             bool cancelled = false;
@@ -1373,6 +1409,7 @@ void pulsar_session::invalidate() {
      * drafter-relative, so restarting at 0 is exact. */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
+    gpu_graph_grid_snapshot_drop(&s->graph, gpu_graph_cur_bank(&s->graph));   /* L183: the history is gone */
     /* The projection-ring span describes the bank the views pointed at when
      * it was deposited; after a repoint + invalidate it still advertised the
      * OLD bank's positions over the NEW bank's lanes, and a rewind before the
@@ -1402,6 +1439,9 @@ void pulsar_session::rewind(int pos) {
      * from the prompt capture on the next prefill, or from commits). */
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
+    /* L183: a grid snapshot above the new frontier is a future that never happened */
+    if (gpu_graph_grid_snapshot_pos(&s->graph, gpu_graph_cur_bank(&s->graph)) > (uint32_t)pos)
+        gpu_graph_grid_snapshot_drop(&s->graph, gpu_graph_cur_bank(&s->graph));
     /* L120: reconcile the compressor frontiers with the rewound position.
      * Stage B's rollforward assigns layer_n_comp/layer_n_index_comp
      * ABSOLUTELY at the round's committed frontier (gpu_prefill.cpp,

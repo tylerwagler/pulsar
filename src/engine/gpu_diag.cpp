@@ -411,6 +411,10 @@ static bool gpu_graph_bank_slabs_alloc(
         }
         b->askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
         b->assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        /* L183 grid snapshot lanes: written by a save before any restore reads them. */
+        b->grid_askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        b->grid_assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+        ok = ok && b->grid_askv[il] && b->grid_assc[il];
         if (enable_spec) {
             /* No fill: a snapshot always writes a lane before its restore
              * reads it, and nothing else reads these. */
@@ -444,6 +448,9 @@ static bool gpu_graph_bank_slabs_alloc(
             }
             b->iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
             b->issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            b->grid_iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            b->grid_issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            ok = ok && b->grid_iskv[il] && b->grid_issc[il];
             if (enable_spec) {
                 b->spec_iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
                 b->spec_issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
@@ -725,6 +732,22 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
                 if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
                                                  b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
                                                  b->astate_bank_bytes[il]) != 0;
+                /* L183: a snapshot at or below the cut is history dst keeps. */
+                if (ok && g->grid_snap_pos[src] && g->grid_snap_pos[src] <= R) {
+                    ok = pulsar_gpu_tensor_copy(b->grid_askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                                b->grid_askv[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                                b->astate_bank_bytes[il]) != 0 &&
+                         pulsar_gpu_tensor_copy(b->grid_assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                                b->grid_assc[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                                b->astate_bank_bytes[il]) != 0;
+                    if (ok && ratio == 4u)
+                        ok = pulsar_gpu_tensor_copy(b->grid_iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                                    b->grid_iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                                    b->istate_bank_bytes[il]) != 0 &&
+                             pulsar_gpu_tensor_copy(b->grid_issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                                    b->grid_issc[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                                    b->istate_bank_bytes[il]) != 0;
+                }
                 if (ok && ratio == 4u) {
                     ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
                                              ((uint64_t)keep4 + 1u) * idx_row) != 0;
@@ -767,6 +790,7 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
     g->ms_r128_undo_head[dst] = 0u;
     g->ms_r128_undo_n[dst] = 0u;
     if (ok) g->ms_emit_keep[dst] = keep4 + 1u;
+    g->grid_snap_pos[dst] = (ok && g->grid_snap_pos[src] <= R) ? g->grid_snap_pos[src] : 0u;
     return ok;
 }
 
@@ -808,6 +832,22 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
         if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
                                          b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
                                          b->astate_bank_bytes[il]) != 0;
+        /* L183: the grid snapshot travels with the history it belongs to. */
+        if (ok && g->grid_snap_pos[src]) {
+            ok = pulsar_gpu_tensor_copy(b->grid_askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                        b->grid_askv[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                        b->astate_bank_bytes[il]) != 0 &&
+                 pulsar_gpu_tensor_copy(b->grid_assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
+                                        b->grid_assc[il], (uint64_t)src * b->astate_bank_bytes[il],
+                                        b->astate_bank_bytes[il]) != 0;
+            if (ok && ratio == 4)
+                ok = pulsar_gpu_tensor_copy(b->grid_iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                            b->grid_iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                            b->istate_bank_bytes[il]) != 0 &&
+                     pulsar_gpu_tensor_copy(b->grid_issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
+                                            b->grid_issc[il], (uint64_t)src * b->istate_bank_bytes[il],
+                                            b->istate_bank_bytes[il]) != 0;
+        }
         if (ratio == 4) {
             const uint64_t isz = (uint64_t)g->ms_n_index_comp[src][il] * idx_row;
             if (ok && isz) ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, isz) != 0;
@@ -826,7 +866,89 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
     g->ms_proj_ring_hi[dst] = 0u;
     g->ms_r128_undo_head[dst] = 0u;
     g->ms_r128_undo_n[dst] = 0u;
+    g->grid_snap_pos[dst] = ok ? g->grid_snap_pos[src] : 0u;
     return ok;
+}
+
+/* ---- L183: the grid snapshot (see the lanes' note in pulsar_bank_slabs) ---- */
+
+/* The four lanes a bank's snapshot lives in, with the byte offset of that bank;
+ * pool-less graphs use the owned twins at offset 0. */
+static bool grid_snapshot_lanes(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
+                                pulsar_gpu_tensor **akv, pulsar_gpu_tensor **asc,
+                                pulsar_gpu_tensor **ikv, pulsar_gpu_tensor **isc,
+                                uint64_t *aoff, uint64_t *abytes, uint64_t *ioff, uint64_t *ibytes) {
+    const uint32_t ratio = pulsar_layer_compress_ratio(il);
+    if (ratio == 0) return false;
+    if (g->banks.n_banks) {
+        pulsar_bank_slabs *b = &g->banks;
+        *akv = b->grid_askv[il]; *asc = b->grid_assc[il];
+        *aoff = (uint64_t)bank * b->astate_bank_bytes[il]; *abytes = b->astate_bank_bytes[il];
+        *ikv = ratio == 4 ? b->grid_iskv[il] : NULL; *isc = ratio == 4 ? b->grid_issc[il] : NULL;
+        *ioff = (uint64_t)bank * b->istate_bank_bytes[il]; *ibytes = b->istate_bank_bytes[il];
+    } else {
+        *akv = g->grid_attn_state_kv[il]; *asc = g->grid_attn_state_score[il];
+        *aoff = 0; *abytes = g->layer_attn_state_kv[il] ? pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]) : 0;
+        *ikv = ratio == 4 ? g->grid_index_state_kv[il] : NULL; *isc = ratio == 4 ? g->grid_index_state_score[il] : NULL;
+        *ioff = 0; *ibytes = g->layer_index_state_kv[il] ? pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]) : 0;
+    }
+    return *akv && *asc && (ratio != 4 || (*ikv && *isc));
+}
+
+static bool grid_snapshot_copy(pulsar_gpu_graph *g, bool to_lane) {
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        pulsar_gpu_tensor *akv, *asc, *ikv, *isc; uint64_t aoff, abytes, ioff, ibytes;
+        if (pulsar_layer_compress_ratio(il) == 0) continue;
+        if (!grid_snapshot_lanes(g, il, bank, &akv, &asc, &ikv, &isc, &aoff, &abytes, &ioff, &ibytes)) {
+            fprintf(stderr, "pulsar: grid snapshot: layer %u has no lane -- refusing\n", il);
+            return false;
+        }
+        /* stream-ordered async copies: the consumer is the next chunk's kernels
+         * on the same stream (save) or the resumed prefill (restore) */
+        bool ok = to_lane
+            ? pulsar_gpu_tensor_copy_async(akv, aoff, g->layer_attn_state_kv[il], 0, abytes) != 0 &&
+              pulsar_gpu_tensor_copy_async(asc, aoff, g->layer_attn_state_score[il], 0, abytes) != 0
+            : pulsar_gpu_tensor_copy_async(g->layer_attn_state_kv[il], 0, akv, aoff, abytes) != 0 &&
+              pulsar_gpu_tensor_copy_async(g->layer_attn_state_score[il], 0, asc, aoff, abytes) != 0;
+        if (ok && ikv) {
+            ok = to_lane
+                ? pulsar_gpu_tensor_copy_async(ikv, ioff, g->layer_index_state_kv[il], 0, ibytes) != 0 &&
+                  pulsar_gpu_tensor_copy_async(isc, ioff, g->layer_index_state_score[il], 0, ibytes) != 0
+                : pulsar_gpu_tensor_copy_async(g->layer_index_state_kv[il], 0, ikv, ioff, ibytes) != 0 &&
+                  pulsar_gpu_tensor_copy_async(g->layer_index_state_score[il], 0, isc, ioff, ibytes) != 0;
+        }
+        if (!ok) {
+            fprintf(stderr, "pulsar: grid snapshot %s failed at layer %u\n", to_lane ? "save" : "restore", il);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool gpu_graph_grid_snapshot_save(pulsar_gpu_graph *g, uint32_t pos) {
+    if (!g || pos == 0 || g->prefill_cap == 0 || pos % g->prefill_cap != 0) return false;
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    if (bank >= PULSAR_MSEQ_MAX) return false;
+    g->grid_snap_pos[bank] = 0u;
+    if (!grid_snapshot_copy(g, true)) return false;
+    g->grid_snap_pos[bank] = pos;
+    return true;
+}
+
+bool gpu_graph_grid_snapshot_restore(pulsar_gpu_graph *g, uint32_t pos) {
+    if (!g || pos == 0) return false;
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    if (bank >= PULSAR_MSEQ_MAX || g->grid_snap_pos[bank] != pos) return false;
+    return grid_snapshot_copy(g, false);
+}
+
+void gpu_graph_grid_snapshot_drop(pulsar_gpu_graph *g, uint32_t bank) {
+    if (g && bank < PULSAR_MSEQ_MAX) g->grid_snap_pos[bank] = 0u;
+}
+
+uint32_t gpu_graph_grid_snapshot_pos(const pulsar_gpu_graph *g, uint32_t bank) {
+    return (g && bank < PULSAR_MSEQ_MAX) ? g->grid_snap_pos[bank] : 0u;
 }
 
 
@@ -1636,6 +1758,9 @@ bool gpu_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
                 g->layer_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->layer_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->grid_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->grid_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                state_init_ok = state_init_ok && g->grid_attn_state_kv[il] && g->grid_attn_state_score[il];
             }
             if (enable_spec) {
                 if (banked) {
@@ -1675,6 +1800,9 @@ bool gpu_graph_alloc_raw_cap(
                             (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
                     g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->grid_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->grid_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    state_init_ok = state_init_ok && g->grid_index_state_kv[il] && g->grid_index_state_score[il];
                 }
                 if (enable_spec) {
                     if (banked) {

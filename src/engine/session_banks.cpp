@@ -377,6 +377,7 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     auto *s = this;
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
     pulsar_gpu_graph *g = &s->graph;
+    gpu_graph_grid_snapshot_drop(g, bank);   /* L183: a disk-restored bank carries no grid snapshot */
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
     }

@@ -777,6 +777,13 @@ bool gpu_graph_prefill_chunked_range(
             }
             return false;
         }
+        /* L183: a chunk that ends ON the grid leaves the compressor state a
+         * resume from this boundary will fold into; snapshot it for this bank. */
+        if (g->prefill_cap && chunk_end % g->prefill_cap == 0 &&
+            !gpu_graph_grid_snapshot_save(g, chunk_end)) {
+            fprintf(stderr, "pulsar: grid snapshot at %u failed -- refusing the prefill\n", chunk_end);
+            return false;
+        }
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }

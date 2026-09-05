@@ -351,8 +351,12 @@ typedef enum {
 } pulsar_session_rewrite_result;
 
 /** Synchronize the live session to a full prompt token prefix.  If the current
- * checkpoint is a prefix, only the suffix is evaluated; otherwise the backend
- * state is refilled from scratch. */
+ * checkpoint is a prefix, the prompt is evaluated from the last CHUNK-GRID
+ * boundary at or below the checkpoint (a multiple of the engine's prefill
+ * chunk; L183: a resume is a cold prefill from that boundary, so its logits are
+ * the cold prefill's byte for byte -- the chunk boundaries, row counts and row
+ * offsets every kernel sees are the same); otherwise the backend state is
+ * refilled from scratch. */
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen);
 bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(

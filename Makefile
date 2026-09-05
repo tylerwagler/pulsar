@@ -949,6 +949,12 @@ cuda-row-neutrality-gate-deeper: tests/mseq_short_ctx_probe
 # MODEL-DEPENDENT, ~1 min.
 cuda-comp-state-gate: tests/comp_state_gate
 	./tests/comp_state_gate $(FRONTIER_MODEL)
+# L183: a prompt's logits do not depend on its chunking (cold, 6-row first
+# chunk, two mid-size chunks, off-grid warm resume -- frontier + one decode step
+# byte-identical).  The plain-weight GEMM arm's fixed reduction order is what
+# makes it hold; a split-K pick fails it from layer 0.
+cuda-chunk-neutrality-gate: tests/chunk_neutrality_gate
+	./tests/chunk_neutrality_gate $(FRONTIER_MODEL)
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
 # L182: teacher-forced drafter acceptance -- E[accept] = sum min(p, q) over a fixed
@@ -967,7 +973,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
                bank_evict_restore_gate bank_fork_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
-               comp_state_gate
+               comp_state_gate chunk_neutrality_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h
 	@mkdir -p tests/runner
@@ -1154,6 +1160,8 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 
 tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
@@ -1257,6 +1265,8 @@ cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
 tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/comp_state_gate: tests/comp_state_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
