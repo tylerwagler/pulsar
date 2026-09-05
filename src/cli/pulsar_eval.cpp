@@ -3820,6 +3820,23 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         if (token < 0)
             token = pulsar_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
+        if (token < 0) {
+            /* The sampler refused a degenerate row (L188): same exit as a
+             * failed eval -- the case is an ERROR, not a shorter answer. */
+            snprintf(err, sizeof err, "sampler refused a degenerate logits row");
+            plain_reset_color(use_plain_color);
+            ui->generated_tokens[idx] = ui->generated;
+            tui_run_clock_stop(ui);
+            fprintf(stderr, "pulsar-eval: decode failed for %s: %s\n", tc->id, err);
+            trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
+                             system, question, raw.v ? raw.v : "", think_mode,
+                             prompt_tokens, ui->generated, now_sec() - t0, "?",
+                             &think_close);
+            free(question);
+            pulsar_tokens_free(&think_close_tokens);
+            buf_free(&raw);
+            return EVAL_RUN_ERROR;
+        }
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {

@@ -300,6 +300,7 @@ static void test_long_story_fact_recall(void) {
     bool decode_ok = true;
     for (; generated < 350; generated++) {
         int token = pulsar_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         if (token == pulsar_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -1084,6 +1085,7 @@ static void test_tool_call_quality_one(void) {
     for (int i = 0; i < r.max_tokens; i++) {
         int token = pulsar_session_sample(session, r.temperature, r.top_k,
                                        r.top_p, r.min_p, &rng);
+        if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
         size_t piece_len = 0;
         char *piece = pulsar_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
@@ -1670,6 +1672,24 @@ static void test_sampler_dist_equivalence(void) {
         if (shape == 12) TEST_ASSERT(sample_argmax(logits, n) == 500);
         for (size_t c = 0; c < sizeof(samp_cfgs) / sizeof(samp_cfgs[0]); c++) {
             const samp_cfg *cfg = &samp_cfgs[c];
+            if (shape == 7) {
+                /* L188: a DEGENERATE row (no finite logit) is REFUSED, never
+                 * sampled -- the old contract (argmax of NaNs = id 0, a
+                 * one-token dist) made a broken step look like a good one.
+                 * Both entries refuse, build nothing and consume no rng. */
+                pulsar_sample_dist got;
+                TEST_ASSERT(pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
+                                                  cfg->min_p, &scratch, &got) == 0);
+                TEST_ASSERT(got.n == 0 && got.ids == NULL && got.probs == NULL);
+                uint64_t r2 = 0xABCD0000u, r3 = r2;
+                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
+                                               cfg->min_p, &r2, NULL) == PULSAR_SAMPLE_REFUSED);
+                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
+                                               cfg->min_p, &r3, &plain_scratch) == PULSAR_SAMPLE_REFUSED);
+                TEST_ASSERT(r2 == 0xABCD0000u && r3 == r2);
+                checked++;
+                continue;
+            }
             pulsar_sample_dist ref, got;
             const int ref_rc = ref_sample_dist_build(logits, n, cfg->temp, cfg->top_k,
                                                      cfg->top_p, cfg->min_p, &ref);

@@ -372,6 +372,11 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
         } else {
             int token = pulsar_session_sample(session, cfg->gen.temperature, 0,
                                            cfg->gen.top_p, cfg->gen.min_p, &rng);
+            if (token < 0) {
+                fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
+                pulsar_session_free(session);
+                return 1;
+            }
             if (token == pulsar_token_eos(engine)) break;
             int eval_rc = pulsar_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
@@ -1281,6 +1286,10 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                                            cfg->gen.top_p,
                                            cfg->gen.min_p,
                                            &rng);
+            if (token < 0) {
+                fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
+                return 1;
+            }
             if (token == pulsar_token_eos(engine)) break;
             int eval_rc = pulsar_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {

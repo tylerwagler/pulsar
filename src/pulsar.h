@@ -402,6 +402,11 @@ void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
 int pulsar_session_argmax(pulsar_session *s);
 /** pulsar_session_argmax with `excluded_id` removed from the row. @return the id, or -1. */
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
+/** Returned by pulsar_sample_logits / pulsar_session_sample when the row is
+ * DEGENERATE (no finite logit, or a probability mass that is not a positive
+ * finite number) or the arguments are unusable: no token is drawn, one line
+ * is printed, and the caller must fail its request (L188).  Never a valid id. */
+#define PULSAR_SAMPLE_REFUSED (-1)
 /** Sample one token from a logits row under (temperature, top-k, top-p,
  * min-p); the row twin of pulsar_session_sample.  Greedy (temperature <= 0)
  * consumes no rng word.

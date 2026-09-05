@@ -1213,7 +1213,7 @@ int pulsar_session::argmax_excluding(int excluded_id) {
 
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!logits || n_vocab <= 0) return 0;
+    if (!logits || n_vocab <= 0) return PULSAR_SAMPLE_REFUSED;   /* was token 0 (L188) */
     /* No session here, so no scratch to borrow: this public entry keeps the
      * malloc path. Session callers below pass their own. */
     return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p,
