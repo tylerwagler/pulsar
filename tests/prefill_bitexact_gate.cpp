@@ -215,10 +215,17 @@
  * mid-range of that window; keep it whenever the caps or the chunk loop change.
  * NOTE the coupling: this row's shape is chunk-dependent, so it only means what
  * it says while opt.prefill_chunk stays pinned at 4096 below. */
-static const uint32_t g_depths[] = { 512u, 2048u, 4096u, 4102u, 6144u };
+/* 8196 and 16388 (L175, 2026-09-04): one row past the n_comp 2048 and 4096
+ * ranking-kernel buckets (pulsar_cuda_indexer.cu: pow2<2048> -> pow2<4096> ->
+ * CUB), graded on logits.  Until then the only gate reaching those buckets
+ * was the evict/restore KV checksum, which a wrong top-k selection cannot
+ * change -- L172's CUB comparator split lived there unseen.  Both chunk as
+ * 4096 x N + 4 (8196) / 4096 x 4 + 4 (16388): a 4-row final chunk, the
+ * n_tok <= 8 window again. */
+static const uint32_t g_depths[] = { 512u, 2048u, 4096u, 4102u, 6144u, 8196u, 16388u };
 #define N_DEPTHS ((uint32_t)(sizeof(g_depths) / sizeof(g_depths[0])))
 #define MAX_DEPTHS 8u
-#define GATE_CTX 8192
+#define GATE_CTX 16512   /* 16388 + headroom; was 8192 before the L175 depths */
 
 #define BLOB_MAGIC "DS4PFXG1"
 #define BLOB_VERSION 2u
