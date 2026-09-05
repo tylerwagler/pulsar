@@ -519,16 +519,6 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
 
 
 
-static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
-    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
-    for (int i = 0; i < m->calls.len; i++) {
-        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
-    }
-    return false;
-}
-
-
-
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
@@ -539,15 +529,26 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
 
 
 
-static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
-                                                     int before,
-                                                     const char *id) {
-    if (!msgs || !id || !id[0]) return NULL;
-    if (before > msgs->len) before = msgs->len;
-    for (int i = before - 1; i >= 0; i--) {
-        if (chat_msg_has_call_id(&msgs->v[i], id)) return &msgs->v[i];
+/* call_id -> the nearest PRECEDING assistant message declaring it, built as
+ * the validators scan forward (upstream ds4 a169cffa): only assistant
+ * messages declare call ids (their calls[]), so registering each as it is
+ * passed and looking up at the tool message reproduces the nearest-preceding
+ * answer without a per-id backward rescan over an uncapped, client-supplied
+ * array (was O(n^2) per request). */
+typedef std::unordered_map<std::string, const chat_msg *> prior_call_map;
+
+static void prior_call_map_add(prior_call_map *map, const chat_msg *m) {
+    if (strcmp(m->role, "assistant")) return;
+    for (int k = 0; k < m->calls.len; k++) {
+        const char *cid = m->calls.v[k].id;
+        if (cid && cid[0]) (*map)[cid] = m;
     }
-    return NULL;
+}
+
+static const chat_msg *prior_call_map_find(const prior_call_map *map, const char *id) {
+    if (!id || !id[0]) return NULL;
+    auto it = map->find(id);
+    return it == map->end() ? NULL : it->second;
 }
 
 
@@ -577,8 +578,10 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
     const bool needs_reasoning = pulsar_think_mode_enabled(think_mode);
+    prior_call_map prior_calls;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        prior_call_map_add(&prior_calls, m);
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
 
         stop_list ids = {0};
@@ -586,7 +589,7 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = s->responses_live_has_call_id(id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            const chat_msg *prior = prior_call_map_find(&prior_calls, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
@@ -674,8 +677,10 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
     auto *s = this;
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (!msgs) return true;
+    prior_call_map prior_calls;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        prior_call_map_add(&prior_calls, m);
         if (!anthropic_msg_is_tool_result_tail(m)) continue;
 
         stop_list ids = {0};
@@ -683,7 +688,7 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = s->anthropic_live_has_call_id(id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            const chat_msg *prior = prior_call_map_find(&prior_calls, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Anthropic continuation state is not available for tool_use_id %s; retry by replaying the full messages history",

@@ -6403,6 +6403,79 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
     chat_msgs_free(&msgs);
 }
 
+/* L192 item 4 (upstream a169cffa): tool-history validation is linear -- a
+ * call_id -> nearest-preceding-assistant map built while scanning forward
+ * replaces a per-id backward rescan.  The semantics it must keep: a repeated
+ * id resolves to the LATER declaration (so its reasoning state is read from
+ * the right turn), and an id declared only AFTER the tool message is not a
+ * prior at all. */
+static void test_l192_tool_history_validation_is_nearest_preceding(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg a0 = l185_msg("assistant", "", "thought once");
+    l185_add_call(&a0, "call_a", "bash", "{}");
+    chat_msgs_push(&msgs, a0);                                   /* 0: declares call_a WITH reasoning */
+    chat_msg t1 = l185_msg("tool", "out", NULL);
+    t1.tool_call_id = xstrdup("call_a");
+    chat_msgs_push(&msgs, t1);                                   /* 1 */
+    chat_msg a2 = l185_msg("assistant", "", NULL);
+    l185_add_call(&a2, "call_a", "bash", "{}");
+    chat_msgs_push(&msgs, a2);                                   /* 2: re-declares call_a WITHOUT reasoning */
+    chat_msg t3 = l185_msg("tool", "out2", NULL);
+    t3.tool_call_id = xstrdup("call_a");
+    chat_msgs_push(&msgs, t3);                                   /* 3: nearest preceding is 2 */
+    chat_msg t4 = l185_msg("tool", "out3", NULL);
+    t4.tool_call_id = xstrdup("call_b");
+    chat_msgs_push(&msgs, t4);                                   /* 4: call_b is declared only later */
+    chat_msg a5 = l185_msg("assistant", "", NULL);
+    l185_add_call(&a5, "call_b", "bash", "{}");
+    chat_msgs_push(&msgs, a5);                                   /* 5 */
+
+    char err[200] = {0};
+    bool live_state = true, live_reasoning = false;
+    chat_msgs head = msgs;   /* shallow view */
+    head.len = 2;
+    TEST_ASSERT(s.responses_validate_tool_outputs(&head, PULSAR_THINK_HIGH, &live_state,
+                                                &live_reasoning, err, sizeof err));
+    TEST_ASSERT(!live_state && !live_reasoning);               /* prior 0 has reasoning */
+    head.len = 4;
+    live_reasoning = false;
+    TEST_ASSERT(s.responses_validate_tool_outputs(&head, PULSAR_THINK_HIGH, &live_state,
+                                                &live_reasoning, err, sizeof err));
+    TEST_ASSERT(live_reasoning);                                /* prior of 3 is 2, reasoning-less */
+    TEST_ASSERT(!s.responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH, &live_state,
+                                                 &live_reasoning, err, sizeof err));
+    TEST_ASSERT(strstr(err, "call_b") != NULL);                 /* declared after the output */
+
+    /* the Anthropic validator shares the map: tool results are user messages */
+    chat_msgs anth = {0};
+    chat_msg b0 = l185_msg("assistant", "", NULL);
+    l185_add_call(&b0, "toolu_a", "Bash", "{}");
+    chat_msgs_push(&anth, b0);
+    chat_msg u1 = l185_msg("user", "<tool_result>x</tool_result>", NULL);
+    chat_msg_add_tool_call_id(&u1, "toolu_a");
+    chat_msgs_push(&anth, u1);
+    chat_msg u2 = l185_msg("user", "<tool_result>y</tool_result>", NULL);
+    chat_msg_add_tool_call_id(&u2, "toolu_b");
+    chat_msgs_push(&anth, u2);
+    chat_msg b3 = l185_msg("assistant", "", NULL);
+    l185_add_call(&b3, "toolu_b", "Bash", "{}");
+    chat_msgs_push(&anth, b3);
+    err[0] = '\0';
+    chat_msgs ahead = anth;
+    ahead.len = 2;
+    TEST_ASSERT(s.anthropic_validate_tool_results(&ahead, &live_state, err, sizeof err));
+    TEST_ASSERT(!live_state);
+    TEST_ASSERT(!s.anthropic_validate_tool_results(&anth, &live_state, err, sizeof err));
+    TEST_ASSERT(strstr(err, "toolu_b") != NULL);
+
+    chat_msgs_free(&anth);
+    chat_msgs_free(&msgs);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 /* L190 C1: the MemAvailable-floor refusal is a per-request condition; its
  * warning prints once per period and carries the count the period swallowed,
  * instead of once per process. */
@@ -6904,6 +6977,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l184_shared_tool_stream_drives_protocol_emitters();
     test_l184_dsml_entity_pair_round_trips();
     test_l185_every_renderer_produces_the_authority_bytes();
+    test_l192_tool_history_validation_is_nearest_preceding();
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_warm_match_usable_rule();
     test_l179_guard_victim_skips_pinned_live_spilled();
