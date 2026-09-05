@@ -222,12 +222,27 @@
  * change -- L172's CUB comparator split lived there unseen.  Both chunk as
  * 4096 x N + 4 (8196) / 4096 x 4 + 4 (16388): a 4-row final chunk, the
  * n_tok <= 8 window again. */
-static const uint32_t g_depths[] = { 512u, 2048u, 4096u, 4102u, 6144u, 8196u, 16388u };
-#define N_DEPTHS ((uint32_t)(sizeof(g_depths) / sizeof(g_depths[0])))
 #define MAX_DEPTHS 8u
+static uint32_t g_depths[MAX_DEPTHS] = { 512u, 2048u, 4096u, 4102u, 6144u, 8196u, 16388u };
+static uint32_t g_n_depths = 7u;
+#define N_DEPTHS g_n_depths
+/* L181 (2026-09-05): the DECODE-STEP mode.  State a prefill writes for FUTURE
+ * steps -- the ratio-4 compressor state, the drafter ring seed, the projection
+ * ring -- never touches the prefill's own frontier logits, so the byte gate
+ * above was blind to L168 (the partial group dropped for every prompt with
+ * n % 4 != 0) at every depth.  --dump-decode / --check-decode prefill D tokens,
+ * run ONE classic decode step (the token at D from the same prompt) and record
+ * THAT step's logits: they depend on the state the prefill left behind.  The
+ * depths are chosen so the prefill ends in an unaligned partial group: 1001
+ * (single chunk, n % 4 == 1), 4102 (chunked, 6-row remainder), 8197 (chunked,
+ * 5-row remainder).  A distinct blob magic keeps the two blob kinds apart. */
+static const uint32_t g_decode_depths[] = { 1001u, 4102u, 8197u };
+static int g_decode = 0;
+static const char *g_blob_magic = "DS4PFXG1";
 #define GATE_CTX 16512   /* 16388 + headroom; was 8192 before the L175 depths */
 
-#define BLOB_MAGIC "DS4PFXG1"
+#define BLOB_MAGIC_PREFILL "DS4PFXG1"
+#define BLOB_MAGIC_DECODE  "DS4PFXD1"
 #define BLOB_VERSION 2u
 #define REF_LEN 24u
 
@@ -481,6 +496,15 @@ static int prefill_logits_ctx(uint32_t depth, float *out, int width, int ctx) {
         fprintf(stderr, "PREFILL GATE: sync failed at depth %u: %s\n", depth, err);
         pulsar_session_free(s);
         return 0;
+    }
+    if (g_decode) {
+        /* L181: one classic decode step on the token at `depth` -- its logits
+         * read the compressor state, ring and seed the prefill left behind. */
+        if (pulsar_session_eval(s, g_toks.v[depth], err, sizeof(err)) != 0) {
+            fprintf(stderr, "PREFILL GATE: decode step failed after depth %u: %s\n", depth, err);
+            pulsar_session_free(s);
+            return 0;
+        }
     }
     const int got = pulsar_session_copy_logits(s, out, width);
     pulsar_session_free(s);
@@ -750,7 +774,7 @@ static int run_check_reference(const char *model, const char *ref_path,
         fclose(fp);
         return 1;
     }
-    if (memcmp(rh.magic, BLOB_MAGIC, 8) != 0 || rh.version != BLOB_VERSION ||
+    if (memcmp(rh.magic, g_blob_magic, 8) != 0 || rh.version != BLOB_VERSION ||
         rh.n_depths == 0 || rh.n_depths > MAX_DEPTHS || rh.width == 0) {
         fprintf(stderr, "reference %s: bad magic/version/shape\n", ref_path);
         fclose(fp);
@@ -1025,7 +1049,7 @@ static int precheck_baseline(const char *path, const char *expect_ref) {
     const int got = fread(&bh, sizeof(bh), 1, fp) == 1;
     fclose(fp);
     if (!got) { fprintf(stderr, "baseline %s: short header\n", path); return 0; }
-    if (memcmp(bh.magic, BLOB_MAGIC, 8) != 0 || bh.version != BLOB_VERSION) {
+    if (memcmp(bh.magic, g_blob_magic, 8) != 0 || bh.version != BLOB_VERSION) {
         fprintf(stderr, "baseline %s: bad magic or version (got %u, want %u) — re-dump it "
                         "with `make cuda-prefill-gate-baseline`\n",
                 path, bh.version, BLOB_VERSION);
@@ -1066,7 +1090,7 @@ static int load_baseline(const char *path, const char *expect_ref,
         fclose(fp);
         return 0;
     }
-    if (memcmp(bh.magic, BLOB_MAGIC, 8) != 0 || bh.version != hdr->version) {
+    if (memcmp(bh.magic, g_blob_magic, 8) != 0 || bh.version != hdr->version) {
         fprintf(stderr, "baseline %s: bad magic or version (got %u, want %u) — re-dump it "
                         "with `make cuda-prefill-gate-baseline`\n",
                 path, bh.version, hdr->version);
@@ -1123,14 +1147,25 @@ int GATE_ENTRY(int argc, char **argv) {
     g_e = NULL;
     memset(&g_toks, 0, sizeof(g_toks));
     if (argc < 4 || (strcmp(argv[2], "--dump") && strcmp(argv[2], "--check") &&
+                     strcmp(argv[2], "--dump-decode") && strcmp(argv[2], "--check-decode") &&
                      strcmp(argv[2], "--check-fidelity") &&
                      strcmp(argv[2], "--check-reference"))) {
         fprintf(stderr, "usage: %s MODEL --dump  FILE\n"
                         "       %s MODEL --check FILE EXPECTED_BASELINE_REF\n"
+                        "       %s MODEL --dump-decode  FILE            (L181: one decode step after each unaligned prefill)\n"
+                        "       %s MODEL --check-decode FILE EXPECTED_DECODE_BASELINE_REF\n"
                         "       %s MODEL --check-fidelity FILE EXPECTED_BASELINE_REF [KL_TOL]\n"
                         "       %s MODEL --check-reference REF.bin TOKENS.bin [KL_TOL]\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
+    }
+    if (strcmp(argv[2], "--dump-decode") == 0 || strcmp(argv[2], "--check-decode") == 0) {
+        g_decode = 1;
+        g_blob_magic = BLOB_MAGIC_DECODE;
+        g_n_depths = (uint32_t)(sizeof(g_decode_depths) / sizeof(g_decode_depths[0]));
+        for (uint32_t i = 0; i < g_n_depths; i++) g_depths[i] = g_decode_depths[i];
+    } else {
+        g_blob_magic = BLOB_MAGIC_PREFILL;
     }
     if (strcmp(argv[2], "--check-reference") == 0) {
         if (argc < 5) {
@@ -1210,7 +1245,7 @@ int GATE_ENTRY(int argc, char **argv) {
                                    kl_base_path, kl_dump_path);
     }
     const char *model = argv[1];
-    const int dumping = strcmp(argv[2], "--dump") == 0;
+    const int dumping = strcmp(argv[2], "--dump") == 0 || strcmp(argv[2], "--dump-decode") == 0;
     const int fidelity = strcmp(argv[2], "--check-fidelity") == 0;
     const char *blob_path = argv[3];
     const char *expect_ref = NULL;
@@ -1293,7 +1328,7 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_tokenize_text(g_e, text, &g_toks);
     free(text);
 
-    const uint32_t deepest = g_depths[N_DEPTHS - 1];
+    const uint32_t deepest = g_depths[N_DEPTHS - 1] + (g_decode ? 1u : 0u);   /* decode mode reads the token at depth */
     if (g_toks.len < (int)deepest) {
         fprintf(stderr, "prompt too short: %d tokens, need %u\n", g_toks.len, deepest);
         goto done;
@@ -1301,7 +1336,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     blob_header hdr;
     memset(&hdr, 0, sizeof(hdr));
-    memcpy(hdr.magic, BLOB_MAGIC, 8);
+    memcpy(hdr.magic, g_blob_magic, 8);
     hdr.version = BLOB_VERSION;
     hdr.n_depths = N_DEPTHS;
     hdr.width = (uint32_t)width;
@@ -1313,7 +1348,8 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     snprintf(hdr.build_ref, REF_LEN, "%s", PULSAR_GATE_BUILD_REF);
 
-    printf("prefill bit-exactness gate: model=%s width=%d prompt_fnv=%016llx depths=",
+    printf("prefill bit-exactness gate%s: model=%s width=%d prompt_fnv=%016llx depths=",
+           g_decode ? " (DECODE STEP after each prefill, L181)" : "",
            pulsar_engine_model_name(g_e), width, (unsigned long long)hdr.prompt_fnv);
     for (uint32_t i = 0; i < N_DEPTHS; i++) printf("%s%u", i ? "," : "", g_depths[i]);
     printf("\n");

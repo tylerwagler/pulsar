@@ -198,10 +198,13 @@ int main(int argc, char **argv) {
     }
     const char *model = argv[1];
     const char *prefill_baseline = NULL, *prefill_ref = NULL, *ref_dir = NULL, *ref_tol = "1e-4";
+    const char *decode_baseline = NULL, *decode_ref = NULL;
     const char *kl_story = NULL, *kl_code = NULL, *only = NULL;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--prefill-baseline")) prefill_baseline = argv[i + 1];
         else if (!strcmp(argv[i], "--prefill-ref")) prefill_ref = argv[i + 1];
+        else if (!strcmp(argv[i], "--decode-baseline")) decode_baseline = argv[i + 1];
+        else if (!strcmp(argv[i], "--decode-ref")) decode_ref = argv[i + 1];
         else if (!strcmp(argv[i], "--ref-dir")) ref_dir = argv[i + 1][0] ? argv[i + 1] : NULL;
         else if (!strcmp(argv[i], "--ref-tol")) ref_tol = argv[i + 1];
         else if (!strcmp(argv[i], "--kl-story")) kl_story = argv[i + 1];
@@ -209,9 +212,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--only")) only = argv[i + 1];
         else { fprintf(stderr, "gates_runner: unknown option %s\n", argv[i]); return 2; }
     }
-    if (!prefill_baseline || !prefill_ref) {
-        fprintf(stderr, "gates_runner: --prefill-baseline and --prefill-ref are required "
-                        "(the prefill byte gate refuses to run without them)\n");
+    if (!prefill_baseline || !prefill_ref || !decode_baseline || !decode_ref) {
+        fprintf(stderr, "gates_runner: --prefill-baseline/--prefill-ref and --decode-baseline/--decode-ref "
+                        "are required (the byte gates refuse to run without their blobs)\n");
         return 2;
     }
 
@@ -285,6 +288,11 @@ int main(int argc, char **argv) {
     };
     const gate_spec prefill = {"cuda-prefill-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                {"--check", prefill_baseline, prefill_ref, NULL}};
+    /* L181: one classic decode step after each unaligned prefill, byte-compared
+     * -- the state class (compressor state, ring, seed) the prefill gate is
+     * blind to.  Same binary, same env scrub, so it runs beside the prefill gate. */
+    const gate_spec prefill_decode = {"cuda-prefill-decode-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
+                                      {"--check-decode", decode_baseline, decode_ref, NULL}};
     const gate_spec ref_story = {"cuda-reference-gate-story", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                  {"--check-reference", story_ref, story_tok, ref_tol, "--known-high", "512,30464",
                                   NULL}};
@@ -300,7 +308,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) RUN(group_default[i]);
     for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) RUN(group_depth1[i]);
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
-    RUN(prefill);
+    RUN(prefill); RUN(prefill_decode);
     if (have_ref) {
         /* --known-flip and --kl-baseline are appended per blob: the story blob
          * carries a documented argmax flip at 512; the KL budgets grade

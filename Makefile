@@ -184,7 +184,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-spec-sampling-gate cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -739,6 +739,15 @@ PREFILL_BASELINE_REF ?= bae614d
 # The blob is ~2.5 MB and self-describing (ref stamp + model header + token FNV;
 # see tests/prefill_bitexact_gate.cpp and the .md next to the blob).
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
+# L181: the decode-step twin -- one classic decode after each UNALIGNED prefill
+# (1001 / 4102 / 8197), logits of that step byte-compared against its own blob.
+# The prefill's own frontier logits never see the compressor state, ring or
+# seed the prefill leaves behind; this gate does.  Anchored separately (the
+# decode numerics move when the prefill's do not, and vice versa).
+PREFILL_DECODE_BASELINE_REF ?= 7b6e79a
+PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
+PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
+PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
 # The blob stamps `git rev-parse --short HEAD` as resolved INSIDE the baseline
 # worktree; normalise the expected ref through the same abbreviation so the
@@ -802,6 +811,26 @@ cuda-prefill-gate:
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
+
+# L181: decode-step byte gate (see PREFILL_DECODE_BASELINE above).
+cuda-prefill-decode-gate:
+	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
+	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-decode $(PREFILL_DECODE_BASELINE) \
+		$(PREFILL_DECODE_BASELINE_REF_SHORT)
+cuda-prefill-decode-gate-baseline:
+	git worktree remove --force $(PREFILL_DECODE_BASELINE_WT) 2>/dev/null || true
+	rm -rf $(PREFILL_DECODE_BASELINE_WT)
+	git worktree prune
+	git worktree add --detach $(PREFILL_DECODE_BASELINE_WT) $(PREFILL_DECODE_BASELINE_REF)
+	cp tests/prefill_bitexact_gate.cpp $(PREFILL_DECODE_BASELINE_WT)/tests/
+	cp Makefile $(PREFILL_DECODE_BASELINE_WT)/
+	cp tests/long_context_story_prompt.txt $(PREFILL_DECODE_BASELINE_WT)/tests/
+	$(MAKE) -C $(PREFILL_DECODE_BASELINE_WT) tests/prefill_bitexact_gate \
+		CUDA_ARCH=sm_120f CUTLASS_DIR=$(abspath $(CUTLASS_DIR))
+	cd $(PREFILL_DECODE_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(FRONTIER_MODEL)) \
+		--dump-decode $(abspath $(PREFILL_DECODE_BASELINE))
+	git worktree remove --force $(PREFILL_DECODE_BASELINE_WT)
+	@echo "decode baseline ($(PREFILL_DECODE_BASELINE_REF)) -> $(PREFILL_DECODE_BASELINE)"
 
 # Cross-engine fidelity gate: grade prefill logits against the vLLM reference
 # blobs from the B300 capture.  This is the only gate that measures us against
@@ -922,6 +951,13 @@ cuda-comp-state-gate: tests/comp_state_gate
 	./tests/comp_state_gate $(FRONTIER_MODEL)
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
+# L182: teacher-forced drafter acceptance -- E[accept] = sum min(p, q) over a fixed
+# context walk, no free-running trajectories, so a one-ulp drafter change is a
+# 1e-4 move instead of a re-drawn sample.  A quality GAUGE for drafter-touching
+# changes (run it beside the oracle); not release-blocking, so not in the runner.
+spec-teacher-forced-probe: tests/spec_teacher_forced_probe
+	./tests/spec_teacher_forced_probe $(SPEC_GATE_MODEL) $(SPEC_TF_POSITIONS)
+SPEC_TF_POSITIONS ?= 2000
 
 # L163: every model-dependent gate as a function in one binary.  Each gate
 # source is compiled a second time with its entry renamed (GATE_ENTRY) and the
@@ -946,7 +982,9 @@ tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o $(
 # unset), the tolerance and the KL budgets (passed only when present).
 cuda-runner-gate: tests/gates_runner
 	./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
-		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) --ref-dir "$(PULSAR_REF_DIR)" \
+		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
+		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
+		--ref-dir "$(PULSAR_REF_DIR)" \
 		--ref-tol $(PULSAR_REF_TOL) --kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE)
 
 # Every release-blocking gate, in one command.
@@ -1247,7 +1285,11 @@ tests/spec_sampling_gate: tests/spec_sampling_gate.o src/lib/pulsar_help.o $(COR
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/mseq_short_ctx_probe.o: tests/mseq_short_ctx_probe.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/mseq_short_ctx_probe.cpp
+tests/spec_teacher_forced_probe.o: tests/spec_teacher_forced_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/spec_teacher_forced_probe.cpp
 tests/mseq_short_ctx_probe: tests/mseq_short_ctx_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/spec_teacher_forced_probe: tests/spec_teacher_forced_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvstore.o $(CORE_OBJS)
@@ -1381,7 +1423,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is
