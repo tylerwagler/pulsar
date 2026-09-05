@@ -1207,12 +1207,6 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
     memset(out, 0, sizeof(*out));
-    /* L188: refuse a degenerate row at the entry (see sample_row_has_finite);
-     * every candidate-collection path below then has n >= 1. */
-    if (!sample_row_has_finite(logits, n_vocab)) {
-        sample_say_degenerate("dist build: no finite logit", n_vocab);
-        return 0;
-    }
     if (temperature <= 0.0f) {
         const int best = sample_argmax(logits, n_vocab);
         if (best < 0) return sample_dist_refuse(out, n_vocab, "no finite logit");
