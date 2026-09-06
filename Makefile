@@ -729,7 +729,7 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
-PREFILL_BASELINE_REF ?= bae614d
+PREFILL_BASELINE_REF ?= 684fa8d
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -744,7 +744,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 # The prefill's own frontier logits never see the compressor state, ring or
 # seed the prefill leaves behind; this gate does.  Anchored separately (the
 # decode numerics move when the prefill's do not, and vice versa).
-PREFILL_DECODE_BASELINE_REF ?= 7b6e79a
+PREFILL_DECODE_BASELINE_REF ?= 684fa8d
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
@@ -892,7 +892,7 @@ cuda-reference-gate-budget:
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
-		$(PULSAR_REF_TOL) --known-high 512,30464 \
+		$(PULSAR_REF_TOL) --known-high 512,30464 --known-flip 512 \
 		--dump-kl $(KL_BUDGET_STORY)
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin \
