@@ -90,6 +90,23 @@ int main(int argc, char **argv) {
                (uint32_t)(n - first) <= chunk ? "one chunk" : "several chunks",
                first > 0 ? (classic ? ", classic continuation after a first sync" : ", after a first sync") : "",
                secs, (double)(n - first) / secs);
+        /* L195: the frontier logits, hashed (FNV-1a over the f32 bytes) -- the
+         * end-to-end answer to "did this chunking change the bytes" without a
+         * per-layer dump.  Two runs that print the same hash agree on every
+         * one of the 129280 logits. */
+        {
+            const int width = pulsar_engine_logits_width(e);
+            float *row = (float *)malloc((size_t)width * sizeof(float));
+            if (row && pulsar_session_copy_logits(s, row, width) == width) {
+                uint64_t h = 1469598103934665603ull;
+                const unsigned char *b = (const unsigned char *)row;
+                for (size_t i = 0; i < (size_t)width * sizeof(float); i++) { h ^= b[i]; h *= 1099511628211ull; }
+                int am = 0; for (int i = 1; i < width; i++) if (row[i] > row[am]) am = i;
+                printf("CENSUS LOGITS: frontier row %d, fnv1a %016llx, argmax %d (%.6f)\n", n - 1,
+                       (unsigned long long)h, am, (double)row[am]);
+            }
+            free(row);
+        }
         rc = 0;
     }
 done:
