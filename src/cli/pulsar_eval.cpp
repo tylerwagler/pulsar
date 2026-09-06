@@ -2657,20 +2657,12 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
-/* Model outputs can contain provisional "answer" text after a forced
- * </think> and then a later final line.  A strict final Answer: marker is the
- * best grading target; outputs without one keep the original loose fallback. */
-static char *strcasestr_local(const char *hay, const char *needle) {
-    size_t nlen = strlen(needle);
-    if (nlen == 0) return (char *)hay;
-    for (; *hay; hay++) {
-        if (tolower((unsigned char)*hay) == tolower((unsigned char)needle[0]) &&
-            strncasecmp(hay, needle, nlen) == 0)
-            return (char *)hay;
-    }
-    return NULL;
-}
-
+/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
+ * before the colon, word-bounded), or NULL.  There is no looser form: the
+ * grading contract (grade_model_output) requires this marker on the last
+ * line, so an extractor is only ever handed text that carries it.  The old
+ * bare-"answer" fallback was reachable from nothing but its own self-tests
+ * (L192). */
 static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
@@ -2690,7 +2682,7 @@ static char *find_last_answer_marker(const char *visible) {
         while (*q && isspace((unsigned char)*q)) q++;
         if (*q == ':') last = (char *)p;
     }
-    return last ? last : strcasestr_local(visible, "answer");
+    return last;
 }
 
 /* True when the in-range capital at `letter` is the object of an explicit
@@ -3000,11 +2992,7 @@ static bool answer_matches(const eval_case *tc, const char *got) {
  * for.  Only that line reaches the extractors, so a provisional "Answer:"
  * earlier in the reply is never graded by mistake. */
 static bool line_has_answer_marker(const char *line) {
-    const char *marker = find_last_answer_marker(line);
-    if (!marker) return false;
-    const char *p = marker + strlen("answer");
-    while (*p && isspace((unsigned char)*p)) p++;
-    return *p == ':';
+    return find_last_answer_marker(line) != NULL;
 }
 
 /** ONE authority for a completed response's outcome: the live run and
@@ -3559,11 +3547,6 @@ static int run_extractor_self_tests(void) {
         &mc,
         "</think>Answer: F\nThis answer is final; option H is a tempting distractor.",
         "F");
-    failed += extractor_self_test_case(
-        "multiple-choice preserves loose-answer fallback",
-        &mc,
-        "</think>The answer is F. This answer is final; option H is tempting.",
-        "F");
 
     const eval_case integer = {
         .source = "AIME2025",
@@ -3573,11 +3556,6 @@ static int run_extractor_self_tests(void) {
         "integer prefers final answer marker",
         &integer,
         "</think>I first thought the answer was 80.\nFinal answer: 082",
-        "82");
-    failed += extractor_self_test_case(
-        "integer preserves loose-answer fallback",
-        &integer,
-        "</think>The answer is 082. This answer comes from AIME 2025.",
         "82");
 
     const eval_case compsec = {
