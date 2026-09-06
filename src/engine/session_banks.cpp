@@ -269,6 +269,12 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
      * EXPLICITLY to the validated tokens[0..R) — do not rely on truncating a
      * possibly-stale/short carry (a fresh dst carry starts at len 0, so the old
      * `checkpoint.len = R` set a length past the buffer's real contents). */
+    /* L195: a CURRENT src's carry is refreshed from the live session first --
+     * the full fork does this (step 6 above) and the partial fork did not, so
+     * dst inherited a stale carry whose prefill frontier said "nothing
+     * prefilled" and every fork into a fresh bank resumed cold from 0
+     * (dogfood 2026-09-06 15:30). */
+    if (src == cur && src != dst && src < s->bank_carry_n) s->bank_state_save(src);
     if (src != dst && src < s->bank_carry_n && dst < s->bank_carry_n) {
         s->bank_carry[dst].copy(&s->bank_carry[src]);
     }

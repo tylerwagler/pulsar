@@ -249,7 +249,6 @@ int GATE_ENTRY(int argc, char **argv) {
 
         /* fresh short src on bank 0 */
         CHECK(prefill_bank_cold(s, 0, toks, SLEN), "P2 src prefill bank0@%d", SLEN);
-        pulsar_session_bank_state_save(s, 0);
 
         /* shallow-cut refusal (R would be 0) */
         CHECK(pulsar_session_bank_fork_partial(s, 0, 1, toks2, 100, 100) != 0,
@@ -283,6 +282,9 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks2; p.len = p.cap = L2;
             char e2[256];
             CHECK(pulsar_session_sync(s, &p, e2, sizeof e2) == 0, "P2 replay sync: %s", e2);
+            CHECK(pulsar_session_resume_origin(s) == (int)(((uint32_t)RCUT / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID),
+                  "P2 replay resumed from %d, want the grid point under the cut %d (a fresh-bank fork must not go cold)",
+                  pulsar_session_resume_origin(s), RCUT);
             CHECK(pulsar_session_pos(s) == L2, "P2 live pos %d != %d", pulsar_session_pos(s), L2);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
@@ -433,7 +435,6 @@ int GATE_ENTRY(int argc, char **argv) {
 
         /* trunk on bank 0, prefilled to the UNALIGNED SLEN5. */
         CHECK(prefill_bank_cold(s, 0, toks, SLEN5), "P5 trunk prefill @%d", SLEN5);
-        pulsar_session_bank_state_save(s, 0);
 
         /* partial fork 0->1 at NC5 (cut R5), replay the divergent suffix to L5. */
         const int prc5 = pulsar_session_bank_fork_partial(s, 0, 1, toks5, NC5, NC5);
@@ -445,6 +446,9 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks5; p.len = p.cap = L5;
             char e5[256];
             CHECK(pulsar_session_sync(s, &p, e5, sizeof e5) == 0, "P5 replay sync: %s", e5);
+            CHECK(pulsar_session_resume_origin(s) == (int)(((uint32_t)R5 / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID),
+                  "P5 replay resumed from %d, want the grid point under the cut %d (a fresh-bank fork must not go cold)",
+                  pulsar_session_resume_origin(s), R5);
             CHECK(pulsar_session_pos(s) == L5, "P5 live pos %d != %d", pulsar_session_pos(s), L5);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
