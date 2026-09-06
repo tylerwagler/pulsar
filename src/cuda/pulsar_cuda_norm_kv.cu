@@ -304,9 +304,13 @@ __device__ static void rope_tail_rotate_pair_dev(
                               corr0, corr1, &r0, &r1);
     tail[i] = (T)r0;
     tail[i + 1] = (T)r1;
-    /* r0/r1 leave as f32 on purpose.  The MX epilogue below quantises from
-     * THESE registers, not from a read-back of tail[], so narrowing T does not
-     * put a second rounding in front of the E4M3 emission. */
+    /* r0/r1 leave as f32; the MX epilogue rounds them to T before quantising
+     * (L195).  This used to say the opposite -- quantise the f32 pair so that
+     * narrowing T "does not put a second rounding in front of the E4M3
+     * emission" -- and that made the E4M3 a function of WHICH kernel emitted
+     * it: the read-back encoder sees tail[] and only tail[].  One operand, one
+     * encoding; the rounding is the price of that and the reference gate
+     * grades it. */
     *out_r0 = r0;
     *out_r1 = r1;
 }
@@ -363,7 +367,11 @@ __global__ static void rope_tail_kernel(
          * first block and 16..31 the second: the amax is a HALF-warp reduction
          * (xor 1,2,4,8), and the lane at each half's base writes the scale. */
         const uint32_t lane = threadIdx.x & 31u;
-        float a = fmaxf(fabsf(r0), fabsf(r1));
+        /* L195: quantise the values the rotate STORED (the heads type), not the
+         * f32 pair -- the read-back encoder sees the stored values, and the two
+         * must agree byte for byte (see heads_round). */
+        const float q0 = (float)(T)r0, q1 = (float)(T)r1;
+        float a = fmaxf(fabsf(q0), fabsf(q1));
         a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
         a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 2));
         a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 4));
@@ -374,8 +382,8 @@ __global__ static void rope_tail_kernel(
         const uint32_t grp = h / hpg, hh = h % hpg;
         const uint32_t d0  = n_nope + i;                /* absolute head dim */
         __nv_fp8_e4m3 *dst = gact_data + ((size_t)grp * n_tok + t) * gd + hh * head_dim;
-        dst[d0]      = pulsar_mx_encode(r0, se);
-        dst[d0 + 1u] = pulsar_mx_encode(r1, se);
+        dst[d0]      = pulsar_mx_encode(q0, se);
+        dst[d0 + 1u] = pulsar_mx_encode(q1, se);
         if ((lane & 15u) == 0u) {
             const uint32_t kb = hh * (head_dim / 32u) + (d0 / 32u);
             gact_scale[(size_t)grp * gact_slab +

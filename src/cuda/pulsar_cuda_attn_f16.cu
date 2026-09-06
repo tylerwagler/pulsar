@@ -705,8 +705,18 @@ static void attn_f16_kernel(
                 heads_store(ob, nb + tg * 2u,      acc[m][n][2] * ib);
                 heads_store(ob, nb + tg * 2u + 1u, acc[m][n][3] * ib);
             }
-            /* E4M3 for the attn-output "a" GEMM, straight out of the registers
-             * the f32 stores above just used.
+            /* E4M3 for the attn-output "a" GEMM, from the registers the stores
+             * above just used -- ROUNDED TO THE STORED HEADS TYPE FIRST (L195).
+             * The 'a' GEMM's operand is a function of the stored heads and of
+             * nothing else: pulsar_gpu_mxfp8_gact_emit_heads (the arms without
+             * this epilogue: indexed, ring) quantises the bf16 heads it reads
+             * back, so this epilogue must quantise the same values or the same
+             * token gets different attn-out bytes on different arms.  It did:
+             * a 4096-token chunk (indexed, > 512 compressed rows) and a
+             * 2048-token chunk (dense, this epilogue) gave byte-identical heads
+             * and different attn_low (census 11/12, 2026-09-06), and every
+             * resumed chunk (ring arm) differed from the cold prefill the same
+             * way.  One encoder now: the value heads_store wrote.
              *
              * WHY THE REDUCTION IS ONLY 4 LANES WIDE: warp w owns head dims
              * [32w, 32w+32) -- exactly one MX block -- but for 16 heads at once,
@@ -727,10 +737,10 @@ static void attn_f16_kernel(
                 float aa = 0.0f, ab = 0.0f;
                 #pragma unroll
                 for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
-                    aa = fmaxf(aa, fabsf(acc[m][n][0] * ia));
-                    aa = fmaxf(aa, fabsf(acc[m][n][1] * ia));
-                    ab = fmaxf(ab, fabsf(acc[m][n][2] * ib));
-                    ab = fmaxf(ab, fabsf(acc[m][n][3] * ib));
+                    aa = fmaxf(aa, fabsf(heads_round(acc[m][n][0] * ia)));
+                    aa = fmaxf(aa, fabsf(heads_round(acc[m][n][1] * ia)));
+                    ab = fmaxf(ab, fabsf(heads_round(acc[m][n][2] * ib)));
+                    ab = fmaxf(ab, fabsf(heads_round(acc[m][n][3] * ib)));
                 }
                 aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 1));
                 aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 2));
@@ -746,10 +756,10 @@ static void attn_f16_kernel(
                 #pragma unroll
                 for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
                     const uint32_t nb = warp * AF16_DPW + n * 8u;
-                    da[nb + tg * 2u]      = pulsar_mx_encode(acc[m][n][0] * ia, sea);
-                    da[nb + tg * 2u + 1u] = pulsar_mx_encode(acc[m][n][1] * ia, sea);
-                    db[nb + tg * 2u]      = pulsar_mx_encode(acc[m][n][2] * ib, seb);
-                    db[nb + tg * 2u + 1u] = pulsar_mx_encode(acc[m][n][3] * ib, seb);
+                    da[nb + tg * 2u]      = pulsar_mx_encode(heads_round(acc[m][n][0] * ia), sea);
+                    da[nb + tg * 2u + 1u] = pulsar_mx_encode(heads_round(acc[m][n][1] * ia), sea);
+                    db[nb + tg * 2u]      = pulsar_mx_encode(heads_round(acc[m][n][2] * ib), seb);
+                    db[nb + tg * 2u + 1u] = pulsar_mx_encode(heads_round(acc[m][n][3] * ib), seb);
                 }
                 if (tg == 0u) {
                     const uint32_t kba = hha * (AF16_DIM / 32u) + warp;

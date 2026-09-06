@@ -319,6 +319,13 @@ __device__ __forceinline__ static float heads_load(const pulsar_heads_t *p, uint
 __device__ __forceinline__ static void heads_store(pulsar_heads_t *p, uint64_t i, float v) {
     p[i] = (pulsar_heads_t)v;
 }
+/** The value heads_store(v) leaves in the buffer, as a float: what every E4M3
+ * encoder of the heads must quantise (L195: the fused attention epilogue and
+ * the rope tail encoded their f32 registers, the read-back encoder the stored
+ * bf16 -- one operand, two encodings, different attn-out bytes per arm). */
+__device__ __forceinline__ static float heads_round(float v) {
+    return (float)(pulsar_heads_t)v;
+}
 static_assert(PULSAR_HEADS_ELT_FMT == PULSAR_ELT_BF16 &&
               std::is_same<pulsar_heads_t, __nv_bfloat16>::value,
               "heads format tag and pulsar_heads_t state the same type; move both or neither");
