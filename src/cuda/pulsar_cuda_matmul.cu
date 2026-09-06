@@ -1558,6 +1558,11 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
 
 
 
+/* The canonical row count at which a prefill GEMM arm chooses its ONE kernel
+ * per shape (the production prefill chunk): the plain-weight arm (L183) and
+ * the attn-out 'a' arm (L195) both pin here. */
+#define PULSAR_BF16_LT_CANON_ROWS 4096
+
 /* Prefill attn-output "a" projection as n_groups block-scaled MXFP8xMXFP8 GEMMs.
  *
  * The projection is block-diagonal: group g's [rank, group_dim] weight slice only
@@ -1632,68 +1637,107 @@ static int cuda_attention_output_a_mx_gemm(
                                                                             (int)n_groups, x_scale_slab, gc->scale_slab);
         if (!cuda_ok(cudaGetLastError(), "attn_out_a scale rebase")) return 0;
     }
-    /* Same shape-keyed handle/algo cache as the main MXFP8 GEMM above (and
-     * the same gotcha: the heuristic must see scale pointers on the desc or
-     * it picks a non-MX algo). The per-group loop swaps only scale pointers,
-     * which is already cache-shaped. */
-    struct lt_group_cache {
-        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
+    /* L195: ONE algorithm per (group_dim, rank, n_groups), chosen at the
+     * canonical row count and used at every row count -- the plain arm's
+     * rule (bf16_lt_matmul below).  Chosen per (shape, ntok) this arm gave a
+     * token different attn-out bytes in a 2048-row and a 4096-row chunk with
+     * byte-identical heads in (census 11, layer 2, 2026-09-06): cuBLASLt's
+     * heuristic picks by M and two fixed-order kernels accumulate K
+     * differently.  The heuristic must see MX scale pointers on the desc or
+     * it picks a non-MX algo; the per-group loop re-sets them per call. */
+    struct lt_group_shape {
+        uint64_t group_dim, rank; uint32_t n_groups; int valid;
         cublasLtMatmulDesc_t op;
-        cublasLtMatrixLayout_t la, lb, ld;
-        cublasLtMatmulHeuristicResult_t h;
+        cublasLtMatrixLayout_t la;
+        cublasLtMatmulAlgo_t algo;
     };
     /** thread_local -- same destroy-on-evict hazard as the shape cache above. */
-    static thread_local lt_group_cache cache[8];
-    static thread_local int cache_next;
-    lt_group_cache *e = NULL;
-    for (int i = 0; i < 8; i++) {
-        if (cache[i].valid && cache[i].group_dim == group_dim && cache[i].rank == rank &&
-            cache[i].n_groups == n_groups && cache[i].ntok == (int)n_tokens) { e = &cache[i]; break; }
+    static thread_local lt_group_shape shapes[4];
+    static thread_local int shapes_next;
+    lt_group_shape *sh = NULL;
+    for (int i = 0; i < 4; i++) {
+        if (shapes[i].valid && shapes[i].group_dim == group_dim && shapes[i].rank == rank &&
+            shapes[i].n_groups == n_groups) { sh = &shapes[i]; break; }
     }
-    if (!e) {
-        lt_group_cache ne = {};
-        ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
-        if (cublasLtMatmulDescCreate(&ne.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
+    if (!sh) {
+        lt_group_shape ns = {};
+        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups;
+        if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
-        cublasLtMatmulDescSetAttribute(ne.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
-        cublasLtMatrixLayoutCreate(&ne.la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
-        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
-        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA));
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB));
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mo, sizeof(mo));
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mo, sizeof(mo));
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
+        cublasLtMatmulDescSetAttribute(ns.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
+        cublasLtMatrixLayoutCreate(&ns.la, CUDA_R_8F_E4M3, group_dim, rank, group_dim);
+        cublasLtMatrixLayout_t lb_c, ld_c;
+        cublasLtMatrixLayoutCreate(&lb_c, CUDA_R_8F_E4M3, group_dim, PULSAR_BF16_LT_CANON_ROWS, group_dim);
+        cublasLtMatrixLayoutCreate(&ld_c, CUDA_R_32F, rank, PULSAR_BF16_LT_CANON_ROWS, low_dim);
         cublasLtMatmulPreference_t pf; cublasLtMatmulPreferenceCreate(&pf);
         cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wz, sizeof(wz));
-        /* determinism: forbid split-K reduction algos (atomic/parallel
-         * reduction order varies run-to-run and vs the decode GEMV path);
-         * NONE-scheme algos accumulate in a fixed order. */
         {
+            /* determinism: no split-K (its reduction order varies run to run and
+             * against the decode GEMV path); NONE-scheme algos accumulate in a
+             * fixed order */
             uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
             cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
         }
-        int got = 0;
-        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ne.op, ne.la, ne.lb, ne.ld, ne.ld, pf, 1, &ne.h, &got);
+        cublasLtMatmulHeuristicResult_t hr; int got = 0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, ns.op, ns.la, lb_c, ld_c, ld_c, pf, 1, &hr, &got);
         cublasLtMatmulPreferenceDestroy(pf);
+        cublasLtMatrixLayoutDestroy(lb_c); cublasLtMatrixLayoutDestroy(ld_c);
         if (hs != CUBLAS_STATUS_SUCCESS || !got) {
-            cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
-            cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
+            cublasLtMatrixLayoutDestroy(ns.la); cublasLtMatmulDescDestroy(ns.op);
+            fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): no fixed-order cuBLASLt "
+                            "kernel at %d rows -- refusing\n", (unsigned long long)group_dim,
+                    (unsigned long long)rank, n_groups, PULSAR_BF16_LT_CANON_ROWS);
+            return 0;
+        }
+        ns.algo = hr.algo;
+        ns.valid = 1;
+        sh = &shapes[shapes_next];
+        shapes_next = (shapes_next + 1) & 3;
+        if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
+        *sh = ns;
+    }
+    /* per (shape, ntok): the row-count layouts and the check that the shape's
+     * kernel supports this row count */
+    struct lt_group_call {
+        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
+        cublasLtMatrixLayout_t lb, ld;
+    };
+    static thread_local lt_group_call calls[8];
+    static thread_local int calls_next;
+    lt_group_call *e = NULL;
+    for (int i = 0; i < 8; i++) {
+        if (calls[i].valid && calls[i].group_dim == group_dim && calls[i].rank == rank &&
+            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens) { e = &calls[i]; break; }
+    }
+    if (!e) {
+        lt_group_call ne = {};
+        ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
+        cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
+        cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
+        cublasLtMatmulHeuristicResult_t chk;
+        cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_cublaslt, sh->op, sh->la, ne.lb, ne.ld, ne.ld, &sh->algo, &chk);
+        if (cs != CUBLAS_STATUS_SUCCESS || chk.state != CUBLAS_STATUS_SUCCESS || chk.workspaceSize > wz) {
+            cublasLtMatrixLayoutDestroy(ne.lb); cublasLtMatrixLayoutDestroy(ne.ld);
+            fprintf(stderr, "pulsar: attn-out 'a' (group_dim=%llu rank=%llu groups=%u): the shape's fixed kernel "
+                            "(chosen at %d rows) does not support %u rows -- refusing\n",
+                    (unsigned long long)group_dim, (unsigned long long)rank, n_groups,
+                    PULSAR_BF16_LT_CANON_ROWS, n_tokens);
             return 0;
         }
         ne.valid = 1;
-        e = &cache[cache_next];
-        cache_next = (cache_next + 1) & 7;
-        if (e->valid) {
-            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
-            cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
-        }
+        e = &calls[calls_next];
+        calls_next = (calls_next + 1) & 7;
+        if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
         *e = ne;
     }
-    cublasLtMatmulDesc_t op = e->op;
-    cublasLtMatrixLayout_t la = e->la, lb = e->lb, ld = e->ld;
-    cublasLtMatmulHeuristicResult_t h = e->h;
+    cublasLtMatmulDesc_t op = sh->op;
+    cublasLtMatrixLayout_t la = sh->la, lb = e->lb, ld = e->ld;
     int ok = 0;
     if (ws) {
         ok = 1;
@@ -1707,7 +1751,7 @@ static int cuda_attention_output_a_mx_gemm(
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bs, sizeof(bs));
             float al = 1.f, be = 0.f;
             cublasStatus_t st = cublasLtMatmul(g_cublaslt, op, &al, ag, la, bg, lb, &be,
-                                               dg, ld, dg, ld, &h.algo, ws, wz,
+                                               dg, ld, dg, ld, &sh->algo, ws, wz,
                                                cudaStreamPerThread);
             ok = (st == CUBLAS_STATUS_SUCCESS);
             if (!ok) fprintf(stderr, "pulsar: cuBLASLt attn_out_a MXFP8 matmul failed: status %d\n", (int)st);
@@ -2259,7 +2303,6 @@ int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map
  * remainder chunk and the frontier row too; cublasLtMatmulAlgoCheck confirms it
  * supports each row count before use, and an unsupported one refuses.  The
  * per-(shape, ntok) entries below cache the layouts and that check. */
-#define PULSAR_BF16_LT_CANON_ROWS 4096
 static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
                           uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
     if (!cublaslt_ensure()) {
