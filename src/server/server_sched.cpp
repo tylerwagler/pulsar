@@ -1,7 +1,7 @@
 /* Scheduler/worker (split move-only from generate.cpp): worker_main and its
  * quantum loop (classic / batched / fused mixed-batch lanes), job->slot
  * routing (choose_slot_for_job) and enqueue, lazy provisioning + the
- * admission/ledger/mem-floor helpers, LRU eviction and the warm-fork
+ * admission/ledger/mem-floor helpers, LRU eviction and the warm
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
 #include "pulsar_server_internal.h"
@@ -18,9 +18,9 @@
  * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
  * caller MUST fail the request rather than sample/commit on the wrong bank's KV
  * (review finding 1). True on success (or classic mode / no-op). */
-/* plan-33 inc D: evict ONE non-trunk victim (LRU-superseded preferred, else
- * plain LRU) so a warm fork has a free bank — trunk always protected. Defined
- * near worker_evict_one; forward-declared for the routing path above it. */
+/* Evict ONE idle victim (LRU-superseded preferred, else plain LRU) so a fresh
+ * conversation has a bank; live-tool owners protected. Defined near
+ * worker_evict_one; forward-declared for the routing path above it. */
 
 
 
@@ -441,19 +441,9 @@ static int divergent_route_decision(bool have_best, int best_common, int frontie
     return any_active ? ROUTE_QUEUE : ROUTE_IN_PLACE;
 }
 
-/* Warm-advance-in-place (L179 branch 5): at a pool full of LIVE banks a PARTIAL
- * fork consumes the requester's OWN trunk (pulsar_session_bank_fork_partial with
- * src == dst, the engine's documented truncate-reuse degenerate) instead of
- * evicting anyone -- this is what makes capacity == banks work. Eligible iff no
- * destination was provisioned, the route is a partial cut (a FULL fork has no
- * cut and only ever forks into a distinct bank) and the refusal was POOL_FULL:
- * any other refusal (admission, mem floor, create fail) is not a "full of live
- * banks" verdict and falls through to the cold path. */
-static bool warm_inplace_eligible(bool have_dst, bool partial, provision_refusal fr) {
-    return !have_dst && partial && fr == PROVISION_REFUSED_POOL_FULL;
-}
-
-/* The commit after a successful in-place cut. The cut moved the frontier
+/* The commit after a successful in-place cut (warm-advance-in-place:
+ * pulsar_session_bank_fork_partial with src == dst, the engine's documented
+ * truncate-reuse degenerate). The cut moved the frontier
  * BACKWARD to the engine's R-aligned resume position; the pre-truncation
  * continued-store watermark would then refuse every continued disk checkpoint
  * until the new conversation outgrows the old frontier (gen_begin only resets
@@ -630,28 +620,29 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * warm-turn TTFT never engaged (2.35 s vs the 0.6 s a fresh pool
          * gives).  Evict an LRU idle bank (live-tool owners protected, no
          * trunk to preserve) and retry once, mirroring the fork path. */
-        if (*refusal == PROVISION_REFUSED_POOL_FULL && s->fork_make_room(NULL)) {
+        if (*refusal == PROVISION_REFUSED_POOL_FULL && s->fresh_make_room()) {
             fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
             if (fresh) return fresh;
         }
     }
-    /* plan-33 inc D: warm PARTIAL-fork routing. `best`'s committed history
-     * shares a token prefix `best_common` with the request (validated
-     * bit-for-bit inside the fork before any device write).  A request whose
-     * prompt EXTENDS the trunk exactly (best_common == frontier) continues IN
-     * PLACE on that bank (Tyler 2026-09-06: "an exact extension should just
-     * stay in the same slot" -- the inc B full fork copied the whole bank to
-     * preserve the trunk for a hypothetical sibling and left a superseded copy
-     * in the pool every turn).  A DIVERGENT request forks the trunk into
-     * another bank and continues there, leaving the trunk intact for the
-     * conversation that still matches it:
-     *   - inc D PARTIAL cut : warm_partial_min <= best_common < frontier
-     *                         -> pulsar_session_bank_fork_partial (engine aligns down
-     *                         to R, byte-stashes the ratio-4 boundary row; dst's
-     *                         committed history becomes tokens[0..R), re-prefill [R..).
-     * A free bank is used first; else one non-trunk victim is evicted (make_room,
-     * LRU-superseded preferred). Any refusal (history moved, evicted src, cut
-     * below R, no evictable bank) degrades to today's path — never a client error. */
+    /* Warm routing (plan-33 inc D, re-cut 2026-09-06). `best`'s committed
+     * history shares a token prefix `best_common` with the request (validated
+     * bit-for-bit inside the engine before any device write).  An exact
+     * extension (best_common == frontier) continues in place.  A DIVERGENT
+     * match on an idle bank ALSO advances in place: the bank is cut at the
+     * R-aligned common (pulsar_session_bank_fork_partial with src == dst) and
+     * the request re-prefills only [R..).  Tyler 2026-09-06: "an exact
+     * extension should just stay in the same slot" and, for the divergent
+     * case, "yes, let's do that" -- the fork-into-another-bank policy
+     * preserved the trunk for a hypothetical sibling and, under Claude Code
+     * (whose injected reminders re-render the last user turn every request),
+     * left a superseded copy of the whole conversation in the pool every
+     * turn, filling the 8 banks in a few turns and then snapshotting one to
+     * disk per fork.  A sibling that returns after its trunk advanced
+     * re-prefills from the disk checkpoints; nothing is corrupted (the cut is
+     * byte-validated).  Any engine refusal (history moved, evicted bank, cut
+     * below the ring's reach) degrades to the divergent/fresh path below --
+     * never a client error. */
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
     /* `best_common <= prompt.len`, NOT `<`. A client that ROLLS BACK or compacts
      * history resends a prompt that is a strict prefix of the trunk's committed
@@ -671,7 +662,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * scrolled past the cut (typical after a client compacts history on a
      * deep bank), which makes every partial fork AND the in-place advance
      * permanently infeasible — the ring only moves forward. Probe before
-     * proposing, so a doomed FORK-partial routes to the divergent/fresh path
+     * proposing, so a doomed in-place cut routes to the divergent/fresh path
      * immediately instead of re-attempting an impossible fork every quantum
      * (observed 2026-08-10: ~30 s of refusal retries stalled a compacted
      * 42k-token turn before an eviction finally let it cold-prefill). */
@@ -681,11 +672,11 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         ? pulsar_session_bank_fork_partial_feasible(s->sess, best->bank, best_common)
         : PULSAR_FORK_OK;
     const bool partial = partial_geom && partial_rc == PULSAR_FORK_OK;       /* inc D */
-    /* Always-on routing-decision inputs, so a 0-fork count is never silent (the
-     * verbose KVCACHE stream; one line per bind, not per token). Confirmed nuance:
-     * re-tokenized generated tail rarely reproduces the trunk's exact frontier, so
-     * best_common < frontier (the PARTIAL path) is the common case; an exact
-     * continuation (best_common == frontier) stays in place. */
+    /* Always-on routing-decision inputs (the verbose KVCACHE stream; one line
+     * per bind, not per token). Confirmed nuance: re-tokenized generated tail
+     * rarely reproduces the trunk's exact frontier, so best_common < frontier
+     * (the in-place CUT) is the common case; an exact continuation
+     * (best_common == frontier) continues without a cut. */
     char infeasible[48] = "";
     if (partial_geom && !partial)
         snprintf(infeasible, sizeof infeasible, " [partial-infeasible: %s]",
@@ -696,76 +687,29 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                    "partial_min %d -> %s%s%s%s",
                    best ? (int)best->bank : -1, best_common, frontier,
                    j->req.prompt.len, s->warm_partial_min,
-                   partial ? "FORK-partial" : "in-place/cold",
+                   partial ? "advance-in-place" : "in-place/cold",
                    best_clobbers_warm_state ? " [trivial]" : "",
                    (best && best->active_job) ? " [busy]" : "",
                    infeasible);
     if (partial) {
-        provision_refusal fr;
-        session_slot *dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
-        if (!dst && fr == PROVISION_REFUSED_POOL_FULL &&
-            s->fork_make_room(best, /*superseded_only=*/true)) {
-            /* Freed a SUPERSEDED victim; the trunk was protected. Retry once.
-             * Live banks are never evicted for a fork: under cyclic
-             * multi-tenant traffic the LRU live bank is exactly the next
-             * returning conversation (the measured domino), and the partial
-             * case has a strictly better option below — advance IN PLACE. */
-            dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
-        }
-        if (warm_inplace_eligible(dst != NULL, partial, fr)) {
-            /* Pool full of LIVE banks: consume the requester's OWN trunk (see
-             * warm_inplace_eligible) -- cut to the R-aligned common, then
-             * re-prefill only the suffix. Every returning conversation advances
-             * its own bank warm, nobody's state dies. The trunk is not
-             * preserved for siblings — at a full pool that luxury costs another
-             * conversation its warmth. */
-            const int rc = pulsar_session_bank_fork_partial(
-                    s->sess, best->bank, best->bank,
-                    j->req.prompt.v, j->req.prompt.len, best_common);
-            if (rc == 0) {
-                warm_inplace_commit(best, pulsar_session_bank_pos(s->sess, best->bank));
-                server_log(PULSAR_LOG_DEFAULT,
-                           "pulsar-server: warm-advance-in-place: bank %u cut "
-                           "(frontier %d, common %d) resume %d; no eviction",
-                           best->bank, frontier, best_common,
-                           best->committed_pos);
-                *clobbers = false;
-                return best;
-            }
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: warm-advance-in-place refused (bank %u, %s); "
-                       "falling through", best->bank, server_fork_rc_name(rc));
-        }
-        if (dst && dst != best) {
-            pulsar_session *pool = s->sess;
-            const int rc = pulsar_session_bank_fork_partial(pool, best->bank, dst->bank,
-                                                            j->req.prompt.v, j->req.prompt.len,
-                                                            best_common);
-            if (rc == 0) {
-                /* The dst resumes at the engine's R-aligned cut (read it back
-                 * rather than recompute the align). */
-                dst->committed_pos = pulsar_session_bank_pos(pool, dst->bank);
-                server_log(PULSAR_LOG_DEFAULT,
-                           "pulsar-server: warm-fork-partial: trunk bank %u (frontier %d, "
-                           "common %d) -> bank %u (resume %d); trunk preserved",
-                           best->bank, frontier, best_common, dst->bank, dst->committed_pos);
-                *clobbers = false;
-                return dst;
-            }
-            /* Refused (history moved / evicted src / cut below R): dst stays a
-             * fresh empty bank — cold on it is safe and beats clobbering best. */
-            server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: warm-fork-partial refused (bank %u, %s); cold on bank %u",
-                       best->bank, server_fork_rc_name(rc), dst->bank);
+        const int rc = pulsar_session_bank_fork_partial(
+                s->sess, best->bank, best->bank,
+                j->req.prompt.v, j->req.prompt.len, best_common);
+        if (rc == 0) {
+            warm_inplace_commit(best, pulsar_session_bank_pos(s->sess, best->bank));
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: warm-advance-in-place: bank %u cut "
+                       "(frontier %d, common %d) resume %d",
+                       best->bank, frontier, best_common, best->committed_pos);
             *clobbers = false;
-            return dst;
+            return best;
         }
-        /* No free/evictable bank for the fork: fall through to the divergent
-         * guard below (reuses in place only for a linear continuation; otherwise
-         * queues rather than clobber). */
+        /* Refused (history moved / evicted bank / cut below the ring's reach):
+         * fall through to the divergent guard, which provisions a fresh bank
+         * or queues -- it never clobbers a live conversation. */
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: warm-fork-partial wanted (bank %u common %d) but no free bank",
-                   best->bank, best_common);
+                   "pulsar-server: warm-advance-in-place refused (bank %u, %s); "
+                   "falling through", best->bank, server_fork_rc_name(rc));
     }
     /* CROSS-WIRE ROOT FIX: the verdict is divergent_route_decision's (see it
      * for the four routes); the provisioning, the log line and *refusal are
@@ -1222,32 +1166,22 @@ int server::pick_superseded_idle(const bool *protect) {
  * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
  * body (snapshot + ledger release + bank reset). Worker thread only; returns
  * true when a bank was freed. */
-bool server::fork_make_room(const session_slot *trunk, bool superseded_only) {
+bool server::fresh_make_room() {
     auto *s = this;
     if (s->pool_banks <= 0) return false;
     bool protect[PULSAR_SESSION_POOL_CAP];
     s->worker_protect_queued_owner_slots(protect);      /* live-tool owners */
-    /* trunk == NULL is the FRESH-SLOT caller: a new conversation that
-     * matched nothing worth keeping, so only live owners are protected. */
-    const int ti = trunk ? (int)(trunk - s->slots) : -1;
-    if (ti >= 0 && ti < PULSAR_SESSION_POOL_CAP) protect[ti] = true;  /* NEVER the trunk */
     const int sup = s->pick_superseded_idle(protect);
     if (sup >= 0) {
         /* Force worker_evict_one onto the superseded pick by protecting all others. */
         bool only[PULSAR_SESSION_POOL_CAP];
         for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) only[i] = (i != sup);
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: warm-fork make-room: evicting LRU-superseded bank %u "
-                   "(trunk bank %u preserved)",
-                   s->slots[sup].bank, trunk ? trunk->bank : (uint32_t)-1);
+                   "pulsar-server: fresh-slot make-room: evicting LRU-superseded bank %u",
+                   s->slots[sup].bank);
         return s->worker_evict_one(only);
     }
-    /* No superseded victim.  superseded_only callers stop here: evicting a
-     * LIVE conversation's bank under cyclic multi-tenant traffic hits
-     * exactly the next returning conversation (the LRU domino, measured
-     * 2026-08-10) — those callers have a better option (advance in place). */
-    if (superseded_only) return false;
-    /* Plain LRU among unprotected idle, trunk still safe. Two-phase: first
+    /* No superseded victim: plain LRU among unprotected idle. Two-phase: first
      * avoid banks that are a queued job's usable warm match (the fresh-path
      * domino), then — if that leaves no victim — retry without the overlay,
      * because binding must progress. */

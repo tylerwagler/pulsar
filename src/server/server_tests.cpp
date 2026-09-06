@@ -6555,7 +6555,7 @@ static void test_l190_mem_floor_warn_is_rate_limited(void) {
     TEST_ASSERT(skipped == 1);
 }
 
-/* L179 branch 6 (i) -- fork_make_room's LRU-superseded victim scan
+/* L179 branch 6 (i) -- fresh_make_room's LRU-superseded victim scan
  * (superseded_pick_core). Invariant: slot a is picked only if it is
  * eligible, unprotected, has history (hist_len > 0) and some OTHER slot k is
  * STRICTLY longer (frontier[k] > hist_len[a]) with a's whole history as its
@@ -6751,29 +6751,13 @@ static void test_l179_divergent_route_four_ways(void) {
     TEST_ASSERT(divergent_route_decision(true, 7, 500, false, false) != ROUTE_NOT_DIVERGENT);
 }
 
-/* L179 branch 5 -- choose_slot_for_job's warm-advance-in-place at a full pool
- * (warm_inplace_eligible + warm_inplace_commit). Invariant: the src == dst
- * partial cut is taken iff NO destination was provisioned AND the route is a
- * PARTIAL cut AND the refusal was POOL_FULL; a full fork, a provisioned
- * destination, or any other refusal never advances in place. The commit
- * moves exactly two fields: committed_pos to the engine's resume position
- * and the continued-store watermark to 0 (the cut moved the frontier
- * backward; a stale watermark would refuse every continued checkpoint). */
-static void test_l179_warm_inplace_only_partial_at_full_pool(void) {
-    /* the one eligible shape */
-    TEST_ASSERT(warm_inplace_eligible(false, true, PROVISION_REFUSED_POOL_FULL));
-    /* a destination was provisioned: fork into it, never in place */
-    TEST_ASSERT(!warm_inplace_eligible(true, true, PROVISION_REFUSED_POOL_FULL));
-    TEST_ASSERT(!warm_inplace_eligible(true, true, PROVISION_OK));
-    /* a full fork has no cut: never in place, whatever the refusal */
-    TEST_ASSERT(!warm_inplace_eligible(false, false, PROVISION_REFUSED_POOL_FULL));
-    TEST_ASSERT(!warm_inplace_eligible(false, false, PROVISION_OK));
-    /* every other refusal is not a "pool full of live banks" verdict */
-    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_OK));
-    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_ADMISSION));
-    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_MEM_FLOOR));
-    TEST_ASSERT(!warm_inplace_eligible(false, true, PROVISION_REFUSED_CREATE_FAIL));
-
+/* L179 branch 5 -- the commit after choose_slot_for_job's warm-advance-in-place
+ * (since 2026-09-06 the route for every divergent match on an idle bank, not
+ * only at a full pool). The commit moves exactly two fields: committed_pos to
+ * the engine's resume position and the continued-store watermark to 0 (the cut
+ * moved the frontier backward; a stale watermark would refuse every continued
+ * checkpoint). */
+static void test_l179_warm_inplace_commit_moves_two_fields(void) {
     session_slot sl;
     memset(&sl, 0, sizeof sl);
     sl.provisioned = true;
@@ -7043,7 +7027,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l179_divergent_route_four_ways();
-    test_l179_warm_inplace_only_partial_at_full_pool();
+    test_l179_warm_inplace_commit_moves_two_fields();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
     test_l179_mixed_giveup_only_on_recoverable_prefill_reject();

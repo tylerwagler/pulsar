@@ -851,7 +851,7 @@ int main(int argc, char **argv) {
             if (v < 128) v = 128;
             s.warm_partial_min = v;
         }
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm-fork routing %s (partial-min %d)",
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: warm routing %s (in-place advance at the aligned cut; partial-min %d)",
                    s.warm_fork_enabled ? "ENABLED" : "disabled", s.warm_partial_min);
     }
     s.n_slots = 1;

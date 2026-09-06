@@ -1835,13 +1835,12 @@ struct server {
      * outgoing bank's device views + host carry, restore the incoming one.
      * No-op when `bank` is already live. Worker thread only. */
     bool bank_switch(int bank);
-    /** Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
-     * always protected (a sibling still matches it); LRU-superseded victims go
-     * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
-     * body (snapshot + ledger release + bank reset). Worker thread only; returns
-     * true when a bank was freed.
-     */
-    bool fork_make_room(const session_slot *trunk, bool superseded_only = false);
+    /** Evict exactly one idle victim so a fresh conversation gets a bank.
+     * Live-tool owners are protected; LRU-superseded victims go first, else
+     * plain LRU (worker_evict_one's picker). Reuses the proven eviction body
+     * (snapshot + ledger release + bank reset). Worker thread only; returns
+     * true when a bank was freed. */
+    bool fresh_make_room();
     /** Bring a spilled bank's KV back from the spill directory.
      * @return false when the file is missing or unreadable, which forces the
      * conversation to replay from a checkpoint instead. */
