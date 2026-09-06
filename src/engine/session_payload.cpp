@@ -138,6 +138,23 @@ static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkp
 
 
 
+/* L194: the raw rows a resume from the grid snapshot attends over -- the
+ * sliding window just below the snapshot position.  A live bank has them in
+ * its ring (raw_cap is sized so the window below the grid and the window at
+ * the checkpoint coexist); a fresh bank has never seen them, so the payload
+ * carries them whenever it carries a snapshot below the checkpoint.  Rows
+ * inside the window at the checkpoint may be written twice (same bytes). */
+static uint32_t session_grid_raw_rows(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
+    const uint32_t pos = gpu_graph_grid_snapshot_pos(g, gpu_graph_cur_bank(g));
+    if (pos == 0 || pos >= checkpoint_len) return 0;
+    uint32_t rows = g->raw_window ? g->raw_window : PULSAR_N_SWA;
+    if (rows > g->raw_cap) rows = g->raw_cap;
+    if (rows > pos) rows = pos;
+    return rows;
+}
+
+
+
 /* Return the exact engine-owned payload size, excluding the server's KVC file
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
@@ -152,8 +169,9 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
     /* L111: the comp pool's row size follows the active PULSAR_KV4 format;
      * raw rows stay E4M3. */
     const uint64_t comp_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint32_t grid_raw = session_grid_raw_rows(g, checkpoint_len);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+        bytes += (uint64_t)(grid_raw + raw_live) * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) * comp_row;
@@ -469,6 +487,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
     const uint32_t bank = gpu_graph_cur_bank(g);
     const uint32_t grid_pos = gpu_graph_grid_snapshot_pos(g, bank);
+    const uint32_t grid_raw = session_grid_raw_rows(g, (uint32_t)s->checkpoint.len);
     if (grid_pos > (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "grid snapshot lies above the checkpoint (it should have been dropped)");
         return 1;
@@ -479,7 +498,8 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 live raw rows serialized below,
      *   13 attn-pack row bytes, 14 indexer fp4 row bytes,
-     *   15 grid snapshot position (0 = none; L194).
+     *   15 grid snapshot position (0 = none; L194),
+     *   16 raw rows serialized just below it (0 = none).
      *
      * 13/14 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
      * file written for a different model; these catch one written for a
@@ -505,6 +525,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         (uint32_t)gpu_graph_attn_comp_cache_row_bytes(),
         (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
         grid_pos,
+        grid_raw,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -524,7 +545,14 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il < PULSAR_N_LAYER; il++) {
         /* Write the raw ring in logical position order.  The file does not care
-         * where the rows happened to live physically in the source graph. */
+         * where the rows happened to live physically in the source graph.
+         * L194: the window below the grid snapshot first, then the window at
+         * the checkpoint. */
+        for (uint32_t r = 0; rc == 0 && r < grid_raw; r++) {
+            const uint32_t pos = grid_pos - grid_raw + r;
+            rc = payload_write_raw_row(fp, g, il, pos % g->raw_cap,
+                                       buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        }
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
@@ -640,6 +668,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
     const uint32_t saved_grid_pos = h[15];
+    const uint32_t saved_grid_raw = h[16];
     const uint32_t saved_raw_cap = h[4];
     const uint32_t saved_raw_window = h[5];
     const uint32_t saved_comp_cap = h[6];
@@ -676,6 +705,11 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     if (saved_grid_pos != 0 &&
         (saved_grid_pos > saved_tokens || s->prefill_cap == 0 || saved_grid_pos % s->prefill_cap != 0)) {
         payload_set_err(err, errlen, "KV checkpoint's grid snapshot is not on this session's chunk grid");
+        return 1;
+    }
+    if (saved_grid_raw > saved_grid_pos || saved_grid_raw > g->raw_cap ||
+        (saved_grid_pos != 0 && saved_grid_pos < saved_tokens && saved_grid_raw == 0)) {
+        payload_set_err(err, errlen, "KV checkpoint's grid raw window is inconsistent with its snapshot");
         return 1;
     }
     if (saved_raw_window != g->raw_window) {
@@ -750,6 +784,11 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         /* Rebuild the physical raw ring expected by the current graph.  This is
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
+        for (uint32_t r = 0; rc == 0 && r < saved_grid_raw; r++) {
+            const uint32_t pos = saved_grid_pos - saved_grid_raw + r;
+            rc = payload_read_raw_row(fp, g, il, pos % g->raw_cap,
+                                      buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
         const uint32_t raw_first = saved_tokens - saved_raw_live;
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;

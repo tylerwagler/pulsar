@@ -746,13 +746,18 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * v7 (L111): unified NVFP4 rows -- raw AND comp strides changed.
  * v8 (L194, 2026-09-06): the payload carries the bank's CHUNK-GRID snapshot
  * (the compressor state at the last grid boundary a prefill chunk ended on,
- * header field 15 = its position, 0 = none) so a restored bank resumes from
- * that boundary like a live one.  Without it every continuation of a restored
- * checkpoint was a cold prefill from 0 (L183 + L194), which made the disk
- * cache a file read followed by the work of a miss.  v7 files are refused. */
+ * header field 15 = its position, 0 = none) AND the raw sliding window just
+ * below that position (field 16 = its row count), because the resumed prefill
+ * attends over those rows and a fresh bank has never held them -- the first
+ * cut carried the snapshot alone and the chunk-neutrality gate's save+load
+ * schedule differed from the cold prefill on every logit.  So a restored bank
+ * resumes from that boundary like a live one.  Without it every continuation
+ * of a restored checkpoint was a cold prefill from 0 (L183 + L194), which made
+ * the disk cache a file read followed by the work of a miss.  v7 files are
+ * refused. */
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(8)
-/** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + grid snapshot position. */
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 16u
+/** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + grid snapshot position + grid raw window rows. */
+#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 /** stage_dir: directory for the transient staged file (the caller's disk
