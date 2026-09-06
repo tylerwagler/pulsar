@@ -904,7 +904,23 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
                 s->checkpoint_valid = false;
                 return 1;
             }
-            if (snap == ck) {
+            /* The resume attends over raw rows [snap - window, snap); the ring
+             * holds the last raw_cap positions, so a snapshot more than
+             * raw_cap - window below the checkpoint has lost its window (a long
+             * generation since the last prefill grid point) and is no snapshot:
+             * cold from 0, said once.  L194's "latest snapshot" rule had no
+             * such guard. */
+            const uint32_t ring_reach = s->graph.raw_cap > s->graph.raw_window
+                                      ? s->graph.raw_cap - s->graph.raw_window : 0u;
+            const bool window_gone = snap != 0 && snap != ck && ck - snap > ring_reach;
+            if (window_gone) {
+                fprintf(stderr, "pulsar: resume at %u: the grid snapshot at %u on bank %u is %u tokens back, past "
+                                "the raw ring's reach (%u) -- prefilling the prompt from 0\n",
+                        ck, snap, bank, ck - snap, ring_reach);
+                gpu_graph_grid_snapshot_drop(&s->graph, bank);
+                s->rewind(0);
+                s->resume_origin = 0;
+            } else if (snap == ck) {
                 s->resume_origin = (int)ck;
             } else if (snap != 0) {
                 s->rewind((int)snap);

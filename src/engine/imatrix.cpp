@@ -1034,7 +1034,6 @@ int gpu_graph_decode_multiseq_batch(
          * this the per-bank slots are consulted, and a classically-prefilled
          * bank has never populated them (n_comp 0), so the step is rejected. */
         bool                   capture_cur) {
-    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: this step's crossings start empty */
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
      * prefill chunk rides this entry); PULSAR_MSEQ_MAX bounds only the BANK count,
      * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
@@ -1167,7 +1166,6 @@ int gpu_graph_decode_multiseq_batch(
      * so a skipped-head run's KV frontier is still validated. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
-    gpu_graph_grid_snapshot_commit_pending(g);   /* L195: every layer saved its lane at the crossing */
 
     /* Logits readback: head_runs rows (one per emitted run, in run order = ascending
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==

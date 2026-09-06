@@ -2788,10 +2788,13 @@ bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *lo
 /** L183/L195 grid snapshot (see pulsar_bank_slabs::grid_askv): the ratio-4
  *  layers' compressor state at a multiple of PULSAR_RESUME_GRID, per bank.
  *  save: every ratio-4 lane of the current bank at `pos` (a chunk end);
- *  save_lane: ONE layer's attention or indexer lane for `bank` -- the per-row
- *  arms call it right after the update that carried the position across a
- *  grid point, then `pending` records the position and the encode that ends
- *  commits it (`commit_pending`; `clear_pending` at encode start).  Saved
+ *  save_lane: ONE layer's attention or indexer lane for `bank` -- the PREFILL
+ *  per-row arm calls it right after the update that carried the position
+ *  across a grid point, then `pending` records the position and the encode
+ *  that ends commits it (`commit_pending`; `clear_pending` at encode start).
+ *  Decode never saves: decode rows are computed by the decode kernels, so a
+ *  snapshot of decode state cannot make a resume equal to a cold prefill; a
+ *  resume recomputes the tokens generated since the last prefill grid point.  Saved
  *  lanes are CANONICAL: the previous group in rows 0..3, rows 4..7 zero / -INF
  *  -- what a cold prefill chunk boundary leaves -- so a restore is byte-
  *  identical to cold.  restore: the ratio-4 lanes back into the live state,

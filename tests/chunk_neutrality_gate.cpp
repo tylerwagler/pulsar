@@ -11,11 +11,14 @@
  *                                 must rewind to 4096 and restore the compressor
  *                                 state the first sync snapshotted when it crossed
  *                                 4096 -- the grid-snapshot path
- *   F  sync(8100), eval x200, sync(N) -> DECODE crosses 8192, which saves (L195): the
- *                                resume redoes [8192, N) only
- *   G  sync(4000), eval x200, sync(N) -> decode crosses 4096, which saves: resume from 4096
- * The resume grid is 128 (PULSAR_RESUME_GRID, L195): every chunk end and every decode
- * crossing snapshots the ratio-4 compressor window, so a resume redoes < 128 tokens.
+ *   F  sync(8100), eval x200, sync(N) -> DECODE crosses 8192; the resume redoes the decoded
+ *                                tokens from the prefill's last grid point (8064), because
+ *                                decode rows are the decode kernels' and a cold prefill's
+ *                                are not (L195)
+ *   G  sync(4000), eval x200, sync(N) -> same from 3968
+ * The resume grid is 128 (PULSAR_RESUME_GRID, L195): every prefill chunk leaves its
+ * snapshot at the last grid point it reached, so a resume redoes < 128 tokens plus
+ * whatever was generated since.
  * (sync evaluates only the suffix when the checkpoint is a prefix, so B..E are
  * exactly what a prefix-cache hit or a warm fork does; F and G are a turn after
  * the model generated across a grid boundary.)  After each schedule the
@@ -155,8 +158,11 @@ int GATE_ENTRY(int argc, char **argv) {
             {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048},
             {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968},
             {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480},
-            {"F: sync 8100, decode 200 across 8192, resume from 8192", 8100, GATE_EVALS, 8192},
-            {"G: sync 4000, decode 200 across 4096, resume from 4096", 4000, GATE_EVALS, 4096},
+            /* decode saves nothing (its rows are the decode kernels'); the
+             * resume redoes the generated tokens from the last PREFILL grid
+             * point -- the only way it equals the cold prefill */
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968},
         };
         char err[256];
         printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",
