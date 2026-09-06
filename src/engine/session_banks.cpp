@@ -156,6 +156,13 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
         gpu_graph_bank_counters_install(g, dst);
         token_vec_set_prefix_from(&s->checkpoint, hist, n_cached);
         s->checkpoint_valid = true;
+        /* L195/L196: the live prefill frontier is the carry's twin while a bank
+         * is current; provision's invalidate zeroed it, so a resume on the
+         * forked bank found no grid point and re-prefilled the whole prompt
+         * (dogfood 2026-09-06 17:41: 292k tokens for a 36-token turn).  Install
+         * it from the carry dst just inherited, bounded by the fork frontier. */
+        s->prefill_frontier = dst < s->bank_carry_n ? s->bank_carry[dst].prefill_frontier : 0;
+        if (s->prefill_frontier > n_cached) s->prefill_frontier = n_cached;
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
@@ -305,7 +312,11 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         gpu_graph_bank_counters_install(g, dst);
         token_vec_set_prefix_from(&s->checkpoint, hist, (int)R);
         s->checkpoint_valid = true;
-        if (s->prefill_frontier > (int)R) s->prefill_frontier = (int)R;   /* L195 */
+        /* L195/L196: install (not merely clamp) the live prefill frontier from
+         * the carry dst inherited -- provision's invalidate left it at 0 and a
+         * clamp of 0 is 0: the resume went cold (see the full fork above). */
+        s->prefill_frontier = dst < s->bank_carry_n ? s->bank_carry[dst].prefill_frontier : 0;
+        if (s->prefill_frontier > (int)R) s->prefill_frontier = (int)R;
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;

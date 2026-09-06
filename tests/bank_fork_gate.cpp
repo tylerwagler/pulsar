@@ -512,6 +512,21 @@ int GATE_ENTRY(int argc, char **argv) {
         fprintf(stderr, "fork_gate: P6 FULL fork dst==cur bank_pos=%d (==%d: %s)\n",
                 pulsar_session_bank_pos(s, 1), FLEN,
                 pulsar_session_bank_pos(s, 1) == FLEN ? "YES" : "NO");
+        {   /* L196: the served shape continues on the forked cur -- the resume
+             * must start at the grid point under the fork frontier, not cold
+             * (provision's invalidate had zeroed the live prefill frontier). */
+            int *toks6f = (int *)malloc((size_t)(FLEN + 64) * sizeof(int));
+            memcpy(toks6f, toks, (size_t)FLEN * sizeof(int));
+            for (int i = 0; i < 64; i++) toks6f[FLEN + i] = base.v[(i + 777) % base.len];
+            pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks6f; p.len = p.cap = FLEN + 64;
+            char e6f[256];
+            CHECK(pulsar_session_sync(s, &p, e6f, sizeof e6f) == 0, "P6 full continuation sync: %s", e6f);
+            CHECK(pulsar_session_resume_origin(s) == (int)(((uint32_t)FLEN / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID),
+                  "P6 FULL dst==cur continuation resumed from %d, want the grid point under the fork frontier %d "
+                  "(a served full fork must not go cold)", pulsar_session_resume_origin(s), FLEN);
+            CHECK(pulsar_session_pos(s) == FLEN + 64, "P6 full continuation pos %d != %d", pulsar_session_pos(s), FLEN + 64);
+            free(toks6f);
+        }
 
         /* ---- PARTIAL fork, dst==cur: bank_pos(dst) must be R, and the tail
          *      [R,L) re-prefill lands byte-identical to cold (aligned oracle) --- */
@@ -532,6 +547,9 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_tokens p; memset(&p, 0, sizeof p); p.v = toks6; p.len = p.cap = L6;
             char e6[256];
             CHECK(pulsar_session_sync(s, &p, e6, sizeof e6) == 0, "P6 tail replay: %s", e6);
+            CHECK(pulsar_session_resume_origin(s) == (int)(((uint32_t)R6 / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID),
+                  "P6 PARTIAL dst==cur replay resumed from %d, want the grid point under the cut %d "
+                  "(a served partial fork must not go cold)", pulsar_session_resume_origin(s), R6);
             CHECK(pulsar_session_pos(s) == L6, "P6 post-replay pos %d != %d", pulsar_session_pos(s), L6);
             gpu_graph_bank_counters_capture(&s->graph, 1);
         }
