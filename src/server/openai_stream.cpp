@@ -223,30 +223,13 @@ static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
     buf clean = {0};
     size_t i = 0;
     while (i < len) {
-        const unsigned char c = (unsigned char)piece[i];
-        size_t need = c < 0x80                 ? 1
-                    : (c >= 0xc2 && c <= 0xdf) ? 2
-                    : (c >= 0xe0 && c <= 0xef) ? 3
-                    : (c >= 0xf0 && c <= 0xf4) ? 4
-                                               : 0;
-        bool ok = need > 0 && len - i >= need;
-        for (size_t k = 1; ok && k < need; k++)
-            ok = ((unsigned char)piece[i + k] & 0xc0) == 0x80;
-        /* 10xxxxxx continuations alone still admit overlongs, UTF-16
-         * surrogates and > U+10FFFF; the second byte carries the extra
-         * constraint (Unicode 15 Table 3-7).  Without this, ED A0 80 walks
-         * through as "well-formed" and a strict client rejects the JSON. */
-        if (ok && need >= 3) {
-            const unsigned char c1 = (unsigned char)piece[i + 1];
-            ok = c == 0xe0 ? c1 >= 0xa0
-               : c == 0xed ? c1 <= 0x9f
-               : c == 0xf0 ? c1 >= 0x90
-               : c == 0xf4 ? c1 <= 0x8f
-                           : true;
-        }
-        if (ok) {
-            buf_append(&clean, piece + i, need);
-            i += need;
+        /* Table 3-7 well-formedness is the lib's one rule (utf8_seq_ok,
+         * L187): ED A0 80 and the other overlong / surrogate / > U+10FFFF
+         * forms are rejected there, so a strict client never sees them. */
+        const int need = utf8_seq_ok((const unsigned char *)piece + i, len - i);
+        if (need > 0) {
+            buf_append(&clean, piece + i, (size_t)need);
+            i += (size_t)need;
         } else {
             buf_puts(&clean, "\xef\xbf\xbd");
             i++;

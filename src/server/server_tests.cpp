@@ -1460,6 +1460,22 @@ static void test_streaming_holds_partial_utf8(void) {
 
     TEST_ASSERT(utf8_stream_safe_len(partial, 0, strlen(partial), false) == 2);
     TEST_ASSERT(utf8_stream_safe_len(complete, 0, strlen(complete), false) == strlen(complete));
+    /* L187: byte-fallback tokens can emit bytes that are not UTF-8 at all.
+     * The hold-back is lenient and these pin its boundaries so a strict
+     * rewrite (which would release E0 80 early) is caught. */
+    {
+        const char e0_80[] = {'a', (char)0xe0, (char)0x80};          /* truncated 3-byte lead: HELD */
+        const char c0_80[] = {'a', (char)0xc0, (char)0x80};          /* 0xC0 is not a lead: released */
+        const char f5[]    = {'a', (char)0xf5, (char)0x80, (char)0x80}; /* 0xF5 is not a lead: released */
+        const char lone[]  = {(char)0x80};                             /* lone continuation at start: held */
+        const char c2[]    = {'a', (char)0xc2};                        /* bare 2-byte lead at the end: held */
+        TEST_ASSERT(utf8_stream_safe_len(e0_80, 0, sizeof(e0_80), false) == 1);
+        TEST_ASSERT(utf8_stream_safe_len(c0_80, 0, sizeof(c0_80), false) == sizeof(c0_80));
+        TEST_ASSERT(utf8_stream_safe_len(f5, 0, sizeof(f5), false) == sizeof(f5));
+        TEST_ASSERT(utf8_stream_safe_len(lone, 0, sizeof(lone), false) == 0);
+        TEST_ASSERT(utf8_stream_safe_len(c2, 0, sizeof(c2), false) == 1);
+        TEST_ASSERT(utf8_stream_safe_len(e0_80, 0, sizeof(e0_80), true) == sizeof(e0_80)); /* final flush releases */
+    }
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -5601,6 +5617,22 @@ static void test_kv_cache_open_unusable_dir_disables(void) {
  * the JSON well-formed for strict clients, so the boundary rows of Unicode
  * Table 3-7 are the teeth: the largest legal value on one side of each
  * second-byte constraint and the smallest illegal value on the other. */
+/* L192 item 7: every id the server mints is prefix + hex from the OS RNG;
+ * two calls never agree and the chat/completion prefixes are the wire's. */
+static void test_random_prefixed_id_format(void) {
+    char a[96], b[96];
+    random_prefixed_id(a, sizeof(a), "chatcmpl-", 12);
+    random_prefixed_id(b, sizeof(b), "chatcmpl-", 12);
+    TEST_ASSERT(strncmp(a, "chatcmpl-", 9) == 0 && strlen(a) == 9 + 24);
+    TEST_ASSERT(strspn(a + 9, "0123456789abcdef") == 24);
+    TEST_ASSERT(strcmp(a, b) != 0);
+    random_prefixed_id(a, sizeof(a), "cmpl-", 12);
+    TEST_ASSERT(strncmp(a, "cmpl-", 5) == 0 && strlen(a) == 5 + 24);
+    char small[8];
+    random_prefixed_id(small, sizeof(small), "resp_", 12);   /* truncates, never overruns */
+    TEST_ASSERT(strlen(small) < sizeof(small) && strncmp(small, "resp_", 5) == 0);
+}
+
 static void test_logprob_token_json_sanitizes_ill_formed_utf8(void) {
     static const struct { const char *in; size_t n; const char *out; } cases[] = {
         {"hi",               2, "\"hi\""},
@@ -6835,6 +6867,7 @@ static void test_l179_mixed_giveup_only_on_recoverable_prefill_reject(void) {
 
 static void pulsar_server_unit_tests_run(void) {
     test_logprob_token_json_sanitizes_ill_formed_utf8();
+    test_random_prefixed_id_format();
     test_kv_disk_default_dir_resolution();
     test_kv_disk_flag_matrix();
     test_kv_cache_open_unusable_dir_disables();

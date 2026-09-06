@@ -2,25 +2,10 @@
 
 
 
-/* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
- * controls the variant (resp_, rs_, msg_, fc_) so each event references a
- * stable identifier across output_item.added / .done. */
-static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
-    unsigned char bytes[12];
-    size_t pos = snprintf(dst, dstlen, "%s", prefix);
-    if (pos >= dstlen) return;
-    if (!random_bytes(bytes, sizeof(bytes))) {
-        /* Fail closed like random_tool_id: ids must not be predictable. */
-        pulsar_die("random_bytes failed; cannot generate response ids");
-    }
-    static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
-        dst[pos++] = hex[bytes[i] >> 4];
-        dst[pos++] = hex[bytes[i] & 15];
-    }
-    dst[pos] = '\0';
-}
-
+/* Codex' Responses API uses 24-hex suffixes for response/item ids
+ * (random_prefixed_id with 12 bytes).  The prefix controls the variant
+ * (resp_, rs_, msg_, fc_) so each event references a stable identifier across
+ * output_item.added / .done. */
 
 
 void responses_stream_init(const request *r, responses_stream *st) {
@@ -28,9 +13,9 @@ void responses_stream_init(const request *r, responses_stream *st) {
     st->mode = pulsar_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
     st->guard_second_reasoning =
         pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
-    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
-    responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
-    responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
+    random_prefixed_id(st->response_id, sizeof(st->response_id), "resp_", 12);
+    random_prefixed_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_", 12);
+    random_prefixed_id(st->message_id, sizeof(st->message_id), "msg_", 12);
     st->reasoning_index = -1;
     st->message_index = -1;
 }
@@ -329,11 +314,11 @@ static void responses_tool_items_build(responses_tool_item **out,
     responses_tool_item *items = (responses_tool_item *)server_xmalloc((size_t)calls->len * sizeof(*items));
     for (int i = 0; i < calls->len; i++) {
         memset(&items[i], 0, sizeof(items[i]));
-        responses_random_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_");
+        random_prefixed_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_", 12);
         if (calls->v[i].id && calls->v[i].id[0]) {
             snprintf(items[i].call_id, sizeof(items[i].call_id), "%s", calls->v[i].id);
         } else {
-            responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
+            random_prefixed_id(items[i].call_id, sizeof(items[i].call_id), "call_", 12);
         }
         items[i].is_custom = false;
         items[i].output_index = starting_output_index + i;
@@ -810,9 +795,9 @@ bool responses_final_response(int fd,
                                      int prompt_tokens, int completion_tokens) {
     (void)id;
     char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
-    responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
-    responses_random_id(message_id, sizeof(message_id), "msg_");
+    random_prefixed_id(response_id, sizeof(response_id), "resp_", 12);
+    random_prefixed_id(reasoning_id, sizeof(reasoning_id), "rs_", 12);
+    random_prefixed_id(message_id, sizeof(message_id), "msg_", 12);
 
     responses_tool_item *items = NULL;
     responses_tool_items_build(&items, calls, 0);

@@ -2,25 +2,29 @@
 
 
 
-void random_tool_id(char *dst, size_t dstlen, api_style api) {
+void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes) {
     unsigned char bytes[16];
-    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    if (nbytes > sizeof(bytes)) nbytes = sizeof(bytes);
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
     if (pos >= dstlen) return;
 
-    if (!random_bytes(bytes, sizeof(bytes))) {
-        /* Fail closed: tool-call IDs must not be predictable, and with
-         * getrandom() + /dev/urandom both unavailable something is deeply
-         * wrong with the host. */
-        pulsar_die("random_bytes failed; cannot generate tool-call ids");
+    if (!random_bytes(bytes, nbytes)) {
+        /* Fail closed: ids must not be predictable, and with getrandom() +
+         * /dev/urandom both unavailable something is deeply wrong with the
+         * host. */
+        pulsar_die("random_bytes failed; cannot generate ids");
     }
 
     static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
+    for (size_t i = 0; i < nbytes && pos + 2 < dstlen; i++) {
         dst[pos++] = hex[bytes[i] >> 4];
         dst[pos++] = hex[bytes[i] & 15];
     }
     dst[pos] = '\0';
+}
+
+void random_tool_id(char *dst, size_t dstlen, api_style api) {
+    random_prefixed_id(dst, dstlen, api == API_ANTHROPIC ? "toolu_" : "call_", 16);
 }
 
 
@@ -494,21 +498,18 @@ size_t stop_list_stream_safe_len(const stop_list *stops, size_t text_len) {
 
 
 
-static int utf8_expected_len(unsigned char c) {
-    if (c < 0x80) return 1;
-    if (c >= 0xc2 && c <= 0xdf) return 2;
-    if (c >= 0xe0 && c <= 0xef) return 3;
-    if (c >= 0xf0 && c <= 0xf4) return 4;
-    return 1;
-}
-
-
-
 /* Tokenizers can split a multi-byte UTF-8 character across two tokens.  If an
  * SSE delta ends at that boundary, some clients replace the incomplete byte
  * sequence with U+FFFD and later send the corrupted text back, destroying KV
  * cache prefix matches.  Hold only the trailing incomplete character; the next
- * generated token will complete it. */
+ * generated token will complete it.
+ *
+ * The lead table is the lib's (utf8_seq_len, L187); the hold-back itself stays
+ * LENIENT on purpose: it counts continuation bytes and never judges the
+ * sequence well-formed, so a byte-fallback token that can never complete
+ * (E0 80 ...) is held until the next token or the final flush exactly as
+ * before.  A strict test here would move SSE delta boundaries for ill-formed
+ * output while changing nothing about the concatenated stream. */
 size_t utf8_stream_safe_len(const char *s, size_t start,
                                    size_t limit, bool final) {
     if (final || !s || limit <= start) return limit;
@@ -523,13 +524,15 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
     }
 
     if (p == limit) {
-        return utf8_expected_len((unsigned char)s[limit - 1]) > 1 ?
+        return utf8_seq_len((unsigned char)s[limit - 1]) > 1 ?
                limit - 1 : limit;
     }
     if (p == start && (((unsigned char)s[p] & 0xc0) == 0x80)) return start;
 
     size_t lead = p - 1;
-    int need = utf8_expected_len((unsigned char)s[lead]);
+    /* a non-lead byte reads 0 here: (limit - lead) >= 1 always, so the
+     * text is released, as it was when the local table said 1 */
+    int need = utf8_seq_len((unsigned char)s[lead]);
     return (limit - lead) < (size_t)need ? lead : limit;
 }
 

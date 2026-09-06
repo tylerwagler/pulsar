@@ -13,6 +13,7 @@
 #include "pulsar_help.h"
 #include "pulsar_kvstore.h"
 #include "pulsar_dsml.h"
+#include "pulsar_utf8.h"
 
 #include <new>
 #include <string>
@@ -1418,7 +1419,6 @@ struct server {
      * head that cannot bind for many quanta registers once, not once a tick. */
     uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
     int m_queue_block_reason;  ///< provision_refusal + 1 of a stuck head; 0 = not blocked
-    uint64_t seq;              ///< monotonic request counter; the source of trace ids
     FILE *trace;               ///< trace sink, or NULL when tracing is off
     pthread_mutex_t trace_mu;  ///< serialises trace writes across threads
     uint64_t trace_seq;        ///< monotonic trace event counter, for ordering
@@ -2427,6 +2427,10 @@ bool json_raw_value(const char **p, char **out);
 char *json_minify_raw_value(const char *json);
 bool json_content(const char **p, char **out);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
+/** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
+ * available (ids must never be predictable).  The ONE id generator: tool-call,
+ * Responses item and chat/completion ids all come from here (L192 item 7). */
+void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes);
 void tool_calls_free(tool_calls *calls);
 void tool_calls_push(tool_calls *calls, tool_call tc);
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id);

@@ -1193,9 +1193,10 @@ void server::gen_stream_begin(session_slot *sl) {
         }
         s->kv_cache_tracker_flush(sl);
     }
-    snprintf(g->id, sizeof(g->id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)++s->seq);
+    /* Random ids, like the tool-call and Responses ids (L192 item 7): a
+     * counter leaked request ordering and made the unseeded sampler seed
+     * below guessable. */
+    random_prefixed_id(g->id, sizeof(g->id), j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-", 12);
 
     g->structured_stream = request_uses_structured_stream(&j->req);
     g->openai_live_chat = request_uses_openai_live_stream(&j->req);
@@ -1261,8 +1262,14 @@ void server::gen_stream_begin(session_slot *sl) {
     }
 
     g->dsml_recovery_attempted = false;
-    g->rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    if (j->req.seed) {
+        g->rng = j->req.seed;
+    } else {
+        uint64_t r = 0;
+        if (!random_bytes(&r, sizeof(r)) || r == 0)
+            pulsar_die("random_bytes failed; cannot seed an unseeded request");
+        g->rng = r;
+    }
     g->phase = GEN_DECODE_INIT;
 }
 
