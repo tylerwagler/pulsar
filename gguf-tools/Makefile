@@ -31,8 +31,16 @@ test_quants: test_quants.c $(QUANTS_OBJS)
 
 # test also rebuilds the production binary: a stale deepseek4-quantize
 # once shipped sign-stripped MXFP4 donors while test_quants (rebuilt) passed.
-test: test_quants deepseek4-quantize
+test: test_quants deepseek4-quantize quantize/tests/imatrix_refuse
 	./test_quants
+	./quantize/tests/imatrix_refuse
+
+# An iq2_xxs tensor with no imatrix entry is refused by name (L192: the
+# synthetic weight-energy stand-in was deleted).  Links the quantizer's own
+# objects minus its main so the test calls the live f32_to_type().
+QUANTIZE_LIB_OBJS := $(filter-out quantize/dsq_cli.o,$(QUANTIZE_OBJS))
+quantize/tests/imatrix_refuse: quantize/tests/imatrix_refuse.c $(QUANTIZE_LIB_OBJS) $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -o $@ $^ -lm -pthread
 
 # Self-tests for the python maintenance tools (reflow_artifact.py and
 # splice_bf16_plain.py). Kept out of `test` because they need the HF source
@@ -116,4 +124,4 @@ quality-score:
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.cc $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o
+	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o quantize/tests/imatrix_refuse

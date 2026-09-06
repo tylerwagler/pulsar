@@ -65,9 +65,16 @@ typedef enum {
     EVAL_THINKING,
     EVAL_SKIPPED,
     EVAL_STOPPED,
+    /** The response ended without its answer line (the budget ran out, or the
+     * model kept writing after it).  Counted on its own: neither a pass nor a
+     * fail, because nothing was graded. */
+    EVAL_INCOMPLETE,
     EVAL_PASSED,
     EVAL_FAILED,
 } eval_status;
+
+/* The one spelling of a status in traces and reports (defined with the report). */
+static const char *report_status_name(eval_status st);
 
 typedef enum {
     EVAL_RUN_OK,
@@ -1336,6 +1343,7 @@ typedef struct {
     pulsar_think_mode think_mode;  ///< reasoning mode for the run
     bool plain;                    ///< plain output, no TUI
     bool self_test_extractors;     ///< run the answer-extractor self-tests and exit
+    bool retry_incomplete;         ///< re-run an INCOMPLETE case once with twice the budget
 } eval_config;
 
 /** How a case's reasoning block ended, recorded for the trace: a forced close
@@ -1638,6 +1646,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.plain = true;
         } else if (!strcmp(arg, "--self-test-extractors")) {
             c.self_test_extractors = true;
+        } else if (!strcmp(arg, "--retry-incomplete")) {
+            c.retry_incomplete = true;
         } else {
             fprintf(stderr, "pulsar-eval: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -1717,6 +1727,7 @@ static void term_set_color_for_status(eval_status st) {
     case EVAL_THINKING: fputs(ANSI_YELLOW, stdout); break;
     case EVAL_SKIPPED:  fputs(ANSI_DIM, stdout); break;
     case EVAL_STOPPED:  fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
+    case EVAL_INCOMPLETE: fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
     case EVAL_PASSED:   fputs(ANSI_GREEN ANSI_BOLD, stdout); break;
     case EVAL_FAILED:   fputs(ANSI_RED ANSI_BOLD, stdout); break;
     }
@@ -1729,6 +1740,7 @@ static const char *status_name(eval_status st) {
     case EVAL_THINKING: return "RUN";
     case EVAL_SKIPPED: return "SKIP";
     case EVAL_STOPPED: return "STOP";
+    case EVAL_INCOMPLETE: return "INC";
     case EVAL_PASSED: return "PASS";
     case EVAL_FAILED: return "FAIL";
     }
@@ -1988,19 +2000,22 @@ static void tui_draw_frame(eval_ui *ui) {
 static void tui_draw_left(eval_ui *ui) {
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ui->ncases; i++) {
         if (ui->status[i] == EVAL_PASSED) passed++;
         else if (ui->status[i] == EVAL_FAILED) failed++;
+        else if (ui->status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     tui_draw_title(ui);
 
     term_move(2, 1);
     tui_clear_left_line(ui, 2);
-    printf("score %s%d%s/%d  failed %s%d%s",
+    printf("score %s%d%s/%d  failed %s%d%s  incomplete %s%d%s",
            ANSI_GREEN, passed, ANSI_RESET,
            ui->ncases,
-           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET);
+           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET,
+           incomplete ? ANSI_YELLOW : ANSI_DIM, incomplete, ANSI_RESET);
 
     const int first_row = 4;
     const int visible_rows = ui->rows >= first_row ? ui->rows - first_row + 1 : 0;
@@ -2042,7 +2057,8 @@ static void tui_draw_left(eval_ui *ui) {
                      ui->cases[i].source, ui->cases[i].title);
             print_trimmed(title, title_w);
         }
-        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED) {
+        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED ||
+            ui->status[i] == EVAL_INCOMPLETE) {
             char answers[64];
             snprintf(answers, sizeof(answers), "%s/%s",
                      ui->guess[i][0] ? ui->guess[i] : "?",
@@ -2202,6 +2218,7 @@ static const char *short_phase_name(const char *phase) {
     if (!strcmp(phase, "answer")) return "ANS";
     if (!strcmp(phase, "passed")) return "PASS";
     if (!strcmp(phase, "failed")) return "FAIL";
+    if (!strcmp(phase, "incomplete")) return "INC";
     return "RUN";
 }
 
@@ -2389,10 +2406,21 @@ static int eval_max_prompt_tokens(pulsar_engine *engine,
     return max_prompt;
 }
 
+/** Generation budget for one attempt at a case.  A retry of an INCOMPLETE case
+ * (--retry-incomplete) gets twice the budget, once; both are capped at the
+ * context ceiling.  Upstream antirez/ds4 29aa7267's rule. */
+static int eval_generation_budget(const eval_config *cfg, bool retry) {
+    long long budget = cfg->max_tokens;
+    if (retry) budget *= 2;
+    if (budget > EVAL_MAX_CONTEXT) budget = EVAL_MAX_CONTEXT;
+    return (int)budget;
+}
+
 static int eval_auto_context_size(pulsar_engine *engine,
                                   eval_config *cfg,
                                   const eval_case *cases,
                                   int ncases,
+                                  int max_generation_tokens,
                                   int *max_prompt_out,
                                   int *max_case_out)
 {
@@ -2407,12 +2435,12 @@ static int eval_auto_context_size(pulsar_engine *engine,
      * thinking mode that the actual run will use. */
     for (int iter = 0; iter < 3; iter++) {
         max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
-        long long required = (long long)max_prompt + (long long)cfg->max_tokens;
+        long long required = (long long)max_prompt + (long long)max_generation_tokens;
         if (required < min_ctx) required = min_ctx;
         if (required > EVAL_MAX_CONTEXT) {
             fprintf(stderr,
-                    "pulsar-eval: largest prompt (%d tokens, case %d) + --tokens (%d) exceeds the %d token context cap\n",
-                    max_prompt, max_case + 1, cfg->max_tokens, EVAL_MAX_CONTEXT);
+                    "pulsar-eval: largest prompt (%d tokens, case %d) + generation budget (%d) exceeds the %d token context cap\n",
+                    max_prompt, max_case + 1, max_generation_tokens, EVAL_MAX_CONTEXT);
             exit(2);
         }
         if ((int)required == ctx) break;
@@ -2436,7 +2464,8 @@ static void eval_warn_think_effort_downgraded(const eval_config *cfg) {
             cfg->ctx_size);
 }
 
-static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens, int max_prompt_case) {
+static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens,
+                                     int max_prompt_case, int max_generation_tokens) {
     if (max_prompt_tokens >= cfg->ctx_size) {
         fprintf(stderr,
                 "pulsar-eval: warning: largest prompt (%d tokens, case=%d) does not fit ctx=%d\n",
@@ -2447,14 +2476,14 @@ static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_toke
     }
 
     const int room = cfg->ctx_size - max_prompt_tokens;
-    if (room < cfg->max_tokens) {
+    if (room < max_generation_tokens) {
         fprintf(stderr,
                 "pulsar-eval: warning: largest prompt (%d tokens, case=%d) leaves %d generation tokens in ctx=%d; requested %d\n",
                 max_prompt_tokens,
                 max_prompt_case + 1,
                 room,
                 cfg->ctx_size,
-                cfg->max_tokens);
+                max_generation_tokens);
     }
 }
 
@@ -2500,7 +2529,8 @@ static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
 static void trace_write_header(FILE *trace, const eval_config *cfg,
                                const char *model_name,
                                int ncases,
-                               int max_prompt_tokens) {
+                               int max_prompt_tokens,
+                               int max_generation_tokens) {
     if (!trace) return;
     fprintf(trace,
             "# pulsar-eval trace\n"
@@ -2510,6 +2540,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "backend: %s\n"
             "ctx: %d\n"
             "max_tokens: %d\n"
+            "max_generation_tokens: %d\n"
             "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
@@ -2527,6 +2558,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             pulsar_backend_name(cfg->backend),
             cfg->ctx_size,
             cfg->max_tokens,
+            max_generation_tokens,
             max_prompt_tokens,
             ncases,
             cfg->temperature,
@@ -2553,6 +2585,7 @@ static void trace_write_case(FILE *trace,
                              pulsar_think_mode effective_think_mode,
                              int prompt_tokens,
                              int generated_tokens,
+                             int generation_budget,
                              double elapsed_sec,
                              const char *picked,
                              const eval_think_close_info *think_close) {
@@ -2570,6 +2603,7 @@ static void trace_write_case(FILE *trace,
             "expected: %s\n"
             "prompt_tokens: %d\n"
             "generated_tokens: %d\n"
+            "generation_budget: %d\n"
             "elapsed_sec: %.3f\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
@@ -2586,6 +2620,7 @@ static void trace_write_case(FILE *trace,
             tc->answer,
             prompt_tokens,
             generated_tokens,
+            generation_budget,
             elapsed_sec,
             cfg->temperature,
             cfg->top_p,
@@ -2959,6 +2994,53 @@ static bool answer_matches(const eval_case *tc, const char *got) {
     return got && strcmp(got, expected) == 0;
 }
 
+/* The grading contract (upstream antirez/ds4 29aa7267): the LAST non-empty
+ * line of the visible reply must carry the "Answer:" marker the prompt asked
+ * for.  Only that line reaches the extractors, so a provisional "Answer:"
+ * earlier in the reply is never graded by mistake. */
+static bool line_has_answer_marker(const char *line) {
+    const char *marker = find_last_answer_marker(line);
+    if (!marker) return false;
+    const char *p = marker + strlen("answer");
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p == ':';
+}
+
+/** ONE authority for a completed response's outcome: the live run and
+ * --regrade-trace both grade through here.  A reply whose last line is not an
+ * answer line ended before its answer -- the budget ran out, or the model kept
+ * writing -- and is EVAL_INCOMPLETE: nothing was graded, so it is neither a
+ * pass nor a fail.  Otherwise EVAL_PASSED or EVAL_FAILED; `got` receives the
+ * extracted answer ("?" when incomplete). */
+static eval_status grade_model_output(const eval_case *tc, const char *generated,
+                                      char *got, size_t gotlen) {
+    if (gotlen) snprintf(got, gotlen, "?");
+    const char *visible = strstr(generated, "</think>");
+    visible = visible ? visible + 8 : generated;
+
+    const char *end = visible + strlen(visible);
+    while (end > visible && isspace((unsigned char)end[-1])) end--;
+    if (end == visible) return EVAL_INCOMPLETE;
+    const char *start = end;
+    while (start > visible && start[-1] != '\n' && start[-1] != '\r') start--;
+
+    size_t len = (size_t)(end - start);
+    char *line = (char *)malloc(len + 1);
+    if (!line) {
+        fprintf(stderr, "pulsar-eval: out of memory while grading answer\n");
+        exit(1);
+    }
+    memcpy(line, start, len);
+    line[len] = '\0';
+    eval_status st = EVAL_INCOMPLETE;
+    if (line_has_answer_marker(line)) {
+        find_case_answer(tc, line, got, gotlen);
+        st = answer_matches(tc, got) ? EVAL_PASSED : EVAL_FAILED;
+    }
+    free(line);
+    return st;
+}
+
 static char *read_text_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -3173,30 +3255,30 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     return out;
 }
 
-typedef enum {
-    REGRADE_NOT_GRADED,
-    REGRADE_PASSED,
-    REGRADE_FAILED,
-} regrade_outcome;
-
-/* Decide how one trace case regrades. Only PASSED/FAILED traces were graded by
- * a completed run; STOPPED/SKIPPED/SWITCHED/ERROR cases carry partial or no
- * model output and must be reported as not-graded rather than counted, since
- * grading them inflates the totals and raises spurious "changed" drift. An
- * empty status keeps legacy traces (written before the status line) working. */
-static regrade_outcome regrade_case_outcome(const eval_case *tc,
-                                            const char *traced_status,
-                                            const char *model_output,
-                                            char *got, size_t gotlen) {
+/* Decide whether one trace case regrades.  Only cases a completed run graded
+ * (PASSED/FAILED/INCOMPLETE) regrade; STOPPED/SKIPPED/SWITCHED/ERROR cases
+ * carry partial or no model output and are reported as not-graded rather than
+ * counted, since grading them inflates the totals and raises spurious
+ * "changed" drift.  An empty status keeps legacy traces (written before the
+ * status line) working.  Returns false when not graded; otherwise *outcome is
+ * the status grade_model_output() gives the traced output TODAY, which may
+ * differ from the traced one -- that difference is what --regrade-trace is
+ * for. */
+static bool regrade_case_outcome(const eval_case *tc,
+                                 const char *traced_status,
+                                 const char *model_output,
+                                 char *got, size_t gotlen,
+                                 eval_status *outcome) {
     bool gradeable = traced_status[0] == '\0' ||
-                     !strcmp(traced_status, "PASSED") ||
-                     !strcmp(traced_status, "FAILED");
+                     !strcmp(traced_status, report_status_name(EVAL_PASSED)) ||
+                     !strcmp(traced_status, report_status_name(EVAL_FAILED)) ||
+                     !strcmp(traced_status, report_status_name(EVAL_INCOMPLETE));
     if (!gradeable) {
         if (gotlen) got[0] = '\0';
-        return REGRADE_NOT_GRADED;
+        return false;
     }
-    find_case_answer(tc, model_output, got, gotlen);
-    return answer_matches(tc, got) ? REGRADE_PASSED : REGRADE_FAILED;
+    *outcome = grade_model_output(tc, model_output, got, gotlen);
+    return true;
 }
 
 static int regrade_trace_file(const char *path) {
@@ -3209,6 +3291,7 @@ static int regrade_trace_file(const char *path) {
     int total = 0;
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     int changed = 0;
     int unknown = 0;
     int parse_errors = 0;
@@ -3254,32 +3337,31 @@ static int regrade_trace_file(const char *path) {
         }
 
         char got[EVAL_ANSWER_MAX];
-        regrade_outcome outcome =
-            regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got));
-        if (outcome == REGRADE_NOT_GRADED) {
+        eval_status outcome = EVAL_PENDING;
+        if (!regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got), &outcome)) {
             not_graded++;
             free(model_output);
             continue;
         }
-        bool ok = (outcome == REGRADE_PASSED);
-        if (ok) passed++;
-        else failed++;
+        if (outcome == EVAL_PASSED) passed++;
+        else if (outcome == EVAL_FAILED) failed++;
+        else incomplete++;
 
-        bool traced_ok = !strcmp(traced_status, "PASSED");
-        if ((traced_status[0] && ok != traced_ok) ||
+        const char *regraded_name = report_status_name(outcome);
+        if ((traced_status[0] && strcmp(traced_status, regraded_name) != 0) ||
             (traced_pick[0] && strcmp(got, traced_pick) != 0)) {
             changed++;
             printf("case %d %s/%s: trace %s picked=%s -> regrade %s picked=%s expected=%s\n",
                    total, source, id,
                    traced_status[0] ? traced_status : "?",
                    traced_pick[0] ? traced_pick : "?",
-                   ok ? "PASSED" : "FAILED", got, tc->answer ? tc->answer : "?");
+                   regraded_name, got, tc->answer ? tc->answer : "?");
         }
         free(model_output);
     }
 
-    printf("pulsar-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
-           total, path, passed, failed, changed, not_graded, unknown, parse_errors);
+    printf("pulsar-eval: regraded %d cases from %s: passed=%d failed=%d incomplete=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
+           total, path, passed, failed, incomplete, changed, not_graded, unknown, parse_errors);
     free(text);
     return (unknown || parse_errors || total == 0) ? 1 : 0;
 }
@@ -3347,27 +3429,61 @@ static int trace_copy_self_test_case(void) {
     return 0;
 }
 
+/* The grading contract, exercised through the ONE grading entry the live run
+ * and the regrade share.  expected_extract is checked only when the outcome is
+ * graded (an INCOMPLETE reply extracts nothing). */
+static int grading_self_test_case(const char *name, const eval_case *tc,
+                                  const char *generated,
+                                  eval_status expected_status,
+                                  const char *expected_extract) {
+    char got[EVAL_ANSWER_MAX];
+    eval_status st = grade_model_output(tc, generated, got, sizeof(got));
+    bool ok = st == expected_status;
+    if (ok && expected_status != EVAL_INCOMPLETE) ok = !strcmp(got, expected_extract);
+    if (ok) return 0;
+
+    fprintf(stderr,
+            "pulsar-eval: grading self-test failed: %s (status %s/%s, got %s, expected %s)\n",
+            name, report_status_name(st), report_status_name(expected_status), got,
+            expected_extract ? expected_extract : "-");
+    return 1;
+}
+
 static int regrade_status_self_test_case(void) {
     int failed = 0;
     const eval_case integer = {.source = "AIME2025", .answer = "82"};
     char got[EVAL_ANSWER_MAX];
+    eval_status st = EVAL_PENDING;
 
-    if (regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_PASSED) {
+    if (!regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
+                              got, sizeof(got), &st) || st != EVAL_PASSED) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: PASSED trace not regraded\n");
         failed++;
     }
     /* An interrupted run whose partial output happens to look correct must not
      * be counted or flagged as drift. */
     if (regrade_case_outcome(&integer, "STOPPED", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_NOT_GRADED) {
+                             got, sizeof(got), &st)) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: STOPPED trace was graded\n");
         failed++;
     }
     /* Legacy traces without a status line stay gradeable. */
-    if (regrade_case_outcome(&integer, "", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_PASSED) {
+    if (!regrade_case_outcome(&integer, "", "</think>Answer: 82",
+                              got, sizeof(got), &st) || st != EVAL_PASSED) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: legacy empty status not graded\n");
+        failed++;
+    }
+    /* An INCOMPLETE case was a completed run: it regrades, and stays INCOMPLETE
+     * while its output still has no answer line. */
+    if (!regrade_case_outcome(&integer, "INCOMPLETE", "</think>The answer is 82, but",
+                              got, sizeof(got), &st) || st != EVAL_INCOMPLETE) {
+        fprintf(stderr, "pulsar-eval: regrade self-test failed: INCOMPLETE trace not regraded as INCOMPLETE\n");
+        failed++;
+    }
+    /* A trace graded PASSED under a looser contract regrades under this one. */
+    if (!regrade_case_outcome(&integer, "PASSED", "</think>The answer is 82.",
+                              got, sizeof(got), &st) || st != EVAL_INCOMPLETE) {
+        fprintf(stderr, "pulsar-eval: regrade self-test failed: answer-less PASSED trace did not regrade INCOMPLETE\n");
         failed++;
     }
     return failed;
@@ -3378,6 +3494,41 @@ static int run_extractor_self_tests(void) {
 
     failed += trace_copy_self_test_case();
     failed += regrade_status_self_test_case();
+
+    /* --- The grading contract: last visible line decides INCOMPLETE vs graded. */
+    const eval_case graded_int = {.source = "AIME2025", .answer = "82"};
+    failed += grading_self_test_case(
+        "grading: a final answer line is graded",
+        &graded_int, "</think>The result is 82.\n**Answer:** 082\n", EVAL_PASSED, "82");
+    failed += grading_self_test_case(
+        "grading: a wrong final answer line is FAILED, not INCOMPLETE",
+        &graded_int, "</think>Answer: 81", EVAL_FAILED, "81");
+    failed += grading_self_test_case(
+        "grading: no answer line is INCOMPLETE",
+        &graded_int, "</think>The answer is 82, but the generation was truncated.",
+        EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: text after the answer line is INCOMPLETE",
+        &graded_int, "</think>Answer: 82\nA later unfinished sentence", EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: an empty reply is INCOMPLETE",
+        &graded_int, "", EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: an answer line inside the thinking block does not count",
+        &graded_int, "Answer: 82</think>Let me reconsider.", EVAL_INCOMPLETE, NULL);
+    const eval_case graded_mc = {
+        .source = "SuperGPQA",
+        .choice = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J" },
+        .answer = "F",
+    };
+    failed += grading_self_test_case(
+        "grading: multiple-choice final line",
+        &graded_mc, "</think>Option H is tempting.\nAnswer: F", EVAL_PASSED, "F");
+    const eval_case graded_compsec = {.source = "COMPSEC", .answer = "9-10"};
+    failed += grading_self_test_case(
+        "grading: COMPSEC final line",
+        &graded_compsec, "**Answer:** 10</think>The primary write is at line 10.\nAnswer: 10",
+        EVAL_PASSED, "10");
 
     const eval_case mc = {
         .source = "SuperGPQA",
@@ -3582,7 +3733,8 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
 
 static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *session,
                                     const eval_config *cfg, eval_ui *ui,
-                                    FILE *trace, int idx, uint64_t *rng) {
+                                    FILE *trace, int idx, int generation_budget,
+                                    uint64_t *rng) {
     const eval_case *tc = &eval_cases[idx];
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
@@ -3608,7 +3760,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt does not fit context", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_budget, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3618,7 +3770,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         return EVAL_RUN_OK;
     }
 
-    int generation_limit = cfg->max_tokens;
+    int generation_limit = generation_budget;
     int ctx_generation_limit = cfg->ctx_size - prompt.len;
     if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
     if (generation_limit < 1) {
@@ -3629,7 +3781,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt leaves no generation room", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_budget, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3672,7 +3824,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         fprintf(stderr, "pulsar-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
-                         system, question, "", think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt.len, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         pulsar_tokens_free(&prompt);
         return EVAL_RUN_ERROR;
@@ -3691,7 +3844,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_QUIT;
     }
@@ -3700,7 +3854,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_SWITCH;
     }
@@ -3731,7 +3886,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3745,7 +3901,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3764,7 +3921,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3778,7 +3936,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3830,7 +3989,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             fprintf(stderr, "pulsar-eval: decode failed for %s: %s\n", tc->id, err);
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
-                             prompt_tokens, ui->generated, now_sec() - t0, "?",
+                             prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                              &think_close);
             free(question);
             pulsar_tokens_free(&think_close_tokens);
@@ -3852,7 +4012,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             fprintf(stderr, "pulsar-eval: decode failed for %s: %s\n", tc->id, err);
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
-                             prompt_tokens, ui->generated, now_sec() - t0, "?",
+                             prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                              &think_close);
             free(question);
             pulsar_tokens_free(&think_close_tokens);
@@ -3900,24 +4061,26 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     }
 
     char got[EVAL_ANSWER_MAX];
-    find_case_answer(tc, raw.v ? raw.v : "", got, sizeof(got));
+    const eval_status outcome = grade_model_output(tc, raw.v ? raw.v : "", got, sizeof(got));
     snprintf(ui->guess[idx], EVAL_ANSWER_MAX, "%s", got);
-    bool pass = answer_matches(tc, got);
-    ui->status[idx] = pass ? EVAL_PASSED : EVAL_FAILED;
+    ui->status[idx] = outcome;
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
     double sec = now_sec() - t0;
-    tui_refresh(ui, pass ? "passed" : "failed");
-    trace_write_case(trace, cfg, tc, idx, ui->ncases, pass ? "PASSED" : "FAILED", NULL,
+    const char *outcome_name = report_status_name(outcome);
+    tui_refresh(ui, outcome == EVAL_PASSED ? "passed" :
+                    outcome == EVAL_FAILED ? "failed" : "incomplete");
+    trace_write_case(trace, cfg, tc, idx, ui->ncases, outcome_name, NULL,
                      system, question, raw.v ? raw.v : "", think_mode, prompt_tokens,
-                     ui->generated, sec, got, &think_close);
+                     ui->generated, generation_limit, sec, got, &think_close);
 
     if (!tty) {
-        printf("%s%s%s got %s expected %s (%.1fs, %d tokens)\n",
-               use_plain_color ? (pass ? ANSI_GREEN : ANSI_RED) : "",
-               pass ? "PASSED" : "FAIL",
+        printf("%s%s%s got %s expected %s (%.1fs, %d tokens of %d)\n",
+               use_plain_color ? (outcome == EVAL_PASSED ? ANSI_GREEN :
+                                  outcome == EVAL_FAILED ? ANSI_RED : ANSI_YELLOW) : "",
+               outcome_name,
                use_plain_color ? ANSI_RESET : "",
-               got, tc->answer, sec, ui->generated);
+               got, tc->answer, sec, ui->generated, generation_limit);
     }
 
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
@@ -4014,6 +4177,7 @@ static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
     case EVAL_FAILED: return "FAILED";
+    case EVAL_INCOMPLETE: return "INCOMPLETE";
     case EVAL_SKIPPED: return "SKIPPED";
     case EVAL_STOPPED: return "STOPPED";
     case EVAL_PREFILL: return "PREFILL";
@@ -4023,21 +4187,23 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
-static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
+static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed,
+                              int incomplete) {
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
     printf("pulsar-eval: %d/%d passed", passed, ncases);
     if (failed) printf(", %d failed", failed);
+    if (incomplete) printf(", %d incomplete", incomplete);
     printf(", runtime %s\n", elapsed);
-    printf("%-3s %-8s %8s %8s %8s %-8s %-8s %s\n",
+    printf("%-3s %-10s %8s %8s %8s %-8s %-8s %s\n",
            "#", "state", "prompt", "gen", "total", "given", "correct", "test");
     for (int i = 0; i < ncases; i++) {
         int prompt_tokens = ui->prompt_tokens ? ui->prompt_tokens[i] : 0;
         int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
         int total_tokens = prompt_tokens + generated_tokens;
         const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
-        printf("%3d %-8s %8d %8d %8d %-8s %-8s %s/%s\n",
+        printf("%3d %-10s %8d %8d %8d %-8s %-8s %s/%s\n",
                i + 1,
                report_status_name(ui->status[i]),
                prompt_tokens,
@@ -4101,26 +4267,32 @@ int main(int argc, char **argv) {
 
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
+    /* The context has to hold the largest budget any attempt can use: the
+     * doubled retry budget when --retry-incomplete is armed. */
+    const int max_generation_tokens = eval_generation_budget(&cfg, cfg.retry_incomplete);
     const bool auto_ctx = cfg.ctx_size <= 0;
     if (auto_ctx) {
         cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+                                              max_generation_tokens,
                                               &max_prompt_tokens, &max_prompt_case);
         fprintf(stderr,
                 "pulsar-eval: context auto-sized to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, max_generation_tokens);
     } else {
         max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
                                                    cfg.ctx_size, &max_prompt_case);
         fprintf(stderr,
                 "pulsar-eval: context set to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
-        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, max_generation_tokens);
+        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case,
+                                 max_generation_tokens);
     }
     fprintf(stderr, "pulsar-eval: model shape %s\n", pulsar_engine_model_name(engine));
     eval_warn_think_effort_downgraded(&cfg);
-    trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases, max_prompt_tokens);
+    trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases,
+                       max_prompt_tokens, max_generation_tokens);
     log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
 
     pulsar_session *session = NULL;
@@ -4134,7 +4306,7 @@ int main(int argc, char **argv) {
 
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
-    tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
+    tui_start(&ui, eval_cases, ncases, max_generation_tokens, split_ui);
 
     uint64_t rng = cfg.seed;
     int rc = 0;
@@ -4157,7 +4329,15 @@ int main(int argc, char **argv) {
             ui.selected_case = next;
         }
 
-        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
+        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next,
+                                              eval_generation_budget(&cfg, false), &rng);
+        if (result == EVAL_RUN_OK && ui.status[next] == EVAL_INCOMPLETE &&
+            cfg.retry_incomplete) {
+            const int retry_budget = eval_generation_budget(&cfg, true);
+            fprintf(stderr, "pulsar-eval: retrying incomplete case %s/%s with %d tokens\n",
+                    eval_cases[next].source, eval_cases[next].id, retry_budget);
+            result = run_one_case(engine, session, &cfg, &ui, trace, next, retry_budget, &rng);
+        }
         if (result == EVAL_RUN_ERROR) {
             rc = 1;
             break;
@@ -4185,20 +4365,23 @@ int main(int argc, char **argv) {
 
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ncases; i++) {
         if (ui.status[i] == EVAL_PASSED) passed++;
         else if (ui.status[i] == EVAL_FAILED) failed++;
+        else if (ui.status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     if (ui.active) tui_restore();
-    print_eval_report(&ui, ncases, passed, failed);
+    print_eval_report(&ui, ncases, passed, failed, incomplete);
     if (trace) {
         fprintf(trace,
                 "===== SUMMARY =====\n"
                 "passed: %d\n"
                 "failed: %d\n"
+                "incomplete: %d\n"
                 "total: %d\n",
-                passed, failed, ncases);
+                passed, failed, incomplete, ncases);
         fflush(trace);
     }
 
@@ -4207,5 +4390,5 @@ int main(int argc, char **argv) {
     pulsar_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);
-    return rc || failed ? 1 : 0;
+    return rc || failed || incomplete ? 1 : 0;
 }

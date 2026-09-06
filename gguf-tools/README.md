@@ -168,17 +168,17 @@ template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
 
 ## When No Imatrix Is Given
 
-`iq2_xxs` requires an importance vector.  If `--imatrix` is not provided and
-the target type requires one, `deepseek4-quantize` computes a synthetic fallback
-from the dequantized weight itself:
+`iq2_xxs` requires an importance vector.  If `--imatrix` is not provided, or
+the file has no entry for a tensor the recipe sends to `iq2_xxs`, the run is
+refused with the tensor's name:
 
 ```text
-importance[column] = sum(row[column]^2) over all rows
+error: iq2_xxs requires an imatrix entry for blk.3.ffn_gate_exps.weight; pass --imatrix
 ```
 
-This is a weight-energy heuristic.  It is not as good as measuring real DS4
-activations, but it gives the quantizer a stable column weighting and was good
-enough for the first working 2-bit GGUFs.
+There is no synthetic weight-energy stand-in (removed, L192): the imatrix
+collector under `imatrix/` is the one source of column weights, and
+`--mse-probe` refuses without `--imatrix` for the same reason.
 
 ## Quality Testing
 

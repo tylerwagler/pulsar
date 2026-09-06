@@ -147,8 +147,10 @@ gguf-tools/deepseek4-quantize \
 
 For Q4, the imatrix does not change the runtime tensor type: routed experts
 remain `Q4_K`.  It changes how quantization error is weighted while choosing
-scales and codes.  For Q2, it replaces the previous synthetic weight-energy
-fallback used for `IQ2_XXS` gate/up experts with real activation statistics.
+scales and codes.  For Q2 it is mandatory: an `IQ2_XXS` tensor without an
+imatrix entry is REFUSED (the quantizer exits naming the tensor).  The former
+synthetic weight-energy fallback was removed (L192), and `--mse-probe` refuses
+to run without `--imatrix` for the same reason.
 
 ## 4. Evaluate
 

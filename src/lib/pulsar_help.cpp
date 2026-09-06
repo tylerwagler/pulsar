@@ -312,6 +312,7 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");
     opt(fp, c, "--regrade-trace FILE", "Regrade a prior trace without loading the model.");
+    opt(fp, c, "--retry-incomplete", "Re-run a case whose reply had no final Answer line (INCOMPLETE) once with 2x --tokens.");
     opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");
     opt(fp, c, "--hard-limit-reply-budget N", "Force </think> with N tokens left. Default: 512");
     opt(fp, c, "--soft-limit-think-close-rank N", "Soft-close when </think> is in top N tokens. Default: 3");

@@ -9,4 +9,5 @@ quality-testing/score_official
 
 # test binaries
 quantize/tests/mxfp8_lt_emit
+quantize/tests/imatrix_refuse
 quantize/tests/sfcmp

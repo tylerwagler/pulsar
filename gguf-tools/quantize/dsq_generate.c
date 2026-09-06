@@ -4,7 +4,12 @@
  * Tensor generation
  */
 
-byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
+/* One weighting path: a target whose quantizer needs an imatrix refuses when
+ * none was found for THIS tensor.  There is no synthetic column-energy stand-in
+ * (deleted, L192): that arm ran exactly when the collector had not covered a
+ * tensor, so it quantized with statistics nobody measured and no gate saw. */
+byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
+                     const float *imat, const char *tensor_name) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
     byte_buf out = {0};
     if (type == DS4Q_TYPE_F32) {
@@ -45,18 +50,12 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
     out.size = (size_t)nrows * ds4q_row_size(type, ncols);
     out.data = xmalloc(out.size);
 
-    float *synthetic = NULL;
-    const float *im_ptr = imat;
-    if (!im_ptr && ds4q_requires_imatrix(type)) {
-        synthetic = xcalloc((size_t)ncols, sizeof(float));
-        for (int64_t r = 0; r < nrows; r++) {
-            const float *row = src + (size_t)r * (size_t)ncols;
-            for (int64_t c = 0; c < ncols; c++) synthetic[c] += row[c] * row[c];
-        }
-        im_ptr = synthetic;
+    if (!imat && ds4q_requires_imatrix(type)) {
+        fprintf(stderr, "error: %s requires an imatrix entry for %s; pass --imatrix\n",
+                ds4q_type_name(type), tensor_name);
+        exit(1);
     }
-    size_t written = ds4q_quantize_chunk(type, src, out.data, 0, nrows, ncols, im_ptr);
-    free(synthetic);
+    size_t written = ds4q_quantize_chunk(type, src, out.data, 0, nrows, ncols, imat);
     if (written != out.size) die("ds4q_quantize_chunk wrote unexpected byte count");
     return out;
 }
@@ -203,7 +202,7 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         const char *names[2] = { gguf_name, hf_name };
         imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
     }
-    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
+    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat, gguf_name);
     free(f32);
     free(hf_name);
     return b;
@@ -272,7 +271,7 @@ static void generate_one_expert(expert_job *j, int xid) {
         const char *names[2] = { j->gguf_name, weight_name };
         imat = imatrix_find(j->imatrix, names, 2, j->ncols, src_xid, j->n_expert_orig);
     }
-    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
+    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat, weight_name);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
     free(q.data);
