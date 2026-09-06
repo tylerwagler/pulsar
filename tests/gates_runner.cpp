@@ -75,11 +75,11 @@ static bool same_str(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
-/* prefill_chunk 0 IS PULSAR_PREFILL_CHUNK_DEFAULT (the runner scrubs
- * PULSAR_CUDA_PREFILL_CHUNK), so a gate that leaves it 0 and one that pins the
- * production grid ask for the same engine -- comparing the raw field cost one
- * model load per battery (the drafter-off multiseq gate vs the prefill gates,
- * L194). */
+/* prefill_chunk 0 IS PULSAR_PREFILL_CHUNK_DEFAULT (main() refuses to run with
+ * PULSAR_CUDA_PREFILL_CHUNK set, so the engine cannot resolve 0 to anything
+ * else), so a gate that leaves it 0 and one that pins the production grid ask
+ * for the same engine -- comparing the raw field cost one model load per
+ * battery (the drafter-off multiseq gate vs the prefill gates, L194). */
 static uint32_t prefill_chunk_resolved(uint32_t v) { return v ? v : PULSAR_PREFILL_CHUNK_DEFAULT; }
 
 /* The fields a gate may set.  Anything else non-zero is a configuration this
@@ -199,6 +199,14 @@ static bool only_wants(const char *only, const char *name) {
 }
 
 int main(int argc, char **argv) {
+    /* The engine resolves prefill_chunk 0 through this variable; the runner's
+     * engine-sharing rule (same_config) assumes the default grid.  Refuse
+     * rather than share an engine opened on some other chunk. */
+    if (getenv("PULSAR_CUDA_PREFILL_CHUNK")) {
+        fprintf(stderr, "gates_runner: PULSAR_CUDA_PREFILL_CHUNK is set; the gate configurations assume the "
+                        "default prefill grid -- unset it and rerun\n");
+        return 2;
+    }
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL --prefill-baseline BLOB --prefill-ref SHORT [--ref-dir DIR] "
                         "[--ref-tol TOL] [--kl-story FILE] [--kl-code FILE] [--only a,b]\n", argv[0]);
