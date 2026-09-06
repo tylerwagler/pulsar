@@ -761,16 +761,6 @@ typedef struct {
      * exactly like the live-state views (repoint already drops the baked
      * batched-copy tables, so the snapshot fast path re-prepares per bank).
      * NULL when the pool is spec-less. */
-    /** L183: the GRID snapshot lanes -- the compressor state as it stood when a
-     *  prefill chunk ended on the chunk grid (a multiple of prefill_cap), one
-     *  lane per bank, same shape as the live state lanes.  A resume recomputes
-     *  from the last grid boundary at or below its checkpoint so that its chunk
-     *  boundaries are the cold prefill's; the state the resumed chunk folds
-     *  into is this snapshot.  Always allocated (small). */
-    pulsar_gpu_tensor *grid_askv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *grid_assc[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *grid_iskv[PULSAR_MAX_LAYER];  ///< ratio-4 layers only
-    pulsar_gpu_tensor *grid_issc[PULSAR_MAX_LAYER];
     pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention KV; NULL when the pool is spec-less
     pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, attention score
     pulsar_gpu_tensor *spec_iskv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, indexer KV
@@ -895,25 +885,16 @@ typedef struct {
      * bytes).  Set by the per-row capture, consumed by the chunk-tail note
      * block.  Not persisted, not banked. */
     bool r128_perrow_chunk;
+    /** L195: this encode is a resume WARM-UP -- it runs the layers to rebuild the
+     *  ratio-4 compressor state at a grid point and persists nothing else: no
+     *  compressed/indexer cache rows, no frontier counters, no projection-ring
+     *  deposits or undo captures, no drafter capture, no head.  Raw ring rows are
+     *  rewritten (byte-identical).  Set only by gpu_graph_prefill_warmup_state. */
+    bool state_only;
 
     /** Speculative decoding scratch.  The drafter is allowed to mutate graph
      * state only if the target verifier can either commit it or restore the
      * saved frontiers. */
-    /** L183: pool-less twins of the grid snapshot lanes (NULL when banked --
-     *  the banked snapshot lives in banks.grid_*); see gpu_graph_grid_snapshot_save. */
-    pulsar_gpu_tensor *grid_attn_state_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *grid_attn_state_score[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *grid_index_state_kv[PULSAR_MAX_LAYER];
-    pulsar_gpu_tensor *grid_index_state_score[PULSAR_MAX_LAYER];
-    /** L183: the grid position each bank's snapshot was taken at; 0 = none
-     *  (a snapshot at position 0 is meaningless: a resume from 0 is a cold
-     *  prefill).  Indexed by bank, index 0 for a pool-less graph. */
-    uint32_t grid_snap_pos[PULSAR_MSEQ_MAX];
-    /** L195: a crossing saved lane by lane during an encode (the layer loop is
-     *  outer, the row loop inner, so no instant has every layer at the new
-     *  position); committed to grid_snap_pos by the encode that ends
-     *  (gpu_graph_grid_snapshot_commit_pending), cleared when one starts. */
-    uint32_t grid_pending_pos[PULSAR_MSEQ_MAX];
     pulsar_gpu_tensor *spec_attn_state_kv[PULSAR_MAX_LAYER];     ///< saved attention compressed KV frontier, per layer
     pulsar_gpu_tensor *spec_attn_state_score[PULSAR_MAX_LAYER];  ///< saved attention compressed scores, per layer
     pulsar_gpu_tensor *spec_index_state_kv[PULSAR_MAX_LAYER];    ///< saved indexer compressed KV frontier, per layer
@@ -1738,6 +1719,7 @@ typedef struct pulsar_bank_carry {
     uint32_t  dspark_pending_qrows_cap;  ///< floats allocated in dspark_pending_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
+    int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
     /** Whole speculative/DSpark shadow, mirrored by value (single assignment in
      * save/restore).  NOTE: pulsar_session.mseq_dirty is deliberately NOT carried:
      * it is a property of the GRAPH's scalar frontier counters, not of a bank's
@@ -1788,7 +1770,8 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
-    int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid snapshot, 0 = cold from the start), -1 when the sync did not resume
+    int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
+    int prefill_frontier;                  ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
     /** A multiseq step has run and this session's per-bank state is no longer
      * re-establishable by bookkeeping alone.
      *
@@ -2432,7 +2415,7 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank);
  * recompute path instead of the replay.  Correct, slower, and the only gap.
  * Every deposit site in the tree tests THIS predicate; do not re-derive it. */
 static inline bool gpu_graph_store_commits(const pulsar_gpu_graph *g, bool banked) {
-    return !banked && g->spec_comp_save_n == 0;
+    return !banked && g->spec_comp_save_n == 0 && !g->state_only;   /* L195: a warm-up commits nothing */
 }
 
 /** L120 value-half: deposit one COMMITTED position's compressor projection
@@ -2773,57 +2756,37 @@ bool gpu_graph_verify_suffix_tops(
         float                 *row_logits);
 bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
 
-/** L195: the RESUME GRID.  A continuation of a checkpoint resumes from the
- *  bank's latest snapshot at or below it, which is always a multiple of this;
- *  the chunker starts the resumed chunk there.  128 because (a) the one
- *  remaining chunk-mate mechanism, the HC-mix GEMM's dependence on a row's
- *  offset within the call, has period 32 (censuses 14/15, 2026-09-06), so any
- *  multiple of 32 is neutral; (b) 128 is the compress-ratio LCM, so at a grid
- *  point every ratio-128 compressor window is fully consumed and only the
- *  ratio-4 two-group window needs saving (pulsar_bank_slabs::grid_askv).  The
- *  prefill chunk (prefill_cap, 4096) is independent of this: a resumed chunk
- *  runs [G, next chunk-cap multiple), a multiple of 128 long. */
+/** L195: the RESUME GRID and the WARM-UP.  A continuation of a checkpoint is a
+ *  cold prefill from G = the last multiple of PULSAR_RESUME_GRID at or below the
+ *  session's PREFILL frontier (the last position a prefill wrote -- decode rows
+ *  are the decode kernels' and can never equal a cold prefill's, so a resume
+ *  recomputes the tokens generated since).  Nothing is saved for this: the bank
+ *  is rewound to G, its ratio-128 compressor windows are reset to the canonical
+ *  empty state they have at any 128-multiple, and the PULSAR_WARMUP_TOKENS
+ *  tokens before G run through the layers in a state-only pass
+ *  (pulsar_gpu_graph::state_only) that rebuilds the ratio-4 two-group window
+ *  (the previous group's projections, which nothing else retains) and persists
+ *  nothing else.  Then [G, N) is prefilled as the cold prefill would.
+ *  128: the compress-ratio LCM (every ratio-128 window is consumed at a grid
+ *  point) and a multiple of 32, the period of the one remaining chunk-mate
+ *  mechanism, the HC-mix GEMM's dependence on a row's offset within the call
+ *  (censuses 14/15, 2026-09-06).  32 warm-up tokens: a call starting on a
+ *  32-multiple reproduces the cold bytes, and 32 >= 8 covers the two groups.
+ *  The first cut of this (L183/L194) saved per-bank snapshots at grid points
+ *  and fell to a cold prefill from 0 whenever a resume sat below the one saved
+ *  stamp (a partial fork's cut, dogfood 2026-09-06 12:08: 47 s). */
 #define PULSAR_RESUME_GRID 128u
+#define PULSAR_WARMUP_TOKENS 32u
+static_assert(PULSAR_RESUME_GRID % PULSAR_WARMUP_TOKENS == 0u && PULSAR_WARMUP_TOKENS >= 8u,
+              "the warm-up window must start on a 32-multiple and cover the ratio-4 two-group window");
 
-/** L183/L195 grid snapshot (see pulsar_bank_slabs::grid_askv): the ratio-4
- *  layers' compressor state at a multiple of PULSAR_RESUME_GRID, per bank.
- *  save: every ratio-4 lane of the current bank at `pos` (a chunk end);
- *  save_lane: ONE layer's attention or indexer lane for `bank` -- the PREFILL
- *  per-row arm calls it right after the update that carried the position
- *  across a grid point, then `pending` records the position and the encode
- *  that ends commits it (`commit_pending`; `clear_pending` at encode start).
- *  Decode never saves: decode rows are computed by the decode kernels, so a
- *  snapshot of decode state cannot make a resume equal to a cold prefill; a
- *  resume recomputes the tokens generated since the last prefill grid point.  Saved
- *  lanes are CANONICAL: the previous group in rows 0..3, rows 4..7 zero / -INF
- *  -- what a cold prefill chunk boundary leaves -- so a restore is byte-
- *  identical to cold.  restore: the ratio-4 lanes back into the live state,
- *  and the ratio-128 live state reset to its canonical empty window; only if
- *  the bank's stamp is `pos`.  drop: forget a bank's snapshot (its history
- *  changed).  pos: the stamp, 0 = none. */
-bool     gpu_graph_grid_snapshot_save(pulsar_gpu_graph *g, uint32_t pos);
-bool     gpu_graph_grid_snapshot_save_lane(pulsar_gpu_graph *g, uint32_t il, uint32_t bank, bool index, uint32_t pos);
-void     gpu_graph_grid_snapshot_pending(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos);
-void     gpu_graph_grid_snapshot_commit_pending(pulsar_gpu_graph *g);
-void     gpu_graph_grid_snapshot_clear_pending(pulsar_gpu_graph *g);
-bool     gpu_graph_grid_snapshot_restore(pulsar_gpu_graph *g, uint32_t pos);
-void     gpu_graph_grid_snapshot_drop(pulsar_gpu_graph *g, uint32_t bank);
-uint32_t gpu_graph_grid_snapshot_pos(const pulsar_gpu_graph *g, uint32_t bank);
-/** L194/L195: a session payload carries the bank's snapshot; `adopt` records the
- *  position of one the payload just restored into the lanes. */
-void     gpu_graph_grid_snapshot_adopt(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos);
-/** The four grid lanes of (layer, bank) with this bank's byte offset and size in
- *  each; false for a layer without lanes (ratio != 4).  Shared with the payload. */
-bool     gpu_graph_grid_snapshot_lanes(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
-                                       pulsar_gpu_tensor **akv, pulsar_gpu_tensor **asc,
-                                       pulsar_gpu_tensor **ikv, pulsar_gpu_tensor **isc,
-                                       uint64_t *aoff, uint64_t *abytes, uint64_t *ioff, uint64_t *ibytes);
-/** The grid lane of (layer, bank) as a view (attention kv/score, indexer kv/score);
- *  NULL when the layer has none (ratio != 4).  Free with pulsar_gpu_tensor_free. */
-pulsar_gpu_tensor *gpu_graph_bank_grid_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_grid_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_grid_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
-pulsar_gpu_tensor *gpu_graph_bank_grid_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank);
+/** Reset a bank's ratio-128 compressor state lanes to the canonical empty
+ *  window (kv 0, score -INF): their state at any 128-multiple. */
+bool gpu_graph_r128_state_reset_canonical(pulsar_gpu_graph *g, uint32_t bank);
+/** The warm-up: run tokens [G - PULSAR_WARMUP_TOKENS, G) of `prompt` through the
+ *  layers in a state-only pass on the current bank (rewound to G by the caller). */
+bool gpu_graph_prefill_warmup_state(pulsar_gpu_graph *g, const pulsar_model *model,
+                                    const pulsar_weights *weights, const token_vec *prompt, uint32_t G);
 /** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
  * spec_logits rows [row0, row0+n_rows) and read the compact block into
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to

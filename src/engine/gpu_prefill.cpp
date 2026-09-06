@@ -136,11 +136,7 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
         uint32_t          head_dim,
         uint32_t          width,
         uint32_t          pos0,
-        uint32_t          n_tokens,
-        uint32_t          il,
-        uint32_t          bank,
-        bool              index,
-        bool              grid) {   ///< L195: rebuild the grid snapshot at this chunk's last grid point (prefill encodes only)
+        uint32_t          n_tokens) {
     if (n_tokens == 0u) {
         fprintf(stderr, "pulsar: ratio-4 compressor state rebuild on an empty chunk at pos0=%u -- refusing\n", pos0);
         return false;
@@ -182,31 +178,6 @@ static bool gpu_graph_refresh_ratio4_compressor_state(
                                                               pos0 + n_tokens - n_tail,
                                                               n_full,
                                                               rem) != 0;
-    }
-    /* L195: the grid snapshot at the LAST grid point this chunk reached, built
-     * from the chunk's own projections (the batched arm materialises no
-     * interior state, but the state at a grid point B is just the previous
-     * group's four rows, and those rows are in batch_comp_kv/sc).  Same kernel
-     * as the live rebuild above at n_full = 4, rem = 0, so at an aligned chunk
-     * end it is byte-identical to the chunk-end save that follows.  The rebuild
-     * writes only the destination lanes, so the scratch is read in place. */
-    const uint32_t B = pos0 + (n_tokens / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
-    if (ok && grid && B > pos0 && B >= 4u) {
-        pulsar_gpu_tensor *gkv = index ? gpu_graph_bank_grid_index_state_kv_view(g, il, bank)
-                                       : gpu_graph_bank_grid_attn_state_kv_view(g, il, bank);
-        pulsar_gpu_tensor *gsc = index ? gpu_graph_bank_grid_index_state_score_view(g, il, bank)
-                                       : gpu_graph_bank_grid_attn_state_score_view(g, il, bank);
-        pulsar_gpu_tensor *tkv = pulsar_gpu_tensor_view(g->batch_comp_kv, (uint64_t)(B - 4u - pos0) * row_bytes, 4u * row_bytes);
-        pulsar_gpu_tensor *tsc = pulsar_gpu_tensor_view(g->batch_comp_sc, (uint64_t)(B - 4u - pos0) * row_bytes, 4u * row_bytes);
-        ok = gkv && gsc && tkv && tsc &&
-             pulsar_gpu_compressor_prefill_state_ratio4_tensor(gkv, gsc, tkv, tsc, model->map, model->size,
-                                                              ape->abs_offset, ape->type, head_dim,
-                                                              B - 4u, 4u, 0u) != 0;
-        pulsar_gpu_tensor_free(tsc); pulsar_gpu_tensor_free(tkv);
-        pulsar_gpu_tensor_free(gsc); pulsar_gpu_tensor_free(gkv);
-        if (!ok) fprintf(stderr, "pulsar: grid snapshot rebuild at %u (layer %u, %s) failed -- refusing the prefill\n",
-                         B, il, index ? "indexer" : "attention");
-        else gpu_graph_grid_snapshot_pending(g, bank, B);
     }
     return ok;
 }
@@ -1153,7 +1124,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                          PULSAR_ROPE_YARN_BETA_FAST,
                                                          PULSAR_ROPE_YARN_BETA_SLOW,
                                                          PULSAR_RMS_EPS) != 0;
-                if (ok && n_comp != 0) {
+                if (ok && n_comp != 0 && !g->state_only) {   /* L195: a warm-up writes no cache rows */
                     ok = gpu_graph_commit_attn_comp_stage(g, il, 0, n_comp);
                 }
                 /* Every whole prompt, including one shorter than the window:
@@ -1168,8 +1139,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      PULSAR_N_HEAD_DIM,
                                                                      comp_width,
                                                                      pos0,
-                                                                     n_tokens,
-                                                                     il, gpu_graph_cur_bank(g), false, !mseq);
+                                                                     n_tokens);
                 }
             }
             if (ok) {
@@ -1178,7 +1148,7 @@ bool gpu_graph_encode_layer_attention_batch(
                  * read-only cross-bank superset; with the scalar gone that
                  * write would land on cur_bank's real row and clobber it. The
                  * banked arm publishes per bank at 1438, so skip it here. */
-                if (!mseq) gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
+                if (!mseq && !g->state_only) gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
                 if (gpu_graph_store_commits(g, mseq) && ratio == 4)
                     ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                           comp_width, false);
@@ -1293,7 +1263,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             PULSAR_RMS_EPS) != 0;
                 }
                 if (ok && comp_chunk != 0) {
-                    ok = banked
+                    if (!g->state_only) ok = banked   /* L195: a warm-up writes no cache rows */
                         ? gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_before, comp_chunk)
                         : gpu_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
                 }
@@ -1301,11 +1271,13 @@ bool gpu_graph_encode_layer_attention_batch(
                     ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
                             st_kv, st_sc,
                             layer->attn_compressor_ape, PULSAR_N_HEAD_DIM, comp_width,
-                            pos0, n_tokens, il, banked ? (uint32_t)bank : gpu_graph_cur_bank(g), false, !mseq);
+                            pos0, n_tokens);
                 }
                 if (ok) {
-                    if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
-                    else        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)    = comp_before + comp_chunk;
+                    if (!g->state_only) {   /* L195: a warm-up moves no frontier */
+                        if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
+                        else        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)    = comp_before + comp_chunk;
+                    }
                     if (gpu_graph_store_commits(g, banked) && ratio == 4)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               comp_width, false);
@@ -1421,7 +1393,7 @@ bool gpu_graph_encode_layer_attention_batch(
                          * place, so the dump happens after it. */
                         ok = comp_row_view != NULL;
                         if (ok) {
-                            ok = mseq
+                            if (!g->state_only) ok = mseq   /* L195 */
                                 ? gpu_graph_commit_attn_comp_stage_bank(g, il, bank, comp_row, 1)
                                 : gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
                         }
@@ -1434,20 +1406,7 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         pulsar_gpu_tensor_free(comp_row_view);
                     }
-                    if (ok && emit) (*n_comp_slot)++;
-                    /* L195: this row carried the frontier across a grid point;
-                     * the lane now IS the state at pos + 1 -- save it before the
-                     * next row moves it.  PREFILL encodes only (a prefill tail
-                     * chunk on the per-row arm): a decode step's rows are
-                     * computed by the decode kernels, and a snapshot of decode
-                     * state can never make a resume equal to a cold prefill --
-                     * the resume recomputes generated tokens from the last
-                     * PREFILL grid point instead (gate schedules F/G). */
-                    if (ok && !mseq && ratio == 4u && ((pos + 1u) % PULSAR_RESUME_GRID) == 0u) {
-                        const uint32_t sb = gpu_graph_cur_bank(g);
-                        ok = gpu_graph_grid_snapshot_save_lane(g, il, sb, false, pos + 1u);
-                        if (ok) gpu_graph_grid_snapshot_pending(g, sb, pos + 1u);
-                    }
+                    if (ok && emit && !g->state_only) (*n_comp_slot)++;
                     if (comp_counts) comp_counts[t] = *n_comp_slot;
                     pulsar_gpu_tensor_free(ms_target);
                     pulsar_gpu_tensor_free(ms_st_sc);
@@ -1589,7 +1548,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                              PULSAR_ROPE_YARN_BETA_SLOW,
                                                              PULSAR_RMS_EPS) != 0;
                 }
-                if (ok && n_comp != 0) {
+                if (ok && n_comp != 0 && !g->state_only) {   /* L195: a warm-up writes no cache rows */
                     ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(g->idx_comp_stage,
                                                                 g->layer_index_comp_cache[il],
                                                                 0,
@@ -1611,14 +1570,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                      PULSAR_N_INDEXER_HEAD_DIM,
                                                                      index_width,
                                                                      pos0,
-                                                                     n_tokens,
-                                                                     il, gpu_graph_cur_bank(g), true, !mseq);
+                                                                     n_tokens);
                 }
                 if (ok) {
                     /* STAGE 1b: indexer twin of the attn guard at 1316 -- under
                      * mseq this was the read-only superset; the banked arm
                      * publishes per bank at 1829. */
-                    if (!mseq) gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
+                    if (!mseq && !g->state_only) gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = n_comp;
                     if (gpu_graph_store_commits(g, mseq))
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                               index_width, true);
@@ -1708,7 +1666,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                 PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
                                 PULSAR_RMS_EPS) != 0;
                     }
-                    if (ok && index_chunk != 0) {
+                    if (ok && index_chunk != 0 && !g->state_only) {   /* L195 */
                         ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_view,
                                                                     idx_dst,
                                                                     index_before,
@@ -1724,11 +1682,13 @@ bool gpu_graph_encode_layer_attention_batch(
                         ok = gpu_graph_refresh_ratio4_compressor_state(g, model,
                                 ist_kv, ist_sc,
                                 layer->indexer_compressor_ape, PULSAR_N_INDEXER_HEAD_DIM,
-                                index_width, pos0, n_tokens, il, banked ? (uint32_t)bank : gpu_graph_cur_bank(g), true, !mseq);
+                                index_width, pos0, n_tokens);
                     }
                     if (ok) {
-                        if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
-                        else        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)    = index_before + index_chunk;
+                        if (!g->state_only) {   /* L195 */
+                            if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
+                            else        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)    = index_before + index_chunk;
+                        }
                         if (gpu_graph_store_commits(g, banked))
                             ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
                                                                   index_width, true);
@@ -1824,7 +1784,7 @@ bool gpu_graph_encode_layer_attention_batch(
                             if (!index_row_view) {
                                 ok = false;
                             } else {
-                                ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
+                                if (!g->state_only) ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,   /* L195 */
                                                                            mseq ? ms_cache
                                                                                 : g->layer_index_comp_cache[il],
                                                                            index_row,
@@ -1834,17 +1794,12 @@ bool gpu_graph_encode_layer_attention_batch(
                                 pulsar_gpu_tensor_free(index_row_view);
                             }
                             /* plan-33 inc C: boundary-row restore (banked emit). */
-                            if (ok) ok = gpu_graph_emit_keep_restore(g, il,
+                            if (ok && !g->state_only) ok = gpu_graph_emit_keep_restore(g, il,
                                     mseq ? (uint32_t)bank
                                          : (g->banks.n_banks ? g->banks.cur_bank : 0u),
                                     index_row, 1, true);
                         }
-                        if (ok && emit) (*n_index_slot)++;
-                        if (ok && !mseq && ((pos + 1u) % PULSAR_RESUME_GRID) == 0u) {   /* L195, indexer half (prefill only) */
-                            const uint32_t sb = gpu_graph_cur_bank(g);
-                            ok = gpu_graph_grid_snapshot_save_lane(g, il, sb, true, pos + 1u);
-                            if (ok) gpu_graph_grid_snapshot_pending(g, sb, pos + 1u);
-                        }
+                        if (ok && emit && !g->state_only) (*n_index_slot)++;
                         if (index_counts) index_counts[t] = *n_index_slot;
                         pulsar_gpu_tensor_free(ms_cache);
                         pulsar_gpu_tensor_free(ms_st_sc);

@@ -131,12 +131,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->grid_attn_state_kv[il]);
-        pulsar_gpu_tensor_free(g->grid_attn_state_score[il]);
-        pulsar_gpu_tensor_free(g->grid_index_state_kv[il]);
-        pulsar_gpu_tensor_free(g->grid_index_state_score[il]);
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
         pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
@@ -166,10 +160,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.assc[il]);
         pulsar_gpu_tensor_free(g->banks.iskv[il]);
         pulsar_gpu_tensor_free(g->banks.issc[il]);
-        pulsar_gpu_tensor_free(g->banks.grid_askv[il]);
-        pulsar_gpu_tensor_free(g->banks.grid_assc[il]);
-        pulsar_gpu_tensor_free(g->banks.grid_iskv[il]);
-        pulsar_gpu_tensor_free(g->banks.grid_issc[il]);
         pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
         pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
         pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);

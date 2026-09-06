@@ -420,7 +420,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     /* Bulk anchor-hidden capture (drafter retraining): armed per chunk, after
      * warmup so warmup encodes don't pollute the buffers; drained (and cleared)
      * by gpu_graph_prefill_chunked_range after the chunk syncs. */
-    g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
+    g->dspark_bulk_n = (g->dspark_bulk_h[0] && !g->state_only) ? n_tokens : 0;   /* L195: a warm-up captures nothing */
 
     /*
      * A full long-prompt prefill can keep the GPU busy for a long time. Split
@@ -658,8 +658,7 @@ bool gpu_graph_prefill_raw_swa(
     (void)cancel;
     (void)cancel_ud;
     (void)cancelled;
-    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: one chunk, same contract as the chunked range */
-    if (!gpu_graph_prefill_layer_major(g,
+    return gpu_graph_prefill_layer_major(g,
                                            model,
                                            weights,
                                            prompt,
@@ -669,18 +668,24 @@ bool gpu_graph_prefill_raw_swa(
                                            show_progress,
                                            NULL,
                                            display_progress,
-                                           display_progress_ud)) return false;
-    /* L195: a prompt that fits one chunk still leaves its snapshot -- at the
-     * last grid point the batched arms rebuilt (pending), or the whole state
-     * when the prompt ends on the grid.  Without this the first sync of every
-     * short prompt left no snapshot and its first continuation was cold. */
-    gpu_graph_grid_snapshot_commit_pending(g);
-    if ((uint32_t)n_tokens % PULSAR_RESUME_GRID == 0 &&
-        !gpu_graph_grid_snapshot_save(g, (uint32_t)n_tokens)) {
-        fprintf(stderr, "pulsar: grid snapshot at %d failed -- refusing the prefill\n", n_tokens);
-        return false;
-    }
-    return true;
+                                           display_progress_ud);
+}
+
+/* L195: the resume warm-up.  The caller rewound the current bank to G (a
+ * PULSAR_RESUME_GRID multiple) and reset its ratio-128 state; this runs the
+ * PULSAR_WARMUP_TOKENS tokens before G through the layers with
+ * pulsar_gpu_graph::state_only set, so the only thing that outlives the call is
+ * the ratio-4 compressor state at G -- the previous group's projections, which
+ * the resumed prefill folds into.  Same kernels, same absolute positions, a
+ * call starting on a 32-multiple: the state is the cold prefill's. */
+bool gpu_graph_prefill_warmup_state(pulsar_gpu_graph *g, const pulsar_model *model,
+                                    const pulsar_weights *weights, const token_vec *prompt, uint32_t G) {
+    if (!g || !prompt || G < PULSAR_WARMUP_TOKENS || G % PULSAR_RESUME_GRID != 0 || G > (uint32_t)prompt->len) return false;
+    g->state_only = true;
+    const bool ok = gpu_graph_prefill_layer_major(g, model, weights, prompt, G - PULSAR_WARMUP_TOKENS,
+                                                  PULSAR_WARMUP_TOKENS, NULL, false, NULL, NULL, NULL);
+    g->state_only = false;
+    return ok;
 }
 
 
@@ -722,7 +727,6 @@ bool gpu_graph_prefill_chunked_range(
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
-    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: this encode's crossings start empty */
 
     const uint32_t end = start + n_tokens;
 
@@ -791,16 +795,6 @@ bool gpu_graph_prefill_chunked_range(
             if (pulsar_gpu_synchronize() == 0) {
                 fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
             }
-            return false;
-        }
-        /* L183/L195: crossings the chunk's per-row arm or its batched arm's
-         * last-boundary rebuild recorded become the bank's stamp; a chunk that
-         * ends ON the grid snapshots the whole state there (the later position
-         * wins, and at an aligned end the two are byte-identical). */
-        gpu_graph_grid_snapshot_commit_pending(g);
-        if (chunk_end % PULSAR_RESUME_GRID == 0 &&
-            !gpu_graph_grid_snapshot_save(g, chunk_end)) {
-            fprintf(stderr, "pulsar: grid snapshot at %u failed -- refusing the prefill\n", chunk_end);
             return false;
         }
         if (progress) {

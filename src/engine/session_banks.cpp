@@ -276,6 +276,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         pulsar_bank_carry *c = &s->bank_carry[dst];
         token_vec_set_prefix_from(&c->checkpoint, hist, (int)R);
         c->checkpoint_valid = true;
+        if (c->prefill_frontier > (int)R) c->prefill_frontier = (int)R;   /* L195: the cut is the new frontier */
         c->valid = true;
         /* Position-stamped state beyond R is meaningless on dst. */
         c->spec.spec_carry_valid = false;
@@ -298,6 +299,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
         gpu_graph_bank_counters_install(g, dst);
         token_vec_set_prefix_from(&s->checkpoint, hist, (int)R);
         s->checkpoint_valid = true;
+        if (s->prefill_frontier > (int)R) s->prefill_frontier = (int)R;   /* L195 */
         s->spec.spec_carry_valid = false;
         pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
@@ -377,7 +379,6 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     auto *s = this;
     if (!s || !fp) { payload_set_err(err, errlen, "bank kv load: bad args"); return 1; }
     pulsar_gpu_graph *g = &s->graph;
-    gpu_graph_grid_snapshot_drop(g, bank);   /* L183: a disk-restored bank carries no grid snapshot */
     if (g->banks.n_banks == 0 || bank >= g->banks.n_banks) {
         payload_set_err(err, errlen, "bank kv load: no pool / bad bank"); return 1;
     }
@@ -543,6 +544,7 @@ void pulsar_session::bank_state_save(uint32_t bank) {
     }
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
+    c->prefill_frontier       = s->prefill_frontier;   /* L195 */
     /* Whole speculative/DSpark shadow in one assignment — a new field added to
      * pulsar_spec_carry_state is carried here for free (the old field-by-field
      * mirror was a silent-corruption footgun: miss one and the entering bank
@@ -586,6 +588,7 @@ bool pulsar_session::bank_state_restore(uint32_t bank) {
                (size_t)c->dspark_pending_qrows_cap * sizeof(float));
     }
     s->checkpoint_valid       = c->checkpoint_valid;
+    s->prefill_frontier       = c->prefill_frontier;   /* L195 */
     /* Mirror of the save above: one assignment restores the whole shadow. */
     s->spec = c->spec;
     /* Cheap resume: per-bank frontier truth is now installed, so the multiseq
