@@ -8,8 +8,15 @@
  * op before it is neutral at this shape.  The driver itself does nothing but
  * open, tokenize, prefill N tokens and close -- the instrument is the dump.
  *
- *   ./tests/prefill_chunk_census_probe MODEL N [CHUNK=8192]
+ *   ./tests/prefill_chunk_census_probe MODEL N [CHUNK=8192] [FIRST=0] [MODE=sync|classic]
+ *
+ * MODE (L195): with FIRST > 0, "sync" resumes through pulsar_session_sync (since
+ * L183 a cold prefill from the grid, so the second call reproduces the cold
+ * chunking and the census sees nothing); "classic" continues from the
+ * checkpoint as one chunk [FIRST, N) (gate_prefill_suffix_classic) -- the
+ * off-grid chunk whose bytes the census is about.
  */
+#include "gate_fixture.h"
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 
@@ -41,6 +48,8 @@ int main(int argc, char **argv) {
      * [FIRST, N) as a chunk starting off position 0, the resume shape; its
      * dumps carry pos0 = FIRST. */
     const int first = argc > 4 ? atoi(argv[4]) : 0;
+    const bool classic = argc > 5 && strcmp(argv[5], "classic") == 0;
+    if (argc > 5 && !classic && strcmp(argv[5], "sync") != 0) { fprintf(stderr, "MODE is sync or classic\n"); return 2; }
     if (n < 1 || chunk < 16u || first < 0 || first >= n) { fprintf(stderr, "bad N, CHUNK or FIRST\n"); return 2; }
 
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
@@ -72,12 +81,15 @@ int main(int argc, char **argv) {
         p.len = n;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync: %s\n", err); goto done; }
+        if (classic && first > 0) {
+            if (!gate_prefill_suffix_classic(s, &toks, first, n, err, sizeof err)) { fprintf(stderr, "classic: %s\n", err); goto done; }
+        } else if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync: %s\n", err); goto done; }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double secs = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
         printf("CENSUS DRIVER: prefilled %d tokens in chunks of %u (%s%s): %.3f s, %.0f tok/s\n", n, chunk,
                (uint32_t)(n - first) <= chunk ? "one chunk" : "several chunks",
-               first > 0 ? ", after a first sync" : "", secs, (double)(n - first) / secs);
+               first > 0 ? (classic ? ", classic continuation after a first sync" : ", after a first sync") : "",
+               secs, (double)(n - first) / secs);
         rc = 0;
     }
 done:
