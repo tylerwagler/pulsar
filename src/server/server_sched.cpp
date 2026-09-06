@@ -635,14 +635,16 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             if (fresh) return fresh;
         }
     }
-    /* plan-33 inc B/D: warm FORK routing. `best`'s committed history shares a
-     * token prefix `best_common` with the request (validated bit-for-bit inside
-     * the fork before any device write). Instead of continuing IN PLACE (which
-     * consumes the trunk — today's behavior), fork the trunk into another bank
-     * and continue there, leaving the trunk INTACT so a divergent sibling keeps
-     * matching it:
-     *   - inc B FULL fork   : best_common == trunk frontier  -> pulsar_session_bank_fork
-     *                         (dst resumes at the exact frontier; re-prefill suffix).
+    /* plan-33 inc D: warm PARTIAL-fork routing. `best`'s committed history
+     * shares a token prefix `best_common` with the request (validated
+     * bit-for-bit inside the fork before any device write).  A request whose
+     * prompt EXTENDS the trunk exactly (best_common == frontier) continues IN
+     * PLACE on that bank (Tyler 2026-09-06: "an exact extension should just
+     * stay in the same slot" -- the inc B full fork copied the whole bank to
+     * preserve the trunk for a hypothetical sibling and left a superseded copy
+     * in the pool every turn).  A DIVERGENT request forks the trunk into
+     * another bank and continues there, leaving the trunk intact for the
+     * conversation that still matches it:
      *   - inc D PARTIAL cut : warm_partial_min <= best_common < frontier
      *                         -> pulsar_session_bank_fork_partial (engine aligns down
      *                         to R, byte-stashes the ratio-4 boundary row; dst's
@@ -661,17 +663,10 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * 123,852 tokens (~2.5 min) with the whole prompt already in bank 0. It also
      * broke the invariant the cross-wire comment below asserts ("deep divergent
      * matches already FORKED above and never reach here"). The partial cut handles
-     * it exactly: align down from best_common, re-prefill only the remainder.
-     *
-     * `full` keeps the strict `<`: a FULL fork exists to re-prefill a suffix, and
-     * best_common == prompt.len == frontier means the trunk IS the prompt, with no
-     * suffix and no divergence. That is a plain in-place continuation and must stay
-     * one — forking there would copy a bank to do nothing. */
+     * it exactly: align down from best_common, re-prefill only the remainder. */
     const bool warm_ok = s->pool_banks > 0 && s->warm_fork_enabled && best &&
                          !best_clobbers_warm_state && !best->active_job &&
                          best_common > 0 && best_common <= j->req.prompt.len;
-    const bool full    = warm_ok && best_common == frontier &&
-                         best_common < j->req.prompt.len;                    /* inc B */
     /* inc D geometry alone isn't enough: the engine's raw ring may have
      * scrolled past the cut (typical after a client compacts history on a
      * deep bank), which makes every partial fork AND the in-place advance
@@ -680,7 +675,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * immediately instead of re-attempting an impossible fork every quantum
      * (observed 2026-08-10: ~30 s of refusal retries stalled a compacted
      * 42k-token turn before an eviction finally let it cold-prefill). */
-    const bool partial_geom = warm_ok && !full && best_common >= s->warm_partial_min &&
+    const bool partial_geom = warm_ok && best_common >= s->warm_partial_min &&
                               best_common < frontier;
     const int  partial_rc   = partial_geom
         ? pulsar_session_bank_fork_partial_feasible(s->sess, best->bank, best_common)
@@ -689,8 +684,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     /* Always-on routing-decision inputs, so a 0-fork count is never silent (the
      * verbose KVCACHE stream; one line per bind, not per token). Confirmed nuance:
      * re-tokenized generated tail rarely reproduces the trunk's exact frontier, so
-     * best_common < frontier (the PARTIAL path) is the common case; full is the
-     * rare exact-continuation. */
+     * best_common < frontier (the PARTIAL path) is the common case; an exact
+     * continuation (best_common == frontier) stays in place. */
     char infeasible[48] = "";
     if (partial_geom && !partial)
         snprintf(infeasible, sizeof infeasible, " [partial-infeasible: %s]",
@@ -701,11 +696,11 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                    "partial_min %d -> %s%s%s%s",
                    best ? (int)best->bank : -1, best_common, frontier,
                    j->req.prompt.len, s->warm_partial_min,
-                   full ? "FORK-full" : partial ? "FORK-partial" : "in-place/cold",
+                   partial ? "FORK-partial" : "in-place/cold",
                    best_clobbers_warm_state ? " [trivial]" : "",
                    (best && best->active_job) ? " [busy]" : "",
                    infeasible);
-    if (full || partial) {
+    if (partial) {
         provision_refusal fr;
         session_slot *dst = s->provision_slot(s->provision_ctx_for_job(j), &fr);
         if (!dst && fr == PROVISION_REFUSED_POOL_FULL &&
@@ -743,31 +738,25 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         }
         if (dst && dst != best) {
             pulsar_session *pool = s->sess;
-            const int rc = full
-                ? pulsar_session_bank_fork(pool, best->bank, dst->bank,
-                                        j->req.prompt.v, j->req.prompt.len, best_common)
-                : pulsar_session_bank_fork_partial(pool, best->bank, dst->bank,
-                                                j->req.prompt.v, j->req.prompt.len,
-                                                best_common);
+            const int rc = pulsar_session_bank_fork_partial(pool, best->bank, dst->bank,
+                                                            j->req.prompt.v, j->req.prompt.len,
+                                                            best_common);
             if (rc == 0) {
-                /* FULL resumes at best_common; PARTIAL resumes at the engine's
-                 * R-aligned cut (read it back rather than recompute the align). */
-                dst->committed_pos = full ? best_common
-                                          : pulsar_session_bank_pos(pool, dst->bank);
+                /* The dst resumes at the engine's R-aligned cut (read it back
+                 * rather than recompute the align). */
+                dst->committed_pos = pulsar_session_bank_pos(pool, dst->bank);
                 server_log(PULSAR_LOG_DEFAULT,
-                           "pulsar-server: warm-fork-%s: trunk bank %u (frontier %d, "
+                           "pulsar-server: warm-fork-partial: trunk bank %u (frontier %d, "
                            "common %d) -> bank %u (resume %d); trunk preserved",
-                           full ? "full" : "partial", best->bank, frontier,
-                           best_common, dst->bank, dst->committed_pos);
+                           best->bank, frontier, best_common, dst->bank, dst->committed_pos);
                 *clobbers = false;
                 return dst;
             }
             /* Refused (history moved / evicted src / cut below R): dst stays a
              * fresh empty bank — cold on it is safe and beats clobbering best. */
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: warm-fork-%s refused (bank %u, %s); cold on bank %u",
-                       full ? "full" : "partial", best->bank,
-                       server_fork_rc_name(rc), dst->bank);
+                       "pulsar-server: warm-fork-partial refused (bank %u, %s); cold on bank %u",
+                       best->bank, server_fork_rc_name(rc), dst->bank);
             *clobbers = false;
             return dst;
         }
@@ -775,8 +764,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * guard below (reuses in place only for a linear continuation; otherwise
          * queues rather than clobber). */
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: warm-fork-%s wanted (bank %u common %d) but no free bank",
-                   full ? "full" : "partial", best->bank, best_common);
+                   "pulsar-server: warm-fork-partial wanted (bank %u common %d) but no free bank",
+                   best->bank, best_common);
     }
     /* CROSS-WIRE ROOT FIX: the verdict is divergent_route_decision's (see it
      * for the four routes); the provisioning, the log line and *refusal are
@@ -950,9 +939,9 @@ void server::worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_
  * (slot_common_prefix reads engine host carries). */
 
 /* The overlay's usability rule (L179 branch 6): a queued job's best match
- * protects its bank iff best_common >= warm_partial_min AND it is either a
- * full fork (best_common == frontier) or a partial cut the raw ring can still
- * replay (feasible_rc == PULSAR_FORK_OK). A ring-scrolled cut is dead warmth
+ * protects its bank iff best_common >= warm_partial_min AND it is either an
+ * exact extension (best_common == frontier, continued in place) or a partial
+ * cut the raw ring can still replay (feasible_rc == PULSAR_FORK_OK). A ring-scrolled cut is dead warmth
  * and stays evictable; best_common == prompt.len (bank holds the whole
  * prompt) rides the partial predicate too -- conservative, never protects
  * dead warmth. */
@@ -985,7 +974,7 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
         const session_slot *sl = &s->slots[best_i];
         const int frontier = s->slot_frontier_pos(sl);
         /* The ring probe is only consulted for a PARTIAL cut at/above the
-         * minimum; a full fork or a below-minimum match needs none. */
+         * minimum; an exact extension or a below-minimum match needs none. */
         const bool probe = best_common >= s->warm_partial_min && best_common != frontier;
         const int feasible_rc = probe
             ? pulsar_session_bank_fork_partial_feasible(s->sess, sl->bank, best_common)
