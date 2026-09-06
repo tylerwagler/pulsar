@@ -744,8 +744,8 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * cache rather than refusing to load.  The version still moves on format
  * changes -- this just means forgetting is no longer silent.
  * v7 (L111): unified NVFP4 rows -- raw AND comp strides changed.
- * v8 (L194, 2026-09-06): the payload carries the bank's CHUNK-GRID snapshot
- * (the compressor state at the last grid boundary a prefill chunk ended on,
+ * v8 (L194/L195, 2026-09-06): the payload carries the bank's RESUME-GRID snapshot
+ * (the ratio-4 compressor window at the last 128 grid point the prefill reached,
  * header field 15 = its position, 0 = none) AND the raw sliding window just
  * below that position (field 16 = its row count), because the resumed prefill
  * attends over those rows and a fresh bank has never held them -- the first

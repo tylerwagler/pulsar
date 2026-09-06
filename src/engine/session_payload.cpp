@@ -195,9 +195,9 @@ static uint64_t session_payload_grid_bytes(const pulsar_gpu_graph *g) {
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (ratio != 4) continue;   /* L195: the snapshot is the ratio-4 lanes only */
         bytes += 2u * layer_attn_state_bytes(ratio);
-        if (ratio == 4) bytes += 2u * layer_index_state_bytes(ratio);
+        bytes += 2u * layer_index_state_bytes(ratio);
     }
     return bytes;
 }
@@ -616,7 +616,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      * have none).  Sized exactly as session_payload_grid_bytes counts it. */
     for (uint32_t il = 0; rc == 0 && grid_pos != 0 && il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (ratio != 4) continue;   /* L195: ratio-4 lanes only */
         pulsar_gpu_tensor *akv, *asc, *ikv, *isc; uint64_t aoff, abytes, ioff, ibytes;
         if (!gpu_graph_grid_snapshot_lanes(g, il, bank, &akv, &asc, &ikv, &isc, &aoff, &abytes, &ioff, &ibytes) ||
             abytes != layer_attn_state_bytes(ratio) || (ratio == 4 && ibytes != layer_index_state_bytes(ratio))) {
@@ -703,7 +703,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * from a session with another chunk is refused (the caller re-prefills),
      * not silently loaded without it -- one path or an error. */
     if (saved_grid_pos != 0 &&
-        (saved_grid_pos > saved_tokens || s->prefill_cap == 0 || saved_grid_pos % s->prefill_cap != 0)) {
+        (saved_grid_pos > saved_tokens || saved_grid_pos % PULSAR_RESUME_GRID != 0)) {
         payload_set_err(err, errlen, "KV checkpoint's grid snapshot is not on this session's chunk grid");
         return 1;
     }
@@ -854,7 +854,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     /* L194: the grid snapshot lanes, in the order the writer emitted them */
     for (uint32_t il = 0; rc == 0 && saved_grid_pos != 0 && il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (ratio != 4) continue;   /* L195: ratio-4 lanes only */
         pulsar_gpu_tensor *akv, *asc, *ikv, *isc; uint64_t aoff, abytes, ioff, ibytes;
         if (!gpu_graph_grid_snapshot_lanes(g, il, bank, &akv, &asc, &ikv, &isc, &aoff, &abytes, &ioff, &ibytes) ||
             abytes != layer_attn_state_bytes(ratio) || (ratio == 4 && ibytes != layer_index_state_bytes(ratio))) {
