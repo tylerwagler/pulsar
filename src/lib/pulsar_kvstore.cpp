@@ -1081,7 +1081,14 @@ public:
             pulsar_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
         {
             const pulsar_tokens *loaded_tokens = pulsar_session_tokens(session);
-            if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
+            const bool whole = loaded_tokens && loaded_tokens->len == (int)hdr.tokens;
+            /* L196: a file whose text ends with an EOS its tokens never sampled
+             * (a pre-L196 key after a tool-call turn) would have the suffix
+             * tokenised from the byte AFTER that EOS, planting a byte seam in
+             * the bank at the restore point.  Refuse and remove it. */
+            const bool ends_ok = whole && pulsar_kvstore_text_ends_with_live(
+                                              engine, cached_text, text_bytes, loaded_tokens);
+            if (ends_ok) {
                 loaded = (int)hdr.tokens;
                 if (effective_prompt) {
                     /* The cache lookup was by bytes, but the graph state is
@@ -1099,8 +1106,9 @@ public:
                 pulsar_session_invalidate(session);
                 unlink(path);
                 logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                     "%s: kv cache discarded corrupt text-prefix payload%s%s %s",
+                     "%s: kv cache discarded %s text-prefix payload%s%s %s",
                      log_name(),
+                     whole ? "stale-key (text EOS disagrees with its tokens, L196)" : "corrupt",
                      responses_protocol ? " " : "",
                      responses_protocol ? "RESPPROTO" : "",
                      path);
@@ -1372,6 +1380,20 @@ void pulsar_kvstore_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *
     if (n > src->len) n = src->len;
     for (int i = 0; i < n; i++) pulsar_tokens_push(dst, src->v[i]);
 }
+
+bool pulsar_kvstore_text_ends_with_live(pulsar_engine *engine, const char *text,
+                                     size_t text_len, const pulsar_tokens *tokens) {
+    const int eos = pulsar_token_eos(engine);
+    size_t eos_len = 0;
+    char *eos_text = pulsar_token_text(engine, eos, &eos_len);
+    const bool text_eos = eos_len > 0 && text_len >= eos_len &&
+                          memcmp(text + text_len - eos_len, eos_text, eos_len) == 0;
+    free(eos_text);
+    const bool live_eos = tokens && tokens->len > 0 && tokens->v[tokens->len - 1] == eos;
+    return text_eos == live_eos;
+}
+
+
 
 void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,

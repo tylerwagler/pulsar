@@ -2187,6 +2187,47 @@ static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
 
 
 
+/* L196: a checkpoint key for a tool-call turn is the replay minus the EOS the
+ * replay renders after the tool_calls block (the sampled tokens stop there). */
+static void assert_replay_is_key_plus_eos(const char *key, const char *replay) {
+    const size_t klen = strlen(key);
+    TEST_ASSERT(strncmp(replay, key, klen) == 0);
+    TEST_ASSERT(!strcmp(replay + klen, "<｜end▁of▁sentence｜>"));
+}
+
+
+
+static void test_checkpoint_key_ends_where_sampled_tokens_end(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = PULSAR_THINK_HIGH;
+    r.tool_orders = make_bash_order();
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_1");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&calls, tc);
+    /* a tool-call turn: no EOS in the key, the replay has one */
+    char *key = build_tool_checkpoint_suffix(&r, "", "need ls", &calls);
+    buf replay = {0};
+    append_assistant_turn_close(&replay, true, "need ls", "", &calls);
+    assert_replay_is_key_plus_eos(key, replay.ptr);
+    free(key);
+    buf_free(&replay);
+    /* a stop turn sampled its EOS: the key carries it and equals the replay */
+    key = build_tool_checkpoint_suffix(&r, "done", "", NULL);
+    append_assistant_turn_close(&replay, true, "", "done", NULL);
+    TEST_ASSERT(!strcmp(key, replay.ptr));
+    TEST_ASSERT(strstr(key, "<｜end▁of▁sentence｜>") != NULL);
+    free(key);
+    buf_free(&replay);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+
+
 static void test_parse_short_dsml_and_canonical_suffix(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -2215,7 +2256,10 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     TEST_ASSERT(description != NULL);
     TEST_ASSERT(description < command);
     TEST_ASSERT(strstr(suffix, "</think>") != NULL);
-    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") != NULL);
+    /* L196: the turn stopped at the closing tool_calls tag; no EOS was sampled,
+     * so the key carries none (the tail renders it). */
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+    TEST_ASSERT(!strcmp(suffix + strlen(suffix) - strlen("tool_calls>"), "tool_calls>"));
 
     free(suffix);
     free(content);
@@ -2640,7 +2684,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
                                                   &r.tool_orders, PULSAR_THINK_HIGH);
 
-    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+    assert_replay_is_key_plus_eos(canonical.ptr, future_prompt);   /* L196 */
 
     free(future_prompt);
     buf_free(&canonical);
@@ -2716,7 +2760,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
                                                   &r.tool_orders, PULSAR_THINK_HIGH);
 
-    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+    assert_replay_is_key_plus_eos(canonical.ptr, future_prompt);   /* L196 */
 
     free(future_prompt);
     buf_free(&canonical);
@@ -6314,7 +6358,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         buf key = {0};
         buf_puts(&key, prompt_text);
         buf_puts(&key, suffix);
-        TEST_ASSERT(!strcmp(key.ptr, replay));
+        assert_replay_is_key_plus_eos(key.ptr, replay);   /* L196: the sampled turn has no EOS */
         /* 5. the Responses visible suffix, with calls: the same bytes */
         char *visible = build_responses_visible_assistant_suffix(&r, "", "need ls", &msgs.v[4].calls);
         TEST_ASSERT(!strcmp(visible, suffix));
@@ -6914,6 +6958,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
+    test_checkpoint_key_ends_where_sampled_tokens_end();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();

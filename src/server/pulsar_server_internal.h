@@ -2485,7 +2485,11 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
  * append_assistant_turn_close below.  A checkpoint key that does not
  * byte-match the next request's render is a silent cold re-prefill of the
  * whole conversation (server_jobs.cpp remember_*_checkpoint), so there is
- * exactly one place that decides those bytes. */
+ * exactly one place that decides those bytes.  A checkpoint key names the
+ * bytes of the LIVE TOKENS, which for a tool-call turn end before the EOS the
+ * replay renders (append_assistant_turn_sampled, L196): the consumer
+ * tokenises the request bytes after the key, so the key must end where the
+ * sampled tokens end or the EOS is lost from the bank. */
 /** Per-render state: the mode, the reasoning-replay facts of the message
  * list, and where the turn structure stands. */
 typedef struct {
@@ -2509,6 +2513,13 @@ void append_assistant_open(buf *out, bool think);
  * content, the DSML tool calls, EOS. */
 void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
                                  const char *content, const tool_calls *calls);
+/** The same turn as the model SAMPLED it: a turn that ends in tool calls
+ * stops at the closing tool_calls tag and has no EOS (the tail renders it);
+ * a stop turn ends with the EOS it sampled.  This is what a checkpoint key
+ * names -- the bytes of the live tokens -- while the replay is
+ * append_assistant_turn_close (L196). */
+void append_assistant_turn_sampled(buf *out, bool close_think, const char *reasoning,
+                                   const char *content, const tool_calls *calls);
 /** Close a render: an open user-side turn gets the generation prefix. */
 void chat_render_finish(buf *out, const chat_render *r);
 /** The live-KV continuation suffix for msgs[start..): EOS, the new user-side

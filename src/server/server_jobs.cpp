@@ -418,10 +418,12 @@ void server::remember_tool_thinking_checkpoint(session_slot *sl,
     if (!pulsar_think_mode_enabled(j->req.think_mode)) return;
 
     /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
-     * suffix "{reasoning}</think>{content}{DSML}<EOS>" — byte-identical to what
-     * render_chat_prompt_text emits for this tool turn on the next request (DSML from
-     * the id-keyed raw sample via tool_memory, reasoning replayed verbatim) and to
-     * the sampled bytes already in the live KV. */
+     * suffix "{reasoning}</think>{content}{DSML}" — byte-identical to the sampled
+     * bytes in the live KV, which stop at the closing tool_calls tag: the turn ended
+     * at saw_tool_end, no EOS was sampled (L196).  The next request's render
+     * continues with "<EOS><｜User｜><tool_result>..." (DSML from the id-keyed raw
+     * sample via tool_memory, reasoning replayed verbatim), and the consumer
+     * tokenises exactly those bytes after the key, EOS first. */
     char *suffix = build_tool_checkpoint_suffix(&j->req, content,
                                                 reasoning ? reasoning : "", calls);
     buf visible = {0};

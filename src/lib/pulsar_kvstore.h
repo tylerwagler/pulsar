@@ -168,6 +168,15 @@ char *pulsar_kvstore_render_tokens_text(pulsar_engine *engine,
                                      size_t *out_len);
 bool pulsar_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
+/** L196: does `text` end where `tokens` end?  A checkpoint's text names the
+ * bytes of its tokens, so it ends with the EOS piece exactly when the last
+ * token is the EOS.  A tool-call turn stops at the closing tool_calls tag
+ * without sampling one; a key that carried the EOS anyway made every consumer
+ * tokenise the request bytes AFTER it, so the EOS never entered the bank and
+ * the live history byte-diverged from every later render at that point.
+ * Store and load both refuse a disagreeing pair. */
+bool pulsar_kvstore_text_ends_with_live(pulsar_engine *engine, const char *text,
+                                     size_t text_len, const pulsar_tokens *tokens);
 void pulsar_kvstore_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
 void pulsar_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,

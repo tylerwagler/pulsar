@@ -296,16 +296,18 @@ bool should_remember_thinking_checkpoint(const request *r,
 
 
 /* The assistant turn after prompt_text's generation prefix ("<｜Assistant｜>"
- * + "<think>" or "</think>"), as render_chat_prompt_text will render it once
- * it is history under tool context: reasoning replayed, think closed,
- * content, DSML, EOS.  One primitive with the renderer (append_assistant_
- * turn_close), so the checkpoint key byte-matches the replay by construction. */
+ * + "<think>" or "</think>") as the model SAMPLED it: reasoning, think closed,
+ * content, DSML, and the EOS only when the turn sampled one (a tool-call turn
+ * stops at the closing tool_calls tag; the replay's EOS there belongs to the
+ * tail).  One primitive with the renderer (append_assistant_turn_sampled next
+ * to append_assistant_turn_close), so the key byte-matches both the live KV
+ * and the replay's prefix by construction (L196). */
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     buf suffix = {0};
-    append_assistant_turn_close(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
-                                content, calls);
+    append_assistant_turn_sampled(&suffix, think, think ? (reasoning ? reasoning : "") : NULL,
+                                  content, calls);
     return buf_take(&suffix);
 }
 
@@ -326,8 +328,8 @@ char *build_responses_visible_assistant_suffix(const request *r,
      * match this visible shortcut and can still use exact token-prefix replay. */
     const bool think = pulsar_think_mode_enabled(r->think_mode);
     const bool replay = think && r->reasoning_summary_emit && calls && calls->len > 0;
-    append_assistant_turn_close(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
-                                content, calls);
+    append_assistant_turn_sampled(&suffix, think, replay ? (reasoning ? reasoning : "") : NULL,
+                                  content, calls);
     return buf_take(&suffix);
 }
 

@@ -585,6 +585,20 @@ bool server::kv_cache_store_current(session_slot *sl, const char *reason) {
     }
     pthread_mutex_unlock(&s->tool_mu);
 
+    if (visible_text &&
+        !pulsar_kvstore_text_ends_with_live(s->engine, visible_text, strlen(visible_text), tokens))
+    {
+        /* L196: the file's text would name bytes the payload does not hold (or
+         * hold bytes the text does not name); a load would then tokenise the
+         * suffix from the wrong byte and drop or double the EOS in the bank. */
+        server_log(PULSAR_LOG_ERROR,
+                   "pulsar-server: kv cache %s key REFUSED (live=%d): the key's EOS "
+                   "disagrees with the last live token -- checkpoint not stored",
+                   visible_key, tokens->len);
+        free(visible_text);
+        return false;
+    }
+
     /* A visible live checkpoint can contain hidden reasoning that the client
      * intentionally does not replay.  For disk recovery after a session switch,
      * key that payload by the visible protocol transcript, not by rendering the
@@ -861,6 +875,12 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
+        server_log(PULSAR_LOG_ERROR,
+                   "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
+                   "with the last live token (L196)", live_pos);
+        return 0;
+    }
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,
@@ -907,6 +927,12 @@ int server::thinking_live_visible_prefix_prompt(session_slot *sl,
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!pulsar_kvstore_text_ends_with_live(s->engine, req->prompt_text, visible_len, live_tokens)) {
+        server_log(PULSAR_LOG_ERROR,
+                   "pulsar-server: visible key REFUSED (live=%d): the key's EOS disagrees "
+                   "with the last live token (L196)", live_pos);
+        return 0;
+    }
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,

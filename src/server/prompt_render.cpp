@@ -345,13 +345,30 @@ void append_assistant_open(buf *out, bool think) {
 
 
 
-void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
-                                 const char *content, const tool_calls *calls) {
+static void append_assistant_turn_body(buf *out, bool close_think, const char *reasoning,
+                                       const char *content, const tool_calls *calls) {
     if (reasoning) buf_puts(out, reasoning);
     if (close_think) buf_puts(out, "</think>");
     buf_puts(out, content ? content : "");
     append_dsml_tool_calls_text(out, calls);
+}
+
+void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
+                                 const char *content, const tool_calls *calls) {
+    append_assistant_turn_body(out, close_think, reasoning, content, calls);
     buf_puts(out, PULSAR_RENDER_EOS);
+}
+
+void append_assistant_turn_sampled(buf *out, bool close_think, const char *reasoning,
+                                   const char *content, const tool_calls *calls) {
+    append_assistant_turn_body(out, close_think, reasoning, content, calls);
+    /* L196: a tool-call turn stops at the closing tool_calls tag (saw_tool_end)
+     * before the model samples an EOS, so the live KV ends there and the tail
+     * (render_live_tool_tail) renders the EOS the replay places next.  A key
+     * that carried the EOS anyway made every consumer tokenise the bytes AFTER
+     * it, so the EOS never entered the bank and the live history byte-diverged
+     * from every later render at that point.  A stop turn sampled its EOS. */
+    if (!(calls && calls->len > 0)) buf_puts(out, PULSAR_RENDER_EOS);
 }
 
 
