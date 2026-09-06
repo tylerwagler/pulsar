@@ -658,7 +658,8 @@ bool gpu_graph_prefill_raw_swa(
     (void)cancel;
     (void)cancel_ud;
     (void)cancelled;
-    return gpu_graph_prefill_layer_major(g,
+    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: one chunk, same contract as the chunked range */
+    if (!gpu_graph_prefill_layer_major(g,
                                            model,
                                            weights,
                                            prompt,
@@ -668,7 +669,18 @@ bool gpu_graph_prefill_raw_swa(
                                            show_progress,
                                            NULL,
                                            display_progress,
-                                           display_progress_ud);
+                                           display_progress_ud)) return false;
+    /* L195: a prompt that fits one chunk still leaves its snapshot -- at the
+     * last grid point the batched arms rebuilt (pending), or the whole state
+     * when the prompt ends on the grid.  Without this the first sync of every
+     * short prompt left no snapshot and its first continuation was cold. */
+    gpu_graph_grid_snapshot_commit_pending(g);
+    if ((uint32_t)n_tokens % PULSAR_RESUME_GRID == 0 &&
+        !gpu_graph_grid_snapshot_save(g, (uint32_t)n_tokens)) {
+        fprintf(stderr, "pulsar: grid snapshot at %d failed -- refusing the prefill\n", n_tokens);
+        return false;
+    }
+    return true;
 }
 
 
