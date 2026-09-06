@@ -72,7 +72,8 @@ static char *read_file(const char *path, size_t *len_out) {
  * frontier forward, as a generation does), sync to GATE_N, read the frontier
  * row, eval token GATE_N, read that row.  `origin` is where that last sync
  * must have resumed from (pulsar_session_resume_origin): the schedule is only
- * the schedule it claims to be if the resume started there. */
+ * the schedule it claims to be if the resume started there.  -1 is a sync
+ * that did not resume at all (schedule A: a fresh session rebuilds). */
 static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, int evals, int origin,
                         int width, float *frontier, float *decoded, char *err, size_t errlen) {
     pulsar_session *s = NULL;
@@ -146,7 +147,7 @@ int GATE_ENTRY(int argc, char **argv) {
         rows = (float *)malloc((size_t)(2 * GATE_SCHEDULES) * (size_t)width * sizeof(float));
         if (!rows) goto done;
         struct { const char *label; int first; int evals; int origin; } sched[GATE_SCHEDULES] = {
-            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, 0},
+            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1},   /* a fresh session: the sync is a rebuild, not a resume */
             {"B: sync 6, then 8600", 6, 0, 0},
             {"C: sync 2048, then 8600", 2048, 0, 0},
             {"D: resume at 4000, then 8600", 4000, 0, 0},
