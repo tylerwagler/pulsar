@@ -129,16 +129,22 @@ static uint64_t layer_index_state_bytes(uint32_t ratio) {
  * the next suffix chunk will write its own raw rows before any attention read.
  * Compressed rows are different: sparse attention can select any row from the
  * prefix, so those are persisted up to their live row counts. */
-static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
-    uint32_t rows = g->raw_window ? g->raw_window : PULSAR_N_SWA;
-    /* L195: a restored checkpoint resumes from the grid point G <= it (at most
-     * PULSAR_RESUME_GRID - 1 below) after a warm-up over the PULSAR_WARMUP_TOKENS
-     * tokens before G, whose attention reaches raw_window further down: the
-     * window a fresh bank needs is [G - warmup - raw_window, checkpoint). */
+/* ONE rule for how many raw rows a payload carries, written AND expected on
+ * load from the header's own window/cap/token count -- the two sides cannot
+ * disagree.  L195: a restored checkpoint resumes from the grid point G <= it
+ * (at most PULSAR_RESUME_GRID - 1 below) after a warm-up over the
+ * PULSAR_WARMUP_TOKENS tokens before G, whose attention reaches raw_window
+ * further down: the window a fresh bank needs is
+ * [G - warmup - raw_window, checkpoint). */
+static uint32_t payload_raw_rows(uint32_t raw_window, uint32_t raw_cap, uint32_t checkpoint_len) {
+    uint32_t rows = raw_window ? raw_window : PULSAR_N_SWA;
     rows += PULSAR_RESUME_GRID - 1u + PULSAR_WARMUP_TOKENS;
-    if (rows > g->raw_cap) rows = g->raw_cap;
+    if (rows > raw_cap) rows = raw_cap;
     if (rows > checkpoint_len) rows = checkpoint_len;
     return rows;
+}
+static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
+    return payload_raw_rows(g->raw_window, g->raw_cap, checkpoint_len);
 }
 
 
@@ -641,8 +647,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     /* The raw rows in the file are logical rows.  We can restore them into any
      * current ring with enough capacity, but the saved live count must be exactly
-     * the last window implied by the saved token count. */
-    const uint32_t expected_raw_live = saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
+     * what the writer's rule gives for the saved window, cap and token count. */
+    const uint32_t expected_raw_live = payload_raw_rows(saved_raw_window, saved_raw_cap, saved_tokens);
     if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live ||
         saved_raw_live > saved_raw_cap || saved_raw_live > g->raw_cap)
     {
