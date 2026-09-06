@@ -1035,6 +1035,10 @@ void gpu_graph_grid_snapshot_drop(pulsar_gpu_graph *g, uint32_t bank) {
     if (g && bank < PULSAR_MSEQ_MAX) g->grid_snap_pos[bank] = 0u;
 }
 
+void gpu_graph_grid_snapshot_adopt(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos) {
+    if (g && bank < PULSAR_MSEQ_MAX) g->grid_snap_pos[bank] = pos;
+}
+
 uint32_t gpu_graph_grid_snapshot_pos(const pulsar_gpu_graph *g, uint32_t bank) {
     return (g && bank < PULSAR_MSEQ_MAX) ? g->grid_snap_pos[bank] : 0u;
 }

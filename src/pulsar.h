@@ -742,10 +742,17 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * the raw ring went from f32-expanded halves at 1024 B to packed 584 B WITHOUT
  * a bump, and a file straddling that change would have decoded noise into a KV
  * cache rather than refusing to load.  The version still moves on format
- * changes -- this just means forgetting is no longer silent. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(7)  /* v7: unified NVFP4 rows -- raw AND comp strides changed (L111) */
-/** 13 shape/counters + 2 row strides (attn pack, indexer fp4). */
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 15u
+ * changes -- this just means forgetting is no longer silent.
+ * v7 (L111): unified NVFP4 rows -- raw AND comp strides changed.
+ * v8 (L194, 2026-09-06): the payload carries the bank's CHUNK-GRID snapshot
+ * (the compressor state at the last grid boundary a prefill chunk ended on,
+ * header field 15 = its position, 0 = none) so a restored bank resumes from
+ * that boundary like a live one.  Without it every continuation of a restored
+ * checkpoint was a cold prefill from 0 (L183 + L194), which made the disk
+ * cache a file read followed by the work of a miss.  v7 files are refused. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(8)
+/** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + grid snapshot position. */
+#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 16u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 /** stage_dir: directory for the transient staged file (the caller's disk

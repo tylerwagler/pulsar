@@ -170,6 +170,22 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
 
 
 
+/* L194: the grid snapshot's bytes, when the current bank holds one.  Its lanes
+ * are the live compressor-state lanes' size (asserted where they are written). */
+static uint64_t session_payload_grid_bytes(const pulsar_gpu_graph *g) {
+    if (gpu_graph_grid_snapshot_pos(g, gpu_graph_cur_bank(g)) == 0) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += 2u * layer_attn_state_bytes(ratio);
+        if (ratio == 4) bytes += 2u * layer_index_state_bytes(ratio);
+    }
+    return bytes;
+}
+
+
+
 /* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
@@ -320,6 +336,7 @@ uint64_t pulsar_session::payload_bytes() {
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
+    bytes += session_payload_grid_bytes(g);
     return bytes;
 }
 
@@ -450,12 +467,19 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
 
     pulsar_gpu_graph *g = &s->graph;
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    const uint32_t grid_pos = gpu_graph_grid_snapshot_pos(g, bank);
+    if (grid_pos > (uint32_t)s->checkpoint.len) {
+        payload_set_err(err, errlen, "grid snapshot lies above the checkpoint (it should have been dropped)");
+        return 1;
+    }
     /* Header fields:
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
      *   5 raw window, 6 compressed cap, 7 token count,
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 live raw rows serialized below,
-     *   13 attn-pack row bytes, 14 indexer fp4 row bytes.
+     *   13 attn-pack row bytes, 14 indexer fp4 row bytes,
+     *   15 grid snapshot position (0 = none; L194).
      *
      * 13/14 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
      * file written for a different model; these catch one written for a
@@ -480,6 +504,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
          * version, refuses any earlier-format file */
         (uint32_t)gpu_graph_attn_comp_cache_row_bytes(),
         (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
+        grid_pos,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -559,6 +584,25 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
                                                         errlen);
         }
     }
+    /* L194: the grid snapshot, lane by lane, in layer order (ratio-0 layers
+     * have none).  Sized exactly as session_payload_grid_bytes counts it. */
+    for (uint32_t il = 0; rc == 0 && grid_pos != 0 && il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        pulsar_gpu_tensor *akv, *asc, *ikv, *isc; uint64_t aoff, abytes, ioff, ibytes;
+        if (!gpu_graph_grid_snapshot_lanes(g, il, bank, &akv, &asc, &ikv, &isc, &aoff, &abytes, &ioff, &ibytes) ||
+            abytes != layer_attn_state_bytes(ratio) || (ratio == 4 && ibytes != layer_index_state_bytes(ratio))) {
+            payload_set_err(err, errlen, "grid snapshot lane missing or mis-sized at a layer");
+            rc = 1;
+            break;
+        }
+        rc = payload_write_tensor_span(fp, akv, aoff, abytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) rc = payload_write_tensor_span(fp, asc, aoff, abytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0 && ratio == 4) {
+            rc = payload_write_tensor_span(fp, ikv, ioff, ibytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(fp, isc, ioff, ibytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
     free(buf);
     return rc;
 }
@@ -587,8 +631,15 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return 1;
     }
     pulsar_gpu_graph *g = &s->graph;
+    const uint32_t bank = gpu_graph_cur_bank(g);
+    /* L194: whatever snapshot this bank held belongs to the history the load
+     * replaces.  Drop it BEFORE any state moves (the kvstore load path used to
+     * keep it, and the resume rule would have restored a stale compressor
+     * state); a snapshot the file carries is adopted at the end. */
+    gpu_graph_grid_snapshot_drop(g, bank);
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
+    const uint32_t saved_grid_pos = h[15];
     const uint32_t saved_raw_cap = h[4];
     const uint32_t saved_raw_window = h[5];
     const uint32_t saved_comp_cap = h[6];
@@ -619,6 +670,14 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     /* prefill_cap is scratch scheduling capacity, not durable KV layout.
      * Old checkpoints remain valid as long as the raw KV window matches. */
     (void)saved_prefill_cap;
+    /* L194: a carried snapshot is only usable on THIS session's grid; a file
+     * from a session with another chunk is refused (the caller re-prefills),
+     * not silently loaded without it -- one path or an error. */
+    if (saved_grid_pos != 0 &&
+        (saved_grid_pos > saved_tokens || s->prefill_cap == 0 || saved_grid_pos % s->prefill_cap != 0)) {
+        payload_set_err(err, errlen, "KV checkpoint's grid snapshot is not on this session's chunk grid");
+        return 1;
+    }
     if (saved_raw_window != g->raw_window) {
         payload_set_err(err, errlen, "KV checkpoint graph chunk layout does not match current runtime");
         return 1;
@@ -753,6 +812,24 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
                                                        errlen);
         }
     }
+    /* L194: the grid snapshot lanes, in the order the writer emitted them */
+    for (uint32_t il = 0; rc == 0 && saved_grid_pos != 0 && il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        pulsar_gpu_tensor *akv, *asc, *ikv, *isc; uint64_t aoff, abytes, ioff, ibytes;
+        if (!gpu_graph_grid_snapshot_lanes(g, il, bank, &akv, &asc, &ikv, &isc, &aoff, &abytes, &ioff, &ibytes) ||
+            abytes != layer_attn_state_bytes(ratio) || (ratio == 4 && ibytes != layer_index_state_bytes(ratio))) {
+            payload_set_err(err, errlen, "grid snapshot lane missing or mis-sized at a layer");
+            rc = 1;
+            break;
+        }
+        rc = payload_read_tensor_span(fp, akv, aoff, abytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        if (rc == 0) rc = payload_read_tensor_span(fp, asc, aoff, abytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        if (rc == 0 && ratio == 4) {
+            rc = payload_read_tensor_span(fp, ikv, ioff, ibytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(fp, isc, ioff, ibytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
+    }
     free(buf);
     if (rc != 0) {
         token_vec_free(&new_checkpoint);
@@ -781,6 +858,9 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->graph.r128_undo_head = 0u;
     s->graph.r128_undo_n = 0u;
     s->graph.r128_perrow_chunk = false;
+    /* L194: the lanes hold the file's snapshot; record where it is so the next
+     * sync resumes from it instead of prefilling the prompt from 0 */
+    if (saved_grid_pos != 0) gpu_graph_grid_snapshot_adopt(g, bank, saved_grid_pos);
     s->checkpoint_valid = true;
     /* a restored state invalidates any in-flight speculative lookahead: the
      * carry token, pre-drafted pendings, AND the drafter's context-KV ring
@@ -845,7 +925,6 @@ int pulsar_session::load_snapshot(const pulsar_session_snapshot *snap, char *err
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
     }
-    gpu_graph_grid_snapshot_drop(&s->graph, gpu_graph_cur_bank(&s->graph));   /* L183: new history */
     if (snap->len > (uint64_t)SIZE_MAX) {
         payload_set_err(err, errlen, "session snapshot is too large for this platform");
         return 1;

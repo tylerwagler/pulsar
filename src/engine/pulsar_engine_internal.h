@@ -2809,6 +2809,9 @@ void     gpu_graph_grid_snapshot_clear_pending(pulsar_gpu_graph *g);
 bool     gpu_graph_grid_snapshot_restore(pulsar_gpu_graph *g, uint32_t pos);
 void     gpu_graph_grid_snapshot_drop(pulsar_gpu_graph *g, uint32_t bank);
 uint32_t gpu_graph_grid_snapshot_pos(const pulsar_gpu_graph *g, uint32_t bank);
+/** L194/L195: a session payload carries the bank's snapshot; `adopt` records the
+ *  position of one the payload just restored into the lanes. */
+void     gpu_graph_grid_snapshot_adopt(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos);
 /** The four grid lanes of (layer, bank) with this bank's byte offset and size in
  *  each; false for a layer without lanes (ratio != 4).  Shared with the payload. */
 bool     gpu_graph_grid_snapshot_lanes(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,

@@ -52,7 +52,7 @@
 
 #define GATE_N 8600
 #define GATE_CTX 8704
-#define GATE_SCHEDULES 7
+#define GATE_SCHEDULES 9
 #define GATE_EVALS 200   /* decode steps that carry schedules F and G across a grid boundary */
 
 static char *read_file(const char *path, size_t *len_out) {
@@ -78,7 +78,7 @@ static char *read_file(const char *path, size_t *len_out) {
  * the schedule it claims to be if the resume started there.  -1 is a sync
  * that did not resume at all (schedule A: a fresh session rebuilds). */
 static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, int evals, int origin,
-                        int width, float *frontier, float *decoded, char *err, size_t errlen) {
+                        bool via_snapshot, int width, float *frontier, float *decoded, char *err, size_t errlen) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); return 1; }
     int rc = 1;
@@ -89,6 +89,18 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
     }
     for (int i = 0; i < evals; i++) {
         if (pulsar_session_eval(s, toks->v[first + i], err, errlen) != 0) goto done;
+    }
+    if (via_snapshot) {
+        /* the disk-cache path: serialise, throw the session away, restore into
+         * a fresh one (a fresh bank has no snapshot of its own to confuse it) */
+        pulsar_session_snapshot snap; memset(&snap, 0, sizeof snap);
+        if (pulsar_session_save_snapshot(s, &snap, err, errlen) != 0) goto done;
+        pulsar_session_free(s);
+        s = NULL;
+        if (pulsar_session_create(&s, e, GATE_CTX) != 0) { pulsar_session_snapshot_free(&snap); snprintf(err, errlen, "session create failed"); return 1; }
+        const int lrc = pulsar_session_load_snapshot(s, &snap, err, errlen);
+        pulsar_session_snapshot_free(&snap);
+        if (lrc != 0) goto done;
     }
     p.len = GATE_N;
     if (pulsar_session_sync(s, &p, err, errlen) != 0) goto done;
@@ -149,26 +161,30 @@ int GATE_ENTRY(int argc, char **argv) {
         /* GATE_SCHEDULES x (frontier, decoded) */
         rows = (float *)malloc((size_t)(2 * GATE_SCHEDULES) * (size_t)width * sizeof(float));
         if (!rows) goto done;
-        struct { const char *label; int first; int evals; int origin; } sched[GATE_SCHEDULES] = {
+        struct { const char *label; int first; int evals; int origin; bool via_snapshot; } sched[GATE_SCHEDULES] = {
             /* origins are on the 128 resume grid (L195): a prefill leaves its
              * snapshot at the last grid point it reached, a decode saves at
              * every crossing; a prompt under 128 tokens has none (cold) */
-            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1},   /* a fresh session: the sync is a rebuild, not a resume */
-            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0},
-            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048},
-            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968},
-            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480},
+            {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1, false},   /* a fresh session: the sync is a rebuild, not a resume */
+            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0, false},
+            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048, false},
+            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968, false},
+            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, false},
             /* decode saves nothing (its rows are the decode kernels'); the
              * resume redoes the generated tokens from the last PREFILL grid
              * point -- the only way it equals the cold prefill */
-            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064},
-            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968},
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, false},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, false},
+            /* the payload carries the snapshot and the raw window below it
+             * (L194 part 2 on the 128 grid): a disk-restored bank resumes too */
+            {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, true},
+            {"I: sync 8192 (a chunk end on the grid), save+load, resume from 8192", 8192, 0, 8192, true},
         };
         char err[256];
         printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",
                GATE_N, opt.prefill_chunk, GATE_SCHEDULES);
         for (int k = 0; k < GATE_SCHEDULES; k++) {
-            if (run_schedule(e, &toks, sched[k].first, sched[k].evals, sched[k].origin, width,
+            if (run_schedule(e, &toks, sched[k].first, sched[k].evals, sched[k].origin, sched[k].via_snapshot, width,
                              rows + (size_t)(2 * k) * width,
                              rows + (size_t)(2 * k + 1) * width, err, sizeof err) != 0) {
                 fprintf(stderr, "CHUNK-NEUTRALITY GATE: schedule %s failed: %s\n", sched[k].label, err);
