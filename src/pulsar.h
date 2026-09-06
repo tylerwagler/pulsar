@@ -350,13 +350,18 @@ typedef enum {
 } pulsar_session_rewrite_result;
 
 /** Synchronize the live session to a full prompt token prefix.  If the current
- * checkpoint is a prefix, the prompt is evaluated from the last CHUNK-GRID
- * boundary at or below the checkpoint (a multiple of the engine's prefill
- * chunk; L183: a resume is a cold prefill from that boundary, so its logits are
- * the cold prefill's byte for byte -- the chunk boundaries, row counts and row
- * offsets every kernel sees are the same); otherwise the backend state is
- * refilled from scratch. */
+ * checkpoint is a prefix, the prompt is evaluated from the bank's latest
+ * CHUNK-GRID snapshot at or below the checkpoint (a multiple of the engine's
+ * prefill chunk; L183/L194: a resume is a cold prefill from that boundary, so
+ * its logits are the cold prefill's byte for byte -- the chunk boundaries, row
+ * counts and row offsets every kernel sees are the same); otherwise the
+ * backend state is refilled from scratch. */
 int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen);
+/** Where the last pulsar_session_sync started evaluating: the grid snapshot
+ * position it resumed from, 0 when it prefilled from the start, -1 when the
+ * call did not resume (nothing to evaluate, or a checkpoint that was not a
+ * prefix).  An instrument for the chunk-neutrality gate (L194). */
+int pulsar_session_resume_origin(pulsar_session *s);
 bool pulsar_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 pulsar_session_rewrite_result pulsar_session_rewrite_from_common(
         pulsar_session *s, const pulsar_tokens *prompt, int common,

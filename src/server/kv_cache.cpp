@@ -664,9 +664,17 @@ void server::kv_cache_maybe_store_continued(session_slot *sl) {
     if (!tokens) return;
     s->kv_cache_tracker_bind(sl);
     const int target = kv_cache_continued_store_target(kc, tokens->len);
+    /* The frontier is the ONLY prefix a live session can serialise: the raw
+     * window and the compressor state exist there and nowhere below it (the
+     * lib refuses a shorter prefix by name).  A boundary the frontier crossed
+     * inside a prefill chunk or a multi-token round is therefore stored AT the
+     * frontier that noticed it, not at the aligned target -- the first cut
+     * asked the lib for the target, was refused, and asked again on every
+     * decode step (561 identical log lines in one generation, dogfood
+     * 2026-09-05) while the checkpoint was never written at all. */
     if (target != 0 &&
-        s->kv_cache_store_live_prefix(sl, tokens, target, "continued")) {
-        kv_cache_note_store(kc, target);
+        s->kv_cache_store_live_prefix(sl, tokens, tokens->len, "continued")) {
+        kv_cache_note_store(kc, tokens->len);
     }
     s->kv_cache_tracker_flush(sl);
 }

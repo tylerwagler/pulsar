@@ -808,6 +808,7 @@ static void pulsar_session_note_prefill_progress(void *ud, const char *event, in
  */
 int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) {
     auto *s = this;
+    s->resume_origin = -1;
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -870,29 +871,55 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
          * checkpoint, restore the compressor state the prefill snapshotted when
          * it crossed G, and evaluate [G, N) -- the chunker cuts on the absolute
          * grid, so every chunk boundary is the cold prefill's and every kernel
-         * sees the call it would have seen.  Cost: up to prefill_cap - 1 tokens
-         * recomputed per resume (measured 2026-09-05: 1.75 s average at 4096;
-         * Tyler chose 4096 over the -10% prefill of a 2048 grid).  Without a
-         * snapshot at G (a bank restored from disk, a fresh pool slot) the
-         * resume IS the cold prefill from 0 -- the same computation, slower,
-         * said once. */
-        if (prompt->len > s->checkpoint.len && s->prefill_cap != 0 &&
-            (uint32_t)s->checkpoint.len % s->prefill_cap != 0) {
-            const uint32_t grid = ((uint32_t)s->checkpoint.len / s->prefill_cap) * s->prefill_cap;
+         * sees the call it would have seen.
+         *
+         * G is the bank's LATEST snapshot at or below the checkpoint, not the
+         * nearest grid multiple (L194, 2026-09-05).  A snapshot is written only
+         * when a prefill chunk ENDS on the grid; the boundary nearest the
+         * checkpoint is routinely crossed by decode instead (every ~4k tokens
+         * of a growing conversation), and the first cut of this rule demanded
+         * a snapshot exactly there -- so every turn after the model generated
+         * past a multiple of 4096 re-prefilled the whole prompt from 0 (58.9 s
+         * for 8.5k new tokens on a 62k prompt, dogfood 2026-09-05).  Every
+         * snapshot position is a grid multiple, so recomputing [G, N) from any
+         * of them chunks exactly as the cold prefill does; the cost is the
+         * tokens since that snapshot: under prefill_cap plus whatever decode
+         * added (measured 2026-09-05: 1.75 s average for the prefill_cap part
+         * at 4096; Tyler chose 4096 over the -10% prefill of a 2048 grid).
+         * Without any snapshot (a bank restored from disk, a fresh pool slot,
+         * a prompt that never reached the grid) the resume IS the cold prefill
+         * from 0 -- the same computation, slower, said once.  A checkpoint that
+         * IS the snapshot position is a prefill chunk end: nothing to redo. */
+        if (prompt->len > s->checkpoint.len && s->prefill_cap != 0) {
             const uint32_t bank = gpu_graph_cur_bank(&s->graph);
-            if (grid != 0 && gpu_graph_grid_snapshot_pos(&s->graph, bank) == grid) {
-                s->rewind((int)grid);
-                if (!gpu_graph_grid_snapshot_restore(&s->graph, grid)) {
-                    snprintf(err, errlen, "grid snapshot restore at %u failed", grid);
+            const uint32_t ck = (uint32_t)s->checkpoint.len;
+            const uint32_t snap = gpu_graph_grid_snapshot_pos(&s->graph, bank);
+            if (snap > ck) {
+                /* the rewind-below-stamp drop did not happen: a future that never was */
+                snprintf(err, errlen, "grid snapshot at %u is above the checkpoint %u on bank %u",
+                         snap, ck, bank);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            if (snap == ck) {
+                s->resume_origin = (int)ck;
+            } else if (snap != 0) {
+                s->rewind((int)snap);
+                if (!gpu_graph_grid_snapshot_restore(&s->graph, snap)) {
+                    snprintf(err, errlen, "grid snapshot restore at %u failed", snap);
                     s->checkpoint_valid = false;
                     return 1;
                 }
+                s->resume_origin = (int)snap;
+                fprintf(stderr, "pulsar: resume at %u from the grid snapshot at %u on bank %u "
+                                "(%u tokens recomputed)\n", ck, snap, bank, ck - snap);
             } else {
-                if (grid != 0) {
-                    fprintf(stderr, "pulsar: resume at %d has no grid snapshot at %u on bank %u -- "
-                                    "prefilling the prompt from 0\n", s->checkpoint.len, grid, bank);
+                if (ck >= s->prefill_cap) {
+                    fprintf(stderr, "pulsar: resume at %u has no grid snapshot on bank %u -- "
+                                    "prefilling the prompt from 0\n", ck, bank);
                 }
                 s->rewind(0);
+                s->resume_origin = 0;
             }
         }
         const int suffix = prompt->len - s->checkpoint.len;
@@ -1694,6 +1721,8 @@ int pulsar_session::ctx() {
     return s->ctx_size;
 }
 
+
+int pulsar_session_resume_origin(pulsar_session *s) { return s->resume_origin; }
 
 int pulsar_session_prefill_cap(pulsar_session *s) {
     return s ? (int)s->prefill_cap : 0;

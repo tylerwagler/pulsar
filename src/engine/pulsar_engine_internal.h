@@ -1783,6 +1783,7 @@ struct pulsar_session {
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
+    int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid snapshot, 0 = cold from the start), -1 when the sync did not resume
     /** A multiseq step has run and this session's per-bank state is no longer
      * re-establishable by bookkeeping alone.
      *
