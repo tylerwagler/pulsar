@@ -18,8 +18,8 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                 if (v <= 0) return cap;
                 cap = (uint32_t)v;
             }
-        } else if (prompt_len > 4096) {
-            cap = 4096u;
+        } else if ((uint32_t)prompt_len > PULSAR_PREFILL_CHUNK_DEFAULT) {
+            cap = PULSAR_PREFILL_CHUNK_DEFAULT;
         }
     }
 

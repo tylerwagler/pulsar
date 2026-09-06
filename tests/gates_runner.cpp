@@ -75,6 +75,13 @@ static bool same_str(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
+/* prefill_chunk 0 IS PULSAR_PREFILL_CHUNK_DEFAULT (the runner scrubs
+ * PULSAR_CUDA_PREFILL_CHUNK), so a gate that leaves it 0 and one that pins the
+ * production grid ask for the same engine -- comparing the raw field cost one
+ * model load per battery (the drafter-off multiseq gate vs the prefill gates,
+ * L194). */
+static uint32_t prefill_chunk_resolved(uint32_t v) { return v ? v : PULSAR_PREFILL_CHUNK_DEFAULT; }
+
 /* The fields a gate may set.  Anything else non-zero is a configuration this
  * runner does not know how to share, so it is treated as different. */
 static bool same_config(const pulsar_engine_options *a, const pulsar_engine_options *b) {
@@ -82,7 +89,7 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
            a->dspark_disable == b->dspark_disable &&
            same_str(a->expert_overlay, b->expert_overlay) &&
            a->backend == b->backend &&
-           a->prefill_chunk == b->prefill_chunk &&
+           prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&
            a->dspark_draft_tokens == b->dspark_draft_tokens &&
            same_str(a->directional_steering_file, b->directional_steering_file) &&
            a->directional_steering_attn == b->directional_steering_attn &&
@@ -282,8 +289,9 @@ int main(int argc, char **argv) {
          * rows, one under PULSAR_SPEC_ROW_BUDGET -- batched == serialized. */
         {"cuda-dspark-batch-gate-depth4", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "4", NULL}},
     };
-    /* Configuration B: drafter off.  Configuration C: drafter off + prefill
-     * chunk 4096, and the environment scrub -- last. */
+    /* Configuration B: drafter off -- the prefill gates below pin the chunk
+     * to the default grid, so they share this engine (four opens per battery,
+     * not five: A, D depth 1, D depth 4, B). */
     const gate_spec group_nodspark[] = {
         {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}},
     };

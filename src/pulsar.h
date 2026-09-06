@@ -59,6 +59,9 @@ typedef struct {
 #define PULSAR_DEFAULT_TEMPERATURE 1.0f
 #define PULSAR_DEFAULT_TOP_P 1.0f
 #define PULSAR_DEFAULT_MIN_P 0.05f
+/** The prefill chunk an engine uses when pulsar_engine_options::prefill_chunk
+ * is 0 (and PULSAR_CUDA_PREFILL_CHUNK is unset): the production grid (L183). */
+#define PULSAR_PREFILL_CHUNK_DEFAULT 4096u
 
 typedef struct pulsar_engine pulsar_engine;
 typedef struct pulsar_session pulsar_session;
@@ -80,7 +83,7 @@ typedef struct {
      * aid for per-layer quant-format KL probes; see gguf-tools/prisma. */
     const char *expert_overlay;
     pulsar_backend backend;      ///< CPU or CUDA; CUDA is the served path
-    uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default
+    uint32_t prefill_chunk;      ///< tokens per prefill chunk; 0 = engine default (PULSAR_PREFILL_CHUNK_DEFAULT for prompts longer than it, else the whole prompt)
     int dspark_draft_tokens;     ///< drafter depth k; 0 = model/engine default
     const char *directional_steering_file;  ///< steering-vector file, or NULL
     float directional_steering_attn;        ///< steering scale on the attention stream
