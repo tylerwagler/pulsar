@@ -34,10 +34,12 @@ static void usage(const char *argv0) {
     printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
     printf("  --overwrite            replace --out if it already exists\n");
     printf("  --dry-run              print output plan without reading HF tensor data\n");
-    printf("  --mse-probe FILE      MSE oracle: per-(tensor,format) imatrix-weighted error -> JSON\n");
-    printf("  --probe-sample N      experts sampled per tensor for --mse-probe (default 8)\n");
-    printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
-    printf("  --imatrix-strict       fail if an imatrix-weighted target (q2_K, iq2_xxs) has no matching vector\n");
+    printf("  --mse-probe FILE       MSE oracle: per-(tensor,format) imatrix-weighted error -> JSON;\n");
+    printf("                         requires --imatrix (there is no unweighted probe)\n");
+    printf("  --probe-sample N       experts sampled per tensor for --mse-probe (default 8)\n");
+    printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out; required by every\n");
+    printf("                         iq2_xxs target (a tensor without an entry refuses)\n");
+    printf("  --imatrix-strict       also fail when a q2_K tensor has no matching vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
@@ -158,6 +160,8 @@ static params parse_args(int argc, char **argv) {
     }
     if (!p.hf_dir) die("--hf is required");
     if (!p.template_gguf) die("--template is required");
+    if (p.mse_probe_file && !p.imatrix_file)
+        die("--mse-probe requires --imatrix: the probe reports imatrix-weighted error and has no unweighted path");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");

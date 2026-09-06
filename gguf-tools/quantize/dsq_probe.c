@@ -47,12 +47,18 @@ static void probe_one_tensor(st_db *db, const char *gguf_name, const tensor_meta
         float *f32 = dequant_fp4_weight(&w, &s, &n);
         const char *names[3] = { gguf_name, wn, NULL };
         const float *imat = imatrix_find(im, names, 2, ncols, xid, n_experts);
+        /* The probe's error is imatrix-weighted by definition; a tensor the
+         * collector did not cover has no unweighted stand-in. */
+        if (!imat) {
+            fprintf(stderr, "error: --mse-probe: no imatrix entry for %s (expert %d)\n", wn, xid);
+            exit(1);
+        }
         /* energy over EVERY expert */
         double en = 0.0, rawe = 0.0;
         for (int64_t r = 0; r < nrows; r++) {
             const float *xr = f32 + (size_t)r * ncols;
             for (int64_t col = 0; col < ncols; col++) {
-                double wc = imat ? imat[col] : 1.0, sq = (double)xr[col] * (double)xr[col];
+                double wc = imat[col], sq = (double)xr[col] * (double)xr[col];
                 en += wc * sq; rawe += sq;
             }
         }
@@ -61,13 +67,13 @@ static void probe_one_tensor(st_db *db, const char *gguf_name, const tensor_meta
         if (xid % mse_step == 0) {
             float *rt = xmalloc((size_t)n * sizeof(float));
             for (int c = 0; c < PROBE_NCAND; c++) {
-                byte_buf q = f32_to_type(f32, n, PROBE_CANDS[c], ncols, imat);
+                byte_buf q = f32_to_type(f32, n, PROBE_CANDS[c], ncols, imat, wn);
                 probe_dequant(PROBE_CANDS[c], q.data, rt, n);
                 double se = 0.0;
                 for (int64_t r = 0; r < nrows; r++) {
                     const float *xr = f32 + (size_t)r * ncols, *rr = rt + (size_t)r * ncols;
                     for (int64_t col = 0; col < ncols; col++) {
-                        double wc = imat ? imat[col] : 1.0, d = (double)xr[col] - (double)rr[col];
+                        double wc = imat[col], d = (double)xr[col] - (double)rr[col];
                         se += wc * d * d;
                     }
                 }

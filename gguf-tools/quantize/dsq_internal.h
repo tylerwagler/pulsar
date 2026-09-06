@@ -22,10 +22,9 @@
  *
  * The optional imatrix is the legacy llama.cpp binary .dat format emitted by
  * ds4's collector.  DS4 stores one packed vector per routed tensor, laid out as
- * n_experts consecutive per-expert importance vectors.  When no external
- * imatrix is supplied and IQ2_XXS requires one, this tool falls back to the
- * same synthetic weight-energy heuristic used by the old generator:
- * each column importance is sum(row[column]^2) over the dequantized weight.
+ * n_experts consecutive per-expert importance vectors.  A target that requires
+ * one (IQ2_XXS) refuses, naming the tensor, when no entry covers it; there is
+ * no synthetic weight-energy stand-in.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -343,7 +342,10 @@ bool is_mxfp8_lt_workhorse(const char *name);
 void policy_load_format_map(quant_policy *p, const char *path);
 
 /* dsq_generate.c */
-byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat);
+/* tensor_name is only read for the refusal message when a requires_imatrix
+ * target arrives with imat == NULL. */
+byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
+                     const float *imat, const char *tensor_name);
 size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims);
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                          ds4q_type target, int n_experts, int n_threads,
