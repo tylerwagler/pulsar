@@ -120,6 +120,36 @@ int GATE_ENTRY(int argc, char **argv) {
                         "device-resident (not demand-paged); set PULSAR_MSEQ_BANKS>=2\n");
     }
 
+    /* The boot line's estimate (pulsar_context_memory_estimate, the KV-policy
+     * sizing read back) is one bank's KV in the stored row formats.  It must
+     * equal what THIS session's bank 0 actually holds, to the byte: the raw
+     * slab's per-bank share plus the per-(layer, bank) comp/index allocations,
+     * read from the tensors the allocator made -- not from the sizing formulas. */
+    if (!s->graph.banks.n_banks) {
+        fprintf(stderr, "accounting_gate: FAIL bank pool disabled; the estimate check "
+                        "reads the per-bank slabs (set PULSAR_MSEQ_BANKS>=2)\n");
+        goto done;
+    }
+    {
+        const pulsar_context_memory est =
+            pulsar_context_memory_estimate(PULSAR_BACKEND_CUDA, ctx, 0);
+        uint64_t held_raw = 0, held_comp_index = 0;
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            held_raw += pulsar_gpu_tensor_bytes(s->graph.banks.raw[il]) / s->graph.banks.n_banks;
+            held_comp_index += pulsar_gpu_tensor_bytes(s->graph.banks.comp[il][0]) +
+                               pulsar_gpu_tensor_bytes(s->graph.banks.index[il][0]);
+        }
+        if (est.raw_bytes != held_raw || est.comp_index_bytes != held_comp_index) {
+            fprintf(stderr, "accounting_gate: FAIL context estimate raw %" PRIu64 " B, comp/idx %" PRIu64
+                            " B; bank 0 holds raw %" PRIu64 " B, comp/idx %" PRIu64 " B\n",
+                    est.raw_bytes, est.comp_index_bytes, held_raw, held_comp_index);
+            goto done;
+        }
+        fprintf(stderr, "accounting_gate: context estimate == bank 0 KV "
+                        "(raw %.3f GiB + comp/idx %.3f GiB, ctx=%d)\n",
+                (double)est.raw_bytes / GIB, (double)est.comp_index_bytes / GIB, ctx);
+    }
+
     /* A tiled token buffer of `peak` tokens, prefixes reused as we grow. */
     toks = (int *)malloc((size_t)peak * sizeof(int));
     if (!toks) { fprintf(stderr, "oom\n"); goto done; }

@@ -2652,6 +2652,47 @@ static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
 
+/* The boot-line estimate is the engine's KV sizing read back: one bank's KV
+ * in the stored row formats (packed attention rows, MXFP4 indexer rows), plus
+ * the indexer_scores scratch.  The unit process has no model, so the loader's
+ * compress ratios are all zero and the comp/idx term would be 0 (a gate that
+ * measures nothing); the test installs a Flash-like pattern -- layer 0 dense,
+ * then ratio 1 / ratio 4 alternating -- and restores what was there. */
+static void test_context_memory_shape(void) {
+    uint32_t saved[PULSAR_MAX_LAYER];
+    memcpy(saved, g_pulsar_compress_ratios, sizeof(saved));
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        g_pulsar_compress_ratios[il] = il == 0 ? 0u : ((il & 1u) ? 4u : 1u);
+    }
+    const int ctx = 32768;
+    const pulsar_context_memory m =
+        pulsar_context_memory_estimate(PULSAR_BACKEND_CUDA, ctx, 0);
+    TEST_ASSERT(m.prefill_cap > 0 && m.raw_cap > 0);
+    TEST_ASSERT(m.raw_bytes ==
+                (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
+    uint64_t comp_index = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = g_pulsar_compress_ratios[il];
+        if (ratio == 0) continue;
+        const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, ratio);
+        comp_index += rows * gpu_graph_attn_comp_cache_row_bytes();
+        if (ratio == 4) comp_index += rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
+    }
+    TEST_ASSERT(comp_index > 0 && m.comp_index_bytes == comp_index);
+    /* the ratio-1 layers hold the deepest pool; that is the row count reported */
+    TEST_ASSERT(m.comp_cap == gpu_graph_comp_cap((uint32_t)ctx, 1u));
+    TEST_ASSERT(m.scratch_bytes > 0);
+    TEST_ASSERT(m.total_bytes == m.raw_bytes + m.comp_index_bytes + m.scratch_bytes);
+    /* The engine's own "context buffers" line (gpu_graph_alloc_raw_cap) prints
+     * the managed-KV policy's two numbers; they are this estimate's kv and total. */
+    uint64_t kv = 0;
+    const uint64_t ctx_bytes =
+        gpu_graph_context_bytes_for_kv_policy((uint32_t)ctx, m.raw_cap, m.prefill_cap, &kv);
+    TEST_ASSERT(kv == m.raw_bytes + m.comp_index_bytes);
+    TEST_ASSERT(ctx_bytes == m.total_bytes);
+    memcpy(g_pulsar_compress_ratios, saved, sizeof(saved));
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2683,6 +2724,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
+    {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

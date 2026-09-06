@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
 
 /* Purpose-built throughput benchmark.
@@ -293,23 +294,6 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -323,7 +307,10 @@ int main(int argc, char **argv) {
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) return 1;
-    log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
+    char ctxmem_line[256];
+    fprintf(stderr, "%s\n",
+            pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-bench",
+                                       cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk));
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     pulsar_tokens prompt = {0};

@@ -842,9 +842,6 @@ bool agent_slash_command_known(const char *cmd);
 double agent_now_sec(void);
 void usage(FILE *fp, const char *topic);
 agent_config parse_options(int argc, char **argv);
-void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk);
 pulsar_think_mode effective_think_mode(const agent_config *cfg);
 void agent_append_system_prompt(pulsar_engine *engine, pulsar_tokens *tokens,
                                        const char *extra);
