@@ -1114,14 +1114,26 @@ public:
                      path);
             }
         } else {
-            if (header_ok) pulsar_session_invalidate(session);
+            /* A file that matched by text but whose payload this engine cannot
+             * load (payload version, row layout, shape, truncation) will never
+             * load here, and while it exists the store treats the same text as
+             * already checkpointed (existing_compatible) and writes nothing:
+             * the two together made every new session cold-prefill a 34k
+             * shared preamble whose only checkpoint was a payload-v7 file
+             * (dogfood 2026-09-06 18:21).  The consumer that refused it
+             * removes it, so the producer rewrites it on this very prefill. */
+            if (header_ok) {
+                pulsar_session_invalidate(session);
+                unlink(path);
+            }
             logf(PULSAR_KVSTORE_LOG_KVCACHE,
-                 "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
+                 "%s: kv cache load failed%s%s %s: %s%s load=%.1f ms",
                  log_name(),
                  responses_protocol ? " " : "",
                  responses_protocol ? "RESPPROTO" : "",
                  path,
                  header_ok ? err : fail_reason,
+                 header_ok ? " (file removed; the store rewrites it)" : "",
                  (kv_now_sec() - load_t0) * 1000.0);
         }
         fclose(fp);
