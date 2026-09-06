@@ -874,7 +874,10 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
          * sees the call it would have seen.
          *
          * G is the bank's LATEST snapshot at or below the checkpoint, not the
-         * nearest grid multiple (L194, 2026-09-05).  A snapshot is written only
+         * nearest grid multiple (L194, 2026-09-05).  The grid is
+         * PULSAR_RESUME_GRID (128, L195): every prefill chunk end and every
+         * decode crossing saves, so G is within 127 tokens of the checkpoint
+         * and the recompute is ~0.1 s, not the 4096-grid's 4-6 s.  A snapshot is written only
          * when a prefill chunk ENDS on the grid; the boundary nearest the
          * checkpoint is routinely crossed by decode instead (every ~4k tokens
          * of a growing conversation), and the first cut of this rule demanded
@@ -914,7 +917,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
                 fprintf(stderr, "pulsar: resume at %u from the grid snapshot at %u on bank %u "
                                 "(%u tokens recomputed)\n", ck, snap, bank, ck - snap);
             } else {
-                if (ck >= s->prefill_cap) {
+                if (ck >= PULSAR_RESUME_GRID) {
                     fprintf(stderr, "pulsar: resume at %u has no grid snapshot on bank %u -- "
                                     "prefilling the prompt from 0\n", ck, bank);
                 }

@@ -1470,6 +1470,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                                                (uint32_t)saved_len,
                                                                (uint32_t)(1 + commit),
                                                                row0);
+            gpu_graph_grid_snapshot_commit_pending(&s->graph);   /* L195: crossings the replay re-derived */
             if (ok_state) {
                 s->checkpoint.len = saved_len + 1 + commit;
                 for (int m = 0; ok_state && m <= commit; m++)

@@ -11,11 +11,11 @@
  *                                 must rewind to 4096 and restore the compressor
  *                                 state the first sync snapshotted when it crossed
  *                                 4096 -- the grid-snapshot path
- *   F  sync(8100), eval x200, sync(N) -> DECODE crosses the 8192 grid, then a resume:
- *                                the latest snapshot is 4096, so [4096, N) is redone
- *                                (the first L183 cut demanded a snapshot at 8192
- *                                and re-prefilled from 0 -- dogfood 2026-09-05, L194)
- *   G  sync(4000), eval x200, sync(N) -> decode crosses 4096 with NO snapshot: cold from 0
+ *   F  sync(8100), eval x200, sync(N) -> DECODE crosses 8192, which saves (L195): the
+ *                                resume redoes [8192, N) only
+ *   G  sync(4000), eval x200, sync(N) -> decode crosses 4096, which saves: resume from 4096
+ * The resume grid is 128 (PULSAR_RESUME_GRID, L195): every chunk end and every decode
+ * crossing snapshots the ratio-4 compressor window, so a resume redoes < 128 tokens.
  * (sync evaluates only the suffix when the checkpoint is a prefix, so B..E are
  * exactly what a prefix-cache hit or a warm fork does; F and G are a turn after
  * the model generated across a grid boundary.)  After each schedule the
@@ -147,13 +147,16 @@ int GATE_ENTRY(int argc, char **argv) {
         rows = (float *)malloc((size_t)(2 * GATE_SCHEDULES) * (size_t)width * sizeof(float));
         if (!rows) goto done;
         struct { const char *label; int first; int evals; int origin; } sched[GATE_SCHEDULES] = {
+            /* origins are on the 128 resume grid (L195): a prefill leaves its
+             * snapshot at the last grid point it reached, a decode saves at
+             * every crossing; a prompt under 128 tokens has none (cold) */
             {"A: cold [0,4096) [4096,8192) [8192,8600)", 0, 0, -1},   /* a fresh session: the sync is a rebuild, not a resume */
-            {"B: sync 6, then 8600", 6, 0, 0},
-            {"C: sync 2048, then 8600", 2048, 0, 0},
-            {"D: resume at 4000, then 8600", 4000, 0, 0},
-            {"E: resume at 4500 (past the 4096 grid), then 8600", 4500, 0, 4096},
-            {"F: sync 8100, decode 200 across 8192, resume from 4096", 8100, GATE_EVALS, 4096},
-            {"G: sync 4000, decode 200 across 4096, no snapshot: cold", 4000, GATE_EVALS, 0},
+            {"B: sync 6 (under the grid), then 8600: cold", 6, 0, 0},
+            {"C: sync 2048 (a grid point), then 8600", 2048, 0, 2048},
+            {"D: resume at 4000 (last grid point 3968), then 8600", 4000, 0, 3968},
+            {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480},
+            {"F: sync 8100, decode 200 across 8192, resume from 8192", 8100, GATE_EVALS, 8192},
+            {"G: sync 4000, decode 200 across 4096, resume from 4096", 4000, GATE_EVALS, 4096},
         };
         char err[256];
         printf("chunk-neutrality gate: %d tokens, prefill chunk %u, %d schedules; frontier row + one decode step each\n",

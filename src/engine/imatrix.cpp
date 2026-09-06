@@ -710,6 +710,7 @@ bool gpu_graph_prefill_chunked_range(
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
+    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: this encode's crossings start empty */
 
     const uint32_t end = start + n_tokens;
 
@@ -780,9 +781,12 @@ bool gpu_graph_prefill_chunked_range(
             }
             return false;
         }
-        /* L183: a chunk that ends ON the grid leaves the compressor state a
-         * resume from this boundary will fold into; snapshot it for this bank. */
-        if (g->prefill_cap && chunk_end % g->prefill_cap == 0 &&
+        /* L183/L195: crossings the chunk's per-row arm or its batched arm's
+         * last-boundary rebuild recorded become the bank's stamp; a chunk that
+         * ends ON the grid snapshots the whole state there (the later position
+         * wins, and at an aligned end the two are byte-identical). */
+        gpu_graph_grid_snapshot_commit_pending(g);
+        if (chunk_end % PULSAR_RESUME_GRID == 0 &&
             !gpu_graph_grid_snapshot_save(g, chunk_end)) {
             fprintf(stderr, "pulsar: grid snapshot at %u failed -- refusing the prefill\n", chunk_end);
             return false;
@@ -1018,6 +1022,7 @@ int gpu_graph_decode_multiseq_batch(
          * this the per-bank slots are consulted, and a classically-prefilled
          * bank has never populated them (n_comp 0), so the step is rejected. */
         bool                   capture_cur) {
+    gpu_graph_grid_snapshot_clear_pending(g);   /* L195: this step's crossings start empty */
     /* plan-34 inc 3: the ROW count (n_active) is bounded by prefill_cap (a K-row
      * prefill chunk rides this entry); PULSAR_MSEQ_MAX bounds only the BANK count,
      * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
@@ -1150,6 +1155,7 @@ int gpu_graph_decode_multiseq_batch(
      * so a skipped-head run's KV frontier is still validated. */
     const bool end_ok = gpu_graph_multiseq_step_end(g);
     if (!ok || !end_ok) return -1;   /* armed sweep failed: session-fatal */
+    gpu_graph_grid_snapshot_commit_pending(g);   /* L195: every layer saved its lane at the crossing */
 
     /* Logits readback: head_runs rows (one per emitted run, in run order = ascending
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
