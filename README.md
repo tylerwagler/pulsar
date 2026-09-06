@@ -439,14 +439,18 @@ first-generation CUDA working set (~7.2 GiB). Warmup lets admission measure the
 *actual* memory cost of a slot rather than estimate it. At the 1M default the
 boot log reads, for example (this capture is from an earlier 5-bank-default
 build; the current default auto-sizes up to 8 banks, and the GiB figures vary
-with the artifact — the shape of the ledger is what matters):
+with the artifact — the shape of the ledger is what matters; to be re-captured
+on the next boot):
 
 ```text
+pulsar-server: context buffers 2.94 GiB (ctx=1048576, backend=cuda,
+  prefill_chunk=4096, kv=2.44 GiB [raw 0.07 + comp/idx 2.38], scratch 0.50 GiB,
+  raw_kv_rows=4352, compressed_kv_rows=262146)
 Tier-2 pool fit table (budget 14.0 GiB, cap 5 banks):
   ctx  131072: fits 5 bank(s) (1-bank 4.57 GiB, 5-bank 7.41 GiB)
   ctx 1048576: fits 2 bank(s) (1-bank 9.59 GiB, 2-bank 13.89 GiB)
 Tier-2 OVERCOMMIT auto-sized to 5 bank(s) for --ctx 1048576: eager floor
-  0.20 GiB/bank charged; demand-paged VA 4.11 GiB/bank reserved (physical on
+  0.20 GiB/bank charged; demand-paged VA 2.38 GiB/bank reserved (physical on
   touch, NOT charged); shared 5.28 GiB; admission est 6.26 GiB (batching ON)
 warmup generation: 4160 prompt + 12 decode tokens in 10.8 s;
   MemAvailable 16.08 -> 12.13 GiB (first-generation working set materialized)

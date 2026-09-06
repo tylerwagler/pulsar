@@ -5080,24 +5080,6 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(server_kv_admits(gb10_budget, 0, 2ull * slot64k));        /* slot 0, 128k bound */
     TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));         /* second slot */
     TEST_ASSERT(!server_kv_admits(gb10_budget, 2ull * slot64k, slot64k)); /* third refused */
-
-    /* Packed estimate vs the sizeof(float) upper bound. The raw SWA ring packs
-     * to f16 regardless of a loaded model (it depends only on the static shape),
-     * so it is strictly smaller here. The compressed term depends on the model's
-     * per-layer compress ratios (g_pulsar_compress_ratios, populated at engine open)
-     * and is therefore 0 in this no-model unit context — its packing is exercised
-     * live at server startup and reported by the KV-admission log. We assert the
-     * model-independent invariants: internal consistency, unpacked scratch, and
-     * monotonic (packed <= f32) bounds. */
-    pulsar_context_memory f32 =
-        pulsar_context_memory_estimate_with_prefill(PULSAR_BACKEND_CUDA, 32768, 0);
-    pulsar_context_memory pk =
-        pulsar_context_memory_estimate_packed(PULSAR_BACKEND_CUDA, 32768, 0);
-    TEST_ASSERT(pk.total_bytes == pk.raw_bytes + pk.compressed_bytes + pk.scratch_bytes);
-    TEST_ASSERT(pk.raw_bytes > 0 && pk.raw_bytes < f32.raw_bytes);  /* f16 raw ring */
-    TEST_ASSERT(pk.scratch_bytes == f32.scratch_bytes);             /* scratch is not packed */
-    TEST_ASSERT(pk.compressed_bytes <= f32.compressed_bytes);       /* packed <= f32 upper bound */
-    TEST_ASSERT(pk.total_bytes < f32.total_bytes);
 }
 
 

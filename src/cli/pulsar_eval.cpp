@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
 #include "pulsar_think_scan.hpp"
 
@@ -3993,23 +3994,6 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
     return 0;
 }
 
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
@@ -4121,7 +4105,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pulsar-eval: model shape %s\n", pulsar_engine_model_name(engine));
     eval_warn_think_effort_downgraded(&cfg);
     trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases, max_prompt_tokens);
-    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
+    char ctxmem_line[256];
+    fprintf(stderr, "%s\n",
+            pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-eval",
+                                       cfg.backend, cfg.ctx_size, cfg.prefill_chunk));
 
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg.ctx_size) != 0) {

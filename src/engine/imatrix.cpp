@@ -1249,128 +1249,29 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
 
 
 
-pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
+/* The boot-line estimate is the KV-policy sizing read back: the same three
+ * functions the allocator's managed-KV decision uses (steering.cpp) price the
+ * raw ring, the comp/index caches and the indexer_scores scratch, so the line
+ * this feeds and the "context buffers" line gpu_graph_alloc_raw_cap prints
+ * cannot disagree.  For ADMISSION the price is pulsar_engine_session_cost_bytes
+ * (the allocator run dry), not this. */
+pulsar_context_memory pulsar_context_memory_estimate(
         pulsar_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk) {
+    if (!pulsar_backend_uses_graph(backend)) {
+        pulsar_die("pulsar_context_memory_estimate: backend has no graph to size");
+    }
     pulsar_context_memory m = {0};
-    uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
-
-    if (pulsar_backend_uses_graph(backend)) {
-        m.prefill_cap = gpu_graph_prefill_cap_for_prompt((int)ctx,
-                                                           prefill_chunk);
-        m.raw_cap = gpu_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
-
-        uint32_t min_ratio = UINT32_MAX;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-        }
-        if (min_ratio == UINT32_MAX) min_ratio = ctx;
-        m.comp_cap = ctx / min_ratio + 2u;
-        if (m.comp_cap < 2u) m.comp_cap = 2u;
-
-        m.raw_bytes = (uint64_t)PULSAR_N_LAYER *
-                      m.raw_cap *
-                      PULSAR_N_HEAD_DIM *
-                      sizeof(float);
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint32_t layer_comp_cap = ctx / ratio + 2u;
-            m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  PULSAR_N_HEAD_DIM *
-                                  sizeof(float);
-            if (ratio == 4) {
-                m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                      PULSAR_N_INDEXER_HEAD_DIM *
-                                      sizeof(float);
-            }
-        }
-        uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
-        if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        /* indexer_scores token rows shrink to the slice size under
-         * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / gpu_diag alloc). */
-        uint64_t score_rows = (uint64_t)m.prefill_cap;
-        if (gpu_graph_prefill_slice() != 0u &&
-            (uint64_t)gpu_graph_prefill_slice() < score_rows) {
-            score_rows = (uint64_t)gpu_graph_prefill_slice();
-        }
-        m.scratch_bytes = m.comp_cap *           /* one indexer_scores buffer */
-                          score_rows *
-                          sizeof(float) +
-                          attn_stage_cap * PULSAR_N_HEAD_DIM * sizeof(float);
-    } else {
-        m.raw_cap = pulsar_default_raw_cap(ctx);
-        m.raw_bytes = (uint64_t)PULSAR_N_LAYER *
-                      m.raw_cap *
-                      PULSAR_N_HEAD_DIM *
-                      sizeof(float);
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint32_t comp_cap = ctx / ratio + 2u;
-            if (ratio == 4) m.comp_cap = comp_cap;
-            m.compressed_bytes += (uint64_t)comp_cap *
-                                  PULSAR_N_HEAD_DIM *
-                                  sizeof(float);
-            if (ratio == 4) {
-                m.compressed_bytes += (uint64_t)comp_cap *
-                                      PULSAR_N_INDEXER_HEAD_DIM *
-                                      sizeof(float);
-            }
-        }
-        if (m.comp_cap == 0) m.comp_cap = ctx / 4u + 2u;
-        m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * sizeof(float)) +
-                          ((uint64_t)m.comp_cap * sizeof(float)) +
-                          ((uint64_t)m.comp_cap * sizeof(bool));
-    }
-
-    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
-    return m;
-}
-
-
-
-
-
-
-/* Packed variant of the estimate: recompute the three persistent KV caches
- * (raw ring, attn comp, indexer comp) with the real element/row widths the
- * graph actually allocates (see gpu_graph_alloc_raw_cap in gpu_diag.cpp), rather
- * than the sizeof(float) pessimistic upper bound the base estimate uses.  The
- * f32 scratch working set (batch_* buffers etc.) is not packed and carries
- * through from the base estimate unchanged. */
-pulsar_context_memory pulsar_context_memory_estimate_packed(
-        pulsar_backend backend,
-        int         ctx_size,
-        uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend, ctx_size, prefill_chunk);
-    if (!pulsar_backend_uses_graph(backend)) return m;
-
     const uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
-
-    /* Raw SWA ring: PULSAR_ATTN_PACK rows (PULSAR_ENGINE_ATTN_PACK_ROWBYTES, 384 B
-     * at head_dim 512), not f16 (1024 B) since the KV-packing campaign; match
-     * the allocator (gpu_diag raw_bank_bytes). */
-    m.raw_bytes = (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-
-    /* Compressed caches: PULSAR_ATTN_PACK attn comp row + MXFP4 indexer row. */
-    const uint64_t attn_row_bytes  = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t index_row_bytes = PULSAR_ENGINE_IDXFP4_ROWBYTES;
-    m.compressed_bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t layer_comp_cap = ctx / ratio + 2u;
-        m.compressed_bytes += (uint64_t)layer_comp_cap * attn_row_bytes;
-        if (ratio == 4) {
-            m.compressed_bytes += (uint64_t)layer_comp_cap * index_row_bytes;
-        }
-    }
-
-    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    m.prefill_cap = gpu_graph_prefill_cap_for_prompt((int)ctx, prefill_chunk);
+    m.raw_cap = gpu_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
+    m.comp_cap = gpu_graph_comp_cap_max(ctx);
+    m.raw_bytes = gpu_graph_raw_ring_bytes_for_context(m.raw_cap);
+    m.comp_index_bytes = gpu_graph_comp_index_bytes_for_context(ctx);
+    uint64_t kv_bytes = 0;
+    m.total_bytes = gpu_graph_context_bytes_for_kv_policy(ctx, m.raw_cap, m.prefill_cap, &kv_bytes);
+    m.scratch_bytes = m.total_bytes - kv_bytes;
     return m;
 }
 

@@ -235,25 +235,6 @@ agent_config parse_options(int argc, char **argv) {
 
 
 
-void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
-
-
 pulsar_think_mode effective_think_mode(const agent_config *cfg) {
     return pulsar_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
 }

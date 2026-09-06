@@ -2,15 +2,6 @@
 
 
 
-uint32_t pulsar_default_raw_cap(uint32_t ctx_size) {
-    uint32_t raw_cap = PULSAR_N_SWA;
-    if (raw_cap > ctx_size) raw_cap = ctx_size;
-    if (raw_cap == 0) raw_cap = 1;
-    return raw_cap;
-}
-
-
-
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;

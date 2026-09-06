@@ -1,5 +1,6 @@
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
 #include "pulsar_argparse.h"
 #include "pulsar_utf8.h"
 #include "pulsar_think_scan.hpp"
@@ -95,23 +96,6 @@ static void usage(FILE *fp, const char *topic) {
 
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
-}
-
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
 }
 
 static pulsar_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
@@ -1402,9 +1386,11 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "pulsar: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend,
-                                   cfg->gen.ctx_size,
-                                   cfg->engine.prefill_chunk);
+                char ctxmem_line[256];
+                fprintf(stderr, "%s\n",
+                        pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar",
+                                                   cfg->engine.backend, cfg->gen.ctx_size,
+                                                   cfg->engine.prefill_chunk));
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
@@ -1669,9 +1655,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend,
-                           cfg.gen.ctx_size,
-                           cfg.engine.prefill_chunk);
+        char ctxmem_line[256];
+        fprintf(stderr, "%s\n",
+                pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar",
+                                           cfg.engine.backend, cfg.gen.ctx_size,
+                                           cfg.engine.prefill_chunk));
         cli_warn_think_effort_downgraded(&cfg.gen,
             cfg.gen.think_mode == PULSAR_THINK_MAX ? "--think-max" : "--think-high");
     }

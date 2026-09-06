@@ -98,19 +98,21 @@ typedef struct {
 typedef void (*pulsar_token_emit_fn)(void *ud, int token);
 typedef void (*pulsar_generation_done_fn)(void *ud);
 
-/** GPU byte breakdown for one session at a given context size.
+/** GPU byte breakdown of one bank's context buffers at a given context size,
+ * in the stored KV row formats (packed NVFP4 attention rows, MXFP4 indexer
+ * rows).
  *
- * Produced by pulsar_context_memory_estimate_packed(). For the number ADMISSION
- * CONTROL must use, prefer pulsar_engine_session_cost_bytes(), which adds the
- * prefill working set and drafter state on top of the persistent caches. */
+ * Produced by pulsar_context_memory_estimate(). Display only: for the number
+ * ADMISSION CONTROL must use, call pulsar_engine_session_cost_bytes(), which
+ * is the allocator run dry (prefill working set, drafter state, every bank). */
 typedef struct {
-    uint64_t total_bytes;       ///< sum of the byte fields below
-    uint64_t raw_bytes;         ///< persistent raw (uncompressed) KV ring
-    uint64_t compressed_bytes;  ///< persistent compressed KV pool
-    uint64_t scratch_bytes;     ///< transient per-step working buffers
+    uint64_t total_bytes;       ///< raw_bytes + comp_index_bytes + scratch_bytes
+    uint64_t raw_bytes;         ///< persistent raw (SWA) KV ring, every layer
+    uint64_t comp_index_bytes;  ///< persistent compressed attention + indexer caches, every compressing layer
+    uint64_t scratch_bytes;     ///< the ctx-scaled indexer_scores working buffer
     uint32_t prefill_cap;       ///< max tokens in one prefill chunk
     uint32_t raw_cap;           ///< raw ring capacity, in rows
-    uint32_t comp_cap;          ///< compressed pool capacity, in rows
+    uint32_t comp_cap;          ///< deepest compressed pool capacity, in rows
 } pulsar_context_memory;
 
 /** Serialized session state (KV + host bookkeeping) as an owned byte blob.
@@ -172,21 +174,18 @@ const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
 const char *pulsar_think_max_prefix(void);
 uint32_t pulsar_think_max_min_context(void);
 pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size);
-/** Uses the active model shape selected by pulsar_engine_open(); call after opening
- * the GGUF so Flash/Pro dimensions are known. */
-pulsar_context_memory pulsar_context_memory_estimate_with_prefill(
-        pulsar_backend backend,
-        int ctx_size,
-        uint32_t prefill_chunk);
-/** Like pulsar_context_memory_estimate_with_prefill, but the persistent KV caches
- * are sized with their real packed element/row widths (f16 raw + PULSAR_ATTN_PACK
- * attn comp + MXFP4 indexer) instead of the sizeof(float) upper bound.
- * WARNING: this covers ONLY the persistent KV rows plus a small scratch term —
- * NOT the full per-session graph (prefill batch buffers, drafter state, …).
- * For admission accounting use pulsar_engine_session_cost_bytes, which prices the
- * whole session; pricing sessions with this estimate under-admitted by ~10x
- * and hard-locked the GB10 (2026-07-13). */
-pulsar_context_memory pulsar_context_memory_estimate_packed(
+/** One bank's context buffers at ctx_size, priced by the engine's own KV
+ * sizing (the managed-KV policy's numbers), so this and the engine's
+ * "context buffers" boot line agree.  Uses the active model shape and
+ * per-layer compress ratios selected by pulsar_engine_open(); call after
+ * opening the GGUF.  prefill_chunk 0 selects the engine default.  Refuses a
+ * backend without a graph.
+ * WARNING: this covers ONLY the persistent KV rows plus the indexer_scores
+ * scratch -- NOT the full per-session graph (prefill batch buffers, drafter
+ * state, ...).  For admission accounting use pulsar_engine_session_cost_bytes,
+ * which prices the whole session; pricing sessions with this estimate
+ * under-admitted by ~10x and hard-locked the GB10 (2026-07-13). */
+pulsar_context_memory pulsar_context_memory_estimate(
         pulsar_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);

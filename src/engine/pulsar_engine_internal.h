@@ -2208,7 +2208,6 @@ float layer_rope_freq_base(uint32_t il);
 float layer_rope_freq_scale(uint32_t il);
 float silu(float x);
 void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp);
-uint32_t pulsar_default_raw_cap(uint32_t ctx_size);
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk);
 uint64_t argmax_f32(const float *x, uint64_t n);
@@ -2322,6 +2321,15 @@ static inline uint32_t gpu_graph_comp_cap(uint32_t ctx_size, uint32_t ratio) {
 /** One bank's comp + index cache bytes at ctx_size in their stored row formats
  * (steering.cpp); the demand-paged term of the overcommit split. */
 uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
+/** One bank's raw SWA ring across every layer at raw_cap rows, in the stored
+ * PULSAR_ATTN_PACK row format (steering.cpp): the eager term of the KV
+ * sizing, the same bytes gpu_graph_bank_slabs_alloc lays out per layer. */
+uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
+/** The deepest compressed pool any layer holds at ctx_size (the smallest
+ * non-zero compress ratio's gpu_graph_comp_cap): the row count the
+ * indexer_scores scratch is sized by and the one the boot line reports as
+ * compressed_kv_rows.  ctx_size itself when no layer compresses. */
+uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size);
 /** Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
  * from its compressor frontier.  Every bank -- live or idle -- reads
  * ms_n_comp[bank] now; stage 1b removed the separate live-scalar case.  The increment-2b guard uses this for the

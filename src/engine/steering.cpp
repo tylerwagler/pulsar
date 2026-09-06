@@ -54,8 +54,9 @@ bool gpu_graph_apply_directional_steering_ffn(
 /* The comp + index caches of one bank at ctx_size, in their stored row
  * formats (packed attn comp, MXFP4 indexer), per-layer capacity from
  * gpu_graph_comp_cap -- the same capacity gpu_graph_compute_dims hands the
- * allocator.  Two readers: the KV-policy sizing below and the overcommit
- * split (gpu_graph_demand_paged_bytes_per_bank). */
+ * allocator.  Three readers: the KV-policy sizing below, the overcommit
+ * split (gpu_graph_demand_paged_bytes_per_bank) and the boot-line estimate
+ * (pulsar_context_memory_estimate). */
 uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
@@ -70,13 +71,22 @@ uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
     return bytes;
 }
 
-static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
+uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
     /* Stored formats, not f32 upper bounds: an f32-priced size overshoots ~3x
      * and trips the managed-KV (demand-paged) policy at the 512k+ contexts
      * where performance matters most.  The raw ring is PULSAR_ATTN_PACK rows,
      * as gpu_graph_bank_slabs_alloc sizes it (raw_bank_bytes). */
-    return (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES +
-           gpu_graph_comp_index_bytes_for_context(ctx_size);
+    return (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+}
+
+uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
+    return gpu_graph_comp_cap(ctx_size, min_ratio);
 }
 
 
@@ -86,14 +96,9 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  raw_cap,
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out) {
-    uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-    }
-    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, min_ratio);
-    const uint64_t kv_cache_bytes = gpu_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
+    const uint64_t comp_cap = gpu_graph_comp_cap_max(ctx_size);
+    const uint64_t kv_cache_bytes = gpu_graph_raw_ring_bytes_for_context(raw_cap) +
+                                    gpu_graph_comp_index_bytes_for_context(ctx_size);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     /* indexer_scores token rows shrink to the slice size under
      * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */

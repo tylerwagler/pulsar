@@ -1,4 +1,5 @@
 #include "pulsar_agent_internal.h"
+#include "pulsar_ctxmem.h"
 
 
 
@@ -590,9 +591,13 @@ int main(int argc, char **argv) {
     }
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
-    log_context_memory(cfg.engine.backend,
-                       cfg.gen.ctx_size,
-                       cfg.engine.prefill_chunk);
+    {
+        char ctxmem_line[256];
+        fprintf(stderr, "%s\n",
+                pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-agent",
+                                           cfg.engine.backend, cfg.gen.ctx_size,
+                                           cfg.engine.prefill_chunk));
+    }
 
     struct sigaction old_int;
     struct sigaction sa;

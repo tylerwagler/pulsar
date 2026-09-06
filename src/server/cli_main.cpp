@@ -1,6 +1,7 @@
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"
+#include "pulsar_ctxmem.h"
 
 #include <malloc.h>
 
@@ -176,25 +177,6 @@ static bool server_overcommit_enabled(void) {
     return !(v[0] == '0' || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
 
-
-
-
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
-               (double)m.total_bytes / (1024.0 * 1024.0),
-               ctx_size,
-               pulsar_backend_name(backend),
-               m.prefill_cap,
-               m.raw_cap,
-               m.comp_cap);
-}
 
 
 
@@ -534,9 +516,13 @@ int main(int argc, char **argv) {
                    "running without speculative decoding");
     }
 
-    log_context_memory(cfg.engine.backend,
-                       cfg.ctx_size,
-                       cfg.engine.prefill_chunk);
+    {
+        char ctxmem_line[256];
+        server_log(PULSAR_LOG_DEFAULT, "%s",
+                   pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-server",
+                                              cfg.engine.backend, cfg.ctx_size,
+                                              cfg.engine.prefill_chunk));
+    }
 
     /* Admission control (Tier 1 §1.4): compute the session budget from the
      * real resident weight footprint and the TRUE per-session cost (full graph

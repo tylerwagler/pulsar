@@ -141,7 +141,7 @@ MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
 ifneq ($(strip $(MMQ_SRCS)),)
 MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
 endif
-LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h
+LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvstore.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h src/lib/pulsar_ctxmem.h
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 
 # ---------------------------------------------------------------------------
