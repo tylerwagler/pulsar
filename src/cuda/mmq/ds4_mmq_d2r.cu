@@ -54,20 +54,40 @@ constexpr int kStages     = 2;  // act PREFETCH DISTANCE (issue at k for k+2)
  * warp spread to one iteration so no third slot is ever live (L099). */
 constexpr int kActDepth   = 3;
 constexpr int kNFrag      = kNTile / 8;
+/* L200: the DECODE tile width.  A layer routes a handful of assignment slots
+ * across ~200 experts, so at decode a 64-wide tile stages 63 activation columns
+ * that do not exist -- 27.6 of the 47 KiB shared budget -- and carries 8
+ * accumulator fragments where one column needs 1.  Those two are what
+ * independently cap the kernel at 2 blocks/SM (L199).  The width is a
+ * PERFORMANCE choice only: it decides which block computes a column, never how,
+ * so every width is bit-identical.  See the dispatch for when each is used. */
+constexpr int kNTileNarrow = 8;
 constexpr int kRawStages  = 2;  // k256 raw slots; NT=64 stays under 48 KiB.
 constexpr int kIQ2RawRowsPerWarp = 16;
 constexpr int kIQ2RawPairsPerRow = 8;
 constexpr int kIQ2RawQCodeChunks = kIQ2RawRowsPerWarp * kIQ2RawPairsPerRow;
 constexpr int kIQ2RawQCodeTrips = (kIQ2RawQCodeChunks + 31) / 32;
-constexpr int kActPrefetchItems = kNFrag * 8 * 9;
-constexpr int kActPrefetchTrips = (kActPrefetchItems + kThreads - 1) / kThreads;
-
-static_assert(kNTile == 64, "D2R production path is CFG1 NT64 only");
+/* Act staging geometry, as a function of the tile width alone.  One column is
+ * sizeof(block_mx_act_mmq) == 144 B == 9 cp.async chunks of 16 B, so a stage is
+ * Cols*9 chunk-issues split over the CTA's 256 threads; a thread's item index
+ * splits into (column, chunk) by Shift == log2(Cols).  The helpers below deduce
+ * NFRAG from the s_act extent, so one body serves every width (L200). */
+template <int NFRAG>
+struct D2RAct {
+    static constexpr int Cols  = NFRAG * 8;
+    static constexpr int Items = Cols * 9;
+    static constexpr int Trips = (Items + kThreads - 1) / kThreads;
+    static constexpr int Shift = (Cols == 8) ? 3 : ((Cols == 16) ? 4 : ((Cols == 32) ? 5 : 6));
+    static_assert(Cols == 8 || Cols == 16 || Cols == 32 || Cols == 64,
+                  "D2R act staging supports tile widths 8, 16, 32 and 64");
+    static_assert((1 << Shift) == Cols, "Shift must be log2(Cols)");
+};
 
 static_assert(kStages == 2, "D2R act prefetch distance is 2");
 static_assert(kActDepth > kStages, "act ring depth must exceed the prefetch distance -- equal means the issue aliases the current read slot (L099)");
 static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
-static_assert(kActPrefetchTrips == 3, "unexpected act issue trip count");
+static_assert(D2RAct<kNFrag>::Trips == 3, "unexpected act issue trip count (wide tile)");
+static_assert(D2RAct<kNTileNarrow / 8>::Trips == 1, "unexpected act issue trip count (narrow tile)");
 static_assert(kIQ2RawQCodeTrips == 4, "unexpected IQ2 raw-ring issue trip count");
 
 struct alignas(16) SmemInvariants {
@@ -215,15 +235,14 @@ __device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
     return k256_iter & (kRawStages - 1);
 }
 
-template <bool FullTile>
+template <bool FullTile, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_one(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const char * __restrict__ act_iter_base,
         int col_count, int stage, int t) {
-    constexpr int cols = kNFrag * 8;
-    static_assert(cols == 64, "NT64 act prefetch mapping expects 64 columns");
+    constexpr int cols = D2RAct<NFRAG>::Cols;
     const int col_local = t & (cols - 1);
-    const int chunk = t >> 6;
+    const int chunk = t >> D2RAct<NFRAG>::Shift;
     const int nf = col_local >> 3;
     const int c = col_local & 7;
     const bool valid = FullTile ? true : (col_local < col_count);
@@ -232,17 +251,17 @@ __device__ __forceinline__ void issue_act_prefetch_one(
     cp_async_16B(dst, src, valid);
 }
 
-template <bool FullTile, int Iter>
+template <bool FullTile, int Iter, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_unrolled(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const char * __restrict__ act_iter_base,
         int col_count, int stage, int tid) {
-    if constexpr (Iter < kActPrefetchTrips) {
+    if constexpr (Iter < D2RAct<NFRAG>::Trips) {
         const int t = tid + Iter * kThreads;
-        if constexpr ((Iter + 1) * kThreads <= kActPrefetchItems) {
+        if constexpr ((Iter + 1) * kThreads <= D2RAct<NFRAG>::Items) {
             issue_act_prefetch_one<FullTile>(s_act, act_iter_base, col_count, stage, t);
         } else {
-            if (t < kActPrefetchItems) {
+            if (t < D2RAct<NFRAG>::Items) {
                 issue_act_prefetch_one<FullTile>(s_act, act_iter_base, col_count, stage, t);
             }
         }
@@ -251,14 +270,14 @@ __device__ __forceinline__ void issue_act_prefetch_unrolled(
     }
 }
 
-template <bool FullTile>
+template <bool FullTile, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter, int tid) {
     const char *act_tile_base = s_inv.act_tile_base;
     const uint32_t k128_stride = s_inv.act_k128_stride_bytes;
-    int col_count = kNTile;
+    int col_count = D2RAct<NFRAG>::Cols;
     if constexpr (!FullTile) {
         col_count = s_inv.col_count;
     }
@@ -267,32 +286,32 @@ __device__ __forceinline__ void issue_act_prefetch(
     cp_async_commit();
 }
 
+template <int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_one_fast(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const char * __restrict__ act_iter_base,
         int stage, int t) {
-    constexpr int cols = kNFrag * 8;
-    static_assert(cols == 64, "NT64 act prefetch mapping expects 64 columns");
+    constexpr int cols = D2RAct<NFRAG>::Cols;
     const int col_local = t & (cols - 1);
     const int c = col_local & 7;
     const int nf = col_local >> 3;
-    const int chunk = t >> 6;
+    const int chunk = t >> D2RAct<NFRAG>::Shift;
     void *dst = (char *)&s_act[stage][nf][c] + chunk * 16;
     const void *src = act_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
     cp_async_16B(dst, src, true);
 }
 
-template <int Iter>
+template <int Iter, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const char * __restrict__ act_iter_base,
         int stage, int tid) {
-    if constexpr (Iter < kActPrefetchTrips) {
+    if constexpr (Iter < D2RAct<NFRAG>::Trips) {
         const int t = tid + Iter * kThreads;
-        if constexpr ((Iter + 1) * kThreads <= kActPrefetchItems) {
+        if constexpr ((Iter + 1) * kThreads <= D2RAct<NFRAG>::Items) {
             issue_act_prefetch_one_fast(s_act, act_iter_base, stage, t);
         } else {
-            if (t < kActPrefetchItems) {
+            if (t < D2RAct<NFRAG>::Items) {
                 issue_act_prefetch_one_fast(s_act, act_iter_base, stage, t);
             }
         }
@@ -300,8 +319,9 @@ __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
     }
 }
 
+template <int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_fast(
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
         const volatile SmemInvariants &s_inv,
         int stage, int k128_iter) {
     const char *act_iter_base =
@@ -337,10 +357,19 @@ constexpr size_t kSmemActStageBytes = (size_t)kNFrag * 8 * sizeof(block_mx_act_m
 constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
 constexpr size_t kSmemIQ2RawBytes = (size_t)kWarps * kRawStages * sizeof(IQ2RawWarpStage);
 constexpr size_t kSmemIQ2GridBytes = 256u * sizeof(uint2);
-constexpr size_t kSmemIQ2StaticBytes = (size_t)kStages * kSmemActStageBytes +
+/* kActDepth, not kStages: s_act is declared [kActDepth][...], so the old
+ * accounting under-counted the act ring by a whole stage (L200). */
+constexpr size_t kSmemIQ2StaticBytes = (size_t)kActDepth * kSmemActStageBytes +
                                        kSmemIQ2RawBytes + kSmemIQ2GridBytes + kSmemInvBytes;
 static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
               "IQ2 D2R static shared memory exceeds 48 KiB");
+/* The narrow tile exists to get under the 3-blocks/SM shared cliff (102.4 KiB
+ * per SM), which is the whole point of L200 -- assert it rather than hope. */
+constexpr size_t kSmemIQ2NarrowBytes =
+    (size_t)kActDepth * (size_t)(kNTileNarrow / 8) * 8 * sizeof(block_mx_act_mmq) +
+    kSmemIQ2RawBytes + kSmemIQ2GridBytes + kSmemInvBytes;
+static_assert(kSmemIQ2NarrowBytes * 4 <= 102400ull,
+              "narrow D2R tile must leave room for 4 blocks per SM");
 
 
 
@@ -753,10 +782,10 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
     }
 }
 
-template <bool FullTile, typename TileA, typename TileB, typename TileC>
+template <bool FullTile, typename TileA, typename TileB, typename TileC, int NFrag>
 __device__ __forceinline__ void iq2_d2r_mainloop(
-        float (&acc)[kNFrag][TileC::ne],
-        block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
+        float (&acc)[NFrag][TileC::ne],
+        block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const uint2 * __restrict__ s_gsel,
         const volatile SmemInvariants &s_inv) {
@@ -958,7 +987,12 @@ void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
  * pipeline regression dominated it) -- N2 was never measured solo and its
  * true cost is UNKNOWN. The spill risk on a 128-register kernel is real, so
  * 2 stays until someone runs the clean single-lever A/B this one never got. */
-__global__ __launch_bounds__(kThreads, 2)
+/* L200: NT is the assignment-slot tile width.  The 2-vs-4 minimum-blocks hint
+ * is the point of the narrow instantiation: with one accumulator fragment
+ * instead of eight the compiler can fit 4 blocks/SM in the register file, and
+ * the narrow act staging fits them in shared. */
+template <int NT>
+__global__ __launch_bounds__(kThreads, NT == 64 ? 2 : 4)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 const void * __restrict__ up_soa,
                                 const block_mx_act_mmq * __restrict__ act,
@@ -983,9 +1017,10 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         return;
     }
 
-    const int col_lo = expert_bounds[expert] + jt * kNTile;
+    constexpr int NFrag = NT / 8;
+    const int col_lo = expert_bounds[expert] + jt * NT;
     const int col_hi_full = expert_bounds[expert + 1];
-    const int col_tile_hi = (col_hi_full < col_lo + kNTile) ? col_hi_full : (col_lo + kNTile);
+    const int col_tile_hi = (col_hi_full < col_lo + NT) ? col_hi_full : (col_lo + NT);
     if (col_lo >= col_tile_hi) {
         return;
     }
@@ -1005,12 +1040,12 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
      * the names still said int8, and a name that outlives its format is not
      * cosmetic -- reading `block_q8_1_mmq` as evidence the MoE still ran q8_1 is
      * exactly how L065 got written and retracted.  See ds4_act_block.cuh. */
-    __shared__ __align__(16) block_mx_act_mmq s_act[kActDepth][kNFrag][8];
+    __shared__ __align__(16) block_mx_act_mmq s_act[kActDepth][NFrag][8];
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) uint2 s_gsel[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
     /* Scatter-index staging: one output column per tile lane. */
-    __shared__ int s_out_cols[kNTile];
+    __shared__ int s_out_cols[NT];
 
     const void *W_soa = leg == 0 ? gate_soa : up_soa;
     float *out = leg == 0 ? out_gate : out_up;
@@ -1018,7 +1053,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     const int warp_row0 = cta_row0 + d2r_warp() * 16;
     const int nb = K >> 8;
 
-    const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + kNTile <= col_hi_full);
+    const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + NT <= col_hi_full);
 
     /* L199: stage the byte-permute selectors and per-half amax index rather than
      * the grid values themselves -- same 2 KiB, and the dequant becomes a
@@ -1066,7 +1101,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     }
     __syncthreads();
 
-    float acc[kNFrag][tile_C::ne] = {};
+    float acc[NFrag][tile_C::ne] = {};
 
     if (full_warp_tile) {
         iq2_d2r_mainloop<true, tile_A, tile_B, tile_C>(
@@ -1082,7 +1117,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     const int out_M = s_inv.M;
     float *out_base = s_inv.out;
 #pragma unroll
-    for (int nf = 0; nf < kNFrag; ++nf) {
+    for (int nf = 0; nf < NFrag; ++nf) {
         const int col_frag0 = out_col_lo + nf * 8;
 #pragma unroll
         for (int l = 0; l < tile_C::ne; ++l) {
@@ -1120,8 +1155,25 @@ static int64_t d2r_work_capacity_for_tile(
     return (ncols_max + tile_n - 1) / tile_n + (int64_t)n_experts;
 }
 
+/* L200: which tile width a launch uses.  Below the threshold an expert almost
+ * certainly holds a single tile at either width, so the narrow tile costs no
+ * extra weight traffic and buys 2x the resident blocks; above it an expert
+ * spans several narrow tiles and would RE-READ its whole weight tile once per
+ * tile, which is the one way this choice can lose.  ne_get_rows is the total
+ * assignment slots (tokens x top-k), so 128 covers the entire decode and
+ * speculative-verify regime (<= 16 rows, the M-neutral range) with room to
+ * spare, and prefill chunks land far above it. */
+constexpr int64_t kD2RNarrowMaxSlots = 128;
+
+static bool d2r_use_narrow_tile(int64_t ne_get_rows) {
+    return ne_get_rows > 0 && ne_get_rows <= kD2RNarrowMaxSlots;
+}
+
+/* The worklist is one entry per (expert, tile), so the NARROW tile produces the
+ * most entries: size every scratch allocation for it, whichever width a given
+ * launch then picks (L200). */
 static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
-    return d2r_work_capacity_for_tile(ncols_max, n_experts, kNTile);
+    return d2r_work_capacity_for_tile(ncols_max, n_experts, kNTileNarrow);
 }
 
 
@@ -1211,7 +1263,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
         return -1;
     }
 
-    const int64_t capacity64 = d2r_work_capacity(ne_get_rows, n_experts);
+    const bool narrow = d2r_use_narrow_tile(ne_get_rows);
+    const int64_t capacity64 = d2r_work_capacity_for_tile(
+        ne_get_rows, n_experts, narrow ? kNTileNarrow : kNTile);
     if (capacity64 <= 0 || capacity64 > (int64_t)(INT_MAX - 1)) {
         return -1;
     }
@@ -1223,8 +1277,13 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     int *work = (int *)worklist_scratch;
     int *n_items = work + capacity64;
 
-    d2r_build_worklist_kernel<kNTile><<<1, kThreads, 0, stream>>>(
-        expert_bounds, work, n_items, n_experts);
+    if (narrow) {
+        d2r_build_worklist_kernel<kNTileNarrow><<<1, kThreads, 0, stream>>>(
+            expert_bounds, work, n_items, n_experts);
+    } else {
+        d2r_build_worklist_kernel<kNTile><<<1, kThreads, 0, stream>>>(
+            expert_bounds, work, n_items, n_experts);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: worklist builder launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -1234,9 +1293,15 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     /* Same expert-major schedule as the down launch (see comment there). */
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 2);
     const dim3 block(32, kWarps, 1);
-    gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
-        out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
+    if (narrow) {
+        gateup_iq2_d2r_pair_kernel<kNTileNarrow><<<grid, block, 0, stream>>>(
+            gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
+            out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
+    } else {
+        gateup_iq2_d2r_pair_kernel<kNTile><<<grid, block, 0, stream>>>(
+            gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
+            out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -1294,7 +1359,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     if (soa_blocks < expected_soa_blocks) {
         return -1;
     }
-    const int64_t capacity64 = d2r_work_capacity(ne_get_rows, n_experts);
+    const bool narrow = d2r_use_narrow_tile(ne_get_rows);
+    const int64_t capacity64 = d2r_work_capacity_for_tile(
+        ne_get_rows, n_experts, narrow ? kNTileNarrow : kNTile);
     if (capacity64 <= 0 || capacity64 > (int64_t)(INT_MAX - 1)) {
         return -1;
     }
@@ -1306,8 +1373,13 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     int *work = (int *)worklist_scratch;
     int *n_items = work + capacity64;
 
-    d2r_build_worklist_kernel<kNTile><<<1, kThreads, 0, stream>>>(
-        expert_bounds, work, n_items, n_experts);
+    if (narrow) {
+        d2r_build_worklist_kernel<kNTileNarrow><<<1, kThreads, 0, stream>>>(
+            expert_bounds, work, n_items, n_experts);
+    } else {
+        d2r_build_worklist_kernel<kNTile><<<1, kThreads, 0, stream>>>(
+            expert_bounds, work, n_items, n_experts);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: worklist builder launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -1317,13 +1389,19 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     /* z = 1: leg is pinned to 0, so only W_soa / out are ever touched. */
     const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 1);
     const dim3 block(32, kWarps, 1);
-    gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
-        W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
-        /* Callers MUST stage E4M3 -- there is no int8 arm left to fall back
-         * to.  This launch once read ds4_d2r_iq2_arm() itself, which ran the
-         * E4M3 MMA against q8_1 bytes whenever the env was set (the arm-1
-         * garbage).  With one format there is nothing left to disagree about. */
-        out, out, M, K, (int)ne_get_rows, n_experts);
+    /* Callers MUST stage E4M3 -- there is no int8 arm left to fall back to.
+     * This launch once read ds4_d2r_iq2_arm() itself, which ran the E4M3 MMA
+     * against q8_1 bytes whenever the env was set (the arm-1 garbage).  With
+     * one format there is nothing left to disagree about. */
+    if (narrow) {
+        gateup_iq2_d2r_pair_kernel<kNTileNarrow><<<grid, block, 0, stream>>>(
+            W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
+            out, out, M, K, (int)ne_get_rows, n_experts);
+    } else {
+        gateup_iq2_d2r_pair_kernel<kNTile><<<grid, block, 0, stream>>>(
+            W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
+            out, out, M, K, (int)ne_get_rows, n_experts);
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
