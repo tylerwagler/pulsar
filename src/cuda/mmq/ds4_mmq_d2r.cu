@@ -463,29 +463,18 @@ __device__ __forceinline__ static uint32_t iq2_mag_triple_e4m3(float scale) {
  * broadcasts and the warp's whole request is 128 contiguous bytes.  Same for the
  * block scale at d[k256*M + row].  Measured on the access pattern alone: 88 GB/s
  * reading the old layout this way, 182 staging it, 218 reading this one (L201). */
-template <int T, typename TileA>
+template <typename TileA>
 __device__ __forceinline__ void make_iq2_A_tile_e4m3(
         TileA &A, uint32_t &sfa,
-        const uint2 * __restrict__ q_expert,
-        const half * __restrict__ d_expert,
-        int M, int k256,
+        uint2 code0, uint2 code1, float d0, float d1,
         const uint2 * __restrict__ s_gsel,
-        int abs_row0, bool row0_ok, bool row1_ok,
-        int group, int tig) {
-    (void)group;
-    constexpr int pair = T;
-    const uint64_t q_off = ((uint64_t)k256 * 8u + (uint64_t)pair) * (uint64_t)M;
-    const uint64_t d_off = (uint64_t)k256 * (uint64_t)M;
-    const uint2 code0 = row0_ok ? q_expert[q_off + (uint64_t)abs_row0]      : make_uint2(0, 0);
-    const uint2 code1 = row1_ok ? q_expert[q_off + (uint64_t)abs_row0 + 8u] : make_uint2(0, 0);
+        bool row0_ok, bool row1_ok, int tig) {
 
     const iq2_half_e4m3 h0a = iq2_decode_half_e4m3(code0, s_gsel, tig,     row0_ok);
     const iq2_half_e4m3 h1a = iq2_decode_half_e4m3(code1, s_gsel, tig,     row1_ok);
     const iq2_half_e4m3 h0b = iq2_decode_half_e4m3(code0, s_gsel, tig + 4, row0_ok);
     const iq2_half_e4m3 h1b = iq2_decode_half_e4m3(code1, s_gsel, tig + 4, row1_ok);
 
-    const float d0 = row0_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0])      : 0.0f;
-    const float d1 = row1_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0 + 8u]) : 0.0f;
     const int ls0 = (int)(code0.y >> 27) | 1;
     const int ls1 = (int)(code1.y >> 27) | 1;
     const float dA0 = d0 * (float)ls0 * 0.125f;
@@ -544,23 +533,21 @@ template <bool FullTile, typename TileA, typename TileB, typename TileC,
           int T0, int T1, int NFrag>
 __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         float (&acc)[NFrag][TileC::ne],
-        const uint2 * __restrict__ q_expert,
-        const half * __restrict__ d_expert,
-        int M, int k256,
+        const uint2 (&c0)[4], const uint2 (&c1)[4], float d0, float d1,
         const uint2 * __restrict__ s_gsel,
         const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int act_stage, bool raw_row0_ok, bool raw_row1_ok,
-        int abs_row0, int group, int tig, const volatile SmemInvariants &s_inv) {
+        int group, int tig, const volatile SmemInvariants &s_inv) {
     static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
     static_assert(TileC::ne == 4, "expected m16n8 accumulator fragment");
     TileA A0;
     TileA A1;
     uint32_t sfa0 = 0;
     uint32_t sfa1 = 0;
-    make_iq2_A_tile_e4m3<T0>(A0, sfa0, q_expert, d_expert, M, k256, s_gsel, abs_row0,
-                             raw_row0_ok, raw_row1_ok, group, tig);
-    make_iq2_A_tile_e4m3<T1>(A1, sfa1, q_expert, d_expert, M, k256, s_gsel, abs_row0,
-                             raw_row0_ok, raw_row1_ok, group, tig);
+    make_iq2_A_tile_e4m3(A0, sfa0, c0[T0 & 3], c1[T0 & 3], d0, d1, s_gsel,
+                         raw_row0_ok, raw_row1_ok, tig);
+    make_iq2_A_tile_e4m3(A1, sfa1, c0[T1 & 3], c1[T1 & 3], d0, d1, s_gsel,
+                         raw_row0_ok, raw_row1_ok, tig);
 
     constexpr int k_in_act_0 = (T0 & 3) * 32;
     constexpr int k_in_act_1 = (T1 & 3) * 32;
@@ -621,20 +608,43 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
     const int act_stage = d2r_act_stage(k128_iter);
     const int half_pair_base = (k128_iter & 1) ? 4 : 0;
 
+    /* L203: fetch this whole k128 iteration's weights BEFORE any of its MMAs.
+     *
+     * L202 deleted the shared ring, which removed the transpose (mio_throttle
+     * 21.6% -> 1.3%) but also removed the software prefetch that came with it:
+     * loading each word where it is consumed puts every load in the dependency
+     * chain, and DRAM latency went from 8.5% to 56.4% of stall samples.  The
+     * four k32 tiles of one k128 iteration read eight independent words, so
+     * issuing all eight together lets them overlap each other and leaves only
+     * the first dequant waiting.  The block scale depends on (row, k256), not
+     * on the word, so it is fetched once here instead of eight times. */
+    const uint64_t d_off = (uint64_t)k256 * (uint64_t)s_inv.M;
+    const float d0 = row0_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0])      : 0.0f;
+    const float d1 = row1_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0 + 8u]) : 0.0f;
+    uint2 c0[4];
+    uint2 c1[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t q_off =
+            ((uint64_t)k256 * 8u + (uint64_t)(half_pair_base + i)) * (uint64_t)s_inv.M;
+        c0[i] = row0_ok ? q_expert[q_off + (uint64_t)abs_row0]      : make_uint2(0, 0);
+        c1[i] = row1_ok ? q_expert[q_off + (uint64_t)abs_row0 + 8u] : make_uint2(0, 0);
+    }
+
     if (half_pair_base == 0) {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 0, 1>(
-            acc, q_expert, d_expert, s_inv.M, k256, s_gsel, s_act, act_stage,
-            row0_ok, row1_ok, abs_row0, group, tig, s_inv);
+            acc, c0, c1, d0, d1, s_gsel, s_act, act_stage,
+            row0_ok, row1_ok, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 2, 3>(
-            acc, q_expert, d_expert, s_inv.M, k256, s_gsel, s_act, act_stage,
-            row0_ok, row1_ok, abs_row0, group, tig, s_inv);
+            acc, c0, c1, d0, d1, s_gsel, s_act, act_stage,
+            row0_ok, row1_ok, group, tig, s_inv);
     } else {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 4, 5>(
-            acc, q_expert, d_expert, s_inv.M, k256, s_gsel, s_act, act_stage,
-            row0_ok, row1_ok, abs_row0, group, tig, s_inv);
+            acc, c0, c1, d0, d1, s_gsel, s_act, act_stage,
+            row0_ok, row1_ok, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 6, 7>(
-            acc, q_expert, d_expert, s_inv.M, k256, s_gsel, s_act, act_stage,
-            row0_ok, row1_ok, abs_row0, group, tig, s_inv);
+            acc, c0, c1, d0, d1, s_gsel, s_act, act_stage,
+            row0_ok, row1_ok, group, tig, s_inv);
     }
 }
 
