@@ -483,17 +483,51 @@ __device__ __forceinline__ void issue_iq2_raw_prefetch_fast(
     cp_async_commit();
 }
 
-__device__ __forceinline__ uint32_t iq2_decode_signed_half(
-        uint2 code, const uint2 * __restrict__ s_grid, int chunk) {
+/* L198/L199: what one half of a grid entry contributes to one A quad.
+ *
+ * Every one of the IQ2_XXS grid's 2048 bytes is POSITIVE and drawn from exactly
+ * {8, 25, 43} (verified against the vendored table itself in
+ * ds4_iq2_grid_magnitudes_ok below -- the sign lives in the ksigns field, not in
+ * the grid).  A weight's E4M3 byte is therefore one of only three values per
+ * row, so the dequant needs to name WHICH, not compute it: `sel` carries one
+ * byte-permute nibble per weight (0/1/2 -> the magnitude, 3 -> a zero byte) and
+ * `sign80` the E4M3 sign bit.  `amax_idx` is the largest magnitude index in this
+ * half, which is all the block amax needs -- the magnitudes are ordered, so the
+ * larger index IS the larger magnitude.
+ *
+ * This replaced, per 16 weights per lane, a 16-step int8->float->fmax scan and
+ * 16 int8->float->E4M3 conversions (census L198: 0.27% of the kernel's
+ * instructions were the MMA itself). */
+struct iq2_half_e4m3 {
+    uint32_t sel;       ///< four byte-permute nibbles, each 0/1/2, or 3 for zero
+    uint32_t sign80;    ///< 0x80 in each byte whose weight is negative
+    int       amax_idx; ///< 0..2, or 3 ("no weights here", magnitude 0)
+};
+
+__device__ __forceinline__ static float iq2_mag_value(int idx) {
+    return idx == 0 ? 8.0f : (idx == 1 ? 25.0f : (idx == 2 ? 43.0f : 0.0f));
+}
+
+__device__ __forceinline__ iq2_half_e4m3 iq2_decode_half_e4m3(
+        uint2 code, const uint2 * __restrict__ s_gsel, int chunk, bool row_ok) {
+    iq2_half_e4m3 h;
+    if (!row_ok) {
+        h.sel      = 0x3333u;   /* every nibble picks the zero byte */
+        h.sign80   = 0u;
+        h.amax_idx = 3;         /* iq2_mag_value(3) == 0.0f */
+        return h;
+    }
     const int group = chunk >> 1;
     const int hi = chunk & 1;
     const uint8_t aux = (uint8_t)(code.x >> (8 * group));
-    const uint2 grid_pos = s_grid[aux];
+    const uint2 packed = s_gsel[aux];
+    const uint32_t half = hi ? packed.y : packed.x;
     const uint32_t signs8 = ds4_unpack_ksigns((uint8_t)(code.y >> (7 * group)));
-    const uint32_t sel = hi ? 0x80402010u : 0x08040201u;
-    const uint32_t s = __vcmpne4(signs8 & sel, 0);
-    const uint32_t grid_half = hi ? grid_pos.y : grid_pos.x;
-    return __vsub4(grid_half ^ s, s);
+    const uint32_t selbits = hi ? 0x80402010u : 0x08040201u;
+    h.sel      = half & 0xFFFFu;
+    h.sign80   = __vcmpne4(signs8 & selbits, 0) & 0x80808080u;
+    h.amax_idx = (int)(half >> 16);
+    return h;
 }
 
 
@@ -527,17 +561,24 @@ __device__ __forceinline__ uint32_t iq2_decode_signed_half(
  *
  * This comment used to read "NOT YET WIRED: the B tile still stages q8_1, so
  * nothing calls this."  Both halves are false now: the B tile stages E4M3
- * (ds4_quantize_e4m3.cu), and make_iq2_A_tile_e4m3 below calls this four times
- * per pair.  Left as a note because the stale version was read as evidence that
- * the routed path still ran q8_1 activations -- see ledger L065. */
-__device__ __forceinline__ static uint32_t iq2_pack_e4m3_quad(
-        uint32_t signed4, float scale) {
+ * (ds4_quantize_e4m3.cu), and make_iq2_A_tile_e4m3 below builds its quads from
+ * this.  Left as a note because the stale version was read as evidence that
+ * the routed path still ran q8_1 activations -- see ledger L065.
+ *
+ * L199: the three E4M3 bytes a row can produce, in magnitude order, with a zero
+ * in byte 3 so a byte-permute nibble of 3 yields a zero weight.  Built ONCE per
+ * row-pair; a weight is then a byte-permute plus a sign XOR.  Bit-identical to
+ * converting each weight: 8/25/43 are exact in float, and e4m3(-x) is the sign
+ * flip of e4m3(x) (the conversion rounds magnitudes symmetrically), so the
+ * sign-after-convert order does not change a byte -- including the saturating
+ * and signed-zero cases. */
+__device__ __forceinline__ static uint32_t iq2_mag_triple_e4m3(float scale) {
+    const float mag[3] = {8.0f, 25.0f, 43.0f};
     uint32_t out = 0;
 #pragma unroll
-    for (int b = 0; b < 4; ++b) {
-        const float v = (float)(int8_t)((signed4 >> (8 * b)) & 0xFFu) * scale;
-        const __nv_fp8_e4m3 e = (__nv_fp8_e4m3)v;
-        out |= ((uint32_t)*(const uint8_t *)&e) << (8 * b);
+    for (int m = 0; m < 3; ++m) {
+        const __nv_fp8_e4m3 e = (__nv_fp8_e4m3)(mag[m] * scale);
+        out |= ((uint32_t)*(const uint8_t *)&e) << (8 * m);
     }
     return out;
 }
@@ -546,7 +587,7 @@ template <int T, typename TileA>
 __device__ __forceinline__ void make_iq2_A_tile_e4m3(
         TileA &A, uint32_t &sfa,
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
-        const uint2 * __restrict__ s_grid,
+        const uint2 * __restrict__ s_gsel,
         int warp, int raw_stage, bool row0_ok, bool row1_ok,
         int group, int tig) {
     const IQ2RawWarpStage &raw = s_raw[warp][raw_stage];
@@ -556,10 +597,10 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
     const uint2 code0 = row0_ok ? raw.qs[row0][pair] : make_uint2(0, 0);
     const uint2 code1 = row1_ok ? raw.qs[row1][pair] : make_uint2(0, 0);
 
-    const uint32_t w0a = row0_ok ? iq2_decode_signed_half(code0, s_grid, tig)     : 0u;
-    const uint32_t w1a = row1_ok ? iq2_decode_signed_half(code1, s_grid, tig)     : 0u;
-    const uint32_t w0b = row0_ok ? iq2_decode_signed_half(code0, s_grid, tig + 4) : 0u;
-    const uint32_t w1b = row1_ok ? iq2_decode_signed_half(code1, s_grid, tig + 4) : 0u;
+    const iq2_half_e4m3 h0a = iq2_decode_half_e4m3(code0, s_gsel, tig,     row0_ok);
+    const iq2_half_e4m3 h1a = iq2_decode_half_e4m3(code1, s_gsel, tig,     row1_ok);
+    const iq2_half_e4m3 h0b = iq2_decode_half_e4m3(code0, s_gsel, tig + 4, row0_ok);
+    const iq2_half_e4m3 h1b = iq2_decode_half_e4m3(code1, s_gsel, tig + 4, row1_ok);
 
     const float d0 = row0_ok ? __half2float(raw.dq[row0]) : 0.0f;
     const float d1 = row1_ok ? __half2float(raw.dq[row1]) : 0.0f;
@@ -568,16 +609,11 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
     const float dA0 = d0 * (float)ls0 * 0.125f;
     const float dA1 = d1 * (float)ls1 * 0.125f;
 
-    float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-    for (int b = 0; b < 4; ++b) {
-        a0 = fmaxf(a0, fabsf((float)(int8_t)((w0a >> (8 * b)) & 0xFFu)));
-        a0 = fmaxf(a0, fabsf((float)(int8_t)((w0b >> (8 * b)) & 0xFFu)));
-        a1 = fmaxf(a1, fabsf((float)(int8_t)((w1a >> (8 * b)) & 0xFFu)));
-        a1 = fmaxf(a1, fabsf((float)(int8_t)((w1b >> (8 * b)) & 0xFFu)));
-    }
-    a0 *= fabsf(dA0);
-    a1 *= fabsf(dA1);
+    /* L199: the block amax is the largest MAGNITUDE this lane holds, and the
+     * grid's three magnitudes are ordered, so the larger index is the larger
+     * magnitude -- no scan over the values. */
+    float a0 = iq2_mag_value(max(h0a.amax_idx, h0b.amax_idx)) * fabsf(dA0);
+    float a1 = iq2_mag_value(max(h1a.amax_idx, h1b.amax_idx)) * fabsf(dA1);
     /* quad reduction: lanes group*4 + 0..3 hold this row's whole 32-block */
     a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, 1));
     a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, 2));
@@ -589,10 +625,12 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
     const float r0 = dA0 * exp2f(-(float)se0);
     const float r1 = dA1 * exp2f(-(float)se1);
 
-    A.x[0] = (int)iq2_pack_e4m3_quad(w0a, r0);
-    A.x[1] = (int)iq2_pack_e4m3_quad(w1a, r1);
-    A.x[2] = (int)iq2_pack_e4m3_quad(w0b, r0);
-    A.x[3] = (int)iq2_pack_e4m3_quad(w1b, r1);
+    const uint32_t mag0 = iq2_mag_triple_e4m3(r0);
+    const uint32_t mag1 = iq2_mag_triple_e4m3(r1);
+    A.x[0] = (int)(__byte_perm(mag0, 0u, h0a.sel) ^ h0a.sign80);
+    A.x[1] = (int)(__byte_perm(mag1, 0u, h1a.sel) ^ h1a.sign80);
+    A.x[2] = (int)(__byte_perm(mag0, 0u, h0b.sel) ^ h0b.sign80);
+    A.x[3] = (int)(__byte_perm(mag1, 0u, h1b.sel) ^ h1b.sign80);
 
     sfa = (uint32_t)pulsar_mx_scale_byte((tig == 1) ? se1 : se0);
 }
@@ -625,7 +663,7 @@ template <bool FullTile, typename TileA, typename TileB, typename TileC,
 __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
-        const uint2 * __restrict__ s_grid,
+        const uint2 * __restrict__ s_gsel,
         const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int raw_stage, int act_stage, bool raw_row0_ok, bool raw_row1_ok,
         int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
@@ -635,9 +673,9 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
     TileA A1;
     uint32_t sfa0 = 0;
     uint32_t sfa1 = 0;
-    make_iq2_A_tile_e4m3<T0>(A0, sfa0, s_raw, s_grid, warp, raw_stage,
+    make_iq2_A_tile_e4m3<T0>(A0, sfa0, s_raw, s_gsel, warp, raw_stage,
                              raw_row0_ok, raw_row1_ok, group, tig);
-    make_iq2_A_tile_e4m3<T1>(A1, sfa1, s_raw, s_grid, warp, raw_stage,
+    make_iq2_A_tile_e4m3<T1>(A1, sfa1, s_raw, s_gsel, warp, raw_stage,
                              raw_row0_ok, raw_row1_ok, group, tig);
 
     constexpr int k_in_act_0 = (T0 & 3) * 32;
@@ -678,7 +716,7 @@ template <bool FullTile, typename TileA, typename TileB, typename TileC,
 __device__ __forceinline__ void mma_fold_iq2_k128(
         float (&acc)[NFrag][TileC::ne],
         const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
-        const uint2 * __restrict__ s_grid,
+        const uint2 * __restrict__ s_gsel,
         const block_mx_act_mmq (&s_act)[kActDepth][NFrag][8],
         int k128_iter, const volatile SmemInvariants &s_inv) {
     const int warp = d2r_warp();
@@ -700,17 +738,17 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
 
     if (half_pair_base == 0) {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 0, 1>(
-            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
+            acc, s_raw, s_gsel, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 2, 3>(
-            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
+            acc, s_raw, s_gsel, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     } else {
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 4, 5>(
-            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
+            acc, s_raw, s_gsel, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
         mma_iq2_k32_pair_e4m3<FullTile, TileA, TileB, TileC, 6, 7>(
-            acc, s_raw, s_grid, s_act, raw_stage, act_stage,
+            acc, s_raw, s_gsel, s_act, raw_stage, act_stage,
             row0_ok, row1_ok, warp, group, tig, s_inv);
     }
 }
@@ -720,7 +758,7 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[kNFrag][TileC::ne],
         block_mx_act_mmq (&s_act)[kActDepth][kNFrag][8],
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
-        const uint2 * __restrict__ s_grid,
+        const uint2 * __restrict__ s_gsel,
         const volatile SmemInvariants &s_inv) {
 #pragma unroll
     for (int pf = 0; pf < kStages; ++pf) {
@@ -788,10 +826,10 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
 
         if constexpr (FullTile) {
             mma_fold_iq2_k128<true, TileA, TileB, TileC>(
-                acc, s_raw, s_grid, s_act, k128_iter, s_inv);
+                acc, s_raw, s_gsel, s_act, k128_iter, s_inv);
         } else {
             mma_fold_iq2_k128<false, TileA, TileB, TileC>(
-                acc, s_raw, s_grid, s_act, k128_iter, s_inv);
+                acc, s_raw, s_gsel, s_act, k128_iter, s_inv);
         }
 
         /* No second block barrier (L099).  The act issue below writes slot
@@ -953,7 +991,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     }
 
     /* A/B: `int` here means "one 32-bit register holding four E4M3 bytes",
-     * not an integer element -- the packing is done by iq2_pack_e4m3_quad and
+     * not an integer element -- the packing is done by make_iq2_A_tile_e4m3 and
      * load_B_tile.  C is genuinely f32 (the FFMA accumulator).  It was
      * tile<16,8,int> -- a leftover of the deleted s8/s32 arm -- which was
      * harmless only because tile::ne is T-independent and only ne/get_i/get_j
@@ -969,7 +1007,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
      * exactly how L065 got written and retracted.  See ds4_act_block.cuh. */
     __shared__ __align__(16) block_mx_act_mmq s_act[kActDepth][kNFrag][8];
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
-    __shared__ __align__(16) uint2 s_grid[256];
+    __shared__ __align__(16) uint2 s_gsel[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
     /* Scatter-index staging: one output column per tile lane. */
     __shared__ int s_out_cols[kNTile];
@@ -982,8 +1020,22 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 
     const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + kNTile <= col_hi_full);
 
+    /* L199: stage the byte-permute selectors and per-half amax index rather than
+     * the grid values themselves -- same 2 KiB, and the dequant becomes a
+     * lookup.  See iq2_decode_half_e4m3. */
     for (int i = d2r_tid(); i < 256; i += kThreads) {
-        s_grid[i] = reinterpret_cast<const uint2 *>(iq2xxs_grid)[i];
+        const uint64_t g = iq2xxs_grid[i];
+        uint32_t sel[2] = {0u, 0u};
+        uint32_t amax[2] = {0u, 0u};
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t v = (uint32_t)((g >> (8 * b)) & 0xFFu);
+            const uint32_t idx = (v == 8u) ? 0u : ((v == 25u) ? 1u : 2u);
+            const int half = b >> 2;
+            sel[half] |= idx << (4 * (b & 3));
+            amax[half] = amax[half] > idx ? amax[half] : idx;
+        }
+        s_gsel[i] = make_uint2(sel[0] | (amax[0] << 16), sel[1] | (amax[1] << 16));
     }
     if (d2r_tid() == 0) {
         const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
@@ -1018,10 +1070,10 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 
     if (full_warp_tile) {
         iq2_d2r_mainloop<true, tile_A, tile_B, tile_C>(
-            acc, s_act, s_raw, s_grid, s_inv);
+            acc, s_act, s_raw, s_gsel, s_inv);
     } else {
         iq2_d2r_mainloop<false, tile_A, tile_B, tile_C>(
-            acc, s_act, s_raw, s_grid, s_inv);
+            acc, s_act, s_raw, s_gsel, s_inv);
     }
 
     const int out_col_lo = s_inv.col_lo;
@@ -1076,13 +1128,41 @@ static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
 } // namespace
 
 
+/* L199: the dequant names a weight's magnitude with a 2-bit nibble, which is
+ * sound only while the vendored grid holds exactly {8, 25, 43}.  Check the table
+ * itself once rather than trust the comment that named them: a fourth magnitude
+ * would otherwise be packed silently as 43.  Refusing here fails the model load
+ * closed -- D2R is the only IQ2 arm (VENDOR.md). */
+static bool ds4_iq2_grid_magnitudes_ok() {
+    uint64_t grid[256];
+    if (cudaMemcpyFromSymbol(grid, iq2xxs_grid, sizeof(grid)) != cudaSuccess) {
+        fprintf(stderr, "ds4_mmq_d2r: could not read iq2xxs_grid to validate it\n");
+        return false;
+    }
+    for (int i = 0; i < 256; ++i) {
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t v = (uint32_t)((grid[i] >> (8 * b)) & 0xFFu);
+            if (v != 8u && v != 25u && v != 43u) {
+                fprintf(stderr,
+                        "ds4_mmq_d2r: iq2xxs_grid[%d] byte %d is %u, not one of "
+                        "{8,25,43} -- the D2R magnitude index cannot name it\n",
+                        i, b, v);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+
 bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc) {
     static int cached_cc = -1;
     static int cached = 0;
     if (cached_cc != cc) {
         cached_cc = cc;
         cached = (GGML_CUDA_CC_IS_NVIDIA(cc) &&
-                  ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE) ? 1 : 0;
+                  ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
+                  ds4_iq2_grid_magnitudes_ok()) ? 1 : 0;
     }
     return cached != 0;
 }
