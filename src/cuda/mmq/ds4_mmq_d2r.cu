@@ -618,17 +618,24 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
      * issuing all eight together lets them overlap each other and leaves only
      * the first dequant waiting.  The block scale depends on (row, k256), not
      * on the word, so it is fetched once here instead of eight times. */
-    const uint64_t d_off = (uint64_t)k256 * (uint64_t)s_inv.M;
-    const float d0 = row0_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0])      : 0.0f;
-    const float d1 = row1_ok ? __half2float(d_expert[d_off + (uint64_t)abs_row0 + 8u]) : 0.0f;
+    /* L205: 32-bit indexing WITHIN the expert.  One expert holds nb*8*M code
+     * words and nb*M scales -- 262144 and 32768 at the shipped shapes -- so the
+     * whole inner loop addresses in 32 bits and the 64-bit offset registers and
+     * their IMAD.WIDE pairs leave the hot path.  Registers are what caps this
+     * kernel's occupancy (L202), so an address temporary is not free.  The
+     * launcher refuses a shape that would not fit rather than wrapping. */
+    const uint32_t rowM = (uint32_t)s_inv.M;
+    const uint32_t d_off = (uint32_t)k256 * rowM + (uint32_t)abs_row0;
+    const float d0 = row0_ok ? __half2float(d_expert[d_off])      : 0.0f;
+    const float d1 = row1_ok ? __half2float(d_expert[d_off + 8u]) : 0.0f;
     uint2 c0[4];
     uint2 c1[4];
+    uint32_t q_off = ((uint32_t)k256 * 8u + (uint32_t)half_pair_base) * rowM + (uint32_t)abs_row0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const uint64_t q_off =
-            ((uint64_t)k256 * 8u + (uint64_t)(half_pair_base + i)) * (uint64_t)s_inv.M;
-        c0[i] = row0_ok ? q_expert[q_off + (uint64_t)abs_row0]      : make_uint2(0, 0);
-        c1[i] = row1_ok ? q_expert[q_off + (uint64_t)abs_row0 + 8u] : make_uint2(0, 0);
+        c0[i] = row0_ok ? q_expert[q_off]      : make_uint2(0, 0);
+        c1[i] = row1_ok ? q_expert[q_off + 8u] : make_uint2(0, 0);
+        q_off += rowM;
     }
 
     if (half_pair_base == 0) {
@@ -1069,6 +1076,14 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
         return -1;
     }
 
+    /* L205: the kernel addresses within one expert in 32 bits (nb*8*M code words
+     * in the q plane).  Refuse a shape that would not fit rather than wrap. */
+    if ((uint64_t)(K >> 8) * 8ull * (uint64_t)M > (uint64_t)UINT32_MAX) {
+        fprintf(stderr, "%s: expert too large for 32-bit intra-expert indexing (K=%d M=%d)\n",
+                tag, K, M);
+        return -1;
+    }
+
     const int64_t expected_soa_blocks =
         (int64_t)n_experts * (int64_t)M * (int64_t)(K >> 8);
     if (soa_blocks < expected_soa_blocks) {
@@ -1163,6 +1178,14 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
         return -1;
     }
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0 || ne_get_rows <= 0) {
+        return -1;
+    }
+
+    /* L205: the kernel addresses within one expert in 32 bits (nb*8*M code words
+     * in the q plane).  Refuse a shape that would not fit rather than wrap. */
+    if ((uint64_t)(K >> 8) * 8ull * (uint64_t)M > (uint64_t)UINT32_MAX) {
+        fprintf(stderr, "%s: expert too large for 32-bit intra-expert indexing (K=%d M=%d)\n",
+                tag, K, M);
         return -1;
     }
 
