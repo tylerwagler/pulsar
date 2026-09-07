@@ -288,7 +288,13 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  * carry them as bare literals at eight sites (L178). */
 enum {
     PULSAR_GPU_TENSOR_CUTLASS_MXFP4 = 40,   /* MXFP4 experts: grouped CUTLASS / fp4 GEMV */
-    PULSAR_GPU_TENSOR_IQ2_XXS_MMQ   = 43,   /* IQ2_XXS experts: the vendored MMQ tier */
+    /* IQ2_XXS experts, k-major (L202).  Type 43 was the same bytes ordered
+     * (expert, row, k); 44 orders them (expert, k, code-word, row) so the D2R
+     * GEMM reads a warp's 16 rows as 128 contiguous bytes and needs no shared
+     * transpose.  There is no reader for 43 any more: an artifact that still
+     * carries it fails the routed-expert type check at load, and
+     * gguf-tools/repack_iq2_mmq.py --to mmq-k converts one. */
+    PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K = 44,
 };
 
 /** Compressor input-width multiplier for a layer's compress ratio: the

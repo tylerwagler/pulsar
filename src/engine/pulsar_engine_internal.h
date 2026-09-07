@@ -433,7 +433,7 @@ enum {
      * cache is capacity-bound (~22.9 GiB budget vs ~35 GB to hold all 90+ IQ2
      * stacks), so it covered only part of the model and made the first prefill
      * frontier absorb the repack.  Pre-storing costs zero model growth. */
-    PULSAR_TENSOR_IQ2_XXS_MMQ = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ,       /* one spelling: pulsar_gpu.h */
+    PULSAR_TENSOR_IQ2_XXS_MMQ_K = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K,       /* one spelling: pulsar_gpu.h */
 };
 
 /** One GGUF metadata entry, held as a key plus an OFFSET rather than a parsed

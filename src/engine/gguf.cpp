@@ -66,11 +66,19 @@ static const gguf_type_info gguf_types[] = {
      * ([d plane][pad to 64B][64B-aligned code plane]).  A DIFFERENT
      * permutation from type 42, but likewise pure, so it also shares type
      * 16's {256, 66} accounting and loads/mmaps through the generic path.
-     * See PULSAR_TENSOR_IQ2_XXS_MMQ. */
+     * The engine has no READER for it any more (L202) -- the routed-expert
+     * type check refuses it -- but the row stays because a file can still carry
+     * it and the parser has to size it to walk the header at all. */
     /*43*/ {"iq2_xxs_mmq", 256, 66},
+    /* IQ2_XXS_MMQ_K: the same 66 B/block content once more, ordered
+     * (expert, k, code-word, row) so a warp's 16 rows at one k step are 128
+     * contiguous bytes and the D2R GEMM reads them straight into registers.
+     * Pure permutation again, so it too shares type 16's {256, 66} accounting.
+     * See PULSAR_TENSOR_IQ2_XXS_MMQ_K. */
+    /*44*/ {"iq2_xxs_mmq_k", 256, 66},
 };
 
-static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 44,
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 45,
               "gguf_types rows must line up with GGUF type ids");
 
 

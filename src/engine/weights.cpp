@@ -213,13 +213,13 @@ static void tensor_expect_plain_layout(
 
 /* The two routed-expert types the engine still reads.  IQ2_XXS (16),
  * IQ2_XXS_SOA (42), Q2_K (10) and FP4_E2M1 (39) were dropped: a scan of the
- * shipped artifact found only types 0/1/26/38/40/41/43 in the file, none of the
+ * shipped artifact found only types 0/1/26/38/40/41/44 in the file, none of the
  * four is ever synthesised at load (they can only arrive FROM a gguf), and the
  * kernels behind them are gone.  Refusing here is what keeps that honest -- an
  * old artifact now fails to load with a clear message instead of dispatching
  * into a reader that no longer exists. */
 static bool tensor_is_routed_expert_type(uint32_t type) {
-    return type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
+    return type == PULSAR_TENSOR_IQ2_XXS_MMQ_K ||
            type == PULSAR_TENSOR_CUTLASS_MXFP4;
 }
 
@@ -227,11 +227,11 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 
 static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
-    /* IQ2_XXS_MMQ (43) is a pure permutation of the old raw IQ2_XXS -- llama.cpp
+    /* IQ2_XXS_MMQ_K (44) is a pure permutation of the raw IQ2_XXS blocks (L202)
      * MMQ's aligned-SoA layout.  Same 66 B/block, so row bytes, expert stride
      * and tensor size are unchanged; that is why it drops into the existing
      * offset machinery.  Only the kernel's read pattern differs. */
-    case PULSAR_TENSOR_IQ2_XXS_MMQ: return sizeof(block_iq2_xxs);
+    case PULSAR_TENSOR_IQ2_XXS_MMQ_K: return sizeof(block_iq2_xxs);
     default:                 pulsar_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -313,11 +313,11 @@ static void tensor_expect_routed_expert_combo(
         const pulsar_tensor *up,
         const pulsar_tensor *down) {
     /* gate/up must match (the fused gate+up kernels assume one format). Each of
-     * gate/up and down is independently either IQ2_XXS_MMQ (43, read by the MMQ
+     * gate/up and down is independently either IQ2_XXS_MMQ_K (44, read by the MMQ
      * arms) or CUTLASS_MXFP4 (40) -- the GPU MoE path handles all-cutlass
      * (uniform, grouped/gemv), all-MMQ, AND the two MIXED shapes via
      * per-projection dispatch, which is what the shipped artifact needs: its 43
-     * routed layers are 9 all-40, 27 all-43 and 7 mixed.
+     * routed layers are 9 all-40, 27 all-44 and 7 mixed.
      *
      * The old dp4a types (IQ2_XXS 16, IQ2_XXS_SOA 42, Q2_K 10, FP4_E2M1 39) are
      * gone along with their kernels, so the former "bad_mix" cross (CUTLASS
@@ -953,7 +953,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_FP8_E4M3:
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
-    case PULSAR_TENSOR_IQ2_XXS_MMQ:
+    case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
         return true;
     default:
         return false;

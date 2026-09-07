@@ -522,7 +522,7 @@ static int routed_moe_launch_cutlass_dispatch(
 
 
 /* ---- MIXED type-40 (CUTLASS W4A8) + type-43 (MMQ) layer dispatch. --------------------------------
- * Some layers have ONE projection as CUTLASS MXFP4 (type 40) and the other as IQ2_XXS_MMQ (type 43);
+ * Some layers have ONE projection as CUTLASS MXFP4 (type 40) and the other as IQ2_XXS_MMQ_K (type 44);
  * the artifact has 7 such layers (4x gate=40/down=43, 3x gate=43/down=40). The grouped path needs
  * all-three-same-type and CUTLASS cannot read the MMQ layout (or vice versa), so we run each
  * projection in its native precision and compose in f32. The CUTLASS side runs as a GROUPED
@@ -591,7 +591,7 @@ static int routed_moe_launch_mixed40(
      * dispatch below is a chain keyed on a type tag, and every silent misread
      * this file has produced came from such a chain ACCEPTING an unknown tag and
      * reading its bytes as the last arm's format.  An allowlist cannot do that. */
-    if ((caseA ? down_type : gate_type) != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;
+    if ((caseA ? down_type : gate_type) != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K) return 0;
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
@@ -911,7 +911,7 @@ static int routed_moe_launch_mixed40(
  */
 /* The runtime aligned-IQ2 repack cache is GONE (2026-08-15).  It existed to
  * lazily repack raw IQ2_XXS (type 16) into the MMQ aligned layout under a
- * memory budget.  The loader now accepts only IQ2_XXS_MMQ (43) and
+ * memory budget.  The loader now accepts only IQ2_XXS_MMQ_K (44) and
  * CUTLASS_MXFP4 (40) for routed experts (weights.cpp tensor_is_routed_expert
  * _type), and 43 is ALREADY aligned in the gguf -- so every tensor took the
  * prealigned branch and the cache never repacked anything.  With it go the
@@ -983,11 +983,11 @@ static int routed_moe_try_mmq_gate_up(
         uint32_t n_tokens,
         float clamp) {
     /* 16 = raw IQ2_XXS block stream (aligned lazily via the cache below).
-     * 43 = IQ2_XXS_MMQ, already stored aligned IN THE GGUF -- no cache, no
+     * 44 = IQ2_XXS_MMQ_K, already stored k-major IN THE GGUF -- no cache, no
      *      repack, no budget, and every tensor gets the fast path instead of
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
-    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;   /* the only MMQ type */
+    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
     /* One-shot: ds4_mmq_init selects the device and populates the ggml
      * device-info singleton the MMQ launchers read. */
     static int mmq_ready = -1;
@@ -1086,7 +1086,7 @@ static int routed_moe_try_mmq_down(
         uint32_t n_total_expert,
         uint64_t pairs,
         const void *mid_q, const void *mid_sf, int mid_kbp) {
-    if (down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;   /* the only MMQ type */
+    if (down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
     if (pairs > (uint64_t)INT32_MAX) return 0;
     if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
     /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
@@ -1140,7 +1140,7 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    /* This function is now IQ2_XXS_MMQ (43) on BOTH sides, and nothing else.
+    /* This function is now IQ2_XXS_MMQ_K (44) on BOTH sides, and nothing else.
      *
      * The three dispatchers above it split the space first: 40/40 goes to
      * routed_moe_launch_cutlass, exactly-one-40 to routed_moe_launch_mixed40,
@@ -1154,7 +1154,7 @@ static int routed_moe_launch(
      * Anything else is refused rather than reinterpreted: a dispatch chain that
      * accepts an unknown tag does not fail, it reads the bytes as some other
      * format and returns plausible garbage. */
-    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ || down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ) return 0;
+    if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K || down_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K) return 0;
 #ifndef PULSAR_HAVE_MMQ
     return 0;   /* no MMQ build -> type 43 is unreadable */
 #endif

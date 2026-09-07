@@ -44,8 +44,19 @@ copies the file and rewrites only (a) the type field of the targeted tensors in
 the header and (b) those tensors' data regions in place.
 
 Usage:
-  repack_iq2_mmq.py IN.gguf OUT.gguf [--match SUBSTR] [--dry-run]
-                                     [--no-copy] [--chunk-blocks N]
+  repack_iq2_mmq.py IN.gguf OUT.gguf [--to mmq|mmq-k] [--match SUBSTR]
+                                     [--dry-run] [--no-copy] [--chunk-blocks N]
+  repack_iq2_mmq.py --selftest x x
+
+--to mmq   (default) raw IQ2_XXS (16) -> aligned SoA (43), described above.
+--to mmq-k aligned SoA (43) -> k-major (44): the SAME two planes at the same
+           offsets, with the block order inside each changed from
+           (expert, row, k) to (expert, k, code-word, row), row fastest.  That
+           puts the 16 rows one k step needs in 128 contiguous bytes, so the
+           D2R GEMM reads its weights straight into registers instead of
+           staging them through shared memory to make the read coalesce
+           (L201: 88 GB/s reading 43 directly, 182 staged, 218 reading 44
+           directly).  Same bytes, same size, bit-identical values.
 
 --match limits which tensor names are converted, comma-separated (default:
 every 3-D IQ2_XXS routed-expert tensor).  Converting a SUBSET is legitimate:
@@ -68,6 +79,7 @@ import numpy as np
 
 IQ2_XXS = 16
 IQ2_XXS_MMQ = 43
+IQ2_XXS_MMQ_K = 44
 QK_K = 256
 BLK_BYTES = 66
 Q_BYTES = 64
@@ -142,9 +154,9 @@ def scan(path):
     return tensors, alignment, data_start + pad
 
 
-def is_candidate(t, pats):
-    """3-D IQ2_XXS routed-expert stack, optionally name-filtered."""
-    if t["type"] != IQ2_XXS or len(t["dims"]) != 3:
+def is_candidate(t, pats, want_type=IQ2_XXS):
+    """3-D routed-expert stack of the SOURCE type, optionally name-filtered."""
+    if t["type"] != want_type or len(t["dims"]) != 3:
         return False
     if not any(t["name"].endswith(s) for s in EXPERT_SUFFIXES):
         return False
@@ -170,6 +182,79 @@ def check_geometry(t):
             "multiple of 32 -- refusing to grow the file"
             % (name, ali, raw, ali - raw, nblk))
     return nblk, raw
+
+
+def repack_tensor_kmajor(f, base, dims, nblk):
+    """Permute one type-43 tensor in place: block order (expert, row, k) becomes
+    (expert, k, code-word, row), row fastest.  Type 43 -> type 44.
+
+    WHY.  The D2R GEMM needs, at one k step, the SAME code word from 16
+    consecutive rows.  Under type 43 those 16 words are 1024 B apart, so the
+    kernel stages through shared memory purely to turn the strided read into a
+    coalesced one -- and that transpose is 37.7% of its stall samples (L201).
+    Under this order they are 128 contiguous bytes, so the lane that loads a
+    word is the lane that consumes it and the staging disappears.  Measured on
+    the access pattern alone: 88 GB/s reading type 43 directly, 182 staged,
+    218 reading this order directly.
+
+    NOT A RE-QUANTIZE, exactly as the raw -> 43 pass is not: the same bytes, the
+    same block count, the same tensor size, the same two planes at the same two
+    offsets.  Only the order within each plane changes, so every downstream
+    value is bit-identical.
+
+    Unlike raw -> 43 this permutation is NOT monotone, so it cannot stream in
+    place: one tensor (~415 MB at the shipped shapes) is read whole, permuted
+    and written back.
+    """
+    K, M, E = dims[0], dims[1], dims[2]
+    nb = K // QK_K
+    if E * M * nb != nblk:
+        raise SystemExit("dims %s give %d blocks, header says %d" % (dims, E * M * nb, nblk))
+    dq_bytes = align_up(nblk * D_BYTES, ALIGN)
+
+    f.seek(base)
+    d_raw = f.read(nblk * D_BYTES)
+    f.seek(base + dq_bytes)
+    q_raw = f.read(nblk * Q_BYTES)
+    if len(d_raw) != nblk * D_BYTES or len(q_raw) != nblk * Q_BYTES:
+        raise SystemExit("short read at base %d" % base)
+
+    # d plane: (E, M, nb) -> (E, nb, M)
+    d = np.frombuffer(d_raw, dtype=np.uint16).reshape(E, M, nb)
+    d = np.ascontiguousarray(d.transpose(0, 2, 1))
+    # q plane: (E, M, nb, 8 words, 8 B) -> (E, nb, 8 words, M, 8 B)
+    q = np.frombuffer(q_raw, dtype=np.uint8).reshape(E, M, nb, 8, 8)
+    q = np.ascontiguousarray(q.transpose(0, 2, 3, 1, 4))
+
+    f.seek(base)
+    f.write(d.tobytes())
+    if dq_bytes > nblk * D_BYTES:
+        f.write(b"\0" * (dq_bytes - nblk * D_BYTES))
+    f.seek(base + dq_bytes)
+    f.write(q.tobytes())
+
+
+def selftest_kmajor():
+    """The permutation IS the layout contract, so check it against the index
+    arithmetic the kernel will use rather than against itself."""
+    E, M, nb = 3, 5, 4
+    nblk = E * M * nb
+    d = np.arange(nblk, dtype=np.uint16)
+    q = np.arange(nblk * 8, dtype=np.uint32).astype(np.uint32).view(np.uint8).reshape(nblk, 8, 4)
+    q = np.repeat(q, 2, axis=2)[:, :, :8].copy()          # 8 B per word, distinct per (blk, word)
+    dn = np.ascontiguousarray(d.reshape(E, M, nb).transpose(0, 2, 1)).reshape(-1)
+    qn = np.ascontiguousarray(q.reshape(E, M, nb, 8, 8).transpose(0, 2, 3, 1, 4)).reshape(-1, 8)
+    for e in range(E):
+        for r in range(M):
+            for k in range(nb):
+                old_blk = (e * M + r) * nb + k
+                if dn[(e * nb + k) * M + r] != d[old_blk]:
+                    raise SystemExit("d plane index mismatch")
+                for w in range(8):
+                    if not (qn[((e * nb + k) * 8 + w) * M + r] == q[old_blk][w]).all():
+                        raise SystemExit("q plane index mismatch")
+    print("selftest: k-major index arithmetic matches the kernel's formula "
+          "(d[(e*nb+k)*M+r], q[((e*nb+k)*8+w)*M+r]) on E=%d M=%d nb=%d" % (E, M, nb))
 
 
 def repack_tensor(f, base, nblk, chunk_blocks):
@@ -220,17 +305,31 @@ def main():
                     help="dst already is a copy of src; rewrite it in place")
     ap.add_argument("--chunk-blocks", type=int, default=1 << 20,
                     help="blocks per streamed chunk (default 1Mi ~ 66 MB)")
+    ap.add_argument("--to", choices=("mmq", "mmq-k"), default="mmq",
+                    help="mmq: raw IQ2_XXS(16) -> aligned SoA(43).  "
+                         "mmq-k: aligned SoA(43) -> k-major(44), the layout the "
+                         "D2R GEMM reads without a shared-memory transpose (L201)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the k-major index arithmetic and exit")
     a = ap.parse_args()
+
+    if a.selftest:
+        selftest_kmajor()
+        return
+
+    src_type = IQ2_XXS if a.to == "mmq" else IQ2_XXS_MMQ
+    dst_type = IQ2_XXS_MMQ if a.to == "mmq" else IQ2_XXS_MMQ_K
 
     tensors, alignment, data_start = scan(a.src)
     pats = [x for x in a.match.split(",") if x]
-    targets = [t for t in tensors if is_candidate(t, pats)]
+    targets = [t for t in tensors if is_candidate(t, pats, src_type)]
 
-    n_iq2 = sum(1 for t in tensors if t["type"] == IQ2_XXS)
+    n_iq2 = sum(1 for t in tensors if t["type"] == src_type)
     print("tensors=%d alignment=%d data_start=%d" % (len(tensors), alignment, data_start))
-    print("IQ2_XXS(16) total=%d  selected targets=%d" % (n_iq2, len(targets)))
+    print("mode %s: type %d -> %d;  source-type total=%d  selected targets=%d"
+          % (a.to, src_type, dst_type, n_iq2, len(targets)))
     if not targets:
-        raise SystemExit("no IQ2_XXS routed-expert tensors matched -- nothing to do")
+        raise SystemExit("no type-%d routed-expert tensors matched -- nothing to do" % src_type)
 
     total_raw = 0
     by_shape = {}
@@ -260,9 +359,12 @@ def main():
     done = 0
     with open(a.dst, "r+b") as f:
         for t in targets:
-            repack_tensor(f, data_start + t["offset"], t["nblk"], a.chunk_blocks)
+            if a.to == "mmq":
+                repack_tensor(f, data_start + t["offset"], t["nblk"], a.chunk_blocks)
+            else:
+                repack_tensor_kmajor(f, data_start + t["offset"], t["dims"], t["nblk"])
             f.seek(t["type_pos"])
-            f.write(struct.pack("<I", IQ2_XXS_MMQ))
+            f.write(struct.pack("<I", dst_type))
             done += 1
             print("  repacked %d/%d %s" % (done, len(targets), t["name"]), flush=True)
         f.flush()
