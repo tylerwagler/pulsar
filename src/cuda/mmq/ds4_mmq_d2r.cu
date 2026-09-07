@@ -217,10 +217,20 @@ __device__ __forceinline__ void issue_act_prefetch_one(
     const int chunk = t >> D2RAct<NFRAG>::Shift;
     const int nf = col_local >> 3;
     const int c = col_local & 7;
-    const bool valid = FullTile ? true : (col_local < col_count);
+    /* L207: a column PAST col_count is zero for the whole block's life -- the
+     * kernel zeroes s_act once at entry -- so skip it entirely rather than
+     * re-storing zeros into it every stage.  At decode the narrow tile has one
+     * real assignment slot of eight, so this was 63 of every 72 shared stores
+     * on the activation path doing nothing.  (The FullTile arm has every column
+     * valid by construction and is unchanged.) */
+    if constexpr (!FullTile) {
+        if (col_local >= col_count) {
+            return;
+        }
+    }
     void *dst = (char *)&s_act[stage][nf][c] + chunk * 16;
     const void *src = act_iter_base + (uint64_t)col_local * sizeof(block_mx_act_mmq) + chunk * 16;
-    cp_async_16B(dst, src, valid);
+    cp_async_16B(dst, src, true);
 }
 
 template <bool FullTile, int Iter, int NFRAG>
@@ -888,6 +898,18 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
             amax[half] = amax[half] > idx ? amax[half] : idx;
         }
         s_gsel[i] = make_uint2(sel[0] | (amax[0] << 16), sel[1] | (amax[1] << 16));
+    }
+    /* L207: zero the activation ring once, so the per-stage issue can skip the
+     * columns this tile does not have instead of re-zeroing them (see
+     * issue_act_prefetch_one).  Slots for real columns are overwritten by their
+     * cp.async before any read. */
+    {
+        int *act_words = reinterpret_cast<int *>(&s_act[0][0][0]);
+        constexpr int act_n_words = (int)(sizeof(s_act) / sizeof(int));
+#pragma unroll 1
+        for (int i = d2r_tid(); i < act_n_words; i += kThreads) {
+            act_words[i] = 0;
+        }
     }
     if (d2r_tid() == 0) {
         const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
