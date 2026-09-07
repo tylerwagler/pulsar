@@ -163,12 +163,11 @@ clients.
 - Reasoning effort: send Anthropic requests at `low`, `high`, and `max` effort
   and confirm the reported `prompt_tokens` reflects the three distinct effort
   prefixes (and that `xhigh` maps to `max`).
-- web_search smoke (needs a reachable SearXNG endpoint): start with
-  `--web-search-url`, send a Claude-Code-style request advertising
-  `web_search_20250305`, and confirm the model's search call executes, results
-  splice into the answer, and a second turn replays the search block from
-  cache. Without the flag, confirm the tool entry is dropped and the model
-  never emits a dead search call.
+- Anthropic server tools: send a Claude-Code-style request advertising
+  `web_search_20250305` next to an ordinary tool and confirm the server-tool
+  entry is dropped at parse (tool log line), the ordinary tool is rendered,
+  and the model never emits a dead search call. The server executes no
+  Anthropic server tools; the router in front of it owns web search.
 
 ## 6. pulsar-agent
 

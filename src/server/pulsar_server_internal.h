@@ -265,9 +265,6 @@ typedef struct {
     /** Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
-    /** Anthropic web_search server tool: the SERVER executes calls to this
-     * name mid-request (web_search.cpp); they never stop the turn. */
-    bool server_web_search;
     char **prop;  ///< property names in DECLARED order, owned
     int len;      ///< properties present
     int cap;      ///< properties allocated
@@ -457,9 +454,6 @@ typedef struct {
     char *raw_body;            ///< the original request body, owned; kept for tracing and replay
     char *prompt_text;         ///< the rendered prompt as text, owned
     tool_schema_orders tool_orders;  ///< tool declaration order, preserved so re-renders stay byte-stable
-    /** >0 iff the request advertised the Anthropic web_search server tool (and
-     * the server has a backend configured): the remaining-use budget. */
-    int web_search_max_uses;
     int max_tokens;      ///< generation cap
     int top_k;           ///< top-k sampling cutoff
     float temperature;   ///< sampling temperature
@@ -744,18 +738,12 @@ typedef enum {
 typedef struct {
     anthropic_stream_mode mode;         ///< what is being emitted
     anthropic_block_type open_block;    ///< which content block is open
-    /** Borrowed from the request for the stream's lifetime: lets the tool-block
-     * opener type server-executed tools as server_tool_use on the wire. */
-    const tool_schema_orders *orders;
     int next_index;              ///< content-block index for the next block opened
     size_t emit_pos;             ///< bytes of generated text already emitted
     bool active;                 ///< the stream has started
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
-    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0).
-     * has_tools is copied from the request at start so the round reset can
-     * re-arm without a request pointer. */
+    /** See openai_stream: second-reasoning-pass hold (upstream ds4 fe2d3b0). */
     bool guard_second_reasoning;
-    bool has_tools;      ///< copied from the request at start, so a round reset can re-arm without it
     bool sent_thinking;  ///< a thinking delta has been emitted
     bool sent_text;      ///< a text delta has been emitted
     dsml_tool_stream tool;  ///< tool-call projection nested in this stream
@@ -1317,7 +1305,6 @@ struct server {
     int default_tokens;      ///< generation cap when the request does not set one
     kv_disk_cache kv;        ///< on-disk prompt-prefix KV cache
     tool_memory tool_mem;    ///< tool call/result bodies kept for replay matching
-    const char *web_search_url;  ///< see server_config.web_search_url
     pthread_mutex_t tool_mu;     ///< guards tool_mem, which client threads also read
     pthread_mutex_t mu;          ///< guards the queue, client count, and every published metric
     pthread_cond_t cv;           ///< wakes the worker when a job is enqueued or state changes
@@ -1632,15 +1619,6 @@ struct server {
      * than failing the request. Attempted at most once per request
      * (gen_state::dsml_recovery_attempted). */
     bool continue_after_invalid_dsml(session_slot *sl, const request *r, const thinking_state *thinking, const char *detail, int *tokens_appended, char *err, size_t errlen);
-    /** Execute one server-side web_search round: run the query against the
-     * configured SearXNG backend, surface the result to the client as
-     * server_tool_use/web_search_tool_result content, splice the result text into
-     * the live session as an ordinary tool_result turn, and re-enter decode within
-     * the same request.  Returns false when this call is not server-executed (or
-     * the splice failed) — the caller then finishes the turn as a normal
-     * client-visible tool_use.
-     */
-    bool gen_web_search_round(session_slot *sl, const tool_calls *calls, const char *pre_content, const char *pre_reasoning);
     /** Report a prefill failure to the client. Handles the case where SSE
      * headers already went out for the keepalive: the error must then be an
      * event in the open stream, not an HTTP status. */
@@ -2275,14 +2253,10 @@ struct gen_state {
     bool responses_live_chat;          ///< the /responses projection is in chat shape
     long responses_created_at;         ///< `created` timestamp, fixed at first emit so it is stable across quanta
     bool dsml_recovery_attempted;      ///< a malformed tool block already triggered one recovery; do not loop
-    /** Server-executed web_search state (request lifetime).  completion_total
-     * accumulates tokens across decode attempts so continued generations spend
-     * one shared max_tokens budget; web_rounds_json holds prebuilt Anthropic
-     * content blocks (thinking/text/server_tool_use/web_search_tool_result,
-     * each ','-terminated) for completed rounds of non-streaming requests. */
+    /** Request-lifetime token count: accumulates across decode attempts (the
+     * tool-error recovery continuation) so continued generations spend ONE
+     * shared max_tokens budget. */
     int completion_total;    ///< tokens generated across ALL attempts; the shared max_tokens budget
-    int web_search_uses;     ///< server-executed web searches performed this request
-    buf web_rounds_json;     ///< prebuilt Anthropic content blocks for completed search rounds
     uint64_t rng;            ///< sampler state; per-request so concurrency cannot perturb a seeded run
 
     /** decode attempt state (reset by GEN_DECODE_INIT) */
@@ -2385,11 +2359,6 @@ typedef struct {
     bool kv_disk_disable;          ///< turn the disk cache off entirely
     uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
     kv_cache_options kv_cache;     ///< checkpoint placement policy
-    /** Base URL of the SearXNG-compatible backend for the Anthropic web_search
-     * server tool (e.g. http://searxng.defense.lan:8888). NULL disables the
-     * feature: web_search tool entries are then dropped at parse so the model
-     * never emits un-executable calls. */
-    const char *web_search_url;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -2462,8 +2431,7 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
                                    size_t limit, bool final);
 bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
-                       bool web_search_enabled, int *web_search_max_uses);
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
 bool parse_messages(const char **p, chat_msgs *msgs);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs);
 bool parse_anthropic_system(const char **p, char **out);
@@ -2685,14 +2653,11 @@ bool final_response(int fd,
                            int prompt_tokens, int completion_tokens,
                            const logprob_ledger *lp);
 void append_anthropic_content(buf *b, const char *text, const char *reasoning,
-                                     const tool_calls *calls, const char *id_prefix,
-                                     const tool_schema_orders *orders,
-                                     const char *prior_blocks_json);
+                                     const tool_calls *calls, const char *id_prefix);
 bool anthropic_final_response(int fd,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens,
-                                     const char *prior_blocks_json);
+                                     int prompt_tokens, int completion_tokens);
 bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st);
 void anthropic_stream_free(anthropic_stream *st);
@@ -2724,25 +2689,6 @@ void visible_live_free(visible_live_state *st);
  * (worker thread; used to route a continuation to the session that owns it). */
 void apply_openai_stream_tool_ids(tool_calls *calls,
                                          const openai_stream *st);
-/* web_search.cpp — Anthropic web_search server tool (SearXNG backend). */
-#define WEB_SEARCH_DEFAULT_MAX_USES 8
-bool web_search_tool_entry(const char *raw_tool_json, int *max_uses);
-const char *web_search_schema_line(void);
-char *web_search_query_from_arguments(const char *arguments_json);
-bool web_search_run(const char *base_url, const char *query,
-                    buf *model_text, buf *client_content_json,
-                    char *logerr, size_t errlen);
-void web_search_run_exhausted(buf *model_text, buf *client_content_json);
-char *web_search_rebuild_result_text(const char *content_json);
-
-/* Streamed emission of one completed web_search round: closes any open block,
- * emits the web_search_tool_result block, and rewinds the text-relative stream
- * state so the continued decode attempt streams from a fresh g->text. */
-bool anthropic_sse_web_search_result_live(int fd, anthropic_stream *st,
-                                          const char *tool_use_id,
-                                          const char *content_json);
-void anthropic_sse_round_reset(anthropic_stream *st, bool thinking_enabled);
-
 void apply_anthropic_stream_tool_ids(tool_calls *calls,
                                             const anthropic_stream *st);
 kv_cache_options kv_cache_default_options(void);
@@ -2877,9 +2823,6 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 double decode_t0,
                                 double *last_t, int *last_completion);
 thinking_state thinking_state_from_prompt(const request *r);
-char *build_web_search_result_suffix(const request *r,
-                                     const thinking_state *thinking,
-                                     const char *result_text);
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail);

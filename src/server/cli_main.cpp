@@ -451,8 +451,6 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--web-search-url")) {
-            c.web_search_url = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -977,18 +975,6 @@ int main(int argc, char **argv) {
                    PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
     }
     s.default_tokens = cfg.default_tokens;
-    /* One startup read (env fallback for the flag), no hot-path getenv: the
-     * resolved URL is consulted per request, never per token.  Set => the
-     * Anthropic web_search server tool is executed here against this
-     * SearXNG-compatible endpoint; unset => web_search tool entries are
-     * dropped at parse. */
-    s.web_search_url = cfg.web_search_url;
-    if (s.web_search_url && !s.web_search_url[0]) s.web_search_url = NULL;
-    server_log(PULSAR_LOG_DEFAULT,
-               s.web_search_url
-                   ? "pulsar-server: web_search server tool ENABLED (backend %s)"
-                   : "pulsar-server: web_search server tool disabled (no --web-search-url)%s",
-               s.web_search_url ? s.web_search_url : "");
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,

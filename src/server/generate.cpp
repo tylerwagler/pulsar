@@ -238,19 +238,6 @@ static char *build_live_tool_result_suffix(const request *r,
     return buf_take(&suffix);
 }
 
-/* The template turn appended to the live session after the server executed a
- * web_search call: end the assistant call turn, present the results as an
- * ordinary tool_result, and reopen the assistant.  Byte-shape must match what
- * the replay path renders from the split web_search_tool_result message
- * (request.cpp parse_anthropic_content_block) or next-turn prefix reuse dies. */
-char *build_web_search_result_suffix(const request *r,
-                                     const thinking_state *thinking,
-                                     const char *result_text) {
-    return build_live_tool_result_suffix(r, thinking, result_text);
-}
-
-
-
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {

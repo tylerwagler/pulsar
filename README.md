@@ -99,9 +99,10 @@ attention is fp16 tensor-core on every path (one kernel since L166), the
 indexer scorer runs block-scaled MXFP4, and the fp16 decode walk lifts shallow-context decode
 — cold prefill now holds ~900-950 t/s from 2k through 32k (see Speed). On the
 serving side it adds the 0731 three-level reasoning-effort scheme, the
-Anthropic `web_search` server tool (backed by a SearXNG endpoint you point it
-at), request-latency/admission metrics, and an 8-bank warm-state pool (up from
-5; see Model residency).
+Anthropic `web_search` server tool (removed again on 2026-09-06: the router in
+front of the server owns web search now; server-tool entries are dropped at
+parse), request-latency/admission metrics, and an 8-bank warm-state pool (up
+from 5; see Model residency).
 Earlier lines: v0.3.x brought Tier-2 batched multi-session decode, KV
 overcommit with proactive eviction, and the pooled-routing and KV round-trip
 fixes that stabilized agentic serving; v0.3.1 was re-verified quality-neutral
@@ -743,26 +744,15 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-### Web search server tool
+### Anthropic server tools
 
-Anthropic-style clients (Claude Code among them) advertise web search as a
-**server** tool — the request carries a `{"type":"web_search_20250305"}` tool
-entry and expects the backend to run the search mid-request. Point the server
-at a SearXNG-compatible JSON endpoint and it will:
-
-```sh
-./pulsar-server --web-search-url http://searxng.local:8888
-```
-
-With a backend configured, `web_search_*` tool entries are recognized and
-rendered to the model as a real callable tool; when the model calls it, the
-server runs the query itself (bounded plain-HTTP GET, top-8 results, 8 s I/O
-timeout, 2 MiB body cap) and splices the results into the transcript before
-generation continues, honoring the tool entry's `max_uses` (default 8 per
-request). **Without** `--web-search-url` the entry is dropped at parse time, so
-the model never emits search calls nobody can execute. The search runs on the
-serving thread, so a slow search backend can stall other sessions for up to
-the I/O timeout — keep the endpoint local.
+Anthropic-style clients (Claude Code among them) may advertise **server**
+tools -- a `{"type":"web_search_20250305"}` entry that expects the backend to
+run the search mid-request. `pulsar-server` executes no server tools: such
+entries are dropped at parse time (one `tool`-level log line per request)
+so the model never emits a call nobody can run. Web search, when wanted, is
+the job of the router in front of the server, which injects results into the
+prompt.
 
 ### Agent Client Usage
 

@@ -52,7 +52,7 @@ static void test_tool_schema_order_from_openai_tools(void) {
     const char *p = json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
     TEST_ASSERT(schemas && strstr(schemas, "\"name\": \"edit\""));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "edit");
     TEST_ASSERT(order != NULL);
@@ -87,8 +87,8 @@ static void test_openai_tool_schema_json_spelling_is_canonical(void) {
     char *a = NULL, *b = NULL;
     tool_schema_orders oa = {0}, ob = {0};
     const char *pa = compact, *pb = spaced;
-    TEST_ASSERT(parse_tools_value(&pa, &a, &oa, false, NULL));
-    TEST_ASSERT(parse_tools_value(&pb, &b, &ob, false, NULL));
+    TEST_ASSERT(parse_tools_value(&pa, &a, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &b, &ob));
     TEST_ASSERT(a && b && !strcmp(a, b));
     TEST_ASSERT(strstr(a, "\"name\": \"bash\""));
     TEST_ASSERT(strstr(a, "rocket \xf0\x9f\x9a\x80"));   /* decoded UTF-8, not \u */
@@ -118,8 +118,8 @@ static void test_anthropic_tool_schema_json_spelling_is_canonical(void) {
     char *a = NULL, *b = NULL;
     tool_schema_orders oa = {0}, ob = {0};
     const char *pa = compact, *pb = spaced;
-    TEST_ASSERT(parse_tools_value(&pa, &a, &oa, false, NULL));
-    TEST_ASSERT(parse_tools_value(&pb, &b, &ob, false, NULL));
+    TEST_ASSERT(parse_tools_value(&pa, &a, &oa));
+    TEST_ASSERT(parse_tools_value(&pb, &b, &ob));
     TEST_ASSERT(a && b && !strcmp(a, b));
     TEST_ASSERT(strstr(a, "\"name\": \"Bash\""));
     TEST_ASSERT(!strstr(a, "\\u2014"));                  /* em-dash decoded */
@@ -140,7 +140,7 @@ static void test_tool_schema_order_from_responses_tool_search(void) {
     const char *p = json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
     TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"tool_search\""));
     TEST_ASSERT(schemas && strstr(schemas, "\"description\":\"Search deferred tools\""));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
@@ -164,7 +164,7 @@ static void test_responses_function_named_tool_search_stays_function_call(void) 
     const char *p = json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "tool_search");
     TEST_ASSERT(order != NULL);
     TEST_ASSERT(order && !order->responses_tool_search);
@@ -208,7 +208,7 @@ static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
     const char *p = json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
     TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"mcp__perplexity__perplexity_search\""));
     TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"perplexity_search\"") == NULL);
 
@@ -308,7 +308,7 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     const char *tools_p = tools_json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
 
     const char *input_json =
         "[{\"type\":\"function_call\",\"call_id\":\"call_ns\","
@@ -350,7 +350,7 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     const char *tools_p = tools_json;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders, false, NULL));
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
     responses_tool_item item = {
         .fc_id = "fc_search",
         .call_id = "call_search",
@@ -699,7 +699,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2, NULL));
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -1659,140 +1659,34 @@ static void test_decode_sampling_tool_payload_forcing(void) {
 
 
 
-static void test_web_search_tool_recognition(void) {
-    int uses = 0;
-    TEST_ASSERT(web_search_tool_entry(
-        "{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3}",
-        &uses));
-    TEST_ASSERT(uses == 3);
-    uses = 0;
-    TEST_ASSERT(web_search_tool_entry("{\"type\":\"web_search_20250305\"}", &uses));
-    TEST_ASSERT(uses == WEB_SEARCH_DEFAULT_MAX_USES);
-    TEST_ASSERT(!web_search_tool_entry(
-        "{\"name\":\"web_search\",\"input_schema\":{\"type\":\"object\"}}", &uses));
-    TEST_ASSERT(!web_search_tool_entry(
-        "{\"type\":\"custom\",\"name\":\"web_search\"}", &uses));
-
-    /* enabled: synthesized internal schema, order flagged server-executed */
-    const char *tools = "[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":5},"
+/* An Anthropic SERVER tool entry ({"type":"web_search_20250305",...}) is not
+ * executed here -- the router upstream owns web search -- so parse drops it
+ * and only the ordinary tool reaches the schemas and the order table. */
+static void test_anthropic_server_tool_entry_dropped(void) {
+    const char *tools = "[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3},"
                         "{\"name\":\"get_weather\",\"input_schema\":{\"type\":\"object\","
                         "\"properties\":{\"city\":{\"type\":\"string\"}}}}]";
     const char *tp = tools;
     char *schemas = NULL;
     tool_schema_orders orders = {0};
-    int max_uses = 0;
-    TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders, true, &max_uses));
-    TEST_ASSERT(max_uses == 5);
-    TEST_ASSERT(strstr(schemas, "\"name\":\"web_search\"") != NULL);
-    TEST_ASSERT(strstr(schemas, "\"query\"") != NULL);
-    const tool_schema_order *ord = tool_schema_orders_find(&orders, "web_search");
-    TEST_ASSERT(ord && ord->server_web_search);
-    ord = tool_schema_orders_find(&orders, "get_weather");
-    TEST_ASSERT(ord && !ord->server_web_search);
+    TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
+    TEST_ASSERT(schemas && strstr(schemas, "web_search") == NULL);
+    TEST_ASSERT(strstr(schemas, "\"name\": \"get_weather\"") != NULL); /* canonical spaced form */
+    TEST_ASSERT(orders.len == 1);
+    TEST_ASSERT(tool_schema_orders_find(&orders, "get_weather") != NULL);
+    TEST_ASSERT(tool_schema_orders_find(&orders, "web_search") == NULL);
+    /* a client-defined function that merely NAMES itself web_search is an
+     * ordinary tool: only the server-tool "type" spelling is dropped */
+    const char *plain = "[{\"name\":\"web_search\",\"input_schema\":{\"type\":\"object\"}}]";
+    const char *pp = plain;
+    char *schemas2 = NULL;
+    tool_schema_orders orders2 = {0};
+    TEST_ASSERT(parse_tools_value(&pp, &schemas2, &orders2));
+    TEST_ASSERT(tool_schema_orders_find(&orders2, "web_search") != NULL);
+    free(schemas2);
+    tool_schema_orders_free(&orders2);
     free(schemas);
     tool_schema_orders_free(&orders);
-
-    /* disabled: the entry is dropped entirely */
-    tp = tools;
-    schemas = NULL;
-    tool_schema_orders orders2 = {0};
-    max_uses = 0;
-    TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders2, false, &max_uses));
-    TEST_ASSERT(max_uses == 0);
-    TEST_ASSERT(strstr(schemas, "web_search") == NULL);
-    TEST_ASSERT(tool_schema_orders_find(&orders2, "get_weather") != NULL);
-    free(schemas);
-    tool_schema_orders_free(&orders2);
-
-    /* query extraction: schema key, plus lenient fallback */
-    char *q = web_search_query_from_arguments("{\"query\":\"pulsar engine\"}");
-    TEST_ASSERT(q && !strcmp(q, "pulsar engine"));
-    free(q);
-    q = web_search_query_from_arguments("{\"search_query\":\"fallback\"}");
-    TEST_ASSERT(q && !strcmp(q, "fallback"));
-    free(q);
-}
-
-
-
-static void test_web_search_result_replay_rebuild(void) {
-    /* The chunk text rides in encrypted_content; replay joins the echoed
-     * chunks with a blank line — byte-identical to the live tool_result. */
-    const char *content =
-        "[{\"type\":\"web_search_result\",\"url\":\"https://a\",\"title\":\"A\","
-        "\"encrypted_content\":\"Result:\\nTitle: A\\nURL: https://a\\nSnippet: alpha\","
-        "\"page_age\":null},"
-        "{\"type\":\"web_search_result\",\"url\":\"https://b\",\"title\":\"B\","
-        "\"encrypted_content\":\"Result:\\nTitle: B\\nURL: https://b\\nSnippet: beta\","
-        "\"page_age\":null}]";
-    char *text = web_search_rebuild_result_text(content);
-    TEST_ASSERT(text != NULL);
-    TEST_ASSERT(!strcmp(text,
-        "Result:\nTitle: A\nURL: https://a\nSnippet: alpha\n\n"
-        "Result:\nTitle: B\nURL: https://b\nSnippet: beta"));
-    free(text);
-
-    text = web_search_rebuild_result_text("[]");
-    TEST_ASSERT(text && !strcmp(text, "No search results found."));
-    free(text);
-
-    text = web_search_rebuild_result_text(
-        "{\"type\":\"web_search_tool_result_error\",\"error_code\":\"max_uses_exceeded\"}");
-    TEST_ASSERT(text && !strcmp(text,
-        "Web search failed: max_uses_exceeded. Answer from available information."));
-    free(text);
-}
-
-
-
-static void test_web_search_replay_message_split(void) {
-    /* One echoed assistant message holding a completed search round maps back
-     * to three template turns: call, tool_result, continuation. */
-    const char *messages =
-        "[{\"role\":\"user\",\"content\":\"look it up\"},"
-        "{\"role\":\"assistant\",\"content\":["
-        "{\"type\":\"thinking\",\"thinking\":\"I should search.\",\"signature\":\"sig\"},"
-        "{\"type\":\"server_tool_use\",\"id\":\"toolu_ws1\",\"name\":\"web_search\","
-        "\"input\":{\"query\":\"pulsar\"}},"
-        "{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"toolu_ws1\",\"content\":"
-        "[{\"type\":\"web_search_result\",\"url\":\"https://a\",\"title\":\"A\","
-        "\"encrypted_content\":\"Result:\\nTitle: A\\nURL: https://a\\nSnippet: alpha\"}]},"
-        "{\"type\":\"text\",\"text\":\"Found it.\"}]}]";
-    const char *p = messages;
-    chat_msgs msgs = {0};
-    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
-    TEST_ASSERT(msgs.len == 4);
-    TEST_ASSERT(!strcmp(msgs.v[1].role, "assistant"));
-    TEST_ASSERT(msgs.v[1].calls.len == 1);
-    TEST_ASSERT(!strcmp(msgs.v[1].calls.v[0].name, "web_search"));
-    TEST_ASSERT(!strcmp(msgs.v[1].calls.v[0].id, "toolu_ws1"));
-    TEST_ASSERT(msgs.v[1].reasoning && !strcmp(msgs.v[1].reasoning, "I should search."));
-    TEST_ASSERT(!strcmp(msgs.v[2].role, "user"));
-    TEST_ASSERT(msgs.v[2].tool_call_id && !strcmp(msgs.v[2].tool_call_id, "toolu_ws1"));
-    TEST_ASSERT(strstr(msgs.v[2].content,
-        "<tool_result>Result:\nTitle: A\nURL: https://a\nSnippet: alpha</tool_result>") != NULL);
-    TEST_ASSERT(!strcmp(msgs.v[3].role, "assistant"));
-    TEST_ASSERT(msgs.v[3].content && !strcmp(msgs.v[3].content, "Found it."));
-
-    /* The rendered replay must reproduce the live continuation shape that
-     * build_web_search_result_suffix appended (EOS + user tool_result + fresh
-     * assistant think turn). */
-    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, PULSAR_THINK_LOW);
-    TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt,
-        "<｜end▁of▁sentence｜><｜User｜><tool_result>Result:\nTitle: A\nURL: https://a"
-        "\nSnippet: alpha</tool_result><｜Assistant｜><think>") != NULL);
-    request req;
-    request_init(&req, REQ_CHAT, 128);
-    req.think_mode = PULSAR_THINK_LOW;
-    thinking_state th = {0};
-    char *suffix = build_web_search_result_suffix(&req, &th,
-        "Result:\nTitle: A\nURL: https://a\nSnippet: alpha");
-    TEST_ASSERT(strstr(prompt, suffix) != NULL);
-    free(suffix);
-    request_free(&req);
-    free(prompt);
-    chat_msgs_free(&msgs);
 }
 
 
@@ -2166,7 +2060,7 @@ static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     r.tool_orders = make_bash_order();
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
-    append_anthropic_content(&b, "done", "thinking text", &calls, "msg_1", &r.tool_orders, NULL);
+    append_anthropic_content(&b, "done", "thinking text", &calls, "msg_1");
     const char *thinking = strstr(b.ptr, "\"type\":\"thinking\"");
     const char *text = strstr(b.ptr, "\"type\":\"text\"");
     const char *tool = strstr(b.ptr, "\"type\":\"tool_use\"");
@@ -3672,7 +3566,7 @@ static void test_json_parser_handles_tool_heavy_requests(void) {
         const char *tp = tools.ptr;
         char *schemas = NULL;
         tool_schema_orders orders = {0};
-        TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders, false, NULL));
+        TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
         json_ws(&tp);
         TEST_ASSERT(*tp == '\0');
         /* The heavy schema goes through the canonical re-render (Python-style
@@ -6420,7 +6314,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         chat_msgs_free(&tl);
     }
 
-    /* 7. a server-executed tool's result suffix == the live tail of one tool message */
+    /* 7. a server-side tool result suffix == the live tail of one tool message */
     {
         request r;
         request_init(&r, REQ_CHAT, 128);
@@ -6429,7 +6323,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         thinking_state th;
         memset(&th, 0, sizeof th);
         th.inside = true;
-        char *ws = build_web_search_result_suffix(&r, &th, "results </tool_result> x");
+        char *ws = build_live_tool_result_suffix(&r, &th, "results </tool_result> x");
         chat_msgs one = {0};
         chat_msgs_push(&one, l185_msg("tool", "results </tool_result> x", NULL));
         char *tail = render_live_tool_tail(&one, 0, true, PULSAR_THINK_HIGH);
@@ -6893,9 +6787,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_think_sampling_respects_explicit_params();
     test_decode_sampling_tool_payload_forcing();
-    test_web_search_tool_recognition();
-    test_web_search_result_replay_rebuild();
-    test_web_search_replay_message_split();
+    test_anthropic_server_tool_entry_dropped();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();

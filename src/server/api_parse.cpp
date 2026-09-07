@@ -87,7 +87,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders, false, NULL)) {
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
                 free(key);
                 goto bad;
             }
@@ -307,9 +307,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders,
-                                   s && s->web_search_url,
-                                   &r->web_search_max_uses)) {
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
                 free(key);
                 goto bad;
             }
@@ -997,7 +995,7 @@ item_fail:
             {
                 const char *tools_p = tools_json;
                 char *schemas = NULL;
-                if (!parse_tools_value(&tools_p, &schemas, orders, false, NULL)) {
+                if (!parse_tools_value(&tools_p, &schemas, orders)) {
                     free(schemas);
                     free(type);
                     free(role);
@@ -1235,7 +1233,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders, false, NULL)) {
+            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
                 free(key);
                 goto bad;
             }
