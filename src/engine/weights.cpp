@@ -979,13 +979,20 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
         any = true;
     }
     if (any) {
-        /* Keep this list in step with weights_tensor_type_supported() above --
-         * it is the only thing the user sees when an old artifact is refused,
-         * and a list naming types the engine no longer reads sends them looking
-         * for a bug in their file instead of re-quantising it. */
-        fprintf(stderr,
-                "pulsar: supported weight tensor types: f32, i32, bf16, "
-                "fp8_e4m3 (MXFP8), mxfp8_lt, cutlass_mxfp4 (40), iq2_xxs_mmq (43)\n");
+        /* DERIVED from weights_tensor_type_supported(), not a second list kept
+         * in step by hand.  This is the only thing a user sees when an artifact
+         * is refused, and a list naming types the engine no longer reads sends
+         * them looking for a bug in their file instead of repacking it -- which
+         * is exactly what it did after the reader for iq2_xxs_mmq (43) was
+         * removed and the prose still advertised it (L207). */
+        fprintf(stderr, "pulsar: supported weight tensor types:");
+        for (uint32_t t = 0; t < 256u; ++t) {
+            const char *tname = tensor_type_name(t);
+            if (tname != NULL && weights_tensor_type_supported(t)) {
+                fprintf(stderr, " %s (%u)", tname, t);
+            }
+        }
+        fprintf(stderr, "\n");
         exit(1);
     }
 }
