@@ -115,6 +115,8 @@
  * folds it with weight zero and never reads the accumulator. */
 #define AF16_PART_ACC     4u
 #define AF16_PART_STRIDE  (AF16_PART_ACC + AF16_DIM)
+static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
+              "partial accumulators must stay 16-byte aligned: the epilogue stores float2 pairs");
 /* The split count is FIXED, and the partition (ceil(n_tiles / AF16_SPLITS)
  * tiles per split, of the row's OWN tile count) is a function of the row's
  * context alone -- never of how many rows share the launch.  A count derived
@@ -757,13 +759,16 @@ static void attn_f16_kernel(
             const uint32_t hb0 = m * AF16_HEADS;
             float *pa = af16_part_acc(partials, t, n_head, hbase + hb0 + g, n_split, split);
             float *pb = af16_part_acc(partials, t, n_head, hbase + hb0 + g + 8u, n_split, split);
+            /* The lane's two dims are adjacent (nb + 2tg, +1) and the record
+             * is 16-byte aligned (AF16_PART_ACC floats in, stride a multiple
+             * of 4), so each pair goes out as one 8-byte store: ncu read the
+             * scattered 4-byte version as lg_throttle 23% of the block's
+             * stalls (rows/L210.md). */
             #pragma unroll
             for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
                 const uint32_t nb = warp * AF16_DPW + n * 8u;
-                pa[nb + tg * 2u]      = acc[m][n][0];
-                pa[nb + tg * 2u + 1u] = acc[m][n][1];
-                pb[nb + tg * 2u]      = acc[m][n][2];
-                pb[nb + tg * 2u + 1u] = acc[m][n][3];
+                *(float2 *)&pa[nb + tg * 2u] = make_float2(acc[m][n][0], acc[m][n][1]);
+                *(float2 *)&pb[nb + tg * 2u] = make_float2(acc[m][n][2], acc[m][n][3]);
             }
         }
         return;
