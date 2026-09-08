@@ -834,7 +834,10 @@ bool gpu_graph_encode_layer_attention_batch(
          * bit-exact (shared rope core, replicated reduction -- attn_f16.cu),
          * and the attention launch is the same fp16 kernel either way (L166:
          * there is no other attention kernel; a device without the tier is
-         * refused by the attention launch, not routed elsewhere). */
+         * refused by the attention launch, not routed elsewhere).  Decode rows
+         * took the standalone arm for one L210 round, when the fused prologue
+         * cost a split-K block ~40 us; the prologue is a warp-level exact copy
+         * of the standalone reduction now and the extra launch is gone. */
         const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0);
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
@@ -2202,13 +2205,41 @@ bool gpu_graph_encode_layer_attention_batch(
     /* Second half of the grouped encoding: this rewrites head dims
      * [n_nope, head_dim) in place, so it owns exactly the MX blocks the
      * attention epilogue deliberately skipped.  Only reached with slots when
-     * that epilogue actually ran (gact_emitted). */
-    if (ok) ok = pulsar_gpu_rope_tail_mx_tensor(g->batch_heads,
-                                            n_tokens,
+     * that epilogue actually ran (gact_emitted).
+     *
+     * L210: DECODE rows with the fused Q prep already carry this rotation --
+     * the split-K combine applies it as it stores the heads (the same two
+     * roundings in the same order; the decode blob did not move) -- so this
+     * launch covers the rows past them: a mixed step's prefill rows, or
+     * nothing.  Those rows never come with grouped slots (the epilogue that
+     * emits them is the dense prefill arm's, which a step with decode rows
+     * does not take); a slot here with decode rows present is a contradiction,
+     * refused rather than half-emitted. */
+    const int rope_dec_rows = pulsar_gpu_matmul_batch_decode_rows();
+    const uint32_t rope_row0 = (g->q_prep_active && rope_dec_rows > 0)
+                             ? ((uint32_t)rope_dec_rows < n_tokens ? (uint32_t)rope_dec_rows : n_tokens) : 0u;
+    if (ok && rope_row0 != 0u && gact_data) {
+        fprintf(stderr, "pulsar: layer %u: grouped heads slots with %u decode rows -- the split-K combine "
+                        "roped those rows without emitting; refusing\n", il, rope_row0);
+        ok = false;
+    }
+    if (ok && rope_row0 < n_tokens) {
+        const uint32_t rope_rows = n_tokens - rope_row0;
+        pulsar_gpu_tensor *heads_rows = rope_row0 ? pulsar_gpu_tensor_view(g->batch_heads,
+                                                        (uint64_t)rope_row0 * q_dim * PULSAR_HEADS_ELT_SIZE,
+                                                        (uint64_t)rope_rows * q_dim * PULSAR_HEADS_ELT_SIZE)
+                                                  : g->batch_heads;
+        pulsar_gpu_tensor *pos_rows = (mseq && rope_row0) ? pulsar_gpu_tensor_view(g->batch_positions,
+                                                        (uint64_t)rope_row0 * sizeof(int32_t),
+                                                        (uint64_t)rope_rows * sizeof(int32_t))
+                                                  : (mseq ? g->batch_positions : NULL);
+        ok = heads_rows && (!mseq || pos_rows) &&
+             pulsar_gpu_rope_tail_mx_tensor(heads_rows,
+                                            rope_rows,
                                             PULSAR_N_HEAD,
                                             PULSAR_N_HEAD_DIM,
                                             PULSAR_N_ROT,
-                                            pos0,
+                                            pos0 + rope_row0,
                                             compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
                                             true,
                                             freq_base,
@@ -2217,9 +2248,14 @@ bool gpu_graph_encode_layer_attention_batch(
                                             attn_factor,
                                             PULSAR_ROPE_YARN_BETA_FAST,
                                             PULSAR_ROPE_YARN_BETA_SLOW,
-                                            mseq ? g->batch_positions : NULL,
+                                            pos_rows,
                                             gact_data, gact_scale, gact_kbp,
                                             (uint32_t)gact_slab, n_groups) != 0;
+        if (rope_row0) {
+            if (heads_rows) pulsar_gpu_tensor_free(heads_rows);
+            if (pos_rows) pulsar_gpu_tensor_free(pos_rows);
+        }
+    }
     /* BOTH producers have now run: the encoding is complete and the "a" GEMM
      * may consume it instead of running its own quantise pass. */
     if (ok && gact_data) pulsar_gpu_mxfp8_gact_note();
