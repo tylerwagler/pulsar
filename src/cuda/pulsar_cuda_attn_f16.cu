@@ -126,14 +126,15 @@ static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
  * split's partial depends on its own tiles alone, so WHICH block folds it,
  * and whether that block folds others before or after, cannot change a byte.
  * The launcher therefore picks the PHYSICAL block count per (row, head-group)
- * -- gridDim.z = n_phys in [1, AF16_SPLITS] -- to put about two blocks on
- * every SM, and a block folds logical splits z, z + n_phys, ... in turn,
- * resetting its softmax state between them.  One row: 16 blocks per
- * head-group, one or two tiles each.  Twelve rows: 4, each folding four
- * splits -- the per-block fixed cost (launch, ring preamble, Q fragments,
- * first-stage latency) that made the 1:1 version a wash at served widths
- * (rows/L210.md) is paid 4x per row instead of 16x.  Splits past a row's tile
- * count fold as empty. */
+ * -- gridDim.z = n_phys in [1, AF16_SPLITS] -- to put one block on every SM
+ * (one is all that fits: see af16_split_target_blocks), and a block folds
+ * logical splits z, z + n_phys, ... in turn, resetting its softmax state
+ * between them.  One row: 16 blocks per head-group, one or two tiles each.
+ * Six rows: 4, each folding four splits -- the per-block fixed cost (launch,
+ * ring preamble, Q fragments, first-stage latency, the 64 KB partial) that
+ * made the 1:1 version a wash at served widths (rows/L210.md) is paid 4x per
+ * row instead of 16x, in one wave.  Splits past a row's tile count fold as
+ * empty. */
 #define AF16_SPLITS       16u
 __device__ __forceinline__ static float *af16_part_acc(float *partials, uint32_t t, uint32_t n_head,
                                                        uint32_t h, uint32_t n_split, uint32_t split) {
@@ -1012,8 +1013,12 @@ static int af16_dynsmem_ok(void) {
     return state > 0;
 }
 
-/* Two blocks per SM: enough to cover the machine at one row without making a
- * wide step's blocks mostly fixed cost.  Asked of the device once. */
+/* ONE block per SM -- which is all this kernel can have resident: 512 threads
+ * at 117 registers under __launch_bounds__(AF16_THREADS, AF16_MINBLK = 1).
+ * A target of two per SM (the first cut) did not overlap anything; it ran two
+ * WAVES, each paying the block's ~18 us fixed cost, and the served-lane census
+ * read the split kernel at 75 us against the classic walk's 85 at 6..12 rows
+ * (rows/L210.md).  Asked of the device once. */
 static uint32_t af16_split_target_blocks(void) {
     static int sms = 0;
     if (sms <= 0) {
@@ -1024,7 +1029,7 @@ static uint32_t af16_split_target_blocks(void) {
         else
             sms = 48;   /* the GB10; only reached if the attribute query fails */
     }
-    return 2u * (uint32_t)sms;
+    return (uint32_t)sms;
 }
 
 /* L210: the split-K partials.  A value that must survive the combine launch
