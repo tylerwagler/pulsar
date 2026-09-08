@@ -45,6 +45,12 @@
  *   /tmp/attnbk
  */
 #include "../src/cuda/pulsar_cuda_attn_f16.cu"
+/* The launcher reads the engine's row-kind global (pulsar_gpu_matmul_batch_decode_rows,
+ * defined in pulsar_cuda_matmul.cu, not linked here): the leading rows under that count
+ * take the L210 split-K path, the rest the classic walk.  This test owns the value and
+ * drives every indexed case through BOTH paths against the same oracle. */
+static int g_decode_rows = 0;
+int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -174,11 +180,19 @@ int main(int argc, char **argv) {
      * Only the first was covered until 2026-08-15; the second is the mode a
      * banked continued-prefill batch actually takes.  Every comp row in bank b
      * holds v_b, so both modes must return v_b for a correctly isolated read. */
+    /* L210: each selection mode also runs on both walks -- classic (no decode
+     * rows) and split-K (every row a decode row) -- so bank isolation and the
+     * evicted row's zero heads (an empty partial from every split) are checked
+     * on the path the decode batch takes. */
     int overall = 1;
-    for (int mode = 0; mode < 2; mode++) {
-        const int32_t *use_tk = mode ? NULL : dtk;
-        const uint32_t use_topk = mode ? 0u : top_k;
-        const char *label = mode ? "visible-prefix sweep (topk=NULL)" : "top-k selection";
+    for (int mode = 0; mode < 4; mode++) {
+        const int sel = mode & 1, split = mode >> 1;
+        g_decode_rows = split ? (int)n_tokens : 0;
+        const int32_t *use_tk = sel ? NULL : dtk;
+        const uint32_t use_topk = sel ? 0u : top_k;
+        char label[96];
+        snprintf(label, sizeof label, "%s, %s", sel ? "visible-prefix sweep (topk=NULL)" : "top-k selection",
+                 split ? "split-K walk" : "classic walk");
         printf("---- %s ----\n", label);
         cudaMemset(dout, 0, out.size() * sizeof(pulsar_heads_t));
         std::fill(out.begin(), out.end(), kSent);

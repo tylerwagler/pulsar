@@ -32,6 +32,12 @@
  * oracle would take longer than the measurement is worth.
  */
 #include "../src/cuda/pulsar_cuda_attn_f16.cu"
+/* The launcher reads the engine's row-kind global (pulsar_gpu_matmul_batch_decode_rows,
+ * defined in pulsar_cuda_matmul.cu, not linked here): the leading rows under that count
+ * take the L210 split-K path, the rest the classic walk.  This test owns the value and
+ * drives every indexed case through BOTH paths against the same oracle. */
+static int g_decode_rows = 0;
+int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -45,6 +51,7 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cstring>
 #include <vector>
 #include <random>
+#include <algorithm>
 
 /* host mirror of the fp16 round trip the kernel applies to its operands */
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
@@ -248,6 +255,18 @@ int main(int argc, char **argv) {
         cudaMalloc(&dtk, tk.size() * 4);
         cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
     }
+    /* L210: an indexed case runs twice -- the classic whole-window walk (no
+     * decode rows) and the split-K path (every row a decode row: 4 logical
+     * splits, partials, combine) -- against the same oracle and bar.  The two
+     * reach the bf16 rounding boundary from different f32 fold orders, so they
+     * are not byte-identical to each other; both must be within the bar. */
+    int overall = 1;
+    for (int split_mode = 0; split_mode < (indexed ? 2 : 1); split_mode++) {
+    g_decode_rows = split_mode ? (int)n_tokens : 0;
+    const char *mode_label = split_mode ? "split-K (decode rows)" : "classic walk";
+    std::fill(out.begin(), out.end(), -12345.f);
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+    cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
     const int rc = indexed
         ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
                                            (const pulsar_attn_pack_t *)dckv, use_topk ? dtk : NULL,
@@ -266,7 +285,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < out.size(); i++) out[i] = (float)out_h[i];
 
     /* ---- timing, at the shape nsys measured the shipping kernel at --------- */
-    {
+    if (split_mode == 0) {
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
         const int iters = 20;
         for (int i = 0; i < 3; i++)
@@ -323,11 +342,14 @@ int main(int argc, char **argv) {
     const double bar = sizeof(pulsar_heads_t) == 2 ? 5e-3 : 1e-3;
     const int pass = (nan == 0 && untouched == 0 && worst_l2 < bar &&
                       (sum_ref > 0 && sum_abs / sum_ref < bar));
-    printf("\nATTN F16 KERNEL TEST: %s\n", pass ? "PASS" : "FAIL");
+    printf("  %s: %s\n", mode_label, pass ? "PASS" : "FAIL");
     if (!pass) {
         printf("  first few (ref vs got):\n");
         for (size_t i = 0; i < 8 && i < out.size(); i++)
             printf("    [%zu] %12.6f  %12.6f\n", i, ref[i], (double)out[i]);
+        overall = 0;
     }
-    return pass ? 0 : 1;
+    }   /* split_mode */
+    printf("\nATTN F16 KERNEL TEST: %s\n", overall ? "PASS" : "FAIL");
+    return overall ? 0 : 1;
 }
