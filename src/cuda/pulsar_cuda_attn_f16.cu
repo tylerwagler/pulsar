@@ -129,13 +129,18 @@ static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
  * -- gridDim.z = n_phys in [1, AF16_SPLITS] -- to put one block on every SM
  * (one is all that fits: see af16_split_target_blocks), and a block folds
  * logical splits z, z + n_phys, ... in turn, resetting its softmax state
- * between them.  One row: 16 blocks per head-group, one or two tiles each.
- * Six rows: 4, each folding four splits -- the per-block fixed cost (launch,
- * ring preamble, Q fragments, first-stage latency, the 64 KB partial) that
- * made the 1:1 version a wash at served widths (rows/L210.md) is paid 4x per
- * row instead of 16x, in one wave.  Splits past a row's tile count fold as
- * empty. */
-#define AF16_SPLITS       16u
+ * between them.
+ *
+ * WHY 4.  Every logical split costs a pipeline restart (its first tile's
+ * stage is not overlapped with anything) and a 64 KB partial, ~10 us,
+ * whatever block folds it -- the served-lane census read the 16-split kernel
+ * at 75 us against the classic walk's 85 at 6..12 rows with one wave AND with
+ * two (rows/L210.md): a six-row step is 192 logical splits either way.  The
+ * count trades the one-row case for the served widths: 16 splits are 25 us
+ * at one row (host-bound there, so unseen) and 75 at width; 4 splits model at
+ * ~38 at one row and ~35..70 at 6..12 rows, all under the classic 85.  Splits
+ * past a row's tile count fold as empty. */
+#define AF16_SPLITS       4u
 __device__ __forceinline__ static float *af16_part_acc(float *partials, uint32_t t, uint32_t n_head,
                                                        uint32_t h, uint32_t n_split, uint32_t split) {
     return partials + ((uint64_t)t * n_head + h) * n_split * AF16_PART_STRIDE +
