@@ -469,6 +469,43 @@ static bool gpu_graph_indexed_attention_span(
 }
 
 
+/* L209: the contract under which a banked round's compressor step runs the
+ * on-device path (pulsar_gpu_compressor_step_dev_tensor) instead of the classic
+ * per-token host loop. ONE authority for both the attention and indexer twins.
+ * The first decline announces its reason once, so a round that silently fell
+ * back to host-baked launches is visible in the log (Rule 5), and a mismatch
+ * between this predicate and the whole-sweep capture's eligibility (imatrix.cpp)
+ * cannot hide. */
+static bool l209_dev_step_eligible(const pulsar_gpu_graph *g, uint32_t il, uint32_t ratio,
+                                   uint32_t n_tokens, bool mseq, bool indexer) {
+    const char *why = NULL;
+    if (!mseq) why = "not a banked step";
+    else if (g->state_only) why = "state-only warm-up";
+    else if (gpu_graph_f32_store_observed_any()) why = "observer dumps armed";
+    else if (indexer ? g->banks.index_count == NULL : g->banks.comp_count == NULL) why = "no device counters (bank pool off)";
+    else if (!indexer && g->attn_comp_stage_cap < n_tokens) why = "staging rows < tokens";
+    for (uint32_t t = 0; !why && t < n_tokens; t++) {
+        const uint32_t b = (uint32_t)g->ms_seq_id[t];
+        const uint32_t p = (uint32_t)g->ms_positions[t];
+        const uint32_t have = indexer ? g->ms_n_index_comp[b][il] : g->ms_n_comp[b][il];
+        if (b >= g->banks.n_banks) why = "row's bank outside the pool";
+        else if (g->ms_emit_keep[b] != 0u) why = "emit-keep window live";
+        else if (((p + 1u) % ratio) == 0u && have >= g->layer_comp_cap[il]) why = "emit past the cap";
+        for (uint32_t u = 0; !why && u < t; u++)
+            if (g->ms_seq_id[u] == g->ms_seq_id[t]) why = "two rows of one bank in the step";
+    }
+    if (why) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: L209 compressor step: classic host loop (first decline: %s; layer %u, %u rows)\n",
+                    why, il, n_tokens);
+        }
+        return false;
+    }
+    return true;
+}
+
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -1321,16 +1358,7 @@ bool gpu_graph_encode_layer_attention_batch(
                  * window (a host-conditional sync copy), no observer dumps
                  * (they read the staging), not a warm-up, a staging row per
                  * token, and the mirror says every emit fits its cap. */
-                bool dev_step = mseq && !g->state_only && !gpu_graph_f32_store_observed_any() &&
-                                g->banks.comp_count != NULL && g->attn_comp_stage_cap >= n_tokens;
-                for (uint32_t t = 0; dev_step && t < n_tokens; t++) {
-                    const uint32_t b = (uint32_t)g->ms_seq_id[t];
-                    const uint32_t p = (uint32_t)g->ms_positions[t];
-                    if (b >= g->banks.n_banks || g->ms_emit_keep[b] != 0u) dev_step = false;
-                    else if (((p + 1u) % ratio) == 0u && g->ms_n_comp[b][il] >= g->layer_comp_cap[il]) dev_step = false;
-                    for (uint32_t u = 0; dev_step && u < t; u++)
-                        if (g->ms_seq_id[u] == g->ms_seq_id[t]) dev_step = false;
-                }
+                const bool dev_step = l209_dev_step_eligible(g, il, ratio, n_tokens, mseq, false);
                 if (ok && dev_step) {
                     pulsar_gpu_tensor *bases = gpu_graph_bank_attn_comp_bases(g, il);
                     ok = bases != NULL && pulsar_gpu_compressor_step_dev_tensor(
@@ -1776,16 +1804,7 @@ bool gpu_graph_encode_layer_attention_batch(
                      * packs it before the next iteration's kernels run. */
                     /* L209: the indexer twin of the on-device compressor step
                      * (same contract and preconditions as the attention side). */
-                    bool idev_step = mseq && !g->state_only && !gpu_graph_f32_store_observed_any() &&
-                                     g->banks.index_count != NULL;
-                    for (uint32_t t = 0; idev_step && t < n_tokens; t++) {
-                        const uint32_t b = (uint32_t)g->ms_seq_id[t];
-                        const uint32_t p = (uint32_t)g->ms_positions[t];
-                        if (b >= g->banks.n_banks || g->ms_emit_keep[b] != 0u) idev_step = false;
-                        else if (((p + 1u) % ratio) == 0u && g->ms_n_index_comp[b][il] >= g->layer_comp_cap[il]) idev_step = false;
-                        for (uint32_t u = 0; idev_step && u < t; u++)
-                            if (g->ms_seq_id[u] == g->ms_seq_id[t]) idev_step = false;
-                    }
+                    const bool idev_step = l209_dev_step_eligible(g, il, ratio, n_tokens, mseq, true);
                     if (ok && idev_step) {
                         pulsar_gpu_tensor *ibases = gpu_graph_bank_index_comp_bases(g, il);
                         ok = ibases != NULL && pulsar_gpu_compressor_step_dev_tensor(
