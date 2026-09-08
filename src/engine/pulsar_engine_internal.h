@@ -2390,6 +2390,13 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
  * check at step_end still sees the truth. */
 bool gpu_graph_bank_set_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
                                uint32_t comp, uint32_t index);
+/** L209: advance the HOST MIRROR only, after the device-resolved compressor
+ * step has already bumped the device counter in-kernel. The two values must be
+ * the arithmetic the kernel performed ((pos+1)/ratio at the emit), which is
+ * exactly what step_end validates. A device write here would be a sync H2D
+ * inside the very region the graph capture brackets. */
+void gpu_graph_bank_mirror_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
+                                  uint32_t comp, uint32_t index);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

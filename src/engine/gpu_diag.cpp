@@ -521,6 +521,12 @@ bool gpu_graph_bank_set_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
            pulsar_gpu_tensor_write(b->index_count, off, &index, sizeof(uint32_t)) != 0;
 }
 
+void gpu_graph_bank_mirror_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
+                                  uint32_t comp, uint32_t index) {
+    g->ms_n_comp[bank][il] = comp;
+    g->ms_n_index_comp[bank][il] = index;
+}
+
 /* Write one bank's entry in the comp/index base-pointer tables (device arrays).
  * A NULL slab nulls the entry so a stray batched-kernel read of an evicted bank
  * faults instead of touching freed pages. */

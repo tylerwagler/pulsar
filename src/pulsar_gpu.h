@@ -1201,6 +1201,50 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(
  * and optional indexer masks.
  */
 
+/** L209: the compressor step of a BANKED decode round with every per-row input
+ * read from device memory (positions, bank id, emit row from the per-(bank,
+ * layer) counter slab), so the launch sequence is identical every round and a
+ * captured graph of it stays valid. Same arithmetic as the classic per-token
+ * path (each stage calls the classic kernel's row helper). Contract: at most one
+ * row per bank in the step. pack_kind 0 = attention NVFP4 row (head_dim 512),
+ * 1 = indexer Hadamard-FP4 row (head_dim 128). Advances the device counters of
+ * the emitting banks; the caller advances the host mirror arithmetically. */
+int pulsar_gpu_compressor_step_dev_tensor(
+        const pulsar_gpu_tensor *kv_rows,
+        const pulsar_gpu_tensor *sc_rows,
+        pulsar_gpu_tensor       *state_kv_lanes,
+        pulsar_gpu_tensor       *state_sc_lanes,
+        uint64_t                lane_bytes,
+        pulsar_gpu_tensor       *stage,
+        const pulsar_gpu_tensor *cache_bases,
+        uint64_t                cache_row_bytes,
+        pulsar_gpu_tensor       *counts,
+        uint32_t                il,
+        uint32_t                n_layer,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        uint32_t                n_tokens,
+        uint32_t                n_banks,
+        uint32_t                comp_cap,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        int                     pack_kind);
+
 int pulsar_gpu_compressor_update_tensor(
         const pulsar_gpu_tensor *kv_cur,
         const pulsar_gpu_tensor *sc_cur,

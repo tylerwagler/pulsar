@@ -1312,7 +1312,54 @@ bool gpu_graph_encode_layer_attention_batch(
                  * independent, and the pack-mode f32 stage row is safe to
                  * share across banks: each iteration's emit packs it before
                  * the next iteration's kernels run on the same stream. */
-                for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                /* L209: the BANKED decode round resolves this step ON-DEVICE --
+                 * positions, bank ids and the emit row are read from device
+                 * memory, so the launch sequence is identical every round and a
+                 * captured graph of it stays valid. Preconditions, else the
+                 * classic per-token loop below: at most one row per bank (rows
+                 * of one bank are sequentially dependent), no live emit-keep
+                 * window (a host-conditional sync copy), no observer dumps
+                 * (they read the staging), not a warm-up, a staging row per
+                 * token, and the mirror says every emit fits its cap. */
+                bool dev_step = mseq && !g->state_only && !gpu_graph_f32_store_observed_any() &&
+                                g->banks.comp_count != NULL && g->attn_comp_stage_cap >= n_tokens;
+                for (uint32_t t = 0; dev_step && t < n_tokens; t++) {
+                    const uint32_t b = (uint32_t)g->ms_seq_id[t];
+                    const uint32_t p = (uint32_t)g->ms_positions[t];
+                    if (b >= g->banks.n_banks || g->ms_emit_keep[b] != 0u) dev_step = false;
+                    else if (((p + 1u) % ratio) == 0u && g->ms_n_comp[b][il] >= g->layer_comp_cap[il]) dev_step = false;
+                    for (uint32_t u = 0; dev_step && u < t; u++)
+                        if (g->ms_seq_id[u] == g->ms_seq_id[t]) dev_step = false;
+                }
+                if (ok && dev_step) {
+                    pulsar_gpu_tensor *bases = gpu_graph_bank_attn_comp_bases(g, il);
+                    ok = bases != NULL && pulsar_gpu_compressor_step_dev_tensor(
+                            g->batch_comp_kv, g->batch_comp_sc,
+                            g->banks.askv[il], g->banks.assc[il], g->banks.astate_bank_bytes[il],
+                            g->attn_comp_stage, bases, gpu_graph_attn_comp_cache_row_bytes(),
+                            g->banks.comp_count, il, PULSAR_N_LAYER,
+                            g->batch_positions, g->batch_seq_id, n_tokens, g->banks.n_banks,
+                            g->layer_comp_cap[il],
+                            model->map, model->size,
+                            layer->attn_compressor_ape->abs_offset, layer->attn_compressor_ape->type,
+                            layer->attn_compressor_norm->abs_offset, layer->attn_compressor_norm->type,
+                            PULSAR_N_HEAD_DIM, ratio, PULSAR_N_ROT,
+                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
+                            freq_base, freq_scale, ext_factor, attn_factor,
+                            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
+                            0 /* attention NVFP4 row */) != 0;
+                    /* The host mirror advances by the arithmetic the kernel just
+                     * performed; the device word moved in-kernel. */
+                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                        const uint32_t b = (uint32_t)g->ms_seq_id[t];
+                        const uint32_t p = (uint32_t)g->ms_positions[t];
+                        if (((p + 1u) % ratio) == 0u)
+                            gpu_graph_bank_mirror_counts(g, b, il, g->ms_n_comp[b][il] + 1u,
+                                                         g->ms_n_index_comp[b][il]);
+                        if (comp_counts) comp_counts[t] = g->ms_n_comp[b][il];
+                    }
+                }
+                for (uint32_t t = 0; ok && !dev_step && t < n_tokens; t++) {
                     const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                     const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
                     /* STAGE 1b: one storage, selected by bank id. Non-mseq is
@@ -1727,7 +1774,45 @@ bool gpu_graph_encode_layer_attention_batch(
                      * bank-LOCAL frontier: two banks at the same frontier
                      * share a stage row safely because each iteration's emit
                      * packs it before the next iteration's kernels run. */
-                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                    /* L209: the indexer twin of the on-device compressor step
+                     * (same contract and preconditions as the attention side). */
+                    bool idev_step = mseq && !g->state_only && !gpu_graph_f32_store_observed_any() &&
+                                     g->banks.index_count != NULL;
+                    for (uint32_t t = 0; idev_step && t < n_tokens; t++) {
+                        const uint32_t b = (uint32_t)g->ms_seq_id[t];
+                        const uint32_t p = (uint32_t)g->ms_positions[t];
+                        if (b >= g->banks.n_banks || g->ms_emit_keep[b] != 0u) idev_step = false;
+                        else if (((p + 1u) % ratio) == 0u && g->ms_n_index_comp[b][il] >= g->layer_comp_cap[il]) idev_step = false;
+                        for (uint32_t u = 0; idev_step && u < t; u++)
+                            if (g->ms_seq_id[u] == g->ms_seq_id[t]) idev_step = false;
+                    }
+                    if (ok && idev_step) {
+                        pulsar_gpu_tensor *ibases = gpu_graph_bank_index_comp_bases(g, il);
+                        ok = ibases != NULL && pulsar_gpu_compressor_step_dev_tensor(
+                                g->batch_comp_kv, g->batch_comp_sc,
+                                g->banks.iskv[il], g->banks.issc[il], g->banks.istate_bank_bytes[il],
+                                g->idx_comp_stage, ibases, PULSAR_ENGINE_IDXFP4_ROWBYTES,
+                                g->banks.index_count, il, PULSAR_N_LAYER,
+                                g->batch_positions, g->batch_seq_id, n_tokens, g->banks.n_banks,
+                                g->layer_comp_cap[il],
+                                model->map, model->size,
+                                layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
+                                layer->indexer_compressor_norm->abs_offset, layer->indexer_compressor_norm->type,
+                                PULSAR_N_INDEXER_HEAD_DIM, ratio, PULSAR_N_ROT,
+                                compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
+                                freq_base, freq_scale, ext_factor, attn_factor,
+                                PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
+                                1 /* indexer Hadamard-FP4 row */) != 0;
+                        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                            const uint32_t b = (uint32_t)g->ms_seq_id[t];
+                            const uint32_t p = (uint32_t)g->ms_positions[t];
+                            if (((p + 1u) % ratio) == 0u)
+                                gpu_graph_bank_mirror_counts(g, b, il, g->ms_n_comp[b][il],
+                                                             g->ms_n_index_comp[b][il] + 1u);
+                            if (index_counts) index_counts[t] = g->ms_n_index_comp[b][il];
+                        }
+                    }
+                    for (uint32_t t = 0; ok && !idev_step && t < n_tokens; t++) {
                         const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
                         const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : 0u;
                         uint32_t *const n_index_slot =

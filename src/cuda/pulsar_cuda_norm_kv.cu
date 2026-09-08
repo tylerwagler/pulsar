@@ -97,6 +97,16 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
  * a GEMM consuming this norm multiplies in the source's format instead of
  * against f32.  Same contract as pulsar_cuda_mx.cuh: every lane of a warp must
  * reach the emit, which the launcher guarantees by refusing n % 256 != 0. */
+/* One row of weighted RMS-norm, block-cooperative (256 threads, the shared
+ * reduction tree below): THE authority for this arithmetic, shared by the
+ * classic kernel and the L209 device-resolved compressor step. `row` only
+ * feeds the MX epilogue's scale addressing. */
+template <bool WBF16>
+__device__ static __forceinline__ void rms_norm_weight_row_dev(float *orow, const float *xr, const void *w,
+                                                               uint32_t n, float eps, uint32_t row,
+                                                               __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp,
+                                                               __nv_bfloat16 *out_b);
+
 /* WBF16: the norm weight is bf16 (source format) rather than f32. Storage only
  * -- the value is promoted to f32 before it multiplies, so the arithmetic here
  * is identical either way and an f32 artifact stays bit-exact. */
@@ -106,8 +116,15 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
                                               __nv_bfloat16 *out_b) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
-    float *orow = out ? out + (uint64_t)row * n : NULL;
+    rms_norm_weight_row_dev<WBF16>(out ? out + (uint64_t)row * n : NULL, x + (uint64_t)row * n, w, n, eps, row,
+                                   out_q, out_sf, out_kbp, out_b);
+}
+
+template <bool WBF16>
+__device__ static __forceinline__ void rms_norm_weight_row_dev(float *orow, const float *xr, const void *w,
+                                                               uint32_t n, float eps, uint32_t row,
+                                                               __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp,
+                                                               __nv_bfloat16 *out_b) {
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         float v = xr[i];
@@ -596,6 +613,9 @@ __device__ __forceinline__ static uint64_t attn_pack_ring_slot(
     return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
 }
 
+__device__ static __forceinline__ void attn_pack_store_row_dev(float *xr, const float *sr, uint8_t *outr,
+                                                               uint32_t head_dim, uint32_t n_rot, uint32_t tid);
+
 __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
                                               uint32_t out_row0, uint32_t n_rows,
                                               uint32_t head_dim, uint32_t n_rot,
@@ -608,13 +628,21 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
     const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
                                                 positions, seq_id);
     if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
+    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    attn_pack_store_row_dev(x ? (x + (uint64_t)row * head_dim) : NULL,
+                            src + (uint64_t)row * head_dim,
+                            out + dst_row * rowbytes, head_dim, n_rot, tid);
+}
+
+/* One packed KV row (block-cooperative, 64 threads): THE authority for the
+ * NVFP4 pack arithmetic, shared by the classic kernel above and the L209
+ * device-resolved compressor commit. `xr` non-NULL roundtrips the f32 source
+ * in place to what the packed row decodes to. */
+__device__ static __forceinline__ void attn_pack_store_row_dev(float *xr, const float *sr, uint8_t *outr,
+                                                               uint32_t head_dim, uint32_t n_rot, uint32_t tid) {
     const uint32_t n_nope = head_dim - n_rot;
     const uint32_t nib_bytes = n_nope / 2u;
     const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const float *sr = src + (uint64_t)row * head_dim;
-    float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
-    uint8_t *outr = out + dst_row * rowbytes;
     uint8_t *sc = outr + nib_bytes;
     __shared__ float samax[PULSAR_KV4_NV_NBLK(512u)];   /* 28 at head_dim 512 */
     __shared__ float sscale[PULSAR_KV4_NV_NBLK(512u)];
@@ -795,17 +823,25 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
  * only under keep_f32 (observers -- every consumer reads the packed row).  The E8M0
  * exponent clamp only differs from the unpacked path outside [2^-127, 2^127]
  * scales, which the 7e-38 amax floor already makes unreachable. */
+/* One packed indexer row (block-cooperative, 128 threads): THE authority for
+ * the Hadamard + FP4 pack arithmetic, shared by the classic kernel below and
+ * the L209 device-resolved compressor commit. */
+__device__ static __forceinline__ void indexer_had_pack_row_dev(float *xr, uint8_t *outr, uint32_t tid, int keep_f32);
+
 __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
                                                         uint32_t n_rows, uint32_t head_dim,
                                                         int keep_f32) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+    indexer_had_pack_row_dev(x + (uint64_t)row * head_dim,
+                             out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid, keep_f32);
+}
 
+__device__ static __forceinline__ void indexer_had_pack_row_dev(float *xr, uint8_t *outr, uint32_t tid, int keep_f32) {
     __shared__ float vals[128];
     __shared__ float absbuf[128];
     __shared__ uint8_t nib_sh[128];
-    float *xr = x + (uint64_t)row * head_dim;
     indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
 
     float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
@@ -820,7 +856,6 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
     nib_sh[tid] = nib;
     __syncthreads();
 
-    uint8_t *outr = out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u);
     if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
     if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
 }
@@ -959,6 +994,16 @@ __global__ static void compressor_prefill_pool_kernel(
 
 
 
+/* The pooled value of one output element: THE authority for the compressor's
+ * softmax-pool arithmetic, shared by the classic per-token kernel below and the
+ * L209 device-resolved step (comp_dev_pool_kernel). */
+__device__ static __forceinline__ float compressor_pool_elem_dev(
+        const float *state_kv,
+        const float *state_score,
+        uint32_t d,
+        uint32_t head_dim,
+        uint32_t ratio);
+
 __global__ static void compressor_update_pool_kernel(
         float *row,
         const float *state_kv,
@@ -967,6 +1012,15 @@ __global__ static void compressor_update_pool_kernel(
         uint32_t ratio) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
+    row[d] = compressor_pool_elem_dev(state_kv, state_score, d, head_dim, ratio);
+}
+
+__device__ static __forceinline__ float compressor_pool_elem_dev(
+        const float *state_kv,
+        const float *state_score,
+        uint32_t d,
+        uint32_t head_dim,
+        uint32_t ratio) {
     uint32_t coff = pulsar_compress_coff(ratio);
     uint32_t width = coff * head_dim;
     float vals[128];
@@ -997,7 +1051,7 @@ __global__ static void compressor_update_pool_kernel(
         den += w;
         acc += vals[i] * w;
     }
-    row[d] = den != 0.0f ? acc / den : 0.0f;
+    return den != 0.0f ? acc / den : 0.0f;
 }
 
 
@@ -1575,6 +1629,286 @@ int pulsar_gpu_compressor_shift_ratio4_tensor(
     return cuda_ok(cudaGetLastError(), "compressor ratio4 shift (replay) launch");
 }
 
+
+
+/* ==== L209: the compressor step of a BANKED decode round, resolved on-device ====
+ *
+ * The classic path below runs one host loop per token: the host reads the
+ * row's position and bank, decides emit = ((pos+1) % ratio == 0), picks the
+ * emit row from a host counter, and bakes all of it into six launches. Every
+ * one of those scalars changes from round to round, so a captured graph of
+ * that sequence is wrong on the next round.
+ *
+ * These kernels take the SAME inputs from device memory: positions and bank
+ * ids from the step's arrays, the emit row from the per-(bank, layer) counter
+ * slab (gpu_graph_bank_set_counts keeps it equal to the host mirror), and the
+ * bank's state lane / cache base from the pool tables. Every kernel is
+ * launched every round, resolves its row, and returns immediately when the row
+ * does not emit -- so the launch sequence is identical every round and one
+ * captured graph serves all of them. The arithmetic is the classic kernels'
+ * own: each stage calls the row helper the classic kernel calls (ONE authority,
+ * bit-exact by construction).
+ *
+ * Contract (the host asserts it before arming): at most ONE row per bank in
+ * the step. Rows of one bank are sequentially dependent (the emit at pos p
+ * pools the slots pos p-3..p, which a later row's store would overwrite), and
+ * this batched shape runs all stores before all emits. Multi-row runs (the
+ * drafter's) stay on the classic loop until the fused in-order kernel lands. */
+struct comp_dev_args {
+    const float *kv_rows;        ///< [n_tokens][width] f32: this step's compressor projections
+    const float *sc_rows;
+    float *state_kv;             ///< bank state lanes: n_banks x lane_floats
+    float *state_sc;
+    uint64_t lane_floats;
+    float *stage;                ///< f32 [>= n_tokens][head_dim]: pool -> norm -> rope scratch, row t
+    void *const *cache_bases;    ///< device array of n_banks cache base pointers
+    uint64_t cache_row_bytes;
+    uint32_t *counts;            ///< u32 [n_banks][n_layer]: the emit row, bumped by the advance kernel
+    uint32_t il, n_layer;
+    const int32_t *positions;    ///< [n_tokens]
+    const int32_t *seq_id;       ///< [n_tokens]
+    uint32_t n_tokens, n_banks, head_dim, ratio, comp_cap;
+    const void *ape;             ///< the compressor's APE table (already range-checked)
+    uint32_t ape_type;
+    const void *norm_w;          ///< the compressor norm weight (already range-checked)
+    uint32_t n_rot, n_ctx_orig;
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, rms_eps;
+};
+
+struct comp_dev_row { uint32_t seq, pos, emit, row; int live; };
+
+__device__ static __forceinline__ comp_dev_row comp_dev_resolve(const comp_dev_args &a, uint32_t t) {
+    comp_dev_row r;
+    r.seq = (uint32_t)a.seq_id[t];
+    r.pos = (uint32_t)a.positions[t];
+    r.emit = ((r.pos + 1u) % a.ratio) == 0u ? 1u : 0u;
+    r.live = r.seq < a.n_banks;
+    r.row = r.live ? a.counts[(uint64_t)r.seq * a.n_layer + a.il] : 0u;
+    /* Capacity is validated on the host from the mirror before the step is
+     * armed; a row past the cap here is a dead row, never a write. */
+    if (r.live && r.emit && r.row >= a.comp_cap) r.live = 0;
+    return r;
+}
+
+/* Stage 1 (every row): the projection lands in the bank's state slot pos % ratio. */
+__global__ static void comp_dev_store_kernel(comp_dev_args a) {
+    const uint32_t width = pulsar_compress_coff(a.ratio) * a.head_dim;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)a.n_tokens * width) return;
+    const uint32_t t = (uint32_t)(gid / width);
+    const uint32_t j = (uint32_t)(gid - (uint64_t)t * width);
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live) return;
+    const uint64_t lane = (uint64_t)r.seq * a.lane_floats;
+    const uint32_t pos_mod = r.pos % a.ratio;
+    const uint32_t dst_row = a.ratio == 4u ? a.ratio + pos_mod : pos_mod;
+    a.state_kv[lane + (uint64_t)dst_row * width + j] = a.kv_rows[(uint64_t)t * width + j];
+    a.state_sc[lane + (uint64_t)dst_row * width + j] =
+        a.sc_rows[(uint64_t)t * width + j] + model_scalar_dev(a.ape, 0, a.ape_type, (uint64_t)pos_mod * width + j);
+}
+
+/* Stage 2 (emit rows): softmax-pool the bank's state into stage row t. */
+__global__ static void comp_dev_pool_kernel(comp_dev_args a) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= a.n_tokens || d >= a.head_dim) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    const uint64_t lane = (uint64_t)r.seq * a.lane_floats;
+    a.stage[(uint64_t)t * a.head_dim + d] =
+        compressor_pool_elem_dev(a.state_kv + lane, a.state_sc + lane, d, a.head_dim, a.ratio);
+}
+
+/* Stage 3 (emit rows): weighted RMS-norm of stage row t in place (256 threads). */
+template <bool WBF16>
+__global__ static void comp_dev_norm_kernel(comp_dev_args a) {
+    const uint32_t t = blockIdx.x;
+    if (t >= a.n_tokens) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    float *row = a.stage + (uint64_t)t * a.head_dim;
+    rms_norm_weight_row_dev<WBF16>(row, row, a.norm_w, a.head_dim, a.rms_eps, 0u, NULL, NULL, 0, NULL);
+}
+
+/* Stage 4 (emit rows): rope the tail of stage row t at the group's first position. */
+__global__ static void comp_dev_rope_kernel(comp_dev_args a) {
+    const uint32_t half = a.n_rot / 2u;
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= a.n_tokens * half) return;
+    const uint32_t t = gid / half;
+    const uint32_t pair = gid - t * half;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    float *tail = a.stage + (uint64_t)t * a.head_dim + (a.head_dim - a.n_rot);
+    float r0, r1;
+    rope_tail_rotate_pair_dev(tail, pair * 2u, a.n_rot, r.pos + 1u - a.ratio, a.n_ctx_orig, 0,
+                              a.freq_base, a.freq_scale, a.ext_factor, a.attn_factor,
+                              a.beta_fast, a.beta_slow, &r0, &r1);
+}
+
+/* Stage 5 (emit rows): pack stage row t into the bank's cache at the counter row. */
+__global__ static void comp_dev_pack_attn_kernel(comp_dev_args a) {      /* 64 threads */
+    const uint32_t t = blockIdx.x;
+    if (t >= a.n_tokens) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    uint8_t *outr = (uint8_t *)a.cache_bases[r.seq] + (uint64_t)r.row * a.cache_row_bytes;
+    attn_pack_store_row_dev(NULL, a.stage + (uint64_t)t * a.head_dim, outr, a.head_dim, a.n_rot, threadIdx.x);
+}
+__global__ static void comp_dev_pack_index_kernel(comp_dev_args a) {     /* 128 threads */
+    const uint32_t t = blockIdx.x;
+    if (t >= a.n_tokens) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    uint8_t *outr = (uint8_t *)a.cache_bases[r.seq] + (uint64_t)r.row * a.cache_row_bytes;
+    indexer_had_pack_row_dev(a.stage + (uint64_t)t * a.head_dim, outr, threadIdx.x, 0);
+}
+
+/* Stage 6 (emit rows, ratio 4): the state's upper half becomes both halves. */
+__global__ static void comp_dev_shift4_kernel(comp_dev_args a) {
+    const uint32_t t = blockIdx.y;
+    if (t >= a.n_tokens) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    const uint64_t half = 4ull * pulsar_compress_coff(a.ratio) * a.head_dim;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= half) return;
+    float *skv = a.state_kv + (uint64_t)r.seq * a.lane_floats;
+    float *ssc = a.state_sc + (uint64_t)r.seq * a.lane_floats;
+    const float v = skv[half + i];
+    const float s = ssc[half + i];
+    skv[i] = v;
+    ssc[i] = s;
+    skv[half + i] = v;
+    ssc[half + i] = s;
+}
+
+/* Stage 7 (emit rows): the counter moves last, after every reader of it. */
+__global__ static void comp_dev_advance_kernel(comp_dev_args a) {
+    const uint32_t t = threadIdx.x;
+    if (t >= a.n_tokens) return;
+    const comp_dev_row r = comp_dev_resolve(a, t);
+    if (!r.live || !r.emit) return;
+    a.counts[(uint64_t)r.seq * a.n_layer + a.il] = r.row + 1u;
+}
+
+int pulsar_gpu_compressor_step_dev_tensor(
+        const pulsar_gpu_tensor *kv_rows,
+        const pulsar_gpu_tensor *sc_rows,
+        pulsar_gpu_tensor       *state_kv_lanes,
+        pulsar_gpu_tensor       *state_sc_lanes,
+        uint64_t                lane_bytes,
+        pulsar_gpu_tensor       *stage,
+        const pulsar_gpu_tensor *cache_bases,
+        uint64_t                cache_row_bytes,
+        pulsar_gpu_tensor       *counts,
+        uint32_t                il,
+        uint32_t                n_layer,
+        const pulsar_gpu_tensor *positions,
+        const pulsar_gpu_tensor *seq_id,
+        uint32_t                n_tokens,
+        uint32_t                n_banks,
+        uint32_t                comp_cap,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        int                     pack_kind) {
+    if (!kv_rows || !sc_rows || !state_kv_lanes || !state_sc_lanes || !stage || !cache_bases ||
+        !counts || !positions || !seq_id || !model_map ||
+        n_tokens == 0 || n_banks == 0 || head_dim == 0 || ratio == 0 || n_layer == 0 || il >= n_layer ||
+        n_rot > head_dim || (n_rot & 1u) != 0 ||
+        (ape_type != 0u && ape_type != 1u) || (norm_type != 0u && norm_type != 30u) ||
+        (pack_kind == 0 && (head_dim != 512u || n_rot != PULSAR_ATTN_PACK_NROT)) ||
+        (pack_kind == 1 && head_dim != 128u) || (pack_kind != 0 && pack_kind != 1)) {
+        return 0;
+    }
+    const uint32_t coff = pulsar_compress_coff(ratio);
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t rows_bytes = (uint64_t)n_tokens * width * sizeof(float);
+    const uint64_t lane_need = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const int norm_bf16 = (norm_type == 30u);
+    const uint64_t norm_bytes = (uint64_t)head_dim * pulsar_w_elt_bytes(norm_bf16);
+    if (lane_bytes < lane_need || (lane_bytes % sizeof(float)) != 0 ||
+        kv_rows->bytes < rows_bytes || sc_rows->bytes < rows_bytes ||
+        state_kv_lanes->bytes < (uint64_t)n_banks * lane_bytes ||
+        state_sc_lanes->bytes < (uint64_t)n_banks * lane_bytes ||
+        stage->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        cache_bases->bytes < (uint64_t)n_banks * sizeof(void *) ||
+        counts->bytes < (uint64_t)n_banks * n_layer * sizeof(uint32_t) ||
+        positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        fprintf(stderr, "pulsar: compressor device step rejected: n_tokens=%u n_banks=%u head_dim=%u ratio=%u "
+                        "lane=%llu/%llu stage=%llu -- refusing\n", n_tokens, n_banks, head_dim, ratio,
+                (unsigned long long)lane_bytes, (unsigned long long)lane_need,
+                (unsigned long long)stage->bytes);
+        return 0;
+    }
+    const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
+    const char *norm_w = cuda_model_range_ptr(model_map, norm_offset, norm_bytes, "compressor_norm");
+    if (!ape || !norm_w) return 0;
+
+    comp_dev_args a;
+    a.kv_rows = (const float *)kv_rows->ptr;
+    a.sc_rows = (const float *)sc_rows->ptr;
+    a.state_kv = (float *)state_kv_lanes->ptr;
+    a.state_sc = (float *)state_sc_lanes->ptr;
+    a.lane_floats = lane_bytes / sizeof(float);
+    a.stage = (float *)stage->ptr;
+    a.cache_bases = (void *const *)cache_bases->ptr;
+    a.cache_row_bytes = cache_row_bytes;
+    a.counts = (uint32_t *)counts->ptr;
+    a.il = il; a.n_layer = n_layer;
+    a.positions = (const int32_t *)positions->ptr;
+    a.seq_id = (const int32_t *)seq_id->ptr;
+    a.n_tokens = n_tokens; a.n_banks = n_banks; a.head_dim = head_dim; a.ratio = ratio; a.comp_cap = comp_cap;
+    a.ape = ape; a.ape_type = ape_type;
+    a.norm_w = norm_w;
+    a.n_rot = n_rot; a.n_ctx_orig = n_ctx_orig;
+    a.freq_base = freq_base; a.freq_scale = freq_scale; a.ext_factor = ext_factor; a.attn_factor = attn_factor;
+    a.beta_fast = beta_fast; a.beta_slow = beta_slow; a.rms_eps = rms_eps;
+
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: L209 compressor step resolved on-device (positions, bank, emit row from device memory)\n");
+    }
+    const uint64_t n_store = (uint64_t)n_tokens * width;
+    comp_dev_store_kernel<<<(unsigned)((n_store + 255u) / 256u), 256>>>(a);
+    comp_dev_pool_kernel<<<dim3((head_dim + 255u) / 256u, n_tokens), 256>>>(a);
+    if (norm_bf16) comp_dev_norm_kernel<true><<<n_tokens, 256>>>(a);
+    else           comp_dev_norm_kernel<false><<<n_tokens, 256>>>(a);
+    if (n_rot != 0u) {
+        const uint32_t pairs = n_tokens * (n_rot / 2u);
+        comp_dev_rope_kernel<<<(pairs + 255u) / 256u, 256>>>(a);
+    }
+    if (pack_kind == 0) comp_dev_pack_attn_kernel<<<n_tokens, 64>>>(a);
+    else                comp_dev_pack_index_kernel<<<n_tokens, 128>>>(a);
+    if (ratio == 4u) {
+        const uint64_t half = 4ull * width;
+        comp_dev_shift4_kernel<<<dim3((unsigned)((half + 255u) / 256u), n_tokens), 256>>>(a);
+    }
+    comp_dev_advance_kernel<<<1, n_tokens>>>(a);
+    return cuda_ok(cudaGetLastError(), "compressor device step launch");
+}
 
 
 int pulsar_gpu_compressor_update_tensor(
