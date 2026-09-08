@@ -1113,9 +1113,10 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
                               float * __restrict__ out_gate,
                               float * __restrict__ out_up,
                               int M, int K, int n_assign, int E) {
-    __shared__ float s_x[kDecodeGemvMaxK];
-    __shared__ float s_red[kDecodeGemvWarps][kDecodeGemvRows][2];
-    __shared__ int   s_expert;
+    __shared__ float    s_x[kDecodeGemvMaxK];
+    __shared__ float    s_red[kDecodeGemvWarps][kDecodeGemvRows][2];
+    __shared__ uint64_t s_grid[256];   /* the IQ2 grid: constant memory serialises divergent indices (L199) */
+    __shared__ int      s_expert;
 
     const int col  = blockIdx.y;                 /* assignment (expert-sorted) */
     const int lane = threadIdx.x;
@@ -1133,6 +1134,10 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
         }
         s_expert = lo;
     }
+    /* The grid table: 256 x 8 bytes, one per thread, indexed by data-dependent
+     * bytes below -- from shared memory that is one wavefront per lookup, from
+     * __constant__ it would be one per distinct byte in the warp. */
+    s_grid[tid] = iq2xxs_grid[tid];
     /* Stage this assignment's activation row as f32: block i holds k in
      * [128 i, 128 i + 128) as 4 groups of 32 e4m3 under one ue8m0 byte each
      * (d4[] carries the byte as a float). */
@@ -1176,8 +1181,8 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
             float sg = 0.0f, su = 0.0f;
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
-                const uint64_t grid_g = iq2xxs_grid[(cg.x >> (8 * g)) & 0xffu];
-                const uint64_t grid_u = iq2xxs_grid[(cu.x >> (8 * g)) & 0xffu];
+                const uint64_t grid_g = s_grid[(cg.x >> (8 * g)) & 0xffu];
+                const uint64_t grid_u = s_grid[(cu.x >> (8 * g)) & 0xffu];
                 const uint32_t sgn_g = ds4_unpack_ksigns((uint8_t)((cg.y >> (7 * g)) & 0x7fu));
                 const uint32_t sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
 #pragma unroll
