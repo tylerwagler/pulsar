@@ -473,35 +473,50 @@ static void attn_f16_kernel(
     const uint32_t mtile = job >> 1u, ntile = job & 1u;
     const uint32_t kgrp = warp >> 2u;                   /* 0..3 */
     /* L037 lever 3 prologue: per-head RMS scales for the block's 32 rows,
-     * computed with EXACTLY the standalone kernel's reduction (thread-local
-     * strided 2-element square sums, then a 256-wide power-of-two tree --
-     * head_rms_norm_rope_tail_kernel runs at blockDim 256), two rows per
-     * pass across this block's 512 threads. Bit-exactness of the whole
-     * fusion hangs on this loop matching that kernel operation-for-
+     * computed with EXACTLY the standalone kernel's arithmetic
+     * (head_rms_norm_rope_tail_kernel at blockDim 256: thread i sums
+     * x[i]^2 then x[i+256]^2, then a power-of-two tree partial[i] +=
+     * partial[i + s] for s = 128, 64, ..., 1).  Two rows per WARP, lane L
+     * standing in for threads L + 32k, k = 0..7: the strides >= 32 pair the
+     * lane's own registers, the strides < 32 pair lanes through shuffles --
+     * the same pairs in the same association order, so the same bits, and no
+     * block barrier.  (L210: the 16-pass version this replaces -- one 256-wide
+     * smem tree per pair of rows, eight barriers each, per block -- was most
+     * of a split-K block's time; the standalone kernel run once per decode
+     * step avoided it at the price of a launch.)  Bit-exactness of the whole
+     * fusion still hangs on this matching that kernel operation for
      * operation; change either together or the prefill gate goes red. */
     __shared__ float sQscale[AF16_HPB];
     float q_corr0 = 0.0f, q_corr1 = 0.0f;
     if (q_raw) {
-        __shared__ float sQpart[2][256];
-        const uint32_t half = tid >> 8u;     /* which of the pass's two rows */
-        const uint32_t vtid = tid & 255u;    /* the standalone kernel's tid */
-        for (uint32_t r2 = 0; r2 < AF16_HPB; r2 += 2u) {
-            const QT *xr = q + ((uint64_t)t * n_head + hbase + r2 + half) * AF16_DIM;
-            float sum = 0.0f;
-            for (uint32_t i = vtid; i < AF16_DIM; i += 256u) {
-                float v = q_load<QT>(xr, i);
-                sum += v * v;
+        #pragma unroll
+        for (uint32_t hh = 0; hh < 2u; hh++) {
+            const uint32_t r = warp * 2u + hh;
+            const QT *xr = q + ((uint64_t)t * n_head + hbase + r) * AF16_DIM;
+            float part[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                float sum = 0.0f;
+                for (uint32_t i = lane + 32u * k; i < AF16_DIM; i += 256u) {   /* thread (lane + 32k)'s loop */
+                    float v = q_load<QT>(xr, i);
+                    sum += v * v;
+                }
+                part[k] = sum;
             }
-            sQpart[half][vtid] = sum;
-            __syncthreads();
-            for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
-                if (vtid < stride) sQpart[half][vtid] += sQpart[half][vtid + stride];
-                __syncthreads();
-            }
-            if (vtid == 0u)
-                sQscale[r2 + half] = rsqrtf(sQpart[half][0] / (float)AF16_DIM + qp.eps);
-            __syncthreads();
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) part[k] += part[k + 4u];   /* stride 128 */
+            part[0] += part[2];                                          /* stride 64 */
+            part[1] += part[3];
+            part[0] += part[1];                                          /* stride 32 */
+            float v = part[0];
+            v += __shfl_down_sync(0xffffffffu, v, 16);                   /* stride 16: lane L takes L + 16 */
+            v += __shfl_down_sync(0xffffffffu, v, 8);
+            v += __shfl_down_sync(0xffffffffu, v, 4);
+            v += __shfl_down_sync(0xffffffffu, v, 2);
+            v += __shfl_down_sync(0xffffffffu, v, 1);
+            if (lane == 0u) sQscale[r] = rsqrtf(v / (float)AF16_DIM + qp.eps);
         }
+        __syncthreads();
         if (qp.ext_factor != 0.0f)
             rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base,
                                qp.beta_fast, qp.beta_slow, &q_corr0, &q_corr1);
