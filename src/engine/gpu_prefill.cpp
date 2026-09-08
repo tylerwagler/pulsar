@@ -826,16 +826,33 @@ bool gpu_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         /* WHERE the Q head-norm + tail rope runs, never WHICH attention kernel.
-         * Shipped: deferred into the fp16 attention kernel's Q-fragment build
+         * Prefill: deferred into the fp16 attention kernel's Q-fragment build
          * (q_prep), so batch_q stays RAW and the normed+roped Q exists only in
-         * the kernel's registers.  A "Qcur" dump needs that intermediate in
-         * memory, so it runs the standalone head_rms_norm_rope_tail kernel
-         * first and hands attention pre-normed Q (q_prep NULL).  The two are
-         * bit-exact (shared rope core, replicated reduction -- attn_f16.cu),
-         * and the attention launch is the same fp16 kernel either way (L166:
-         * there is no other attention kernel; a device without the tier is
-         * refused by the attention launch, not routed elsewhere). */
-        const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0);
+         * the kernel's registers -- at 4096 rows the standalone kernel would
+         * round-trip 268 MB of Q per layer (L037 lever 3).  A "Qcur" dump
+         * needs that intermediate in memory, so it runs the standalone
+         * head_rms_norm_rope_tail kernel first and hands attention pre-normed
+         * Q (q_prep NULL).  The two are bit-exact (shared rope core,
+         * replicated reduction -- attn_f16.cu), and the attention launch is
+         * the same fp16 kernel either way (L166: there is no other attention
+         * kernel; a device without the tier is refused by the attention
+         * launch, not routed elsewhere).
+         *
+         * DECODE rows (L210 target 2): the standalone kernel, once per step.
+         * Split-K attention runs 16 blocks per (row, head-group), each folding
+         * a couple of key tiles, and ncu read the block as a latency chain,
+         * not a bandwidth problem: 32 blocks, occupancy 26%, no eligible warp
+         * 90% of cycles, memory 10%, stalls long_scoreboard 42% / lg_throttle
+         * 23% / barrier 11% (rows/L210.md).  That is the fused prologue's
+         * shape -- 16 serial passes, each a global-load round trip and an
+         * 8-level barrier tree -- paid per block where the classic walk paid
+         * it twice per row.  At decode Q is n_dec x 64 x 512 halves, the
+         * standalone round trip is nothing, and the prologue collapses to the
+         * fragment loads.  Same bytes either way (the drafter has always
+         * taken this arm, gpu_decode.cpp); the choice is keyed on L167's
+         * row-kind predicate so a step's rows all take one arm. */
+        const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0) &&
+                                     pulsar_gpu_matmul_batch_decode_rows() == 0;
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
         if (ok && prefill_q_defer) {
