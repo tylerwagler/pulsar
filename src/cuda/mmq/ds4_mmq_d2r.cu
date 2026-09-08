@@ -1071,6 +1071,143 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_exper
 
 
 
+/* ==== L210: the DECODE tier -- a GEMV over the k-major artifact ==============
+ *
+ * The D2R tile above is an m16n8k32 block-scaled MMA whose N dimension is the
+ * assignments of ONE expert.  At decode a routed expert receives ~1 token
+ * whatever the row count (6 of 256 experts per token), so the tile runs at
+ * ~1/8 N-fill on every served shape and reads its weights at ~60% of DRAM
+ * roofline (L208 census: 7.8 ms/token where the bytes take 4.8).  The right
+ * shape at decode is a GEMV.
+ *
+ * Type 44 is K-MAJOR (rows fastest): the word for (row, k256, cw) sits at
+ * q[(k256*8 + cw)*M + row] and its scale at d[k256*M + row].  A warp-per-row
+ * GEMV (what the row-major forks run) would stride M between a lane's
+ * consecutive words; instead a WARP OWNS 32 CONSECUTIVE ROWS and each load is
+ * one 256-byte contiguous slab, the layout's natural access.  The block's 8
+ * warps split K (k256 blocks w, w+8, ...) and reduce through shared memory in
+ * fixed warp order, so the result is deterministic.  Gate and up ride the same
+ * pass and share the activation reads.  Activations are the producer's E4M3 +
+ * ue8m0 blocks ([k128][assignment]), dequantised once per block to f32.
+ *
+ * Numerics: the weight is the EXACT f32 value d * ls * 0.125 * {8,25,43} * sign;
+ * the D2R tile rounds it to E4M3 under a shared exponent first.  Different
+ * bytes by construction -- the reference gate grades it, the byte gates
+ * re-anchor (rows/L210.md).  Output contract is the D2R kernel's:
+ * out[ids_dst[col] * M + row], f32. */
+constexpr int kDecodeGemvRows       = 32;    ///< rows per warp == lanes
+constexpr int kDecodeGemvWarps      = 8;     ///< K split
+constexpr int kDecodeGemvMaxAssign  = 64;    ///< tier cap: <= 8 tokens x 6 experts, with margin
+constexpr int kDecodeGemvMaxK       = 4096;  ///< shared f32 activation slab
+
+__device__ __forceinline__ static float d2r_e4m3_to_f32(uint8_t bits) {
+    return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
+}
+
+__global__ void __launch_bounds__(kDecodeGemvRows * kDecodeGemvWarps)
+gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
+                              const void * __restrict__ up_soa,
+                              const block_mx_act_mmq * __restrict__ act,
+                              const int32_t * __restrict__ ids_dst,
+                              const int32_t * __restrict__ expert_bounds,
+                              float * __restrict__ out_gate,
+                              float * __restrict__ out_up,
+                              int M, int K, int n_assign, int E) {
+    __shared__ float s_x[kDecodeGemvMaxK];
+    __shared__ float s_red[kDecodeGemvWarps][kDecodeGemvRows][2];
+    __shared__ int   s_expert;
+
+    const int col  = blockIdx.y;                 /* assignment (expert-sorted) */
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = warp * kDecodeGemvRows + lane;
+    const int row  = blockIdx.x * kDecodeGemvRows + lane;
+    if (col >= n_assign) return;
+
+    /* Which expert owns this assignment: expert_bounds is E+1 ascending offsets. */
+    if (tid == 0) {
+        int lo = 0, hi = E - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (expert_bounds[mid] <= col) lo = mid; else hi = mid - 1;
+        }
+        s_expert = lo;
+    }
+    /* Stage this assignment's activation row as f32: block i holds k in
+     * [128 i, 128 i + 128) as 4 groups of 32 e4m3 under one ue8m0 byte each
+     * (d4[] carries the byte as a float). */
+    const int n_k128 = K >> 7;
+    for (int i = tid; i < n_k128 * 4; i += kDecodeGemvRows * kDecodeGemvWarps) {
+        const int blk = i >> 2, grp = i & 3;
+        const block_mx_act_mmq &b = act[(uint64_t)blk * (uint64_t)n_assign + (uint64_t)col];
+        const float sc = exp2f(b.d4[grp] - 127.0f);
+        const int8_t *q = b.qs + grp * 32;
+        float *xo = s_x + blk * 128 + grp * 32;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) xo[j] = d2r_e4m3_to_f32((uint8_t)q[j]) * sc;
+    }
+    __syncthreads();
+
+    const int expert = s_expert;
+    const int nb = K >> 8;                       /* k256 blocks per row */
+    const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
+    const uint64_t dq_bytes = (nblk * 2ull + 63ull) & ~63ull;
+    const half  *dg = reinterpret_cast<const half *>(gate_soa) + (uint64_t)expert * nb * (uint64_t)M;
+    const half  *du = reinterpret_cast<const half *>(up_soa)   + (uint64_t)expert * nb * (uint64_t)M;
+    const uint2 *qg = reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(gate_soa) + dq_bytes) +
+                      (uint64_t)expert * nb * 8ull * (uint64_t)M;
+    const uint2 *qu = reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(up_soa) + dq_bytes) +
+                      (uint64_t)expert * nb * 8ull * (uint64_t)M;
+    const bool row_ok = row < M;
+
+    float acc_g = 0.0f, acc_u = 0.0f;
+    for (int b256 = warp; b256 < nb; b256 += kDecodeGemvWarps) {
+        if (!row_ok) break;
+        const float dgb = __half2float(dg[(uint64_t)b256 * (uint64_t)M + row]);
+        const float dub = __half2float(du[(uint64_t)b256 * (uint64_t)M + row]);
+        const uint2 *qgb = qg + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
+        const uint2 *qub = qu + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
+        const float *xb = s_x + b256 * 256;
+#pragma unroll 2
+        for (int cw = 0; cw < 8; ++cw) {
+            const uint2 cg = qgb[(uint64_t)cw * (uint64_t)M];   /* 32 lanes -> 256 contiguous bytes */
+            const uint2 cu = qub[(uint64_t)cw * (uint64_t)M];
+            const float *x = xb + cw * 32;
+            float sg = 0.0f, su = 0.0f;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const uint64_t grid_g = iq2xxs_grid[(cg.x >> (8 * g)) & 0xffu];
+                const uint64_t grid_u = iq2xxs_grid[(cu.x >> (8 * g)) & 0xffu];
+                const uint32_t sgn_g = ds4_unpack_ksigns((uint8_t)((cg.y >> (7 * g)) & 0x7fu));
+                const uint32_t sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float mg = (float)((grid_g >> (8 * j)) & 0xffu);
+                    const float mu = (float)((grid_u >> (8 * j)) & 0xffu);
+                    const float xv = x[g * 8 + j];
+                    sg = fmaf(((sgn_g >> j) & 1u) ? -mg : mg, xv, sg);
+                    su = fmaf(((sgn_u >> j) & 1u) ? -mu : mu, xv, su);
+                }
+            }
+            const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
+            const float lsu = (float)((int)(cu.y >> 27) | 1) * 0.125f;
+            acc_g = fmaf(dgb * lsg, sg, acc_g);
+            acc_u = fmaf(dub * lsu, su, acc_u);
+        }
+    }
+    s_red[warp][lane][0] = acc_g;
+    s_red[warp][lane][1] = acc_u;
+    __syncthreads();
+    if (warp == 0 && row_ok) {
+        float g = 0.0f, u = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kDecodeGemvWarps; ++w) { g += s_red[w][lane][0]; u += s_red[w][lane][1]; }
+        const uint64_t o = (uint64_t)ids_dst[col] * (uint64_t)M + (uint64_t)row;
+        out_gate[o] = g;
+        out_up[o] = u;
+    }
+}
+
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
                                          const void *up_soa,
                                          int64_t soa_blocks,
@@ -1112,6 +1249,29 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
         return -1;
     }
 
+    /* L210: the decode tier.  Few assignments (<= 8 tokens x 6 experts) is the
+     * shape where the MMA tile runs N-starved; the GEMV reads the same k-major
+     * bytes at roofline.  Same output contract, different arithmetic (exact f32
+     * weights vs E4M3-rounded): the reference gate grades it. */
+    if (ne_get_rows <= kDecodeGemvMaxAssign && K <= kDecodeGemvMaxK) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: L210 routed IQ2 gate/up decode tier = k-major GEMV (assignments <= %d)\n",
+                    kDecodeGemvMaxAssign);
+        }
+        const dim3 grid((unsigned)((M + kDecodeGemvRows - 1) / kDecodeGemvRows), (unsigned)ne_get_rows, 1);
+        const dim3 block(kDecodeGemvRows, kDecodeGemvWarps, 1);
+        gateup_iq2_decode_gemv_kernel<<<grid, block, 0, stream>>>(
+            gate_soa, up_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds,
+            out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
+        const cudaError_t gerr = cudaGetLastError();
+        if (gerr != cudaSuccess) {
+            fprintf(stderr, "%s: decode GEMV launch failed: %s\n", tag, cudaGetErrorString(gerr));
+            return -3;
+        }
+        return 0;
+    }
     const bool narrow = d2r_use_narrow_tile(ne_get_rows);
     const int64_t capacity64 = d2r_work_capacity_for_tile(
         ne_get_rows, n_experts, narrow ? kNTileNarrow : kNTile);
