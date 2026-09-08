@@ -934,12 +934,25 @@ static void attn_f16_kernel(
  * order, so the result is deterministic.  The sink enters exactly as in the
  * classic epilogue: denominator mass only, never rounded to fp16.  l is
  * strictly positive (the sink term is exp(sink - nm) with nm >= sink), so the
- * classic path's zero-denominator guard has no case here. */
+ * classic path's zero-denominator guard has no case here.
+ *
+ * With fold_rope the kernel also applies the heads' INVERSE tail rope that
+ * rope_tail_kernel (pulsar_cuda_norm_kv.cu) would otherwise apply in a
+ * launch of its own right after attention: the tail value is rounded to the
+ * stored heads type first, exactly as that kernel reads it back, then
+ * rotated with the shared YaRN core and stored -- the same two roundings in
+ * the same order, so the same bytes as the two-kernel sequence, and the
+ * decode blob is the proof.  The rope constants are Q's (one rope for the
+ * model; the engine passes the same freq/YaRN settings to both), the
+ * position is the row's, the direction is inverse -- as the engine's
+ * rope_tail call for heads has always been. */
 __global__ __launch_bounds__(AF16_DIM)
 static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
                                     const float *__restrict__ sinks,
                                     const float *__restrict__ partials,
-                                    uint32_t n_head, uint32_t n_split) {
+                                    uint32_t n_head, uint32_t n_split,
+                                    const int32_t *__restrict__ positions, uint32_t pos0,
+                                    pulsar_gpu_q_prep qp, int fold_rope) {
     const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const float *base = partials + ((uint64_t)t * n_head + h) * n_split * AF16_PART_STRIDE;
     float mx = -INFINITY;
@@ -955,7 +968,31 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
         l = fmaf(rec[1], w, l);
         acc = fmaf(rec[AF16_PART_ACC + d], w, acc);
     }
-    heads_store(heads, ((uint64_t)t * n_head + h) * AF16_DIM + d, acc / l);
+    const float v = acc / l;
+    pulsar_heads_t *row = heads + ((uint64_t)t * n_head + h) * AF16_DIM;
+    if (!fold_rope) {
+        heads_store(row, d, v);
+        return;
+    }
+    const uint32_t n_nope = AF16_DIM - qp.n_rot;
+    /* Every lane of the warp joins the shuffle (the tail is whole warps:
+     * n_rot is even and AF16_DIM a multiple of 32); the odd lane's rounded
+     * value travels to its even partner, which stores the rotated pair. */
+    const float x_next = __shfl_down_sync(0xffffffffu, heads_round(v), 1);
+    if (d < n_nope) {
+        heads_store(row, d, v);
+    } else if ((d & 1u) == 0u) {
+        const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (qp.ext_factor != 0.0f)
+            rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base, qp.beta_fast, qp.beta_slow, &corr0, &corr1);
+        float r0, r1;
+        rope_pair_rotate_core_dev(heads_round(v), x_next, d - n_nope, qp.n_rot, rope_pos, 1,
+                                  qp.freq_base, qp.freq_scale, qp.ext_factor, qp.attn_factor,
+                                  corr0, corr1, &r0, &r1);
+        heads_store(row, d, r0);
+        heads_store(row, d + 1u, r1);
+    }
 }
 
 /* ---- launcher ----------------------------------------------------------- */
@@ -1304,7 +1341,12 @@ int pulsar_gpu_attention_f16_indexed(
                                             partials, n_dec);
     if (!cuda_ok(cudaGetLastError(), "attention f16 indexed launch")) return 0;
     if (n_dec != 0u) {
-        attn_f16_combine_kernel<<<dim3(n_dec, n_head, 1), AF16_DIM>>>(heads, sinks, partials, n_head, AF16_SPLITS);
+        /* The heads' inverse tail rope folds in here whenever the fused Q prep
+         * is on (q_prep != NULL); the engine then ropes only the rows past
+         * n_dec.  With q_prep NULL (the Qcur dump) the engine ropes every row
+         * as before. */
+        attn_f16_combine_kernel<<<dim3(n_dec, n_head, 1), AF16_DIM>>>(heads, sinks, partials, n_head, AF16_SPLITS,
+                                                                       (const int32_t *)positions, pos0, qp, q_prep != NULL);
         return cuda_ok(cudaGetLastError(), "attention f16 split-K combine launch");
     }
     return 1;
