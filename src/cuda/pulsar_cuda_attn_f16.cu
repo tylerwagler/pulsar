@@ -117,14 +117,23 @@
 #define AF16_PART_STRIDE  (AF16_PART_ACC + AF16_DIM)
 static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
               "partial accumulators must stay 16-byte aligned: the epilogue stores float2 pairs");
-/* The split count is FIXED, and the partition (ceil(n_tiles / AF16_SPLITS)
- * tiles per split, of the row's OWN tile count) is a function of the row's
- * context alone -- never of how many rows share the launch.  A count derived
- * from the row count would give a row a different accumulation order at 1 row
- * than at 3, which is the L161 class of split the row-neutrality gates exist
- * to refuse.  16: at one token 32 blocks each fold a couple of tiles at 512
- * ctx; a 16-row step launches 512 blocks whose prologue is the price of the
- * fixed count.  Splits past a row's tile count fold as empty. */
+/* LOGICAL splits vs PHYSICAL blocks.  The numerics are the logical split: a
+ * row's key tiles are partitioned into AF16_SPLITS contiguous ranges of
+ * ceil(n_tiles / AF16_SPLITS) tiles, a function of the row's OWN context and
+ * never of how many rows share the launch -- a count derived from the row
+ * count would give a row a different accumulation order at 1 row than at 3,
+ * the L161 class of split the row-neutrality gates refuse.  Each logical
+ * split's partial depends on its own tiles alone, so WHICH block folds it,
+ * and whether that block folds others before or after, cannot change a byte.
+ * The launcher therefore picks the PHYSICAL block count per (row, head-group)
+ * -- gridDim.z = n_phys in [1, AF16_SPLITS] -- to put about two blocks on
+ * every SM, and a block folds logical splits z, z + n_phys, ... in turn,
+ * resetting its softmax state between them.  One row: 16 blocks per
+ * head-group, one or two tiles each.  Twelve rows: 4, each folding four
+ * splits -- the per-block fixed cost (launch, ring preamble, Q fragments,
+ * first-stage latency) that made the 1:1 version a wash at served widths
+ * (rows/L210.md) is paid 4x per row instead of 16x.  Splits past a row's tile
+ * count fold as empty. */
 #define AF16_SPLITS       16u
 __device__ __forceinline__ static float *af16_part_acc(float *partials, uint32_t t, uint32_t n_head,
                                                        uint32_t h, uint32_t n_split, uint32_t split) {
@@ -290,11 +299,13 @@ static void attn_f16_kernel(
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
     if (t >= n_tokens || hbase >= n_head) return;
-    /* L210: a decode row's blocks share its walk; a prefill row's walk is
-     * blockIdx.z == 0's alone.  Block-uniform, and before every barrier. */
-    const uint32_t split = blockIdx.z, n_split = gridDim.z;
+    /* L210: a decode row's blocks share its walk (physical block z folds
+     * logical splits z, z + n_phys, ...); a prefill row's walk is blockIdx.z
+     * == 0's alone.  Block-uniform, and before every barrier. */
+    const uint32_t phys = blockIdx.z, n_phys = gridDim.z;
+    const uint32_t n_split = AF16_SPLITS;
     const int split_mode = (t < n_dec);
-    if (!split_mode && split != 0u) return;
+    if (!split_mode && phys != 0u) return;
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -316,7 +327,8 @@ static void attn_f16_kernel(
             /* An empty partial from every split: the combine folds nothing and
              * stores zero heads, as the classic path below does directly. */
             if (tid < AF16_HPB)
-                af16_part_header(partials, t, n_head, hbase + tid, n_split, split, -INFINITY, 0.0f);
+                for (uint32_t sp = phys; sp < n_split; sp += n_phys)
+                    af16_part_header(partials, t, n_head, hbase + tid, n_split, sp, -INFINITY, 0.0f);
             return;
         }
         for (uint32_t i = tid; i < AF16_HPB * AF16_DIM; i += AF16_THREADS) {
@@ -418,26 +430,14 @@ static void attn_f16_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)AF16_DIM);
 
-    /* ---- L210: this block's share of the key tiles ---------------------
-     * Whole tiles, contiguous, ceil(n_tiles / n_split) per split with
-     * n_split fixed (AF16_SPLITS), so the partition is a function of this
-     * row's own context and the tile boundaries -- the rows staged together
-     * -- are those of the classic walk.  A split past the last tile folds
-     * nothing. */
-    uint32_t row_lo = 0u, row_hi = n_score;
-    if (split_mode) {
-        const uint32_t n_tiles = (n_score + AF16_ROWS - 1u) / AF16_ROWS;
-        const uint32_t tps = (n_tiles + n_split - 1u) / n_split;
-        const uint32_t tile_lo = split * tps;
-        if (tile_lo >= n_tiles) {
-            if (tid < AF16_HPB)
-                af16_part_header(partials, t, n_head, hbase + tid, n_split, split, -INFINITY, 0.0f);
-            return;
-        }
-        const uint32_t tile_hi = min(n_tiles, tile_lo + tps);
-        row_lo = tile_lo * AF16_ROWS;
-        row_hi = min(n_score, tile_hi * AF16_ROWS);
-    }
+    /* ---- L210: the logical splits this block folds -----------------------
+     * Whole tiles, contiguous, ceil(n_tiles / AF16_SPLITS) per logical split,
+     * so the partition is a function of this row's own context and the tile
+     * boundaries -- the rows staged together -- are those of the classic
+     * walk.  The classic path is the loop run once over the whole window. */
+    const uint32_t n_tiles = (n_score + AF16_ROWS - 1u) / AF16_ROWS;
+    const uint32_t tps = split_mode ? (n_tiles + n_split - 1u) / n_split : 0u;
+    const uint32_t n_iter = split_mode ? (n_split - phys + n_phys - 1u) / n_phys : 1u;
 
     /* __align__(16) is REQUIRED by the ldmatrix in phase 3: it loads 8 x 16 bits
      * per lane and the address must be 16-byte aligned.  A __half array is only
@@ -593,9 +593,26 @@ static void attn_f16_kernel(
         __pipeline_commit();                                                  \
     } while (0)
 
+    float acc[AF16_MT][AF16_DPW / 8u][4];
+    for (uint32_t it = 0; it < n_iter; it++) {
+    uint32_t split = 0u, row_lo = 0u, row_hi = n_score;
+    if (split_mode) {
+        split = phys + it * n_phys;
+        const uint32_t tile_lo = split * tps;
+        if (tile_lo >= n_tiles) {
+            /* Past this row's last tile: an empty partial, nothing to fold.
+             * Block-uniform (split, n_tiles), so the continue is too. */
+            if (tid < AF16_HPB)
+                af16_part_header(partials, t, n_head, hbase + tid, n_split, split, -INFINITY, 0.0f);
+            continue;
+        }
+        const uint32_t tile_hi = min(n_tiles, tile_lo + tps);
+        row_lo = tile_lo * AF16_ROWS;
+        row_hi = min(n_score, tile_hi * AF16_ROWS);
+    }
+
     /* ---- running softmax state + output accumulator --------------------- */
     if (tid < AF16_HPB) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
-    float acc[AF16_MT][AF16_DPW / 8u][4];
     #pragma unroll
     for (uint32_t m = 0; m < AF16_MT; m++)
         #pragma unroll
@@ -750,7 +767,11 @@ static void attn_f16_kernel(
     /* ---- L210 split mode: hand the unnormalised partial to the combine --
      * sM/sL are the last tile's state (the loop's closing barrier published
      * them); acc[] is the lane's own.  No sink here: it is denominator mass
-     * the combine adds once. */
+     * the combine adds once.  The next logical split, if this block has
+     * one, resets the state at the top of the iteration; its reset writes
+     * sM/sL from the same 32 threads that read them here, and the tile
+     * loop's closing barrier already ordered every smem read of this split
+     * before any of its staging. */
     if (split_mode) {
         if (tid < AF16_HPB)
             af16_part_header(partials, t, n_head, hbase + tid, n_split, split, sM[tid], sL[tid]);
@@ -771,8 +792,10 @@ static void attn_f16_kernel(
                 *(float2 *)&pb[nb + tg * 2u] = make_float2(acc[m][n][2], acc[m][n][3]);
             }
         }
-        return;
+        continue;
     }
+    }   /* for it: logical splits (one iteration on the classic path) */
+    if (split_mode) return;
 
     /* ---- epilogue: fold the sink, normalise, store ---------------------- */
     if (tid < AF16_HPB) {
@@ -987,6 +1010,21 @@ static int af16_dynsmem_ok(void) {
                     cudaGetErrorString(e));
     }
     return state > 0;
+}
+
+/* Two blocks per SM: enough to cover the machine at one row without making a
+ * wide step's blocks mostly fixed cost.  Asked of the device once. */
+static uint32_t af16_split_target_blocks(void) {
+    static int sms = 0;
+    if (sms <= 0) {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
+            sms = n;
+        else
+            sms = 48;   /* the GB10; only reached if the attribute query fails */
+    }
+    return 2u * (uint32_t)sms;
 }
 
 /* L210: the split-K partials.  A value that must survive the combine launch
@@ -1207,21 +1245,25 @@ int pulsar_gpu_attention_f16_indexed(
      * launch keep the classic walk on z == 0, byte for byte. */
     const int dec_rows = pulsar_gpu_matmul_batch_decode_rows();
     const uint32_t n_dec = dec_rows > 0 ? min((uint32_t)dec_rows, n_tokens) : 0u;
-    uint32_t n_split = 1u;
+    uint32_t n_phys = 1u;
     float *partials = NULL;
     if (n_dec != 0u) {
-        n_split = AF16_SPLITS;
-        partials = af16_partials(n_dec, n_head, n_split);
+        const uint32_t groups = n_dec * (n_head / AF16_HPB);
+        n_phys = (af16_split_target_blocks() + groups - 1u) / groups;
+        if (n_phys > AF16_SPLITS) n_phys = AF16_SPLITS;
+        if (n_phys == 0u) n_phys = 1u;
+        partials = af16_partials(n_dec, n_head, AF16_SPLITS);
         if (!partials) return 0;   /* af16_partials said why */
         static int announced = 0;
         if (!announced) {
             announced = 1;
             fprintf(stderr, "pulsar: decode attention = split-K flash-decode over the fp16 tensor-core tile "
-                            "(decode rows only; %u splits x %u head-groups per row)\n",
-                    n_split, n_head / AF16_HPB);
+                            "(decode rows only; %u logical splits x %u head-groups per row, physical blocks "
+                            "sized to %u)\n",
+                    (unsigned)AF16_SPLITS, n_head / AF16_HPB, af16_split_target_blocks());
         }
     }
-    dim3 grid(n_tokens, n_head / AF16_HPB, n_split);
+    dim3 grid(n_tokens, n_head / AF16_HPB, n_phys);
     attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
@@ -1237,7 +1279,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             partials, n_dec);
     if (!cuda_ok(cudaGetLastError(), "attention f16 indexed launch")) return 0;
     if (n_dec != 0u) {
-        attn_f16_combine_kernel<<<dim3(n_dec, n_head, 1), AF16_DIM>>>(heads, sinks, partials, n_head, n_split);
+        attn_f16_combine_kernel<<<dim3(n_dec, n_head, 1), AF16_DIM>>>(heads, sinks, partials, n_head, AF16_SPLITS);
         return cuda_ok(cudaGetLastError(), "attention f16 split-K combine launch");
     }
     return 1;
