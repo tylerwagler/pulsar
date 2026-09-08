@@ -1173,10 +1173,20 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
         const uint2 *qgb = qg + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
         const uint2 *qub = qu + ((uint64_t)b256 * 8ull) * (uint64_t)M + row;
         const float *xb = s_x + b256 * 256;
-#pragma unroll 2
+        /* All 16 code words of this k256 block (8 gate, 8 up; 256 contiguous bytes
+         * per warp each) are fetched before any of them is used: the round-3
+         * profile was 77% long_scoreboard with one or two loads in flight per
+         * warp.  Same lesson as L203 on the tile. */
+        uint2 cgw[8], cuw[8];
+#pragma unroll
         for (int cw = 0; cw < 8; ++cw) {
-            const uint2 cg = qgb[(uint64_t)cw * (uint64_t)M];   /* 32 lanes -> 256 contiguous bytes */
-            const uint2 cu = qub[(uint64_t)cw * (uint64_t)M];
+            cgw[cw] = qgb[(uint64_t)cw * (uint64_t)M];
+            cuw[cw] = qub[(uint64_t)cw * (uint64_t)M];
+        }
+#pragma unroll
+        for (int cw = 0; cw < 8; ++cw) {
+            const uint2 cg = cgw[cw];
+            const uint2 cu = cuw[cw];
             /* The activations come out of shared memory as two float4 broadcasts
              * per 8-weight group -- ONE shared load per 4 MACs per matrix. The
              * first cut loaded one float per weight and saturated the LSU pipe
