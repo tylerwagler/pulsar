@@ -744,7 +744,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 # The prefill's own frontier logits never see the compressor state, ring or
 # seed the prefill leaves behind; this gate does.  Anchored separately (the
 # decode numerics move when the prefill's do not, and vice versa).
-PREFILL_DECODE_BASELINE_REF ?= 684fa8d
+PREFILL_DECODE_BASELINE_REF ?= 4d0172e
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
