@@ -2397,6 +2397,19 @@ bool gpu_graph_bank_set_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
  * inside the very region the graph capture brackets. */
 void gpu_graph_bank_mirror_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
                                   uint32_t comp, uint32_t index);
+/** L209: the contract under which a banked round's compressor step (layer il,
+ * compression `ratio`, `n_tokens` rows) runs on-device. The whole-sweep graph
+ * capture (gpu_graph_decode_multiseq_batch) asks this for every compressing
+ * layer before it captures, so a round the capture would replay is exactly a
+ * round whose every launch argument came from device memory. Announces the
+ * first decline once. */
+bool l209_dev_step_eligible(const pulsar_gpu_graph *g, uint32_t il, uint32_t ratio,
+                            uint32_t n_tokens, bool mseq, bool indexer);
+/** L209: the host side-effects a REPLAYED sweep must reproduce, because none of
+ * the encoders' host code ran: the hc carrier swap (43 per-layer swaps, net one)
+ * and the counter mirror advance ((pos+1)/ratio per emitting row per compressing
+ * layer -- the arithmetic the device kernels performed). */
+void gpu_graph_multiseq_replay_host_effects(pulsar_gpu_graph *g, uint32_t n_tokens);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

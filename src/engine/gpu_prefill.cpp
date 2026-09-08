@@ -476,8 +476,8 @@ static bool gpu_graph_indexed_attention_span(
  * back to host-baked launches is visible in the log (Rule 5), and a mismatch
  * between this predicate and the whole-sweep capture's eligibility (imatrix.cpp)
  * cannot hide. */
-static bool l209_dev_step_eligible(const pulsar_gpu_graph *g, uint32_t il, uint32_t ratio,
-                                   uint32_t n_tokens, bool mseq, bool indexer) {
+bool l209_dev_step_eligible(const pulsar_gpu_graph *g, uint32_t il, uint32_t ratio,
+                            uint32_t n_tokens, bool mseq, bool indexer) {
     const char *why = NULL;
     if (!mseq) why = "not a banked step";
     else if (g->state_only) why = "state-only warm-up";
@@ -504,6 +504,31 @@ static bool l209_dev_step_eligible(const pulsar_gpu_graph *g, uint32_t il, uint3
         return false;
     }
     return true;
+}
+
+void gpu_graph_multiseq_replay_host_effects(pulsar_gpu_graph *g, uint32_t n_tokens) {
+    /* The hc carrier swap: encode_layer_batch swaps cur/next once per layer;
+     * PULSAR_N_LAYER (43) is odd, so the sweep's net effect is ONE swap. Keyed
+     * into the graph as parity, replicated here so the next round's key and
+     * the head's source buffer agree with what the replayed kernels wrote. */
+    if (PULSAR_N_LAYER & 1u) {
+        pulsar_gpu_tensor *tmp = g->batch_cur_hc;
+        g->batch_cur_hc = g->batch_next_hc;
+        g->batch_next_hc = tmp;
+    }
+    /* The counter mirror: exactly the arithmetic the device kernels performed
+     * (comp_dev_advance_kernel), per emitting row per compressing layer. */
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        if (ratio == 0u) continue;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t b = (uint32_t)g->ms_seq_id[t];
+            const uint32_t p = (uint32_t)g->ms_positions[t];
+            if (((p + 1u) % ratio) != 0u) continue;
+            gpu_graph_bank_mirror_counts(g, b, il, g->ms_n_comp[b][il] + 1u,
+                                         g->ms_n_index_comp[b][il] + (ratio == 4u ? 1u : 0u));
+        }
+    }
 }
 
 bool gpu_graph_encode_layer_attention_batch(

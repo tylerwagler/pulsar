@@ -1117,10 +1117,88 @@ int gpu_graph_decode_multiseq_batch(
         for (uint32_t r = 0; r < head_runs; r++)
             if ((uint32_t)last_idx[r] != r) { head_single_block = false; break; }
 
+    /* L209: capture the WHOLE sweep -- 43 layers plus the head -- as ONE graph
+     * and replay it every round. L119 captured FFN brackets keyed per layer at
+     * 87% replay and lost 13%; Entrpi captures the whole step, replayed every
+     * round, and banks -16%. The unit is the difference. A round is eligible
+     * when every launch argument in it comes from device memory: the banked
+     * lane (positions/bank ids are device arrays, attention takes the cap), the
+     * on-device compressor step on every compressing layer (the same predicate
+     * those layers consult), no layer on the indexed span (it still bakes a host
+     * position), no zero-prefix row (prefill arms), the identity head. Key:
+     * rows, hc parity, head rows. Replay reproduces the sweep's host effects. */
+    uint64_t sweep_key = 0;
+    if (g->batch_multiseq && g->banks.n_banks != 0u && head_single_block && head_runs == n_active &&
+        n_active <= PULSAR_MSEQ_MAX && !g->state_only && !gpu_graph_f32_store_observed_any()) {
+        bool eligible = true;
+        for (uint32_t t = 0; eligible && t < n_active; t++)
+            if (pos[t] <= 0) eligible = false;
+        for (uint32_t il = 0; eligible && il < PULSAR_N_LAYER; il++) {
+            const uint32_t ratio = pulsar_layer_compress_ratio(il);
+            if (ratio == 0u) continue;
+            if (ratio == 4u && g->batch_comp_sup[il] > PULSAR_N_INDEXER_TOP_K) eligible = false;
+            else if (!l209_dev_step_eligible(g, il, ratio, n_active, true, false)) eligible = false;
+            else if (ratio == 4u && !l209_dev_step_eligible(g, il, ratio, n_active, true, true)) eligible = false;
+        }
+        if (eligible) {
+            const uint64_t hc_parity =
+                (uintptr_t)(const void *)g->batch_cur_hc >
+                (uintptr_t)(const void *)g->batch_next_hc ? 1ull : 0ull;
+            sweep_key = (0xA9ull << 56) | (hc_parity << 40) | ((uint64_t)head_runs << 24) | (uint64_t)n_active;
+        }
+    }
+
     bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-        ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
-                                          (uint32_t)pos[0], n_active);
+    int seg_st = 0;
+    decltype(g->ms_n_comp) snap_comp;
+    decltype(g->ms_n_index_comp) snap_index;
+    if (ok && sweep_key != 0) {
+        /* A capture that fails executes NOTHING, but the encoders' host code
+         * (counter mirror, hc swaps) runs during the attempt: snapshot so the
+         * eager re-run starts from the round's true state. */
+        memcpy(snap_comp, g->ms_n_comp, sizeof snap_comp);
+        memcpy(snap_index, g->ms_n_index_comp, sizeof snap_index);
+        seg_st = pulsar_gpu_seg_enter(sweep_key);
+    }
+    if (seg_st == 2) {
+        static int announced = 0;
+        if (!announced) {   /* Rule 5: the lane taken names itself, once */
+            announced = 1;
+            fprintf(stderr, "pulsar: L209 whole-sweep decode graph REPLAYING (%u rows, %u layers + head as one graph)\n",
+                    n_active, PULSAR_N_LAYER);
+        }
+        gpu_graph_multiseq_replay_host_effects(g, n_active);
+    } else {
+        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+            ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
+                                              (uint32_t)pos[0], n_active);
+        }
+        /* The identity head joins the sweep's command block (and its capture:
+         * the head's own segment stays eager while an outer capture is open,
+         * so its kernels are recorded into this graph). */
+        if (ok && head_single_block)
+            ok = gpu_graph_encode_output_head_batch(g, model, weights,
+                                                    head_runs, weights->output->dim[1]);
+        if (seg_st == 1 && !pulsar_gpu_seg_exit(sweep_key, ok ? 1 : 0)) {
+            /* Capture failed (key poisoned, eager from now on). The recorded
+             * work never ran: undo the aborted pass's host effects and run it
+             * for real. */
+            memcpy(g->ms_n_comp, snap_comp, sizeof snap_comp);
+            memcpy(g->ms_n_index_comp, snap_index, sizeof snap_index);
+            if (PULSAR_N_LAYER & 1u) {
+                pulsar_gpu_tensor *tmp = g->batch_cur_hc;
+                g->batch_cur_hc = g->batch_next_hc;
+                g->batch_next_hc = tmp;
+            }
+            ok = true;
+            for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
+                ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il,
+                                                  (uint32_t)pos[0], n_active);
+            }
+            if (ok && head_single_block)
+                ok = gpu_graph_encode_output_head_batch(g, model, weights,
+                                                        head_runs, weights->output->dim[1]);
+        }
     }
     /* HOST time to encode all PULSAR_N_LAYER layers. On a single-stream
      * drafter-off decode this is the LARGER half of the step (measured
@@ -1133,8 +1211,8 @@ int gpu_graph_decode_multiseq_batch(
          * Decode-only (head_runs == n_active) is byte-identical to before; an
          * intermediate fused step (head_runs == n_dec < n_active) heads only the
          * decode banks and skips the whole prefill-head two-block. */
-        if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        head_runs, weights->output->dim[1]);
+        /* (The head itself was encoded above, inside the sweep's command block
+         * -- and its capture, when one is open.) */
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     } else {
         /* Prefill/mixed final: close the layer block so batch_cur_hc is final,
