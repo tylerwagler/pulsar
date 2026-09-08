@@ -1177,7 +1177,11 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
         for (int cw = 0; cw < 8; ++cw) {
             const uint2 cg = qgb[(uint64_t)cw * (uint64_t)M];   /* 32 lanes -> 256 contiguous bytes */
             const uint2 cu = qub[(uint64_t)cw * (uint64_t)M];
-            const float *x = xb + cw * 32;
+            /* The activations come out of shared memory as two float4 broadcasts
+             * per 8-weight group -- ONE shared load per 4 MACs per matrix. The
+             * first cut loaded one float per weight and saturated the LSU pipe
+             * (ncu: memory 9.6%, short_scoreboard 49%, tex_throttle 27%). */
+            const float4 *x4 = reinterpret_cast<const float4 *>(xb + cw * 32);
             float sg = 0.0f, su = 0.0f;
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
@@ -1185,13 +1189,20 @@ gateup_iq2_decode_gemv_kernel(const void * __restrict__ gate_soa,
                 const uint64_t grid_u = s_grid[(cu.x >> (8 * g)) & 0xffu];
                 const uint32_t sgn_g = ds4_unpack_ksigns((uint8_t)((cg.y >> (7 * g)) & 0x7fu));
                 const uint32_t sgn_u = ds4_unpack_ksigns((uint8_t)((cu.y >> (7 * g)) & 0x7fu));
+                const float4 xa = x4[g * 2], xb4 = x4[g * 2 + 1];
+                const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb4.x, xb4.y, xb4.z, xb4.w};
+                const uint32_t glo = (uint32_t)grid_g, ghi = (uint32_t)(grid_g >> 32);
+                const uint32_t ulo = (uint32_t)grid_u, uhi = (uint32_t)(grid_u >> 32);
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const float mg = (float)((grid_g >> (8 * j)) & 0xffu);
-                    const float mu = (float)((grid_u >> (8 * j)) & 0xffu);
-                    const float xv = x[g * 8 + j];
-                    sg = fmaf(((sgn_g >> j) & 1u) ? -mg : mg, xv, sg);
-                    su = fmaf(((sgn_u >> j) & 1u) ? -mu : mu, xv, su);
+                    /* byte j of the 8-byte grid entry, zero-extended in one op */
+                    const uint32_t bg = __byte_perm(j < 4 ? glo : ghi, 0u, 0x4440u | (uint32_t)(j & 3));
+                    const uint32_t bu = __byte_perm(j < 4 ? ulo : uhi, 0u, 0x4440u | (uint32_t)(j & 3));
+                    /* sign = bit j of the sign byte, moved to the float sign bit */
+                    const float mg = __uint_as_float(__float_as_uint((float)bg) | (((sgn_g >> j) & 1u) << 31));
+                    const float mu = __uint_as_float(__float_as_uint((float)bu) | (((sgn_u >> j) & 1u) << 31));
+                    sg = fmaf(mg, xv[j], sg);
+                    su = fmaf(mu, xv[j], su);
                 }
             }
             const float lsg = (float)((int)(cg.y >> 27) | 1) * 0.125f;
