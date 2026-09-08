@@ -885,6 +885,12 @@ cuda-reference-gate:
 # PREFILL_BASELINE_REF: do this only when a change has been GRADED CLOSER to the
 # source and adopted, and say why in the commit.  Re-recording to silence a
 # regression is the one thing that makes this gate worthless.
+#
+# A change graded UNCHANGED (L211: every moving depth under the 1e-6 noise floor
+# on both sides) lands WITHOUT a re-record.  The budget stays where the last
+# CLOSER change put it, so sub-floor moves accumulate against that anchor and
+# the first one to cross the floor votes -- re-recording after each would reset
+# the drift to zero and let it walk.
 .PHONY: cuda-reference-gate-budget
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \

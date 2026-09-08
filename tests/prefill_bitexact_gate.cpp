@@ -768,6 +768,36 @@ static void row_entropy(const float *row, int width, double *H_out, double *p1_o
  * a control. */
 #define GATE_NET_DEAD_BAND 5e-5   /* = 0.005%, half of the last printed digit */
 
+/* L211 (2026-09-08): a confident depth whose KL sits under this floor on BOTH
+ * sides (recorded budget and this run) does not vote in the NET.
+ *
+ * WHY.  The NET has no absolute floor of its own, so a move of a few 1e-8 at
+ * one depth decides the sign whenever every other depth is identical -- and
+ * it did, three times, always at story 4102 against a 1.975e-07 budget:
+ * L191 read 2.464e-07 (+24.7%), L210's exact-f32 GEMV 2.425e-07 (+22.8%) and
+ * the SAME kernel with the MMA tile's own E4M3 weight rounding 3.248e-07
+ * (+64%).  Byte-identical weights, two summation orders, opposite sides of
+ * the third: at this scale the sign is which fma ran first, not fidelity.
+ * L180 measured the same band from the other direction, before L195 made the
+ * prefill chunk-neutral: re-chunking the prompt then moved these depths 20x
+ * either way (1.8e-07..2.8e-06) with no chunking systematically closer.  The
+ * LARGE single-depth guard below already carries an absolute floor (1e-5)
+ * for exactly this reason; the NET now has one too.
+ *
+ * WHY 1e-6.  A decade above the largest accumulation-order move measured
+ * (1.3e-07), a decade under the LARGE guard's floor, two under the per-depth
+ * tolerance.  Not a tolerance on fidelity: the floor is tested on BOTH
+ * sides, so a depth that crosses it in either direction votes with its full
+ * delta -- a regression from under the floor to over it fails, and an
+ * improvement from over the floor to under it keeps its credit (the
+ * hc_expand adoption's 4102, 2.0e-06 -> 1.975e-07, still counts; only its
+ * 6144 vote, 3.9e-07 -> 9.6e-08, would have gone quiet, changing nothing
+ * about that verdict).  Mutation controls for each branch are recorded in
+ * pulsar-notes rows/L211.md.  Because the budget is NOT re-recorded for an
+ * UNCHANGED grade, sub-floor moves cannot stack unseen: they accumulate
+ * against the last CLOSER anchor until one crosses the floor and votes. */
+#define GATE_NET_FLOOR 1e-6
+
 /* L180: the reference mode's prefill chunk.  4096 is production parity; the
  * --prefill-chunk override exists to grade OTHER chunkings of the same prompt
  * against the same reference rows -- the prefill lane is not chunk-mate
@@ -950,22 +980,27 @@ static int run_check_reference(const char *model, const char *ref_path,
     if (kl_base_path && n_kl_out > 0) {
         double sum_cur = 0.0, sum_base = 0.0;          /* CONFIDENT depths only */
         double flat_cur = 0.0, flat_base = 0.0;        /* FLAT depths, reported  */
-        int matched = 0, n_flat = 0, worse_big = 0;
+        int matched = 0, n_flat = 0, n_floor = 0, worse_big = 0;
         printf("\n  KL DIRECTION vs %s:\n", kl_base_path);
         for (int k = 0; k < n_kl_out; k++) {
             double b = kl_baseline_lookup(kl_base_path, kl_out[k].depth);
             if (b < 0.0) { printf("    depth %6u: %.3e  (no baseline entry)\n",
                                   kl_out[k].depth, kl_out[k].kl); continue; }
+            /* One predicate decides the vote and the printed tag (L211). */
+            const int at_floor = !kl_out[k].flat &&
+                                 kl_out[k].kl < GATE_NET_FLOOR && b < GATE_NET_FLOOR;
             if (kl_out[k].flat) { n_flat++; flat_cur += kl_out[k].kl; flat_base += b; }
+            else if (at_floor)  { n_floor++; }
             else                { matched++; sum_cur += kl_out[k].kl; sum_base += b; }
             const double rel = (b > 0.0) ? (kl_out[k].kl - b) / b : 0.0;
             const char *tag = (kl_out[k].kl < b) ? "CLOSER" :
                               (kl_out[k].kl > b) ? "further" : "same";
-            printf("    depth %6u: %.3e vs %.3e  %+7.1f%%  %s   [%s H=%.3f p1=%.3f]%s\n",
+            printf("    depth %6u: %.3e vs %.3e  %+7.1f%%  %s   [%s H=%.3f p1=%.3f]%s%s\n",
                    kl_out[k].depth, kl_out[k].kl, b, rel * 100.0, tag,
                    kl_out[k].flat ? "FLAT     " : "confident",
                    kl_out[k].H, kl_out[k].p1,
-                   kl_out[k].known_high ? "  (known-high)" : "");
+                   kl_out[k].known_high ? "  (known-high)" : "",
+                   at_floor ? "  (both under the 1e-6 noise floor: no NET vote)" : "");
             /* Large single-depth regression: 10x worse AND above 1e-5.
              *
              * ⚠ THE ABSOLUTE FLOOR IS THE LOAD-BEARING HALF, and it was raised
@@ -1007,8 +1042,9 @@ static int run_check_reference(const char *model, const char *ref_path,
             const char *dir = moved_further ? "FURTHER FROM SOURCE"
                             : (net < -GATE_NET_DEAD_BAND) ? "CLOSER TO SOURCE"
                             : "UNCHANGED (below this gate's display resolution)";
-            printf("  NET over %d CONFIDENT depths: %.6e vs %.6e  (%+.2f%%) -> %s\n",
-                   matched, sum_cur, sum_base, net * 100.0, dir);
+            printf("  NET over %d CONFIDENT depths (%d more at the noise floor, not voting): "
+                   "%.6e vs %.6e  (%+.2f%%) -> %s\n",
+                   matched, n_floor, sum_cur, sum_base, net * 100.0, dir);
             if (enforce && moved_further) {
                 fprintf(stderr, "REFERENCE GATE FAIL: net KL over CONFIDENT depths "
                                 "moved AWAY from the source (%.6e > %.6e)\n",
@@ -1020,6 +1056,9 @@ static int run_check_reference(const char *model, const char *ref_path,
                                 ">10x above 1e-5\n");
                 fail = 1;
             }
+        } else if (n_floor > 0) {
+            printf("  NET: all %d CONFIDENT depths under the 1e-6 noise floor on both sides "
+                   "-> UNCHANGED\n", n_floor);
         }
     }
     if (kl_dump_path && n_kl_out > 0) {
