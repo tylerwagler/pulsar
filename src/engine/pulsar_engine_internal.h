@@ -728,6 +728,16 @@ typedef struct {
     pulsar_gpu_tensor *index[PULSAR_MAX_LAYER][PULSAR_MSEQ_MAX];  ///< indexer cache, same per-(layer,bank) shape
     pulsar_gpu_tensor *comp_bases[PULSAR_MAX_LAYER];  ///< device array of the n_banks comp[il][*] pointers, indexed by seq_id[t]; NULL when the pool is disabled
     pulsar_gpu_tensor *index_bases[PULSAR_MAX_LAYER]; ///< device array of the n_banks index[il][*] pointers, indexed by seq_id[t]
+    /** L209: the per-(bank, layer) compressed-row counters ON THE DEVICE --
+     * u32[n_banks][PULSAR_N_LAYER], index [bank * PULSAR_N_LAYER + il]. The
+     * batched compressor/indexer kernels read their emit row here instead of a
+     * host scalar baked into the launch, which is what lets one captured graph
+     * serve every round. The host arrays ms_n_comp / ms_n_index_comp are the
+     * MIRROR (advanced arithmetically, validated at step_end); every writer goes
+     * through gpu_graph_bank_set_counts so the two cannot drift. NULL when the
+     * pool is disabled. */
+    pulsar_gpu_tensor *comp_count;
+    pulsar_gpu_tensor *index_count;
     pulsar_gpu_tensor *askv[PULSAR_MAX_LAYER];  ///< attention compressor state lane, KV half
     pulsar_gpu_tensor *assc[PULSAR_MAX_LAYER];  ///< attention compressor state lane, score half
     pulsar_gpu_tensor *iskv[PULSAR_MAX_LAYER];  ///< indexer compressor state lane, KV half
@@ -2373,6 +2383,13 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t 
  * seq_id*comp_cap over one slab. NULL when the pool is disabled. */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il);
+/** L209: THE writer of a bank's per-layer compressed-row counts. Sets the host
+ * mirror (ms_n_comp / ms_n_index_comp) and, when the pool is enabled, the
+ * device counters the batched compressor kernels read. Returns false only when
+ * the device write fails; the host mirror is set either way so the frontier
+ * check at step_end still sees the truth. */
+bool gpu_graph_bank_set_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
+                               uint32_t comp, uint32_t index);
 /** Fresh single-bank views for the batched emit path (caller frees; when the
  * pool is disabled, bank must be 0 and the view wraps the classic tensor).
  * kind: the per-(bank,layer) comp caches and compressor state lanes. */

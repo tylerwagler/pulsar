@@ -376,6 +376,19 @@ static bool gpu_graph_bank_slabs_alloc(
     b->cur_bank = 0;
     b->raw_bank_bytes = (uint64_t)dz->raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
     bool ok = true;
+    /* L209: the device-resident per-(bank, layer) compressed-row counters, one
+     * u32 slab each for the attention and indexer compressors, zeroed like the
+     * host mirror they shadow (gpu_graph_bank_set_counts is the only writer). */
+    {
+        const uint64_t n_counts = (uint64_t)n_banks * PULSAR_N_LAYER;
+        b->comp_count = pulsar_gpu_tensor_alloc(n_counts * sizeof(uint32_t));
+        b->index_count = pulsar_gpu_tensor_alloc(n_counts * sizeof(uint32_t));
+        if (!b->comp_count || !b->index_count ||
+            !pulsar_gpu_tensor_fill_f32(b->comp_count, 0.0f, n_counts) ||    /* f32 0 == u32 0 */
+            !pulsar_gpu_tensor_fill_f32(b->index_count, 0.0f, n_counts)) {
+            return false;
+        }
+    }
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         /* uint32 row-ABI audit: batched kernels address rows as
@@ -492,6 +505,22 @@ static bool gpu_graph_bank_slabs_alloc(
 
 
 
+/* L209: THE writer of a bank's per-layer compressed-row counts -- host mirror
+ * and device counter together, so the batched compressor kernels (which read
+ * the device word) and the frontier check at step_end (which reads the host
+ * word) can never disagree. Called from every site that used to assign
+ * ms_n_comp / ms_n_index_comp directly. */
+bool gpu_graph_bank_set_counts(pulsar_gpu_graph *g, uint32_t bank, uint32_t il,
+                               uint32_t comp, uint32_t index) {
+    g->ms_n_comp[bank][il] = comp;
+    g->ms_n_index_comp[bank][il] = index;
+    pulsar_bank_slabs *b = &g->banks;
+    if (!b->n_banks || !b->comp_count || !b->index_count) return true;
+    const uint64_t off = ((uint64_t)bank * PULSAR_N_LAYER + il) * sizeof(uint32_t);
+    return pulsar_gpu_tensor_write(b->comp_count, off, &comp, sizeof(uint32_t)) != 0 &&
+           pulsar_gpu_tensor_write(b->index_count, off, &index, sizeof(uint32_t)) != 0;
+}
+
 /* Write one bank's entry in the comp/index base-pointer tables (device arrays).
  * A NULL slab nulls the entry so a stray batched-kernel read of an evicted bank
  * faults instead of touching freed pages. */
@@ -545,8 +574,7 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
         }
         table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
         /* Finding 2: a freed bank contributes 0 resident KV. */
-        g->ms_n_comp[bank][il] = 0;
-        g->ms_n_index_comp[bank][il] = 0;
+        table_ok = gpu_graph_bank_set_counts(g, bank, il, 0u, 0u) && table_ok;
     }
     g->ms_proj_ring_lo[bank] = 0u;
     g->ms_proj_ring_hi[bank] = 0u;
@@ -751,14 +779,11 @@ bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t ds
                                      ((uint64_t)dst * PULSAR_N_LAYER + il) * idx_row,
                                      b->index[il][src], (uint64_t)keep4 * idx_row,
                                      idx_row) != 0;
-            g->ms_n_comp[dst][il] = keep4;
-            g->ms_n_index_comp[dst][il] = keep4;
+            if (ok) ok = gpu_graph_bank_set_counts(g, dst, il, keep4, keep4);
         } else if (ratio != 0) {
-            g->ms_n_comp[dst][il] = R / ratio;
-            g->ms_n_index_comp[dst][il] = 0u;
+            if (ok) ok = gpu_graph_bank_set_counts(g, dst, il, R / ratio, 0u);
         } else {
-            g->ms_n_comp[dst][il] = 0u;
-            g->ms_n_index_comp[dst][il] = 0u;
+            if (ok) ok = gpu_graph_bank_set_counts(g, dst, il, 0u, 0u);
         }
     }
     /* L120 value-half: a partial fork's cut invalidates the projection ring
@@ -799,8 +824,8 @@ bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
         ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
                                  b->raw[il], (uint64_t)src * b->raw_bank_bytes,
                                  b->raw_bank_bytes) != 0;
-        g->ms_n_comp[dst][il] = g->ms_n_comp[src][il];
-        g->ms_n_index_comp[dst][il] = g->ms_n_index_comp[src][il];
+        if (ok) ok = gpu_graph_bank_set_counts(g, dst, il, g->ms_n_comp[src][il],
+                                               g->ms_n_index_comp[src][il]);
         if (!ok || ratio == 0) continue;
         const uint64_t csz = (uint64_t)g->ms_n_comp[src][il] * attn_row;
         if (ok && csz) ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, csz) != 0;

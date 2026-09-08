@@ -1275,8 +1275,11 @@ bool gpu_graph_encode_layer_attention_batch(
                 }
                 if (ok) {
                     if (!g->state_only) {   /* L195: a warm-up moves no frontier */
-                        if (banked) g->ms_n_comp[bank][il] = comp_before + comp_chunk;
-                        else        gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)    = comp_before + comp_chunk;
+                        /* L209: one writer for host mirror + device counter; the
+                         * indexer count is untouched here (its own arm below). */
+                        const uint32_t cb = banked ? bank : gpu_graph_cur_bank(g);
+                        ok = gpu_graph_bank_set_counts(g, cb, il, comp_before + comp_chunk,
+                                                       g->ms_n_index_comp[cb][il]);
                     }
                     if (gpu_graph_store_commits(g, banked) && ratio == 4)
                         ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
@@ -1406,7 +1409,11 @@ bool gpu_graph_encode_layer_attention_batch(
                         }
                         pulsar_gpu_tensor_free(comp_row_view);
                     }
-                    if (ok && emit && !g->state_only) (*n_comp_slot)++;
+                    if (ok && emit && !g->state_only) {   /* L209: host mirror + device counter */
+                        const uint32_t cb = mseq ? bank : gpu_graph_cur_bank(g);
+                        ok = gpu_graph_bank_set_counts(g, cb, il, *n_comp_slot + 1u,
+                                                       g->ms_n_index_comp[cb][il]);
+                    }
                     if (comp_counts) comp_counts[t] = *n_comp_slot;
                     pulsar_gpu_tensor_free(ms_target);
                     pulsar_gpu_tensor_free(ms_st_sc);
@@ -1686,8 +1693,10 @@ bool gpu_graph_encode_layer_attention_batch(
                     }
                     if (ok) {
                         if (!g->state_only) {   /* L195 */
-                            if (banked) g->ms_n_index_comp[bank][il] = index_before + index_chunk;
-                            else        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)    = index_before + index_chunk;
+                            /* L209: one writer for host mirror + device counter. */
+                            const uint32_t ib = banked ? bank : gpu_graph_cur_bank(g);
+                            ok = gpu_graph_bank_set_counts(g, ib, il, g->ms_n_comp[ib][il],
+                                                           index_before + index_chunk);
                         }
                         if (gpu_graph_store_commits(g, banked))
                             ok = gpu_graph_proj_ring_deposit_tail(g, il, pos0, n_tokens,
@@ -1799,7 +1808,11 @@ bool gpu_graph_encode_layer_attention_batch(
                                          : (g->banks.n_banks ? g->banks.cur_bank : 0u),
                                     index_row, 1, true);
                         }
-                        if (ok && emit && !g->state_only) (*n_index_slot)++;
+                        if (ok && emit && !g->state_only) {   /* L209: host mirror + device counter */
+                            const uint32_t ib = mseq ? bank : gpu_graph_cur_bank(g);
+                            ok = gpu_graph_bank_set_counts(g, ib, il, g->ms_n_comp[ib][il],
+                                                           *n_index_slot + 1u);
+                        }
                         if (index_counts) index_counts[t] = *n_index_slot;
                         pulsar_gpu_tensor_free(ms_cache);
                         pulsar_gpu_tensor_free(ms_st_sc);

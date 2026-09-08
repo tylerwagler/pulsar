@@ -467,8 +467,10 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * 0 (empty, safe). */
     if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = comp_cnt[il];
-        g->ms_n_index_comp[bank][il] = idx_cnt[il];
+        if (!gpu_graph_bank_set_counts(g, bank, il, comp_cnt[il], idx_cnt[il])) {   /* L209: host + device */
+            payload_set_err(err, errlen, "bank kv load: device counters");
+            return 1;
+        }
     }
     /* L120 value-half: the spill payload does not carry the projection
      * ring; a restored bank runs degraded until it deposits fresh

@@ -190,8 +190,8 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
      * any more, so that job is gone with it.) */
     {
         const uint32_t b = gpu_graph_cur_bank(g);
-        memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
-        memset(g->ms_n_index_comp[b], 0, sizeof(g->ms_n_index_comp[b]));
+        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
+            (void)gpu_graph_bank_set_counts(g, b, il, 0u, 0u);   /* L209: host + device */
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);

@@ -146,6 +146,10 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */
+    pulsar_gpu_tensor_free(g->banks.comp_count);    /* L209 device counters */
+    pulsar_gpu_tensor_free(g->banks.index_count);
+    g->banks.comp_count = NULL;
+    g->banks.index_count = NULL;
     for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         pulsar_gpu_tensor_free(g->banks.raw[il]);
         /* Per-bank split comp/index allocations (increment 2a): each bank is its
