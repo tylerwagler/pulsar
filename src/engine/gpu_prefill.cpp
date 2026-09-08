@@ -1906,7 +1906,13 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                          mseq ? 0 : n_raw,
                                                                          g->raw_cap,
                                                                          mseq ? 0 : raw_start,
-                                                                         n_comp,
+                                                                         /* L209: on the banked path the kernel derives
+                                                                          * each row's visible count from its DEVICE
+                                                                          * position and only clamps to this value, so
+                                                                          * the per-bank cap makes the launch identical
+                                                                          * every round (a captured graph stays valid);
+                                                                          * the live sup would bake a stale bound. */
+                                                                         mseq ? g->layer_comp_cap[il] : n_comp,
                                                                           g->raw_window,
                                                                           ratio,
                                                                           PULSAR_N_HEAD,
