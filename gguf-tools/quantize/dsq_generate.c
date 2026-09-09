@@ -88,6 +88,17 @@ size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
     return nbytes;
 }
 
+/* Tensors the template declares TRANSPOSED relative to the source: ne[0] is
+ * the source's SLOWER dim. L213: markov_w2 is stored k-major so the engine's
+ * markov kernels read contiguous memory per warp; its loader refuses the
+ * v-major layout by dims (weights.cpp), so template, quantizer and engine
+ * cannot silently disagree -- a mismatch dies here or refuses there.
+ * generate_regular transposes the f32 buffer for these before quantising;
+ * bf16 -> f32 -> bf16 is exact, so the stored values are the source's. */
+static int is_kmajor_tensor(const char *gguf_name) {
+    return strcmp(gguf_name, "dspark.2.markov_head.markov_w2.weight") == 0;
+}
+
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
     int nd = tensor_n_dims(tmpl);
     int skip = 0;
@@ -96,8 +107,13 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, con
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
+    const int kmajor = is_kmajor_tensor(gguf_name);
+    if (kmajor && nd != 2) die("k-major tensor must be 2D");
     for (int i = 0; i < nd; i++) {
-        if (tmpl->ne[i] != info->shape[info->n_dims - 1 - i]) {
+        /* k-major: the template's ne runs in the SOURCE's order, not reversed */
+        const int64_t want = kmajor ? (int64_t)info->shape[skip + i]
+                                    : (int64_t)info->shape[info->n_dims - 1 - i];
+        if ((int64_t)tmpl->ne[i] != want) {
             fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
             exit(1);
         }
@@ -192,6 +208,21 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
         st_value w = db_read(db, hf_name);
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
+    }
+    if (is_kmajor_tensor(gguf_name)) {
+        /* source [rows][cols] -> template [cols][rows]: out[c*rows + r] = in[r*cols + c].
+         * Before reap_permute_regular so the buffer already has the template's
+         * row length (ne[0]) when anything downstream is told that length. */
+        const int64_t rows = (int64_t)te->info.shape[te->info.n_dims - 2];
+        const int64_t cols = (int64_t)te->info.shape[te->info.n_dims - 1];
+        if (rows * cols != n) die("k-major transpose: element count mismatch");
+        float *t = (float *)malloc((size_t)n * sizeof(float));
+        if (!t) die("k-major transpose: out of memory");
+        for (int64_t r = 0; r < rows; r++)
+            for (int64_t c = 0; c < cols; c++)
+                t[c * rows + r] = f32[r * cols + c];
+        free(f32);
+        f32 = t;
     }
     reap_permute_regular(reap, gguf_name, f32, n, tmpl->ne[0]);
     /* Only targets whose quantizer reads an imatrix look one up, so

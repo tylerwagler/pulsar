@@ -433,7 +433,7 @@ static int check_dspark_markov_head(void) {
     for (uint32_t v = 0; v < vocab_size; v++) {
         for (uint32_t i = 0; i < embed_dim; i++) {
             w1_host[(uint64_t)v * embed_dim + i] = (float)((v * 7 + i * 13) % 100) * 0.01f;
-            w2_host[(uint64_t)v * embed_dim + i] = (float)((v * 3 + i * 11) % 50) * 0.02f;
+            w2_host[(uint64_t)i * vocab_size + v] = (float)((v * 3 + i * 11) % 50) * 0.02f;  /* k-major (L213) */
         }
         base_host[v] = (float)(v % 200) * 0.01f;
     }
@@ -461,9 +461,8 @@ static int check_dspark_markov_head(void) {
             int32_t cpu_id = 0;
             for (uint32_t v = 0; v < vocab_size; v++) {
                 float dot = 0.0f;
-                const float *w2r = w2_host + (uint64_t)v * embed_dim;
-                for (uint32_t i = 0; i < embed_dim; i++)
-                    dot += w2r[i] * embed[i];
+                for (uint32_t i = 0; i < embed_dim; i++)   /* same i order as the kernel */
+                    dot += w2_host[(uint64_t)i * vocab_size + v] * embed[i];
                 float val = base_host[v] + dot;
                 if (val > cpu_best) { cpu_best = val; cpu_id = (int32_t)v; }
             }

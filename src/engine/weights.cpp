@@ -1155,9 +1155,16 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
 
     /* bf16 upstream; f32 here until 2026-08-15. markov_w2 is the single
      * largest above-source tensor in the model (66 MB of pure width) and the
-     * markov step streams all of it every draft position. */
+     * markov step streams all of it every draft position.
+     *
+     * markov_w2 is K-MAJOR (L213): dims (vocab, 256), element (v, i) at
+     * i * vocab + v, so the markov kernels' warps read contiguous memory. The
+     * source and markov_w1 are (256, vocab). An artifact still carrying the
+     * v-major markov_w2 fails this dims check and refuses to load -- there is
+     * no runtime transpose; gguf-tools/gguf_transpose_bf16_tensor.py migrates
+     * an existing artifact in place and --verify proves the result. */
     tensor_expect_f32_or_bf16(w->markov_w1, 2, 256, V, 0);
-    tensor_expect_f32_or_bf16(w->markov_w2, 2, 256, V, 0);
+    tensor_expect_f32_or_bf16(w->markov_w2, 2, V, 256, 0);
     tensor_expect_f32_or_bf16(w->confidence_proj, 1, E + 256, 0, 0);
     tensor_expect_layout(w->hc_head_base, PULSAR_TENSOR_F32, 1, PULSAR_N_HC, 0, 0);
     tensor_expect_layout(w->hc_head_fn, PULSAR_TENSOR_F32, 2, (uint64_t)PULSAR_N_HC * E, PULSAR_N_HC, 0);

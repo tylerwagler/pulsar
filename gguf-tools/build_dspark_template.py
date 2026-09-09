@@ -225,7 +225,10 @@ def main():
         add(f'dspark.{li}.ffn_down_exps.weight', 3, gguf(R, E, F), MXFP4)
 
     add('dspark.2.markov_head.markov_w1.weight', 2, gguf(V, 256), 30)
-    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(V, 256), 30)
+    # K-MAJOR (L213): ne = (V, 256), v fastest -- the transpose of the source's
+    # [V, 256]. The quantizer transposes the data to match (dsq_generate.c,
+    # is_kmajor_tensor); the engine refuses the v-major layout by dims.
+    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(256, V), 30)
     add('dspark.2.confidence_head.proj.weight',  1, (E + 256,), 30)
     add('dspark.2.hc_head_base.weight',  1, gguf(NHC), 0)
     add('dspark.2.hc_head_fn.weight',    2, gguf(NHC, NHC*E), 0)
