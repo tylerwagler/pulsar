@@ -1470,12 +1470,16 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         g->batch_multiseq_rows = 0;
         return false;
     }
+    /* L212: the batched step is one of the two lanes that take the width arm
+     * (the other is the classic verify block); cleared at step_end. */
+    pulsar_gpu_matmul_set_batch_decode_width_arm(1);
     return true;
 }
 
 bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     if (!g || !g->batch_multiseq) return false;
     (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
+    pulsar_gpu_matmul_set_batch_decode_width_arm(0);
     g->batch_multiseq = false;
     const uint32_t n_rows = g->batch_multiseq_rows;
     g->batch_multiseq_rows = 0;

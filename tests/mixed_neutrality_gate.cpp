@@ -282,6 +282,48 @@ static bool classic_resume(int K, float *out_lg, int *next_tok) {
 }
 
 
+/* L212: the width arm makes a row's bytes depend on the batch WIDTH across a
+ * shape's crossover (never on batchmates' values).  So a (solo width, batched
+ * width) pair is graded one of two ways, decided by the same table the
+ * dispatch reads (pulsar_gpu_dense_arm_same_regime):
+ *   same regime  -> BYTE-IDENTICAL, as before (this is where L161-, L150- and
+ *                   L170-class bugs showed, and they still show here);
+ *   straddles    -> the one intended difference, f32-ulp scale at each GEMM
+ *                   (measured rel-L2 <= 4.3e-7 per GEMM, nt_crossover_sweep
+ *                   ... neutral), graded on the logits against
+ *                   GATE_CROSS_ARM_BAR.  The bar sits two orders above the
+ *                   intended difference and two orders under the bug classes
+ *                   (L161: every logit, |d| ~1.5; L170: whole logits past the
+ *                   2048-token bucket) -- see rows/L212.md for the calibration
+ *                   run.  The rel-L2 is printed on every pair so the number is
+ *                   on record whichever way the verdict goes. */
+#define GATE_CROSS_ARM_BAR 1e-4
+static double rel_l2(const float *a, const float *b, long n) {
+    double num = 0.0, den = 0.0;
+    for (long i = 0; i < n; i++) { const double d = (double)a[i] - (double)b[i]; num += d * d; den += (double)b[i] * (double)b[i]; }
+    return den > 0.0 ? sqrt(num / den) : 0.0;
+}
+/* Returns 1 when the pair passes its verdict; prints the verdict line. */
+static int grade_pair(const char *tag, const char *what, int solo_rows, int batched_rows,
+                      const float *batched, const float *solo, long n, int fatal) {
+    const long d = gate_first_diff(batched, solo, n);
+    const int same = pulsar_gpu_dense_arm_same_regime(solo_rows, batched_rows);
+    const double rl2 = rel_l2(batched, solo, n);
+    if (same) {
+        if (d < 0) { printf("%s %s: same regime (%d vs %d rows): BYTE-IDENTICAL\n", tag, what, solo_rows, batched_rows); return 1; }
+        long nd = 0; float md = 0.f;
+        for (long i = 0; i < n; i++) if (batched[i] != solo[i]) { nd++; const float x = fabsf(batched[i] - solo[i]); if (x > md) md = x; }
+        fprintf(fatal ? stderr : stdout, "%s%s %s: same regime (%d vs %d rows) but DIFFERS at float %ld (%.6g vs %.6g), %ld/%ld floats, max |d| %.4g, rel-L2 %.3e\n",
+                fatal ? "FAIL: " : "", tag, what, solo_rows, batched_rows, d, (double)batched[d], (double)solo[d], nd, n, (double)md, rl2);
+        return 0;
+    }
+    const int ok = rl2 <= GATE_CROSS_ARM_BAR;
+    fprintf(ok || !fatal ? stdout : stderr, "%s%s %s: cross-regime (%d vs %d rows): rel-L2 %.3e vs bar %.0e -> %s%s\n",
+            ok || !fatal ? "" : "FAIL: ", tag, what, solo_rows, batched_rows, rl2, GATE_CROSS_ARM_BAR,
+            ok ? "within the intended difference" : "OVER THE BAR", d < 0 ? " (byte-identical)" : "");
+    return ok;
+}
+
 /* GATE 5R (L152): the multi-run step's EVERY row, batched vs solo, in both bank
  * orders.  `spec` is one run length for every bank or a comma list per bank
  * ("5,5" = two banks of 5 rows).  fatal => a differing row fails the gate;
@@ -334,24 +376,12 @@ static void gate5r_run(const char *spec, bool fatal) {
             for (int j = 0; j < RPB; j++) {
                 const float *a = all + (row_off + (size_t)j) * vocab;
                 const float *b = solo + (size_t)j * vocab;
-                long d = gate_first_diff(a, b, (long)vocab);
-                if (d < 0) {
-                    if (!fatal) printf("%s %s: bank %d (slot %d) row %d/%d: IDENTICAL\n", tag, rev ? "reversed" : "forward", k, slot, j, RPB);
-                } else {
-                    long nd = 0; float md = 0.f;
-                    for (long i = 0; i < (long)vocab; i++) if (a[i] != b[i]) { nd++; float x = fabsf(a[i] - b[i]); if (x > md) md = x; }
-                    fprintf(fatal ? stderr : stdout,
-                            "%s%s %s: bank %d (slot %d) row %d/%d: DIFFERS at float %ld (%.6g vs %.6g), %ld/%u floats, max |d| %.4g\n",
-                            fatal ? "GATE 5R FAIL: " : "", tag, rev ? "reversed" : "forward", k, slot, j, RPB,
-                            d, (double)a[d], (double)b[d], nd, vocab, (double)md);
-                    bad++;
-                }
+                char what[96];
+                snprintf(what, sizeof what, "%s bank %d (slot %d) row %d/%d", rev ? "reversed" : "forward", k, slot, j, RPB);
+                /* solo = this bank's run alone (RPB decode rows); batched = the whole step (total rows) */
+                if (!grade_pair(tag, what, RPB, total, a, b, (long)vocab, fatal)) bad++;
             }
-            if (fatal) {
-                if (bad) g_fail = 1;
-                else printf("%s %s: bank %d (slot %d) all %d rows batched (%d) == solo BYTE-IDENTICAL\n",
-                            tag, rev ? "reversed" : "forward", k, slot, RPB, total);
-            }
+            if (fatal && bad) g_fail = 1;
             row_off += (size_t)RPB;
         }
         free(all); free(solo);
@@ -458,16 +488,11 @@ int GATE_ENTRY(int argc, char **argv) {
             for (int k = 0; mr_ok && k < g_n_dec; k++) mr_ok = multirun_step_logits(RPB, k, mr_solo);
             if (!mr_ok) { fprintf(stderr, "GATE 5 FAIL: multi-run step failed\n"); g_fail = 1; }
             for (int k = 0; mr_ok && k < g_n_dec; k++) {
-                const long d = gate_first_diff(mr_all + (size_t)k * vocab, mr_solo + (size_t)k * vocab, vocab);
-                if (d < 0) {
-                    printf("GATE 5 MULTI-RUN: bank %d run of %d rows, batched (%d rows) == solo (%d rows) BYTE-IDENTICAL\n",
-                           k, RPB, rows_total, RPB);
-                } else {
-                    fprintf(stderr, "GATE 5 FAIL: bank %d run last-row logits DIFFER at float %ld (%.9g vs %.9g) -- "
-                            "a %d-row multi-run step is not M-neutral\n",
-                            k, d, (mr_all + (size_t)k * vocab)[d], (mr_solo + (size_t)k * vocab)[d], rows_total);
+                char what[64];
+                snprintf(what, sizeof what, "bank %d run of %d rows, last row", k, RPB);
+                if (!grade_pair("GATE 5 MULTI-RUN", what, RPB, rows_total,
+                                mr_all + (size_t)k * vocab, mr_solo + (size_t)k * vocab, (long)vocab, 1))
                     g_fail = 1;
-                }
             }
             free(mr_all); free(mr_solo);
         }

@@ -511,12 +511,20 @@ cuda-reap-router-audit:
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
-# PULSAR_GATE_ROWS_FATAL (L152/L153): every row of a 10- and a 16-row multi-run
-# step must match its solo run byte for byte.  GATE 5 alone checks last rows at
-# 6 total, and the wide variant skips GATE 5 above the cap -- the 9..16-row
-# range where L152 lived had no battery gate until this.
+# PULSAR_GATE_ROWS_FATAL (L152/L153): every row of each listed multi-run step
+# against its solo run.  L212 made the verdict regime-aware (the gate reads the
+# dispatch's own crossover table): a pair whose solo and batched widths sit in
+# the same regime must be BYTE-IDENTICAL; a pair that straddles a crossover
+# carries the width arm's intended f32-ulp difference and is graded against a
+# bar on the logits.  The list covers both kinds on purpose --
+#   2,3   5 rows total: 2 vs 5 and 3 vs 5, all below every crossover -> identity (the nt regime)
+#   13,3  16 rows total: 13 vs 16 above every crossover -> identity (the tensor-core regime);
+#         3 vs 16 straddles -> bar
+#   5,5   10 rows: 5 vs 10 straddles -> bar (the 9..16-row range where L152 lived)
+#   8,8   16 rows: 8 vs 16 straddles -> bar
+# so an unintended width dependence inside either regime still fails on a byte.
 cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
-	PULSAR_MSEQ_BANKS=3 PULSAR_GATE_ROWS_FATAL="5,5 8,8" ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 PULSAR_GATE_ROWS_FATAL="2,3 13,3 5,5 8,8" ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # Wide variant: 12 decode banks exercises the armed M-neutral kernel range past
 # 8 (the l048-ntcap-16 coverage) — NT instantiations 9..16 and the MoE

@@ -675,17 +675,25 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
  * refused (n past PULSAR_GPU_MNEUTRAL_ROWS_MAX); the caller refuses too. */
 class pulsar_decode_rows_scope {
 public:
-    explicit pulsar_decode_rows_scope(uint32_t n)
+    /** `width_arm` (L212): let the row COUNT pick the tensor-core arm for the
+     * dense projections past each shape's crossover.  Default off -- a lane
+     * that does not ask keeps width-independent bytes at every count. */
+    explicit pulsar_decode_rows_scope(uint32_t n, bool width_arm = false)
         : saved_(pulsar_gpu_matmul_batch_decode_rows()),
-          ok_(pulsar_gpu_matmul_set_batch_decode_rows((int)n) != 0) {}
+          saved_arm_(pulsar_gpu_matmul_batch_decode_width_arm()),
+          ok_(pulsar_gpu_matmul_set_batch_decode_rows((int)n) != 0) {
+        pulsar_gpu_matmul_set_batch_decode_width_arm(width_arm ? 1 : 0);
+    }
     ~pulsar_decode_rows_scope() {
         (void)pulsar_gpu_matmul_set_batch_decode_rows(saved_);   /* restoring an accepted value */
+        pulsar_gpu_matmul_set_batch_decode_width_arm(saved_arm_);
     }
     bool ok() const { return ok_; }
     pulsar_decode_rows_scope(const pulsar_decode_rows_scope &) = delete;
     pulsar_decode_rows_scope &operator=(const pulsar_decode_rows_scope &) = delete;
 private:
     int  saved_;
+    int  saved_arm_;
     bool ok_;
 };
 

@@ -886,8 +886,11 @@ bool gpu_graph_verify_suffix_tops(
     /* The verify block's rows are DECODE rows (the continuation token and the
      * drafts under test): every GEMM and MoE tier below takes the
      * M-independent arms whatever n_tokens is (L167; until then row count
-     * chose, so a 5..16-row block took cuBLASLt).  Restored on return. */
-    pulsar_decode_rows_scope rows(n_tokens);
+     * chose, so a 5..16-row block took cuBLASLt).  Restored on return.
+     * L212: this block arms the width arm -- past a shape's crossover its
+     * dense projections take the tensor-core call by row count again, now
+     * as a measured, gated choice rather than a proxy for row kind. */
+    pulsar_decode_rows_scope rows(n_tokens, /*width_arm=*/true);
     if (!rows.ok()) return false;
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);

@@ -1984,6 +1984,70 @@ int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
  * slot, so the skips apply only when no decode prefix is in flight). */
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_batch_decode_rows; }
 
+/* ---- L212: the WIDTH-DEPENDENT dense arm -----------------------------------
+ * Row kind still chooses the family (decode rows: GEMV/nt; prefill rows:
+ * tensor-core).  Within decode rows, a lane that ARMS this flag lets the row
+ * COUNT choose too: at or past a shape's crossover the rows take the cuBLASLt
+ * tensor-core GEMM -- the same call prefill rows make -- because the nt kernel
+ * re-runs per row while cuBLASLt is M-flat, and past ~7 rows the difference is
+ * 100..185 us per layer (rows/L212.md, nt sweep on 27bb941).
+ *
+ * What this costs, stated in the row and accepted by Tyler 2026-09-09: a row's
+ * bytes now depend on the batch WIDTH across the crossover (never on its
+ * batchmates' values), so a session's verify logits move by f32 ulps when a
+ * batchmate joins or leaves.  Within a regime -- every width below a shape's
+ * crossover, or every width at or above it -- bytes are still width-
+ * independent: the nt arm by construction, the tensor-core arm as MEASURED
+ * (tests/nt_crossover_sweep MODEL LAYER neutral: identical bytes at M = 8, 12,
+ * 16 and at row offsets 0 and 8 on every shape, both layers probed) and as
+ * ENFORCED by the mixed-neutrality gate's within-regime pairs.  The gate reads
+ * the same table through pulsar_gpu_dense_arm_same_regime, so which pairs
+ * must be byte-identical and which carry the one intended difference is one
+ * fact, here.
+ *
+ * OPT-IN, default OFF: only the lanes that asked for the speed arm it -- the
+ * batched multiseq step and the classic verify block.  The drafter's forwards,
+ * its seeds, the output head and any lane that declares decode rows without
+ * arming keep the width-independent arm at every count, so the dspark batch
+ * gate's byte-for-byte draft identity is untouched. */
+static thread_local int g_batch_decode_width_arm = 0;
+void pulsar_gpu_matmul_set_batch_decode_width_arm(int on) { g_batch_decode_width_arm = on ? 1 : 0; }
+int  pulsar_gpu_matmul_batch_decode_width_arm(void) { return g_batch_decode_width_arm; }
+
+/* Per-shape crossovers: the smallest decode row count that takes the
+ * tensor-core arm; 0 = never (the nt arm wins at every width up to the cap).
+ * Measured 2026-09-08 on dev 27bb941 with tests/nt_crossover_sweep (layers 4
+ * and 20 agree): the first M at which cuBLASLt's flat time undercuts the nt
+ * kernel's, rounded toward keeping nt where the two were within noise.  A
+ * shape not listed announces once and stays on the nt arm. */
+typedef struct { uint64_t in_dim, out_dim; int crossover; const char *name; } dense_arm_crossover_t;
+static const dense_arm_crossover_t k_dense_arm_crossovers[] = {
+    { 4096u,  1024u, 11, "attn_q_a"        },   /* 10: 1.04, 12: 0.88 */
+    { 1024u, 32768u,  8, "attn_q_b"        },   /*  6: 1.13,  8: 0.92 */
+    { 4096u,   512u,  0, "attn_kv"         },   /* 16: 0.98 / 0.87 -- never */
+    { 8192u,  4096u, 13, "attn_output_b"   },   /* 12: 1.03, 16: 0.82 */
+    { 4096u,  2048u,  6, "ffn_gate_shexp"  },   /*  5: 1.15,  6: 0.97 */
+    { 2048u,  4096u,  7, "ffn_down_shexp"  },   /*  6: 1.08,  8: 0.82 */
+};
+static const dense_arm_crossover_t *dense_arm_lookup(uint64_t in_dim, uint64_t out_dim) {
+    for (size_t i = 0; i < sizeof(k_dense_arm_crossovers) / sizeof(k_dense_arm_crossovers[0]); i++)
+        if (k_dense_arm_crossovers[i].in_dim == in_dim && k_dense_arm_crossovers[i].out_dim == out_dim)
+            return &k_dense_arm_crossovers[i];
+    return NULL;
+}
+int pulsar_gpu_dense_arm_crossover(uint64_t in_dim, uint64_t out_dim) {
+    const dense_arm_crossover_t *c = dense_arm_lookup(in_dim, out_dim);
+    return c ? c->crossover : 0;
+}
+int pulsar_gpu_dense_arm_same_regime(int rows_a, int rows_b) {
+    const int lo = rows_a < rows_b ? rows_a : rows_b, hi = rows_a < rows_b ? rows_b : rows_a;
+    for (size_t i = 0; i < sizeof(k_dense_arm_crossovers) / sizeof(k_dense_arm_crossovers[0]); i++) {
+        const int c = k_dense_arm_crossovers[i].crossover;
+        if (c > 0 && lo < c && c <= hi) return 0;   /* the pair straddles this shape's crossover */
+    }
+    return 1;
+}
+
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {
     /* Derived from the destination, never passed in: the two cannot
@@ -2095,7 +2159,38 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     (unsigned long long)in_dim, (unsigned long long)out_dim);
             return 0;
         }
-        /* DECODE rows, n_tok 2..cap (spec-verify batches, drafter forwards):
+        /* DECODE rows at or past the shape's crossover, in a lane that ARMED
+         * the width arm (L212; see g_batch_decode_width_arm): the cuBLASLt MX
+         * tensor-core GEMM, the prefill rows' call, M-flat where the nt kernel
+         * below grows per row.  Refuses on failure exactly as the prefill
+         * branch does -- no fall-through to nt, which would put a row's bytes
+         * at the mercy of a library error.  Announced once per shape; a shape
+         * with no crossover on record is announced once too and stays on nt. */
+        if (g_batch_decode_width_arm && n_tok >= 2) {
+            const dense_arm_crossover_t *xo = dense_arm_lookup(in_dim, out_dim);
+            static pulsar_shape_once seen_arm = {};
+            if (pulsar_shape_once_first(&seen_arm, pulsar_shape_key(in_dim, out_dim), "dense width-arm announce")) {
+                if (xo && xo->crossover > 0)
+                    fprintf(stderr, "pulsar: dense %s (in_dim=%llu out_dim=%llu): decode rows take the tensor-core "
+                                    "arm from %d rows, nt below (L212 width arm)\n",
+                            xo->name, (unsigned long long)in_dim, (unsigned long long)out_dim, xo->crossover);
+                else
+                    fprintf(stderr, "pulsar: dense in_dim=%llu out_dim=%llu: no width crossover on record -- "
+                                    "nt at every decode width (L212)\n",
+                            (unsigned long long)in_dim, (unsigned long long)out_dim);
+            }
+            if (xo && xo->crossover > 0 && (int)n_tok >= xo->crossover) {
+                if (cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
+                        weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
+                fprintf(stderr, "pulsar: cuBLASLt MX GEMM failed for %s (decode rows past the crossover, "
+                                "n_tok=%llu in_dim=%llu out_dim=%llu) -- refusing\n",
+                        label ? label : "weights", (unsigned long long)n_tok,
+                        (unsigned long long)in_dim, (unsigned long long)out_dim);
+                return 0;
+            }
+        }
+        /* DECODE rows, n_tok 2..cap (spec-verify batches, drafter forwards),
+         * below the crossover or in a lane that did not arm the width arm:
          * batched GEMV over the de-interleaved weight.  One weight-row read
          * serves every row; each row's result is bit-identical to the n == 1
          * kernel's below, so a row's bytes do not depend on the batch width.

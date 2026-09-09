@@ -656,6 +656,29 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
 int pulsar_gpu_matmul_set_batch_decode_rows(int n);
 int pulsar_gpu_matmul_batch_decode_rows(void);
 
+/** THE WIDTH ARM (L212, Tyler 2026-09-09).  Within DECODE rows, a lane that
+ * arms this lets the row COUNT choose as well: the MXFP8 dense projections take
+ * the cuBLASLt tensor-core GEMM (the prefill rows' call, M-flat) at or past a
+ * per-shape crossover, and the nt GEMV below it.  Opt-in, default off: the
+ * batched multiseq step and the classic verify block arm it; the drafter's
+ * forwards and every other decode lane keep the width-independent arm.  The
+ * price: across a crossover a row's bytes depend on the batch width (never on
+ * batchmates' values), so a session's verify logits move by f32 ulps when a
+ * batchmate joins or leaves.  Within a regime bytes stay width-independent --
+ * the nt arm by construction, the tensor-core arm as measured
+ * (tests/nt_crossover_sweep ... neutral) and enforced (mixed-neutrality gate).
+ * Scoped by pulsar_decode_rows_scope's second argument in the engine. */
+void pulsar_gpu_matmul_set_batch_decode_width_arm(int on);
+int  pulsar_gpu_matmul_batch_decode_width_arm(void);
+/** The crossover table, one authority for the dispatch AND the gates: the
+ * smallest decode row count at which (in_dim, out_dim) takes the tensor-core
+ * arm, 0 = never / not on record.  same_regime(a, b) is 1 when no listed
+ * crossover lies in (min, max]: two armed decode widths in the same regime must
+ * produce byte-identical rows; a pair that straddles a crossover carries the
+ * one intended f32-ulp difference and is graded against a bar instead. */
+int pulsar_gpu_dense_arm_crossover(uint64_t in_dim, uint64_t out_dim);
+int pulsar_gpu_dense_arm_same_regime(int rows_a, int rows_b);
+
 int pulsar_gpu_matmul_bf16_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
