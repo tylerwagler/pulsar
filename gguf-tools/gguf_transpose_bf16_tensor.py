@@ -46,7 +46,7 @@ def main():
 
     tensors, alignment, data_start = scan(a.src)
     t = find(tensors, a.tensor)
-    ne = list(t["ne"])
+    ne = list(t["dims"])              # scan(): dims = the list, ne = element COUNT
     if t["type"] != GGML_BF16:
         sys.exit("refusing: %s is type %d, not BF16 (%d)" % (a.tensor, t["type"], GGML_BF16))
     if len(ne) != 2:
@@ -92,7 +92,7 @@ def main():
     print("verifying ...")
     tensors2, alignment2, data_start2 = scan(a.dst)
     t2 = find(tensors2, a.tensor)
-    if list(t2["ne"]) != [ne1, ne0] or t2["type"] != GGML_BF16 or data_start2 != data_start \
+    if list(t2["dims"]) != [ne1, ne0] or t2["type"] != GGML_BF16 or data_start2 != data_start \
             or t2["offset"] != t["offset"] or alignment2 != alignment:
         sys.exit("VERIFY FAIL: dst header does not describe the transposed tensor in place")
     with open(a.src, "rb") as fs, open(a.dst, "rb") as fd:
