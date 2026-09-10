@@ -954,6 +954,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
     case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K:
         return true;
     default:
         return false;
@@ -1162,9 +1163,24 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
      * source and markov_w1 are (256, vocab). An artifact still carrying the
      * v-major markov_w2 fails this dims check and refuses to load -- there is
      * no runtime transpose; gguf-tools/gguf_transpose_bf16_tensor.py migrates
-     * an existing artifact in place and --verify proves the result. */
+     * an existing artifact in place and --verify proves the result.
+     *
+     * Its storage is one of three (L213 step 2; pulsar_markov_w2_fmt is the
+     * type -> arm mapping): f32 or bf16 (the source's widths), or
+     * FP8_E4M3_SOA_K (46: MXFP8 numerics -- E8M0 scale plane then E4M3 payload
+     * plane -- the shipped table; alpha-neutral to bf16, 289 -> 161 us).  Plain
+     * type 38 is NOT accepted anywhere in the artifact.  Any other type refuses
+     * here; the dims contract is the same for all three. */
     tensor_expect_f32_or_bf16(w->markov_w1, 2, 256, V, 0);
-    tensor_expect_f32_or_bf16(w->markov_w2, 2, V, 256, 0);
+    switch (w->markov_w2->type) {
+    case PULSAR_TENSOR_F32:
+    case PULSAR_TENSOR_BF16:
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+        tensor_expect_layout(w->markov_w2, w->markov_w2->type, 2, V, 256, 0);
+        break;
+    default:
+        pulsar_die("dspark markov_w2: storage must be f32, bf16 or fp8_e4m3_soa_k (46)");
+    }
     tensor_expect_f32_or_bf16(w->confidence_proj, 1, E + 256, 0, 0);
     tensor_expect_layout(w->hc_head_base, PULSAR_TENSOR_F32, 1, PULSAR_N_HC, 0, 0);
     tensor_expect_layout(w->hc_head_fn, PULSAR_TENSOR_F32, 2, (uint64_t)PULSAR_N_HC * E, PULSAR_N_HC, 0);

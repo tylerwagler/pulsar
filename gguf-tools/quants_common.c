@@ -73,6 +73,8 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
      * MXFP8_LT.  Distinct permutation from IQ2_XXS_SOA (42); not
      * interchangeable. */
     [DS4Q_TYPE_IQ2_XXS_MMQ] = { "iq2_xxs_mmq", QK_K, 66, false, false },
+    /* 38's bytes permuted into planes: shares its {32, 33} accounting exactly */
+    [DS4Q_TYPE_FP8_E4M3_SOA_K] = { "fp8_e4m3_soa_k", 32, 33, false, false },
 };
 
 float ds4q_f32_from_bits(uint32_t bits) {

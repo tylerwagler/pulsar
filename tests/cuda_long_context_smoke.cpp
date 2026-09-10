@@ -410,30 +410,118 @@ static int check_dspark_non_causal_attention(void) {
     return rc;
 }
 
+/* ---- host-side codecs the markov oracle needs, mirroring the kernel arms --- */
+static uint16_t smoke_f32_to_bf16(float x) {            /* round to nearest even */
+    uint32_t u; memcpy(&u, &x, 4);
+    const uint32_t lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    return (uint16_t)(u >> 16);
+}
+static float smoke_bf16_to_f32(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
+/* E4M3 codec, the quantizer's (gguf-tools/quants_fp.c) rounding and decode */
+static uint8_t smoke_f32_to_e4m3(float x) {
+    if (x != x) return 0x7f;
+    uint8_t sgn = (x < 0.0f) ? 0x80 : 0x00;
+    float a = fabsf(x);
+    if (a >= 448.0f) return (uint8_t)(sgn | 0x7e);
+    if (a == 0.0f)   return sgn;
+    uint32_t u; memcpy(&u, &a, 4);
+    int32_t exp = (int32_t)((u >> 23) & 0xff) - 127;
+    uint32_t sig = (1u << 23) | (u & 0x7fffffu);
+    int32_t e8 = exp + 7;
+    if (e8 <= 0) {
+        int code = (int)lrintf(a * 512.0f);
+        if (code > 7) return (uint8_t)(sgn | (1u << 3));
+        return (uint8_t)(sgn | (code & 0x7));
+    }
+    uint32_t mant3 = (sig >> 20) & 0x7;
+    uint32_t rem = sig & ((1u << 20) - 1), half = 1u << 19;
+    if (rem > half || (rem == half && (mant3 & 1))) { if (++mant3 == 8) { mant3 = 0; e8++; } }
+    if (e8 > 15 || (e8 == 15 && mant3 >= 7)) return (uint8_t)(sgn | 0x7e);
+    return (uint8_t)(sgn | ((e8 & 0xf) << 3) | (mant3 & 0x7));
+}
+static float smoke_e4m3_to_f32(uint8_t b) {
+    float sign = (b & 0x80) ? -1.0f : 1.0f;
+    uint32_t e = (b >> 3) & 0xf, m = b & 0x7;
+    if (e == 0) return sign * (float)m * (1.0f / 512.0f);
+    if (e == 15 && m == 7) return sign * (float)NAN;
+    return sign * (1.0f + (float)m * 0.125f) * ldexpf(1.0f, (int)e - 7);
+}
+
+/* Build markov_w2 in storage `fmt` from the k-major f32 table t[i*V + v]; returns
+ * the blob's byte count.  Decode-side twins below reproduce the kernel arms. */
+static uint64_t smoke_w2_encode(int fmt, const float *t, uint32_t V, uint32_t E, uint8_t *blob) {
+    if (fmt == PULSAR_MARKOV_W2_F32) { memcpy(blob, t, (size_t)V * E * 4); return (uint64_t)V * E * 4; }
+    if (fmt == PULSAR_MARKOV_W2_BF16) {
+        uint16_t *o = (uint16_t *)blob;
+        for (uint64_t n = 0; n < (uint64_t)V * E; n++) o[n] = smoke_f32_to_bf16(t[n]);
+        return (uint64_t)V * E * 2;
+    }
+    /* MXFP8 SoA (46): per (i, 32-block of v) an E8M0 scale in the scale plane
+     * [E][V/32], the 32 E4M3 in the payload plane [E][V] that follows it */
+    uint8_t *sc = blob;
+    uint8_t *pay = blob + (uint64_t)E * (V / 32);
+    for (uint32_t i = 0; i < E; i++) {
+        for (uint32_t b = 0; b < V / 32; b++) {
+            const float *x = t + (uint64_t)i * V + (uint64_t)b * 32;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) { const float a = fabsf(x[j]); if (a > amax) amax = a; }
+            int scale_exp = -127;
+            if (amax > 0.0f) { int e; frexpf(amax, &e); scale_exp = (e - 1) - 7; }
+            if (scale_exp < -127) scale_exp = -127;
+            if (scale_exp > 127) scale_exp = 127;
+            sc[(uint64_t)i * (V / 32) + b] = (uint8_t)(scale_exp + 127);
+            const float inv = ldexpf(1.0f, -scale_exp);
+            for (int j = 0; j < 32; j++) pay[(uint64_t)i * V + (uint64_t)b * 32 + j] = smoke_f32_to_e4m3(x[j] * inv);
+        }
+    }
+    return (uint64_t)(V / 32) * 33 * E;
+}
+/* w2 element (i, v) decoded as the kernel arm sees it */
+static float smoke_w2_decode(int fmt, const uint8_t *blob, uint32_t V, uint32_t E, uint32_t i, uint32_t v) {
+    switch (fmt) {
+    case PULSAR_MARKOV_W2_F32:   return ((const float *)blob)[(uint64_t)i * V + v];
+    case PULSAR_MARKOV_W2_BF16:  return smoke_bf16_to_f32(((const uint16_t *)blob)[(uint64_t)i * V + v]);
+    default: {
+        const uint8_t *pay = blob + (uint64_t)E * (V / 32);
+        return smoke_e4m3_to_f32(pay[(uint64_t)i * V + v]) *
+               ldexpf(1.0f, (int)blob[(uint64_t)i * (V / 32) + (v / 32)] - 127);
+    }
+    }
+}
+
 static int check_dspark_markov_head(void) {
-    const uint32_t vocab_size = 4096;
+    const uint32_t vocab_size = 4096;      /* % 32 == 0 (MXFP8 blocks), % 4 == 0 (4 v per lane) */
     const uint32_t embed_dim = 256;
     const uint32_t n_draft = 5;
-    int32_t prev_tokens[5] = {42, 100, 500, 1200, 3000};
+    const int32_t prev_tokens[5] = {42, 100, 500, 1200, 3000};
+    const int fmts[3] = { PULSAR_MARKOV_W2_F32, PULSAR_MARKOV_W2_BF16, PULSAR_MARKOV_W2_MXFP8 };
+    const char *fmt_names[3] = { "f32", "bf16", "mxfp8" };
 
-    /* The markov head reads its weights from the model map: stage w1|w2 in one
-     * PAGE-ALIGNED buffer so the runtime's per-range cudaHostRegister of the
-     * two offsets never overlaps a page (w_bytes is a page multiple here).
-     * The buffer is intentionally never freed: its pages stay host-registered
-     * until pulsar_gpu_cleanup, and munmap of registered pages is UB. */
-    const uint64_t w_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
-    float *map_host = NULL;
-    if (posix_memalign((void **)&map_host, 4096, (size_t)(2 * w_bytes)) != 0) return 1;
-    memset(map_host, 0, (size_t)(2 * w_bytes));
+    /* The markov head reads its weights from the model map: stage w1 | w2 in one
+     * PAGE-ALIGNED buffer so the runtime's per-range cudaHostRegister of the two
+     * offsets never overlaps a page (both regions are page multiples).  The
+     * buffer is intentionally never freed: its pages stay host-registered until
+     * pulsar_gpu_cleanup, and munmap of registered pages is UB. */
+    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);   /* 4 MB, page multiple */
+    const uint64_t w2_cap   = w1_bytes;                                          /* f32 is the widest arm */
+    /* Each storage gets its OWN region: the runtime's model-range cache is
+     * keyed by offset and keeps a device-resident copy, so rewriting one
+     * region in place between formats would have the kernel read the previous
+     * format's bytes (f32 read as bf16 pairs: garbage on even v, the truncated
+     * value on odd v -- exactly what round 2 saw). */
+    const uint64_t map_bytes = w1_bytes + 3u * w2_cap;
+    uint8_t *map_host = NULL;
+    if (posix_memalign((void **)&map_host, 4096, (size_t)map_bytes) != 0) return 1;
+    memset(map_host, 0, (size_t)map_bytes);
+    float *w1_host = (float *)map_host;
+    float *t = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));   /* k-major f32 source */
     float *base_host = (float *)calloc((size_t)vocab_size, sizeof(float));
-    if (!map_host || !base_host) return 1;
-    float *w1_host = map_host;
-    float *w2_host = map_host + (uint64_t)vocab_size * embed_dim;
-
+    if (!t || !base_host) return 1;
     for (uint32_t v = 0; v < vocab_size; v++) {
         for (uint32_t i = 0; i < embed_dim; i++) {
             w1_host[(uint64_t)v * embed_dim + i] = (float)((v * 7 + i * 13) % 100) * 0.01f;
-            w2_host[(uint64_t)i * vocab_size + v] = (float)((v * 3 + i * 11) % 50) * 0.02f;  /* k-major (L213) */
+            t[(uint64_t)i * vocab_size + v]      = (float)((v * 3 + i * 11) % 50) * 0.02f;   /* k-major (L213) */
         }
         base_host[v] = (float)(v % 200) * 0.01f;
     }
@@ -441,47 +529,141 @@ static int check_dspark_markov_head(void) {
     pulsar_gpu_tensor *base = pulsar_gpu_tensor_alloc((uint64_t)vocab_size * sizeof(float));
     pulsar_gpu_tensor *ref_logits = pulsar_gpu_tensor_alloc((uint64_t)vocab_size * sizeof(float));
     int rc = 1;
-    if (base && ref_logits &&
-        pulsar_gpu_tensor_write(base, 0, base_host, (uint64_t)vocab_size * sizeof(float))) {
+    if (!base || !ref_logits ||
+        !pulsar_gpu_tensor_write(base, 0, base_host, (uint64_t)vocab_size * sizeof(float))) goto cleanup;
 
+    for (int fi = 0; fi < 3; fi++) {
+        const int fmt = fmts[fi];
+        const uint64_t w2_off = w1_bytes + (uint64_t)fi * w2_cap;      /* distinct offset per storage */
+        uint8_t *w2_blob = map_host + w2_off;
+        const uint64_t w2_bytes = smoke_w2_encode(fmt, t, vocab_size, embed_dim, w2_blob);
+        if (w2_bytes > w2_cap) {   /* every storage must fit its region (f32 is the widest) */
+            fprintf(stderr, "markov (%s): encoded %llu bytes > region %llu\n", fmt_names[fi],
+                    (unsigned long long)w2_bytes, (unsigned long long)w2_cap);
+            rc = 1; goto cleanup;
+        }
         int32_t id = prev_tokens[0];
         for (uint32_t step = 0; step < n_draft; step++) {
             int32_t gpu_id = 0;
             if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, base,
-                                                  map_host, 2 * w_bytes,
-                                                  0, w_bytes,
+                                                  map_host, map_bytes,
+                                                  0, w2_off,
                                                   id, vocab_size, embed_dim,
-                                                  /*w1_bf16=*/0, /*w2_bf16=*/0)) {
-                rc = 1;
-                goto cleanup;
+                                                  /*w1_bf16=*/0, fmt)) {
+                fprintf(stderr, "markov step %u (%s): launch failed\n", step, fmt_names[fi]);
+                rc = 1; goto cleanup;
             }
-
+            /* CPU oracle: the arm's decode and accumulation, same i order */
             const float *embed = w1_host + (uint64_t)id * embed_dim;
             float cpu_best = -1e30f;
             int32_t cpu_id = 0;
             for (uint32_t v = 0; v < vocab_size; v++) {
                 float dot = 0.0f;
-                for (uint32_t i = 0; i < embed_dim; i++)   /* same i order as the kernel */
-                    dot += w2_host[(uint64_t)i * vocab_size + v] * embed[i];
-                float val = base_host[v] + dot;
+                for (uint32_t i = 0; i < embed_dim; i++)
+                    dot += smoke_w2_decode(fmt, w2_blob, vocab_size, embed_dim, i, v) * embed[i];
+                const float val = base_host[v] + dot;
                 if (val > cpu_best) { cpu_best = val; cpu_id = (int32_t)v; }
             }
-
             if (gpu_id != cpu_id) {
-                fprintf(stderr, "markov step %u: GPU=%d CPU=%d\n", step, gpu_id, cpu_id);
-                rc = 1;
-                goto cleanup;
+                fprintf(stderr, "markov step %u (%s): GPU=%d CPU=%d\n", step, fmt_names[fi], gpu_id, cpu_id);
+                /* Diagnose, do not just fail: which refined logits differ, and how.
+                 * (A wrong-lane mapping shows as a periodic pattern in v; a wrong
+                 * decode shows as every v off by a scale; a wrong reduce shows the
+                 * logits agreeing while the argmax does not.) */
+                float *gpu_ref = (float *)calloc((size_t)vocab_size, sizeof(float));
+                if (gpu_ref && pulsar_gpu_tensor_read(ref_logits, 0, gpu_ref, (uint64_t)vocab_size * sizeof(float))) {
+                    int shown = 0, ndiff = 0; float gmax = -1e30f; int32_t gmax_id = 0;
+                    for (uint32_t v = 0; v < vocab_size; v++) {
+                        float dot = 0.0f;
+                        for (uint32_t i = 0; i < embed_dim; i++)
+                            dot += smoke_w2_decode(fmt, w2_blob, vocab_size, embed_dim, i, v) * embed[i];
+                        const float cpu_v = base_host[v] + dot;
+                        if (gpu_ref[v] > gmax) { gmax = gpu_ref[v]; gmax_id = (int32_t)v; }
+                        if (gpu_ref[v] != cpu_v) {
+                            ndiff++;
+                            if (shown < 6) { fprintf(stderr, "    v=%u gpu=%.6f cpu=%.6f\n", v, gpu_ref[v], cpu_v); shown++; }
+                        }
+                    }
+                    fprintf(stderr, "    %d/%u refined logits differ; GPU buffer argmax=%d (%.6f) vs reduce said %d; CPU argmax=%d (%.6f)\n",
+                            ndiff, vocab_size, gmax_id, gmax, gpu_id, cpu_id, cpu_best);
+                }
+                free(gpu_ref);
+                rc = 1; goto cleanup;
             }
             id = gpu_id;
         }
-        rc = 0;
+        printf("  markov head (%s): %u steps argmax-identical to the CPU oracle\n", fmt_names[fi], n_draft);
     }
+    rc = 0;
 
 cleanup:
     pulsar_gpu_tensor_free(ref_logits);
     pulsar_gpu_tensor_free(base);
     free(base_host);
+    free(t);
     /* map_host intentionally leaked (host-registered; see above). */
+    return rc;
+}
+
+/* ---- instrument, not a gate: the markov step per storage at the PRODUCTION
+ * table shape, same launch and n_banks for each, so the storages' kernels can
+ * be ranked.  The served census cannot rank them: a launch's time there rides
+ * on how many banks the load batched, which differs run to run (L213 step 2
+ * round 2: bf16 read 364 then 459 us with no kernel change between).  Each
+ * launch includes the reduce and the 4-byte id readback, the same fixed cost
+ * for every storage. */
+static int bench_dspark_markov_storages(void) {
+    const uint32_t V = 129280, E = 256;          /* deepseek4 vocab x markov rank */
+    const int fmts[3] = { PULSAR_MARKOV_W2_F32, PULSAR_MARKOV_W2_BF16, PULSAR_MARKOV_W2_MXFP8 };
+    const char *fmt_names[3] = { "f32", "bf16", "mxfp8" };
+    const uint64_t w1_bytes = (uint64_t)V * E * sizeof(float);
+    const uint64_t w2_cap = w1_bytes;
+    const uint64_t map_bytes = w1_bytes + 3u * w2_cap;
+    uint8_t *map_host = NULL;
+    if (posix_memalign((void **)&map_host, 4096, (size_t)map_bytes) != 0) return 1;
+    memset(map_host, 0, (size_t)map_bytes);
+    float *w1_host = (float *)map_host;
+    float *t = (float *)malloc((size_t)V * E * sizeof(float));
+    float *base_host = (float *)malloc((size_t)V * sizeof(float));
+    if (!t || !base_host) return 1;
+    for (uint32_t v = 0; v < V; v++) {
+        for (uint32_t i = 0; i < E; i++) {
+            w1_host[(uint64_t)v * E + i] = (float)((v * 7 + i * 13) % 100) * 0.01f;
+            t[(uint64_t)i * V + v]       = (float)((v * 3 + i * 11) % 50) * 0.02f - 0.49f;
+        }
+        base_host[v] = (float)(v % 200) * 0.01f;
+    }
+    pulsar_gpu_tensor *base = pulsar_gpu_tensor_alloc((uint64_t)V * sizeof(float));
+    pulsar_gpu_tensor *ref = pulsar_gpu_tensor_alloc((uint64_t)V * sizeof(float));
+    int rc = 1;
+    if (!base || !ref || !pulsar_gpu_tensor_write(base, 0, base_host, (uint64_t)V * sizeof(float))) goto cleanup;
+    printf("  markov step at %u x %u, one bank, 20 launches after 3 warm-ups (reduce + id readback included):\n", V, E);
+    for (int fi = 0; fi < 3; fi++) {
+        const int fmt = fmts[fi];
+        const uint64_t w2_off = w1_bytes + (uint64_t)fi * w2_cap;
+        const uint64_t w2_bytes = smoke_w2_encode(fmt, t, V, E, map_host + w2_off);
+        int32_t id = 42, out = 0;
+        for (int k = 0; k < 3; k++)
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, 0, w2_off, id, V, E, 0, fmt)) {
+                fprintf(stderr, "  markov bench (%s): launch failed\n", fmt_names[fi]); goto cleanup;
+            }
+        if (!pulsar_gpu_synchronize()) goto cleanup;
+        const double t0 = monotonic_seconds();
+        const int iters = 20;
+        for (int k = 0; k < iters; k++)
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, 0, w2_off, id, V, E, 0, fmt)) goto cleanup;
+        if (!pulsar_gpu_synchronize()) goto cleanup;
+        const double us = (monotonic_seconds() - t0) * 1e6 / iters;
+        printf("    %-12s %8.1f us/launch   w2 %6.1f MB   %6.1f GB/s over the w2 stream   argmax %d\n",
+               fmt_names[fi], us, w2_bytes / 1e6, w2_bytes / us / 1e3, out);
+    }
+    rc = 0;
+cleanup:
+    pulsar_gpu_tensor_free(ref);
+    pulsar_gpu_tensor_free(base);
+    free(base_host);
+    free(t);
+    /* map_host intentionally leaked (host-registered / range-cached). */
     return rc;
 }
 
@@ -1226,6 +1408,7 @@ int main(void) {
     int rc = check_large_topk();
     rc |= check_topk_set_identity();
     if (check_dspark_markov_head() != 0) rc = 1;
+    if (rc == 0 && bench_dspark_markov_storages() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
     if (check_decode_attention_one_row_long_comp() != 0) rc = 1;

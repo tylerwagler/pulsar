@@ -10,11 +10,10 @@
  * visits a thread's ids in ascending order with a strict-'>' update, and the
  * shared-memory tree keeps the lower-index side as the incumbent.
  */
-/* W1BF16/W2BF16 select the storage of markov_w1 and markov_w2 (pulsar_w_load).
- * They are SEPARATE tensors and nothing in the format forces them to agree, so
- * they get separate flags even though every artifact so far converts them
- * together -- a single shared flag silently misreads one of them the first time
- * that stops being true.
+/* W1BF16 selects the storage of markov_w1 (pulsar_w_load); W2FMT is markov_w2's
+ * PULSAR_MARKOV_W2_* format.  They are SEPARATE tensors and nothing in the
+ * format forces them to agree, so they get separate descriptors -- a single
+ * shared one silently misreads one of them the first time that stops being true.
  *
  * This kernel streams the WHOLE of markov_w2 -- every vocab row, every step --
  * at one multiply-add per element, so it is pure bandwidth: halving the element
@@ -28,7 +27,72 @@
  * The per-thread accumulation order over i is unchanged, so refined logits are
  * bit-identical to the v-major kernel's. markov_w1 stays v-major: it is read
  * one whole row (the previous token's) per bank, which that layout serves. */
-template <bool W1BF16, bool W2BF16>
+/* Every W2 arm reads FOUR consecutive v per lane at each i (L213 step 2): a
+ * warp's load is one contiguous 128 B (mxfp8) .. 512 B (f32) run, where the
+ * one-v-per-lane bf16 kernel it replaces made a 64 B request per warp-load
+ * (half a line) and reached 113 of ~218 GB/s.  Each v still accumulates over i
+ * in order in its own f32 register, so the f32/bf16 arms are bit-identical to
+ * the one-v kernel; the per-thread argmax visits its four v ascending with a
+ * strict '>', so the lowest id still wins a tie into the same block tree. */
+/* (value, id) argmax merge: the lower id wins an exact tie.  Used at EVERY level
+ * -- per thread, the in-block tree, the cross-block reduce -- so the result is
+ * the sequential "first maximum" for any thread -> vocab mapping. */
+__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
+                                                  float v, int32_t id) {
+    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
+}
+
+template <int W2FMT>
+__device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size, uint32_t embed_dim,
+                                                       uint32_t i, uint32_t v0, float out[4]) {
+    if constexpr (W2FMT == PULSAR_MARKOV_W2_F32) {
+        const float4 q = *(const float4 *)((const float *)w2 + (uint64_t)i * vocab_size + v0);
+        out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
+    } else if constexpr (W2FMT == PULSAR_MARKOV_W2_BF16) {
+        /* four bf16 in one 8-byte load; bf16 -> f32 is the 16-bit shift, the
+         * value __bfloat162float would give */
+        const uint2 q = *(const uint2 *)((const __nv_bfloat16 *)w2 + (uint64_t)i * vocab_size + v0);
+        out[0] = __uint_as_float(q.x << 16); out[1] = __uint_as_float(q.x & 0xffff0000u);
+        out[2] = __uint_as_float(q.y << 16); out[3] = __uint_as_float(q.y & 0xffff0000u);
+    } else {
+        /* MXFP8 SoA (GGUF 46): type 38's content as two planes -- E8M0 scales
+         * [E][V/32], then E4M3 payload [E][V] -- so the payload is one aligned
+         * 4-byte load.  Stock 38's 33-byte blocks forced five byte loads per
+         * lane per i and held this arm at 152 GB/s (L213 round 5); the planes
+         * took it to 161 us, 212 GB/s.
+         * v0 is 4-aligned so its four v share one scale.  ldexpf keeps byte 0
+         * (2^-127, an f32 subnormal) exact, as the CPU codec's ldexpf does; the
+         * E4M3 -> f32 hardware conversion is exact. */
+        const uint8_t *sc  = (const uint8_t *)w2;
+        const uint8_t *pay = sc + (uint64_t)embed_dim * (vocab_size >> 5);
+        const float scale = ldexpf(1.0f, (int)sc[(uint64_t)i * (vocab_size >> 5) + (v0 >> 5)] - 127);
+        const uint32_t q = *(const uint32_t *)(pay + (uint64_t)i * vocab_size + v0);
+        __nv_fp8_e4m3 f;
+        f.__x = (uint8_t)(q & 0xffu);         out[0] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 8) & 0xffu);  out[1] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 16) & 0xffu); out[2] = (float)f * scale;
+        f.__x = (uint8_t)(q >> 24);           out[3] = (float)f * scale;
+    }
+}
+/* Bytes of a markov_w2 blob in each storage; 0 = unknown format (refuse). */
+static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t embed_dim) {
+    const uint64_t n = (uint64_t)vocab_size * embed_dim;
+    switch (w2_fmt) {
+    case PULSAR_MARKOV_W2_F32:   return n * 4u;
+    case PULSAR_MARKOV_W2_BF16:  return n * 2u;
+    case PULSAR_MARKOV_W2_MXFP8: return (vocab_size % 32u) ? 0 : ((uint64_t)vocab_size / 32u) * 33u * embed_dim;
+    default: return 0;
+    }
+}
+#define PULSAR_MARKOV_DISPATCH(LAUNCH, A)                                       \
+    switch (w2_fmt) {                                                           \
+    case PULSAR_MARKOV_W2_F32:   LAUNCH(A, PULSAR_MARKOV_W2_F32);   break;      \
+    case PULSAR_MARKOV_W2_BF16:  LAUNCH(A, PULSAR_MARKOV_W2_BF16);  break;      \
+    case PULSAR_MARKOV_W2_MXFP8: LAUNCH(A, PULSAR_MARKOV_W2_MXFP8); break;      \
+    default: return 0;                                                          \
+    }
+
+template <bool W1BF16, int W2FMT>
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
         int32_t *block_best_id,
@@ -47,15 +111,21 @@ __global__ static void dspark_markov_step_kernel(
     float best_val = -INFINITY;
     int32_t best_id = 0;
 
-    for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
-         v += blockDim.x * gridDim.x) {
-        float dot = 0.0f;
-        for (uint32_t i = 0; i < embed_dim; i++)
-            dot += pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, (uint64_t)i * vocab_size + v) *
-                   pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
-        float val = base_logits[v] + dot;
-        refined_logits[v] = val;
-        if (val > best_val) { best_val = val; best_id = (int32_t)v; }
+    for (uint32_t v0 = 4u * (threadIdx.x + blockIdx.x * blockDim.x); v0 < vocab_size;
+         v0 += 4u * blockDim.x * gridDim.x) {
+        float dot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t i = 0; i < embed_dim; i++) {
+            float w2v[4];
+            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i, v0, w2v);
+            const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
+            for (int k = 0; k < 4; k++) dot[k] += w2v[k] * w1v;
+        }
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v = v0 + k;
+            const float val = base_logits[v] + dot[k];
+            refined_logits[v] = val;
+            if (val > best_val) { best_val = val; best_id = (int32_t)v; }
+        }
     }
 
     __shared__ float best_vals[256];
@@ -67,11 +137,14 @@ __global__ static void dspark_markov_step_kernel(
 
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            /* strict '>': the lower-index side stays the incumbent on a tie */
-            const float nb = best_vals[tid + stride];
-            if (nb > best_vals[tid]) {
-                best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-            }
+            /* (value, id) merge, lower id wins -- the cross-block reduce's rule
+             * (L191 #5).  The strict-'>' "lower slot stays the incumbent"
+             * shortcut this replaces equalled "lower id wins" only while no slot
+             * ever inherited a higher thread's value; the tree migrates values
+             * downward, so it never did.  L213 step 2's four-v-per-lane mapping
+             * put five tied ids in one block and it returned the third. */
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         }
         __syncthreads();
     }
@@ -98,10 +171,6 @@ __global__ static void dspark_markov_step_kernel(
  * change only on exact ties).  A thread with no block holds (-inf, INT32_MAX)
  * so it never wins a tie.
  */
-__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
-                                                  float v, int32_t id) {
-    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
-}
 
 __global__ static void dspark_markov_reduce_kernel(
         int32_t *dst,               /* winner id (L108 P1: points into the
@@ -160,7 +229,7 @@ int pulsar_gpu_dspark_markov_step_model(
         uint32_t vocab_size,
         uint32_t embed_dim,
         int w1_bf16,
-        int w2_bf16) {
+        int w2_fmt) {
     if (!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map)
         return 0;
     if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
@@ -184,8 +253,8 @@ int pulsar_gpu_dspark_markov_step_model(
      * tensor near the end of the file. */
     const uint64_t w1_bytes =
         (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
-    const uint64_t w2_bytes =
-        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
+    const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
+    if (!w2_bytes) return 0;
     if (markov_w1_offset > dspark_model_size ||
         w1_bytes > dspark_model_size - markov_w1_offset) return 0;
     if (markov_w2_offset > dspark_model_size ||
@@ -198,7 +267,9 @@ int pulsar_gpu_dspark_markov_step_model(
     if (!w1 || !w2) return 0;
 
     const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
+    if (vocab_size % 4u != 0) return 0;
+    const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
 
     /* Persistent reduce buffers, grown on demand: grid_dim is fixed for a given
@@ -252,10 +323,8 @@ int pulsar_gpu_dspark_markov_step_model(
         (float *)rb.val->ptr,                                 \
         (const float *)base_logits->ptr,                      \
         w1, w2, (const int32_t *)staged_id->ptr, vocab_size, embed_dim)
-    if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_LAUNCH(true, true);
-    else if (w1_bf16)         PULSAR_MARKOV_LAUNCH(true, false);
-    else if (w2_bf16)         PULSAR_MARKOV_LAUNCH(false, true);
-    else                      PULSAR_MARKOV_LAUNCH(false, false);
+    if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_LAUNCH, true)
+    else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_LAUNCH, false)
 #undef PULSAR_MARKOV_LAUNCH
 
     int rc = 0;
@@ -299,7 +368,7 @@ int pulsar_gpu_dspark_markov_chain_model(
         uint32_t vocab_size,
         uint32_t embed_dim,
         int w1_bf16,
-        int w2_bf16) {
+        int w2_fmt) {
     if (!refined_logits || !ids_dev || !base_logits ||
         !dspark_model_map || n_draft == 0 || n_draft > 16)
         return 0;
@@ -312,8 +381,8 @@ int pulsar_gpu_dspark_markov_chain_model(
 
     const uint64_t w1_bytes =
         (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
-    const uint64_t w2_bytes =
-        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
+    const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
+    if (!w2_bytes) return 0;
     if (markov_w1_offset > dspark_model_size ||
         w1_bytes > dspark_model_size - markov_w1_offset) return 0;
     if (markov_w2_offset > dspark_model_size ||
@@ -325,7 +394,9 @@ int pulsar_gpu_dspark_markov_chain_model(
     if (!w1 || !w2) return 0;
 
     const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
+    if (vocab_size % 4u != 0) return 0;
+    const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
     static thread_local DsparkReduceBufsChain crb = {};
     if (grid_dim > crb.cap) {
@@ -348,10 +419,8 @@ int pulsar_gpu_dspark_markov_chain_model(
             (int32_t *)crb.id->ptr,                               \
             (float *)crb.val->ptr,                                \
             base_row, w1, w2, ids + pos, vocab_size, embed_dim)
-        if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_CHAIN_LAUNCH(true, true);
-        else if (w1_bf16)         PULSAR_MARKOV_CHAIN_LAUNCH(true, false);
-        else if (w2_bf16)         PULSAR_MARKOV_CHAIN_LAUNCH(false, true);
-        else                      PULSAR_MARKOV_CHAIN_LAUNCH(false, false);
+        if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_CHAIN_LAUNCH, true)
+        else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_CHAIN_LAUNCH, false)
 #undef PULSAR_MARKOV_CHAIN_LAUNCH
         dspark_markov_reduce_kernel<<<1, 256>>>(
             ids + pos + 1, (const int32_t *)crb.id->ptr, (const float *)crb.val->ptr,
@@ -747,7 +816,7 @@ int pulsar_gpu_distill_top64_tensor(
  * [n_banks][gridDim.x]; the bank's base row is base_logits[(base_row[b] +
  * base_row_add) * base_row_stride]; the previous token for bank b is
  * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_BANKS_MAX. */
-template <bool W1BF16, bool W2BF16>
+template <bool W1BF16, int W2FMT>
 __global__ static void dspark_markov_step_banks_kernel(
         float *__restrict__ refined_logits,
         int32_t *__restrict__ block_best_id,
@@ -778,19 +847,25 @@ __global__ static void dspark_markov_step_banks_kernel(
             base[b] = base_logits + ((uint64_t)base_row[b] + base_row_add) * base_row_stride;
         }
     }
-    for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
-         v += blockDim.x * gridDim.x) {
-        float dot[MAXB];
-        for (uint32_t b = 0; b < MAXB; b++) dot[b] = 0.0f;
+    for (uint32_t v0 = 4u * (threadIdx.x + blockIdx.x * blockDim.x); v0 < vocab_size;
+         v0 += 4u * blockDim.x * gridDim.x) {
+        float dot[MAXB][4];
+        for (uint32_t b = 0; b < MAXB; b++) for (int k = 0; k < 4; k++) dot[b][k] = 0.0f;
         for (uint32_t i = 0; i < embed_dim; i++) {
-            const float w2v = pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, (uint64_t)i * vocab_size + v);
-            for (uint32_t b = 0; b < n_banks; b++)
-                dot[b] += w2v * pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base[b] + i);
+            float w2v[4];
+            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i, v0, w2v);
+            for (uint32_t b = 0; b < n_banks; b++) {
+                const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base[b] + i);
+                for (int k = 0; k < 4; k++) dot[b][k] += w2v[k] * w1v;
+            }
         }
         for (uint32_t b = 0; b < n_banks; b++) {
-            const float val = base[b][v] + dot[b];
-            refined_logits[(uint64_t)b * vocab_size + v] = val;
-            if (val > best_val[b]) { best_val[b] = val; best_id[b] = (int32_t)v; }
+            for (int k = 0; k < 4; k++) {
+                const uint32_t v = v0 + k;
+                const float val = base[b][v] + dot[b][k];
+                refined_logits[(uint64_t)b * vocab_size + v] = val;
+                if (val > best_val[b]) { best_val[b] = val; best_id[b] = (int32_t)v; }
+            }
         }
     }
 
@@ -803,10 +878,9 @@ __global__ static void dspark_markov_step_banks_kernel(
         __syncthreads();
         for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (tid < stride) {
-                const float nb = best_vals[tid + stride];
-                if (nb > best_vals[tid]) {
-                    best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-                }
+                /* (value, id) merge, lower id wins -- see the single-bank tree */
+                dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                    best_vals[tid + stride], best_ids[tid + stride]);
             }
             __syncthreads();
         }
@@ -882,11 +956,11 @@ static int dspark_markov_banks_launch(
         uint64_t dspark_model_size, uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t pos_first, uint32_t pos_count,
         const pulsar_gpu_tensor *prev_override, /* NULL: chain feed ids[b][pos]; else [n_banks] i32 */
-        uint32_t vocab_size, uint32_t embed_dim, int w1_bf16, int w2_bf16) {
+        uint32_t vocab_size, uint32_t embed_dim, int w1_bf16, int w2_fmt) {
     const uint64_t w1_bytes =
         (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
-    const uint64_t w2_bytes =
-        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w2_bf16);
+    const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
+    if (!w2_bytes) return 0;
     if (markov_w1_offset > dspark_model_size ||
         w1_bytes > dspark_model_size - markov_w1_offset) return 0;
     if (markov_w2_offset > dspark_model_size ||
@@ -898,7 +972,9 @@ static int dspark_markov_banks_launch(
     if (!w1 || !w2) return 0;
 
     const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
+    /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
+    if (vocab_size % 4u != 0) return 0;
+    const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
     if (grid_dim > 65535) return 0;
     static thread_local DsparkReduceBufsBanks bb = {};
     const uint32_t need = n_banks * grid_dim;
@@ -923,10 +999,8 @@ static int dspark_markov_banks_launch(
             (const float *)base_logits->ptr, (const int32_t *)base_row_dev->ptr, \
             pos, base_row_stride_bytes / sizeof(float),                       \
             w1, w2, prev, prev_stride, n_banks, vocab_size, embed_dim)
-        if (w1_bf16 && w2_bf16)   PULSAR_MARKOV_BANKS_LAUNCH(true, true);
-        else if (w1_bf16)         PULSAR_MARKOV_BANKS_LAUNCH(true, false);
-        else if (w2_bf16)         PULSAR_MARKOV_BANKS_LAUNCH(false, true);
-        else                      PULSAR_MARKOV_BANKS_LAUNCH(false, false);
+        if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, true)
+        else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, false)
 #undef PULSAR_MARKOV_BANKS_LAUNCH
         dspark_markov_reduce_banks_kernel<<<n_banks, 256>>>(
             ids + pos + 1, ids_stride,
@@ -943,7 +1017,7 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_bf16) {
+        int w1_bf16, int w2_fmt) {
     if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
                                      base_row_stride_bytes, base_row_dev, n_banks, n_draft,
                                      vocab_size, embed_dim))
@@ -952,7 +1026,7 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
                                       base_row_stride_bytes, base_row_dev, dspark_model_map,
                                       dspark_model_size, markov_w1_offset, markov_w2_offset,
                                       n_banks, 0u, n_draft, NULL, vocab_size, embed_dim,
-                                      w1_bf16, w2_bf16);
+                                      w1_bf16, w2_fmt);
 }
 
 int pulsar_gpu_dspark_markov_step_banks_model(
@@ -962,7 +1036,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_bf16) {
+        int w1_bf16, int w2_fmt) {
     if (!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t)) return 0;
     if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
                                      base_row_stride_bytes, base_row_dev, n_banks, pos + 1,
@@ -972,7 +1046,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
                                       base_row_stride_bytes, base_row_dev, dspark_model_map,
                                       dspark_model_size, markov_w1_offset, markov_w2_offset,
                                       n_banks, pos, 1u, prev_dev, vocab_size, embed_dim,
-                                      w1_bf16, w2_bf16);
+                                      w1_bf16, w2_fmt);
 }
 
 

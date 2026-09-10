@@ -76,9 +76,14 @@ static const gguf_type_info gguf_types[] = {
      * Pure permutation again, so it too shares type 16's {256, 66} accounting.
      * See PULSAR_TENSOR_IQ2_XXS_MMQ_K. */
     /*44*/ {"iq2_xxs_mmq_k", 256, 66},
+    /*45*/ {NULL,       0,   0},   /* was I8_ROWSCALE_K during L213 step 2's experiment; lost to 46 */
+    /* FP8_E4M3_SOA_K: type 38's E4M3 + E8M0 content split into a scale plane and
+     * a payload plane (L213 step 2b).  A pure permutation, so it shares 38's
+     * {32, 33} accounting and loads through the generic path. */
+    /*46*/ {"fp8_e4m3_soa_k", 32, 33},
 };
 
-static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 45,
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 47,
               "gguf_types rows must line up with GGUF type ids");
 
 

@@ -1,6 +1,7 @@
 #include "quants_internal.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 /* A NaN weight means the source tensor is corrupt; encoding it (E4M3 NaN or
@@ -278,4 +279,19 @@ void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk) {
         memcpy(out + (size_t)b * 2, iq2_blocks + (size_t)b * 66, 2);
     for (int64_t b = 0; b < nblk; b++)
         memcpy(out + dq + (size_t)b * 64, iq2_blocks + (size_t)b * 66 + 2, 64);
+}
+
+/* ---- FP8_E4M3_SOA_K (46): type-38 blocks -> [scale plane][payload plane] ------ */
+void ds4q_fp8_e4m3_soa_k_repack(const void *blocks, void *soa, int64_t nrows, int64_t ncols) {
+    const uint8_t *b = (const uint8_t *)blocks;
+    const int64_t nblk = ncols / 32;
+    uint8_t *sc = (uint8_t *)soa;
+    uint8_t *pay = sc + (size_t)nrows * (size_t)nblk;
+    for (int64_t r = 0; r < nrows; r++) {
+        for (int64_t c = 0; c < nblk; c++) {
+            sc[r * nblk + c] = b[0];
+            memcpy(pay + (size_t)r * (size_t)ncols + (size_t)c * 32u, b + 1, 32);
+            b += 33;
+        }
+    }
 }

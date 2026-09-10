@@ -433,8 +433,23 @@ enum {
      * cache is capacity-bound (~22.9 GiB budget vs ~35 GB to hold all 90+ IQ2
      * stacks), so it covered only part of the model and made the first prefill
      * frontier absorb the repack.  Pre-storing costs zero model growth. */
-    PULSAR_TENSOR_IQ2_XXS_MMQ_K = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K,       /* one spelling: pulsar_gpu.h */
+    PULSAR_TENSOR_IQ2_XXS_MMQ_K = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K,
+    PULSAR_TENSOR_FP8_E4M3_SOA_K = PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K, /* one spelling: pulsar_gpu.h */       /* one spelling: pulsar_gpu.h */
 };
+
+/** The drafter markov_w2 table's storage, derived from its GGUF type -- the one
+ * place the type -> kernel-arm mapping is spelled (L213).  Any other type is a
+ * refusal, not a default: the loader's dims contract already rejected it, so
+ * reaching here with one is a bug. */
+void pulsar_die(const char *msg);   /* declared in full further down; needed here */
+static inline int pulsar_markov_w2_fmt(uint32_t type) {
+    switch (type) {
+    case PULSAR_TENSOR_F32:           return PULSAR_MARKOV_W2_F32;
+    case PULSAR_TENSOR_BF16:          return PULSAR_MARKOV_W2_BF16;
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K: return PULSAR_MARKOV_W2_MXFP8;
+    default: pulsar_die("markov_w2: unsupported storage type"); return -1;
+    }
+}
 
 /** One GGUF metadata entry, held as a key plus an OFFSET rather than a parsed
  * value: values vary in type and length, and most are never read, so parsing

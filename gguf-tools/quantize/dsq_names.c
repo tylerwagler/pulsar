@@ -237,7 +237,7 @@ ds4q_type parse_type(const char *raw) {
 bool is_quantizable_target(ds4q_type type) {
     return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 ||
            type == DS4Q_TYPE_CUTLASS_MXFP4 || type == DS4Q_TYPE_MXFP8_LT ||
-           type == DS4Q_TYPE_IQ2_XXS_MMQ ||
+           type == DS4Q_TYPE_IQ2_XXS_MMQ || type == DS4Q_TYPE_FP8_E4M3_SOA_K ||
            ds4q_can_quantize(type);
 }
 

@@ -735,7 +735,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                               w->markov_w2->abs_offset,
                                               n_draft, vocab_size, embed_dim,
                                               w->markov_w1->type == PULSAR_TENSOR_BF16,
-                                              w->markov_w2->type == PULSAR_TENSOR_BF16) &&
+                                              pulsar_markov_w2_fmt(w->markov_w2->type)) &&
             (defer_harvest ||
              pulsar_gpu_tensor_read(g->dspark_refined_ids, sizeof(int32_t),
                                     &refined[1], (uint64_t)n_draft * sizeof(int32_t)));
@@ -750,7 +750,7 @@ static uint32_t spec_round_redraft(pulsar_session *s, int next_base,
                                              w->markov_w2->abs_offset,
                                              refined[pos], vocab_size, embed_dim,
                                              w->markov_w1->type == PULSAR_TENSOR_BF16,
-                                             w->markov_w2->type == PULSAR_TENSOR_BF16);
+                                             pulsar_markov_w2_fmt(w->markov_w2->type));
         pulsar_gpu_tensor_free(base_row);
         if (!draft_ok || !sample_drafts) continue;
         /* Build this position's proposal q BEFORE the next markov step
@@ -1976,7 +1976,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
     }
     const uint64_t spec_row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
     const int w1_bf16 = w->markov_w1->type == PULSAR_TENSOR_BF16;
-    const int w2_bf16 = w->markov_w2->type == PULSAR_TENSOR_BF16;
+    const int w2_fmt = pulsar_markov_w2_fmt(w->markov_w2->type);
 
     /* greedy banks: the whole chain on device, ids read back once */
     if (n_g > 0) {
@@ -1984,7 +1984,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                 g->dspark_markov_logits, g->dspark_refined_ids, 17u,
                 g->spec_logits, spec_row_bytes, g->dspark_bank_meta,
                 dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
-                (uint32_t)n_g, max_draft_g, vocab_size, embed_dim, w1_bf16, w2_bf16)) {
+                (uint32_t)n_g, max_draft_g, vocab_size, embed_dim, w1_bf16, w2_fmt)) {
             snprintf(err, errlen, "redraft batch: markov chain failed");
             return -1;
         }
@@ -2021,7 +2021,7 @@ static int spec_redraft_group(pulsar_session *s, pulsar_spec_round **rounds,
                  pulsar_gpu_dspark_markov_step_banks_model(
                      refined_s, ids_s, 17u, g->spec_logits, spec_row_bytes, base_s, prev_s,
                      dmap, dsize, w->markov_w1->abs_offset, w->markov_w2->abs_offset,
-                     (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_bf16);
+                     (uint32_t)n_s, pos, vocab_size, embed_dim, w1_bf16, w2_fmt);
             if (ok && all_sparse &&
                 !(pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, refined_s, 0,
                                                  (uint32_t)n_s, vocab_size, vocab_size,

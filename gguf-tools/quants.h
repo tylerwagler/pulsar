@@ -79,7 +79,13 @@ typedef enum {
                                  * engine-only until 2026-08-12, which is why
                                  * repack_iq2_mmq.py existed as a separate
                                  * post-pass over the whole artifact. */
-    DS4Q_TYPE_COUNT   = 44,
+    /* 45 was I8_ROWSCALE_K during L213 step 2's experiment; it lost to 46 */
+    DS4Q_TYPE_FP8_E4M3_SOA_K = 46, /* type 38's E4M3 + E8M0 content split into an E8M0
+                                    * scale plane [rows][cols/32] then an E4M3 payload
+                                    * plane [rows][cols] (L213 step 2b).  Pure permutation:
+                                    * same 33 B per 32, so row_size accounting is 38's.
+                                    * Wire-matches the engine's PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K. */
+    DS4Q_TYPE_COUNT   = 47,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {
@@ -161,6 +167,10 @@ void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
  * NOT interchangeable with IQ2_XXS_SOA (42), which is a different permutation
  * (q plane first, no padding). */
 size_t ds4q_iq2_xxs_mmq_bytes(int64_t nblk);
+
+/* FP8_E4M3_SOA_K (46): permute nrows*(ncols/32) type-38 blocks (33 B: scale then
+ * 32 E4M3) into [scales: nrows*(ncols/32) B][payload: nrows*ncols B]. */
+void ds4q_fp8_e4m3_soa_k_repack(const void *blocks, void *soa, int64_t nrows, int64_t ncols);
 void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk);
 
 /* The canonical Blackwell 128x4 scale-factor swizzle, shared by the CUTLASS

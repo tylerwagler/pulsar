@@ -44,6 +44,19 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
         free(tmp);
         return out;
     }
+    if (type == DS4Q_TYPE_FP8_E4M3_SOA_K) {
+        /* the type-38 codec, then the plane permutation (same byte count) */
+        if (ncols % 32 != 0) die("fp8_e4m3_soa_k ncols is not divisible by 32");
+        const int64_t nrows = n / ncols;
+        const size_t bytes = (size_t)nrows * ds4q_row_size(DS4Q_TYPE_FP8_E4M3, ncols);
+        uint8_t *tmp = xmalloc(bytes);
+        ds4q_quantize_chunk(DS4Q_TYPE_FP8_E4M3, src, tmp, 0, nrows, ncols, NULL);
+        out.size = bytes;
+        out.data = xmalloc(out.size);
+        ds4q_fp8_e4m3_soa_k_repack(tmp, out.data, nrows, ncols);
+        free(tmp);
+        return out;
+    }
     if (!ds4q_can_quantize(type)) die("unsupported quant target type");
     if (ncols % ds4q_block_size(type) != 0) die("ncols is not divisible by quant block size");
     const int64_t nrows = n / ncols;

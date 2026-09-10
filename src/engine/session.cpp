@@ -411,8 +411,8 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->dspark_model = e->model;
         e->dspark_external = false;
         e->dspark_ready = true;
-        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d)\n",
-                e->dspark_draft_tokens);
+        fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
+                e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
     }
 
     if (graph_backend) {
