@@ -43,7 +43,7 @@ __device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best
 }
 
 template <int W2FMT>
-__device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size,
+__device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size, uint32_t embed_dim,
                                                        uint32_t i, uint32_t v0, float out[4]) {
     if constexpr (W2FMT == PULSAR_MARKOV_W2_F32) {
         const float4 q = *(const float4 *)((const float *)w2 + (uint64_t)i * vocab_size + v0);
@@ -61,17 +61,22 @@ __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t 
         out[0] = (float)(int8_t)(q & 0xffu);         out[1] = (float)(int8_t)((q >> 8) & 0xffu);
         out[2] = (float)(int8_t)((q >> 16) & 0xffu); out[3] = (float)(int8_t)(q >> 24);
     } else {
-        /* MXFP8 (GGUF 38): 33-byte blocks of 32 v at fixed i -- one E8M0 scale
-         * byte then 32 E4M3.  v0 is 4-aligned so its four v share a block.
-         * ldexpf keeps byte 0 (2^-127, an f32 subnormal) exact, as the CPU
-         * codec's ldexpf does; the E4M3 -> f32 hardware conversion is exact. */
-        const uint8_t *blk = (const uint8_t *)w2 + ((uint64_t)i * (vocab_size >> 5) + (v0 >> 5)) * 33u;
-        const float scale = ldexpf(1.0f, (int)blk[0] - 127);
-        const uint8_t *pq = blk + 1 + (v0 & 31u);
-        for (int k = 0; k < 4; k++) {
-            __nv_fp8_e4m3 f; f.__x = pq[k];
-            out[k] = (float)f * scale;
-        }
+        /* MXFP8 SoA (GGUF 46): type 38's content as two planes -- E8M0 scales
+         * [E][V/32], then E4M3 payload [E][V] -- so the payload is the int8
+         * arm's aligned 4-byte load.  Stock 38's 33-byte blocks forced five byte
+         * loads per lane per i and held this arm at 152 GB/s (L213 round 5).
+         * v0 is 4-aligned so its four v share one scale.  ldexpf keeps byte 0
+         * (2^-127, an f32 subnormal) exact, as the CPU codec's ldexpf does; the
+         * E4M3 -> f32 hardware conversion is exact. */
+        const uint8_t *sc  = (const uint8_t *)w2;
+        const uint8_t *pay = sc + (uint64_t)embed_dim * (vocab_size >> 5);
+        const float scale = ldexpf(1.0f, (int)sc[(uint64_t)i * (vocab_size >> 5) + (v0 >> 5)] - 127);
+        const uint32_t q = *(const uint32_t *)(pay + (uint64_t)i * vocab_size + v0);
+        __nv_fp8_e4m3 f;
+        f.__x = (uint8_t)(q & 0xffu);         out[0] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 8) & 0xffu);  out[1] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 16) & 0xffu); out[2] = (float)f * scale;
+        f.__x = (uint8_t)(q >> 24);           out[3] = (float)f * scale;
     }
 }
 /* I8ROW: the four vocab rows' f16 scales, from the plane that follows the
@@ -127,7 +132,7 @@ __global__ static void dspark_markov_step_kernel(
         float dot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         for (uint32_t i = 0; i < embed_dim; i++) {
             float w2v[4];
-            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, i, v0, w2v);
+            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i, v0, w2v);
             const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
             for (int k = 0; k < 4; k++) dot[k] += w2v[k] * w1v;
         }
@@ -868,7 +873,7 @@ __global__ static void dspark_markov_step_banks_kernel(
         for (uint32_t b = 0; b < MAXB; b++) for (int k = 0; k < 4; k++) dot[b][k] = 0.0f;
         for (uint32_t i = 0; i < embed_dim; i++) {
             float w2v[4];
-            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, i, v0, w2v);
+            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i, v0, w2v);
             for (uint32_t b = 0; b < n_banks; b++) {
                 const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base[b] + i);
                 for (int k = 0; k < 4; k++) dot[b][k] += w2v[k] * w1v;

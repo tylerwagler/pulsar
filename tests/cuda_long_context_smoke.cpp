@@ -505,8 +505,10 @@ static uint64_t smoke_w2_encode(int fmt, const float *t, uint32_t V, uint32_t E,
         }
         return (uint64_t)V * E + (uint64_t)V * 2;
     }
-    /* MXFP8: per (i, 32-block of v): E8M0 scale byte then 32 E4M3 */
-    uint8_t *o = blob;
+    /* MXFP8 SoA (46): per (i, 32-block of v) an E8M0 scale in the scale plane
+     * [E][V/32], the 32 E4M3 in the payload plane [E][V] that follows it */
+    uint8_t *sc = blob;
+    uint8_t *pay = blob + (uint64_t)E * (V / 32);
     for (uint32_t i = 0; i < E; i++) {
         for (uint32_t b = 0; b < V / 32; b++) {
             const float *x = t + (uint64_t)i * V + (uint64_t)b * 32;
@@ -516,10 +518,9 @@ static uint64_t smoke_w2_encode(int fmt, const float *t, uint32_t V, uint32_t E,
             if (amax > 0.0f) { int e; frexpf(amax, &e); scale_exp = (e - 1) - 7; }
             if (scale_exp < -127) scale_exp = -127;
             if (scale_exp > 127) scale_exp = 127;
-            o[0] = (uint8_t)(scale_exp + 127);
+            sc[(uint64_t)i * (V / 32) + b] = (uint8_t)(scale_exp + 127);
             const float inv = ldexpf(1.0f, -scale_exp);
-            for (int j = 0; j < 32; j++) o[1 + j] = smoke_f32_to_e4m3(x[j] * inv);
-            o += 33;
+            for (int j = 0; j < 32; j++) pay[(uint64_t)i * V + (uint64_t)b * 32 + j] = smoke_f32_to_e4m3(x[j] * inv);
         }
     }
     return (uint64_t)(V / 32) * 33 * E;
@@ -527,14 +528,14 @@ static uint64_t smoke_w2_encode(int fmt, const float *t, uint32_t V, uint32_t E,
 /* w2 element (i, v) decoded as the kernel arm sees it (I8ROW: the raw q; the
  * row scale is applied by the caller once per output). */
 static float smoke_w2_decode(int fmt, const uint8_t *blob, uint32_t V, uint32_t E, uint32_t i, uint32_t v) {
-    (void)E;
     switch (fmt) {
     case PULSAR_MARKOV_W2_F32:   return ((const float *)blob)[(uint64_t)i * V + v];
     case PULSAR_MARKOV_W2_BF16:  return smoke_bf16_to_f32(((const uint16_t *)blob)[(uint64_t)i * V + v]);
     case PULSAR_MARKOV_W2_I8ROW: return (float)((const int8_t *)blob)[(uint64_t)i * V + v];
     default: {
-        const uint8_t *blk = blob + ((uint64_t)i * (V / 32) + (v / 32)) * 33u;
-        return smoke_e4m3_to_f32(blk[1 + (v % 32)]) * ldexpf(1.0f, (int)blk[0] - 127);
+        const uint8_t *pay = blob + (uint64_t)E * (V / 32);
+        return smoke_e4m3_to_f32(pay[(uint64_t)i * V + v]) *
+               ldexpf(1.0f, (int)blob[(uint64_t)i * (V / 32) + (v / 32)] - 127);
     }
     }
 }

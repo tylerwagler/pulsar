@@ -302,6 +302,13 @@ enum {
      * applied once per output, outside the i loop.  Byte size is
      * rows*cols + 2*cols, not a per-element rate (gguf.cpp sizes it by dims). */
     PULSAR_GPU_TENSOR_I8_ROWSCALE_K = 45,
+    /* MXFP8 SoA, k-major (L213 step 2b): type 38's exact E4M3 + E8M0-per-32 content
+     * split into two planes -- E8M0 scales [rows][cols/32], then E4M3 payload
+     * [rows][cols] -- so a lane's payload load is one aligned 4-byte word where
+     * 38's 33-byte blocks forced five byte loads.  Same bytes, same count
+     * (33 per 32), a pure permutation, exactly as IQ2_XXS_SOA (42) is to 16.
+     * The drafter's markov_w2 is the consumer; stock 38 has no reader. */
+    PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K = 46,
 };
 
 /** Storage of the drafter's markov_w2 table (one spelling; the engine derives
@@ -311,7 +318,7 @@ enum {
     PULSAR_MARKOV_W2_F32   = 0,   /* GGUF type 0 */
     PULSAR_MARKOV_W2_BF16  = 1,   /* GGUF type 30 */
     PULSAR_MARKOV_W2_I8ROW = 2,   /* GGUF type 45, PULSAR_GPU_TENSOR_I8_ROWSCALE_K */
-    PULSAR_MARKOV_W2_MXFP8 = 3,   /* GGUF type 38: E4M3 + E8M0 per 32 along v, 33 B/32 */
+    PULSAR_MARKOV_W2_MXFP8 = 3,   /* GGUF type 46: E8M0 scale plane [E][V/32], then E4M3 payload plane [E][V] */
 };
 
 /** Compressor input-width multiplier for a layer's compress ratio: the

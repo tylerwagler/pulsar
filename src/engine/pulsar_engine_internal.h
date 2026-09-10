@@ -434,7 +434,8 @@ enum {
      * stacks), so it covered only part of the model and made the first prefill
      * frontier absorb the repack.  Pre-storing costs zero model growth. */
     PULSAR_TENSOR_IQ2_XXS_MMQ_K = PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K,
-    PULSAR_TENSOR_I8_ROWSCALE_K = PULSAR_GPU_TENSOR_I8_ROWSCALE_K,   /* one spelling: pulsar_gpu.h */       /* one spelling: pulsar_gpu.h */
+    PULSAR_TENSOR_I8_ROWSCALE_K = PULSAR_GPU_TENSOR_I8_ROWSCALE_K,   /* one spelling: pulsar_gpu.h */
+    PULSAR_TENSOR_FP8_E4M3_SOA_K = PULSAR_GPU_TENSOR_FP8_E4M3_SOA_K, /* one spelling: pulsar_gpu.h */       /* one spelling: pulsar_gpu.h */
 };
 
 /** The drafter markov_w2 table's storage, derived from its GGUF type -- the one
@@ -447,7 +448,7 @@ static inline int pulsar_markov_w2_fmt(uint32_t type) {
     case PULSAR_TENSOR_F32:           return PULSAR_MARKOV_W2_F32;
     case PULSAR_TENSOR_BF16:          return PULSAR_MARKOV_W2_BF16;
     case PULSAR_TENSOR_I8_ROWSCALE_K: return PULSAR_MARKOV_W2_I8ROW;
-    case PULSAR_TENSOR_FP8_E4M3:      return PULSAR_MARKOV_W2_MXFP8;
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K: return PULSAR_MARKOV_W2_MXFP8;
     default: pulsar_die("markov_w2: unsupported storage type"); return -1;
     }
 }
