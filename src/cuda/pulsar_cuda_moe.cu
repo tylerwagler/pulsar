@@ -1315,6 +1315,41 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
+
+/* ---- L214 route census (throwaway instrument, see rows/L214.md) ---------------- */
+#include <stdlib.h>
+struct l214_acc { double calls, slots, uniq, bytes_slots, bytes_uniq; };
+static struct l214_acc l214_by_width[64];
+static void l214_print(void) {
+    fprintf(stderr, "L214_ROUTE_CENSUS width  calls  slots/call  unique/call  dup%%  bytes/call(MB)  unique-bytes/call(MB)  saved%%\n");
+    for (int w = 1; w < 64; w++) {
+        const struct l214_acc *a = &l214_by_width[w];
+        if (a->calls <= 0) continue;
+        fprintf(stderr, "L214_ROUTE_CENSUS %5d %6.0f %10.2f %12.2f %5.1f %15.1f %22.1f %7.1f\n", w, a->calls,
+                a->slots / a->calls, a->uniq / a->calls, 100.0 * (1.0 - a->uniq / a->slots),
+                a->bytes_slots / a->calls / 1e6, a->bytes_uniq / a->calls / 1e6, 100.0 * (1.0 - a->bytes_uniq / a->bytes_slots));
+    }
+}
+static void l214_route_census(const pulsar_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_expert,
+                              uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    static int armed = -1;
+    if (armed < 0) { armed = getenv("L214_ROUTE_CENSUS") ? 1 : 0; if (armed) atexit(l214_print); }
+    if (!armed || n_tokens == 0 || n_tokens >= 64) return;
+    int32_t ids[64 * 16];
+    const uint32_t n = n_tokens * n_expert;
+    if (n > sizeof(ids) / sizeof(ids[0])) return;
+    if (cudaMemcpy(ids, selected->ptr, n * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    uint32_t uniq = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++) if (ids[j] == ids[i]) { seen = true; break; }
+        if (!seen) uniq++;
+    }
+    const double per = (double)(2u * gate_expert_bytes + down_expert_bytes);
+    struct l214_acc *a = &l214_by_width[n_tokens];
+    a->calls += 1; a->slots += n; a->uniq += uniq; a->bytes_slots += per * n; a->bytes_uniq += per * uniq;
+}
+
 static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
@@ -1366,6 +1401,9 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             return (r1 && r2) ? 1 : 0;
         }
     }
+    /* L214 instrument: the decode pass of a step only (the mixed-step outer call has n_dec < n_tokens) */
+    if (n_tokens > 0 && selected && selected->ptr && (uint32_t)pulsar_gpu_matmul_batch_decode_rows() >= n_tokens)
+        l214_route_census(selected, n_tokens, n_expert, gate_expert_bytes, down_expert_bytes);
     if (gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4 && down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4) {
         /* Which expert-FFN arithmetic a row gets is a numerics boundary: the
          * direct fp4 GEMV over the packed expert weights (4 launches per
