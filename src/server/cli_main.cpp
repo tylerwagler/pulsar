@@ -508,6 +508,9 @@ int main(int argc, char **argv) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding active (merged drafter, adaptive draft depth, start %d)",
                    pulsar_engine_dspark_draft_tokens(engine));
+    } else if (cfg.engine.dspark_disable) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: speculative decoding disabled by --no-dspark");
     } else {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: no dspark.* tensors in the artifact; "

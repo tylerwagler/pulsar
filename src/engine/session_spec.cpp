@@ -180,8 +180,19 @@ int gpu_graph_spec_dump_active(void) {
  * slows" is NOT what was measured: the step's depth slope (0.17 ms/1k) is close
  * to plain's (0.20). The guard ratio still improves with depth, but because the
  * step is 2-3x larger, not because it is flat. */
-#define PULSAR_QUENCH_FLAT_MS    57.0f
-#define PULSAR_QUENCH_ROW_MS     18.37f
+/* RE-FIT 2026-09-10 (L214, engine b536784 + the L214 gate/up dedupe): the pinned-width
+ * census (n_batch = 2, 4, 6, 8 every step, one client, prose + structured + code at
+ * production sampling, nsys-attached wall clock, steps counted from the type-40
+ * gate/up launches) is LINEAR in rows to 1 ms: step = 40.5 + 9.33 x n_batch ms.  The
+ * previous line (57.0 + 18.37, 2026-07) priced the row at twice its cost -- the row is
+ * structurally the expert bytes (top-6 x 366 MB across 43 MoE layers = 10.1 ms at
+ * 218 GB/s, less what the dedupe and L2 now save) -- so the guard sat at ~2.9 tokens
+ * per step at K=3 where it belongs at ~1.5, and prose that ran 20% faster
+ * speculative (23.8 vs 19.9 t/s) was being quenched to plain.  The plain table
+ * below is re-measured on the same instrument; guard = step / plain, so both sides
+ * carry the same ~3% profiler overhead and the ratio is clean. */
+#define PULSAR_QUENCH_FLAT_MS    40.5f
+#define PULSAR_QUENCH_ROW_MS     9.33f
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
@@ -240,7 +251,12 @@ int gpu_graph_spec_dump_active(void) {
 #define PULSAR_QUENCH_PLAIN_CAP_POS 256000.0f
 static float spec_quench_plain_ms(int pos) {
     static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
-    static const float py[5] = { 55.7f, 62.9f, 65.8f, 70.0f, 80.2f };
+    /* 2026-09-10 (L214): the first three anchors MEASURED (served plain, --no-dspark,
+     * 256-token prose, same instrument as the step fit); the 38k and 100k anchors are
+     * the 2026-07-21 values scaled by the measured ratio at 0.3k-9.3k (0.826 = 54.3/65.8 at 9.3k) --
+     * plain has sped up uniformly at every re-measurement so far, and an
+     * over-estimated plain biases AGAINST quenching, the design's safe direction. */
+    static const float py[5] = { 51.7f, 52.8f, 54.3f, 57.8f, 66.2f };
     const float p = (float)pos;
     if (p <= px[0]) return py[0];
     for (int i = 1; i < 5; i++)
