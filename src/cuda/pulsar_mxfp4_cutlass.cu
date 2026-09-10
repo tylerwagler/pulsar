@@ -707,6 +707,27 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
  *     that pair.  Requires N % 32 == 0 (every CTA is a whole block).
  *   !EMIT_E4M3 -- lane 0 stores the f32 to mid[slot][n]; the MoE stage encodes
  *     it (pulsar_cutlass_gemv_gateup).  Tolerates N % 8 == 0. */
+/* L214 cross-row expert dedupe (the gate/up GEMV; the down GEMV stays one slot per
+ * CTA: one output row per warp with the mid read dominating, sharing its 1 KB of
+ * weight bytes across rows measured +45..65% slower).  Slot s owns the up-to-
+ * GEMV_DEDUPE_MAX slots naming its expert that start at s when s's rank among
+ * those slots is a multiple of GEMV_DEDUPE_MAX; every other slot's CTA exits.
+ * CTA-uniform: every thread scans the same sel[] and reaches the same answer.
+ * n_tokens <= PULSAR_GPU_MNEUTRAL_ROWS_MAX (16) bounds a duplicate count at 16,
+ * so at most two owners per expert per step.  Returns the owned count (0 = exit). */
+enum { GEMV_DEDUPE_MAX = 8 };
+__device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
+                                                        int e, bool valid, int owned[GEMV_DEDUPE_MAX]) {
+  if (!valid) { owned[0] = slot; return 1; }   /* an invalid expert is its own slot's business */
+  int rank = 0;
+  for (int t = 0; t < slot; t++) rank += (sel[t] == e);
+  if (rank % GEMV_DEDUPE_MAX) return 0;
+  int m = 0;
+  for (unsigned t = (unsigned)slot; t < n_slots && m < GEMV_DEDUPE_MAX; t++)
+    if (sel[t] == e) owned[m++] = (int)t;
+  return m;
+}
+
 template <class SFL, bool EMIT_E4M3>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
@@ -719,9 +740,9 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
     const float *rw,          // [n_slots] routing weights
     const uint8_t *gate_base, const uint8_t *up_base,
     uint64_t stride, uint64_t data_bytes, SFL sfl, float clampv,
-    int n_expert, unsigned n_total, int K, int N) {
+    int n_expert, unsigned n_total, unsigned n_slots, int K, int N) {
   __shared__ float lut[16];
-  __shared__ float vblk[32];
+  __shared__ float vblk[GEMV_DEDUPE_MAX][32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
   __syncthreads();
   const int slot = (int)blockIdx.y;
@@ -730,56 +751,78 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
   const int n0 = (int)(blockIdx.x * 32u);
   const int e = sel[slot];
   const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  int owned[GEMV_DEDUPE_MAX];
+  const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
+  if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
   const uint8_t *ge = valid ? gate_base + (size_t)e * stride : nullptr;
   const uint8_t *ue = valid ? up_base + (size_t)e * stride : nullptr;
-  const int xrow = slot / n_expert;
-  const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
   for (int i = 0; i < 4; i++) {
     const int n = n0 + i * 8 + warp;
     if (n >= N) break;                 /* N % 8 == 0: uniform across the CTA */
-    float v = 0.f;                     /* an invalid expert contributes zero */
+    float v[GEMV_DEDUPE_MAX];
+    #pragma unroll
+    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) v[r] = 0.f;   /* an invalid expert contributes zero */
     if (valid) {
       const uint8_t *gd = ge + (size_t)n * (K / 2);
       const uint8_t *ud = ue + (size_t)n * (K / 2);
       const uint8_t *gsf = ge + data_bytes;
       const uint8_t *usf = ue + data_bytes;
-      float g = 0.f, u = 0.f;
+      float g[GEMV_DEDUPE_MAX], u[GEMV_DEDUPE_MAX];
+      #pragma unroll
+      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) { g[r] = 0.f; u[r] = 0.f; }
       for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+        /* the expert's bytes: once per k chunk for every owned row */
         const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
         const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
         const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
         const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
-        const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-          const float xv = __half2float((__half)xt8[k0 + j]) * sa;
-          g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
-          u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+        for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+          if (r < m) {
+            const int xrow = owned[r] / n_expert;
+            const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
+            const float sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+              const float xv = __half2float((__half)xt8[k0 + j]) * sa;
+              g[r] += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
+              u[r] += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+            }
+          }
         }
       }
-      for (int sh = 16; sh > 0; sh >>= 1) {
-        g += __shfl_xor_sync(0xffffffffu, g, sh);
-        u += __shfl_xor_sync(0xffffffffu, u, sh);
+      #pragma unroll
+      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+        if (r < m) {
+          for (int sh = 16; sh > 0; sh >>= 1) {
+            g[r] += __shfl_xor_sync(0xffffffffu, g[r], sh);
+            u[r] += __shfl_xor_sync(0xffffffffu, u[r], sh);
+          }
+          /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
+          float gg = g[r], uu = u[r];
+          if (clampv > 1.0e-6f) {
+            if (gg > clampv) gg = clampv;
+            if (uu > clampv) uu = clampv;
+            if (uu < -clampv) uu = -clampv;
+          }
+          v[r] = (gg / (1.f + expf(-gg))) * uu * rw[owned[r]];
+        }
       }
-      /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
-      if (clampv > 1.0e-6f) {
-        if (g > clampv) g = clampv;
-        if (u > clampv) u = clampv;
-        if (u < -clampv) u = -clampv;
-      }
-      v = (g / (1.f + expf(-g))) * u * rw[slot];
     }
-    if constexpr (EMIT_E4M3) {
-      if (lane == 0) vblk[n - n0] = v;
-    } else {
-      if (lane == 0) mid[(size_t)slot * N + n] = v;
+    #pragma unroll
+    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+      if (r < m && lane == 0) {
+        if constexpr (EMIT_E4M3) vblk[r][n - n0] = v[r];
+        else                     mid[(size_t)owned[r] * N + n] = v[r];
+      }
     }
   }
   if constexpr (EMIT_E4M3) {
     __syncthreads();
     if (warp == 0) {
-      pulsar_mx_emit_block(vblk[lane], (uint32_t)(n0 + lane), (uint32_t)slot, (uint32_t)N,
-                           mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
+      for (int r = 0; r < m; r++)
+        pulsar_mx_emit_block(vblk[r][lane], (uint32_t)(n0 + lane), (uint32_t)owned[r], (uint32_t)N,
+                             mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
     }
   }
 }
@@ -906,7 +949,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         nullptr, midq8, midsf, mid_kbp,
         (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
         gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
-        n_expert, n_total_expert, in_dim, mid_dim);
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim);
   }
   {
     dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
@@ -947,7 +990,7 @@ int pulsar_cutlass_gemv_gateup(
       mid, nullptr, nullptr, 0,
       (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
       selected, rweights, gate_w, up_w,
-      gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
+      gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
