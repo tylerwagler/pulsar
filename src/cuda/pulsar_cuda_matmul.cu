@@ -2169,11 +2169,13 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 const int KBp = pulsar_mx_kbp((int)in_dim);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
-                /* L214: two outputs per warp at served widths (n_tok >= 6) where the grid
-                 * stays >= 128 blocks wide.  Measured: RO = 2 cut the dense bucket 10% at
-                 * 3 clients (9-12 rows) and cost 6% at 2-4 rows, where half the warps is
-                 * latency-bound.  Both arms compute every output identically. */
-                const unsigned ro = (out_dim >= 2048 && n_tok >= 6) ? 2u : 1u;
+                /* L214: two outputs per warp where the grid stays wide.  Measured: RO = 2
+                 * cut the dense bucket 10% at 3 clients (9-12 rows) and cost 6% at 2-4 rows
+                 * across the shape set, where halving the warps of the 512..4096-output
+                 * shapes is latency-bound.  The two widest shapes (8192 and 32768 outputs)
+                 * keep >= 4096 warps at RO = 2 and take it at any width; the 2048..4096
+                 * shapes take it from n_tok >= 6.  Both arms compute every output identically. */
+                const unsigned ro = (out_dim >= 8192 || (out_dim >= 2048 && n_tok >= 6)) ? 2u : 1u;
                 dim3 grid_ro(((unsigned)out_dim + wpb * ro - 1) / (wpb * ro));
                 /* A8 first, for the same reason the n==1 path takes it: the
                  * source multiplies dynamic E4M3 activations, and this arm
