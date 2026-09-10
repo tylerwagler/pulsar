@@ -44,6 +44,15 @@ byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
         free(tmp);
         return out;
     }
+    if (type == DS4Q_TYPE_I8_ROWSCALE_K) {
+        /* sized by dims, not by a per-element rate (see quants.h) */
+        const int64_t nrows = n / ncols;
+        out.size = ds4q_i8_rowscale_k_bytes(nrows, ncols);
+        out.data = xmalloc(out.size);
+        const size_t written = ds4q_quantize_i8_rowscale_k(src, out.data, nrows, ncols);
+        if (written != out.size) die("i8_rowscale_k wrote unexpected byte count");
+        return out;
+    }
     if (!ds4q_can_quantize(type)) die("unsupported quant target type");
     if (ncols % ds4q_block_size(type) != 0) die("ncols is not divisible by quant block size");
     const int64_t nrows = n / ncols;

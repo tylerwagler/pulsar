@@ -279,3 +279,35 @@ void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk) {
     for (int64_t b = 0; b < nblk; b++)
         memcpy(out + dq + (size_t)b * 64, iq2_blocks + (size_t)b * 66 + 2, 64);
 }
+
+/* ---- I8_ROWSCALE_K (45): int8 + one f16 scale per column ----------------- */
+static uint16_t ds4q_f32_to_f16_scalar(float x) {
+    uint16_t h; ds4q_f32_to_f16_row(&x, &h, 1); return h;
+}
+
+size_t ds4q_i8_rowscale_k_bytes(int64_t nrows, int64_t ncols) {
+    return (size_t)nrows * (size_t)ncols + (size_t)ncols * 2u;
+}
+
+size_t ds4q_quantize_i8_rowscale_k(const float *src, void *dst, int64_t nrows, int64_t ncols) {
+    int8_t *q = (int8_t *)dst;
+    uint16_t *sc = (uint16_t *)((uint8_t *)dst + (size_t)nrows * (size_t)ncols);
+    for (int64_t c = 0; c < ncols; c++) {
+        float amax = 0.0f;
+        for (int64_t r = 0; r < nrows; r++) {
+            const float x = src[r * ncols + c];
+            if (x != x) { fprintf(stderr, "i8_rowscale_k: NaN in column %lld\n", (long long)c); exit(1); }
+            const float a = fabsf(x); if (a > amax) amax = a;
+        }
+        const uint16_t sh = ds4q_f32_to_f16_scalar(amax / 127.0f);
+        const float scale = ds4q_f16_to_f32(sh);   /* the shared decoder: what the engine will multiply by */
+        sc[c] = sh;
+        for (int64_t r = 0; r < nrows; r++) {
+            long v = scale > 0.0f ? lrintf(src[r * ncols + c] / scale) : 0;
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            q[r * ncols + c] = (int8_t)v;
+        }
+    }
+    return ds4q_i8_rowscale_k_bytes(nrows, ncols);
+}

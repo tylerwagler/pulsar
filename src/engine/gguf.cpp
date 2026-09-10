@@ -390,7 +390,13 @@ static void parse_tensors(pulsar_model *m, pulsar_cursor *c) {
         if (!cursor_u32(c, &t->type)) pulsar_die(c->error);
         if (!cursor_u64(c, &t->rel_offset)) pulsar_die(c->error);
 
-        if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
+        if (t->type == PULSAR_TENSOR_I8_ROWSCALE_K) {
+            /* int8 payload (one byte per element) followed by one f16 scale per
+             * COLUMN of the 2D k-major table (dim[0] columns) -- L213 step 2.
+             * Not a per-element byte rate, so it is sized by dims, like type 40. */
+            if (t->ndim != 2) pulsar_die("I8_ROWSCALE_K tensor must be 2D [cols,rows]");
+            t->bytes = t->elements + 2u * t->dim[0];
+        } else if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
             if (t->ndim != 3) pulsar_die("CUTLASS MXFP4 tensor must be 3D [K,N,n_expert]");
             uint64_t data_bytes, sf_bytes, stride;
             cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data_bytes, &sf_bytes, &stride);

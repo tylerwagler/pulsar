@@ -42,6 +42,13 @@ QUANTIZE_LIB_OBJS := $(filter-out quantize/dsq_cli.o,$(QUANTIZE_OBJS))
 quantize/tests/imatrix_refuse: quantize/tests/imatrix_refuse.c $(QUANTIZE_LIB_OBJS) $(QUANTS_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -o $@ $^ -lm -pthread
 
+# Re-quantise ONE tensor straight out of an existing GGUF through the live
+# f32_to_type() -- the same codec a full rebuild would use -- into a raw blob
+# that gguf_replace_tensor.py splices in (L213 step 2: the drafter's markov_w2
+# bf16 -> type 45 / type 38 variants without a 92 GB re-quantise).
+quantize/tools/dsq_requant_tensor: quantize/tools/dsq_requant_tensor.c $(QUANTIZE_LIB_OBJS) $(QUANTS_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -Iquantize -o $@ $^ -lm -pthread
+
 # Self-tests for the python maintenance tools (reflow_artifact.py and
 # splice_bf16_plain.py). Kept out of `test` because they need the HF source
 # checkpoint on disk; reflow's F32 codec path also needs numpy, so prefer the
@@ -124,4 +131,4 @@ quality-score:
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.cc $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o quantize/tests/imatrix_refuse
+	rm -f deepseek4-quantize test_quants quality-testing/score_official quantize/*.o *.o quantize/tests/imatrix_refuse quantize/tools/dsq_requant_tensor

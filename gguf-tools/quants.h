@@ -79,7 +79,14 @@ typedef enum {
                                  * engine-only until 2026-08-12, which is why
                                  * repack_iq2_mmq.py existed as a separate
                                  * post-pass over the whole artifact. */
-    DS4Q_TYPE_COUNT   = 44,
+    DS4Q_TYPE_I8_ROWSCALE_K = 45, /* int8 payload [rows][cols] + one f16 scale per
+                                   * COLUMN (L213 step 2: the drafter's markov_w2,
+                                   * k-major (vocab, 256), one scale per vocab
+                                   * row).  Bytes = rows*cols + 2*cols -- not a
+                                   * per-element rate, so type_size is 0 and
+                                   * f32_to_type sizes it by dims.  Wire-matches
+                                   * the engine's PULSAR_GPU_TENSOR_I8_ROWSCALE_K. */
+    DS4Q_TYPE_COUNT   = 46,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {
@@ -161,6 +168,14 @@ void ds4q_pack_mxfp8_lt(const uint8_t *fp8_blocks, void *dst,
  * NOT interchangeable with IQ2_XXS_SOA (42), which is a different permutation
  * (q plane first, no padding). */
 size_t ds4q_iq2_xxs_mmq_bytes(int64_t nblk);
+
+/* I8_ROWSCALE_K (45): src is [nrows][ncols] f32 row-major (the k-major table:
+ * rows = i, cols = v).  Per column: amax -> f16 scale (rounded FIRST, then used
+ * to quantise, so decode-side scale * q reproduces the quantiser's own
+ * rounding); q = clamp(lrint(x / scale), -127, 127).  Layout: int8 payload
+ * [nrows][ncols] then f16 scales [ncols]. */
+size_t ds4q_i8_rowscale_k_bytes(int64_t nrows, int64_t ncols);
+size_t ds4q_quantize_i8_rowscale_k(const float *src, void *dst, int64_t nrows, int64_t ncols);
 void ds4q_pack_iq2_xxs_mmq(const uint8_t *iq2_blocks, void *dst, int64_t nblk);
 
 /* The canonical Blackwell 128x4 scale-factor swizzle, shared by the CUTLASS

@@ -73,6 +73,10 @@ const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
      * MXFP8_LT.  Distinct permutation from IQ2_XXS_SOA (42); not
      * interchangeable. */
     [DS4Q_TYPE_IQ2_XXS_MMQ] = { "iq2_xxs_mmq", QK_K, 66, false, false },
+    /* not a per-element rate (payload + a per-column scale plane): type_size 0
+     * keeps ds4q_row_size() out of it; f32_to_type sizes it by dims, exactly
+     * as MXFP8_LT is special-cased before the generic path. */
+    [DS4Q_TYPE_I8_ROWSCALE_K] = { "i8_rowscale_k", 1, 0, false, false },
 };
 
 float ds4q_f32_from_bits(uint32_t bits) {

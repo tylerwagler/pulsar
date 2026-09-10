@@ -295,6 +295,23 @@ enum {
      * carries it fails the routed-expert type check at load, and
      * gguf-tools/repack_iq2_mmq.py --to mmq-k converts one. */
     PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K = 44,
+    /* int8 payload k-major [rows][cols] + one f16 scale per COLUMN (L213 step 2):
+     * the drafter's markov_w2 as (vocab, 256) with element (v, i) at i*vocab + v,
+     * followed by vocab f16 scales -- one per vocab row, where the magnitude
+     * lives.  refined = base + (sum_i q[i,v] * w1[i]) * scale[v]: the scale is
+     * applied once per output, outside the i loop.  Byte size is
+     * rows*cols + 2*cols, not a per-element rate (gguf.cpp sizes it by dims). */
+    PULSAR_GPU_TENSOR_I8_ROWSCALE_K = 45,
+};
+
+/** Storage of the drafter's markov_w2 table (one spelling; the engine derives
+ * it from the tensor's GGUF type in pulsar_markov_w2_fmt(), the CUDA launchers
+ * dispatch a kernel arm on it).  Every arm is k-major (L213). */
+enum {
+    PULSAR_MARKOV_W2_F32   = 0,   /* GGUF type 0 */
+    PULSAR_MARKOV_W2_BF16  = 1,   /* GGUF type 30 */
+    PULSAR_MARKOV_W2_I8ROW = 2,   /* GGUF type 45, PULSAR_GPU_TENSOR_I8_ROWSCALE_K */
+    PULSAR_MARKOV_W2_MXFP8 = 3,   /* GGUF type 38: E4M3 + E8M0 per 32 along v, 33 B/32 */
 };
 
 /** Compressor input-width multiplier for a layer's compress ratio: the
@@ -1906,7 +1923,7 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_bf16);
+        int w1_bf16, int w2_fmt);
 int pulsar_gpu_dspark_markov_step_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
@@ -1914,7 +1931,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_bf16);
+        int w1_bf16, int w2_fmt);
 
 /** DSpark Markov + confidence heads */
 
@@ -1924,7 +1941,7 @@ int pulsar_gpu_dspark_markov_chain_model(
         const void *dspark_model_map, uint64_t dspark_model_size,
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
-        int w1_bf16, int w2_bf16);
+        int w1_bf16, int w2_fmt);
 int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor       *refined_logits,
         int32_t               *refined_id_dst,
@@ -1936,12 +1953,13 @@ int pulsar_gpu_dspark_markov_step_model(
         int32_t                prev_token,
         uint32_t               vocab_size,
         uint32_t               embed_dim,
-        /* Storage of markov_w1 and markov_w2: 1 = bf16 (source format), 0 =
-         * f32.  Separate flags because they are separate tensors.  The step
-         * streams all of markov_w2 at one FMA per element, so its width sets
-         * the kernel's runtime, not just its footprint. */
+        /* markov_w1: 1 = bf16 (source format), 0 = f32.  markov_w2: a
+         * PULSAR_MARKOV_W2_* format (the two are separate tensors and get
+         * separate descriptors).  The step streams all of markov_w2 at one
+         * FMA per element, so its storage sets the kernel's runtime, not
+         * just its footprint. */
         int                    w1_bf16,
-        int                    w2_bf16);
+        int                    w2_fmt);
 
 int pulsar_gpu_dspark_hc_mean_reduce_batch(
         pulsar_gpu_tensor       *out,
