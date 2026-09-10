@@ -12,12 +12,12 @@
  *
  *   dsq_requant_tensor SRC.gguf TENSOR_NAME TYPE_CODE NE0 NE1 OUT.blob
  */
+#include "dsq_internal.h"   /* first: it sets _POSIX_C_SOURCE before the system headers */
+#include "quants.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "dsq_internal.h"
-#include "quants.h"
 
 int main(int argc, char **argv) {
     if (argc != 7) {

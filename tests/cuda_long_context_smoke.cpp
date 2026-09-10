@@ -604,6 +604,28 @@ static int check_dspark_markov_head(void) {
             }
             if (gpu_id != cpu_id) {
                 fprintf(stderr, "markov step %u (%s): GPU=%d CPU=%d\n", step, fmt_names[fi], gpu_id, cpu_id);
+                /* Diagnose, do not just fail: which refined logits differ, and how.
+                 * (A wrong-lane mapping shows as a periodic pattern in v; a wrong
+                 * decode shows as every v off by a scale; a wrong reduce shows the
+                 * logits agreeing while the argmax does not.) */
+                float *gpu_ref = (float *)calloc((size_t)vocab_size, sizeof(float));
+                if (gpu_ref && pulsar_gpu_tensor_read(ref_logits, 0, gpu_ref, (uint64_t)vocab_size * sizeof(float))) {
+                    int shown = 0, ndiff = 0; float gmax = -1e30f; int32_t gmax_id = 0;
+                    for (uint32_t v = 0; v < vocab_size; v++) {
+                        float dot = 0.0f;
+                        for (uint32_t i = 0; i < embed_dim; i++)
+                            dot += smoke_w2_decode(fmt, w2_blob, vocab_size, embed_dim, i, v) * embed[i];
+                        const float cpu_v = base_host[v] + (fmt == PULSAR_MARKOV_W2_I8ROW ? dot * smoke_f16_to_f32(rowscale[v]) : dot);
+                        if (gpu_ref[v] > gmax) { gmax = gpu_ref[v]; gmax_id = (int32_t)v; }
+                        if (gpu_ref[v] != cpu_v) {
+                            ndiff++;
+                            if (shown < 6) { fprintf(stderr, "    v=%u gpu=%.6f cpu=%.6f\n", v, gpu_ref[v], cpu_v); shown++; }
+                        }
+                    }
+                    fprintf(stderr, "    %d/%u refined logits differ; GPU buffer argmax=%d (%.6f) vs reduce said %d; CPU argmax=%d (%.6f)\n",
+                            ndiff, vocab_size, gmax_id, gmax, gpu_id, cpu_id, cpu_best);
+                }
+                free(gpu_ref);
                 rc = 1; goto cleanup;
             }
             id = gpu_id;

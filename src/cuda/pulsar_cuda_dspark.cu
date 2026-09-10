@@ -34,6 +34,14 @@
  * in order in its own f32 register, so the f32/bf16 arms are bit-identical to
  * the one-v kernel; the per-thread argmax visits its four v ascending with a
  * strict '>', so the lowest id still wins a tie into the same block tree. */
+/* (value, id) argmax merge: the lower id wins an exact tie.  Used at EVERY level
+ * -- per thread, the in-block tree, the cross-block reduce -- so the result is
+ * the sequential "first maximum" for any thread -> vocab mapping. */
+__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
+                                                  float v, int32_t id) {
+    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
+}
+
 template <int W2FMT>
 __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size,
                                                        uint32_t i, uint32_t v0, float out[4]) {
@@ -144,11 +152,14 @@ __global__ static void dspark_markov_step_kernel(
 
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            /* strict '>': the lower-index side stays the incumbent on a tie */
-            const float nb = best_vals[tid + stride];
-            if (nb > best_vals[tid]) {
-                best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-            }
+            /* (value, id) merge, lower id wins -- the cross-block reduce's rule
+             * (L191 #5).  The strict-'>' "lower slot stays the incumbent"
+             * shortcut this replaces equalled "lower id wins" only while no slot
+             * ever inherited a higher thread's value; the tree migrates values
+             * downward, so it never did.  L213 step 2's four-v-per-lane mapping
+             * put five tied ids in one block and it returned the third. */
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         }
         __syncthreads();
     }
@@ -175,10 +186,6 @@ __global__ static void dspark_markov_step_kernel(
  * change only on exact ties).  A thread with no block holds (-inf, INT32_MAX)
  * so it never wins a tie.
  */
-__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
-                                                  float v, int32_t id) {
-    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
-}
 
 __global__ static void dspark_markov_reduce_kernel(
         int32_t *dst,               /* winner id (L108 P1: points into the
@@ -890,10 +897,9 @@ __global__ static void dspark_markov_step_banks_kernel(
         __syncthreads();
         for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (tid < stride) {
-                const float nb = best_vals[tid + stride];
-                if (nb > best_vals[tid]) {
-                    best_vals[tid] = nb; best_ids[tid] = best_ids[tid + stride];
-                }
+                /* (value, id) merge, lower id wins -- see the single-bank tree */
+                dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                    best_vals[tid + stride], best_ids[tid + stride]);
             }
             __syncthreads();
         }

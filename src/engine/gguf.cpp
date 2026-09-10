@@ -1,5 +1,16 @@
 #include "pulsar_engine_internal.h"
 
+/* The one plain-MXFP8 (type 38) tensor an artifact may carry: the DSpark
+ * drafter's Markov table, stored k-major with E8M0-per-32 blocks along vocab
+ * (L213 step 2).  It is a GEMV-decoded lookup table whose only reader is
+ * dspark_w2_load4<MXFP8>; it never reaches the plain-38 matmul path that was
+ * deleted (L060), so it is neither refused below nor registered as an FP8
+ * matmul weight.  Every other type-38 tensor is still refused at load. */
+static bool gguf_plain_mxfp8_table_ok(const pulsar_tensor *t) {
+    static const char name[] = "dspark.2.markov_head.markov_w2.weight";
+    return t->name.len == sizeof(name) - 1 && memcmp(t->name.ptr, name, sizeof(name) - 1) == 0;
+}
+
 
 
 /* Positional rows (C++ has no array designators); the /(n)/ comments carry
@@ -76,9 +87,15 @@ static const gguf_type_info gguf_types[] = {
      * Pure permutation again, so it too shares type 16's {256, 66} accounting.
      * See PULSAR_TENSOR_IQ2_XXS_MMQ_K. */
     /*44*/ {"iq2_xxs_mmq_k", 256, 66},
+    /* I8_ROWSCALE_K: int8 payload + one f16 scale per column -- rows*cols +
+     * 2*cols bytes, NOT a per-element rate, so block_elems=0 as for type 40:
+     * the row exists so tensor_type_name() can name it, and it makes
+     * tensor_nbytes() refuse rather than miscompute; the parser sizes it by
+     * dims (see the type-45 branch below).  L213 step 2. */
+    /*45*/ {"i8_rowscale_k", 0, 0},
 };
 
-static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 45,
+static_assert(sizeof(gguf_types) / sizeof(gguf_types[0]) == 46,
               "gguf_types rows must line up with GGUF type ids");
 
 
@@ -769,7 +786,9 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
     uint64_t n_fp8 = 0, n_fp8_lt = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor *t = &m->tensors[i];
-        if (t->type == PULSAR_TENSOR_FP8_E4M3) {
+        if (t->type == PULSAR_TENSOR_FP8_E4M3 && gguf_plain_mxfp8_table_ok(t)) {
+            /* the drafter's Markov table: a lookup table, not a matmul weight -- see above */
+        } else if (t->type == PULSAR_TENSOR_FP8_E4M3) {
             /* Plain type-38 is no longer served. The runtime used to convert it
              * at first use into exactly the bytes MXFP8_LT already holds --
              * a second resident copy of every such weight beside the mmap. That
