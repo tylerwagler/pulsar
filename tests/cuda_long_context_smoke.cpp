@@ -554,11 +554,16 @@ static int check_dspark_markov_head(void) {
      * pulsar_gpu_cleanup, and munmap of registered pages is UB. */
     const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);   /* 4 MB, page multiple */
     const uint64_t w2_cap   = w1_bytes;                                          /* f32 is the widest arm */
+    /* Each storage gets its OWN region: the runtime's model-range cache is
+     * keyed by offset and keeps a device-resident copy, so rewriting one
+     * region in place between formats would have the kernel read the previous
+     * format's bytes (f32 read as bf16 pairs: garbage on even v, the truncated
+     * value on odd v -- exactly what round 2 saw). */
+    const uint64_t map_bytes = w1_bytes + 4u * w2_cap;
     uint8_t *map_host = NULL;
-    if (posix_memalign((void **)&map_host, 4096, (size_t)(w1_bytes + w2_cap)) != 0) return 1;
-    memset(map_host, 0, (size_t)(w1_bytes + w2_cap));
+    if (posix_memalign((void **)&map_host, 4096, (size_t)map_bytes) != 0) return 1;
+    memset(map_host, 0, (size_t)map_bytes);
     float *w1_host = (float *)map_host;
-    uint8_t *w2_blob = map_host + w1_bytes;
     float *t = (float *)calloc((size_t)vocab_size * embed_dim, sizeof(float));   /* k-major f32 source */
     float *base_host = (float *)calloc((size_t)vocab_size, sizeof(float));
     if (!t || !base_host) return 1;
@@ -578,13 +583,20 @@ static int check_dspark_markov_head(void) {
 
     for (int fi = 0; fi < 4; fi++) {
         const int fmt = fmts[fi];
+        const uint64_t w2_off = w1_bytes + (uint64_t)fi * w2_cap;      /* distinct offset per storage */
+        uint8_t *w2_blob = map_host + w2_off;
         const uint64_t w2_bytes = smoke_w2_encode(fmt, t, vocab_size, embed_dim, w2_blob);
+        if (w2_bytes > w2_cap) {   /* every storage must fit its region (f32 is the widest) */
+            fprintf(stderr, "markov (%s): encoded %llu bytes > region %llu\n", fmt_names[fi],
+                    (unsigned long long)w2_bytes, (unsigned long long)w2_cap);
+            rc = 1; goto cleanup;
+        }
         int32_t id = prev_tokens[0];
         for (uint32_t step = 0; step < n_draft; step++) {
             int32_t gpu_id = 0;
             if (!pulsar_gpu_dspark_markov_step_model(ref_logits, &gpu_id, base,
-                                                  map_host, w1_bytes + w2_bytes,
-                                                  0, w1_bytes,
+                                                  map_host, map_bytes,
+                                                  0, w2_off,
                                                   id, vocab_size, embed_dim,
                                                   /*w1_bf16=*/0, fmt)) {
                 fprintf(stderr, "markov step %u (%s): launch failed\n", step, fmt_names[fi]);
