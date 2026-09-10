@@ -228,10 +228,15 @@ void server::close_resources() {
         fclose(s->trace);
         s->trace = NULL;
     }
+    if (s->capture) {
+        fclose(s->capture);
+        s->capture = NULL;
+    }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
+    pthread_mutex_destroy(&s->capture_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
@@ -441,6 +446,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--capture-requests")) {
+            c.capture_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             /* An empty value opts out of the default-on disk cache; the last
              * kv-disk flag on the command line wins. */
@@ -996,6 +1003,20 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.capture_mu, NULL);
+    if (cfg.capture_path) {
+        /* L216: the served workload as a corpus -- one JSON line per accepted
+         * request {ts, path, body}; the body is the client's JSON verbatim. */
+        s.capture = fopen(cfg.capture_path, "a");
+        if (!s.capture) {
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to open capture file %s: %s",
+                       cfg.capture_path, strerror(errno));
+            s.close_resources();
+            return 1;
+        }
+        setvbuf(s.capture, NULL, _IOLBF, 0);
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: capturing accepted requests to %s", cfg.capture_path);
+    }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {

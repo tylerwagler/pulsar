@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include <time.h>
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
 
@@ -796,6 +797,14 @@ void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok && s->capture) {
+        /* L216 --capture-requests: the accepted body verbatim, one JSON line. */
+        pthread_mutex_lock(&s->capture_mu);
+        fprintf(s->capture, "{\"ts\":%lld,\"path\":\"%s\",\"body\":", (long long)time(NULL), hr.path);
+        fwrite(hr.body, 1, hr.body_len, s->capture);
+        fputs("}\n", s->capture);
+        pthread_mutex_unlock(&s->capture_mu);
+    }
     http_request_free(&hr);
     if (!ok) {
         if (anthropic_surface) http_error_anthropic(fd, 400, err);

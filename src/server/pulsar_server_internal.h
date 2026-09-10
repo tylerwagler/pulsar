@@ -1409,6 +1409,8 @@ struct server {
     FILE *trace;               ///< trace sink, or NULL when tracing is off
     pthread_mutex_t trace_mu;  ///< serialises trace writes across threads
     uint64_t trace_seq;        ///< monotonic trace event counter, for ordering
+    FILE *capture;             ///< --capture-requests sink (append), or NULL
+    pthread_mutex_t capture_mu;///< serialises capture writes across client threads
 
     /** @name Server methods (C++ port)
      *  1:1 mirror of the server_ / worker_ verb family; bodies keep the
@@ -2354,6 +2356,7 @@ typedef struct {
     int port;                      ///< listen port
     int ctx_size;                  ///< per-bank context size
     int default_tokens;            ///< generation cap when a request does not set one
+    const char *capture_path;      ///< --capture-requests: every accepted request body appended as a JSON line; NULL disables
     const char *trace_path;        ///< request trace file; NULL disables tracing
     const char *kv_disk_dir;       ///< directory for the on-disk KV cache
     bool kv_disk_disable;          ///< turn the disk cache off entirely
