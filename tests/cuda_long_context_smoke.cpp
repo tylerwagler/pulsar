@@ -655,6 +655,68 @@ cleanup:
     return rc;
 }
 
+/* ---- instrument, not a gate: the markov step per storage at the PRODUCTION
+ * table shape, same launch and n_banks for each, so the storages' kernels can
+ * be ranked.  The served census cannot rank them: a launch's time there rides
+ * on how many banks the load batched, which differs run to run (L213 step 2
+ * round 2: bf16 read 364 then 459 us with no kernel change between).  Each
+ * launch includes the reduce and the 4-byte id readback, the same fixed cost
+ * for every storage. */
+static int bench_dspark_markov_storages(void) {
+    const uint32_t V = 129280, E = 256;          /* deepseek4 vocab x markov rank */
+    const int fmts[4] = { PULSAR_MARKOV_W2_F32, PULSAR_MARKOV_W2_BF16, PULSAR_MARKOV_W2_I8ROW, PULSAR_MARKOV_W2_MXFP8 };
+    const char *fmt_names[4] = { "f32", "bf16", "i8+rowscale", "mxfp8" };
+    const uint64_t w1_bytes = (uint64_t)V * E * sizeof(float);
+    const uint64_t w2_cap = w1_bytes;
+    const uint64_t map_bytes = w1_bytes + 4u * w2_cap;
+    uint8_t *map_host = NULL;
+    if (posix_memalign((void **)&map_host, 4096, (size_t)map_bytes) != 0) return 1;
+    memset(map_host, 0, (size_t)map_bytes);
+    float *w1_host = (float *)map_host;
+    float *t = (float *)malloc((size_t)V * E * sizeof(float));
+    float *base_host = (float *)malloc((size_t)V * sizeof(float));
+    if (!t || !base_host) return 1;
+    for (uint32_t v = 0; v < V; v++) {
+        for (uint32_t i = 0; i < E; i++) {
+            w1_host[(uint64_t)v * E + i] = (float)((v * 7 + i * 13) % 100) * 0.01f;
+            t[(uint64_t)i * V + v]       = (float)((v * 3 + i * 11) % 50) * 0.02f - 0.49f;
+        }
+        base_host[v] = (float)(v % 200) * 0.01f;
+    }
+    pulsar_gpu_tensor *base = pulsar_gpu_tensor_alloc((uint64_t)V * sizeof(float));
+    pulsar_gpu_tensor *ref = pulsar_gpu_tensor_alloc((uint64_t)V * sizeof(float));
+    int rc = 1;
+    if (!base || !ref || !pulsar_gpu_tensor_write(base, 0, base_host, (uint64_t)V * sizeof(float))) goto cleanup;
+    printf("  markov step at %u x %u, one bank, 20 launches after 3 warm-ups (reduce + id readback included):\n", V, E);
+    for (int fi = 0; fi < 4; fi++) {
+        const int fmt = fmts[fi];
+        const uint64_t w2_off = w1_bytes + (uint64_t)fi * w2_cap;
+        const uint64_t w2_bytes = smoke_w2_encode(fmt, t, V, E, map_host + w2_off);
+        int32_t id = 42, out = 0;
+        for (int k = 0; k < 3; k++)
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, 0, w2_off, id, V, E, 0, fmt)) {
+                fprintf(stderr, "  markov bench (%s): launch failed\n", fmt_names[fi]); goto cleanup;
+            }
+        if (!pulsar_gpu_synchronize()) goto cleanup;
+        const double t0 = monotonic_seconds();
+        const int iters = 20;
+        for (int k = 0; k < iters; k++)
+            if (!pulsar_gpu_dspark_markov_step_model(ref, &out, base, map_host, map_bytes, 0, w2_off, id, V, E, 0, fmt)) goto cleanup;
+        if (!pulsar_gpu_synchronize()) goto cleanup;
+        const double us = (monotonic_seconds() - t0) * 1e6 / iters;
+        printf("    %-12s %8.1f us/launch   w2 %6.1f MB   %6.1f GB/s over the w2 stream   argmax %d\n",
+               fmt_names[fi], us, w2_bytes / 1e6, w2_bytes / us / 1e3, out);
+    }
+    rc = 0;
+cleanup:
+    pulsar_gpu_tensor_free(ref);
+    pulsar_gpu_tensor_free(base);
+    free(base_host);
+    free(t);
+    /* map_host intentionally leaked (host-registered / range-cached). */
+    return rc;
+}
+
 static int check_dspark_confidence_head(void) {
     const uint32_t n_positions = 3;
     const uint32_t hidden_dim = 32;
@@ -1396,6 +1458,7 @@ int main(void) {
     int rc = check_large_topk();
     rc |= check_topk_set_identity();
     if (check_dspark_markov_head() != 0) rc = 1;
+    if (rc == 0 && bench_dspark_markov_storages() != 0) rc = 1;
     if (check_dspark_confidence_head() != 0) rc = 1;
     if (check_dspark_non_causal_attention() != 0) rc = 1;
     if (check_decode_attention_one_row_long_comp() != 0) rc = 1;
