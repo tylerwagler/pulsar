@@ -1315,6 +1315,50 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
+
+/* ---- L216 expert histogram (throwaway instrument, see rows/L216.md) ------------------ */
+#include <stdlib.h>
+#include <string.h>
+struct l216_layer { double *count, *wsum; uint64_t tokens, calls; uint32_t n; };
+static struct l216_layer l216_layers[128];
+static const char *l216_path = NULL;
+static void l216_dump(void) {
+    if (!l216_path) return;
+    FILE *f = fopen(l216_path, "w"); if (!f) return;
+    fprintf(f, "{\"layers\":{");
+    int first = 1;
+    for (int L = 0; L < 128; L++) {
+        struct l216_layer *y = &l216_layers[L]; if (!y->count) continue;
+        fprintf(f, "%s\"%d\":{\"tokens\":%llu,\"calls\":%llu,\"count\":[", first ? "" : ",", L, (unsigned long long)y->tokens, (unsigned long long)y->calls); first = 0;
+        for (uint32_t e = 0; e < y->n; e++) fprintf(f, "%s%.0f", e ? "," : "", y->count[e]);
+        fprintf(f, "],\"wsum\":[");
+        for (uint32_t e = 0; e < y->n; e++) fprintf(f, "%s%.6g", e ? "," : "", y->wsum[e]);
+        fprintf(f, "]}");
+    }
+    fprintf(f, "}}\n"); fclose(f);
+}
+static void l216_expert_hist(const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
+                             uint32_t n_tokens, uint32_t n_expert, uint32_t n_total_expert, uint32_t layer) {
+    static int armed = -1;
+    if (armed < 0) { l216_path = getenv("PULSAR_EXPERT_HIST"); armed = l216_path ? 1 : 0; if (armed) atexit(l216_dump); }
+    if (!armed || layer >= 128 || n_tokens == 0 || n_total_expert > 4096) return;
+    const uint32_t n = n_tokens * n_expert;
+    int32_t *ids = (int32_t *)malloc(n * sizeof(int32_t)); float *w = (float *)malloc(n * sizeof(float));
+    if (!ids || !w) { free(ids); free(w); return; }
+    if (cudaMemcpy(ids, selected->ptr, n * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        (weights && cudaMemcpy(w, weights->ptr, n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)) { free(ids); free(w); return; }
+    struct l216_layer *y = &l216_layers[layer];
+    if (!y->count) { y->n = n_total_expert; y->count = (double *)calloc(n_total_expert, sizeof(double)); y->wsum = (double *)calloc(n_total_expert, sizeof(double)); }
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t e = ids[i];
+        if (e >= 0 && (uint32_t)e < y->n) { y->count[e] += 1.0; if (weights) y->wsum[e] += w[i]; }
+    }
+    y->tokens += n_tokens; y->calls += 1;
+    free(ids); free(w);
+    static unsigned total = 0;
+    if ((++total % 2048u) == 0) l216_dump();
+}
+
 static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
@@ -1365,6 +1409,11 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
             (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
             return (r1 && r2) ? 1 : 0;
         }
+    }
+    /* L216 instrument: every non-mixed pass (decode pass, pure prefill, or pure decode) */
+    if (n_tokens > 0 && selected && selected->ptr) {
+        const int nd = pulsar_gpu_matmul_batch_decode_rows();
+        if (nd == 0 || (uint32_t)nd >= n_tokens) l216_expert_hist(selected, weights, n_tokens, n_expert, n_total_expert, layer_index);
     }
     if (gate_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4 && down_type == (uint32_t)PULSAR_GPU_TENSOR_CUTLASS_MXFP4) {
         /* Which expert-FFN arithmetic a row gets is a numerics boundary: the
