@@ -716,6 +716,8 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
  * n_tokens <= PULSAR_GPU_MNEUTRAL_ROWS_MAX (16) bounds a duplicate count at 16,
  * so at most two owners per expert per step.  Returns the owned count (0 = exit). */
 enum { GEMV_DEDUPE_MAX = 8 };
+enum { GEMV_DOWN_TILE_N = 64 };      /* down GEMV: outputs per CTA (8 warps x 8) */
+enum { GEMV_DOWN_MAX_K  = 2048 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim) */
 __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
                                                         int e, bool valid, int owned[GEMV_DEDUPE_MAX]) {
   if (!valid) { owned[0] = slot; return 1; }   /* an invalid expert is its own slot's business */
@@ -839,34 +841,72 @@ __global__ static void expert_gemv_down_kernel(
     const int32_t *sel,       // [n_slots] expert ids
     const uint8_t *down_base,
     uint64_t stride, uint64_t data_bytes, SFL sfl,
-    unsigned n_total, int K, int N) {
+    unsigned n_total, unsigned n_slots, int K, int N) {
+  /* L214: the CTA owns GEMV_DOWN_TILE_N outputs (8 per warp) for one expert-owner slot
+   * and every slot naming that expert (gemv_dedupe_owned): each owned slot's mid row and
+   * its decoded scales are staged in shared memory once, the expert's down rows stream
+   * from DRAM once per CTA, and the lanes read activations from shared memory -- so
+   * sharing the weights across rows costs no L2 latency chain (the per-warp-one-row
+   * variant measured +45..65%).  Per-row arithmetic is the per-slot kernel's exactly. */
   __shared__ float lut[16];
+  __shared__ __align__(16) uint8_t s_x[GEMV_DEDUPE_MAX][GEMV_DOWN_MAX_K];
+  __shared__ float s_sa[GEMV_DEDUPE_MAX][GEMV_DOWN_MAX_K / 32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
-  __syncthreads();
   const int slot = (int)blockIdx.y;
   const int lane = (int)(threadIdx.x & 31u);
-  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
-  if (n >= N) return;
+  const int warp = (int)(threadIdx.x >> 5);
+  const int tid  = (int)threadIdx.x;
   const int e = sel[slot];
-  float *o = down_out + (size_t)slot * N;
-  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) o[n] = 0.f; return; }
+  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  int owned[GEMV_DEDUPE_MAX];
+  const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
+  if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
+  const int n_base = (int)(blockIdx.x * GEMV_DOWN_TILE_N) + warp * 8;
+  if (!valid) {                        /* an invalid expert contributes zero to its own slot */
+    if (lane == 0) for (int i = 0; i < 8 && n_base + i < N; i++) down_out[(size_t)slot * N + n_base + i] = 0.f;
+    return;
+  }
+  /* stage: K bytes of E4M3 per owned slot (one uint2 per thread per pass) and K/32 scales */
+  for (int r = 0; r < m; r++) {
+    const uint2 *src = (const uint2 *)(midq8 + (size_t)owned[r] * K);
+    uint2 *dst = (uint2 *)s_x[r];
+    for (int idx = tid; idx < K / 8; idx += 256) dst[idx] = src[idx];
+    for (int kb = tid; kb < K / 32; kb += 256) s_sa[r][kb] = gemv_sf_val(midsf[pulsar_mx_sfoff(owned[r], kb, xkbp)]);
+  }
+  __syncthreads();
   const uint8_t *de = down_base + (size_t)e * stride;
-  const uint8_t *dd = de + (size_t)n * (K / 2);
   const uint8_t *dsf = de + data_bytes;
-  const uint8_t *xt8 = midq8 + (size_t)slot * K;
-  float a = 0.f;
-  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
-    const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));
-    const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
-    const float sa = gemv_sf_val(midsf[pulsar_mx_sfoff(slot, k0 >> 5, xkbp)]);
+  for (int i = 0; i < 8; i++) {
+    const int n = n_base + i;
+    if (n >= N) break;                 /* N % 8 == 0: uniform across the warp */
+    const uint8_t *dd = de + (size_t)n * (K / 2);
+    float a[GEMV_DEDUPE_MAX];
     #pragma unroll
-    for (int j = 0; j < 8; j++) {
-      const float xv = __half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[k0 + j]) * sa;
-      a += lut[(w >> (4 * j)) & 0xFu] * sc * xv;
+    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) a[r] = 0.f;
+    for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
+      const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));   /* the expert's bytes, once for every owned row */
+      const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
+      #pragma unroll
+      for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+        if (r < m) {
+          const float sa = s_sa[r][k0 >> 5];
+          const uint8_t *xt8 = s_x[r] + k0;
+          #pragma unroll
+          for (int j = 0; j < 8; j++) {
+            const float xv = __half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[j]) * sa;
+            a[r] += lut[(w >> (4 * j)) & 0xFu] * sc * xv;
+          }
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < GEMV_DEDUPE_MAX; r++) {
+      if (r < m) {
+        for (int sh = 16; sh > 0; sh >>= 1) a[r] += __shfl_xor_sync(0xffffffffu, a[r], sh);
+        if (lane == 0) down_out[(size_t)owned[r] * N + n] = a[r];
+      }
     }
   }
-  for (int sh = 16; sh > 0; sh >>= 1) a += __shfl_xor_sync(0xffffffffu, a, sh);
-  if (lane == 0) o[n] = a;
 }
 
 
@@ -895,6 +935,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     const void *act_q, const void *act_sf, int act_kbp) {
   if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
+  if (mid_dim > GEMV_DOWN_MAX_K) return 1;                    /* the down GEMV stages mid rows in shared memory */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* Both legs read their scale plane through pulsar_mx_sfoff's swizzle: the
    * gate/up leg from the producer's plane, the down leg from the one the
@@ -952,11 +993,11 @@ int pulsar_cutlass_expert_ffn_gemv_small(
         n_expert, n_total_expert, n_slots, in_dim, mid_dim);
   }
   {
-    dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
+    dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
     expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
         down_out, midq8, midsf, mid_kbp, selected,
         down_w, down_stride, down_data_bytes, sfl_dn,
-        n_total_expert, mid_dim, out_dim);
+        n_total_expert, n_slots, mid_dim, out_dim);
   }
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
@@ -999,7 +1040,7 @@ int pulsar_cutlass_gemv_down(
     const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
     const void *mid_q, const void *mid_sf, int mid_kbp) {
-  if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u)) return 1;
+  if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u) || mid_dim > GEMV_DOWN_MAX_K) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
    * VEC32 swizzle), or the call refuses. */
@@ -1009,10 +1050,10 @@ int pulsar_cutlass_gemv_down(
     return 1;
   }
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
+  dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
   expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
       down_out, (const uint8_t *)mid_q, (const uint8_t *)mid_sf, mid_kbp, selected, down_w,
-      down_stride, down_data_bytes, sfl_dn, n_total_expert, mid_dim, out_dim);
+      down_stride, down_data_bytes, sfl_dn, n_total_expert, n_slots, mid_dim, out_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
