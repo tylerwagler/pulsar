@@ -53,6 +53,14 @@ static float dspark_conf_sched_tau(void) {
 #define SPEC_DEPTH_MIN PULSAR_SPEC_DEPTH_MIN
 #define SPEC_DEPTH_MAX PULSAR_SPEC_DEPTH_MAX
 #define SPEC_DEPTH_CONF_UP 0.70f
+/* L214 INSTRUMENT (never lands): L214_PIN_DEPTH=1 pins the verify width for the
+ * census -- the adaptive controller does not move the depth and the yield quench
+ * never latches, so every step after warm-up runs n_batch = 1 + --dspark-draft. */
+static bool l214_pin_depth(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("L214_PIN_DEPTH") != NULL;
+    return v == 1;
+}
 static uint32_t spec_cur_depth(const pulsar_session *s) {
     int d = s->spec.spec_adaptive_depth;
     if (d <= 0) d = s->engine->dspark_draft_tokens;
@@ -1376,7 +1384,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         if (dspark_stats && (uint32_t)next != depth)
             fprintf(stderr, "pulsar: adaptive-k depth %u -> %d (commit=%d K=%u tail=%.2f)\n",
                     depth, next, commit, K, (double)pend_conf[K - 1]);
-        s->spec.spec_adaptive_depth = next;
+        if (!l214_pin_depth()) s->spec.spec_adaptive_depth = next;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
@@ -1399,7 +1407,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                    s->spec.spec_quench_ewma < 0.0f &&
                    s->spec.spec_quench_debt > PULSAR_QUENCH_BUDGET;
         }
-        if (fire) {
+        if (fire && !l214_pin_depth()) {
             s->spec.spec_quenched = true;
             fprintf(stderr,
                     "pulsar: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
