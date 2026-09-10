@@ -1839,19 +1839,33 @@ __global__ static void mxfp8_mmvq_deint_a8_kernel(OT *out, const __nv_fp8_e4m3 *
  * The activation cache is row-major [rows, K] (mxfp8_quant_act_kernel stores at
  * row*K + k), so a lane's 4 elements stay contiguous per token and the scale row
  * is simply the token index. */
-template <int NT, typename OT>
+template <int NT, int RO, typename OT>
 __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m3 *data,
                                                      const unsigned char *scale,
                                                      const __nv_fp8_e4m3 *xq,
                                                      const unsigned char *xs,
                                                      int in_dim, int out_dim, int KBp, int xKBp) {
-    int o = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    /* L214: RO output rows per warp share each activation word.  This kernel's
+     * per-token traffic is the activation re-read per weight row (out_dim x in_dim
+     * bytes per token per call, from L1), so RO = 2 halves it; each output's FMA
+     * sequence is the RO == 1 kernel's exactly.  A row past out_dim (odd tails)
+     * reads the last row and never stores. */
+    const int o = (int)(blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32)) * RO;
     int lane = threadIdx.x & 31;
     if (o >= out_dim) return;
-    const __nv_fp8_e4m3 *row = data + (size_t)o * in_dim;
-    float acc[NT];
+    const __nv_fp8_e4m3 *rows[RO];
+    int orow[RO];
     #pragma unroll
-    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+    for (int r = 0; r < RO; r++) {
+        orow[r] = (o + r < out_dim) ? o + r : out_dim - 1;
+        rows[r] = data + (size_t)orow[r] * in_dim;
+    }
+    float acc[RO][NT];
+    #pragma unroll
+    for (int r = 0; r < RO; r++) {
+        #pragma unroll
+        for (int t = 0; t < NT; t++) acc[r][t] = 0.f;
+    }
     /* L109 N4 FINAL VERDICT (2026-08-25, two trials): a manual
      * software-pipelined weight load (prefetch next word+scale, guarded by an
      * in-loop bounds branch) measured -33% DECODE in a clean single-lever A/B
@@ -1862,27 +1876,38 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
      * re-add without a branch-free formulation A/B'd solo. */
     for (int base = 0; base < in_dim; base += 128) {
         int k = base + lane * 4;
-        uint32_t wpk = *(const uint32_t *)(row + k);
         int kb = k >> 5;
-        float sw = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(o, kb, KBp)] << 23);
-        const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk;
+        uint32_t wpk[RO];
+        float sw[RO];
+        #pragma unroll
+        for (int r = 0; r < RO; r++) {
+            wpk[r] = *(const uint32_t *)(rows[r] + k);
+            sw[r] = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(orow[r], kb, KBp)] << 23);
+        }
         #pragma unroll
         for (int t = 0; t < NT; t++) {
             uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
             float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
-            const float s = sw * sa;
             const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
             #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                acc[t] += __half2float((__half)qw[j]) * __half2float((__half)qa[j]) * s;
+            for (int r = 0; r < RO; r++) {
+                const float s = sw[r] * sa;
+                const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk[r];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    acc[r][t] += __half2float((__half)qw[j]) * __half2float((__half)qa[j]) * s;
+                }
             }
         }
     }
     #pragma unroll
-    for (int t = 0; t < NT; t++) {
-        float a = acc[t];
-        for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
-        if (lane == 0) q_store<OT>(out, (size_t)t * out_dim + o, a);
+    for (int r = 0; r < RO; r++) {
+        #pragma unroll
+        for (int t = 0; t < NT; t++) {
+            float a = acc[r][t];
+            for (int s2 = 16; s2 > 0; s2 >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s2);
+            if (lane == 0 && o + r < out_dim) q_store<OT>(out, (size_t)t * out_dim + o + r, a);
+        }
     }
 }
 
@@ -2113,6 +2138,12 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                 const int KBp = pulsar_mx_kbp((int)in_dim);
                 const unsigned wpb = 8;
                 dim3 grid(((unsigned)out_dim + wpb - 1) / wpb);
+                /* L214: two outputs per warp at served widths (n_tok >= 6) where the grid
+                 * stays >= 128 blocks wide.  Measured: RO = 2 cut the dense bucket 10% at
+                 * 3 clients (9-12 rows) and cost 6% at 2-4 rows, where half the warps is
+                 * latency-bound.  Both arms compute every output identically. */
+                const unsigned ro = (out_dim >= 2048 && n_tok >= 6) ? 2u : 1u;
+                dim3 grid_ro(((unsigned)out_dim + wpb * ro - 1) / (wpb * ro));
                 /* A8 first, for the same reason the n==1 path takes it: the
                  * source multiplies dynamic E4M3 activations, and this arm
                  * serving the verify batch in f32 while n==1 served the
@@ -2136,9 +2167,10 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                                     (unsigned long long)in_dim, (unsigned long long)out_dim);
                         }
                     }
-                    #define PULSAR_FP8_NT_A8(N, OT) mxfp8_mmvq_deint_nt_a8_kernel<N, OT><<<grid, wpb * 32>>>( \
+                    #define PULSAR_FP8_NT_A8_RO(N, RO, OT) mxfp8_mmvq_deint_nt_a8_kernel<N, RO, OT><<<grid_ro, wpb * 32>>>( \
                             (OT *)out->ptr, bw->data, bw->scale, ac8nt->xq, ac8nt->sx, \
                             (int)in_dim, (int)out_dim, KBp, xKBp)
+                    #define PULSAR_FP8_NT_A8(N, OT) do { if (ro == 2u) PULSAR_FP8_NT_A8_RO(N, 2, OT); else PULSAR_FP8_NT_A8_RO(N, 1, OT); } while (0)
                     switch (n_tok) {
                     case 2: if (out_f16) PULSAR_FP8_NT_A8(2, __half); else PULSAR_FP8_NT_A8(2, float); break;
                     case 3: if (out_f16) PULSAR_FP8_NT_A8(3, __half); else PULSAR_FP8_NT_A8(3, float); break;
@@ -2157,6 +2189,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
                     default: if (out_f16) PULSAR_FP8_NT_A8(16, __half); else PULSAR_FP8_NT_A8(16, float); break;  ///< n_tok == 16 == PULSAR_GPU_MNEUTRAL_ROWS_MAX
                     }
                     #undef PULSAR_FP8_NT_A8
+                    #undef PULSAR_FP8_NT_A8_RO
                     return cuda_ok(cudaGetLastError(), "fp8_mx mmvq deint nt a8");
                 }
                 /* L158: no E4M3 encoding and none declared -- refuse (the f32
