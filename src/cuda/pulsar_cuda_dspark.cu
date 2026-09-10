@@ -18,7 +18,16 @@
  *
  * This kernel streams the WHOLE of markov_w2 -- every vocab row, every step --
  * at one multiply-add per element, so it is pure bandwidth: halving the element
- * width halves its runtime. That, not the 132 MB, is why the storage matters. */
+ * width halves its runtime. That, not the 132 MB, is why the storage matters.
+ *
+ * markov_w2 is stored K-MAJOR (L213): element (v, i) lives at i * vocab + v, so
+ * at each i the 32 lanes of a warp (consecutive v) read 64 contiguous bytes.
+ * The v-major layout it replaced put adjacent lanes 512 bytes apart -- 32
+ * scattered transactions per warp-load -- and the served census measured this
+ * kernel at ~47 GB/s against a ~218 GB/s streaming roofline (rows/L213.md).
+ * The per-thread accumulation order over i is unchanged, so refined logits are
+ * bit-identical to the v-major kernel's. markov_w1 stays v-major: it is read
+ * one whole row (the previous token's) per bank, which that layout serves. */
 template <bool W1BF16, bool W2BF16>
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
@@ -41,9 +50,8 @@ __global__ static void dspark_markov_step_kernel(
     for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
          v += blockDim.x * gridDim.x) {
         float dot = 0.0f;
-        const uint64_t w2_base = (uint64_t)v * embed_dim;
         for (uint32_t i = 0; i < embed_dim; i++)
-            dot += pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, w2_base + i) *
+            dot += pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, (uint64_t)i * vocab_size + v) *
                    pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
         float val = base_logits[v] + dot;
         refined_logits[v] = val;
@@ -723,9 +731,10 @@ int pulsar_gpu_distill_top64_tensor(
  * The single-bank kernels above stream all of markov_w2 (129,280 x 256 bf16,
  * 66 MB) once per draft position PER BANK; the served lane ran three banks'
  * drafter passes back to back, so a tick paid 3 x n_draft streams. These
- * kernels take N banks per launch: each thread loads a w2 row element once
- * and dots it against N w1 rows (one per bank's previous token), so one
- * stream serves every bank.
+ * kernels take N banks per launch: each thread loads its vocab entry's w2
+ * element at each i once (k-major, see the single-bank kernel's header) and
+ * dots it against N w1 rows (one per bank's previous token), so one stream
+ * serves every bank.
  *
  * BYTE-EXACT with the single-bank kernels by construction: per bank the dot
  * accumulates the same products in the same i order into its own
@@ -773,9 +782,8 @@ __global__ static void dspark_markov_step_banks_kernel(
          v += blockDim.x * gridDim.x) {
         float dot[MAXB];
         for (uint32_t b = 0; b < MAXB; b++) dot[b] = 0.0f;
-        const uint64_t w2_base = (uint64_t)v * embed_dim;
         for (uint32_t i = 0; i < embed_dim; i++) {
-            const float w2v = pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, w2_base + i);
+            const float w2v = pulsar_w_load_f32_or_bf16<W2BF16>(markov_w2, (uint64_t)i * vocab_size + v);
             for (uint32_t b = 0; b < n_banks; b++)
                 dot[b] += w2v * pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base[b] + i);
         }
