@@ -1348,6 +1348,8 @@ static void l214_route_census(const pulsar_gpu_tensor *selected, uint32_t n_toke
     const double per = (double)(2u * gate_expert_bytes + down_expert_bytes);
     struct l214_acc *a = &l214_by_width[n_tokens];
     a->calls += 1; a->slots += n; a->uniq += uniq; a->bytes_slots += per * n; a->bytes_uniq += per * uniq;
+    static unsigned total_calls = 0;
+    if ((++total_calls % 4096u) == 0) l214_print();   /* cumulative; a SIGTERM may skip atexit */
 }
 
 static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
