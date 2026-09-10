@@ -295,13 +295,6 @@ enum {
      * carries it fails the routed-expert type check at load, and
      * gguf-tools/repack_iq2_mmq.py --to mmq-k converts one. */
     PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K = 44,
-    /* int8 payload k-major [rows][cols] + one f16 scale per COLUMN (L213 step 2):
-     * the drafter's markov_w2 as (vocab, 256) with element (v, i) at i*vocab + v,
-     * followed by vocab f16 scales -- one per vocab row, where the magnitude
-     * lives.  refined = base + (sum_i q[i,v] * w1[i]) * scale[v]: the scale is
-     * applied once per output, outside the i loop.  Byte size is
-     * rows*cols + 2*cols, not a per-element rate (gguf.cpp sizes it by dims). */
-    PULSAR_GPU_TENSOR_I8_ROWSCALE_K = 45,
     /* MXFP8 SoA, k-major (L213 step 2b): type 38's exact E4M3 + E8M0-per-32 content
      * split into two planes -- E8M0 scales [rows][cols/32], then E4M3 payload
      * [rows][cols] -- so a lane's payload load is one aligned 4-byte word where
@@ -317,8 +310,7 @@ enum {
 enum {
     PULSAR_MARKOV_W2_F32   = 0,   /* GGUF type 0 */
     PULSAR_MARKOV_W2_BF16  = 1,   /* GGUF type 30 */
-    PULSAR_MARKOV_W2_I8ROW = 2,   /* GGUF type 45, PULSAR_GPU_TENSOR_I8_ROWSCALE_K */
-    PULSAR_MARKOV_W2_MXFP8 = 3,   /* GGUF type 46: E8M0 scale plane [E][V/32], then E4M3 payload plane [E][V] */
+    PULSAR_MARKOV_W2_MXFP8 = 2,   /* GGUF type 46: E8M0 scale plane [E][V/32], then E4M3 payload plane [E][V] -- the shipped table */
 };
 
 /** Compressor input-width multiplier for a layer's compress ratio: the

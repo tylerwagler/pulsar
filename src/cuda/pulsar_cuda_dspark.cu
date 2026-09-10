@@ -28,7 +28,7 @@
  * bit-identical to the v-major kernel's. markov_w1 stays v-major: it is read
  * one whole row (the previous token's) per bank, which that layout serves. */
 /* Every W2 arm reads FOUR consecutive v per lane at each i (L213 step 2): a
- * warp's load is one contiguous 128 B (int8) .. 512 B (f32) run, where the
+ * warp's load is one contiguous 128 B (mxfp8) .. 512 B (f32) run, where the
  * one-v-per-lane bf16 kernel it replaces made a 64 B request per warp-load
  * (half a line) and reached 113 of ~218 GB/s.  Each v still accumulates over i
  * in order in its own f32 register, so the f32/bf16 arms are bit-identical to
@@ -54,17 +54,12 @@ __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t 
         const uint2 q = *(const uint2 *)((const __nv_bfloat16 *)w2 + (uint64_t)i * vocab_size + v0);
         out[0] = __uint_as_float(q.x << 16); out[1] = __uint_as_float(q.x & 0xffff0000u);
         out[2] = __uint_as_float(q.y << 16); out[3] = __uint_as_float(q.y & 0xffff0000u);
-    } else if constexpr (W2FMT == PULSAR_MARKOV_W2_I8ROW) {
-        /* payload [E][V] int8; the per-vocab-row scale is applied by the caller
-         * once per output (dspark_w2_rowscale4), not per element */
-        const uint32_t q = *(const uint32_t *)((const uint8_t *)w2 + (uint64_t)i * vocab_size + v0);
-        out[0] = (float)(int8_t)(q & 0xffu);         out[1] = (float)(int8_t)((q >> 8) & 0xffu);
-        out[2] = (float)(int8_t)((q >> 16) & 0xffu); out[3] = (float)(int8_t)(q >> 24);
     } else {
         /* MXFP8 SoA (GGUF 46): type 38's content as two planes -- E8M0 scales
-         * [E][V/32], then E4M3 payload [E][V] -- so the payload is the int8
-         * arm's aligned 4-byte load.  Stock 38's 33-byte blocks forced five byte
-         * loads per lane per i and held this arm at 152 GB/s (L213 round 5).
+         * [E][V/32], then E4M3 payload [E][V] -- so the payload is one aligned
+         * 4-byte load.  Stock 38's 33-byte blocks forced five byte loads per
+         * lane per i and held this arm at 152 GB/s (L213 round 5); the planes
+         * took it to 161 us, 212 GB/s.
          * v0 is 4-aligned so its four v share one scale.  ldexpf keeps byte 0
          * (2^-127, an f32 subnormal) exact, as the CPU codec's ldexpf does; the
          * E4M3 -> f32 hardware conversion is exact. */
@@ -79,22 +74,12 @@ __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t 
         f.__x = (uint8_t)(q >> 24);           out[3] = (float)f * scale;
     }
 }
-/* I8ROW: the four vocab rows' f16 scales, from the plane that follows the
- * int8 payload in the same blob. */
-__device__ __forceinline__ static void dspark_w2_rowscale4(const void *w2, uint32_t vocab_size,
-                                                           uint32_t embed_dim, uint32_t v0, float out[4]) {
-    const __half2 *sc = (const __half2 *)((const uint8_t *)w2 + (uint64_t)vocab_size * embed_dim + (uint64_t)v0 * 2u);
-    const __half2 a = sc[0], b = sc[1];
-    out[0] = __low2float(a); out[1] = __high2float(a);
-    out[2] = __low2float(b); out[3] = __high2float(b);
-}
 /* Bytes of a markov_w2 blob in each storage; 0 = unknown format (refuse). */
 static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t embed_dim) {
     const uint64_t n = (uint64_t)vocab_size * embed_dim;
     switch (w2_fmt) {
     case PULSAR_MARKOV_W2_F32:   return n * 4u;
     case PULSAR_MARKOV_W2_BF16:  return n * 2u;
-    case PULSAR_MARKOV_W2_I8ROW: return n + (uint64_t)vocab_size * 2u;
     case PULSAR_MARKOV_W2_MXFP8: return (vocab_size % 32u) ? 0 : ((uint64_t)vocab_size / 32u) * 33u * embed_dim;
     default: return 0;
     }
@@ -103,7 +88,6 @@ static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t
     switch (w2_fmt) {                                                           \
     case PULSAR_MARKOV_W2_F32:   LAUNCH(A, PULSAR_MARKOV_W2_F32);   break;      \
     case PULSAR_MARKOV_W2_BF16:  LAUNCH(A, PULSAR_MARKOV_W2_BF16);  break;      \
-    case PULSAR_MARKOV_W2_I8ROW: LAUNCH(A, PULSAR_MARKOV_W2_I8ROW); break;      \
     case PULSAR_MARKOV_W2_MXFP8: LAUNCH(A, PULSAR_MARKOV_W2_MXFP8); break;      \
     default: return 0;                                                          \
     }
@@ -136,13 +120,9 @@ __global__ static void dspark_markov_step_kernel(
             const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
             for (int k = 0; k < 4; k++) dot[k] += w2v[k] * w1v;
         }
-        float rs[4];
-        if constexpr (W2FMT == PULSAR_MARKOV_W2_I8ROW) dspark_w2_rowscale4(markov_w2, vocab_size, embed_dim, v0, rs);
         for (int k = 0; k < 4; k++) {
             const uint32_t v = v0 + k;
-            float val;
-            if constexpr (W2FMT == PULSAR_MARKOV_W2_I8ROW) val = base_logits[v] + dot[k] * rs[k];
-            else                                            val = base_logits[v] + dot[k];
+            const float val = base_logits[v] + dot[k];
             refined_logits[v] = val;
             if (val > best_val) { best_val = val; best_id = (int32_t)v; }
         }
@@ -879,14 +859,10 @@ __global__ static void dspark_markov_step_banks_kernel(
                 for (int k = 0; k < 4; k++) dot[b][k] += w2v[k] * w1v;
             }
         }
-        float rs[4];
-        if constexpr (W2FMT == PULSAR_MARKOV_W2_I8ROW) dspark_w2_rowscale4(markov_w2, vocab_size, embed_dim, v0, rs);
         for (uint32_t b = 0; b < n_banks; b++) {
             for (int k = 0; k < 4; k++) {
                 const uint32_t v = v0 + k;
-                float val;
-                if constexpr (W2FMT == PULSAR_MARKOV_W2_I8ROW) val = base[b][v] + dot[b][k] * rs[k];
-                else                                            val = base[b][v] + dot[b][k];
+                const float val = base[b][v] + dot[b][k];
                 refined_logits[(uint64_t)b * vocab_size + v] = val;
                 if (val > best_val[b]) { best_val[b] = val; best_id[b] = (int32_t)v; }
             }

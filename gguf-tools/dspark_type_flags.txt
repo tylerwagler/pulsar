@@ -72,7 +72,7 @@
 --tensor-type dspark.2.hc_head_fn.weight=f32
 --tensor-type dspark.2.hc_head_scale.weight=f32
 --tensor-type dspark.2.markov_head.markov_w1.weight=bf16
---tensor-type dspark.2.markov_head.markov_w2.weight=bf16
+--tensor-type dspark.2.markov_head.markov_w2.weight=fp8_e4m3_soa_k
 --tensor-type dspark.2.norm.weight=bf16
 --tensor-type dspark.main_norm.weight=bf16
 --tensor-type dspark.main_proj.weight=mxfp8_lt

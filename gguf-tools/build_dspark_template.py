@@ -228,7 +228,10 @@ def main():
     # K-MAJOR (L213): ne = (V, 256), v fastest -- the transpose of the source's
     # [V, 256]. The quantizer transposes the data to match (dsq_generate.c,
     # is_kmajor_tensor); the engine refuses the v-major layout by dims.
-    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(256, V), 30)
+    # Stored as MXFP8 SoA (46, L213 step 2): type 38's E4M3 + E8M0/32 content as
+    # a scale plane then a payload plane, so the markov kernel's warp reads one
+    # aligned word per lane.  dspark_type_flags.txt names the same type.
+    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(256, V), 46)
     add('dspark.2.confidence_head.proj.weight',  1, (E + 256,), 30)
     add('dspark.2.hc_head_base.weight',  1, gguf(NHC), 0)
     add('dspark.2.hc_head_fn.weight',    2, gguf(NHC, NHC*E), 0)
