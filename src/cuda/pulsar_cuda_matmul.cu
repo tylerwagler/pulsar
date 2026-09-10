@@ -257,8 +257,19 @@ __global__ static void matmul_bf16_kernel(
  * load in front of it -- ONE arithmetic body, so a kernel that stages a weight
  * block once and dots it against N tokens (grouped_fp8mx_a_nt_a8_kernel) gets
  * every token's value from the same expression the one-token kernels use. */
-__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8_w(
-        const uint32_t wp[8], float sw,
+/* L214: the weight block as 32 floats.  The packed-word form below converts and
+ * calls this; grouped_fp8mx_a_nt_a8_kernel converts its staged block ONCE and
+ * calls this for every token, instead of re-converting per token. */
+__device__ __forceinline__ static void dev_fp8mx_block_to_f32(const uint32_t wp[8], float wf[32]) {
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+        const __nv_fp8_e4m3 *wq = (const __nv_fp8_e4m3 *)&wp[g];
+#pragma unroll
+        for (int j = 0; j < 4; j++) wf[g * 4 + j] = __half2float((__half)wq[j]);
+    }
+}
+__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8_wf(
+        const float wf[32], float sw,
         const __nv_fp8_e4m3 *xblk, unsigned char xscale_byte) {
     const float sa = __int_as_float((uint32_t)xscale_byte << 23);  ///< E8M0
     float s = 0.0f;
@@ -266,13 +277,19 @@ __device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8_w(
 #pragma unroll
     for (int g = 0; g < 8; g++) {
         const uint32_t xp = ((const uint32_t *)xblk)[g];
-        const __nv_fp8_e4m3 *wq = (const __nv_fp8_e4m3 *)&wp[g];
         const __nv_fp8_e4m3 *xq = (const __nv_fp8_e4m3 *)&xp;
 #pragma unroll
         for (int j = 0; j < 4; j++)
-            s += __half2float((__half)wq[j]) * __half2float((__half)xq[j]);
+            s += wf[g * 4 + j] * __half2float((__half)xq[j]);
     }
     return sw * sa * s;
+}
+__device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8_w(
+        const uint32_t wp[8], float sw,
+        const __nv_fp8_e4m3 *xblk, unsigned char xscale_byte) {
+    float wf[32];
+    dev_fp8mx_block_to_f32(wp, wf);
+    return dev_dot_fp8mx_deint_block_a8_wf(wf, sw, xblk, xscale_byte);
 }
 
 __device__ __forceinline__ static float dev_dot_fp8mx_deint_block_a8(
@@ -469,11 +486,13 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
             for (int g = 0; g < 8; g++) wp[g] = wblk[g];
             const float sw = __int_as_float(
                     (uint32_t)wscale[pulsar_mx_sfoff((int)rw, (int)b, KBp)] << 23);
+            float wf[32];                     /* L214: converted once, dotted NT times */
+            dev_fp8mx_block_to_f32(wp, wf);
 #pragma unroll
             for (int t = 0; t < NT; t++)
-                acc[r][t] += dev_dot_fp8mx_deint_block_a8_w(wp, sw,
-                                                            xg + (uint64_t)t * group_dim + i0,
-                                                            xsb[t]);
+                acc[r][t] += dev_dot_fp8mx_deint_block_a8_wf(wf, sw,
+                                                             xg + (uint64_t)t * group_dim + i0,
+                                                             xsb[t]);
         }
     }
     for (uint32_t r = 0; r < nr; r++) {
@@ -1884,18 +1903,30 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
             wpk[r] = *(const uint32_t *)(rows[r] + k);
             sw[r] = __int_as_float((uint32_t)scale[pulsar_mx_sfoff(orow[r], kb, KBp)] << 23);
         }
+        /* L214: each weight byte is converted once per chunk, not once per token
+         * (and each activation byte once, not once per output row); the products
+         * are formed in the original order, (wf * af) * s, so nothing changes. */
+        float wf[RO][4];
+        #pragma unroll
+        for (int r = 0; r < RO; r++) {
+            const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk[r];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) wf[r][j] = __half2float((__half)qw[j]);
+        }
         #pragma unroll
         for (int t = 0; t < NT; t++) {
             uint32_t apk = *(const uint32_t *)(xq + (size_t)t * in_dim + k);
             float sa = __int_as_float((uint32_t)xs[pulsar_mx_sfoff(t, kb, xKBp)] << 23);
             const __nv_fp8_e4m3 *qa = (const __nv_fp8_e4m3 *)&apk;
+            float af[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) af[j] = __half2float((__half)qa[j]);
             #pragma unroll
             for (int r = 0; r < RO; r++) {
                 const float s = sw[r] * sa;
-                const __nv_fp8_e4m3 *qw = (const __nv_fp8_e4m3 *)&wpk[r];
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    acc[r][t] += __half2float((__half)qw[j]) * __half2float((__half)qa[j]) * s;
+                    acc[r][t] += wf[r][j] * af[j] * s;
                 }
             }
         }
