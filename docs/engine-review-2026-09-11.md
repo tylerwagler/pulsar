@@ -17,6 +17,35 @@ re-litigation of measured NO-GOs.
 
 ---
 
+## Implementation status — branch `l219-review-fixes` (2026-09-11)
+
+Landed, compile-verified, **none yet measured or gate-run** (no GPU on the
+review box). Every item below still owes its A/B or byte-baseline re-anchor on
+the GB10 before it can merge.
+
+- A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
+- A2 payload digest, format v10 (`117541f7`)
+- A3 sampler range clamps + warning (`bc9d70bb`)
+- A4 AGENTS.md truth (`d6b4e93c`)
+- A5 quantizer pre-flight shapes (`b9745c7e`)
+- B1 IQ2 down decode GEMV — **numerics change; decode byte baseline must be
+  re-anchored** (`cf30211f`)
+- B3 greedy spec argmax readback (`4fa5e0b6`)
+- B6 persistent plain/mixed lane logits (`e5b2979f`)
+- B7 bulk `pulsar_tokens_copy` (`f59043f7`)
+- B8 async drafter seed copies (`eb9b5a8b`)
+- C3 `hc_expand` destination dedupe (bit-exact) (`ef576858`)
+- C7 block-parallel softmax (bit-exact) (`6a152fbd`)
+- C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
+- C9 refuted — already covered at block granularity (`8c67aeb0`)
+
+Still open and writeable blind, in value order: B2 (sampler host fast path),
+B5 (lane grouping), B10 (sampled redraft), C2 (fold-epilogue E4M3), C4
+(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10 items and the
+`attn_pack_store` retile. B4, B9, C1, D1 and D2 need the rig.
+
+---
+
 ## Priority board
 
 | ID | Item | Class | Expected value | Effort | Basis |
