@@ -495,7 +495,10 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
     pulsar_engine *e = s->engine;
     for (int i = 0; i < 3; i++) {
         if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
-        if (!pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
+        /* Async: project_main_x below reads these on the same (per-thread)
+         * stream; nothing on the host reads them before the sync that already
+         * bounds the step. */
+        if (!pulsar_gpu_tensor_copy_async(g->dspark_target_h[i], 0,
                                  g->dspark_target_h_batch[i],
                                  (uint64_t)row * PULSAR_N_EMBD * sizeof(float),
                                  (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;

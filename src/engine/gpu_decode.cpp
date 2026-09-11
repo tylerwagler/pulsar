@@ -416,8 +416,10 @@ bool gpu_graph_dspark_seed_draft_kv(
             const uint32_t row = pos % PULSAR_DSPARK_DRAFT_WINDOW;
             /* Both copies were unchecked: a failed stage used to leave the row
              * unwritten while the counter still advanced past it, i.e. the ring
-             * would be read as if it held a seeded position. */
-            if (!pulsar_gpu_tensor_copy(kv_rot, 0, kv_norm, 0, kv_bytes)) {
+             * would be read as if it held a seeded position.  Async: kv_rot is
+             * consumed only by the rope/pack kernels that follow on this same
+             * (per-thread) stream, so the host wait bought nothing. */
+            if (!pulsar_gpu_tensor_copy_async(kv_rot, 0, kv_norm, 0, kv_bytes)) {
                 seeded = false;
                 break;
             }
