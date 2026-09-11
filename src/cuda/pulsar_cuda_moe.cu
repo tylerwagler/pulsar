@@ -714,7 +714,8 @@ static int routed_moe_launch_mixed40(
     int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_b, A);
     uint8_t  *proj_scratch = (uint8_t *)cuda_arena_take(&ar, proj_b, A);
     if (!proj_scratch) return 0;  /* take() latches: one check covers all fourteen */
-    float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
+    float *mid_flat = (float *)mid->ptr;        /* f32 mid scratch: MMQ raw up on the MMQ arms;
+                                                 * every arm's folded leaf is E4M3 in mid's slot (L219) */
     float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
 
     /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1).
@@ -803,8 +804,9 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter (E4M3)");
             }
         } else {
-            /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
-             * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
+            /* decode/verify (n<=4): lean W4A8 GEMV -> mid's E4M3 slot (fused swiglu+routing
+             * weight), pair layout, ONE launch over all slots -- no gather/scatter, no host
+             * sync, no TC underfill, and no separate encode (L219). */
             (void)gate_g; (void)up_g; (void)mid_g;
             /* Hand over the producing norm's E4M3, exactly as the grouped path
              * above does.  A miss refuses (L158): there is no re-encode here. */
@@ -853,8 +855,8 @@ static int routed_moe_launch_mixed40(
             ok = 0;
         }
     } else {
-        /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat, reading the
-         * producer's E4M3 x. */
+        /* Case B. Phase 1: MMQ gate/up whose fold epilogue emits mid's E4M3
+         * directly (L219), reading the producer's E4M3 x. */
         float *out_g = out_g_buf;
         /* Type-43 gate/up against a type-40 down (3 of the artifact's layers).
          * `up` is pair-sized and serves as MMQ's raw gate buffer. */
@@ -904,7 +906,7 @@ static int routed_moe_launch_mixed40(
             }
         } else if (ok) {
             /* decode/verify (n<=4): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
-             * slots (routing weight already applied by the dp4a gate/up swiglu into mid_flat). */
+             * slots (the routing weight is already in the mid E4M3 the gate/up epilogue emitted). */
             (void)out_g;
             if (pulsar_cutlass_gemv_down(down_flat, selected_ptr,
                     (const uint8_t *)down_w, down_expert_bytes, down_row_bytes,
