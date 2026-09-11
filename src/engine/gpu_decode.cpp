@@ -116,34 +116,6 @@ bool gpu_graph_matmul_plain_tensor(
 
 
 
-/* Decode-only fused RMSNorm + HC-mix GEMV.  Byte-identical to the
- * rms_norm_plain -> matmul_f16 pair it replaces (see pulsar_cuda_hc_router.cu);
- * it exists because that pair ran a 1-block kernel and then a 24-block kernel
- * with a 64 KB f32 scratch round trip between them, for ~5.4% of decode.
- * src_hc is an HC residual carrier (BF16 under task #62); the fused kernel
- * reads it via pulsar_hc_load, exactly as pulsar_gpu_rms_norm_plain_rows_tensor does.
- * L159: the unfused norm -> plain-GEMM arm for other weight formats was a
- * fallback nothing ran (hc_*_fn is bf16); it is deleted, other formats refuse. */
-static bool gpu_graph_norm_mix_plain(
-        const pulsar_model      *model,
-        const pulsar_tensor     *w,
-        uint64_t              hc_dim,
-        uint64_t              out_dim,
-        const pulsar_gpu_tensor *src_hc,
-        pulsar_gpu_tensor       *out) {
-    /* Any storage the fused kernel can read takes the fusion; only an fp8 mix
-     * weight still needs the unfused pair. Was F16-only, which quietly dropped
-     * the fusion -- and its ~5.4% of decode -- as soon as hc_*_fn moved. */
-    if (w->type != PULSAR_TENSOR_BF16 && w->type != PULSAR_TENSOR_F32) {
-        fprintf(stderr, "pulsar: hc mix weight type %d has no fused norm+mix kernel -- refusing\n",
-                (int)w->type);
-        return false;
-    }
-    return pulsar_gpu_hc_norm_mix_tensor(out, model->map, model->size,
-                                          w->abs_offset, hc_dim, out_dim,
-                                          src_hc, PULSAR_RMS_EPS,
-                                          w->type) != 0;
-}
 
 
 
@@ -489,6 +461,8 @@ bool gpu_graph_dspark_draft_forward_banks(
                                               n_draft,
                                               PULSAR_N_EMBD,
                                               PULSAR_N_HC) != 0;
+    /* forward_spec: the drafter's stream starts from the identity pre-mix too */
+    if (ok) ok = pulsar_gpu_hc_pre_identity_tensor(g->batch_hc_pre, n_draft, PULSAR_N_HC) != 0;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
@@ -561,7 +535,7 @@ bool gpu_graph_dspark_draft_forward_banks(
             ffn_cur_view, g->batch_attn_norm, dn_q, dn_sf, dn_kbp,
             NULL /* no bf16 consumer in the drafter */,
             gpu_graph_f32_store_observed_any() ? 0u : n_draft /* f32 rows only for a dump */,
-            hc_split_view, hc_mix_view, g->batch_cur_hc,
+            hc_split_view, g->batch_hc_pre, hc_mix_view, g->batch_cur_hc,
             dspark_model->map, dspark_model->size,
             layer->hc_attn_scale->abs_offset,
             layer->hc_attn_base->abs_offset,
@@ -799,40 +773,38 @@ bool gpu_graph_dspark_draft_forward_banks(
 }
 
 /* Encode the final HC collapse, output norm, and vocab projection on GPU for
- * ONE row (g->cur_hc): the last row of a whole/chunked prefill.  Its logits are
- * the first decode output -- the same distribution the classic decode step
- * produces with the one-row GEMV -- so the row is declared a DECODE row and
- * the vocab GEMM takes the M-independent arm (as it did before L167, by row
- * count).  The callers are the prefill lane, which declares nothing itself. */
+ * ONE row of the sweep-final stream: the last row of a whole/chunked prefill.
+ * The collapse weights are the pre the last FFN handed on (batch_hc_pre, the
+ * reference's `layer.hc_pre(h, pre_mix)` after the layer loop) -- there is no
+ * head-side mix.  Its logits are the first decode output -- the same
+ * distribution the classic decode step produces with the one-row GEMV -- so
+ * the row is declared a DECODE row and the vocab GEMM takes the M-independent
+ * arm (as it did before L167, by row count).  The callers are the prefill
+ * lane, which declares nothing itself. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     pulsar_decode_rows_scope rows(1u);
     if (!rows.ok()) return false;
-    bool ok = gpu_graph_norm_mix_plain((const pulsar_model *)model, weights->output_hc_fn,
-                                       hc_dim, PULSAR_N_HC, g->cur_hc, g->output_pre);
+    pulsar_gpu_tensor *row_hc = gpu_graph_hc_row_view(g->batch_cur_hc, row, hc_dim);
+    pulsar_gpu_tensor *row_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
+                                                        (uint64_t)row * PULSAR_N_HC * sizeof(float),
+                                                        (uint64_t)PULSAR_N_HC * sizeof(float));
+    bool ok = row_hc && row_pre;
     if (ok) {
-        gpu_graph_debug_dump_tensor("result_hc_pre", g->output_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
-    }
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(g->output_weights,
-                                                    g->output_pre,
-                                                    model->map,
-                                                    model->size,
-                                                    weights->output_hc_scale->abs_offset,
-                                                    weights->output_hc_base->abs_offset,
-                                                    PULSAR_N_HC,
-                                                    PULSAR_HC_EPS) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+        gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
     }
     if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  g->cur_hc,
-                                                  g->output_weights,
+                                                  row_hc,
+                                                  row_pre,
                                                   PULSAR_N_EMBD,
                                                   PULSAR_N_HC) != 0;
+    pulsar_gpu_tensor_free(row_pre);
+    pulsar_gpu_tensor_free(row_hc);
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc", g->output_embd, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
@@ -903,6 +875,7 @@ static bool gpu_graph_encode_output_head_batch_impl(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row0,
         uint32_t               n_tokens,
         uint64_t               vocab_dim);
 
@@ -915,9 +888,10 @@ bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row0,
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
-    if (n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+    if (row0 == 0u && n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
         /* L119: parity-keyed like the FFN bracket — the head reads the
          * sweep-final hidden buffer, whose identity alternates per sweep
          * (odd layer count x per-layer pointer swap). */
@@ -930,42 +904,44 @@ bool gpu_graph_encode_output_head_batch(
         if (st == 2) return true;
         if (st == 1) {
             const bool ok = gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, n_tokens, vocab_dim);
+                    g, model, weights, 0u, n_tokens, vocab_dim);
             if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
             /* Capture failed (key now poisoned): the recorded work never ran,
              * and a mid-capture violation can fail an otherwise-good body —
              * run the body for real regardless of ok; a REAL body failure
              * simply fails again here and propagates. */
             return gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, n_tokens, vocab_dim);
+                    g, model, weights, 0u, n_tokens, vocab_dim);
         }
     }
-    return gpu_graph_encode_output_head_batch_impl(g, model, weights, n_tokens, vocab_dim);
+    return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens, vocab_dim);
 }
 
 static bool gpu_graph_encode_output_head_batch_impl(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row0,
         uint32_t               n_tokens,
         uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap ||
+    if (n_tokens == 0 || row0 > g->prefill_cap || n_tokens > g->prefill_cap - row0 ||
         n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    pulsar_gpu_tensor *output_pre = NULL;
-    pulsar_gpu_tensor *output_weights = NULL;
+    pulsar_gpu_tensor *rows_hc = NULL;
+    pulsar_gpu_tensor *rows_pre = NULL;
     pulsar_gpu_tensor *output_embd = NULL;
     pulsar_gpu_tensor *output_norm = NULL;
     pulsar_gpu_tensor *logits = NULL;
 
     bool ok = true;
-    output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix,
-                                       0,
-                                       (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-    output_weights = pulsar_gpu_tensor_view(g->batch_hc_split,
-                                           0,
-                                           (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+    /* the sweep-final rows and the pre the last FFN handed each of them */
+    rows_hc = pulsar_gpu_tensor_view(g->batch_cur_hc,
+                                     (uint64_t)row0 * hc_dim * PULSAR_HC_ELT_SIZE,
+                                     (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);
+    rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
+                                      (uint64_t)row0 * PULSAR_N_HC * sizeof(float),
+                                      (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur,
                                         0,
                                         (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
@@ -981,43 +957,13 @@ static bool gpu_graph_encode_output_head_batch_impl(
     logits = pulsar_gpu_tensor_view(g->spec_logits,
                                    0,
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
-    ok = output_pre && output_weights && output_embd && output_norm && logits;
+    ok = rows_hc && rows_pre && output_embd && output_norm && logits;
 
-    /* The output head's hc projection is a BF16-weight GEMM (output_hc_fn via
-     * pulsar_gpu_matmul_f32_tensor -> the shared bf16 core), so emit the bf16
-     * copy from the norm epilogue rather than letting the GEMM convert
-     * hc_dim floats every step.  L086 T3. */
-    void *out_flat_b = NULL;
-    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
-                                        (uint64_t)hc_dim, &out_flat_b)) {
-        fprintf(stderr, "pulsar: verify head flat_hc: no bf16 slot -- refusing (L159)\n");
-        ok = false;
-    }
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, out_flat_b,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      PULSAR_RMS_EPS, 0) != 0;
-    if (ok && out_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
-                                                   (uint64_t)hc_dim);
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
-                                                 (const pulsar_model *)model,
-                                                 weights->output_hc_fn,
-                                             hc_dim,
-                                             PULSAR_N_HC,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights,
-                                                    output_pre,
-                                                    model->map,
-                                                    model->size,
-                                                    weights->output_hc_scale->abs_offset,
-                                                    weights->output_hc_base->abs_offset,
-                                                    PULSAR_N_HC,
-                                                    PULSAR_HC_EPS) != 0;
+    /* layer.hc_pre(h, pre_mix): collapse with the carried pre -- no head-side
+     * mix GEMM, no sigmoid; V4.1 has no output_hc_* tensors */
     if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
-                                                  g->batch_cur_hc,
-                                                  output_weights,
+                                                  rows_hc,
+                                                  rows_pre,
                                                   PULSAR_N_EMBD,
                                                   PULSAR_N_HC) != 0;
     void *on_b = NULL;
@@ -1052,17 +998,17 @@ static bool gpu_graph_encode_output_head_batch_impl(
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
-    pulsar_gpu_tensor_free(output_weights);
-    pulsar_gpu_tensor_free(output_pre);
+    pulsar_gpu_tensor_free(rows_pre);
+    pulsar_gpu_tensor_free(rows_hc);
     return ok;
 }
 
-/* DSpark drafter output head.  Collapses the drafter's final HC with the DSpark
- * block's OWN head (dspark.2.hc_head_fn/scale/base) and norm (dspark.2.norm),
- * then projects to vocab with the SHARED main output head (self.head in the
- * reference).  The plain gpu_graph_encode_output_head_batch used the MAIN model's
- * output_hc and output_norm weights for the drafter -- wrong weights that
- * corrupted the draft base logits (base0_hit was ~29%). */
+/* DSpark drafter output head (forward_head in the reference): collapses the
+ * drafter's final HC with the pre its last FFN handed on (batch_hc_pre), norms
+ * with the DSpark block's OWN norm (dspark.2.norm), then projects to vocab
+ * with the SHARED main output head (self.head).  The main model's
+ * output_norm is the wrong norm for the drafter -- using it corrupted the
+ * draft base logits (base0_hit was ~29%). */
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,
         const pulsar_model          *dspark_model,
@@ -1073,9 +1019,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
         uint64_t                  vocab_dim) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap ||
         n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-    pulsar_gpu_tensor *output_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+    pulsar_gpu_tensor *rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
@@ -1085,27 +1029,8 @@ bool gpu_graph_encode_dspark_output_head_batch(
      * on the same door, and it is free. */
     pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
-    bool ok = output_pre && output_weights && output_embd && output_norm && logits;
-    /* Same as the main output head above: dw->hc_head_fn is a BF16-weight
-     * GEMM, so the epilogue emits the copy it needs. */
-    void *dsp_flat_b = NULL;
-    if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
-                                        (uint64_t)hc_dim, &dsp_flat_b)) {
-        fprintf(stderr, "pulsar: dspark head flat_hc: no bf16 slot -- refusing (L159)\n");
-        ok = false;
-    }
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
-                                                     (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
-    if (ok && dsp_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
-                                                   (uint64_t)hc_dim);
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
-                                               hc_dim, PULSAR_N_HC, g->batch_flat_hc, n_tokens) != 0;
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights, output_pre,
-                                                  dspark_model->map, dspark_model->size,
-                                                  dw->hc_head_scale->abs_offset,
-                                                  dw->hc_head_base->abs_offset,
-                                                  PULSAR_N_HC, PULSAR_HC_EPS) != 0;
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, output_weights,
+    bool ok = rows_pre && output_embd && output_norm && logits;
+    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
                                                 PULSAR_N_EMBD, PULSAR_N_HC) != 0;
     void *dn_b = NULL;
     if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&
@@ -1134,8 +1059,7 @@ bool gpu_graph_encode_dspark_output_head_batch(
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
-    pulsar_gpu_tensor_free(output_weights);
-    pulsar_gpu_tensor_free(output_pre);
+    pulsar_gpu_tensor_free(rows_pre);
     return ok;
 }
 

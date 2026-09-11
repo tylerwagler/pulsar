@@ -591,9 +591,6 @@ typedef struct {
  * owns none of them. */
 typedef struct {
     pulsar_tensor *token_embd;       ///< token embedding table
-    pulsar_tensor *output_hc_base;   ///< HC per-channel base/offset, output-head side
-    pulsar_tensor *output_hc_fn;     ///< HC mix weight feeding the output head
-    pulsar_tensor *output_hc_scale;  ///< HC per-channel scale, output-head side
     pulsar_tensor *output_norm;      ///< final RMSNorm before the vocab projection
     pulsar_tensor *output;           ///< vocab projection (the output head)
     pulsar_layer_weights layer[PULSAR_MAX_LAYER];  ///< per-layer weight stacks
@@ -613,9 +610,6 @@ typedef struct {
     pulsar_tensor *markov_w1;   ///< Markov head, first projection (cheap next-token prior)
     pulsar_tensor *markov_w2;   ///< Markov head, second projection
     pulsar_tensor *confidence_proj;  ///< confidence head: scores how likely a draft is to be accepted, feeding the adaptive-depth controller
-    pulsar_tensor *hc_head_base;     ///< HC collapse for the drafter's output head, base
-    pulsar_tensor *hc_head_fn;       ///< HC collapse mix weight
-    pulsar_tensor *hc_head_scale;    ///< HC collapse per-channel scale
     pulsar_tensor *final_norm;       ///< RMSNorm before the drafter's vocab projection
     uint32_t embed_dim;              ///< drafter hidden width
     uint32_t vocab_size;             ///< drafter output width; must match the target's logits width
@@ -879,8 +873,6 @@ typedef struct {
     pulsar_gpu_tensor *cand_bscore;
     uint32_t           cand_mask_words;
     pulsar_gpu_tensor *ffn_norm;         ///< RMSNorm output feeding the FFN
-    pulsar_gpu_tensor *output_pre;       ///< final HC mix output feeding the output head
-    pulsar_gpu_tensor *output_weights;   ///< per-stream weights for the HC collapse
     pulsar_gpu_tensor *output_embd;      ///< collapsed embedding-width vector
     pulsar_gpu_tensor *output_norm;      ///< final RMSNorm before the vocab projection
     pulsar_gpu_tensor *logits;           ///< vocab logits row (width = pulsar_shape::n_vocab)
@@ -982,6 +974,12 @@ typedef struct {
     pulsar_gpu_tensor *batch_flat_hc;               ///< batched twin: HC streams flattened for the mix GEMV
     pulsar_gpu_tensor *batch_hc_mix;                ///< batched twin: HC mix projection output
     pulsar_gpu_tensor *batch_hc_split;              ///< batched twin: per-stream split of the mix
+    /** Single-pass mHC (L218): the `pre` collapse weights handed from one
+     * sublayer to the next, [prefill_cap][n_hc] f32 -- born one-hot with the
+     * residual stream (embedding expansion), rewritten by every sublayer's
+     * split with its own pre, read by the output head after the last FFN.
+     * Row-indexed like batch_cur_hc: whatever moves an hc row moves its pre. */
+    pulsar_gpu_tensor *batch_hc_pre;
     pulsar_gpu_tensor *batch_attn_cur;              ///< batched twin: attention sublayer input
     pulsar_gpu_tensor *batch_attn_norm;             ///< batched twin: RMSNorm output feeding the projections
     pulsar_gpu_tensor *batch_qr;                    ///< batched twin: low-rank query latent
@@ -2441,15 +2439,22 @@ bool gpu_graph_env_flag(const char *name, int *cache);
  */
 uint32_t gpu_graph_prefill_slice(void);
 /** Comp-cache row stride in bytes for the active storage format (pack-aware). */
+/** The output head for ONE row of the sweep-final stream: batch_cur_hc row
+ * `row` collapsed with batch_hc_pre row `row` (the last FFN's pre), normed,
+ * projected into g->logits. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row,
         uint64_t               vocab_dim);
+/** The output head for rows [row0, row0 + n_tokens) of the sweep-final stream
+ * into g->spec_logits rows [0, n_tokens). */
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row0,
         uint32_t               n_tokens,
         uint64_t               vocab_dim);
 bool gpu_graph_encode_dspark_output_head_batch(
@@ -2545,9 +2550,11 @@ bool gpu_graph_upload_prompt_tokens(
         const token_vec  *prompt,
         uint32_t          pos0,
         uint32_t          n_tokens);
+/** Where the residual stream is born: prompt[pos0 .. pos0+n_tokens) embedded
+ * into g->batch_cur_hc (hc copies) and g->batch_hc_pre set to the identity
+ * pre-mix for those rows. */
 bool gpu_graph_upload_prompt_embeddings_hc(
-        pulsar_gpu_tensor   *out_hc,
-        pulsar_gpu_tensor   *tokens,
+        pulsar_gpu_graph     *g,
         const pulsar_model    *model,
         const pulsar_weights  *weights,
         const token_vec    *prompt,

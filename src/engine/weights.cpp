@@ -363,24 +363,16 @@ static void tensor_expect_routed_expert(
 
 
 
+/* V4.1 (L218): the head collapses the stream with the LAST FFN's pre-mix, so
+ * there are no output_hc_* tensors -- the head is the norm and the projection. */
 bool weights_have_output_head(const pulsar_weights *w) {
-    return w &&
-           w->output_hc_base &&
-           w->output_hc_fn &&
-           w->output_hc_scale &&
-           w->output_norm &&
-           w->output;
+    return w && w->output_norm && w->output;
 }
 
 
 
 static bool weights_have_partial_output_head(const pulsar_weights *w) {
-    return w &&
-           (w->output_hc_base ||
-            w->output_hc_fn ||
-            w->output_hc_scale ||
-            w->output_norm ||
-            w->output);
+    return w && (w->output_norm || w->output);
 }
 
 
@@ -478,9 +470,6 @@ static void weights_validate_layout(
     if (require_output && !have_output) pulsar_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) pulsar_die("partial output head in GGUF");
     if (have_output) {
-        tensor_expect_layout(w->output_hc_base,  PULSAR_TENSOR_F32,  1, PULSAR_N_HC, 0, 0);
-        tensor_expect_plain_or_mxfp8(w->output_hc_fn, 2, hc_dim, PULSAR_N_HC, 0);
-        tensor_expect_layout(w->output_hc_scale, PULSAR_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_f32_or_bf16(w->output_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Output head is BF16 (source format, kept lossless by a dedicated BF16
          * matmul) or MXFP8 (routed to the FP8 matmul).  Source ships this head
@@ -1011,18 +1000,12 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
 
 static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
     if (required) {
-        w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-        w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-        w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
         w->output_norm      = required_tensor(m, "output_norm.weight");
         w->output           = required_tensor(m, "output.weight");
         return;
     }
     if (!optional) return;
 
-    w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
     w->output_norm      = model_find_tensor(m, "output_norm.weight");
     w->output           = model_find_tensor(m, "output.weight");
     if (weights_have_partial_output_head(w) && !weights_have_output_head(w)) {
@@ -1207,9 +1190,6 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         pulsar_die("dspark markov_w2: storage must be f32, bf16 or fp8_e4m3_soa_k (46)");
     }
     tensor_expect_f32_or_bf16(w->confidence_proj, 1, E + 256, 0, 0);
-    tensor_expect_layout(w->hc_head_base, PULSAR_TENSOR_F32, 1, PULSAR_N_HC, 0, 0);
-    tensor_expect_layout(w->hc_head_fn, PULSAR_TENSOR_F32, 2, (uint64_t)PULSAR_N_HC * E, PULSAR_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, PULSAR_TENSOR_F32, 1, 1, 0, 0);
     tensor_expect_f32_or_bf16(w->final_norm, 1, E, 0, 0);
 }
 
@@ -1254,9 +1234,6 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     w->markov_w1        = required_tensor(m, "dspark.2.markov_head.markov_w1.weight");
     w->markov_w2        = required_tensor(m, "dspark.2.markov_head.markov_w2.weight");
     w->confidence_proj  = required_tensor(m, "dspark.2.confidence_head.proj.weight");
-    w->hc_head_base     = required_tensor(m, "dspark.2.hc_head_base.weight");
-    w->hc_head_fn       = required_tensor(m, "dspark.2.hc_head_fn.weight");
-    w->hc_head_scale    = required_tensor(m, "dspark.2.hc_head_scale.weight");
     w->final_norm       = required_tensor(m, "dspark.2.norm.weight");
 
     w->vocab_size = (uint32_t)w->markov_w1->dim[1];

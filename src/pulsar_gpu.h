@@ -1669,7 +1669,10 @@ int pulsar_gpu_hc_weighted_sum_tensor(
  *                            skipped; 0 stores all. Pass nonzero ONLY with
  *                            note_f32_skipped(), so the skipped-store hazard
  *                            check refuses instead of reading unwritten bytes.
- * @param split               per-stream split of the mix
+ * @param split               per-stream split of the mix: this sublayer's pre / post / comb
+ * @param pre_carry           [n_rows][n_hc] f32: IN the pre handed to this sublayer (the
+ *                            previous sublayer's, or the identity before layer 0), OUT this
+ *                            sublayer's pre for the next collapse -- single-pass mHC (L218)
  * @param mix                 the HC mix projection output
  * @param residual_hc         the HC residual being collapsed
  * @param model_map           base of the model mapping the weights live in
@@ -1695,6 +1698,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         void                    *norm_out_b,
         uint32_t                 norm_f32_keep_from,
         pulsar_gpu_tensor       *split,
+        pulsar_gpu_tensor       *pre_carry,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
@@ -1712,47 +1716,10 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         int                     norm_w_bf16);
 
 
-/** Fused plain-RMSNorm + HC-mix GEMV (decode, n_tok == 1).  Byte-identical to
- * a one-row plain RMSNorm (pulsar_gpu_rms_norm_plain_rows_tensor) followed by the
- * matmul for `w_type`; see the kernel
- * comment in pulsar_cuda_hc_router.cu for the order argument.  `x` is an HC
- * residual CARRIER (pulsar_hc_t storage, PULSAR_HC_ELT_SIZE bytes/sample), not f32.
- *
- * @param out            destination, f32
- * @param model_map      base of the model mapping the mix weight lives in
- * @param model_size     its size; the bound the weight span is checked against
- * @param weight_offset  byte offset of the mix weight within that mapping
- * @param in_dim         input width (K)
- * @param out_dim        output width (N)
- * @param x              the HC residual carrier to norm and mix
- * @param eps            RMS epsilon
- * @param w_type         ds4 tensor type of the mix weight: 1 F16, 30 BF16,
- *                       0 F32. Templated rather than F16-gated -- the fusion is
- *                       about avoiding a scratch round trip, not about the
- *                       weight being 2 bytes.
- * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
- */
-int pulsar_gpu_hc_norm_mix_tensor(
-        pulsar_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        float                   eps,
-        uint32_t                w_type);
-
-int pulsar_gpu_output_hc_weights_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *pre,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_hc,
-        float                   eps);
-
+/** make_identity_pre_mix (L218): rows [0, n_rows) of `pre` become the one-hot
+ * (1, 0, ...) that layer 0's attention collapses with.  Called where the HC
+ * residual stream is born (the embedding expansion), once per sweep. */
+int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, uint32_t n_hc);
 int pulsar_gpu_hc_expand_split_tensor(
         pulsar_gpu_tensor       *out_hc,
         const pulsar_gpu_tensor *block_out,

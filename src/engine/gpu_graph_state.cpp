@@ -58,6 +58,7 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_attn_norm);
     pulsar_gpu_tensor_free(g->batch_attn_cur);
     pulsar_gpu_tensor_free(g->batch_hc_split);
+    pulsar_gpu_tensor_free(g->batch_hc_pre);
     pulsar_gpu_tensor_free(g->batch_hc_mix);
     pulsar_gpu_tensor_free(g->batch_flat_hc);
     pulsar_gpu_tensor_free(g->batch_next_hc);
@@ -100,8 +101,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     free(g->spec_compact_host);
     pulsar_gpu_tensor_free(g->output_norm);
     pulsar_gpu_tensor_free(g->output_embd);
-    pulsar_gpu_tensor_free(g->output_weights);
-    pulsar_gpu_tensor_free(g->output_pre);
     pulsar_gpu_tensor_free(g->ffn_norm);
     pulsar_gpu_tensor_free(g->attn_comp_stage);
     pulsar_gpu_tensor_free(g->idx_comp_stage);

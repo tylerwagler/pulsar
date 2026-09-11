@@ -390,6 +390,13 @@ tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
                          src/cuda/pulsar_cuda_kvrows.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
 	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
+# Single-pass mHC hand-over (L218): the fused split collapses with the pre it
+# was handed and leaves its own behind; two chained calls vs a host oracle.
+# Built the way the engine builds the TU (--use_fast_math).
+tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
+                            src/cuda/pulsar_cuda_hc_router.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
 # attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
 # raw_cap] and its own header argues the compressed and indexed halves matter --
 # "wiring the kernel in against only the n_comp=0 path would have shipped that
@@ -402,7 +409,7 @@ tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -410,6 +417,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 	./tests/attn_f16_kernel_test 48 16 32 x 12 4 0 20    # decode-batch, no topk table
 	./tests/attn_f16_kernel_test 1 16 32 x 12 1 5 20     # ONE-row indexed launch (L166: n_tokens==1 is the same kernel)
 	./tests/attn_f16_banked_test
+	./tests/hc_carry_kernel_test
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips

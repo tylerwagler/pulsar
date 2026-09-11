@@ -163,8 +163,7 @@ static bool run_step(pulsar_session *s, const step_row *rows, uint32_t n) {
         seq[t] = rows[t].bank;
     }
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, &vec, 0, n) &&
-              gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc, g->prefill_tokens,
-                                                    &g_e->model, &g_e->weights, &vec, 0, n) &&
+              gpu_graph_upload_prompt_embeddings_hc(g, &g_e->model, &g_e->weights, &vec, 0, n) &&
               gpu_graph_multiseq_step_begin(g, pos, seq, n, false);
     if (ok) {
         ok = pulsar_gpu_begin_commands() != 0;

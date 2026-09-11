@@ -421,13 +421,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     const bool split_commands = n_tokens > 2048 || imatrix != NULL;
 
     if (!split_commands) {
-        ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                     g->prefill_tokens,
-                                                     model,
-                                                     weights,
-                                                     prompt,
-                                                     start,
-                                                     n_tokens);
+        ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
             ok = gpu_graph_encode_layer_batch(g,
@@ -449,23 +443,14 @@ static bool gpu_graph_prefill_layer_major_inner(
             display_progress(display_progress_ud, "prefill_display",
                              (int)(start + n_tokens), prompt->len);
 
-        const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-        uint32_t output_row = (uint32_t)n_tokens - 1u;
-        pulsar_gpu_tensor *saved_cur = g->cur_hc;
-        pulsar_gpu_tensor *last_hc = NULL;
+        /* the head reads the last row of the sweep-final stream and the pre
+         * its last FFN handed on, both by row */
         if (ok && logits) {
-            last_hc = gpu_graph_hc_row_view(g->batch_cur_hc, output_row, hc_dim);
-            ok = last_hc != NULL;
-        }
-        if (ok && logits) {
-            g->cur_hc = last_hc;
-            ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-            g->cur_hc = saved_cur;
+            ok = gpu_graph_encode_output_head(g, model, weights, (uint32_t)n_tokens - 1u,
+                                              weights->output->dim[1]);
         }
 
         if (ok) ok = pulsar_gpu_end_commands() != 0;
-        g->cur_hc = saved_cur;
-        if (last_hc) pulsar_gpu_tensor_free(last_hc);
         if (!ok) {
             if (pulsar_gpu_synchronize() == 0) {
                 fprintf(stderr, "pulsar: GPU synchronize after whole-prefill graph failure also failed\n");
@@ -479,13 +464,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         return ok;
     }
 
-    ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                 g->prefill_tokens,
-                                                 model,
-                                                 weights,
-                                                 prompt,
-                                                 start,
-                                                 n_tokens);
+    ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
     if (!ok) {
         if (pulsar_gpu_synchronize() == 0) {
             fprintf(stderr, "pulsar: GPU synchronize after layer-major prefill embed failure also failed\n");
@@ -564,51 +543,24 @@ static bool gpu_graph_prefill_layer_major_inner(
      * layer loop -- the head's scratch reuse of the batch FFN buffers is
      * legitimate exactly here. */
     if (g->distill_top_ids && g->dspark_bulk_n) {
-        const uint64_t hcd = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
         const uint64_t vocab_dim = weights->output->dim[1];
-        pulsar_gpu_tensor *saved_batch = g->batch_cur_hc;
         for (uint32_t r0 = 0; ok && r0 < n_tokens; r0 += 16u) {
             const uint32_t nr = n_tokens - r0 < 16u ? n_tokens - r0 : 16u;
-            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(saved_batch,
-                    (uint64_t)r0 * hcd * PULSAR_HC_ELT_SIZE,
-                    (uint64_t)nr * hcd * PULSAR_HC_ELT_SIZE);
-            ok = v != NULL;
-            if (ok) {
-                g->batch_cur_hc = v;
-                ok = pulsar_gpu_begin_commands() != 0;
-                if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                             nr, vocab_dim);
-                if (ok) ok = pulsar_gpu_distill_top64_tensor(g->spec_logits, nr,
-                                (uint32_t)vocab_dim, g->distill_top_ids,
-                                g->distill_top_vals, g->distill_tail_lse,
-                                g->distill_inexact, r0) != 0;
-                if (ok) ok = pulsar_gpu_end_commands() != 0;
-                g->batch_cur_hc = saved_batch;
-                pulsar_gpu_tensor_free(v);
-            }
+            ok = pulsar_gpu_begin_commands() != 0;
+            if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights, r0, nr, vocab_dim);
+            if (ok) ok = pulsar_gpu_distill_top64_tensor(g->spec_logits, nr,
+                            (uint32_t)vocab_dim, g->distill_top_ids,
+                            g->distill_top_vals, g->distill_tail_lse,
+                            g->distill_inexact, r0) != 0;
+            if (ok) ok = pulsar_gpu_end_commands() != 0;
         }
         if (!ok) return false;
     }
 
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    uint32_t output_row = (uint32_t)n_tokens - 1u;
-    pulsar_gpu_tensor *saved_cur = g->cur_hc;
-    pulsar_gpu_tensor *last_hc = NULL;
-
-    if (logits) {
-        last_hc = gpu_graph_hc_row_view(g->batch_cur_hc,
-                                          output_row,
-                                          hc_dim);
-        ok = last_hc != NULL;
-    }
-    if (ok && logits) {
-        g->cur_hc = last_hc;
-        ok = pulsar_gpu_begin_commands() != 0;
-    }
-    if (ok && logits) ok = gpu_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && logits) ok = pulsar_gpu_begin_commands() != 0;
+    if (ok && logits) ok = gpu_graph_encode_output_head(g, model, weights, (uint32_t)n_tokens - 1u,
+                                                        weights->output->dim[1]);
     if (ok && logits) ok = pulsar_gpu_end_commands() != 0;
-    g->cur_hc = saved_cur;
-    if (last_hc) pulsar_gpu_tensor_free(last_hc);
     if (!ok) return false;
 
     if (logits) {
@@ -856,13 +808,7 @@ bool gpu_graph_verify_suffix_tops(
     if (!rows.ok()) return false;
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                         g->prefill_tokens,
-                                                         model,
-                                                         weights,
-                                                         prompt,
-                                                         start,
-                                                         n_tokens);
+    if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
     if (!ok) return false;
 
 
@@ -886,6 +832,7 @@ bool gpu_graph_verify_suffix_tops(
     if (ok) ok = gpu_graph_encode_output_head_batch(g,
                                                       model,
                                                       weights,
+                                                      0u,
                                                       n_tokens,
                                                       weights->output->dim[1]);
     if (ok) {
@@ -1026,10 +973,7 @@ int gpu_graph_decode_multiseq_batch(
     cur.v = cur_tokens;
     cur.len = cur.cap = (int)n_active;
     if (!gpu_graph_upload_prompt_tokens(g->prefill_tokens, &cur, 0, n_active) ||
-        !gpu_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                               g->prefill_tokens,
-                                               model, weights, &cur,
-                                               0, n_active)) {
+        !gpu_graph_upload_prompt_embeddings_hc(g, model, weights, &cur, 0, n_active)) {
         free(cur_tokens);
         return 0;   /* scratch-only writes so far — recoverable */
     }
@@ -1099,7 +1043,7 @@ int gpu_graph_decode_multiseq_batch(
          * intermediate fused step (head_runs == n_dec < n_active) heads only the
          * decode banks and skips the whole prefill-head two-block. */
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        head_runs, weights->output->dim[1]);
+                                                        0u, head_runs, weights->output->dim[1]);
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     } else {
         /* Prefill/mixed final: close the layer block so batch_cur_hc is final,
@@ -1109,15 +1053,21 @@ int gpu_graph_decode_multiseq_batch(
          * un-copied source. The extra synchronize is amortized over the prefill. */
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
         const uint64_t hc_row_bytes = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD * PULSAR_HC_ELT_SIZE;   /* carrier */
+        const uint64_t pre_row_bytes = (uint64_t)PULSAR_N_HC * sizeof(float);
         for (uint32_t r = 0; ok && r < head_runs; r++) {
-            if ((uint32_t)last_idx[r] != r)
-                ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
-                                         g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
-                                         hc_row_bytes) != 0;
+            if ((uint32_t)last_idx[r] == r) continue;
+            /* the row's pre moves with it: the head collapses row r with the
+             * pre row r's last FFN handed on */
+            ok = pulsar_gpu_tensor_copy(g->batch_cur_hc, (uint64_t)r * hc_row_bytes,
+                                     g->batch_cur_hc, (uint64_t)last_idx[r] * hc_row_bytes,
+                                     hc_row_bytes) != 0 &&
+                 pulsar_gpu_tensor_copy(g->batch_hc_pre, (uint64_t)r * pre_row_bytes,
+                                     g->batch_hc_pre, (uint64_t)last_idx[r] * pre_row_bytes,
+                                     pre_row_bytes) != 0;
         }
         if (ok) ok = pulsar_gpu_begin_commands() != 0;
         if (ok) ok = gpu_graph_encode_output_head_batch(g, model, weights,
-                                                        head_runs, weights->output->dim[1]);
+                                                        0u, head_runs, weights->output->dim[1]);
         if (ok) ok = pulsar_gpu_end_commands() != 0; else (void)pulsar_gpu_synchronize();
     }
     /* Disarm + per-bank frontier self-check even when the sweep failed. The

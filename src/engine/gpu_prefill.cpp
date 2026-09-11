@@ -339,28 +339,31 @@ static bool gpu_graph_csa2_produce(
  * 512 until L167 was a second implementation of the same copy (rule 1) and is
  * deleted with its helpers embed_token_f16 and pulsar_store_hc_carrier_f32. */
 bool gpu_graph_upload_prompt_embeddings_hc(
-        pulsar_gpu_tensor   *out_hc,
-        pulsar_gpu_tensor   *tokens,
+        pulsar_gpu_graph     *g,
         const pulsar_model    *model,
         const pulsar_weights  *weights,
         const token_vec    *prompt,
         uint32_t            pos0,
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
-    if (!tokens) {
+    if (!g->prefill_tokens) {
         fprintf(stderr, "pulsar: prompt embedding gather needs the device token tensor "
                         "(gpu_graph_upload_prompt_tokens first) -- refusing\n");
         return false;
     }
-    return pulsar_gpu_embed_tokens_hc_tensor(out_hc,
-                                            tokens,
-                                            model->map,
-                                            model->size,
-                                            weights->token_embd->abs_offset,
-                                            (uint32_t)weights->token_embd->dim[1],
-                                            n_tokens,
-                                            PULSAR_N_EMBD,
-                                            PULSAR_N_HC) != 0;
+    if (!pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
+                                          g->prefill_tokens,
+                                          model->map,
+                                          model->size,
+                                          weights->token_embd->abs_offset,
+                                          (uint32_t)weights->token_embd->dim[1],
+                                          n_tokens,
+                                          PULSAR_N_EMBD,
+                                          PULSAR_N_HC)) return false;
+    /* the pre-mix is born with the stream: layer 0's attention collapses with
+     * the identity (make_identity_pre_mix), every later sublayer with what the
+     * one before it derived */
+    return pulsar_gpu_hc_pre_identity_tensor(g->batch_hc_pre, n_tokens, PULSAR_N_HC) != 0;
 }
 
 
@@ -868,6 +871,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                  attn_norm_b,
                                                                  attn_norm_keep_from,
                                                                  hc_split_view,
+                                                                 g->batch_hc_pre,
                                                                  hc_mix_view,
                                                                  g->batch_cur_hc,
                                                                  model->map,
@@ -1900,6 +1904,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                                  ffn_norm_b,
                                                                  ffn_norm_keep_from,
                                                                  hc_split_view,
+                                                                 g->batch_hc_pre,
                                                                  hc_mix_view,
                                                                  g->batch_after_attn_hc,
                                                                  model->map,

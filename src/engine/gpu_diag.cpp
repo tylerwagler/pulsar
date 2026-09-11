@@ -1498,8 +1498,6 @@ bool gpu_graph_alloc_raw_cap(
     g->cand_mask = pulsar_gpu_tensor_alloc((uint64_t)pc * g->cand_mask_words * sizeof(uint32_t));
     g->cand_bscore = pulsar_gpu_tensor_alloc(score_rows * (uint64_t)g->cand_mask_words * 32u * sizeof(float));
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->output_pre = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
-    g->output_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_embd = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->output_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->logits = pulsar_gpu_tensor_alloc(vocab_dim * sizeof(float));
@@ -1517,6 +1515,7 @@ bool gpu_graph_alloc_raw_cap(
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_hc_mix = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
+    g->batch_hc_pre = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HC * sizeof(float));
     /* Dump-only carrier (L090.1): its WRITE has been dump-gated NULL since the
      * dead-store pass, but the 64 MiB allocation never followed.  Confirmed by
      * the D2 hand census: zero non-debug readers.  Allocate it only when a
@@ -1592,11 +1591,11 @@ bool gpu_graph_alloc_raw_cap(
                     g->indexer_scores &&
                     g->comp_selected && g->cand_mask && g->cand_bscore &&
                     g->ffn_norm &&
-                    g->output_pre && g->output_weights && g->output_embd &&
+                    g->output_embd &&
                     g->output_norm && g->logits &&
                     g->prefill_tokens && g->spec_logits &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
-                    g->batch_hc_mix && g->batch_hc_split &&
+                    g->batch_hc_mix && g->batch_hc_split && g->batch_hc_pre &&
                     (g->batch_attn_cur || !gpu_graph_f32_store_observed_any()) &&
                     g->batch_attn_norm &&
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
