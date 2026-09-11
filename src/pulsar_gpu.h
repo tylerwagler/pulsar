@@ -1729,11 +1729,17 @@ int pulsar_cutlass_grouped_proj(float *out, const float *x_gathered,
 
 /** Single-projection W4A8 GEMV for MIXED type-40 layers at decode/small-batch (n<=4): lean fp4-weight
  * GEMV with E4M3-roundtripped f32 activations (same function as the prefill grouped GEMM), one launch
- * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32. */
+ * over all (token,expert) slots, no per-expert loop/host sync. mid/down_out are pair-layout f32.
+ *
+ * L219: when emit_q is non-NULL the SwiGLU epilogue writes the mid E4M3 + E8M0
+ * into that slot (rows = (token, slot) pairs, emit_sf's swizzle pitch is
+ * emit_kbp) and `mid` is NOT written; mid_dim must then be a multiple of 32.
+ * Pass NULL/NULL/0 for the historical f32 output. */
 int pulsar_cutlass_gemv_gateup(float *mid, const int32_t *selected, const float *rweights,
         const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
         float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
-    const void *act_q, const void *act_sf, int act_kbp);
+    const void *act_q, const void *act_sf, int act_kbp,
+    void *emit_q, void *emit_sf, int emit_kbp);
 /** L158 inc 5: mid arrives as the MoE stage's E4M3 encoding (mid_q/mid_sf in the
  * VEC32 swizzle at pitch mid_kbp, rows = (token, slot) pairs); no f32 mid. */
 int pulsar_cutlass_gemv_down(float *down_out, const int32_t *selected,

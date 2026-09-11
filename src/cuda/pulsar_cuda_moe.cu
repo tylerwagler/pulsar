@@ -309,16 +309,41 @@ __global__ static void moe_sum_padded_kernel(
 
 /* One block per padded row R: scatter the pre-weighted FFN result back to the flat down buffer at
  * its originating pair (padding rows carry padded_pair<0 and are skipped). */
+/* EMIT=false: plain padded-row -> pair-row copy (the down scatter and the
+ * historical mid path).  EMIT=true (L219): the mid leaf is emitted as E4M3
+ * here, from the same f32 values the deleted encode pass would have read.
+ * One block owns one padded row and warp w covers columns [k0 + 32w, ...),
+ * an aligned 32-block per step, so the block amax is a full-warp shuffle; the
+ * destination row is the PAIR row, which is the activation slot's row. */
+template <bool EMIT>
 __global__ static void moe_padded_scatter_kernel(
         float *down_flat, const float *ffn_out, const int32_t *padded_pair,
-        uint32_t padded_total, uint32_t out_dim) {
+        uint32_t padded_total, uint32_t out_dim,
+        __nv_fp8_e4m3 *eq, unsigned char *esf, int ekbp) {
     uint32_t R = blockIdx.x;
     if (R >= padded_total) return;
     int32_t pair = padded_pair[R];
     if (pair < 0) return;
     const float *src = ffn_out + (uint64_t)R * out_dim;
-    float *dst = down_flat + (uint64_t)pair * out_dim;
-    for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
+    if constexpr (!EMIT) {
+        float *dst = down_flat + (uint64_t)pair * out_dim;
+        for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
+    } else {
+        for (uint32_t k0 = 0; k0 < out_dim; k0 += blockDim.x) {
+            const uint32_t k = k0 + threadIdx.x;
+            const bool live = k < out_dim;
+            const float v = live ? src[k] : 0.0f;
+            float a = live ? fabsf(v) : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            const int se = pulsar_mx_shared_exp(a);
+            if (live) {
+                eq[(size_t)pair * out_dim + k] = pulsar_mx_encode(v, se);
+                if ((threadIdx.x & 31u) == 0u)
+                    esf[pulsar_mx_sfoff((int)pair, (int)(k >> 5), ekbp)] = pulsar_mx_scale_byte(se);
+            }
+        }
+    }
 }
 
 static int routed_moe_launch_cutlass_grouped(
@@ -717,6 +742,19 @@ static int routed_moe_launch_mixed40(
         float *gate_g = gate_g_buf;
         float *up_g   = up_g_buf;
         float *mid_g  = mid_g_buf;
+        /* L219: both case-A arms emit the folded leaf as E4M3 in their own
+         * epilogue (the scatter for the grouped arm, the GEMV for decode), so
+         * the slot is reserved before either runs -- the same producer contract
+         * routed_moe_try_mmq_gate_up uses. */
+        void *ca_q = NULL, *ca_sf = NULL;
+        int ca_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pair_count, expert_mid_dim,
+                                                        &ca_q, &ca_sf, &ca_kbp)) {
+            fprintf(stderr, "pulsar: routed MoE mixed40A: no E4M3 slot for the folded mid "
+                            "(mid_dim=%u pairs=%u) -- refusing\n",
+                    expert_mid_dim, pair_count);
+            ok = 0;
+        }
         if (use_grouped) {
             /* grouped: gather the producer's E4M3 x straight into the CUTLASS
              * layout (riding the row permutation that happens anyway) ->
@@ -759,9 +797,10 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40A swiglu");
             }
             if (ok) {
-                moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(mid_flat, mid_g, padded_pair,
-                        (uint32_t)padded_upper, expert_mid_dim);
-                ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter");
+                moe_padded_scatter_kernel<true><<<(uint32_t)padded_upper, 256>>>(NULL, mid_g, padded_pair,
+                        (uint32_t)padded_upper, expert_mid_dim,
+                        (__nv_fp8_e4m3 *)ca_q, (unsigned char *)ca_sf, ca_kbp);
+                ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter (E4M3)");
             }
         } else {
             /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
@@ -785,20 +824,18 @@ static int routed_moe_launch_mixed40(
             if (ok && pulsar_cutlass_gemv_gateup(mid_flat, selected_ptr, (const float *)weights->ptr,
                     (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
                     clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    gq, gsf, gkbp) != 0) ok = 0;
+                    gq, gsf, gkbp, ca_q, ca_sf, ca_kbp) != 0) ok = 0;
         }
         /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
-         * layers).  The SwiGLU output is an activation like any other: the MoE
-         * stage emits its E4M3 ONCE here (slot rows = (token, slot) pairs) and
-         * every down arm consumes that encoding. */
-        const void *mq = NULL, *msf = NULL; int mkbp = 0;
-        if (ok && !pulsar_gpu_mxfp8_act_cache_encode_f32(mid, pair_count, expert_mid_dim)) {
-            fprintf(stderr, "pulsar: routed MoE: could not emit the mid E4M3 (pairs=%llu mid=%u) -- refusing\n",
-                    (unsigned long long)pair_count, expert_mid_dim);
-            ok = 0;
+         * layers).  The leaf was emitted as E4M3 by phase 1's own epilogue
+         * (L219); make the slot current and hand the down arm the encoding. */
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_arm(mid, pair_count, expert_mid_dim);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
         }
+        const void *mq = NULL, *msf = NULL; int mkbp = 0;
         if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, pair_count, expert_mid_dim, &mq, &msf, &mkbp)) {
-            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after emit -- refusing\n");
+            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after the case-A emit -- refusing\n");
             ok = 0;
         }
         int mmq_down_done = 0;
@@ -861,8 +898,8 @@ static int routed_moe_launch_mixed40(
                     counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
                     mq, msf, mkbp, padded_pair) != 0) ok = 0;
             if (ok) {
-                moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
-                        (uint32_t)padded_upper, out_dim);
+                moe_padded_scatter_kernel<false><<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
+                        (uint32_t)padded_upper, out_dim, NULL, NULL, 0);
                 ok = cuda_ok(cudaGetLastError(), "mixed40B down scatter");
             }
         } else if (ok) {
