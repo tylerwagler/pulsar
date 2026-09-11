@@ -362,6 +362,15 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     /* Under a REAP map this tensor holds only the layer's survivors. The
      * template already declares that count in ne[2]; cross-check rather than
      * trust one of them, since a mismatch would write past the declared slot. */
+    /* A drafter stack has its own expert count (V4.1: 128 against the target's
+     * 384) and is never REAP-pruned: the template's ne[2] is its one authority
+     * and the main model's survivor map does not apply at its layer index. */
+    const bool drafter = strncmp(gguf_name, "dspark.", 7) == 0 || strncmp(gguf_name, "mtp.", 4) == 0;
+    if (drafter) {
+        if (tensor_n_dims(tmpl) < 3 || tmpl->ne[2] <= 0 || tmpl->ne[2] > INT_MAX) die("drafter expert stack template is not 3-D");
+        n_experts = (int)tmpl->ne[2];
+        reap = NULL;
+    }
     const int n_expert_orig = n_experts;
     n_experts = reap_keep(reap, e.layer, n_experts);
     if (tensor_n_dims(tmpl) >= 3 && tmpl->ne[2] != (int64_t)n_experts) {

@@ -118,19 +118,26 @@ def write_gguf(path, kvs, tensors, alignment=GGUF_DEFAULT_ALIGNMENT):
     with open(path, 'wb') as f:
         f.write(buf.data)
 
+def load_text_config(hf_dir):
+    """V4.1 nests the language model (and the DSpark fields) under text_config."""
+    top = json.load(open(os.path.join(hf_dir, 'config.json')))
+    return top['text_config']
+
+
 def make_kvs(cfg):
     E = cfg['hidden_size']
     H = cfg['num_attention_heads']
     K = cfg['num_key_value_heads']
     D = cfg['head_dim']
-    R = cfg['n_routed_experts']
+    R = cfg['dspark_n_routed_experts']
     F = cfg['moe_intermediate_size']
-    eps = cfg.get('rms_norm_eps', 1e-6)
-    # The 3 draft sublayers target the last 3 main-model layers; the engine's
-    # dspark_weights_bind() reads these KVs and the quantizer's dspark-template
-    # merge requires them (a merged artifact without them fails to bind the
-    # drafter).
-    L = cfg['num_hidden_layers']
+    eps = cfg['rms_norm_eps']          # no default: a missing key is a wrong artifact, not a 1e-6 one
+    targets = cfg['dspark_target_layer_ids']
+    if len(targets) != 3:
+        raise SystemExit(f'dspark_target_layer_ids must name 3 layers, got {targets}')
+    # The engine's dspark_weights_bind() reads these KVs and the quantizer's
+    # dspark-template merge requires them (a merged artifact without them
+    # fails to bind the drafter).
     kvs = [
         ('general.architecture', VAL_STRING, 'deepseek_v4_dspark'),
         ('deepseek_v4_dspark.embedding_length', VAL_UINT32, E),
@@ -139,11 +146,15 @@ def make_kvs(cfg):
         ('deepseek_v4_dspark.head_count_kv', VAL_UINT32, K),
         ('deepseek_v4_dspark.key_length', VAL_UINT32, D),
         ('deepseek_v4_dspark.expert_count', VAL_UINT32, R),
+        ('deepseek_v4_dspark.expert_used_count', VAL_UINT32, cfg['dspark_num_experts_per_tok']),
         ('deepseek_v4_dspark.expert_feed_forward_length', VAL_UINT32, F),
         ('deepseek_v4_dspark.layer_norm_rms_eps', VAL_FLOAT32, eps),
-        ('dspark.target_layer_ids.0', VAL_UINT32, L - 3),
-        ('dspark.target_layer_ids.1', VAL_UINT32, L - 2),
-        ('dspark.target_layer_ids.2', VAL_UINT32, L - 1),
+        ('deepseek_v4_dspark.block_size', VAL_UINT32, cfg['dspark_block_size']),
+        ('deepseek_v4_dspark.noise_token_id', VAL_UINT32, cfg['dspark_noise_token_id']),
+        ('deepseek_v4_dspark.markov_rank', VAL_UINT32, cfg['dspark_markov_rank']),
+        ('dspark.target_layer_ids.0', VAL_UINT32, targets[0]),
+        ('dspark.target_layer_ids.1', VAL_UINT32, targets[1]),
+        ('dspark.target_layer_ids.2', VAL_UINT32, targets[2]),
         ('general.file_type', VAL_UINT32, 1),
         ('general.quantization_version', VAL_UINT32, 2),
     ]
@@ -165,21 +176,23 @@ def main():
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
 
-    cfg = json.load(open(os.path.join(a.hf, 'config.json')))
+    cfg = load_text_config(a.hf)
     kvs = make_kvs(cfg)
 
-    # Build tensor list with correct names
+    # Build tensor list with correct names.  Every shape comes from the config;
+    # there are no defaults -- a key the checkpoint does not carry is an error.
     E = cfg['hidden_size']
     F = cfg['moe_intermediate_size']
-    R = cfg['n_routed_experts']
+    R = cfg['dspark_n_routed_experts']
     H = cfg['num_attention_heads']
     D = cfg['head_dim']
-    Q = cfg.get('q_lora_rank', 1024)
-    O = cfg.get('o_lora_rank', 1024)
-    OG = cfg.get('o_groups', 8)
+    Q = cfg['q_lora_rank']
+    O = cfg['o_lora_rank']
+    OG = cfg['o_groups']
     V = cfg['vocab_size']
-    NHC = cfg.get('hc_mult', 4)
-    HC_MIX = 24  # draft decoder layers use hc_mix_dim=24 (not 4)
+    NHC = cfg['hc_mult']
+    MR = cfg['dspark_markov_rank']
+    HC_MIX = (2 + NHC) * NHC  # pre/post/comb coefficients per hc copy
 
     tensors = []
 
@@ -212,6 +225,11 @@ def main():
         ('attn_output_a.weight',    gguf(O*OG, E), MXFP8_LT),
         ('attn_output_b.weight',    gguf(E, O*OG), MXFP8_LT),
         ('ffn_gate_inp.weight',     gguf(R, E),    30),
+        # The router's correction bias.  V4's drafter shipped one too
+        # (mtp.N.ffn.gate.bias) and this template never carried it, so the
+        # V4 drafter selected experts WITHOUT the bias it was trained with
+        # (L218 finding, 2026-09-10).  Present on every V4.1 drafter layer.
+        ('exp_probs_b.bias',        gguf(R),        0),
         ('ffn_gate_shexp.weight',   gguf(F, E),    MXFP8_LT),
         ('ffn_up_shexp.weight',     gguf(F, E),    MXFP8_LT),
         ('ffn_down_shexp.weight',   gguf(E, F),    MXFP8_LT),
@@ -224,18 +242,17 @@ def main():
         add(f'dspark.{li}.ffn_up_exps.weight',   3, gguf(R, F, E), MXFP4)
         add(f'dspark.{li}.ffn_down_exps.weight', 3, gguf(R, E, F), MXFP4)
 
-    add('dspark.2.markov_head.markov_w1.weight', 2, gguf(V, 256), 30)
+    add('dspark.2.markov_head.markov_w1.weight', 2, gguf(V, MR), 30)
     # K-MAJOR (L213): ne = (V, 256), v fastest -- the transpose of the source's
     # [V, 256]. The quantizer transposes the data to match (dsq_generate.c,
     # is_kmajor_tensor); the engine refuses the v-major layout by dims.
     # Stored as MXFP8 SoA (46, L213 step 2): type 38's E4M3 + E8M0/32 content as
     # a scale plane then a payload plane, so the markov kernel's warp reads one
     # aligned word per lane.  dspark_type_flags.txt names the same type.
-    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(256, V), 46)
-    add('dspark.2.confidence_head.proj.weight',  1, (E + 256,), 30)
-    add('dspark.2.hc_head_base.weight',  1, gguf(NHC), 0)
-    add('dspark.2.hc_head_fn.weight',    2, gguf(NHC, NHC*E), 0)
-    add('dspark.2.hc_head_scale.weight', 1, gguf(1), 0)
+    add('dspark.2.markov_head.markov_w2.weight', 2, gguf(MR, V), 46)
+    add('dspark.2.confidence_head.proj.weight',  1, (E + MR,), 30)
+    # V4.1 has no hc_head_* mix: the head collapses the hc copies with the last
+    # block's ffn pre-mix (single-pass mHC), exactly like the main model's head.
     add('dspark.2.norm.weight',          1, gguf(E), 30)
 
     write_gguf(a.out, kvs, tensors)

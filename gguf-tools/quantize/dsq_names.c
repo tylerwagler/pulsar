@@ -53,9 +53,6 @@ static const name_map top_map[] = {
     { "token_embd.weight",      "embed.weight" },
     { "output_norm.weight",     "norm.weight" },
     { "output.weight",          "head.weight" },
-    { "output_hc_base.weight",  "hc_head_base" },
-    { "output_hc_fn.weight",    "hc_head_fn" },
-    { "output_hc_scale.weight", "hc_head_scale" },
 };
 
 static const name_map layer_map[] = {
@@ -73,16 +70,16 @@ static const name_map layer_map[] = {
     { "attn_kv_a_norm.weight",            "attn.kv_norm.weight" },
     { "attn_output_a.weight",             "attn.wo_a.weight" },
     { "attn_output_b.weight",             "attn.wo_b.weight" },
-    { "attn_compressor_ape.weight",       "attn.compressor.ape" },
+    /* V4.1 CSA2 (L218): the compressor and the index-K projection live on the
+     * KV-source layers, the indexer query/head weights on the index-source
+     * layers; no ape, no separate indexer compressor, no hash table. */
     { "attn_compressor_kv.weight",        "attn.compressor.wkv.weight" },
     { "attn_compressor_gate.weight",      "attn.compressor.wgate.weight" },
     { "attn_compressor_norm.weight",      "attn.compressor.norm.weight" },
     { "indexer.attn_q_b.weight",          "attn.indexer.wq_b.weight" },
     { "indexer.proj.weight",              "attn.indexer.weights_proj.weight" },
-    { "indexer_compressor_ape.weight",    "attn.indexer.compressor.ape" },
-    { "indexer_compressor_kv.weight",     "attn.indexer.compressor.wkv.weight" },
-    { "indexer_compressor_gate.weight",   "attn.indexer.compressor.wgate.weight" },
-    { "indexer_compressor_norm.weight",   "attn.indexer.compressor.norm.weight" },
+    { "indexer.attn_k.weight",            "attn.indexer.wk.weight" },
+    { "indexer.k_norm.weight",            "attn.indexer.k_norm.weight" },
     { "attn_norm.weight",                 "attn_norm.weight" },
     { "ffn_norm.weight",                  "ffn_norm.weight" },
     { "ffn_gate_shexp.weight",            "ffn.shared_experts.w1.weight" },
@@ -90,15 +87,13 @@ static const name_map layer_map[] = {
     { "ffn_down_shexp.weight",            "ffn.shared_experts.w2.weight" },
     { "ffn_gate_inp.weight",              "ffn.gate.weight" },
     { "exp_probs_b.bias",                 "ffn.gate.bias" },
-    { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
-    { "hc_head_base.weight",              "hc_head_base" },
-    { "hc_head_fn.weight",                "hc_head_fn" },
-    { "hc_head_scale.weight",             "hc_head_scale" },
     { "main_proj.weight",                 "main_proj.weight" },
     { "main_norm.weight",                 "main_norm.weight" },
     { "norm.weight",                      "norm.weight" },
-    { "markov_head.markov_w1.weight",     "markov_head.markov_w1.weight" },
-    { "markov_head.markov_w2.weight",     "markov_head.markov_w2.weight" },
+    /* The engine's markov_w1/w2 are the checkpoint's DSparkMarkovHead
+     * embed (vocab -> rank) and head (rank -> vocab); V4.1 names them so. */
+    { "markov_head.markov_w1.weight",     "markov_head.embed.weight" },
+    { "markov_head.markov_w2.weight",     "markov_head.head.weight" },
     { "confidence_head.proj.weight",      "confidence_head.proj.weight" },
 };
 

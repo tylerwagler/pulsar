@@ -61,13 +61,17 @@ float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64_t *n_o
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
-    const int64_t block_out = 128;
-    const int64_t block_in = 128;
     if (out_dim <= 0 || in_dim <= 0) die("FP8 dims must be positive");
-    if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
-    const int64_t scale_rows = out_dim / block_out;
-    const int64_t scale_cols = in_dim / block_in;
-    if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* The block size is the scale plane's word, not a constant: V4 shipped
+     * 128x128 blocks, V4.1 ships 32x32 (L218).  Either divides the per-32
+     * MXFP8 groups the engine stores, so the re-encode stays exact. */
+    const int64_t scale_rows = scale->shape[0];
+    const int64_t scale_cols = scale->shape[1];
+    if (scale_rows <= 0 || scale_cols <= 0 || out_dim % scale_rows || in_dim % scale_cols) die("FP8 scale shape does not tile the weight");
+    const int64_t block_out = out_dim / scale_rows;
+    const int64_t block_in = in_dim / scale_cols;
+    if (!((block_out == 32 && block_in == 32) || (block_out == 128 && block_in == 128)))
+        die("FP8 scale blocks are neither 32x32 nor 128x128");
     /* The loop bounds come from the header shape while data comes from
      * data_offsets; a shape declared over a short data range is heap OOB
      * (upstream ds4 a968c08). */
