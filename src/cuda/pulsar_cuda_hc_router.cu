@@ -101,9 +101,18 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
  * apart, individually coalesced) issue ONE AT A TIME, each waiting on the last.
  * Templating on the count lets all NHC loads be in flight together.
  *
- * BIT-EXACT: the accumulation order is unchanged (acc += c0*r0; acc += c1*r1;
- * ...), so this is an issue-order change only.  It is graded by the byte-exact
- * prefill gate, not the reference gate. */
+ * L219: the thread mapping is one thread per (t,d), computing ALL NHC
+ * destinations.  The old per-(t,dst,d) mapping re-read the same NHC residual
+ * values and the same block_out element once per destination -- 4x the residual
+ * traffic, and residual_hc is the bulk of this op's bytes ([t][hc][embd], read
+ * once here instead of four times).  Gathering the residuals once and looping
+ * the destinations in registers changes nothing about the per-output
+ * accumulation order, so it stays bit-exact by construction.
+ *
+ * BIT-EXACT: the per-output accumulation order is unchanged (acc starts at
+ * block_v*post[dst], then src_hc 0..NHC-1 in order), so this is an issue-order
+ * and dedupe change only.  It is graded by the byte-exact prefill gate, not the
+ * reference gate. */
 template <int NHC>
 __global__ static void hc_expand_kernel(
         pulsar_hc_t *out_hc,
@@ -118,28 +127,20 @@ __global__ static void hc_expand_kernel(
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    if (gid >= n_elem) return;
-    uint32_t d = gid % n_embd;
-    uint64_t tmp = gid / n_embd;
-    uint32_t dst_hc = tmp % n_hc;
-    uint32_t t = tmp / n_hc;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (NHC > 0) {
+        const uint64_t n_elem = (uint64_t)n_tokens * n_embd;
+        if (gid >= n_elem) return;
+        const uint32_t d = (uint32_t)(gid % n_embd);
+        const uint32_t t = (uint32_t)(gid / n_embd);
 
-    float block_v = block_out[(uint64_t)t * n_embd + d];
-    if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
-    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
-    if (NHC > 0) {
-        /* Gather first, accumulate second: the loads have no dependence on each
-         * other, so hoisting them out of the accumulate lets the compiler keep
-         * NHC of them in flight.  The adds then run in the SAME order as the
-         * rolled loop, which is what keeps this bit-exact. */
-        float comb_v[NHC > 0 ? NHC : 1];
-        float res_v[NHC > 0 ? NHC : 1];
+        float block_v = block_out[(uint64_t)t * n_embd + d];
+        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
+        float res_v[NHC];
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++) {
-            comb_v[src_hc] = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-            res_v[src_hc] = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
+        for (int src = 0; src < NHC; src++) {
+            res_v[src] = pulsar_hc_load(residual_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)src * n_embd + d);
         }
         /* PLAIN `acc += a*b`, DELIBERATELY, and this is a numerics decision --
          * read before "fixing" it back to __fmaf_rn.
@@ -159,28 +160,52 @@ __global__ static void hc_expand_kernel(
          * original model."  The prefill baseline was re-anchored for this
          * change; see PREFILL_BASELINE_REF in the Makefile. */
 #pragma unroll
-        for (int src_hc = 0; src_hc < NHC; src_hc++) acc += comb_v[src_hc] * res_v[src_hc];
+        for (int dst = 0; dst < NHC; dst++) {
+            float acc = block_v * post[(uint64_t)t * post_stride + dst];
+#pragma unroll
+            for (int src = 0; src < NHC; src++) {
+                const float comb_v = comb[(uint64_t)t * comb_stride + dst + (uint64_t)src * (uint64_t)NHC];
+                acc += comb_v * res_v[src];
+            }
+            pulsar_hc_store(out_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)dst * n_embd + d, acc);
+        }
     } else {
+        const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+        if (gid >= n_elem) return;
+        const uint32_t d = (uint32_t)(gid % n_embd);
+        const uint64_t tmp = gid / n_embd;
+        const uint32_t dst_hc = (uint32_t)(tmp % n_hc);
+        const uint32_t t = (uint32_t)(tmp / n_hc);
+
+        float block_v = block_out[(uint64_t)t * n_embd + d];
+        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
+        float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
         for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
             float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
             float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
             acc += comb_v * res_v;   /* matches the unrolled arm above */
         }
+        pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
     }
-    pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
 }
 
 
 
 /* One dispatch point for the three hc_expand callers.  PULSAR_N_HC is 4 on the
  * shipped artifact; anything else takes the runtime-loop instantiation, so a
- * differently-shaped model still runs (just without the unrolled gather). */
-static void hc_expand_launch(uint32_t blocks, uint32_t threads,
+ * differently-shaped model still runs (just without the unrolled gather).
+ * The grid differs by arm: NHC=4 maps one thread per (t,d), the runtime arm one
+ * per (t,dst,d). */
+static void hc_expand_launch(uint32_t threads,
                              pulsar_hc_t *out_hc, const float *block_out,
                              const float *block_add, const pulsar_hc_t *residual_hc,
                              const float *post, const float *comb,
                              uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
                              uint32_t post_stride, uint32_t comb_stride, int has_add) {
+    const uint64_t elems = n_hc == 4u ? (uint64_t)n_tokens * n_embd
+                                      : (uint64_t)n_tokens * n_hc * n_embd;
+    const uint32_t blocks = (uint32_t)((elems + threads - 1u) / threads);
     if (n_hc == 4u) {
         hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
                                                 post, comb, n_embd, n_hc, n_tokens,
@@ -846,9 +871,8 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+    hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
@@ -866,9 +890,8 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch((uint32_t)((n_elem + 255) / 256), 256,
+    hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
