@@ -71,11 +71,14 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 - C7 block-parallel softmax (bit-exact; runtime-bound fix `09228ff9`)
 - C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
 - C9 refuted — already covered at block granularity (`8c67aeb0`)
+- C10a (indexed prefill gact/rope fusion) — **MEASURED NO-GO 2026-09-11** and
+  reverted (`bedc2744`): the in-kernel epilogue costs attention +31.4 ms while
+  removing 44.5 ms of fallback, a -0.3% wash at 4096 tokens that worsens with
+  depth.  Kernel census and reasoning in the revert message.
 
-Still open, in value order: B2 (sampler host fast path; needs its identity
-gate), B5 (lane grouping), B10 (sampled redraft), C4 (indexer f16 scores),
-C5 (`low` fusion), C6 (`mxf4nvf4`), C10 items and the `attn_pack_store` retile.
-B4, B9, C1, D1 and D2 need dedicated campaigns.
+Still open, in value order: B5 (lane grouping), B10 (sampled redraft), C4
+(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10b/c/d and the
+`attn_pack_store` retile.  B4, B9, C1, D1 and D2 need dedicated campaigns.
 
 ---
 
