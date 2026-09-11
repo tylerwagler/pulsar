@@ -1464,7 +1464,6 @@ int pulsar_gpu_router_select_batch_tensor(
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                bias_offset,
-        bool                    has_bias,
         const pulsar_gpu_tensor *logits,
         uint32_t                n_expert,
         uint32_t                n_expert_used,

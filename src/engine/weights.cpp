@@ -35,15 +35,6 @@ static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
 
 
 
-static pulsar_tensor *tensor_by_namef(const pulsar_model *m, const char *fmt, uint32_t layer) {
-    char name[128];
-    int n = snprintf(name, sizeof(name), fmt, layer);
-    if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
-    return model_find_tensor(m, name);
-}
-
-
-
 static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
@@ -110,15 +101,6 @@ static void tensor_expect_layout(
 
 
 
-static void tensor_expect_optional(
-        const pulsar_tensor *t,
-        uint32_t          type,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
-}
 /* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
  * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
  * accounting; the FP8 matmul resolver dispatches on the registered offset. */
@@ -528,7 +510,7 @@ static void weights_validate_layout(
          * (== n_expert for un-pruned models). */
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
-        tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
@@ -1069,7 +1051,7 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-    l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -1151,6 +1133,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
         tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
@@ -1198,6 +1181,26 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     weights_reject_unsupported_types(m);
 
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
+    /* The drafter's own shape keys, checked against what this engine was built
+     * to draft: block_size is the depth it was trained to draft (the depth
+     * controller's ceiling must not exceed it), the noise token fills the
+     * draft slots past the first (forward_embed), the markov rank is the
+     * width the k-major markov kernels are written for. */
+    {
+        const uint32_t block_size = required_u32(m, "deepseek_v4_dspark.block_size");
+        const uint32_t noise_id = required_u32(m, "deepseek_v4_dspark.noise_token_id");
+        const uint32_t markov_rank = required_u32(m, "deepseek_v4_dspark.markov_rank");
+        if (block_size < (uint32_t)PULSAR_SPEC_DEPTH_MAX || noise_id != (uint32_t)PULSAR_DSPARK_NOISE_TOKEN_ID ||
+            markov_rank != 256u) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "dspark: artifact block_size %u / noise_token_id %u / markov_rank %u vs this engine's "
+                     "depth ceiling %d / noise token %d / markov rank 256 -- refusing",
+                     block_size, noise_id, markov_rank, (int)PULSAR_SPEC_DEPTH_MAX,
+                     (int)PULSAR_DSPARK_NOISE_TOKEN_ID);
+            pulsar_die(msg);
+        }
+    }
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 
@@ -1223,6 +1226,9 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
         l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
         l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
+        /* the drafter's trained router bias (L216: every shipped 0731 artifact
+         * routed its drafter without it; V4.1 ships one per drafter layer) */
+        l->ffn_exp_probs_b = required_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
         l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
         l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
         l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);
@@ -1238,22 +1244,16 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
 
     w->vocab_size = (uint32_t)w->markov_w1->dim[1];
 
-    {
-        uint32_t target_ids[3];
-        if (model_get_u32(m, "dspark.target_layer_ids.0", &target_ids[0]) &&
-            model_get_u32(m, "dspark.target_layer_ids.1", &target_ids[1]) &&
-            model_get_u32(m, "dspark.target_layer_ids.2", &target_ids[2])) {
-            memcpy(w->target_layer_ids, target_ids, sizeof(target_ids));
-        } else {
-            /*
-             * Fall back to the target model's last three layers.  Derive from
-             * the compiled target shape (PULSAR_N_LAYER), NOT the support GGUF's
-             * block_count — that field describes the 3-layer draft backbone, so
-             * using it would capture target layers {0,1,2} instead of the tail.
-             */
-            w->target_layer_ids[0] = PULSAR_N_LAYER - 3;
-            w->target_layer_ids[1] = PULSAR_N_LAYER - 2;
-            w->target_layer_ids[2] = PULSAR_N_LAYER - 1;
+    /* dspark_target_layer_ids: the artifact says which target layers' INPUT
+     * hiddens the drafter conditions on (V4.1: 37, 38, 39 of 40).  No
+     * derivation from the layer count -- a drafter trained on other anchors
+     * would run and draft garbage. */
+    w->target_layer_ids[0] = required_u32(m, "dspark.target_layer_ids.0");
+    w->target_layer_ids[1] = required_u32(m, "dspark.target_layer_ids.1");
+    w->target_layer_ids[2] = required_u32(m, "dspark.target_layer_ids.2");
+    for (int i = 0; i < 3; i++) {
+        if (w->target_layer_ids[i] >= PULSAR_N_LAYER || (i && w->target_layer_ids[i] <= w->target_layer_ids[i - 1])) {
+            pulsar_die("dspark.target_layer_ids must be ascending target layer indices");
         }
     }
 

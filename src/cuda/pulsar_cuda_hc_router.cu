@@ -390,7 +390,7 @@ __global__ static void router_select_warp_topk_kernel(
         const uint32_t e = lane + j * 32u;
         const float p = sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
-        local_score[j] = p + (bias ? bias[e] : 0.0f);
+        local_score[j] = p + bias[e];
         if (prob) prob[e] = p;
     }
 
@@ -644,7 +644,7 @@ int pulsar_gpu_directional_steering_project_tensor(
 
 
 
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, bool has_bias, const pulsar_gpu_tensor *logits, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
+int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, const pulsar_gpu_tensor *logits, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
     if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
         logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
@@ -652,13 +652,12 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
-    const float *bias = NULL;
-    if (has_bias) {
-        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
-        if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
-        if (!bias) return 0;
-    }
+    /* the correction bias (exp_probs_b) is part of every V4.1 router, target
+     * and drafter alike -- there is no bias-less arm */
+    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+    if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
+    if (!bias) return 0;
     dim3 block(32, 4, 1);
     const dim3 grid((n_tokens + 3u) / 4u);
     int32_t *sel = (int32_t *)selected->ptr;

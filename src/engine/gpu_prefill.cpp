@@ -1948,8 +1948,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                           ? g->batch_router_probs : NULL,
                                                       model->map,
                                                       model->size,
-                                                      layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                      layer->ffn_exp_probs_b != NULL,
+                                                      layer->ffn_exp_probs_b->abs_offset,
                                                       g->batch_router_logits,
                                                       layer->n_expert,
                                                       layer->n_expert_used,
@@ -2163,26 +2162,17 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    bool ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
-    if (!ok) {
-        fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);
-    }
-    if (ok) {
-        ok = gpu_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
-        if (!ok) {
-            fprintf(stderr, "pulsar: gpu layer %u ffn batch encode failed\n", il);
-        }
-    }
-    if (ok) {
-        pulsar_gpu_tensor *tmp = g->batch_cur_hc;
-        g->batch_cur_hc = g->batch_next_hc;
-        g->batch_next_hc = tmp;
-    }
-    /* Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
+    bool ok = true;
+    /* DRAFTER ANCHORS ARE THE TARGET LAYER'S INPUT (V4.1, Transformer.forward:
+     * `if i in target_layer_ids: main_hiddens.append(h.mean(dim=2))` BEFORE
+     * `h = layer(h)`; 0731 appended after).  So the captures below read
+     * batch_cur_hc before this layer touches it.
+     *
+     * Fused spec loop (P2): when armed, capture the drafter's anchor hidden for
      * every batch position at the anchor layers, so the last-accepted position's
      * hidden is available without a replay decode. Off (0) during prefill and
      * plain decode. */
-    if (ok && g->dspark_capture_batch_n) {
+    if (g->dspark_capture_batch_n) {
         for (int slot = 0; slot < 3; slot++) {
             if (il != g->dspark_target_layer_ids[slot]) continue;
             if (!g->dspark_target_h_batch[slot]) {
@@ -2228,6 +2218,21 @@ bool gpu_graph_encode_layer_batch(
             }
             break;
         }
+    }
+    if (ok) ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    if (!ok) {
+        fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);
+    }
+    if (ok) {
+        ok = gpu_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+        if (!ok) {
+            fprintf(stderr, "pulsar: gpu layer %u ffn batch encode failed\n", il);
+        }
+    }
+    if (ok) {
+        pulsar_gpu_tensor *tmp = g->batch_cur_hc;
+        g->batch_cur_hc = g->batch_next_hc;
+        g->batch_next_hc = tmp;
     }
     return ok;
 }
