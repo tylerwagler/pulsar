@@ -34,15 +34,17 @@ the GB10 before it can merge.
 - B6 persistent plain/mixed lane logits (`e5b2979f`)
 - B7 bulk `pulsar_tokens_copy` (`f59043f7`)
 - B8 async drafter seed copies (`eb9b5a8b`)
+- C2 MMQ gate/up fold emits the mid E4M3 itself — both-43 and mixed case B;
+  case-A (type-40 gate/up) still does f32 + encode (`8a6986ea`)
 - C3 `hc_expand` destination dedupe (bit-exact) (`ef576858`)
 - C7 block-parallel softmax (bit-exact) (`6a152fbd`)
 - C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
 - C9 refuted — already covered at block granularity (`8c67aeb0`)
 
 Still open and writeable blind, in value order: B2 (sampler host fast path),
-B5 (lane grouping), B10 (sampled redraft), C2 (fold-epilogue E4M3), C4
-(indexer f16 scores), C5 (`low` fusion), C6 (`mxf4nvf4`), C10 items and the
-`attn_pack_store` retile. B4, B9, C1, D1 and D2 need the rig.
+B5 (lane grouping), B10 (sampled redraft), C2 case A, C4 (indexer f16 scores),
+C5 (`low` fusion), C6 (`mxf4nvf4`), C10 items and the `attn_pack_store` retile.
+B4, B9, C1, D1 and D2 need the rig.
 
 ---
 
