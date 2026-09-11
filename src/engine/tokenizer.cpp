@@ -1262,6 +1262,7 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
     uint32_t n = 0;
     int have_probs = 0;
     float sum = 0.0f;
+    bool sum_inert = false;   /* the full-nucleus fast arm hands the emit +inf */
     if (top_k > 0) {
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
@@ -1296,21 +1297,49 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         /* Pass 2: one prob per finite candidate, computed ONCE and carried
          * through the sort; `sum` over ALL of them, in this (index) order;
          * survivors collected in ascending-id order so the stable radix keeps
-         * ascending-id as the canonical tie order. */
+         * ascending-id as the canonical tie order.
+         *
+         * L219 fast path -- the full-nucleus shape skips the below-floor expf.
+         * With top_p == 1.0 the emitted set is the min-p cut and every prob is
+         * renormalised over it, so the only role `sum` plays is the
+         * `filtered_sum / sum >= 1.0` break.  While a survivor remains that
+         * ratio is at least prefilter/sum away from one, and with
+         * min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN over this vocabulary that is
+         * far more than an ulp, so the break can only coincide with the min-p
+         * boundary.  Hand the emit +inf instead (the trick
+         * pulsar_sample_dist_build_prefiltered documents) and members need no
+         * normaliser at all.  An entry below the device prefilter's logit floor
+         * (slack 1e-3, a strict superset of the survivors) can never satisfy
+         * `p >= prefilter`, so it needs no expf.  At the production shape that
+         * is ~129k expf per sampled token -- the pass the L149 comment measures
+         * at ~630 us.  Membership is still decided by the SAME comparison
+         * below; the floor only bounds it.  Below the sparse floor the full sum
+         * is still computed and the general arithmetic runs. */
         if (finite > 0) {
             uint64_t *keys = scratch->keys;
             const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
+            const bool full_nucleus = (top_p == 1.0f &&
+                                       min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN &&
+                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX);
+            const float floor_logit = full_nucleus
+                ? max_logit + temperature * (logf(min_p) - 1e-3f)
+                : -INFINITY;
             for (uint32_t i = 0; i < n_vocab; i++) {
                 const float v = logits[i];
                 if (!isfinite(v)) continue;
+                if (v < floor_logit && i != max_id) continue;
                 const float p = expf((v - max_logit) / temperature);
-                sum += p;
+                if (!full_nucleus) sum += p;   /* inert on the fast arm (sum = +inf below) */
                 if (p >= prefilter || i == max_id) {
                     keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
                     cand[n] = (sample_candidate){
                         .id = (int)i, .logit = v, .prob = p};
                     n++;
                 }
+            }
+            if (full_nucleus) {
+                sum = INFINITY;
+                sum_inert = true;
             }
             /* n >= 1: the max candidate is always kept. */
             sample_radix_sort_desc(keys, scratch->tmp, n);
@@ -1354,8 +1383,11 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         }
     }
     /* prob(0) == expf(0) == 1 exactly, so the mass is >= 1 for any finite
-     * temperature: only a NaN temperature reaches this. */
-    if (sum <= 0.0f || !isfinite(sum))
+     * temperature: only a NaN temperature reaches this.  The full-nucleus arm
+     * replaces `sum` with +inf on purpose (see its comment), so the guard
+     * does not apply there: the emitted probs are renormalised by filtered_sum
+     * and every kept prob is a finite positive number. */
+    if (!sum_inert && (sum <= 0.0f || !isfinite(sum)))
         return sample_dist_refuse(out, n_vocab, "candidate mass is not a positive finite number");
     sample_nucleus_emit(n, sum, top_p, min_p,
                         [&](uint32_t i) { return pv ? pv[i] : sc[i].prob; },
