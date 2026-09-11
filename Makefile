@@ -321,7 +321,8 @@ IDX_PROBE_GENCODE ?= -gencode arch=compute_121a,code=sm_121a
 
 PROBES = tests/attn_mma_probe tests/fp16_fold_probe tests/mxfp8_mma_probe \
          tests/idx_mxfp4_probe tests/idx_mma_issue_bench \
-         tests/idx_mxfp4_kernel_test tests/csa2_compressor_kernel_test
+         tests/idx_mxfp4_kernel_test tests/csa2_compressor_kernel_test \
+         tests/candidate_kernel_test
 
 .PHONY: probes
 probes: $(PROBES)
@@ -358,6 +359,12 @@ tests/idx_mxfp4_kernel_test: tests/idx_mxfp4_kernel_test.cu Makefile \
 # slot store) against the reference's Compressor.forward written out in C.
 tests/csa2_compressor_kernel_test: tests/csa2_compressor_kernel_test.cu Makefile \
                             src/cuda/pulsar_cuda_csa2.cu src/cuda/pulsar_cuda_internal.h
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# L218: the CSA2 candidate pool (block-max, radix top-k, mask) against the
+# reference's select_candidate_blocks written out in C.
+tests/candidate_kernel_test: tests/candidate_kernel_test.cu Makefile \
+                            src/cuda/pulsar_cuda_candidates.cu src/cuda/pulsar_cuda_internal.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 # DELIBERATELY NOT in PROBES: tests/flashinfer_sparse_mla_bench.cu needs

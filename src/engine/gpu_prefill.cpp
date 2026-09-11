@@ -157,7 +157,7 @@ static bool gpu_graph_csa2_emit_rows(
                                                      pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
                                                      freq_base, freq_scale, ext_factor, attn_factor,
                                                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(idx, idx_dst, cache_row0, n_rows,
+    if (ok) ok = pulsar_gpu_indexer_fp4_pack_tensor(idx, idx_dst, cache_row0, n_rows,
                                                          PULSAR_N_INDEXER_HEAD_DIM,
                                                          gpu_graph_f32_store_observed_any()) != 0;
     if (ok) gpu_graph_debug_dump_tensor("indexer_KVcompress", idx,
@@ -427,6 +427,33 @@ bool gpu_graph_warmup_prefill_kernels(
 
 
 
+/* CSA2 (L218): what happens between an index source's scores and its top-k,
+ * for batch rows [row0, row0 + n) whose scores sit at g->indexer_scores rows
+ * [0, n): the candidate source publishes the block mask for those rows (from
+ * its unmasked scores), a later index source scores only inside the published
+ * mask.  `positions` (mseq) or pos0 + row give each row's reach. */
+static bool gpu_graph_csa2_candidates(pulsar_gpu_graph *g, const pulsar_layer_attn *attn, uint32_t il,
+                                      uint32_t row0, uint32_t n, uint32_t n_comp, uint32_t ratio,
+                                      uint32_t pos0, const pulsar_gpu_tensor *positions) {
+    if (!attn->candidate_source && !attn->uses_candidates) return true;
+    const uint32_t mw = g->cand_mask_words;
+    pulsar_gpu_tensor *mask = pulsar_gpu_tensor_view(g->cand_mask, (uint64_t)row0 * mw * sizeof(uint32_t),
+                                                     (uint64_t)n * mw * sizeof(uint32_t));
+    if (!mask) return false;
+    bool ok = true;
+    if (attn->candidate_source) {
+        ok = pulsar_gpu_candidate_blocks_tensor(mask, g->cand_bscore, g->indexer_scores, n_comp, n, mw,
+                                                PULSAR_CANDIDATE_BLOCK_SIZE, PULSAR_CANDIDATE_TOPK_BLOCKS,
+                                                pos0, ratio, positions) != 0;
+        if (ok) gpu_graph_debug_dump_i32_tensor("candidate_mask", mask, (uint64_t)n * mw, il, pos0);
+    } else {
+        ok = pulsar_gpu_candidate_mask_scores_tensor(g->indexer_scores, mask, n_comp, n, mw,
+                                                     PULSAR_CANDIDATE_BLOCK_SIZE) != 0;
+    }
+    pulsar_gpu_tensor_free(mask);
+    return ok;
+}
+
 /** Operand set for one indexed-attention span: indexer score -> top-k ->
  * indexed attention over rows [s0, s0+sn) of the batch.
  *
@@ -452,6 +479,7 @@ static bool gpu_graph_indexed_attention_span(
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
         uint32_t                    il,
+        const pulsar_layer_attn    *attn,
         uint32_t                    s0,
         uint32_t                    sn,
         uint32_t                    spos0,
@@ -491,7 +519,14 @@ static bool gpu_graph_indexed_attention_span(
                               (uint64_t)s0 * sizeof(int32_t),
                               (uint64_t)sn * sizeof(int32_t))
         : NULL;
-    bool ok = iq_view && iw_view && sq_view && sh_view &&
+    /* CSA2: the selection lives at ABSOLUTE batch rows so the index source's
+     * REUSE members find it; an index source writes it here, a REUSE layer
+     * reads it and runs no indexer. */
+    pulsar_gpu_tensor *sel_view = pulsar_gpu_tensor_view(g->comp_selected,
+            (uint64_t)s0 * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t),
+            (uint64_t)sn * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t));
+    const bool selects = attn->mode != PULSAR_ATTN_REUSE;
+    bool ok = iq_view && iw_view && sq_view && sh_view && sel_view &&
               (!op->mseq || (sp_view && ss_view));
 
     /* L121: a banked multi-row span is scored per bank run through the
@@ -524,7 +559,7 @@ static bool gpu_graph_indexed_attention_span(
      * the deleted SIMT kernel; a one-row run here is the same arithmetic as
      * the classic one-row decode, which is what solo-vs-banked comparisons
      * depend on). */
-    if (ok && op->mseq) {
+    if (ok && selects && op->mseq) {
         for (uint32_t r0 = 0; ok && r0 < sn; ) {
             uint32_t rn = 1;
             while (r0 + rn < sn &&
@@ -540,7 +575,7 @@ static bool gpu_graph_indexed_attention_span(
             pulsar_gpu_tensor *rs = pulsar_gpu_tensor_view(g->indexer_scores,
                     (uint64_t)r0 * n_comp * sizeof(float),
                     (uint64_t)rn * n_comp * sizeof(float));
-            pulsar_gpu_tensor *rb = gpu_graph_bank_index_comp_view(g, il, bank);
+            pulsar_gpu_tensor *rb = gpu_graph_bank_index_comp_view(g, attn->kv_source, bank);   /* the source's index K */
             ok = rq && rw && rs && rb &&
                  pulsar_gpu_indexer_scores_decode_run_tensor(rs, rq, rw, rb,
                         n_comp, rn, rpos0,
@@ -553,7 +588,7 @@ static bool gpu_graph_indexed_attention_span(
             pulsar_gpu_tensor_free(rq);
             r0 += rn;
         }
-    } else if (ok) {
+    } else if (ok && selects) {
         ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                           iq_view,
                                                           iw_view,
@@ -566,18 +601,19 @@ static bool gpu_graph_indexed_attention_span(
                                                           ratio,
                                                           index_scale) != 0;
     }
-    if (ok) {
+    if (ok && selects) {
         gpu_graph_debug_dump_tensor("indexer_scores", g->indexer_scores,
                                       (uint64_t)n_comp * sn, il, spos0);
+        ok = gpu_graph_csa2_candidates(g, attn, il, s0, sn, n_comp, ratio, spos0, sp_view);
     }
-    if (ok) {
-        ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
+    if (ok && selects) {
+        ok = pulsar_gpu_indexer_topk_tensor(sel_view,
                                            g->indexer_scores,
                                            n_comp,
                                            sn,
                                            PULSAR_N_INDEXER_TOP_K) != 0;
         if (ok) {
-            gpu_graph_debug_dump_i32_tensor("indexer_topk", g->comp_selected,
+            gpu_graph_debug_dump_i32_tensor("indexer_topk", sel_view,
                                               (uint64_t)sn * PULSAR_N_INDEXER_TOP_K, il, spos0);
         }
     }
@@ -589,7 +625,7 @@ static bool gpu_graph_indexed_attention_span(
                                                                   sq_view,
                                                                   op->raw_src,
                                                                   op->comp_src,
-                                                                  g->comp_selected,
+                                                                  sel_view,
                                                                   sn,
                                                                   spos0,
                                                                   n_raw,
@@ -607,6 +643,7 @@ static bool gpu_graph_indexed_attention_span(
                                                                   op->n_banks,
                                           g->q_prep_active ? &g->q_prep : NULL) != 0;
     }
+    pulsar_gpu_tensor_free(sel_view);
     pulsar_gpu_tensor_free(ss_view);
     pulsar_gpu_tensor_free(sp_view);
     pulsar_gpu_tensor_free(sh_view);
@@ -1230,9 +1267,9 @@ bool gpu_graph_encode_layer_attention_batch(
                                                           (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM,
                                                           g->batch_qr_norm,
                                                           n_tokens);
-            /* Fused rope + QAT: one launch over batch_indexer_q instead of the
-             * old rope_tail + qat pair (bit-exact, see the kernel note). */
-            if (ok) ok = pulsar_gpu_dsv4_indexer_rope_qat_tensor(g->batch_indexer_q,
+            /* Fused rope + FP4 pack: one launch over batch_indexer_q instead of
+             * a rope_tail + pack pair (bit-exact, see the kernel note). */
+            if (ok) ok = pulsar_gpu_indexer_rope_fp4_pack_tensor(g->batch_indexer_q,
                                                     g->batch_indexer_qp,
                                                     n_tokens,
                                                     PULSAR_N_INDEXER_HEAD,
@@ -1275,14 +1312,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                      mseq ? g->batch_positions : NULL,
                                                      mseq ? g->batch_seq_id : NULL,
                                                      mseq ? nb : 1) != 0;
-            if (ok && attn->mode == PULSAR_ATTN_REUSE && n_comp > PULSAR_N_INDEXER_TOP_K) {
-                /* 2c wires the index source's published top-k into its REUSE
-                 * members; until then a REUSE layer can attend only while the
-                 * dense sweep of every visible row IS the selection. */
-                fprintf(stderr, "pulsar: layer %u (REUSE of index source %u) needs the shared top-k at %u compressed rows "
-                                "-- not wired yet, refusing\n", il, attn->index_source, n_comp);
-                ok = false;
-            } else if (ok && attn->mode != PULSAR_ATTN_REUSE && n_comp > PULSAR_N_INDEXER_TOP_K) {
+            if (ok && n_comp > PULSAR_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                 /* PULSAR_PREFILL_SLICE: run [score -> top-k -> indexed attention]
                  * over <=slice-token spans so indexer_scores only ever holds
@@ -1324,7 +1354,7 @@ bool gpu_graph_encode_layer_attention_batch(
                     const uint32_t s_raw_start = gpu_graph_raw_start_for_span(g,
                                                                                 spos0 + sn - 1u,
                                                                                 s_n_raw);
-                    ok = gpu_graph_indexed_attention_span(g, model, layer, il,
+                    ok = gpu_graph_indexed_attention_span(g, model, layer, il, attn,
                             s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                             mseq ? 0u : s_n_raw, mseq ? 0u : s_raw_start,
                             &sop);
@@ -1361,11 +1391,6 @@ bool gpu_graph_encode_layer_attention_batch(
         }
 
         const bool topk_prefill_needed = compressed && n_comp > PULSAR_N_INDEXER_TOP_K;
-        if (ok && zero_prefix && topk_prefill_needed && attn->mode == PULSAR_ATTN_REUSE) {
-            fprintf(stderr, "pulsar: layer %u (REUSE of index source %u) needs the shared top-k at %u compressed rows "
-                            "-- not wired yet, refusing\n", il, attn->index_source, n_comp);
-            ok = false;
-        }
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
             const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
             /* PULSAR_PREFILL_SLICE: same span loop as the chunked branch.  The
@@ -1392,7 +1417,7 @@ bool gpu_graph_encode_layer_attention_batch(
             for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
                 const uint32_t spos0 = pos0 + s0;
-                ok = gpu_graph_indexed_attention_span(g, model, layer, il,
+                ok = gpu_graph_indexed_attention_span(g, model, layer, il, attn,
                         s0, sn, spos0, q_dim, n_comp, ratio, index_scale,
                         s0 + sn, 0u,
                         &zsop);
@@ -1432,8 +1457,8 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * has ONE arm now (L166): the fp16 tier reads
                                                                         * the ATTN_PACK pool natively through comp_kv;
                                                                         * no shadow, no second kernel. */
-                                                                       mseq ? gpu_graph_bank_attn_comp_pool(g, il)
-                                                                            : g->layer_attn_comp_cache[il],
+                                                                       mseq ? gpu_graph_bank_attn_comp_pool(g, src)
+                                                                            : g->layer_attn_comp_cache[src],
                                                                        gact_data, gact_scale, gact_kbp,
                                                                        (uint32_t)gact_slab, n_groups,
                                                                        PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
@@ -1510,13 +1535,14 @@ bool gpu_graph_encode_layer_attention_batch(
                 /* The indexer ranks the source's index-K rows and the attention
                  * folds the selected ids over the source's comp rows; one emit
                  * writes both, so cur_comp bounds both. */
-                if (compressed && attn->mode == PULSAR_ATTN_REUSE && cur_comp > PULSAR_N_INDEXER_TOP_K) {
-                    fprintf(stderr, "pulsar: layer %u (REUSE of index source %u) needs the shared top-k at %u compressed rows "
-                                    "-- not wired yet, refusing\n", il, attn->index_source, cur_comp);
-                    ok = false;
-                    break;
-                }
-                if (compressed && attn->mode != PULSAR_ATTN_REUSE && cur_comp > PULSAR_N_INDEXER_TOP_K) {
+                /* CSA2: the selection for row t lives at absolute row t of the
+                 * shared buffer; an index source writes it, a REUSE layer reads
+                 * its index source's. */
+                pulsar_gpu_tensor *sel_t = compressed ? pulsar_gpu_tensor_view(g->comp_selected,
+                        (uint64_t)t * PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t),
+                        (uint64_t)PULSAR_N_INDEXER_TOP_K * sizeof(uint32_t)) : NULL;
+                if (compressed && !sel_t) { ok = false; break; }
+                if (compressed && cur_comp > PULSAR_N_INDEXER_TOP_K && attn->mode != PULSAR_ATTN_REUSE) {
                     const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
                     pulsar_gpu_tensor *indexer_q_view = pulsar_gpu_tensor_view(
                             g->batch_indexer_qp,
@@ -1533,13 +1559,16 @@ bool gpu_graph_encode_layer_attention_batch(
                                                             PULSAR_N_INDEXER_HEAD,
                                                             PULSAR_N_INDEXER_HEAD_DIM,
                                                             index_scale) != 0 &&
-                         pulsar_gpu_indexer_topk_tensor(g->comp_selected,
+                         gpu_graph_csa2_candidates(g, attn, il, t, 1u, cur_comp, ratio, pos, NULL) &&
+                         pulsar_gpu_indexer_topk_tensor(sel_t,
                                                        g->indexer_scores,
                                                        cur_comp,
                                                        1,
                                                        PULSAR_N_INDEXER_TOP_K) != 0;
                     pulsar_gpu_tensor_free(indexer_w_view);
                     pulsar_gpu_tensor_free(indexer_q_view);
+                }
+                if (compressed && cur_comp > PULSAR_N_INDEXER_TOP_K) {
                     if (ok) {
                         have_topk = true;
                         n_selected = PULSAR_N_INDEXER_TOP_K < cur_comp
@@ -1555,7 +1584,7 @@ bool gpu_graph_encode_layer_attention_batch(
                          * whole verdict question, and this is the instrument
                          * that answers it. */
                         gpu_graph_debug_dump_i32_tensor("indexer_topk",
-                                g->comp_selected, (uint64_t)n_selected, il, pos);
+                                sel_t, (uint64_t)n_selected, il, pos);
                     }
                 }
 
@@ -1596,7 +1625,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                                * cur_comp grows per token, so the shadow was rebuilt
                                                                                * for every token. */
                                                                               g->layer_attn_comp_cache[src],
-                                                                              g->comp_selected,
+                                                                              sel_t,
                                                                               1,
                                                                               pos,
                                                                               n_raw,
@@ -1629,6 +1658,7 @@ bool gpu_graph_encode_layer_attention_batch(
                 pulsar_gpu_tensor_free(heads_view);
                 pulsar_gpu_tensor_free(kv_pack_view);
                 pulsar_gpu_tensor_free(q_view);
+                pulsar_gpu_tensor_free(sel_t);
             }
         }
     }

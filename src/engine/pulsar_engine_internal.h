@@ -107,6 +107,8 @@
 #define PULSAR_N_INDEXER_HEAD            (g_pulsar_shape.n_indexer_head)
 #define PULSAR_N_INDEXER_HEAD_DIM        (g_pulsar_shape.n_indexer_head_dim)
 #define PULSAR_N_INDEXER_TOP_K           (g_pulsar_shape.n_indexer_top_k)
+#define PULSAR_CANDIDATE_BLOCK_SIZE      (g_pulsar_shape.candidate_block_size)
+#define PULSAR_CANDIDATE_TOPK_BLOCKS     (g_pulsar_shape.candidate_topk_blocks)
 #define PULSAR_N_HC                      (g_pulsar_shape.n_hc)
 #define PULSAR_N_HC_SINKHORN_ITER        (g_pulsar_shape.n_hc_sinkhorn_iter)
 #define PULSAR_RMS_EPS                   (g_pulsar_shape.rms_eps)
@@ -867,8 +869,20 @@ typedef struct {
      * layer_index_comp_cache.  Also reused for session-save dequant and
      * session-load repack. */
     pulsar_gpu_tensor *idx_comp_stage;
-    pulsar_gpu_tensor *indexer_scores;   ///< indexer relevance score per compressed row
-    pulsar_gpu_tensor *comp_selected;    ///< top-k compressed row ids the attention will read
+    pulsar_gpu_tensor *indexer_scores;   ///< indexer relevance score per compressed row (one <= slice-token span)
+    /** CSA2 (L218): the top-k selection is SHARED down the layer sweep -- an
+     * index source writes rows [t] for every batch row t of the step (absolute
+     * batch row, not span-relative), and every REUSE layer up to the next
+     * index source attends with them unchanged.  [prefill_cap][top_k] u32. */
+    pulsar_gpu_tensor *comp_selected;
+    /** CSA2 (L218): the candidate pool the candidate source (layer 20) publishes
+     * per batch row and every later index source scores inside: one bit per
+     * block of candidate_block_size compressed positions, cand_mask_words u32
+     * per row, [prefill_cap] rows.  cand_bscore is the block-max scratch of one
+     * span ([slice][n_blocks] f32). */
+    pulsar_gpu_tensor *cand_mask;
+    pulsar_gpu_tensor *cand_bscore;
+    uint32_t           cand_mask_words;
     pulsar_gpu_tensor *ffn_norm;         ///< RMSNorm output feeding the FFN
     pulsar_gpu_tensor *output_pre;       ///< final HC mix output feeding the output head
     pulsar_gpu_tensor *output_weights;   ///< per-stream weights for the HC collapse

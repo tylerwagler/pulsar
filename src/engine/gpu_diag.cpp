@@ -1495,6 +1495,12 @@ bool gpu_graph_alloc_raw_cap(
     g->indexer_scores = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
+    /* CSA2 candidate pool: a block bitmask per batch row over the deepest
+     * pool (the candidate source is the ratio-1 source, comp_cap rows), and
+     * the block-max scratch for one span. */
+    g->cand_mask_words = pulsar_gpu_candidate_mask_words(g->comp_cap, PULSAR_CANDIDATE_BLOCK_SIZE);
+    g->cand_mask = pulsar_gpu_tensor_alloc((uint64_t)pc * g->cand_mask_words * sizeof(uint32_t));
+    g->cand_bscore = pulsar_gpu_tensor_alloc(score_rows * (uint64_t)g->cand_mask_words * 32u * sizeof(float));
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->output_pre = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
@@ -1588,7 +1594,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->attn_norm && g->kv &&
                     g->attn_comp_stage &&
                     g->indexer_scores &&
-                    g->comp_selected &&
+                    g->comp_selected && g->cand_mask && g->cand_bscore &&
                     g->ffn_norm &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&

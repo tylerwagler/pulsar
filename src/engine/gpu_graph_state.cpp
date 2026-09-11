@@ -106,6 +106,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->attn_comp_stage);
     pulsar_gpu_tensor_free(g->idx_comp_stage);
     pulsar_gpu_tensor_free(g->comp_selected);
+    pulsar_gpu_tensor_free(g->cand_mask);
+    pulsar_gpu_tensor_free(g->cand_bscore);
     pulsar_gpu_tensor_free(g->indexer_scores);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->layer_raw_cache[il]);

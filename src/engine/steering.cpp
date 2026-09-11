@@ -106,8 +106,13 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
     if (gpu_graph_prefill_slice() != 0u && (uint64_t)gpu_graph_prefill_slice() < score_rows) {
         score_rows = (uint64_t)gpu_graph_prefill_slice();
     }
+    /* CSA2 candidate pool: the per-row block bitmask over the deepest pool
+     * and one span's block-max scratch (gpu_diag's alloc, same formulas). */
+    const uint64_t mask_words = pulsar_gpu_candidate_mask_words((uint32_t)comp_cap, PULSAR_CANDIDATE_BLOCK_SIZE);
     uint64_t bytes = kv_cache_bytes +
-                     comp_cap * score_rows * sizeof(float);  /* one indexer_scores buffer */
+                     comp_cap * score_rows * sizeof(float) +                     /* one indexer_scores buffer */
+                     (uint64_t)prefill_cap * mask_words * sizeof(uint32_t) +    /* cand_mask */
+                     score_rows * mask_words * 32u * sizeof(float);             /* cand_bscore */
     return bytes;
 }
 

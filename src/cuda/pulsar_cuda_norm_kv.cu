@@ -272,7 +272,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
 
 
 /* One rope rotation pair, in place at tail[i], tail[i+1], for the callers that
- * rotate a stored tail (rope_tail_kernel and the fused indexer rope+QAT
+ * rotate a stored tail (rope_tail_kernel and the fused indexer rope+pack
  * kernel).  T is the buffer's STORED element type and is deduced from the
  * pointer, never named at the call site.
  *
@@ -477,7 +477,7 @@ __device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
  * this bug and lost 10.5% of their fp4 indexer lanes to zero.
  *
  * **If you ever feed already-quantized data into `fp8_kv_quantize*`,
- * `attn_pack_store`, or `indexer_hadamard_fp4*`, the misround rate jumps from
+ * `attn_pack_store`, or `indexer_fp4_pack*`, the misround rate jumps from
  * 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**  the old standalone
  * quantizer's `quantize_fp8` flag was hardcoded false at every call site for
  * exactly this reason -- and was deleted, with its kernel, in the L093 sweep:
@@ -672,52 +672,33 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
     }
 }
 
-/* The QAT transform both indexer FP4 kernels run before they diverge: the
- * 128-point Hadamard butterfly, the 1/sqrt(128) scaling, and the per-32-block
- * absmax left in absbuf[block_base].  Returns this thread's transformed value.
+/* The indexer's FP4 row (L218, DeepSeek-V4.1): the reference's
+ * fp4_act_quant(x, 32, scale_dtype=e8m0) on a bf16 row -- per 32-element
+ * block, amax floored at 6 * 2^-126, scale 2^ceil(log2(amax / 6)), values
+ * clamped to +-6 and rounded to E2M1, the scale stored as one E8M0 byte.  The
+ * value is rounded to bf16 first: the reference quantises the bf16 tensor the
+ * projection (fp8 GEMM, bf16 out) and RoPE (fp32 math, copied back to bf16)
+ * left, and our f32 staging carries those steps unrounded.  0731's 128-point
+ * Hadamard rotation before the quant is gone with that checkpoint.
  *
- * The packing kernel's contract is that it writes a BIT-IDENTICAL f32 result to
- * the unpacked one, and two hand-kept copies of this code is exactly how such a
- * contract rots silently.  One copy makes it structural.
- *
- * Called by all 128 threads of the block, after the kernels' own bounds check --
- * the __syncthreads() below are as uniform here as they were when inlined. */
-/** One thread's result from the shared Hadamard + block-absmax step.
- *
- * Returned by value so the packing and non-packing indexer kernels can share
- * ONE copy of that code -- see the note above: the packing kernel's contract is
- * a bit-identical f32 result, and two hand-kept copies is exactly how such a
- * contract rots silently. */
-struct indexer_had_t {
-    float    v;           ///< this thread's transformed value
+ * Both kernels below run this ONE copy (the packing kernel's contract is a
+ * bit-identical row to the rope-fused one; two hand-kept copies is how such a
+ * contract rots).  Called by all 128 threads of the block after the kernels'
+ * own bounds check -- the __syncthreads() are uniform. */
+struct indexer_fp4_t {
+    float    v;           ///< this thread's bf16-rounded value
     uint32_t fp4_block;   ///< which 32-wide FP4 block it lands in
     uint32_t lane;        ///< its lane within that block
     uint32_t block_base;  ///< absbuf[block_base] holds the block's absmax
 };
 
-__device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
-        const float *xr, uint32_t tid, float *vals, float *absbuf) {
-    vals[tid] = xr[tid];
-    __syncthreads();
-
-    for (uint32_t stride = 1u; stride < 128u; stride <<= 1u) {
-        if ((tid & stride) == 0u) {
-            uint32_t base = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
-            float a = vals[base];
-            float b = vals[base + stride];
-            vals[base] = a + b;
-            vals[base + stride] = a - b;
-        }
-        __syncthreads();
-    }
-
-    float v = vals[tid] * 0.08838834764831845f;
-    uint32_t fp4_block = tid >> 5u;
-    uint32_t lane = tid & 31u;
-    uint32_t block_base = fp4_block * 32u;
+__device__ static inline indexer_fp4_t indexer_block_absmax_dev(const float *xr, uint32_t tid, float *absbuf) {
+    const float v = __bfloat162float(__float2bfloat16(xr[tid]));
+    const uint32_t fp4_block = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t block_base = fp4_block * 32u;
     absbuf[tid] = fabsf(v);
     __syncthreads();
-
     for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             absbuf[block_base + lane] = fmaxf(absbuf[block_base + lane],
@@ -728,18 +709,30 @@ __device__ static inline indexer_had_t indexer_hadamard_block_absmax_dev(
     return { v, fp4_block, lane, block_base };
 }
 
+__device__ static inline void indexer_fp4_pack_row_dev(const indexer_fp4_t &h, const float *absbuf,
+                                                       uint8_t *nib_sh, uint8_t *outr, uint32_t tid,
+                                                       float *keep_f32_slot) {
+    const float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);   /* 6 * 2^-126 */
+    int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
+    e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
+    const float scale = exp2f((float)(e8 - 127));
+    const uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
+    /* The dequantised writeback is for OBSERVERS only -- the packed rows are
+     * what every consumer reads (L094). */
+    if (keep_f32_slot) *keep_f32_slot = dsv4_e2m1fn_decode_dev(nib, scale);
+    nib_sh[tid] = nib;
+    __syncthreads();
+    if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
+    if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
+}
 
-/* Fused indexer-q epilogue: rope the tail, then the Hadamard+FP4 QAT
- * round-trip, one 128-thread block per (token, head) row. Replaces the two
- * back-to-back launches over the same tensor (rope_tail_kernel then
- * indexer_hadamard_fp4_pack_kernel), saving a full read+write of the buffer. The
- * rotation is the SAME device function rope_tail_kernel runs and the QAT
- * body is the same code as indexer_hadamard_fp4_pack_kernel, in the same order,
- * so the PACKED row is bit-exact vs the two-launch sequence (this kernel writes
- * no f32 back -- see the note at its QAT phase); the __syncthreads
- * between the phases stands in for the old kernel boundary (one block owns
- * the whole row, so a block-local barrier is equivalent). */
-__global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
+/* Fused indexer-q epilogue: rope the tail, then the FP4 pack, one 128-thread
+ * block per (token, head) row -- the rotation is the SAME device function
+ * rope_tail_kernel runs, and the __syncthreads between the phases stands in
+ * for a kernel boundary (one block owns the whole row).  This kernel writes no
+ * f32 back: x is producer-internal rope staging and every consumer reads the
+ * packed row, so there is exactly one Q operand encoding (L090.4). */
+__global__ static void indexer_rope_fp4_pack_q_kernel(
         float *x, uint8_t *out, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, int inverse,
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
@@ -760,64 +753,27 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
                                   &r0, &r1);
     }
     __syncthreads();
-
-    /* Hadamard + QAT, identical math to indexer_hadamard_fp4_pack_kernel --
-     * but the E2M1 code + E8M0 scale ARE the output now.  The f32 dequant
-     * writeback that used to live here (the "QAT round-trip") is gone: x is
-     * producer-internal rope staging, and every consumer reads the packed
-     * row, so there is exactly one Q operand encoding (L090.4). */
-    __shared__ float vals[128];
     __shared__ float absbuf[128];
     __shared__ uint8_t nib_sh[128];
-    indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
-
-    float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
-    int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
-    e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
-    float scale = exp2f((float)(e8 - 127));
-    uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
-    nib_sh[tid] = nib;
-    __syncthreads();
-
-    uint8_t *outr = out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u);
-    if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
-    if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
+    const indexer_fp4_t h = indexer_block_absmax_dev(xr, tid, absbuf);
+    indexer_fp4_pack_row_dev(h, absbuf, nib_sh, out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid, NULL);
 }
 
-/* Same QAT transform as indexer_rope_hadamard_fp4_pack_q_kernel minus the rope,
- * emitting the row in MXKV FP4 layout — E2M1 nibble pairs low-nibble-first
- * followed by one E8M0 byte per 32-block; the dequantised f32 goes back into x
- * only under keep_f32 (observers -- every consumer reads the packed row).  The E8M0
- * exponent clamp only differs from the unpacked path outside [2^-127, 2^127]
- * scales, which the 7e-38 amax floor already makes unreachable. */
-__global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
-                                                        uint32_t n_rows, uint32_t head_dim,
-                                                        int keep_f32) {
+/* The same pack minus the rope (the kv source's index-K rows, already rotated
+ * at their group positions), emitting MXKV FP4 rows -- E2M1 nibble pairs
+ * low-nibble-first, then one E8M0 byte per 32-block. */
+__global__ static void indexer_fp4_pack_kernel(float *x, uint8_t *out,
+                                               uint32_t n_rows, uint32_t head_dim,
+                                               int keep_f32) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
-
-    __shared__ float vals[128];
     __shared__ float absbuf[128];
     __shared__ uint8_t nib_sh[128];
     float *xr = x + (uint64_t)row * head_dim;
-    indexer_had_t h = indexer_hadamard_block_absmax_dev(xr, tid, vals, absbuf);
-
-    float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);
-    int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
-    e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
-    float scale = exp2f((float)(e8 - 127));
-    uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
-    /* The dequantised writeback is for OBSERVERS only -- the packed rows below
-     * are what every consumer reads (L094).  Skipped unless a dump or the
-     * range sweep will actually look at the staging. */
-    if (keep_f32) xr[tid] = dsv4_e2m1fn_decode_dev(nib, scale);
-    nib_sh[tid] = nib;
-    __syncthreads();
-
-    uint8_t *outr = out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u);
-    if (tid < 64u) outr[tid] = (uint8_t)(nib_sh[2u * tid] | (nib_sh[2u * tid + 1u] << 4));
-    if (h.lane == 0u) outr[64u + h.fp4_block] = (uint8_t)e8;
+    const indexer_fp4_t h = indexer_block_absmax_dev(xr, tid, absbuf);
+    indexer_fp4_pack_row_dev(h, absbuf, nib_sh, out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid,
+                             keep_f32 ? &xr[tid] : NULL);
 }
 
 
@@ -1096,12 +1052,11 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
 
 
 
-/* Fused rope + QAT + PACK for the indexer q projection: rope the f32 staging
- * in place, Hadamard + E2M1-quantize, and store MXKV FP4 packed rows into
+/* Rope the indexer Q rows' tails in place and store their FP4 rows into
  * `packed`.  There is no dequantized output: the packed rows are the ONLY Q
  * the scorers see, so the quantized values cannot fork from what a second
  * encode would produce -- the encode happens once, here. n_rows = n_tok * n_head. */
-int pulsar_gpu_dsv4_indexer_rope_qat_tensor(pulsar_gpu_tensor *x,
+int pulsar_gpu_indexer_rope_fp4_pack_tensor(pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
@@ -1115,18 +1070,17 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(pulsar_gpu_tensor *x,
     }
     if (pulsar_tensor_esz(x) != sizeof(float)) return 0;   /* staging is f32 by contract */
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
-    indexer_rope_hadamard_fp4_pack_q_kernel<<<n_rows, 128>>>((float *)x->ptr,
+    indexer_rope_fp4_pack_q_kernel<<<n_rows, 128>>>((float *)x->ptr,
             (uint8_t *)packed->ptr,
             n_rows, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
             freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
             positions ? (const int32_t *)positions->ptr : NULL);
-    return cuda_ok(cudaGetLastError(), "indexer rope+qat+pack launch");
+    return cuda_ok(cudaGetLastError(), "indexer rope+fp4 pack launch");
 }
 
-/* QAT + pack: roundtrip n_rows f32 rows of x in place (the same QAT the fused
- * rope+QAT entry applies) and store the MXKV FP4 packed rows into
- * `packed` at rows [out_row0, out_row0 + n_rows). */
-int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
+/* Pack n_rows f32 rows of x (the same quant the fused rope entry applies) into
+ * MXKV FP4 rows of `packed` at [out_row0, out_row0 + n_rows). */
+int pulsar_gpu_indexer_fp4_pack_tensor(pulsar_gpu_tensor *x,
                                                     pulsar_gpu_tensor *packed,
                                                     uint32_t out_row0,
                                                     uint32_t n_rows,
@@ -1138,11 +1092,11 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
         packed->bytes < ((uint64_t)out_row0 + n_rows) * rowbytes) {
         return 0;
     }
-    indexer_hadamard_fp4_pack_kernel<<<n_rows, 128>>>(
+    indexer_fp4_pack_kernel<<<n_rows, 128>>>(
             (float *)x->ptr,
             (uint8_t *)packed->ptr + (uint64_t)out_row0 * rowbytes,
             n_rows, head_dim, keep_f32 ? 1 : 0);
-    return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_pack launch");
+    return cuda_ok(cudaGetLastError(), "indexer fp4 pack launch");
 }
 
 

@@ -562,6 +562,25 @@ int pulsar_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/** CSA2 candidate pool (L218): level one of the two-level top-k, the
+ * reference's select_candidate_blocks.  From the candidate source's indexer
+ * scores ([n_rows][n_comp] f32, -inf beyond each row's reach) keep the
+ * `topk_blocks` highest-scoring blocks of `block_size` compressed positions
+ * per row -- the row's newest block pinned, unreachable blocks dropped -- as
+ * a bitmask of `mask_words` u32 per row (bit b = block b).  `bscore_scratch`
+ * holds [n_rows][n_blocks] f32 during the call.  vis per row is
+ * (pos + 1) / ratio with pos = pos0 + row or positions[row]. */
+uint32_t pulsar_gpu_candidate_mask_words(uint32_t n_comp_cap, uint32_t block_size);
+int pulsar_gpu_candidate_blocks_tensor(pulsar_gpu_tensor *mask, pulsar_gpu_tensor *bscore_scratch,
+                                       const pulsar_gpu_tensor *scores,
+                                       uint32_t n_comp, uint32_t n_rows, uint32_t mask_words,
+                                       uint32_t block_size, uint32_t topk_blocks,
+                                       uint32_t pos0, uint32_t ratio, const pulsar_gpu_tensor *positions);
+/** Level two: -inf into every score whose block is outside the row's mask,
+ * before that layer's top-k. */
+int pulsar_gpu_candidate_mask_scores_tensor(pulsar_gpu_tensor *scores, const pulsar_gpu_tensor *mask,
+                                            uint32_t n_comp, uint32_t n_rows, uint32_t mask_words, uint32_t block_size);
+
 /** GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
 int pulsar_gpu_argmax_tensor(
@@ -1072,10 +1091,12 @@ int pulsar_gpu_attn_pack_quantize_store_tensor(
         uint32_t          n_rot,
         bool              keep_f32);
 
-/** Fused rope + QAT for the indexer q projection: one launch replacing the
- * rope_tail + indexer_qat pair over the same tensor; bit-exact vs that
- * sequence (shared rotation device fn, same QAT body, same order). */
-int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
+/** Fused rope + FP4 pack for the indexer q projection (L218: the reference's
+ * fp4_act_quant with E8M0 scales per 32 on the bf16-rounded row; 0731's
+ * Hadamard is gone): one launch replacing a rope_tail + pack pair over the
+ * same tensor, bit-exact vs that sequence (shared rotation device fn, same
+ * pack body, same order). */
+int pulsar_gpu_indexer_rope_fp4_pack_tensor(
         pulsar_gpu_tensor *x,          /* f32 rope staging, mutated in place */
         pulsar_gpu_tensor *packed,     /* MXKV FP4 rows out -- the only Q output */
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
@@ -1083,9 +1104,8 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
         float freq_base, float freq_scale, float ext_factor, float attn_factor,
         float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions);
 
-/** QAT-roundtrip n_rows f32 rows of x in place AND store them MXKV-FP4-packed
- * into `packed` at rows [out_row0, out_row0+n_rows).  The f32 result in x is
- * bit-identical to the fused rope+QAT entry above.
+/** Pack n_rows f32 rows of x MXKV-FP4 into `packed` at rows [out_row0,
+ * out_row0+n_rows) -- the same quant the fused rope entry above applies.
  *
  * @param x         f32 indexer rows, round-tripped in place
  * @param packed    destination for the MXKV-FP4 rows
@@ -1097,7 +1117,7 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
  *                  gpu_graph_f32_store_observed_any() (L094).
  * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
  */
-int pulsar_gpu_dsv4_indexer_qat_pack_tensor(
+int pulsar_gpu_indexer_fp4_pack_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
         uint32_t          out_row0,
