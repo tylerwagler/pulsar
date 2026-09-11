@@ -1,5 +1,8 @@
 #include "pulsar_server_internal.h"
 
+#include <charconv>
+#include <cmath>
+
 #include <sys/random.h>
 
 
@@ -447,6 +450,177 @@ char *json_minify_raw_value(const char *json) {
         } else if (!isspace(c)) {
             buf_putc(&b, (char)c);
         }
+    }
+    return buf_take(&b);
+}
+
+
+
+/* ---- Python json.dumps emulation ----------------------------------------
+ *
+ * The V4.1 reference encoder writes every non-string DSML parameter value
+ * with `json.dumps(value, ensure_ascii=False)` after `json.loads`.  Those
+ * bytes are what the model was trained on, and a prompt that differs only in
+ * ", " versus "," tokenises differently, so the renderer reproduces the
+ * spelling exactly: dict/list separators ", " and ": ", strings escaped for
+ * backslash, quote and the C0 controls only (\b \f \n \r \t short forms,
+ * \u00XX otherwise; non-ASCII raw), integer literals verbatim, floats as
+ * repr(): shortest round-trip digits, fixed notation for decimal exponents in
+ * (-4, 16], ".0" appended to an integral value, else "d.ddde+XX". */
+static void py_json_string(buf *b, const char *s, size_t n) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  buf_puts(b, "\\\""); break;
+        case '\\': buf_puts(b, "\\\\"); break;
+        case '\b': buf_puts(b, "\\b"); break;
+        case '\f': buf_puts(b, "\\f"); break;
+        case '\n': buf_puts(b, "\\n"); break;
+        case '\r': buf_puts(b, "\\r"); break;
+        case '\t': buf_puts(b, "\\t"); break;
+        default:
+            if (c < 0x20) buf_printf(b, "\\u%04x", (unsigned)c);
+            else buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+static void py_float_repr(buf *b, double v) {
+    if (v == 0.0) {
+        buf_puts(b, std::signbit(v) ? "-0.0" : "0.0");
+        return;
+    }
+    /* shortest round-trip digits in scientific form: [-]d[.ddd]e[+-]XX */
+    char tmp[64];
+    auto r = std::to_chars(tmp, tmp + sizeof tmp, v, std::chars_format::scientific);
+    if (r.ec != std::errc()) pulsar_die("py_float_repr: to_chars failed");
+    *r.ptr = '\0';
+    const char *m = tmp;
+    if (*m == '-') { buf_putc(b, '-'); m++; }
+    const char *e = strchr(m, 'e');
+    if (!e) pulsar_die("py_float_repr: no exponent in scientific form");
+    char digits[40];
+    size_t nd = 0;
+    for (const char *q = m; q < e; q++) if (*q != '.') digits[nd++] = *q;
+    digits[nd] = '\0';
+    const int exp10 = atoi(e + 1);
+    const int decpt = exp10 + 1;             /* digits d1..dn stand for 0.d1..dn x 10^decpt */
+    if (decpt > -4 && decpt <= 16) {
+        if (decpt <= 0) {
+            buf_puts(b, "0.");
+            for (int i = 0; i < -decpt; i++) buf_putc(b, '0');
+            buf_puts(b, digits);
+        } else if ((size_t)decpt >= nd) {
+            buf_puts(b, digits);
+            for (size_t i = nd; i < (size_t)decpt; i++) buf_putc(b, '0');
+            buf_puts(b, ".0");
+        } else {
+            for (size_t i = 0; i < nd; i++) {
+                if (i == (size_t)decpt) buf_putc(b, '.');
+                buf_putc(b, digits[i]);
+            }
+        }
+    } else {
+        buf_putc(b, digits[0]);
+        if (nd > 1) { buf_putc(b, '.'); buf_puts(b, digits + 1); }
+        buf_printf(b, "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+    }
+}
+
+static bool py_json_value(const char **p, buf *b) {
+    json_ws(p);
+    const char c = **p;
+    if (c == '{') {
+        (*p)++;
+        buf_putc(b, '{');
+        json_ws(p);
+        bool first = true;
+        while (**p && **p != '}') {
+            char *key = NULL;
+            size_t klen = 0;
+            if (!json_string_n(p, &key, &klen)) return false;
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            py_json_string(b, key, klen);
+            free(key);
+            json_ws(p);
+            if (**p != ':') return false;
+            (*p)++;
+            buf_puts(b, ": ");
+            if (!py_json_value(p, b)) return false;
+            json_ws(p);
+            if (**p == ',') { (*p)++; json_ws(p); }
+        }
+        if (**p != '}') return false;
+        (*p)++;
+        buf_putc(b, '}');
+        return true;
+    }
+    if (c == '[') {
+        (*p)++;
+        buf_putc(b, '[');
+        json_ws(p);
+        bool first = true;
+        while (**p && **p != ']') {
+            if (!first) buf_puts(b, ", ");
+            first = false;
+            if (!py_json_value(p, b)) return false;
+            json_ws(p);
+            if (**p == ',') { (*p)++; json_ws(p); }
+        }
+        if (**p != ']') return false;
+        (*p)++;
+        buf_putc(b, ']');
+        return true;
+    }
+    if (c == '"') {
+        char *str = NULL;
+        size_t n = 0;
+        if (!json_string_n(p, &str, &n)) return false;
+        py_json_string(b, str, n);
+        free(str);
+        return true;
+    }
+    if (json_lit(p, "true"))  { buf_puts(b, "true");  return true; }
+    if (json_lit(p, "false")) { buf_puts(b, "false"); return true; }
+    if (json_lit(p, "null"))  { buf_puts(b, "null");  return true; }
+    /* number: an integer literal is Python int -> printed verbatim (modulo
+     * "-0" -> "0"); anything with a fraction or exponent is a float -> repr */
+    const char *start = *p;
+    const char *q = start;
+    if (*q == '-') q++;
+    bool is_float = false;
+    while ((*q >= '0' && *q <= '9') || *q == '.' || *q == 'e' || *q == 'E' || *q == '+' || *q == '-') {
+        if (*q == '.' || *q == 'e' || *q == 'E') is_float = true;
+        q++;
+    }
+    if (q == start || (q == start + 1 && *start == '-')) return false;
+    if (!is_float) {
+        if (q - start == 2 && start[0] == '-' && start[1] == '0') buf_putc(b, '0');
+        else buf_append(b, start, (size_t)(q - start));
+    } else {
+        char *end = NULL;
+        const double v = strtod(start, &end);
+        if (end != q) return false;
+        py_float_repr(b, v);
+    }
+    *p = q;
+    return true;
+}
+
+char *json_python_dumps_raw_value(const char *json) {
+    const char *p = json ? json : "null";
+    buf b = {0};
+    if (!py_json_value(&p, &b)) {
+        buf_free(&b);
+        return xstrdup(json ? json : "null");
+    }
+    json_ws(&p);
+    if (*p) {
+        buf_free(&b);
+        return xstrdup(json);
     }
     return buf_take(&b);
 }

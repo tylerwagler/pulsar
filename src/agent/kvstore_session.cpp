@@ -367,7 +367,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
     pulsar_chat_begin(w->engine, out);
-    pulsar_chat_append_effort_prefix(w->engine, out, effective_think_mode(w->cfg));
+    pulsar_chat_append_lead_in(w->engine, out, w->cfg->gen.system && w->cfg->gen.system[0],
+                               w->cfg->gen.think_mode);
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
 }
 

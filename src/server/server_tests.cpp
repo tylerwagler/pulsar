@@ -1512,7 +1512,7 @@ static void test_streaming_holds_partial_utf8(void) {
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == PULSAR_THINK_LOW);
+    TEST_ASSERT(r.think_mode == PULSAR_THINK_DEFAULT);
     TEST_ASSERT(r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == PULSAR_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
@@ -1700,20 +1700,34 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == PULSAR_THINK_MAX);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == PULSAR_THINK_MAX);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_MAX, 32768) == PULSAR_THINK_LOW);
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_HIGH, 32768) == PULSAR_THINK_LOW);
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_LOW, 32768) == PULSAR_THINK_LOW);
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_MAX,
-                                           (int)pulsar_think_max_min_context()) == PULSAR_THINK_MAX);
-    TEST_ASSERT(pulsar_think_mode_for_context(PULSAR_THINK_HIGH,
-                                           (int)pulsar_think_max_min_context()) == PULSAR_THINK_HIGH);
-    /* The three prefixes are distinct: low empty, high/max non-empty and
-     * different texts (0731 restructure). */
-    TEST_ASSERT(!pulsar_think_effort_prefix(PULSAR_THINK_LOW)[0]);
-    TEST_ASSERT(pulsar_think_effort_prefix(PULSAR_THINK_HIGH)[0]);
-    TEST_ASSERT(pulsar_think_effort_prefix(PULSAR_THINK_MAX)[0]);
-    TEST_ASSERT(strcmp(pulsar_think_effort_prefix(PULSAR_THINK_HIGH),
-                       pulsar_think_effort_prefix(PULSAR_THINK_MAX)) != 0);
+    /* V4.1: the presets are points on the 1..100 axis and every thinking
+     * mode renders the effort line, byte-identical to encoding.py's
+     * REASONING_EFFORT_TEMPLATE; thinking-off renders nothing. */
+    TEST_ASSERT(PULSAR_THINK_LOW == 50 && PULSAR_THINK_HIGH == 75 && PULSAR_THINK_MAX == 100);
+    TEST_ASSERT(PULSAR_THINK_DEFAULT == PULSAR_THINK_HIGH);
+    TEST_ASSERT(!pulsar_think_effort_prefix(PULSAR_THINK_NONE)[0]);
+    TEST_ASSERT(!strcmp(pulsar_think_effort_prefix(PULSAR_THINK_HIGH),
+                        "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"));
+    TEST_ASSERT(!strcmp(pulsar_think_effort_prefix(1),
+                        "Reasoning Effort: 1 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"));
+    TEST_ASSERT(!strcmp(pulsar_think_effort_prefix(PULSAR_THINK_MAX),
+                        "Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"));
+    TEST_ASSERT(!strcmp(pulsar_think_mode_name(PULSAR_THINK_LOW), "low"));
+    TEST_ASSERT(!strcmp(pulsar_think_mode_name(42), "42"));
+    TEST_ASSERT(pulsar_think_mode_valid(0) && pulsar_think_mode_valid(1) && pulsar_think_mode_valid(100));
+    TEST_ASSERT(!pulsar_think_mode_valid(101) && !pulsar_think_mode_valid(-1));
+    /* the length helper strips whichever effort the line carries, and nothing else */
+    TEST_ASSERT(pulsar_think_effort_prefix_len(pulsar_think_effort_prefix(7)) == strlen(pulsar_think_effort_prefix(7)));
+    TEST_ASSERT(pulsar_think_effort_prefix_len("Reasoning Effort: 0 (range 1-100, the higher the value, the more thorough the reasoning)\n\n") == 0);
+    TEST_ASSERT(pulsar_think_effort_prefix_len("Reasoning Effort: high\n") == 0);
+    TEST_ASSERT(pulsar_think_effort_prefix_len("") == 0);
+    /* a JSON integer is an effort; out of range or fractional is refused */
+    const char *int_effort = "37";
+    TEST_ASSERT(parse_reasoning_effort_value(&int_effort, &mode) && mode == 37);
+    const char *big_effort = "101";
+    TEST_ASSERT(!parse_reasoning_effort_value(&big_effort, &mode));
+    const char *frac_effort = "7.5";
+    TEST_ASSERT(!parse_reasoning_effort_value(&frac_effort, &mode));
 }
 
 
@@ -1758,10 +1772,12 @@ static void test_render_think_max_prompt_prefix(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_MAX);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
-    TEST_ASSERT(strstr(prompt, pulsar_think_max_prefix()) != NULL);
-    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+    /* V4.1 (encoding.py render_message, index 0, thinking): BOS, the System
+     * token, the effort line, the system text, then the turns. */
+    TEST_ASSERT(!strcmp(prompt,
+        "<｜begin▁of▁sentence｜><｜System｜>"
+        "Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        "You are terse.<｜User｜>Hello<｜Assistant｜><think>"));
 
     free(prompt);
     chat_msgs_free(&msgs);
@@ -1771,8 +1787,8 @@ static void test_render_think_max_prompt_prefix(void) {
 
 /* vLLM PR #44283's bug class (inline role:system accepted) + L113 placement
  * (2026-08-25): the LEADING run of system messages joins the system region;
- * a system message arriving MID-conversation renders IN PLACE as a
- * <system-reminder> environment note. Consolidating mid-stream system
+ * a system message arriving MID-conversation renders IN PLACE behind V4.1's
+ * System token (L218). Consolidating mid-stream system
  * messages into the region is what capped every warm-fork at the
  * scaffolding: agent clients append one system-role nudge per turn, and
  * teleporting it to the top shifted the whole rendered prefix. */
@@ -1795,15 +1811,17 @@ static void test_inline_system_message_placement(void) {
      * mid-conversation one renders after that turn, in place, wrapped. */
     const char *sys_lead = strstr(prompt, "You are terse.");
     const char *user_turn = strstr(prompt, "<｜User｜>Hello");
-    const char *in_place = strstr(prompt,
-        "<｜User｜><system-reminder>\nPrefer bullet lists.\n</system-reminder>");
+    const char *in_place = strstr(prompt, "<｜System｜>Prefer bullet lists.");
     TEST_ASSERT(sys_lead != NULL);
     TEST_ASSERT(user_turn != NULL);
     TEST_ASSERT(in_place != NULL);
     TEST_ASSERT(sys_lead < user_turn);
     TEST_ASSERT(user_turn < in_place);
     /* Nothing from the nudge leaks into the region. */
-    TEST_ASSERT(strstr(prompt, "Prefer bullet lists.") == in_place + strlen("<｜User｜><system-reminder>\n"));
+    TEST_ASSERT(strstr(prompt, "Prefer bullet lists.") == in_place + strlen("<｜System｜>"));
+    /* the leading system text sits in the region behind the conversation's
+     * one System token, and the region ends where the first turn begins */
+    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜><｜System｜>", strlen("<｜begin▁of▁sentence｜><｜System｜>")));
     free(prompt);
 
     /* The top-level system FIELD is appended to the array by the parser --
@@ -1866,8 +1884,7 @@ static void test_appended_system_message_keeps_prefix(void) {
     TEST_ASSERT(strlen(after) > blen);
     TEST_ASSERT(strncmp(before, after, blen) == 0);
     /* And the nudge itself sits in place, after the first answer. */
-    const char *in_place = strstr(after, "<｜User｜><system-reminder>\n"
-                                  "The task tools haven't been used recently.");
+    const char *in_place = strstr(after, "<｜System｜>The task tools haven't been used recently.");
     TEST_ASSERT(in_place != NULL);
     TEST_ASSERT(in_place >= after + blen - strlen("<｜Assistant｜>"));
     free(before);
@@ -1876,8 +1893,10 @@ static void test_appended_system_message_keeps_prefix(void) {
 }
 
 
-/* 0731 effort levels: HIGH renders its own (distinct) prefix, LOW renders
- * none — a LOW prompt is byte-identical to the pre-0731 default rendering. */
+/* V4.1 effort line: every thinking mode renders "Reasoning Effort: N ..." behind
+ * the System token, even with no system message; thinking-off renders neither
+ * (encoding.py render_message: the token leads only when an effort line or a
+ * system message opens the conversation). */
 static void test_render_think_effort_prefixes(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -1887,15 +1906,25 @@ static void test_render_think_effort_prefixes(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, pulsar_think_effort_prefix(PULSAR_THINK_HIGH)) != NULL);
-    TEST_ASSERT(strstr(prompt, pulsar_think_max_prefix()) == NULL);
-    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<｜begin▁of▁sentence｜><｜System｜>"
+        "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        "<｜User｜>Hello<｜Assistant｜><think>"));
     free(prompt);
 
     prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
-    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜System｜>Reasoning Effort: 50 (range") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, 3);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜System｜>Reasoning Effort: 3 (range") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt, "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"));
     free(prompt);
     chat_msgs_free(&msgs);
 }
@@ -1911,7 +1940,7 @@ static void test_render_non_thinking_prompt_closes_think(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_NONE);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, pulsar_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
     TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜></think>") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
@@ -1984,11 +2013,11 @@ static void test_render_preserves_reasoning_with_tools(void) {
 
 
 
-static void test_render_chat_prompt_text_renders_tools_before_system(void) {
-    /* The tool-schema block must sit at the head of the system region so the
-     * client's system content stays at the tail, right before <｜User｜>.
-     * That keeps a per-request dynamic tail (e.g. a timestamp) out of the
-     * cached prefix without losing the tool schemas to the trim. */
+static void test_render_chat_prompt_text_renders_tools_after_system(void) {
+    /* V4.1 reference order (encoding.py render_message, role system): the
+     * client's system content, "\n\n", then the tools block; the region ends
+     * at <｜User｜>.  The V4-era tools-first order was a boundary-trim
+     * optimisation, retired with V4 (L218). */
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -2006,8 +2035,9 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
     const char *user_m = strstr(prompt, "<｜User｜>");
     TEST_ASSERT(tools && client && user_m);
-    TEST_ASSERT(tools  < client);
-    TEST_ASSERT(client < user_m);
+    TEST_ASSERT(client < tools);
+    TEST_ASSERT(tools  < user_m);
+    TEST_ASSERT(!strncmp(client + strlen("CLIENT_SYSTEM_MARKER"), "\n\n## Tools\n\n", strlen("\n\n## Tools\n\n")));
     free(prompt);
     chat_msgs_free(&msgs);
 }
@@ -6203,7 +6233,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         buf_puts(&glued, prefix);
         buf_puts(&glued, r.anthropic_live_suffix_text ? r.anthropic_live_suffix_text : "");
         TEST_ASSERT(!strcmp(glued.ptr, full_anth));
-        TEST_ASSERT(strstr(glued.ptr, "<｜User｜><system-reminder>\nBe brief.\n</system-reminder><｜Assistant｜><think>") != NULL);
+        TEST_ASSERT(strstr(glued.ptr, "<｜System｜>Be brief.<｜Assistant｜><think>") != NULL);
         request_free(&r);
         buf_free(&glued);
         free(prefix);
@@ -6317,14 +6347,14 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
     {
         char *legacy = render_completion_prompt_text("hi", PULSAR_THINK_HIGH);
         buf want = {0};
-        buf_puts(&want, PULSAR_SERVER_RENDER_BOS);
+        buf_puts(&want, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM);
         buf_puts(&want, pulsar_think_effort_prefix(PULSAR_THINK_HIGH));
         buf_puts(&want, "You are a helpful assistant<｜User｜>hi<｜Assistant｜><think>");
         TEST_ASSERT(!strcmp(legacy, want.ptr));
         buf_free(&want);
         free(legacy);
         legacy = render_completion_prompt_text("hi", PULSAR_THINK_NONE);
-        TEST_ASSERT(!strcmp(legacy, PULSAR_SERVER_RENDER_BOS "You are a helpful assistant<｜User｜>hi<｜Assistant｜></think>"));
+        TEST_ASSERT(!strcmp(legacy, PULSAR_SERVER_RENDER_BOS PULSAR_RENDER_SYSTEM "You are a helpful assistant<｜User｜>hi<｜Assistant｜></think>"));
         free(legacy);
     }
 
@@ -6774,7 +6804,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
-    test_render_chat_prompt_text_renders_tools_before_system();
+    test_render_chat_prompt_text_renders_tools_after_system();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_openai_tool_schema_json_spelling_is_canonical();

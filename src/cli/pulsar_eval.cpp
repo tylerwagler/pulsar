@@ -1587,7 +1587,7 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
-        .think_mode = PULSAR_THINK_LOW,
+        .think_mode = PULSAR_THINK_DEFAULT,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -1636,7 +1636,12 @@ static eval_config parse_options(int argc, char **argv) {
             }
             c.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--think")) {
+            c.think_mode = PULSAR_THINK_DEFAULT;
+        } else if (!strcmp(arg, "--think-low")) {
             c.think_mode = PULSAR_THINK_LOW;
+        } else if (!strcmp(arg, "--think-effort")) {
+            c.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
+                                           PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
         } else if (!strcmp(arg, "--think-high")) {
             c.think_mode = PULSAR_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -2380,13 +2385,11 @@ static int eval_max_prompt_tokens(pulsar_engine *engine,
                                   const eval_config *cfg,
                                   const eval_case *cases,
                                   int ncases,
-                                  int ctx_for_think_mode,
                                   int *max_case_out)
 {
     int max_prompt = 0;
     int max_case = -1;
-    const pulsar_think_mode think_mode =
-        pulsar_think_mode_for_context(cfg->think_mode, ctx_for_think_mode);
+    const pulsar_think_mode think_mode = cfg->think_mode;
 
     for (int i = 0; i < ncases; i++) {
         char *question = build_question_prompt(&cases[i]);
@@ -2425,44 +2428,22 @@ static int eval_auto_context_size(pulsar_engine *engine,
                                   int *max_prompt_out,
                                   int *max_case_out)
 {
-    int ctx = EVAL_MAX_CONTEXT;
     int max_prompt = 0;
     int max_case = -1;
-    const int min_ctx = pulsar_think_effort_prefix(cfg->think_mode)[0] ?
-                        (int)pulsar_think_max_min_context() : 1;
-
-    /* High/max effort downgrades to normal thinking under its minimum context.  Size
-     * the prompts iteratively so the prompt tokenizer sees the same effective
-     * thinking mode that the actual run will use. */
-    for (int iter = 0; iter < 3; iter++) {
-        max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
-        long long required = (long long)max_prompt + (long long)max_generation_tokens;
-        if (required < min_ctx) required = min_ctx;
-        if (required > EVAL_MAX_CONTEXT) {
-            fprintf(stderr,
-                    "pulsar-eval: largest prompt (%d tokens, case %d) + generation budget (%d) exceeds the %d token context cap\n",
-                    max_prompt, max_case + 1, max_generation_tokens, EVAL_MAX_CONTEXT);
-            exit(2);
-        }
-        if ((int)required == ctx) break;
-        ctx = (int)required;
+    max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, &max_case);
+    long long required = (long long)max_prompt + (long long)max_generation_tokens;
+    if (required < 1) required = 1;
+    if (required > EVAL_MAX_CONTEXT) {
+        fprintf(stderr,
+                "pulsar-eval: largest prompt (%d tokens, case %d) + generation budget (%d) exceeds the %d token context cap\n",
+                max_prompt, max_case + 1, max_generation_tokens, EVAL_MAX_CONTEXT);
+        exit(2);
     }
+    const int ctx = (int)required;
 
     if (max_prompt_out) *max_prompt_out = max_prompt;
     if (max_case_out) *max_case_out = max_case;
     return ctx;
-}
-
-static void eval_warn_think_effort_downgraded(const eval_config *cfg) {
-    if (!pulsar_think_effort_prefix(cfg->think_mode)[0] ||
-        pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == cfg->think_mode) {
-        return;
-    }
-    fprintf(stderr,
-            "pulsar-eval: warning: --think-%s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
-            pulsar_think_mode_name(cfg->think_mode),
-            pulsar_think_max_min_context(),
-            cfg->ctx_size);
 }
 
 static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens,
@@ -3717,7 +3698,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     const eval_case *tc = &eval_cases[idx];
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
-    const pulsar_think_mode think_mode = pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
+    const pulsar_think_mode think_mode = cfg->think_mode;
     const char *system = eval_system_prompt();
 
     char *question = build_question_prompt(tc);
@@ -4243,7 +4224,7 @@ int main(int argc, char **argv) {
                 cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, max_generation_tokens);
     } else {
         max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
-                                                   cfg.ctx_size, &max_prompt_case);
+                                                   &max_prompt_case);
         fprintf(stderr,
                 "pulsar-eval: context set to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
@@ -4252,7 +4233,6 @@ int main(int argc, char **argv) {
                                  max_generation_tokens);
     }
     fprintf(stderr, "pulsar-eval: model shape %s\n", pulsar_engine_model_name(engine));
-    eval_warn_think_effort_downgraded(&cfg);
     trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases,
                        max_prompt_tokens, max_generation_tokens);
     char ctxmem_line[256];

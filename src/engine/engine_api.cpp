@@ -53,47 +53,74 @@ bool pulsar_think_mode_enabled(pulsar_think_mode mode) {
 
 
 
+bool pulsar_think_mode_valid(pulsar_think_mode mode) {
+    return mode == PULSAR_THINK_NONE ||
+           (mode >= PULSAR_THINK_EFFORT_MIN && mode <= PULSAR_THINK_EFFORT_MAX);
+}
+
+
+
+/* One row per effort 0..100: [0] the name / "" prefix for thinking-off, the
+ * rest the decimal effort and its rendered line.  Built once, read forever;
+ * every caller keeps a const char* into it. */
+namespace {
+struct think_effort_row {
+    char name[4];      /* "1".."100" */
+    char prefix[160];  /* PULSAR_REASONING_EFFORT_HEAD N PULSAR_REASONING_EFFORT_TAIL */
+};
+struct think_effort_table {
+    think_effort_row row[PULSAR_THINK_EFFORT_MAX + 1];
+    think_effort_table() {
+        memset(row, 0, sizeof row);
+        for (int n = PULSAR_THINK_EFFORT_MIN; n <= PULSAR_THINK_EFFORT_MAX; n++) {
+            snprintf(row[n].name, sizeof row[n].name, "%d", n);
+            const int w = snprintf(row[n].prefix, sizeof row[n].prefix,
+                                   PULSAR_REASONING_EFFORT_HEAD "%d" PULSAR_REASONING_EFFORT_TAIL, n);
+            if (w <= 0 || (size_t)w >= sizeof row[n].prefix) pulsar_die("reasoning-effort line does not fit its row");
+        }
+    }
+};
+const think_effort_table &think_efforts() {
+    static const think_effort_table t;
+    return t;
+}
+}
+
+
+
 const char *pulsar_think_mode_name(pulsar_think_mode mode) {
     switch (mode) {
     case PULSAR_THINK_NONE: return "none";
     case PULSAR_THINK_LOW:  return "low";
     case PULSAR_THINK_HIGH: return "high";
     case PULSAR_THINK_MAX:  return "max";
+    default: break;
     }
-    return "unknown";
+    if (!pulsar_think_mode_valid(mode)) pulsar_die("pulsar_think_mode_name: not a thinking mode");
+    return think_efforts().row[mode].name;
 }
 
 
 
 const char *pulsar_think_effort_prefix(pulsar_think_mode mode) {
-    switch (mode) {
-    case PULSAR_THINK_HIGH: return PULSAR_REASONING_EFFORT_HIGH_PREFIX;
-    case PULSAR_THINK_MAX:  return PULSAR_REASONING_EFFORT_MAX_PREFIX;
-    default:                return "";
-    }
+    if (mode == PULSAR_THINK_NONE) return "";
+    if (!pulsar_think_mode_valid(mode)) pulsar_die("pulsar_think_effort_prefix: not a thinking mode");
+    return think_efforts().row[mode].prefix;
 }
 
 
 
-const char *pulsar_think_max_prefix(void) {
-    return PULSAR_REASONING_EFFORT_MAX_PREFIX;
-}
-
-
-
-uint32_t pulsar_think_max_min_context(void) {
-    return PULSAR_THINK_MAX_MIN_CONTEXT;
-}
-
-
-
-pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size) {
-    if (pulsar_think_effort_prefix(mode)[0] &&
-        (uint32_t)(ctx_size > 0 ? ctx_size : 0) < PULSAR_THINK_MAX_MIN_CONTEXT)
-    {
-        return PULSAR_THINK_LOW;
-    }
-    return mode;
+size_t pulsar_think_effort_prefix_len(const char *s) {
+    if (!s) return 0;
+    const size_t head = sizeof(PULSAR_REASONING_EFFORT_HEAD) - 1;
+    if (strncmp(s, PULSAR_REASONING_EFFORT_HEAD, head) != 0) return 0;
+    const char *p = s + head;
+    int n = 0, digits = 0;
+    while (*p >= '0' && *p <= '9' && digits < 3) { n = n * 10 + (*p - '0'); p++; digits++; }
+    if (digits == 0 || n < PULSAR_THINK_EFFORT_MIN || n > PULSAR_THINK_EFFORT_MAX) return 0;
+    const size_t tail = sizeof(PULSAR_REASONING_EFFORT_TAIL) - 1;
+    if (strncmp(p, PULSAR_REASONING_EFFORT_TAIL, tail) != 0) return 0;
+    return (size_t)(p - s) + tail;
 }
 
 

@@ -191,15 +191,11 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     const char *bos = PULSAR_SERVER_RENDER_BOS;
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_MAX, PULSAR_THINK_HIGH};
-    for (size_t i = 0; i < sizeof(prefixed_modes) / sizeof(prefixed_modes[0]); i++) {
-        const char *effort_prefix = pulsar_think_effort_prefix(prefixed_modes[i]);
-        const size_t effort_prefix_len = strlen(effort_prefix);
-        if (effort_prefix_len && !strncmp(p, effort_prefix, effort_prefix_len)) {
-            p += effort_prefix_len;
-            break;
-        }
-    }
+    /* V4.1 leads a thinking conversation with the System token and the effort
+     * line; neither belongs to the client's system region. */
+    const size_t sys_len = strlen(PULSAR_RENDER_SYSTEM);
+    if (!strncmp(p, PULSAR_RENDER_SYSTEM, sys_len)) p += sys_len;
+    p += pulsar_think_effort_prefix_len(p);
     while (*p && isspace((unsigned char)*p)) p++;
 
     const char *user = strstr(p, PULSAR_RENDER_USER);

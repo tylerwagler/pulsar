@@ -754,8 +754,7 @@ void *client_main(void *arg) {
         request creq;
         char cerr[160];
         if (!parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
-                                     pulsar_session_ctx(s->sess), &creq,
-                                     cerr, sizeof(cerr)))
+                                     &creq, cerr, sizeof(cerr)))
         {
             http_error_anthropic(fd, 400, cerr);
             http_request_free(&hr);
@@ -776,21 +775,19 @@ void *client_main(void *arg) {
     ok = false;
     bool anthropic_surface;
     anthropic_surface = false;
-    int ctx_size;
-    ctx_size = pulsar_session_ctx(s->sess);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         anthropic_surface = true;
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
-                                     ctx_size, &req, err, sizeof(err));
+                                     &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err));
+                                &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
-                                     ctx_size, &req, err, sizeof(err));
+                                     &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
-                                      ctx_size, &req, err, sizeof(err));
+                                      &req, err, sizeof(err));
     } else {
         http_error(fd, 404, "unknown endpoint");
         http_request_free(&hr);
@@ -815,6 +812,8 @@ void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_served_model_id(s));
     }
+    int ctx_size;
+    ctx_size = pulsar_session_ctx(s->sess);
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
         request_free(&req);

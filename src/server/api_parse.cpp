@@ -49,8 +49,8 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+bool parse_chat_request_render(server *s, const char *body, int def_tokens,
+                               request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
     bool got_messages = false;
@@ -60,7 +60,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     bool got_top_logprobs = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -223,8 +223,7 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     /* parse_chat_request accepts a NULL server (parse-without-server, exercised
      * by the tool-call-quality test). The predecessor free functions no-op'd on
      * null s via their internal `if (!s) return` guard; as members that guard is
@@ -248,7 +247,6 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
         r->force_tool_call = true;
         request_apply_forced_tool_prefill(r);
     }
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -262,8 +260,17 @@ bad:
 
 
 
+bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
+                        request *r, char *err, size_t errlen) {
+    if (!parse_chat_request_render(s, body, def_tokens, r, err, errlen)) return false;
+    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    return true;
+}
+
+
+
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+                                    request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
     const char *p = body;
@@ -273,7 +280,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -442,8 +449,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (s && !s->anthropic_validate_tool_results(&msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -1171,7 +1177,7 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
 
 
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+                                    request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
     const char *p = body;
@@ -1180,7 +1186,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -1392,8 +1398,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (s && !s->responses_validate_tool_outputs(&msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -1473,14 +1478,14 @@ static bool parse_prompt(const char **p, char **out) {
 
 
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
     int skr = 0;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
+    pulsar_think_mode reasoning_effort = PULSAR_THINK_DEFAULT;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1570,8 +1575,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     r->prompt_text = render_completion_prompt_text(prompt, r->think_mode);
     pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);

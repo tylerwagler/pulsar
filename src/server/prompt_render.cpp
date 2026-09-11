@@ -2,11 +2,18 @@
 
 
 
+/* Byte-identical to the V4.1 reference encoder's TOOLS_TEMPLATE (encoding.py
+ * render_tools).  The V4-era additions this prompt used to carry -- entity-
+ * escape guidance, the "finish reasoning with </think>" rewording (upstream
+ * ds4 fe2d3b0), "Use the exact parameter names" -- were observed-behaviour
+ * workarounds for a model that no longer serves here; V4.1 gets the text it
+ * was trained on, and any V4.1 workaround earns its place from V4.1 samples
+ * (L218). */
 static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
     buf_puts(b,
         "## Tools\n\n"
-        "You have access to a set of tools to help answer the user question. "
+        "You have access to a set of tools to help answer the user's question. "
         "You can invoke tools by writing a \"" PULSAR_TOOL_CALLS_START "\" block like the following:\n\n"
         PULSAR_TOOL_CALLS_START "\n"
         PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
@@ -17,21 +24,13 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "...\n"
         PULSAR_INVOKE_END "\n"
         PULSAR_TOOL_CALLS_END "\n\n"
-        "String parameters should be specified as raw text and set `string=\"true\"`. "
-        "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
-        "Only if a string value itself contains the exact closing parameter tag `" PULSAR_PARAM_END "`, write that tag as `&lt;/" PULSAR_DSML PULSAR_DSML_PARAM_NAME ">` inside the value. "
+        "String parameters should be specified as is and set `string=\"true\"`. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-        /* Do not ask the model to OPEN a <think> block the prompt already
-         * opened — that wording provoked a second reasoning pass after the
-         * first </think> (upstream ds4 fe2d3b0). NOTE: changes the rendered
-         * tools-prompt bytes — one-time full re-prefill of cached prefixes on
-         * first request after upgrade. */
-        "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
     buf_puts(b, tool_schemas);
-    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
-                "Use the exact parameter names from the schemas.");
+    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
 }
 
 
@@ -89,9 +88,12 @@ static bool json_args_parse(const char *json, json_args *args) {
             is_string = true;
             if (!json_string(&p, &value)) goto bad;
         } else {
+            /* The reference writes non-string values with Python's json.dumps
+             * (", " and ": " separators, repr() floats, non-ASCII raw); the
+             * bytes are what the model was trained on. */
             char *raw = NULL;
             if (!json_raw_value(&p, &raw)) goto bad;
-            value = json_minify_raw_value(raw);
+            value = json_python_dumps_raw_value(raw);
             free(raw);
         }
 
@@ -193,7 +195,22 @@ static void append_dsml_arg(buf *b, const json_arg *arg) {
 
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
     json_args args = {0};
-    if (!json_args_parse(json, &args)) return false;
+    if (!json_args_parse(json, &args)) {
+        /* encoding.py encode_arguments_to_dsml tolerates a DOUBLE-encoded
+         * arguments field (a JSON string whose content is the object) by
+         * decoding twice; clients that stringify twice are common enough that
+         * the reference renders them as parameters, so we do too. */
+        const char *p = json ? json : "";
+        json_ws(&p);
+        char *inner = NULL;
+        bool ok = false;
+        if (*p == '"' && json_string(&p, &inner)) {
+            json_ws(&p);
+            ok = *p == '\0' && json_args_parse(inner, &args);
+        }
+        free(inner);
+        if (!ok) return false;
+    }
     if (order) {
         for (int i = 0; i < order->len; i++) {
             int idx = json_args_find_unused(&args, order->prop[i]);
@@ -253,11 +270,15 @@ void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
         buf_puts(b, PULSAR_INVOKE_START " name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
+        const size_t before_args = b->len;
         if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
             buf_puts(b, PULSAR_PARAM_START " name=\"arguments\" string=\"true\">");
             append_dsml_parameter_text(b, tc->arguments);
             buf_puts(b, PULSAR_PARAM_END "\n");
         }
+        /* reference: name line, "\n".join(parameters), "\n", close -- so an
+         * invoke with no parameters carries one blank line */
+        if (b->len == before_args) buf_puts(b, "\n");
         buf_puts(b, PULSAR_INVOKE_END "\n");
     }
     buf_puts(b, PULSAR_TOOL_CALLS_END);
@@ -331,8 +352,19 @@ void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertis
     r->think = pulsar_think_mode_enabled(think_mode);
     r->tool_context = tools_advertised || chat_history_uses_tool_context(msgs, NULL);
     r->last_user_idx = -1;
+    /* V4.1: a mid-conversation system message counts as a user turn for the
+     * "last user" that governs reasoning replay (encoding.py
+     * find_last_user_index: role system at index > 0).  The LEADING run of
+     * system messages is the system region, not a turn. */
+    int leading_end = 0;
+    while (msgs && leading_end < msgs->len &&
+           role_is_system(msgs->v[leading_end].role) &&
+           !msgs->v[leading_end].system_field)
+        leading_end++;
     for (int i = 0; msgs && i < msgs->len; i++) {
-        if (role_is_user_like(msgs->v[i].role)) r->last_user_idx = i;
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_user_like(m->role)) r->last_user_idx = i;
+        else if (role_is_system(m->role) && !m->system_field && i >= leading_end) r->last_user_idx = i;
     }
 }
 
@@ -376,27 +408,30 @@ void append_assistant_turn_sampled(buf *out, bool close_think, const char *reaso
 void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
     const chat_msg *m = &msgs->v[i];
     if (role_is_system(m->role)) {
-        /* Mid-conversation system message: render in place as an
-         * environment note (the wrapper agent clients already use for
-         * injected context), so the rendered prefix stays append-only
-         * across turns (L113). */
-        buf_puts(out, PULSAR_RENDER_USER "<system-reminder>\n");
+        /* Mid-conversation system message: V4.1 renders it in place behind
+         * the System token, and it counts as a user turn for the assistant
+         * header that follows (encoding.py find_last_user_index).  In place
+         * keeps the rendered prefix append-only across turns (L113); the
+         * V4-era <system-reminder> wrapper emulated what the token now does. */
+        buf_puts(out, PULSAR_RENDER_SYSTEM);
         buf_puts(out, m->content ? m->content : "");
-        buf_puts(out, "\n</system-reminder>");
         r->pending_assistant = true;
-        r->pending_tool_result = false;
+        r->user_turn_open = false;
     } else if (!strcmp(m->role, "user")) {
-        buf_puts(out, PULSAR_RENDER_USER);
+        /* encoding.py merge_tool_messages: consecutive user-side messages
+         * (user text, tool results, in any order) are one <｜User｜> turn whose
+         * parts are joined by "\n\n". */
+        buf_puts(out, r->user_turn_open ? "\n\n" : PULSAR_RENDER_USER);
         buf_puts(out, m->content ? m->content : "");
         r->pending_assistant = true;
-        r->pending_tool_result = false;
+        r->user_turn_open = true;
     } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-        if (!r->pending_tool_result) buf_puts(out, PULSAR_RENDER_USER);
+        buf_puts(out, r->user_turn_open ? "\n\n" : PULSAR_RENDER_USER);
         buf_puts(out, "<tool_result>");
         append_tool_result_text(out, m->content);
         buf_puts(out, "</tool_result>");
         r->pending_assistant = true;
-        r->pending_tool_result = true;
+        r->user_turn_open = true;
     } else if (!strcmp(m->role, "assistant")) {
         if (r->pending_assistant) {
             /* Reasoning replays on every turn under tool context (agentic
@@ -412,11 +447,16 @@ void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
             append_assistant_turn_close(out, true, replay ? (m->reasoning ? m->reasoning : "") : NULL,
                                         m->content, &m->calls);
         } else {
-            /* A second assistant message in a row continues the open turn. */
-            append_assistant_turn_close(out, false, NULL, m->content, &m->calls);
+            /* A second assistant message in a row: no header (the previous
+             * turn's EOS stands), but the reference renders its thinking part
+             * by the same rule as any assistant turn -- reasoning + </think>
+             * when replaying, nothing otherwise (encoding.py render_message). */
+            const bool replay = r->think && (r->tool_context || i > r->last_user_idx);
+            append_assistant_turn_close(out, replay, replay ? (m->reasoning ? m->reasoning : "") : NULL,
+                                        m->content, &m->calls);
         }
         r->pending_assistant = false;
-        r->pending_tool_result = false;
+        r->user_turn_open = false;
     }
 }
 
@@ -435,13 +475,6 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     chat_render r;
     chat_render_init(&r, msgs, tool_schemas && tool_schemas[0], think_mode);
     buf system = {0};
-    /* Render tool schemas before the client system content so the cold
-     * boundary-trim (KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS) chops a dynamic
-     * tail from the client message instead of the much larger tool-schema
-     * region. */
-    if (tool_schemas && tool_schemas[0]) {
-        append_tools_prompt_text(&system, tool_schemas);
-    }
     /* L113: only the LEADING run of system messages (plus the top-level
      * system/instructions FIELD, wherever the parser appended it) joins the
      * system region. Mid-conversation system-role messages render IN PLACE
@@ -462,10 +495,23 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         if (system.len) buf_puts(&system, "\n\n");
         buf_puts(&system, m->content ? m->content : "");
     }
+    /* The reference renders the tool schemas AFTER the system content
+     * (system + "\n\n" + render_tools).  The V4-era tools-first order bought
+     * the cold boundary-trim a cheaper tail; V4.1 gets the order it was
+     * trained on. */
+    if (tool_schemas && tool_schemas[0]) {
+        if (system.len) buf_puts(&system, "\n\n");
+        append_tools_prompt_text(&system, tool_schemas);
+    }
 
     buf out = {0};
     buf_puts(&out, PULSAR_SERVER_RENDER_BOS);
-    buf_puts(&out, pulsar_think_effort_prefix(think_mode));
+    /* V4.1 lead-in (encoding.py render_message, index 0): the System token
+     * when the conversation opens with the effort line (thinking on) or with
+     * system text, then the effort line, then the system region. */
+    const char *effort = pulsar_think_effort_prefix(think_mode);
+    if (effort[0] || system.len) buf_puts(&out, PULSAR_RENDER_SYSTEM);
+    buf_puts(&out, effort);
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     for (int i = 0; i < msgs->len; i++) {

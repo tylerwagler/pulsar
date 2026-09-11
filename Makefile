@@ -1020,6 +1020,18 @@ cuda-runner-gate: tests/gates_runner
 unit-test-gate: pulsar_test seam-check
 	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test
 
+# The renderer gate (L218): pulsar's chat renderer must produce the SAME BYTES
+# as DeepSeek's reference encoder for every conversation it serves.  Oracle =
+# the checkpoint's encoding/ (its shipped goldens plus encoding.py imported
+# for the corpus); no model is loaded.  RENDER_GATE_CASES names JSON case
+# files or directories in the L216 corpus layout (default: the reference's
+# goldens only).
+V41_REFERENCE_ENCODING ?= /home/claude/v41/encoding
+RENDER_GATE_CASES ?=
+.PHONY: render-gate
+render-gate: pulsar_test
+	python3 tests/render_gate.py --reference "$(V41_REFERENCE_ENCODING)" --vectors $(if $(RENDER_GATE_CASES),--cases $(RENDER_GATE_CASES),)
+
 # The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
 # tests/gates_runner.cpp) -- one 86 GB model load per engine configuration
 # instead of one per gate.  Their individual targets below remain for

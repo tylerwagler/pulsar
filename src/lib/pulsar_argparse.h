@@ -34,6 +34,18 @@ static inline int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+/* Int in [min, max]. */
+static inline int parse_int_range(const char *s, const char *opt, int min, int max) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "%s: invalid value for %s: %s (expected %d..%d)\n",
+                program_invocation_short_name, opt, s, min, max);
+        exit(2);
+    }
+    return (int)v;
+}
+
 /* Non-negative int (allows 0). */
 static inline int parse_nonnegative_int(const char *s, const char *opt) {
     char *end = NULL;

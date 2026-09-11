@@ -233,7 +233,7 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = PULSAR_DEFAULT_TEMPERATURE;
     r->top_p = PULSAR_DEFAULT_TOP_P;
     r->min_p = PULSAR_DEFAULT_MIN_P;
-    r->think_mode = PULSAR_THINK_LOW;
+    r->think_mode = PULSAR_THINK_DEFAULT;
 }
 
 
@@ -265,10 +265,10 @@ pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort
 
 
 
-/* DS4 exposes the 0731 levels low/high/max above zero. OpenAI-style names
- * collapse onto them: "minimal"/"medium" join "low" (the prefix-free
- * default), "xhigh" joins "max". Callers that need *no* reasoning must use
- * "none" instead. */
+/* The V4.1 reference encoder accepts three names -- low/high/max, the presets
+ * 50/75/100 on the effort axis -- or an integer in [1, 100].  OpenAI-style
+ * names collapse onto the presets: "minimal"/"medium" join "low", "xhigh"
+ * joins "max".  Callers that need *no* reasoning must use "none". */
 bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
     if (!s) return false;
     if (!strcmp(s, "max") || !strcmp(s, "xhigh")) {
@@ -292,14 +292,23 @@ bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
 
 
 
+/* A JSON string names a preset; a JSON integer in [1, 100] is the effort
+ * itself (the reference encoder accepts both). */
 bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
-    char *effort = NULL;
-    if (!json_string(p, &effort)) return false;
-    bool ok = parse_reasoning_effort_name(effort, out);
-    free(effort);
-    return ok;
+    if (**p == '"') {
+        char *effort = NULL;
+        if (!json_string(p, &effort)) return false;
+        bool ok = parse_reasoning_effort_name(effort, out);
+        free(effort);
+        return ok;
+    }
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (v != (double)(int)v || (int)v < PULSAR_THINK_EFFORT_MIN || (int)v > PULSAR_THINK_EFFORT_MAX) return false;
+    *out = (pulsar_think_mode)(int)v;
+    return true;
 }
 
 

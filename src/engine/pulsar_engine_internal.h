@@ -65,28 +65,13 @@
 #define PULSAR_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define PULSAR_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
 
-/** Reasoning-effort prompt prefixes, byte-identical to the 0731 reference
- * encoder (encoding_dsv4.py REASONING_EFFORT_PROMPTS). The 0731 release
- * restructured the levels: "low" (the default) adds nothing, "high" carries
- * the text that was "max" in the original release, and "max" gained a new
- * stronger text. Rendering the old single-prefix scheme against the 0731
- * weights silently demotes every level by one. */
-static const char PULSAR_REASONING_EFFORT_HIGH_PREFIX[] =
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-
-static const char PULSAR_REASONING_EFFORT_MAX_PREFIX[] =
-    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
-
-
-/** DeepSeek recommends the high and max effort levels only with a 384K-token
- * output budget (0731 model card). Below that context size we drop to LOW —
- * ordinary thinking, no prefix — to avoid injecting a prompt that asks for a
- * reasoning budget the allocated context is not meant to hold. */
-#define PULSAR_THINK_MAX_MIN_CONTEXT 393216u
+/** The V4.1 reasoning-effort line, byte-identical to the reference encoder
+ * (encoding.py REASONING_EFFORT_TEMPLATE): the head, the decimal effort, the
+ * tail.  Rendered before the system message whenever thinking is on; there
+ * is no level that renders nothing (the 0731 "low adds nothing" scheme went
+ * with 0731, L218). */
+#define PULSAR_REASONING_EFFORT_HEAD "Reasoning Effort: "
+#define PULSAR_REASONING_EFFORT_TAIL " (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -1342,6 +1327,7 @@ struct pulsar_vocab {
     int eos_id;            ///< end-of-sequence token
     int user_id;           ///< chat role marker: user turn
     int assistant_id;      ///< chat role marker: assistant turn
+    int system_id;         ///< chat role marker: system text (V4.1 leads a thinking conversation with it)
     int think_start_id;    ///< opens a reasoning span
     int think_end_id;      ///< closes a reasoning span
     int dsml_id;           ///< DSML tool-call marker

@@ -175,9 +175,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    opt(fp, c, "--think", "Use thinking mode at the default (low) reasoning effort.");
-    opt(fp, c, "--think-high", "Use high reasoning effort when context is large enough.");
-    opt(fp, c, "--think-max", "Use max reasoning effort when context is large enough.");
+    opt(fp, c, "--think", "Use thinking mode at the default reasoning effort (high, 75).");
+    opt(fp, c, "--think-effort N", "Use thinking mode at effort N in [1, 100] (V4.1 numeric budget).");
+    opt(fp, c, "--think-low, --think-high, --think-max", "The named presets: effort 50, 75, 100.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
@@ -226,7 +226,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-high, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think [N], /think-low, /think-high, /think-max, /nothink", "Switch thinking mode / effort.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
@@ -413,7 +413,7 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
     } else {
         opt(fp, c, "chat", "./pulsar");
         opt(fp, c, "one shot", "./pulsar -p \"Explain mmap in C\"");
-        opt(fp, c, "long prompt", "./pulsar --think-max --prompt-file prompt.txt --ctx 393216");
+        opt(fp, c, "long prompt", "./pulsar --think-max --prompt-file prompt.txt --ctx 262144");
     }
     fputc('\n', fp);
 }

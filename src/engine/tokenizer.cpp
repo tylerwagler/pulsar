@@ -523,6 +523,7 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     vocab->eos_id       = vocab->vocab_lookup("<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab->vocab_lookup("<｜User｜>");
     vocab->assistant_id = vocab->vocab_lookup("<｜Assistant｜>");
+    vocab->system_id    = vocab->vocab_lookup("<｜System｜>");
     vocab->think_start_id = vocab->vocab_lookup("<think>");
     vocab->think_end_id = vocab->vocab_lookup("</think>");
     vocab->dsml_id = vocab->vocab_lookup("｜DSML｜");
@@ -540,9 +541,23 @@ void pulsar_vocab::vocab_free() {
 
 
 
-/* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
- * marker, and either <think> or </think> depending on the requested mode.  Max
- * thinking is only a prompt prefix: the model still enters through <think>. */
+/* The V4.1 conversation lead-in after BOS: the System token when the
+ * conversation opens with the effort line (thinking on) or with system text,
+ * then the effort line.  One authority for the CLI path; the server renderer
+ * writes the same bytes (prompt_render.cpp). */
+static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
+                                pulsar_think_mode think_mode, token_vec *out) {
+    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
+    if (effort_prefix[0] || has_system) token_vec_push(out, vocab->system_id);
+    if (effort_prefix[0]) vocab->bpe_tokenize_text(effort_prefix, out);
+}
+
+
+
+/* Build the V4.1 chat prompt: BOS, the lead-in, optional system text, user
+ * prompt, assistant marker, and either <think> or </think> depending on the
+ * requested mode.  The effort line is only a prompt prefix: the model still
+ * enters through <think>. */
 static void encode_chat_prompt(
         const pulsar_vocab *vocab,
         const char      *system,
@@ -550,11 +565,9 @@ static void encode_chat_prompt(
         pulsar_think_mode   think_mode,
         token_vec       *out) {
     token_vec_push(out, vocab->bos_id);
-    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
-    if (effort_prefix[0]) {
-        vocab->bpe_tokenize_text(effort_prefix, out);
-    }
-    if (system && system[0]) {
+    const bool has_system = system && system[0];
+    encode_chat_lead_in(vocab, has_system, think_mode, out);
+    if (has_system) {
         vocab->bpe_tokenize_text(system, out);
     }
     token_vec_push(out, vocab->user_id);
@@ -585,6 +598,7 @@ bool pulsar_vocab::special_token_at(const char *p, int *token, size_t *len) cons
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
+        {"<｜System｜>",            vocab->system_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"｜DSML｜",                vocab->dsml_id},
@@ -662,9 +676,9 @@ void pulsar_encode_chat_prompt(
 
 
 
-void pulsar_chat_append_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
-    if (effort_prefix[0]) e->vocab.bpe_tokenize_text(effort_prefix, tokens);
+void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
+                                pulsar_think_mode think_mode) {
+    encode_chat_lead_in(&e->vocab, has_system, think_mode, tokens);
 }
 
 

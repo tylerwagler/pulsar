@@ -235,7 +235,4 @@ agent_config parse_options(int argc, char **argv) {
 
 
 
-pulsar_think_mode effective_think_mode(const agent_config *cfg) {
-    return pulsar_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
-}
 

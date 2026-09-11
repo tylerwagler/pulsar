@@ -1066,7 +1066,7 @@ static void test_tool_call_quality_one(void) {
     request r;
     char err[160];
     TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
-                                   512, 32768, &r, err, sizeof(err)));
+                                   512, &r, err, sizeof(err)));
 
     pulsar_session *session = NULL;
     TEST_ASSERT(pulsar_session_create(&session, engine, 32768) == 0);
@@ -2235,7 +2235,7 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"temperature\":0.35,\"top_k\":40,\"top_p\":0.9,\"min_p\":0.1}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_k && r.top_k == 40);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
@@ -2245,7 +2245,7 @@ static void test_api_sampling_presence_flags(void) {
     /* OpenAI chat completions: nothing sent -> defaults, all flags false */
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(!r.has_temperature && r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(!r.has_top_k && r.top_k == 0);
     TEST_ASSERT(!r.has_top_p && r.top_p == PULSAR_DEFAULT_TOP_P);
@@ -2258,7 +2258,7 @@ static void test_api_sampling_presence_flags(void) {
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"max_tokens\":64,\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40,"
         "\"min_p\":0.1,\"seed\":123}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_k && r.top_k == 40);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
@@ -2271,7 +2271,7 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(parse_responses_request(engine, NULL,
         "{\"input\":\"hi\",\"temperature\":0.35,\"top_p\":0.9,\"top_k\":40,"
         "\"min_p\":0.1,\"seed\":123}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == 0.35f);
     TEST_ASSERT(r.has_top_p && r.top_p == 0.9f);
     TEST_ASSERT(r.has_top_k && r.top_k == 40);
@@ -2284,7 +2284,7 @@ static void test_api_sampling_presence_flags(void) {
     TEST_ASSERT(parse_completion_request(engine,
         "{\"prompt\":\"hi\",\"temperature\":1.0,\"top_k\":0,"
         "\"top_p\":1.0,\"min_p\":0.05}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_temperature && r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.has_top_k && r.top_k == 0);
     TEST_ASSERT(r.has_top_p && r.top_p == PULSAR_DEFAULT_TOP_P);
@@ -2308,13 +2308,13 @@ static void test_anthropic_count_tokens_parse(void) {
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"max_tokens\":64}";
     TEST_ASSERT(parse_anthropic_request(engine, NULL, one_turn,
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     const int n_one = r.prompt.len;
     TEST_ASSERT(n_one > 0);
     request_free(&r);
 
     TEST_ASSERT(parse_anthropic_request(engine, NULL, one_turn,
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.prompt.len == n_one);
     request_free(&r);
 
@@ -2323,7 +2323,7 @@ static void test_anthropic_count_tokens_parse(void) {
         "{\"role\":\"assistant\",\"content\":\"hello there\"},"
         "{\"role\":\"user\",\"content\":\"tell me more about lobsters\"}],"
         "\"max_tokens\":64}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.prompt.len > n_one);
     request_free(&r);
 
@@ -2334,7 +2334,7 @@ static void test_anthropic_count_tokens_parse(void) {
         "\"description\":\"Get the current weather for a location\","
         "\"input_schema\":{\"type\":\"object\",\"properties\":"
         "{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}]}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.prompt.len > n_one);
     request_free(&r);
 }
@@ -2357,35 +2357,35 @@ static void test_api_min_p_range_validation(void) {
     /* OpenAI chat completions: min_p > 1 -> filter disabled, flag set */
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":1.5}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
     request_free(&r);
 
     /* OpenAI chat completions: min_p < 0 -> filter disabled, flag set */
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":-0.5}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
     request_free(&r);
 
     /* OpenAI chat completions: boundary values 0 and 1 are valid as-is */
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"min_p\":1.0}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_min_p && r.min_p == 1.0f);
     request_free(&r);
 
     /* Legacy completions: same clamp on the other min_p surface */
     TEST_ASSERT(parse_completion_request(engine,
         "{\"prompt\":\"hi\",\"min_p\":2.0}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_min_p && r.min_p == 0.0f);
     request_free(&r);
 
     /* Legacy completions: in-range value untouched */
     TEST_ASSERT(parse_completion_request(engine,
         "{\"prompt\":\"hi\",\"min_p\":0.1}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.has_min_p && r.min_p == 0.1f);
     request_free(&r);
 }
@@ -2408,13 +2408,13 @@ static void test_api_logprobs_parse_validation(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":true,\"top_logprobs\":5}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.logprobs && r.top_logprobs == 5);
     request_free(&r);
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"top_logprobs\":20,\"logprobs\":true}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.logprobs && r.top_logprobs == 20);
     request_free(&r);
 
@@ -2422,7 +2422,7 @@ static void test_api_logprobs_parse_validation(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":true}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(r.logprobs && r.top_logprobs == 0);
     request_free(&r);
 
@@ -2430,7 +2430,7 @@ static void test_api_logprobs_parse_validation(void) {
     TEST_ASSERT(parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":null,\"top_logprobs\":null}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(!r.logprobs && r.top_logprobs == 0);
     request_free(&r);
 
@@ -2438,24 +2438,24 @@ static void test_api_logprobs_parse_validation(void) {
     TEST_ASSERT(!parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"top_logprobs\":0}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(strstr(err, "requires"));
 
     /* out of domain: negative, fractional, above the cap — all 400s */
     TEST_ASSERT(!parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":true,\"top_logprobs\":-5}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(strstr(err, "integer"));
     TEST_ASSERT(!parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":true,\"top_logprobs\":3.9}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(strstr(err, "integer"));
     TEST_ASSERT(!parse_chat_request(engine, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
         "\"logprobs\":true,\"top_logprobs\":21}",
-        128, 32768, &r, err, sizeof(err)));
+        128, &r, err, sizeof(err)));
     TEST_ASSERT(strstr(err, "integer"));
 }
 
@@ -2651,6 +2651,44 @@ static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
 
+/* The renderer gate's engine side: PULSAR_RENDER_CASES names a JSONL file of
+ * OpenAI chat-completion request bodies, one per line, each carrying an
+ * "_id" field.  Every body is parsed and RENDERED (not tokenised: no model
+ * is loaded) and the bytes are printed between markers for
+ * tests/render_gate.py to compare against the reference encoder.  A body the
+ * parser refuses is reported as such, so the gate can count it. */
+static void test_render_cases(void) {
+    const char *path = getenv("PULSAR_RENDER_CASES");
+    TEST_ASSERT(path && path[0]);
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    int rendered = 0, refused = 0;
+    while ((n = getline(&line, &cap, fp)) > 0) {
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        if (!n) continue;
+        const char *idp = strstr(line, "\"_id\":");
+        long id = idp ? strtol(idp + 6, NULL, 10) : -1;
+        request r;
+        char err[160];
+        if (!parse_chat_request_render(NULL, line, 128, &r, err, sizeof err)) {
+            printf("===CASE %ld REFUSED %s===\n", id, err);
+            refused++;
+            continue;
+        }
+        printf("===CASE %ld===\n%s\n===END===\n", id, r.prompt_text ? r.prompt_text : "");
+        request_free(&r);
+        rendered++;
+    }
+    free(line);
+    fclose(fp);
+    fprintf(stderr, "pulsar-test: render-cases: %d rendered, %d refused\n", rendered, refused);
+}
+
 /* The boot-line estimate is the engine's KV sizing read back: one bank's KV
  * in the stored row formats (packed attention rows, MXFP4 indexer rows), plus
  * the indexer_scores scratch.  The unit process has no model, so the loader's
@@ -2725,6 +2763,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},
 };
 
 static void test_print_help(const char *prog) {

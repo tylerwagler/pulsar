@@ -19,12 +19,23 @@ typedef enum {
     PULSAR_BACKEND_CUDA,
 } pulsar_backend;
 
-typedef enum {
-    PULSAR_THINK_NONE,
-    PULSAR_THINK_LOW,   /* thinking on, no effort prefix (DeepSeek's default) */
-    PULSAR_THINK_HIGH,  /* thinking on, "Absolute maximum" effort prefix */
-    PULSAR_THINK_MAX,   /* thinking on, "Beyond maximum" effort prefix */
-} pulsar_think_mode;
+/** Thinking mode and reasoning effort are ONE value (L218, V4.1): 0 is
+ * thinking off; 1..100 is thinking on at that effort budget, the integer the
+ * V4.1 encoder renders as "Reasoning Effort: N (range 1-100, ...)" before
+ * the system message.  The three names the reference encoder accepts are
+ * presets on the same axis -- low 50, high 75, max 100 -- and "high" is the
+ * reference default.  There is no "thinking on, no prefix" mode any more:
+ * V4.1 always renders the effort line when thinking. */
+typedef int pulsar_think_mode;
+enum {
+    PULSAR_THINK_NONE    = 0,
+    PULSAR_THINK_LOW     = 50,
+    PULSAR_THINK_HIGH    = 75,
+    PULSAR_THINK_MAX     = 100,
+    PULSAR_THINK_DEFAULT = PULSAR_THINK_HIGH,
+    PULSAR_THINK_EFFORT_MIN = 1,
+    PULSAR_THINK_EFFORT_MAX = 100,
+};
 
 typedef enum {
     PULSAR_LOG_DEFAULT,
@@ -170,13 +181,18 @@ int pulsar_engine_model_id(pulsar_engine *e);
 bool pulsar_engine_is_pruned(pulsar_engine *e);
 const char *pulsar_backend_name(pulsar_backend backend);
 bool pulsar_think_mode_enabled(pulsar_think_mode mode);
+/** True for 0 and for 1..100; anything else is not a mode. */
+bool pulsar_think_mode_valid(pulsar_think_mode mode);
+/** "none", the preset name ("low"/"high"/"max") or the decimal effort. */
 const char *pulsar_think_mode_name(pulsar_think_mode mode);
-/** The reasoning-effort prompt prefix rendered before the system message for
- * this mode ("" for NONE/LOW). Texts match the 0731 reference encoder. */
+/** The reasoning-effort line rendered before the system message when
+ * thinking is on ("" for NONE), byte-identical to the V4.1 reference encoder:
+ * "Reasoning Effort: N (range 1-100, the higher the value, the more thorough
+ * the reasoning)\n\n".  Static storage; valid for the process lifetime. */
 const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
-const char *pulsar_think_max_prefix(void);
-uint32_t pulsar_think_max_min_context(void);
-pulsar_think_mode pulsar_think_mode_for_context(pulsar_think_mode mode, int ctx_size);
+/** If `s` starts with SOME effort line, the length of that line (so a caller
+ * that strips it does not have to know the effort), else 0. */
+size_t pulsar_think_effort_prefix_len(const char *s);
 /** One bank's context buffers at ctx_size, priced by the engine's own KV
  * sizing (the managed-KV policy's numbers), so this and the engine's
  * "context buffers" boot line agree.  Uses the active model shape and
@@ -324,7 +340,10 @@ void pulsar_encode_chat_prompt(
         const char *prompt,
         pulsar_think_mode think_mode,
         pulsar_tokens *out);
-void pulsar_chat_append_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
+/** The V4.1 lead-in after BOS: the System token when the conversation opens
+ * with the effort line (thinking on) or with system text, then the effort line. */
+void pulsar_chat_append_lead_in(pulsar_engine *e, pulsar_tokens *tokens, bool has_system,
+                                pulsar_think_mode think_mode);
 void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content);
 void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode);
 

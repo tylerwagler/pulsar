@@ -1018,6 +1018,7 @@ typedef struct {
 /* The chat template's role markers and turn terminator (DeepSeek V4).  Written
  * only by the renderers in prompt_render.cpp; read by the few places that
  * parse a rendered prompt back (generate.cpp rendered_chat_system_region). */
+#define PULSAR_RENDER_SYSTEM "<｜System｜>"   /* V4.1: leads a thinking conversation or one opening with system text; marks mid-conversation system messages */
 #define PULSAR_RENDER_USER "<｜User｜>"
 #define PULSAR_RENDER_ASSISTANT "<｜Assistant｜>"
 #define PULSAR_RENDER_EOS "<｜end▁of▁sentence｜>"
@@ -2396,6 +2397,12 @@ bool json_bool(const char **p, bool *out);
 bool json_skip_value(const char **p);
 bool json_raw_value(const char **p, char **out);
 char *json_minify_raw_value(const char *json);
+/** Re-serialise one JSON value the way Python's json.dumps(value, ensure_ascii=False)
+ * prints it after json.loads(): ", " and ": " separators, keys in document order,
+ * strings escaped only for backslash, quote and controls (non-ASCII raw),
+ * integers verbatim, floats as repr().  Malloc'd; the input verbatim when it
+ * does not parse. */
+char *json_python_dumps_raw_value(const char *json);
 bool json_content(const char **p, char **out);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
@@ -2467,7 +2474,7 @@ typedef struct {
     bool tool_context;        ///< tools advertised or used in the history: reasoning replays on every turn
     int last_user_idx;        ///< index of the last user-side message; assistant turns after it replay reasoning
     bool pending_assistant;   ///< a user-side turn is open; the next assistant turn (or the tail) opens with the role marker
-    bool pending_tool_result; ///< the open user-side turn is a run of tool results (one role marker for the run)
+    bool user_turn_open;      ///< a user-side turn (text and/or tool results) is open; further user-side parts join it with "\n\n"
 } chat_render;
 void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
                       pulsar_think_mode think_mode);
@@ -2506,17 +2513,23 @@ void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
+/** parse_chat_request up to and including the rendered prompt TEXT, without
+ * tokenising it -- what the renderer gate compares against the reference
+ * encoder with no model loaded.  parse_chat_request is this plus the
+ * tokenisation. */
+bool parse_chat_request_render(server *s, const char *body, int def_tokens,
+                               request *r, char *err, size_t errlen);
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen);
+                               request *r, char *err, size_t errlen);
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen);
+                                    request *r, char *err, size_t errlen);
 bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded_tool_schemas,
                                   tool_schema_orders *orders);
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen);
+                                    request *r, char *err, size_t errlen);
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen);
+                                     request *r, char *err, size_t errlen);
 bool send_all(int fd, const void *p, size_t n);
 void json_escape(buf *b, const char *s);
 void json_escape_n(buf *b, const char *s, size_t n);
