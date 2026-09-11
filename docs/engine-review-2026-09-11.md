@@ -381,13 +381,16 @@ smaller structural items.)*
   0–1%. `v41-flash`: still 8-byte.
 
 ### C9. Prefill indexer computes the full causal rectangle
-- Evidence: `indexer_mxfp4.cu:306-353` — the per-token sweep has no visibility
-  bound; the only early-out is block-level (`:236-246`); out-of-visibility
-  columns are already overwritten with `-INF` in the epilogue (`:435-444`).
-- Change: bound each token's `nt0` loop by
-  `ceil(((pos0+tok0+1)/ratio)/8)` and skip whole tiles; combine unchanged.
-- Impact: up to ~2× on the scorer's causal half; small absolute (<1% of
-  prefill), free. Low. `v41-flash`: uses the candidate-mask scheme.
+- **STATUS 2026-09-11: NOT A FINDING.** The block-level early-out
+  (`indexer_mxfp4.cu:238-246`, `tile_c >= (pos0 + tok_base + ngroup)/ratio`)
+  already writes `-INF` and returns before any MMA, so the per-block grid
+  already carves the causal rectangle: hidden column tiles cost only the
+  masking stores. A per-token bound would only trim the diagonal-crossing
+  blocks, and a block's 8 tokens span just ~2 compressed columns at ratio 4,
+  so the waste is a couple of columns per token, not the ~half the review
+  estimated. Do not spend here unless a profile shows otherwise.
+- Evidence: `indexer_mxfp4.cu:238-246` (early-out), `:442` (per-column mask).
+  `v41-flash`: uses the candidate-mask scheme.
 
 ### C10. Smaller structural items (each ~0.2–0.4%)
 - **Indexed prefill arm misses the in-kernel E4M3 epilogue and folded inverse
@@ -467,7 +470,7 @@ changes need ppl + `pulsar-eval` q1..q4 + KL where attention/selection moves.
 5. C7 + C8 attention: unit gate for bit-exactness, then prefill/decode A/B.
 6. C6 `mxf4nvf4`: in-kernel scorer A/B and selection-set comparison against the
    existing top-k oracle; gate on D2.
-7. C3 hc_expand, C4 f16 scores, C5 f16 `low`, C9 causal bound: standalone then
+7. C3 hc_expand, C4 f16 scores, C5 f16 `low`: standalone then
    in-engine.
 8. B4 depth re-sweep [2,8] and the B9 8-vs-12/16 bank re-measure on the current
    kernels.
