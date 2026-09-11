@@ -330,7 +330,7 @@ static void tensor_expect_routed_expert_combo(
     fprintf(stderr,
             "pulsar: unsupported routed expert quant combo at tensor %.*s: "
             "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
-            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq (43); "
+            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq_k (44); "
             "combos may differ per layer\n",
             (int)gate->name.len,
             gate->name.ptr,
@@ -1000,6 +1000,97 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
 
 
 
+/* ---- E8M0 scale-plane validation ----------------------------------------
+ *
+ * The custom decode GEMVs decode an E8M0 scale byte as __int_as_float(b << 23),
+ * so 0xFF is +Inf.  cuBLASLt's VEC32_UE8M0 and the CUTLASS block-scaled MMA
+ * read the same byte as NaN (OCP), and the host codec's ldexpf(1, b-127) also
+ * gives +Inf.  Producers clamp to <=254, so 0xFF can only arrive from a foreign
+ * or corrupt file -- and when it does, one artifact runs two different
+ * arithmetics on the same weight.  Scan the E8M0 planes once on the cold load
+ * path (~1/32 of the weight bytes) and refuse the tensor by name.  Data planes
+ * are not scanned: E2M1/E4M3 payload bytes have no invalid encoding.
+ *
+ * E8M0 plane geometry per accepted type (see the consumers for the authority):
+ *   41 mxfp8_lt       [E4M3 data: one byte per element][swizzled E8M0 scale]
+ *   38 fp8_e4m3       33-byte interleaved blocks [E8M0][32 x E4M3]
+ *   40 cutlass_mxfp4   expert-major [data N*K/2][swizzled E8M0 SF] per expert
+ *   46 fp8_e4m3_soa_k [E8M0 scales: E x V/32][E4M3 payload]
+ *
+ * The scan is blocks of block_len bytes every stride bytes; a contiguous plane
+ * is one block.  Sizing that does not match the type's layout is left to the
+ * consumers' own refusals -- this pass must never be the thing that rejects a
+ * shape the engine would otherwise read. */
+static void e8m0_scan_blocks(
+        const pulsar_model *m,
+        const pulsar_tensor *t,
+        uint64_t         off,
+        uint64_t         block_len,
+        uint64_t         stride,
+        uint64_t         nblocks,
+        const char      *what) {
+    if (nblocks == 0 || block_len == 0) return;
+    const uint64_t base = t->abs_offset;
+    /* off + (nblocks-1)*stride + block_len, overflow-checked. */
+    if (off > t->bytes || block_len > t->bytes - off) return;
+    const uint64_t last = off + (nblocks - 1u) * stride;
+    if (last < off || last > t->bytes || block_len > t->bytes - last) return;
+    const uint8_t *map = t->ext_map ? t->ext_map : m->map;
+    const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+    if (base > map_size || last > map_size - base || block_len > map_size - base - last) return;
+
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const uint8_t *p = map + base + off + b * stride;
+        for (uint64_t i = 0; i < block_len; i++) {
+            if (p[i] != 0xFFu) continue;
+            fprintf(stderr,
+                    "pulsar: tensor %.*s: %s E8M0 scale byte 0xFF at plane offset %llu\n",
+                    (int)t->name.len, t->name.ptr, what,
+                    (unsigned long long)(off + b * stride + i));
+            fprintf(stderr,
+                    "pulsar: 0xFF never decodes consistently (custom GEMVs read +Inf, "
+                    "cuBLASLt/CUTLASS read NaN); refusing the artifact\n");
+            exit(1);
+        }
+    }
+}
+
+
+
+static void weights_reject_bad_e8m0(const pulsar_model *m) {
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor *t = &m->tensors[i];
+        switch (t->type) {
+        case PULSAR_TENSOR_MXFP8_LT:
+            /* One E4M3 byte per element, then the scale plane; do not restate
+             * the swizzle geometry here. */
+            if (t->elements > t->bytes) break;
+            e8m0_scan_blocks(m, t, t->elements, t->bytes - t->elements, 0, 1, "MXFP8");
+            break;
+        case PULSAR_TENSOR_FP8_E4M3:
+            e8m0_scan_blocks(m, t, 0, 1, 33u, t->bytes / 33u, "FP8");
+            break;
+        case PULSAR_TENSOR_CUTLASS_MXFP4: {
+            uint64_t data = 0, sf = 0, stride = 0;
+            if (t->ndim < 3) break;
+            cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data, &sf, &stride);
+            e8m0_scan_blocks(m, t, data, sf, stride, t->dim[2], "MXFP4");
+            break;
+        }
+        case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+            /* dims (V, E): scales E x V/32, then the E4M3 payload.  A V not
+             * divisible by 32 is refused by the consumer. */
+            if (t->ndim < 2 || (t->dim[0] & 31u)) break;
+            e8m0_scan_blocks(m, t, 0, t->dim[1] * (t->dim[0] >> 5), 0, 1, "SoA");
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+
+
 static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
     if (required) {
         w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
@@ -1077,6 +1168,7 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
 void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->token_embd = required_tensor(m, "token_embd.weight");
     weights_bind_output(w, m, true, false);
@@ -1191,6 +1283,7 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
