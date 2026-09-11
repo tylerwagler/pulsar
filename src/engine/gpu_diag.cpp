@@ -2079,6 +2079,12 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->spec_compact_rows = 0;
         g->spec_compact_armed = false;
         g->spec_compact_acc_n = 0;
+        g->spec_argmax_host = (int32_t *)xmalloc(
+            (size_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
+        g->spec_argmax_rows = 0;
+        g->spec_argmax_armed = false;
+        g->spec_argmax_acc_n = 0;
+        g->spec_argmax_acc_ok = false;
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
              g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&

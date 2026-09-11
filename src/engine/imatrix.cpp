@@ -1165,19 +1165,32 @@ int gpu_graph_decode_multiseq_batch(
      * first-appearance). Decode-only => head_runs == n_runs == n_active, row k ==
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
-    if (head_all_rows && g->spec_compact_armed) {
+    if (head_all_rows && g->spec_argmax_armed) {
+        /* L219: every round in this step is greedy, so the walk consults only
+         * each row's argmax.  Run the per-row argmax on device (the same
+         * readback the fused lane and the classic verify use) and read ints
+         * instead of head_runs x 517 KB.  Greedy and compact are mutually
+         * exclusive by temperature; a device failure refuses rather than
+         * falling back to the full read (L174). */
+        ok = gpu_graph_spec_argmax_read(g, 0u, head_runs);
+        if (!ok)
+            fprintf(stderr, "pulsar: spec argmax readback failed for %u rows -- refusing "
+                            "(no full-row readback fallback; L174)\n", head_runs);
+    } else if (head_all_rows && g->spec_compact_armed) {
         /* L149 phase 2: every round in this step is in the sparse min-p
          * contract -- read the prefilter's compact block (16 KB/row) instead of
          * the 517 KB rows; the caller's `logits` block is left untouched and
          * the accept walk builds from candidates.  A failed compact read used to
          * fall to the full readback silently -- a device error read as a slower
          * path (L174). */
+        g->spec_argmax_rows = 0;
         ok = gpu_graph_spec_compact_read(g, 0u, head_runs);
         if (!ok)
             fprintf(stderr, "pulsar: spec compact readback failed for %u rows -- refusing "
                             "(no full-row readback fallback; L174)\n", head_runs);
     } else {
         g->spec_compact_rows = 0;
+        g->spec_argmax_rows = 0;
         ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
                                  (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
     }
@@ -1206,6 +1219,35 @@ bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_
                                 (uint64_t)n_rows * row_i32 * sizeof(int32_t)))
         return false;
     g->spec_compact_rows = row0 + n_rows;
+    return true;
+}
+
+bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows) {
+    g->spec_argmax_rows = 0;
+    if (!g || !g->spec_logits || !g->spec_argmax_host || !g->comp_selected ||
+        n_rows == 0 || row0 + n_rows > PULSAR_SPEC_LOGITS_ROWS)
+        return false;
+    bool ok = pulsar_gpu_begin_commands() != 0;
+    for (uint32_t r = 0; ok && r < n_rows; r++) {
+        /* Per-row views, exactly the classic verify's readback shape. */
+        pulsar_gpu_tensor *row = pulsar_gpu_tensor_view(
+                g->spec_logits,
+                (uint64_t)(row0 + r) * PULSAR_N_VOCAB * sizeof(float),
+                (uint64_t)PULSAR_N_VOCAB * sizeof(float));
+        pulsar_gpu_tensor *dst = pulsar_gpu_tensor_view(
+                g->comp_selected,
+                (uint64_t)r * sizeof(int32_t), sizeof(int32_t));
+        ok = row && dst && pulsar_gpu_argmax_tensor(dst, row, PULSAR_N_VOCAB) != 0;
+        pulsar_gpu_tensor_free(row);
+        pulsar_gpu_tensor_free(dst);
+    }
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
+    if (ok)
+        ok = pulsar_gpu_tensor_read(g->comp_selected, 0, g->spec_argmax_host,
+                                    (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    if (!ok) return false;
+    g->spec_argmax_rows = row0 + n_rows;
     return true;
 }
 

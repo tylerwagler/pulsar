@@ -1039,6 +1039,18 @@ typedef struct {
     float    spec_compact_delta;
     int32_t *spec_compact_host;   ///< PULSAR_SPEC_LOGITS_ROWS x PULSAR_DSPARK_PREFILTER_ROW_I32, owned
     uint32_t spec_compact_rows;   ///< rows [0, spec_compact_rows) hold this step's compact output (0 = none)
+    /** L219 greedy verify rows: spec_round_begin accumulates, over the rounds
+     * begun since the last step, whether EVERY one is greedy (temperature <= 0).
+     * An armed ALL_ROWS head then runs the per-row argmax on device and reads
+     * int32s into spec_argmax_host instead of the full 517 KB rows -- the walk
+     * on a greedy round consults only row argmaxes, and the single row the
+     * s->logits refresh needs is read from the device on demand.  Greedy and
+     * compact are mutually exclusive by temperature. */
+    bool     spec_argmax_acc_ok;
+    uint32_t spec_argmax_acc_n;
+    bool     spec_argmax_armed;
+    int32_t *spec_argmax_host;    ///< PULSAR_SPEC_LOGITS_ROWS int32, owned
+    uint32_t spec_argmax_rows;    ///< rows [0, spec_argmax_rows) hold this step's argmaxes (0 = none)
     pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
     pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
     pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
@@ -2807,6 +2819,10 @@ bool gpu_graph_prefill_warmup_state(pulsar_gpu_graph *g, const pulsar_model *mod
  * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to
  * row0+n_rows on success, 0 on failure. Blocking read (one small copy). */
 bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
+/** L219: the greedy twin of the compact read -- per-row argmax over
+ * spec_logits rows [row0, row0+n_rows) into g->spec_argmax_host; sets
+ * g->spec_argmax_rows to row0+n_rows on success, 0 on failure. */
+bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
 /** Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch.
  */
