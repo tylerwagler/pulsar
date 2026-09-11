@@ -178,6 +178,50 @@ static void reap_permute_regular(const reap_map *reap, const char *gguf_name,
     free(tmp);
 }
 
+/* Every planned tensor's shape against the source's, from the shard headers
+ * alone -- BEFORE any data is read, so a template formula that is wrong for
+ * this checkpoint dies in seconds, not after the hours of I/O a full run
+ * spends on the tensors ahead of it (the drafter's wo_a, L218: the 40 main
+ * layers had been written when it fired).  Dense tensors take the same
+ * reversed-shape check generation applies; expert stacks check one expert's
+ * nibble-packed weight against ne[0..1] and the declared count against the
+ * source's, which is exactly what generate_expert would assert per expert. */
+void validate_plan_shapes(st_db *db, const gguf_file *tmpl, const output_context *ctx, const reap_map *reap) {
+    for (uint64_t i = 0; i < ctx->n_tensors; i++) {
+        const tensor_meta *t = &ctx->tensors[i];
+        expert_tensor e = parse_expert_tensor(t->name);
+        if (!e.is_expert) {
+            char *hf_name = hf_name_for_regular(t->name);
+            tensor_entry *te = db_tensor(db, hf_name, NULL);
+            check_reversed_shape(t->name, &te->info, t);
+            free(hf_name);
+            continue;
+        }
+        if (tensor_n_dims(t) != 3) die("expert stack template is not 3-D");
+        const bool drafter = str_starts(t->name, "dspark.");
+        const int n_experts = drafter ? (int)t->ne[2]
+                                      : reap_keep(reap, e.layer, (int)tmpl->n_experts ? (int)tmpl->n_experts : (int)t->ne[2]);
+        if ((int64_t)n_experts != t->ne[2]) {
+            fprintf(stderr, "error: %s declares %lld experts, the plan expects %d\n", t->name, (long long)t->ne[2], n_experts);
+            exit(1);
+        }
+        /* expert 0 of the SOURCE (the first survivor under a map) */
+        const int src_x = (!drafter && reap) ? reap_src_expert(reap, e.layer, 0) : 0;
+        char hf[320];
+        snprintf(hf, sizeof(hf), e.is_mtp ? "mtp.%d.ffn.experts.%d.%s.weight" : "layers.%d.ffn.experts.%d.%s.weight",
+                 e.layer, src_x, expert_part_name(e.part));
+        tensor_entry *te = db_tensor(db, hf, NULL);
+        if (te->info.n_dims != 2 || te->info.shape[0] != t->ne[1] || te->info.shape[1] * 2 != t->ne[0]) {
+            fprintf(stderr, "error: shape mismatch for %s (source %s is %lld x %lld nibble-packed, template %lld x %lld)\n",
+                    t->name, hf, (long long)te->info.shape[0], (long long)te->info.shape[1],
+                    (long long)t->ne[1], (long long)t->ne[0]);
+            exit(1);
+        }
+    }
+    fflush(stdout);   /* the plan above went to stdout; keep the two streams readable together */
+    fprintf(stderr, "plan: %" PRIu64 " tensor shapes match the source\n", ctx->n_tensors);
+}
+
 static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                  ds4q_type target, const imatrix_store *imatrix,
                                  const reap_map *reap) {

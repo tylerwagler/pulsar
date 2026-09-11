@@ -347,6 +347,7 @@ void policy_load_format_map(quant_policy *p, const char *path);
 byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols,
                      const float *imat, const char *tensor_name);
 size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims);
+void validate_plan_shapes(st_db *db, const gguf_file *tmpl, const output_context *ctx, const reap_map *reap);
 byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                          ds4q_type target, int n_experts, int n_threads,
                          const imatrix_store *imatrix, const reap_map *reap);
