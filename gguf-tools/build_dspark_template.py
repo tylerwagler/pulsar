@@ -222,7 +222,11 @@ def main():
         ('attn_q_b.weight',         gguf(H*D, Q),  MXFP8_LT),
         ('attn_kv.weight',          gguf(D, E),    MXFP8_LT),
         ('attn_kv_a_norm.weight',   gguf(D),       30),
-        ('attn_output_a.weight',    gguf(O*OG, E), MXFP8_LT),
+        # wo_a is block-diagonal over the o_groups: each group projects ITS
+        # heads (H*D/OG wide) to O.  At 0731 H*D/OG == E == 4096, so the wrong
+        # formula (E) produced the right shape; V4.1's E = 5120 exposed it
+        # after a 298 GB quantize run (L218, 2026-09-10).
+        ('attn_output_a.weight',    gguf(O*OG, H*D//OG), MXFP8_LT),
         ('attn_output_b.weight',    gguf(E, O*OG), MXFP8_LT),
         ('ffn_gate_inp.weight',     gguf(R, E),    30),
         # The router's correction bias.  V4's drafter shipped one too

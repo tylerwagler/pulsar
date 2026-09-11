@@ -275,10 +275,12 @@ int main(int argc, char **argv) {
     }
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
-
+    /* Shapes against the source's shard headers before any data moves; a
+     * dry run gets the same check, so it is a real pre-flight. */
     st_db db;
     db_open(&db, p.hf_dir);
+    validate_plan_shapes(&db, &tmpl, &out_ctx, p.reap_survivors ? &reap : NULL);
+    if (p.dry_run) { db_close(&db); return 0; }
     if (p.mse_probe_file) {
         run_mse_probe(&db, &tmpl, &imatrix, p.n_experts, p.n_threads,
                       p.probe_sample, p.mse_probe_file);
