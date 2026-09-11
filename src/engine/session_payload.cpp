@@ -933,21 +933,29 @@ int pulsar_session::save_snapshot(pulsar_session_snapshot *snap, char *err, size
         payload_set_err(err, errlen, "session has no valid checkpoint to snapshot");
         return 1;
     }
-    if (bytes > (uint64_t)SIZE_MAX) {
+    if (bytes > (uint64_t)SIZE_MAX - 1u) {
         payload_set_err(err, errlen, "session snapshot is too large for this platform");
         return 1;
     }
-    if (snap->cap < bytes) {
-        uint8_t *p = (uint8_t *)realloc(snap->ptr, (size_t)bytes);
+    /* ONE EXTRA BYTE, DELIBERATELY.  fmemopen's write mode appends a NUL at
+     * the next position on fclose, and when the buffer is filled EXACTLY to
+     * capacity that NUL lands on its last byte: the trailing payload byte is
+     * silently zeroed.  That was always true here (before the v10 digest the
+     * victim was the final payload byte, not the digest's most significant
+     * one, which is why only the digest exposed it), so budget the terminator
+     * and keep snap->len at the real payload size. */
+    const uint64_t capacity = bytes + 1u;
+    if (snap->cap < capacity) {
+        uint8_t *p = (uint8_t *)realloc(snap->ptr, (size_t)capacity);
         if (!p) {
             payload_set_err(err, errlen, "out of memory while allocating session snapshot");
             return 1;
         }
         snap->ptr = p;
-        snap->cap = bytes;
+        snap->cap = capacity;
     }
 
-    FILE *fp = fmemopen(snap->ptr, (size_t)bytes, "wb");
+    FILE *fp = fmemopen(snap->ptr, (size_t)capacity, "wb");
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
