@@ -24,14 +24,89 @@ static uint32_t payload_get_u32(const uint8_t in[4]) {
 
 
 
-static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
+/* ---- payload digest ------------------------------------------------------
+ *
+ * L219: a 64-bit rolling digest over every payload byte, appended after the
+ * data.  The store is atomic, but media bit-rot or an offline edit inside a
+ * multi-GB payload used to load silently: a flipped KV row decrypts as
+ * plausible values and a lowered n_comp quietly drops compressed recall.  With
+ * the digest a damaged file is a cache miss (re-prefill), not wrong attention.
+ * Format v10 added the trailing 8 bytes; v9 files refuse on the version.
+ *
+ * The update is CHUNK-INDEPENDENT: bytes are folded 8 at a time with a partial
+ * word carried in `tail`, so a writer that hashes one 64 MB buffer and a reader
+ * that hashes it in ten pieces compute the same digest.  Not cryptographic --
+ * integrity against corruption, not tampering. */
+typedef struct {
+    uint64_t h;      ///< running digest
+    uint64_t tail;   ///< pending bytes, first-arrived at the low end
+    uint32_t ntail;  ///< 0..7 pending bytes
+} payload_digest;
+
+static void payload_digest_init(payload_digest *d) {
+    d->h = UINT64_C(1469598103934665603);
+    d->tail = 0;
+    d->ntail = 0;
+}
+
+static uint64_t payload_digest_mix(uint64_t h, uint64_t w) {
+    h ^= w;
+    h *= UINT64_C(0x9E3779B97F4A7C15);
+    return (h << 31) | (h >> 33);
+}
+
+static void payload_digest_update(payload_digest *d, const void *ptr, uint64_t bytes) {
+    const uint8_t *p = (const uint8_t *)ptr;
+    while (d->ntail != 0 && bytes != 0) {
+        d->tail |= (uint64_t)(*p++) << (8u * d->ntail);
+        d->ntail++;
+        bytes--;
+        if (d->ntail == 8u) {
+            d->h = payload_digest_mix(d->h, d->tail);
+            d->tail = 0;
+            d->ntail = 0;
+        }
+    }
+    while (bytes >= 8u) {
+        uint64_t w = 0;
+        memcpy(&w, p, sizeof(w));
+        d->h = payload_digest_mix(d->h, w);
+        p += 8;
+        bytes -= 8;
+    }
+    while (bytes != 0) {
+        d->tail |= (uint64_t)(*p++) << (8u * d->ntail);
+        d->ntail++;
+        bytes--;
+    }
+}
+
+static uint64_t payload_digest_final(const payload_digest *d) {
+    uint64_t h = d->h;
+    if (d->ntail != 0) h = payload_digest_mix(h, d->tail);
+    return h;
+}
+
+
+
+/* One payload stream: the file plus the digest covering everything read or
+ * written through it.  A private type so the file and its digest cannot drift
+ * apart: only these helpers touch the stream, and every one of them folds the
+ * bytes it moved. */
+typedef struct {
+    FILE *fp;
+    payload_digest digest;
+} payload_io;
+
+static int payload_write_bytes(payload_io *io, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
     const uint8_t *p = (const uint8_t *)ptr;
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
-        if (fwrite(p, 1, n, fp) != n) {
+        if (fwrite(p, 1, n, io->fp) != n) {
             payload_set_err(err, errlen, "failed to write session payload");
             return 1;
         }
+        payload_digest_update(&io->digest, p, n);
         p += n;
         bytes -= n;
     }
@@ -40,7 +115,7 @@ static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *
 
 
 
-static int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
+static int payload_read_bytes(payload_io *io, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
     if (remaining && *remaining < bytes) {
         payload_set_err(err, errlen, "truncated session payload");
         return 1;
@@ -49,10 +124,11 @@ static int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *rem
     uint8_t *p = (uint8_t *)ptr;
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
-        if (fread(p, 1, n, fp) != n) {
+        if (fread(p, 1, n, io->fp) != n) {
             payload_set_err(err, errlen, "failed to read session payload");
             return 1;
         }
+        payload_digest_update(&io->digest, p, n);
         p += n;
         bytes -= n;
     }
@@ -62,25 +138,17 @@ static int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *rem
 
 
 
-static int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
+static int payload_write_u32(payload_io *io, uint32_t v, char *err, size_t errlen) {
     uint8_t b[4];
     payload_put_u32(b, v);
-    return payload_write_bytes(fp, b, sizeof(b), err, errlen);
+    return payload_write_bytes(io, b, sizeof(b), err, errlen);
 }
 
 
 
-static int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
+static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
-    if (remaining && *remaining < sizeof(b)) {
-        payload_set_err(err, errlen, "truncated session payload");
-        return 1;
-    }
-    if (fread(b, 1, sizeof(b), fp) != sizeof(b)) {
-        payload_set_err(err, errlen, "failed to read session payload");
-        return 1;
-    }
-    if (remaining) *remaining -= sizeof(b);
+    if (payload_read_bytes(io, b, sizeof(b), remaining, err, errlen) != 0) return 1;
     *v = payload_get_u32(b);
     return 0;
 }
@@ -184,7 +252,7 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
 /* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
-static int payload_write_tensor_span(FILE *fp, const pulsar_gpu_tensor *tensor,
+static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (!tensor || offset > pulsar_gpu_tensor_bytes(tensor) ||
@@ -200,7 +268,7 @@ static int payload_write_tensor_span(FILE *fp, const pulsar_gpu_tensor *tensor,
             payload_set_err(err, errlen, "failed to read accelerator session tensor");
             return 1;
         }
-        if (payload_write_bytes(fp, buf, n, err, errlen) != 0) return 1;
+        if (payload_write_bytes(io, buf, n, err, errlen) != 0) return 1;
         done += n;
     }
     return 0;
@@ -208,7 +276,7 @@ static int payload_write_tensor_span(FILE *fp, const pulsar_gpu_tensor *tensor,
 
 
 
-static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
+static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
                                     uint64_t offset, uint64_t bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
                                     char *err, size_t errlen) {
@@ -221,7 +289,7 @@ static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (payload_read_bytes(fp, buf, n, remaining, err, errlen) != 0) return 1;
+        if (payload_read_bytes(io, buf, n, remaining, err, errlen) != 0) return 1;
         if (pulsar_gpu_tensor_write(tensor, offset + done, buf, n) == 0) {
             payload_set_err(err, errlen, "failed to restore accelerator session tensor");
             return 1;
@@ -237,16 +305,16 @@ static int payload_read_tensor_span(FILE *fp, pulsar_gpu_tensor *tensor,
  * v4 did for the attention comp cache.  It used to dequantise MXKV-FP4 rows into
  * a 512 B/row f32 staging buffer, write that, and re-pack on load -- 68 B of
  * content stored as 512 B, and a re-encode on every restore. */
-static int payload_write_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
+static int payload_write_index_comp(payload_io *io, pulsar_gpu_graph *g, uint32_t il,
                                     uint32_t n_rows, uint8_t *buf, size_t cap,
                                     char *err, size_t errlen) {
     if (n_rows == 0) return 0;
     const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
-    return payload_write_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
+    return payload_write_tensor_span(io, g->layer_index_comp_cache[il], 0, bytes,
                                      buf, cap, err, errlen);
 }
 
-static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
+static int payload_read_index_comp(payload_io *io, pulsar_gpu_graph *g, uint32_t il,
                                    uint32_t n_rows, uint8_t *buf, size_t cap,
                                    uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
@@ -258,7 +326,7 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
      * acceptance).  Copying bytes cannot invoke an idempotence it never relies
      * on, which is the same reason v4 gave for the attention rows, and it is
      * why the re-encode machinery could then be deleted outright. */
-    return payload_read_tensor_span(fp, g->layer_index_comp_cache[il], 0, bytes,
+    return payload_read_tensor_span(io, g->layer_index_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
 }
 
@@ -273,16 +341,16 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
  * load side needed the EXACT-scale repack because "the fast-math quantize bucket
  * is not bit-idempotent at scale boundaries". Copying packed bytes cannot lose an
  * idempotence it never invokes. */
-static int payload_write_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
+static int payload_write_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint32_t il,
                                         uint32_t n_rows, uint8_t *buf, size_t cap,
                                         char *err, size_t errlen) {
     if (n_rows == 0) return 0;
     const uint64_t bytes = (uint64_t)n_rows * gpu_graph_attn_comp_cache_row_bytes();
-    return payload_write_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
+    return payload_write_tensor_span(io, g->layer_attn_comp_cache[il], 0, bytes,
                                      buf, cap, err, errlen);
 }
 
-static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
+static int payload_read_attn_comp_pack(payload_io *io, pulsar_gpu_graph *g, uint32_t il,
                                        uint32_t n_rows, uint8_t *buf, size_t cap,
                                        uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
@@ -290,9 +358,9 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
     /* Straight into the packed cache: the file holds exactly what it holds, so
      * there is no staging buffer and no re-encode on either side.  Under KV4
      * this is what makes save/load safe at all -- an FP4 re-encode misrounds
-     * ~33% of blocks, so the bytes ARE the values.  The version (v7) plus the
+     * ~33% of blocks, so the bytes ARE the values.  The version (v10) plus the
      * h[13] stride refuse files from any earlier row format. */
-    return payload_read_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
+    return payload_read_tensor_span(io, g->layer_attn_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
 }
 
@@ -306,17 +374,17 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
  * bytes as halves, so it walked the wrong rows AND past the end of the
  * allocation.  Nothing caught it because ->bytes is a number and __half is a
  * legal way to look at those bytes. */
-static int payload_write_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
+static int payload_write_raw_row(payload_io *io, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
-    return payload_write_tensor_span(fp, g->layer_raw_cache[il],
+    return payload_write_tensor_span(io, g->layer_raw_cache[il],
             (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
             (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, err, errlen);
 }
 
-static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
+static int payload_read_raw_row(payload_io *io, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                 char *err, size_t errlen) {
-    return payload_read_tensor_span(fp, g->layer_raw_cache[il],
+    return payload_read_tensor_span(io, g->layer_raw_cache[il],
             (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
             (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, remaining, err, errlen);
 }
@@ -331,6 +399,8 @@ uint64_t pulsar_session::payload_bytes() {
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)PULSAR_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
+    /* v10: the trailing digest, appended raw after the data. */
+    bytes += sizeof(uint64_t);
     return bytes;
 }
 
@@ -465,6 +535,10 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         payload_set_err(err, errlen, "prefill frontier lies outside the checkpoint");
         return 1;
     }
+    payload_io io;
+    io.fp = fp;
+    payload_digest_init(&io.digest);
+
     /* Header fields:
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
      *   5 raw window, 6 compressed cap, 7 token count,
@@ -499,17 +573,17 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         (uint32_t)s->prefill_frontier,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+        if (payload_write_u32(&io, header[i], err, errlen) != 0) return 1;
     }
     for (int i = 0; i < s->checkpoint.len; i++) {
-        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+        if (payload_write_u32(&io, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
-    if (payload_write_bytes(fp, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+    if (payload_write_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_write_u32(fp, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
+        if (payload_write_u32(&io, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_write_u32(fp, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
+        if (payload_write_u32(&io, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
     }
 
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
@@ -521,7 +595,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_raw_row(fp, g, il, phys,
+            rc = payload_write_raw_row(&io, g, il, phys,
                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
@@ -529,13 +603,13 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-            rc = payload_write_attn_comp_pack(fp, g, il,
+            rc = payload_write_attn_comp_pack(&io, g, il,
                                               gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il),
                                               buf,
                                               PULSAR_SESSION_IO_CHUNK,
                                               err,
                                               errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp,
+        if (rc == 0) rc = payload_write_tensor_span(&io,
                                                     g->layer_attn_state_kv[il],
                                                     0,
                                                     layer_attn_state_bytes(ratio),
@@ -543,7 +617,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
                                                     PULSAR_SESSION_IO_CHUNK,
                                                     err,
                                                     errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp,
+        if (rc == 0) rc = payload_write_tensor_span(&io,
                                                     g->layer_attn_state_score[il],
                                                     0,
                                                     layer_attn_state_bytes(ratio),
@@ -552,13 +626,13 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_index_comp(fp, g, il,
+            rc = payload_write_index_comp(&io, g, il,
                                           gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il),
                                           buf,
                                           PULSAR_SESSION_IO_CHUNK,
                                           err,
                                           errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
+            if (rc == 0) rc = payload_write_tensor_span(&io,
                                                         g->layer_index_state_kv[il],
                                                         0,
                                                         layer_index_state_bytes(ratio),
@@ -566,7 +640,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
                                                         PULSAR_SESSION_IO_CHUNK,
                                                         err,
                                                         errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
+            if (rc == 0) rc = payload_write_tensor_span(&io,
                                                         g->layer_index_state_score[il],
                                                         0,
                                                         layer_index_state_bytes(ratio),
@@ -577,6 +651,16 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         }
     }
     free(buf);
+    if (rc == 0) {
+        /* The digest covers every byte above; it is appended RAW so it does not
+         * cover itself.  load_payload requires exactly these 8 bytes to remain
+         * after the data and refuses on mismatch. */
+        const uint64_t dg = payload_digest_final(&io.digest);
+        if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
+            payload_set_err(err, errlen, "failed to write session payload digest");
+            return 1;
+        }
+    }
     return rc;
 }
 
@@ -594,10 +678,14 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->spec.spec_carry_valid = false;
     pulsar_spec_drop_pendings(&s->spec);
     spec_quench_reset(s);
+    payload_io io;
+    io.fp = fp;
+    payload_digest_init(&io.digest);
+
     uint64_t remaining = payload_bytes;
     uint32_t h[PULSAR_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
+        if (payload_read_u32(&io, &h[i], &remaining, err, errlen) != 0) return 1;
     }
     if (h[0] != PULSAR_SESSION_PAYLOAD_MAGIC || h[1] != PULSAR_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
@@ -663,13 +751,13 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     token_vec new_checkpoint = {0};
     for (uint32_t i = 0; i < saved_tokens; i++) {
         uint32_t tok = 0;
-        if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) {
+        if (payload_read_u32(&io, &tok, &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
         }
         token_vec_push(&new_checkpoint, (int)tok);
     }
-    if (payload_read_bytes(fp, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float),
+    if (payload_read_bytes(&io, s->logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float),
                            &remaining, err, errlen) != 0)
     {
         token_vec_free(&new_checkpoint);
@@ -678,7 +766,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     uint32_t n_comp[PULSAR_MAX_LAYER];
     uint32_t n_index_comp[PULSAR_MAX_LAYER];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
+        if (payload_read_u32(&io, &n_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
         }
@@ -689,7 +777,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         }
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
+        if (payload_read_u32(&io, &n_index_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
             return 1;
         }
@@ -717,19 +805,19 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_raw_row(fp, g, il, phys,
+            rc = payload_read_raw_row(&io, g, il, phys,
                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-            rc = payload_read_attn_comp_pack(fp, g, il,
+            rc = payload_read_attn_comp_pack(&io, g, il,
                                              n_comp[il],
                                              buf,
                                              PULSAR_SESSION_IO_CHUNK,
                                              &remaining,
                                              err,
                                              errlen);
-        if (rc == 0) rc = payload_read_tensor_span(fp,
+        if (rc == 0) rc = payload_read_tensor_span(&io,
                                                     g->layer_attn_state_kv[il],
                                                    0,
                                                    layer_attn_state_bytes(ratio),
@@ -738,7 +826,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
                                                    &remaining,
                                                    err,
                                                    errlen);
-        if (rc == 0) rc = payload_read_tensor_span(fp,
+        if (rc == 0) rc = payload_read_tensor_span(&io,
                                                    g->layer_attn_state_score[il],
                                                    0,
                                                    layer_attn_state_bytes(ratio),
@@ -748,14 +836,14 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_index_comp(fp, g, il,
+            rc = payload_read_index_comp(&io, g, il,
                                          n_index_comp[il],
                                          buf,
                                          PULSAR_SESSION_IO_CHUNK,
                                          &remaining,
                                          err,
                                          errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
+            if (rc == 0) rc = payload_read_tensor_span(&io,
                                                        g->layer_index_state_kv[il],
                                                        0,
                                                        layer_index_state_bytes(ratio),
@@ -764,7 +852,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
                                                        &remaining,
                                                        err,
                                                        errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
+            if (rc == 0) rc = payload_read_tensor_span(&io,
                                                        g->layer_index_state_score[il],
                                                        0,
                                                        layer_index_state_bytes(ratio),
@@ -780,9 +868,23 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         token_vec_free(&new_checkpoint);
         return 1;
     }
-    if (remaining != 0) {
+    /* v10: the trailing 8 bytes are the digest over every byte above.  A
+     * mismatch is a corrupted payload -- refuse it (the caller treats this as a
+     * cache miss and re-prefills), never decode byte-rot into a live cache. */
+    if (remaining != sizeof(uint64_t)) {
         token_vec_free(&new_checkpoint);
-        payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+        payload_set_err(err, errlen, "KV checkpoint is missing its payload digest");
+        return 1;
+    }
+    uint64_t stored_dg = 0;
+    if (fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg)) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to read session payload digest");
+        return 1;
+    }
+    if (stored_dg != payload_digest_final(&io.digest)) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "KV checkpoint digest mismatch (corrupt payload)");
         return 1;
     }
     if (pulsar_gpu_synchronize() == 0) {

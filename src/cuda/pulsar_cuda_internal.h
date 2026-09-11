@@ -83,7 +83,8 @@ enum {
  * stale payloads refuse.  The geometry macros (PULSAR_ATTN_PACK_*,
  * PULSAR_KV4_NV_*, PULSAR_MXKV_*) live in src/pulsar_gpu.h, the one
  * definition both sides of the seam read (L159 inc 5).  Bumping this layout
- * MUST bump PULSAR_SESSION_PAYLOAD_VERSION (done for the unification: v7).
+ * MUST bump PULSAR_SESSION_PAYLOAD_VERSION (v10 carries the digest; the row
+ * unification was v7).
  */
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.

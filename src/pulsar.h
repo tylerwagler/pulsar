@@ -748,8 +748,10 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * snapshot.  v9 (L195, 2026-09-06): no snapshot -- a restored checkpoint resumes
  * from the grid point below its PREFILL frontier (header field 15) after a
  * 32-token state-only warm-up, so the raw window it carries reaches that far
- * below the checkpoint (raw_window + 127 + 32 rows).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(9)
+ * below the checkpoint (raw_window + 127 + 32 rows).  Earlier files are refused.
+ * v10 (L219, 2026-09-11): a trailing 64-bit digest over every byte above; a
+ * damaged payload refuses instead of decoding byte-rot into a live cache. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(10)
 /** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + the prefill frontier. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 16u
 
