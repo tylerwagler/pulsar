@@ -208,6 +208,8 @@
 
 enum {
     PULSAR_MAX_LAYER            = 61,
+    PULSAR_MAX_ATTN_SOURCE      = 8,   ///< CSA2 source layers of one kind (V4.1: 4 kv, 8 index)
+    PULSAR_NO_LAYER             = 0xFFFFFFFFu,  ///< "no such layer" in the attention layout table
     PULSAR_MAX_EMBD             = 7168,
     PULSAR_MAX_VOCAB            = 129280,
     PULSAR_MAX_HEAD             = 128,
@@ -259,14 +261,27 @@ typedef struct {
     uint32_t n_lora_o;         ///< rank of the low-rank attention-output path
     uint32_t n_expert;         ///< routed experts per MoE layer
     uint32_t n_expert_used;    ///< experts activated per token (top-k routing)
-    uint32_t n_expert_shared;
+    uint32_t n_expert_shared;  ///< always-on shared experts
     uint32_t n_dspark_expert;      ///< routed experts per DSpark drafter layer (V4.1: 128)
-    uint32_t n_dspark_expert_used; ///< experts a drafter token activates (V4.1: 3)  ///< always-on shared experts
+    uint32_t n_dspark_expert_used; ///< experts a drafter token activates (V4.1: 3)
     uint32_t n_ff_exp;         ///< per-expert FFN hidden width
     uint32_t n_swa;            ///< sliding-window attention span
     uint32_t n_indexer_head;      ///< indexer tower heads
     uint32_t n_indexer_head_dim;  ///< indexer per-head dimension
     uint32_t n_indexer_top_k;     ///< compressed rows the indexer selects per query
+    /** CSA2 (L218): the layers that compress their own KV and publish it (with
+     * the index keys derived from the same latent) to every later layer up to
+     * the next source; the layers that run their own indexer and publish its
+     * top-k the same way; and the one indexer whose block-max pool pre-filters
+     * every later indexer (-1: none).  Ascending, and every kv source is also
+     * an index source -- pulsar_attn_layout_install asserts both. */
+    uint32_t n_kv_source;
+    uint32_t kv_source_layer[PULSAR_MAX_ATTN_SOURCE];
+    uint32_t n_index_source;
+    uint32_t index_source_layer[PULSAR_MAX_ATTN_SOURCE];
+    int32_t  candidate_source_layer;
+    uint32_t candidate_topk_blocks;  ///< compressed-position blocks the candidate pool keeps per query
+    uint32_t candidate_block_size;   ///< compressed positions per candidate block
     uint32_t n_hc;                ///< hyper-connection streams
     uint32_t n_hc_sinkhorn_iter;  ///< Sinkhorn normalisation iterations in the HC mix
     float rms_eps;             ///< epsilon for the transformer RMSNorms
@@ -549,8 +564,10 @@ typedef struct {
     pulsar_tensor *attn_compressor_kv;    ///< compressor KV projection: pools `ratio` rows into one
     pulsar_tensor *attn_compressor_gate;  ///< compressor gate deciding each row's contribution
     pulsar_tensor *attn_compressor_norm;  ///< RMSNorm inside the compressor
-    pulsar_tensor *indexer_attn_q_b;      ///< indexer query up-projection (its own head space)
-    pulsar_tensor *indexer_proj;          ///< indexer scoring projection
+    pulsar_tensor *indexer_attn_q_b;      ///< indexer query up-projection (its own head space); FULL + REINDEX layers
+    pulsar_tensor *indexer_proj;          ///< indexer per-head score weights; FULL + REINDEX layers
+    pulsar_tensor *indexer_k;             ///< index key from the compressor latent [head_dim -> indexer_head_dim]; FULL layers
+    pulsar_tensor *indexer_k_norm;        ///< RMSNorm on the index key; FULL layers
     pulsar_tensor *indexer_compressor_ape;  ///< indexer compressor position embedding
     pulsar_tensor *indexer_compressor_kv;   ///< indexer compressor KV projection
     pulsar_tensor *indexer_compressor_gate; ///< indexer compressor gate
@@ -2091,11 +2108,42 @@ void payload_set_err(char *err, size_t errlen, const char *msg);
  */
 void spec_quench_reset(pulsar_session *s);
 
+/** How one layer's attention reaches beyond its 128-token window (CSA2, L218).
+ *
+ * WINDOW:  compress_ratio 0; the sliding window is all there is (layers 0-1,
+ *          and every drafter layer).
+ * FULL:    a kv source.  Runs the compressor over its own input, writes the
+ *          shared compressed-KV rows and the index-K rows derived from the same
+ *          latent, runs its own indexer and publishes the top-k.
+ * REINDEX: an index source that is not a kv source.  Reads its kv source's
+ *          compressed KV and index K, scores them with its own indexer weights
+ *          (inside the candidate pool when one is published), publishes top-k.
+ * REUSE:   neither.  Reads the kv source's rows and the index source's top-k
+ *          unchanged; owns nothing beyond its window ring and its q path. */
+typedef enum {
+    PULSAR_ATTN_WINDOW = 0,
+    PULSAR_ATTN_FULL,
+    PULSAR_ATTN_REINDEX,
+    PULSAR_ATTN_REUSE,
+} pulsar_attn_mode;
+
+/** One layer's row of the attention layout table.  Derived once at load from
+ * the artifact's compress_ratios / kv_source_layers / index_source_layers /
+ * candidate_source_layer by pulsar_attn_layout_install(), which is the only
+ * writer; every cache-ownership and weight-binding decision reads THIS. */
+typedef struct {
+    uint32_t ratio;         ///< tokens per compressed row; 0 = window only
+    uint32_t kv_source;     ///< layer whose compressed KV + index K this layer reads (itself when FULL; PULSAR_NO_LAYER at ratio 0)
+    uint32_t index_source;  ///< layer whose top-k this layer attends with (itself when FULL/REINDEX; PULSAR_NO_LAYER at ratio 0)
+    pulsar_attn_mode mode;
+    bool candidate_source;  ///< this layer's indexer publishes the candidate block mask
+    bool uses_candidates;   ///< this layer's indexer scores only inside the published mask
+} pulsar_layer_attn;
+
 /** ---- shared globals ---- */
 
 extern const pulsar_shape PULSAR_SHAPE_FLASH;
 extern pulsar_shape g_pulsar_shape;
-extern uint32_t g_pulsar_compress_ratios[PULSAR_MAX_LAYER];
 /** REAP ds4-compact-v1: per-layer count of physically-present routed experts.
  * 0 means "not set" -> falls back to n_expert (the un-pruned default). The
  * router/bias tensors stay padded to n_expert (256); only the expert weight
@@ -2111,6 +2159,18 @@ void pulsar_die(const char *msg);
  * matches the exact layout expected for the loaded model shape.
  */
 uint32_t pulsar_layer_compress_ratio(uint32_t il);
+/** The layer's row of the CSA2 attention layout table (ratio, sources, mode). */
+const pulsar_layer_attn *pulsar_layer_attn_layout(uint32_t il);
+/** Build the attention layout table from a per-layer ratio array and the
+ * source sets, asserting the shape profile's expectation and the CSA2
+ * invariants (sources ascending and inside the backbone, a member's ratio
+ * equals its source's, every kv source is an index source, the candidate
+ * source is an index source).  The loader calls it with the artifact's
+ * metadata; a unit test with the profile's own sets.  Dies on any violation. */
+void pulsar_attn_layout_install(const uint32_t *ratios,
+                                const uint32_t *kv_sources, uint32_t n_kv,
+                                const uint32_t *index_sources, uint32_t n_index,
+                                int32_t candidate_source);
 /** Physically-present routed-expert count for a layer. For an un-pruned model
  * (or any layer whose keep_count was not set) this is the full n_expert; for a
  * REAP ds4-compact-v1 model the pruned layers report their dense survivor
@@ -2118,7 +2178,6 @@ uint32_t pulsar_layer_compress_ratio(uint32_t il);
  * bias stay padded to n_expert.
  */
 uint32_t pulsar_layer_n_expert(uint32_t il);
-uint32_t pulsar_expected_layer_compress_ratio(uint32_t il);
 void pulsar_die_errno(const char *what, const char *path);
 bool pulsar_streq(pulsar_str s, const char *z);
 bool pulsar_str_eq(pulsar_str a, pulsar_str b);

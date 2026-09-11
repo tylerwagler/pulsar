@@ -31,6 +31,13 @@ const pulsar_shape PULSAR_SHAPE_FLASH = {
     .n_indexer_head = 32,
     .n_indexer_head_dim = 128,
     .n_indexer_top_k = 512,
+    .n_kv_source = 4,
+    .kv_source_layer = { 2, 8, 14, 20 },
+    .n_index_source = 8,
+    .index_source_layer = { 2, 8, 14, 20, 24, 28, 32, 36 },
+    .candidate_source_layer = 20,
+    .candidate_topk_blocks = 2048,
+    .candidate_block_size = 8,
     .n_hc = 4,
     .n_hc_sinkhorn_iter = 20,
     .rms_eps = PULSAR_DEFAULT_RMS_EPS,
@@ -58,7 +65,6 @@ pulsar_shape g_pulsar_shape = PULSAR_SHAPE_FLASH;
 
 
 
-uint32_t g_pulsar_compress_ratios[PULSAR_MAX_LAYER] = {0};
 uint32_t g_pulsar_layer_expert_count[PULSAR_MAX_LAYER] = {0};
 
 

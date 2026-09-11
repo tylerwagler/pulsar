@@ -414,22 +414,18 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
         return false;
     }
 
-    const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    if (ratio != 0 &&
-        (!l->attn_compressor_ape ||
-         !l->attn_compressor_kv ||
-         !l->attn_compressor_gate ||
-         !l->attn_compressor_norm))
+    const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+    if (a->mode == PULSAR_ATTN_FULL &&
+        (!l->attn_compressor_kv ||
+         !l->attn_compressor_norm ||
+         (a->ratio > 1 && !l->attn_compressor_gate) ||
+         !l->indexer_k ||
+         !l->indexer_k_norm))
     {
         return false;
     }
-    if (ratio == 4 &&
-        (!l->indexer_attn_q_b ||
-         !l->indexer_proj ||
-         !l->indexer_compressor_ape ||
-         !l->indexer_compressor_kv ||
-         !l->indexer_compressor_gate ||
-         !l->indexer_compressor_norm))
+    if ((a->mode == PULSAR_ATTN_FULL || a->mode == PULSAR_ATTN_REINDEX) &&
+        (!l->indexer_attn_q_b || !l->indexer_proj))
     {
         return false;
     }
@@ -499,7 +495,6 @@ static void weights_validate_layout(
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const pulsar_layer_weights *l = &w->layer[il];
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il);
             exit(1);
@@ -518,23 +513,21 @@ static void weights_validate_layout(
         tensor_expect_mxfp8(l->attn_output_a,   2, PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, PULSAR_N_EMBD, 0);
 
-        if (ratio != 0) {
-            const uint32_t coff = pulsar_compress_coff(ratio);
-            const uint64_t comp_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, ratio, 0);
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, comp_width, 0);
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, comp_width, 0);
+        /* CSA2 (L218): the compressor and the index-key projection live on the
+         * kv sources only, the indexer's q/score weights on every index source.
+         * A ratio-1 compressor is a plain projection + norm (no gate). */
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+        if (a->mode == PULSAR_ATTN_FULL) {
+            tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
+            if (a->ratio > 1) tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
             tensor_expect_f32_or_bf16(l->attn_compressor_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
+            tensor_expect_plain_or_mxfp8(l->indexer_k, 2, PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, 0);
+            tensor_expect_f32_or_bf16(l->indexer_k_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
         }
-        if (ratio == 4) {
+        if (a->mode == PULSAR_ATTN_FULL || a->mode == PULSAR_ATTN_REINDEX) {
             const uint64_t index_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
-            const uint64_t index_width = 2u * PULSAR_N_INDEXER_HEAD_DIM;
             tensor_expect_plain_or_mxfp8(l->indexer_attn_q_b, 2, PULSAR_N_LORA_Q, index_q_dim, 0);
             tensor_expect_plain_or_mxfp8(l->indexer_proj, 2, PULSAR_N_EMBD, PULSAR_N_INDEXER_HEAD, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_ape, 2, index_width, ratio, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_kv, 2, PULSAR_N_EMBD, index_width, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_gate, 2, PULSAR_N_EMBD, index_width, 0);
-            tensor_expect_f32_or_bf16(l->indexer_compressor_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
@@ -659,40 +652,63 @@ static void pulsar_select_shape_from_metadata(
 
 
 
-static void validate_compress_ratio_metadata(const pulsar_model *m) {
-    const char *key = "deepseek4.attention.compress_ratios";
+/* Read an int32/uint32 array key into `out` (capacity `cap`), returning its
+ * length.  Dies when the key is missing, the wrong type, longer than `cap`, or
+ * carries a negative value. */
+static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
         fprintf(stderr, "pulsar: required int32/uint32 array metadata key is missing: %s\n", key);
         exit(1);
     }
-    if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+    if (arr.len > cap) {
+        fprintf(stderr, "pulsar: %s has %llu entries, at most %u are meaningful\n",
+                key, (unsigned long long)arr.len, cap);
+        exit(1);
     }
-
-    memset(g_pulsar_compress_ratios, 0, sizeof(g_pulsar_compress_ratios));
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        uint32_t got = 0;
+    for (uint64_t i = 0; i < arr.len; i++) {
         if (arr.type == GGUF_VALUE_UINT32) {
-            if (!cursor_u32(&c, &got)) pulsar_die(c.error);
+            if (!cursor_u32(&c, &out[i])) pulsar_die(c.error);
         } else {
             int32_t v = 0;
             if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
             if (v < 0) pulsar_die("metadata array contains a negative value");
-            got = (uint32_t)v;
+            out[i] = (uint32_t)v;
         }
-
-        const uint32_t expected = pulsar_expected_layer_compress_ratio(il);
-        if (got != expected) {
-            fprintf(stderr,
-                    "pulsar: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
-                    il, PULSAR_MODEL_SHAPE_NAME, got, expected);
-            exit(1);
-        }
-        g_pulsar_compress_ratios[il] = got;
     }
+    return (uint32_t)arr.len;
+}
+
+
+
+/* CSA2 (L218): the per-layer ratios and the kv / index / candidate source
+ * layers are the artifact's; pulsar_attn_layout_install checks them against
+ * the shape profile and derives every layer's mode and sources from them. */
+static void validate_attention_layout_metadata(const pulsar_model *m) {
+    uint32_t ratios[PULSAR_MAX_LAYER];
+    const uint32_t n_ratio = model_read_u32_array(m, "deepseek4.attention.compress_ratios", ratios, PULSAR_MAX_LAYER);
+    if (n_ratio < PULSAR_N_LAYER) pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+
+    uint32_t kv_sources[PULSAR_MAX_ATTN_SOURCE], index_sources[PULSAR_MAX_ATTN_SOURCE];
+    const uint32_t n_kv = model_read_u32_array(m, "deepseek4.attention.kv_source_layers", kv_sources, PULSAR_MAX_ATTN_SOURCE);
+    const uint32_t n_index = model_read_u32_array(m, "deepseek4.attention.index_source_layers", index_sources, PULSAR_MAX_ATTN_SOURCE);
+
+    uint32_t candidate = 0, topk_blocks = 0, block_size = 0;
+    if (!model_get_u32(m, "deepseek4.attention.candidate_source_layer", &candidate) ||
+        !model_get_u32(m, "deepseek4.attention.candidate_topk_blocks", &topk_blocks) ||
+        !model_get_u32(m, "deepseek4.attention.candidate_block_size", &block_size)) {
+        pulsar_die("deepseek4.attention.candidate_{source_layer,topk_blocks,block_size} are required");
+    }
+    if (candidate > (uint32_t)INT32_MAX) pulsar_die("deepseek4.attention.candidate_source_layer is out of range");
+    if (topk_blocks != g_pulsar_shape.candidate_topk_blocks || block_size != g_pulsar_shape.candidate_block_size) {
+        fprintf(stderr, "pulsar: candidate pool is %u blocks of %u, %s expects %u of %u\n",
+                topk_blocks, block_size, PULSAR_MODEL_SHAPE_NAME,
+                g_pulsar_shape.candidate_topk_blocks, g_pulsar_shape.candidate_block_size);
+        exit(1);
+    }
+    pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, (int32_t)candidate);
 }
 
 
@@ -886,7 +902,7 @@ void config_validate_model(const pulsar_model *m) {
     config_expect_u32("hyper_connection.sinkhorn_iterations", n_hc_sinkhorn_iter, PULSAR_N_HC_SINKHORN_ITER);
 
     config_validate_fixed_shape(n_layer);
-    validate_compress_ratio_metadata(m);
+    validate_attention_layout_metadata(m);
 
     validate_reap_metadata(m);
 
@@ -1017,7 +1033,7 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool r
 
 
 static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, uint32_t il) {
-    const uint32_t compress_ratio = pulsar_layer_compress_ratio(il);
+    const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
     l->n_expert = PULSAR_N_EXPERT;
     l->n_expert_used = PULSAR_N_EXPERT_USED;
     l->n_expert_present = pulsar_layer_n_expert(il);
@@ -1034,19 +1050,36 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-    if (compress_ratio != 0) {
-        l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+    /* CSA2 (L218): compressor + index key on the kv sources, indexer q/score
+     * weights on every index source, nothing on a REUSE layer.  Any of these
+     * tensors on a layer whose mode does not own it is a wrong artifact. */
+    if (attn->mode == PULSAR_ATTN_FULL) {
         l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-        l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
+        if (attn->ratio > 1) l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
         l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+        l->indexer_k            = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
+        l->indexer_k_norm       = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
     }
-    if (compress_ratio == 4) {
+    if (attn->mode == PULSAR_ATTN_FULL || attn->mode == PULSAR_ATTN_REINDEX) {
         l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
         l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-        l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-        l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-        l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-        l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+    }
+    static const char *const attn_owned[] = {
+        "attn_compressor_kv.weight", "attn_compressor_gate.weight", "attn_compressor_norm.weight",
+        "indexer.attn_k.weight", "indexer.k_norm.weight", "indexer.attn_q_b.weight", "indexer.proj.weight",
+    };
+    const pulsar_tensor *const attn_bound[] = {
+        l->attn_compressor_kv, l->attn_compressor_gate, l->attn_compressor_norm,
+        l->indexer_k, l->indexer_k_norm, l->indexer_attn_q_b, l->indexer_proj,
+    };
+    for (size_t i = 0; i < sizeof(attn_owned) / sizeof(attn_owned[0]); i++) {
+        char name[128];
+        const int n = snprintf(name, sizeof(name), "blk.%u.%s", il, attn_owned[i]);
+        if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
+        if (!attn_bound[i] && model_find_tensor(m, name)) {
+            fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il, name);
+            exit(1);
+        }
     }
     l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
     l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);

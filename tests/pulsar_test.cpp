@@ -2689,18 +2689,60 @@ static void test_render_cases(void) {
     fprintf(stderr, "pulsar-test: render-cases: %d rendered, %d refused\n", rendered, refused);
 }
 
+/* The unit process has no model, so the loader never installs the attention
+ * layout; the tests that need one install the profile's own (V4.1 CSA2) through
+ * the loader's one writer, which also exercises its invariant checks. */
+static void install_profile_attn_layout(void) {
+    uint32_t ratios[PULSAR_MAX_LAYER];
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) ratios[il] = il < 2 ? 0u : il < 20 ? 2u : 1u;
+    pulsar_attn_layout_install(ratios,
+                               g_pulsar_shape.kv_source_layer, g_pulsar_shape.n_kv_source,
+                               g_pulsar_shape.index_source_layer, g_pulsar_shape.n_index_source,
+                               g_pulsar_shape.candidate_source_layer);
+}
+
+/* The CSA2 layout table (L218): every layer's mode and sources follow the
+ * reference's "read what the latest source published" rule.  Pinned against
+ * the V4.1 config: kv sources 2/8/14/20, index sources + 24/28/32/36,
+ * candidate pool from 20. */
+static void test_attn_layout_table(void) {
+    install_profile_attn_layout();
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+        TEST_ASSERT(a->ratio == pulsar_layer_compress_ratio(il));
+        if (il < 2) {
+            TEST_ASSERT(a->mode == PULSAR_ATTN_WINDOW && a->ratio == 0);
+            TEST_ASSERT(a->kv_source == PULSAR_NO_LAYER && a->index_source == PULSAR_NO_LAYER);
+            TEST_ASSERT(!a->candidate_source && !a->uses_candidates);
+            continue;
+        }
+        const uint32_t kv_src = il < 8 ? 2u : il < 14 ? 8u : il < 20 ? 14u : 20u;
+        const uint32_t idx_src = il < 20 ? kv_src : il < 24 ? 20u : il < 28 ? 24u : il < 32 ? 28u : il < 36 ? 32u : 36u;
+        TEST_ASSERT(a->ratio == (il < 20 ? 2u : 1u));
+        TEST_ASSERT(a->kv_source == kv_src);
+        TEST_ASSERT(a->index_source == idx_src);
+        const pulsar_attn_mode want = kv_src == il ? PULSAR_ATTN_FULL : idx_src == il ? PULSAR_ATTN_REINDEX : PULSAR_ATTN_REUSE;
+        TEST_ASSERT(a->mode == want);
+        TEST_ASSERT(a->candidate_source == (il == 20));
+        TEST_ASSERT(a->uses_candidates == (il > 20 && idx_src == il));
+        /* a member never precedes its source, and a source's ratio is its own */
+        TEST_ASSERT(a->kv_source <= il && a->index_source <= il);
+        TEST_ASSERT(pulsar_layer_compress_ratio(a->kv_source) == a->ratio);
+    }
+    /* the four modes are all present: 4 FULL, 4 REINDEX, 30 REUSE, 2 WINDOW */
+    uint32_t n[4] = {0, 0, 0, 0};
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) n[pulsar_layer_attn_layout(il)->mode]++;
+    TEST_ASSERT(n[PULSAR_ATTN_WINDOW] == 2 && n[PULSAR_ATTN_FULL] == 4 &&
+                n[PULSAR_ATTN_REINDEX] == 4 && n[PULSAR_ATTN_REUSE] == 30);
+}
+
 /* The boot-line estimate is the engine's KV sizing read back: one bank's KV
  * in the stored row formats (packed attention rows, MXFP4 indexer rows), plus
- * the indexer_scores scratch.  The unit process has no model, so the loader's
- * compress ratios are all zero and the comp/idx term would be 0 (a gate that
- * measures nothing); the test installs a Flash-like pattern -- layer 0 dense,
- * then ratio 1 / ratio 4 alternating -- and restores what was there. */
+ * the indexer_scores scratch.  The unit process has no model, so the loader
+ * installs no layout and the comp/idx term would be 0 (a gate that measures
+ * nothing); the test installs the profile's V4.1 layout first. */
 static void test_context_memory_shape(void) {
-    uint32_t saved[PULSAR_MAX_LAYER];
-    memcpy(saved, g_pulsar_compress_ratios, sizeof(saved));
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g_pulsar_compress_ratios[il] = il == 0 ? 0u : ((il & 1u) ? 4u : 1u);
-    }
+    install_profile_attn_layout();
     const int ctx = 32768;
     const pulsar_context_memory m =
         pulsar_context_memory_estimate(PULSAR_BACKEND_CUDA, ctx, 0);
@@ -2709,7 +2751,7 @@ static void test_context_memory_shape(void) {
                 (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
     uint64_t comp_index = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = g_pulsar_compress_ratios[il];
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, ratio);
         comp_index += rows * gpu_graph_attn_comp_cache_row_bytes();
@@ -2727,7 +2769,6 @@ static void test_context_memory_shape(void) {
         gpu_graph_context_bytes_for_kv_policy((uint32_t)ctx, m.raw_cap, m.prefill_cap, &kv);
     TEST_ASSERT(kv == m.raw_bytes + m.comp_index_bytes);
     TEST_ASSERT(ctx_bytes == m.total_bytes);
-    memcpy(g_pulsar_compress_ratios, saved, sizeof(saved));
 }
 
 typedef void (*test_fn)(void);
@@ -2761,6 +2802,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
+    {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},
