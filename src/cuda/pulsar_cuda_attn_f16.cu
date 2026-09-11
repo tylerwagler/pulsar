@@ -466,6 +466,9 @@ static void attn_f16_kernel(
      * so a stale entry from the previous tile is harmless. */
     __shared__ uint8_t sRowBad[AF16_ROWS];
     __shared__ float  sM[AF16_HPB], sL[AF16_HPB];
+    /* Per-head max from the parallel softmax pass, read by the lane that folds
+     * it into the running state (sM/sL/sCorr) after the sync. */
+    __shared__ float  sMx[AF16_HPB];
 
     /* ---- Q fragments, once, into registers -----------------------------
      * Warp w works job = w & 3 (M-tile, n-tile) and k-group kgrp = w >> 2,
@@ -713,10 +716,21 @@ static void attn_f16_kernel(
         }
         __syncthreads();
 
-        if (tid < AF16_HPB) {
-            const uint32_t h = tid;
-            float mx = sM[h];
-            for (uint32_t r = 0; r < nr; r++) mx = fmaxf(mx, sS[h][r]);
+        /* One thread per (head,row): AF16_HPB * AF16_ROWS == AF16_THREADS, so
+         * this is exactly one pass.  The max is a 4-step shuffle tree inside
+         * the head's 16-lane half-warp and the expf chain leaves the single
+         * softmax warp, which previously serialised 16 exps per head while 480
+         * threads waited at the barrier (attention is latency-bound, one block
+         * per SM).  The normaliser l is STILL summed by lane h from the rounded
+         * halves in ascending r, so the emitted arithmetic and its sum order are
+         * the serial version's -- bit-exact by construction. */
+        {
+            const uint32_t i = tid;
+            const uint32_t h = i / AF16_ROWS, r = i % AF16_ROWS;
+            float mx = fmaxf(sM[h], sS[h][r]);
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
             /* ⚠ MASKING MAKES AN ALL--INF TILE REACHABLE, AND expf(-INF - -INF)
              * IS NaN.  Before the row mask above, every r < nr carried a real
              * score so mx could only be -INF when the tile was empty of rows at
@@ -726,20 +740,23 @@ static void attn_f16_kernel(
              * mx == -INF implies sM[h] == -INF (mx >= sM[h]), so corr is already
              * 0 and l stays 0 -- nothing has been accumulated to rescale. */
             const bool empty = (mx == -INFINITY);
+            const float p = (empty || r >= nr) ? 0.0f : __expf(sS[h][r] - mx);
+            sP[h][r] = __float2half(p);
+            sMx[h] = mx;
+        }
+        __syncthreads();
+        if (tid < AF16_HPB) {
+            const uint32_t h = tid;
+            const float mx = sMx[h];
             const float corr = (sM[h] == -INFINITY) ? 0.0f : __expf(sM[h] - mx);
+            /* Sum the ROUNDED weight, not p: the MMA multiplies sP, so the
+             * normaliser has to be the sum of what it multiplies or the
+             * weights do not sum to one.  The sink term in the epilogue is
+             * deliberately NOT rounded -- it has no V row, it is denominator
+             * mass only.  Rows past nr / hidden rows are zero in sP and add
+             * exactly nothing. */
             float l = sL[h] * corr;
-            for (uint32_t r = 0; r < nr; r++) {
-                const float p = empty ? 0.0f : __expf(sS[h][r] - mx);
-                /* Sum the ROUNDED weight, not p: the MMA multiplies sP, so the
-                 * normaliser has to be the sum of what it multiplies or the
-                 * weights do not sum to one.  The sink term in the epilogue is
-                 * deliberately NOT rounded -- it has no V row, it is denominator
-                 * mass only. */
-                const __half ph = __float2half(p);
-                sP[h][r] = ph;
-                l += __half2float(ph);
-            }
-            for (uint32_t r = nr; r < AF16_ROWS; r++) sP[h][r] = __float2half(0.f);
+            for (uint32_t r = 0; r < AF16_ROWS; r++) l += __half2float(sP[h][r]);
             sM[h] = mx; sL[h] = l; sCorr[h] = corr;
         }
         __syncthreads();
