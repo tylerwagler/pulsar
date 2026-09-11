@@ -724,13 +724,22 @@ int pulsar_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u) {
+        if (n_comp > 1024u) {
+            const int smem = indexer_topk_cub_smem();
+            if (smem > 0) {
+                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                             (const float *)scores->ptr,
+                                                                             n_comp, n_tokens, top_k);
+                return cuda_ok(cudaGetLastError(), "indexer topk 2048 cub launch");
+            }
+        }
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u) {
-        if (n_comp == 4096u) {
+        if (n_comp > 1024u) {
             const int smem = indexer_topk_cub_smem();
             if (smem > 0) {
                 indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
