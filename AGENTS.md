@@ -89,9 +89,10 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 
 ## Testing
 
-- `make test` runs `./pulsar-eval --self-test-extractors`, `./pulsar_agent_test`,
-  and `./pulsar_test`. The eval self-test and agent test need no model;
-  `pulsar_test` loads a model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`).
+- `make test` runs `./pulsar_test` and the seam check. `pulsar_test` loads a
+  model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`). The eval extractor
+  self-test (`./pulsar-eval --self-test-extractors`) and `./pulsar_agent_test`
+  are separate targets; see `docs/QA_BEFORE_RELEASES.md`.
 - `pulsar_test` distinguishes **gating** internal-correctness tests (any failure
   fails the suite) from **informational** ones: `logprob-vectors` compares
   the 2-bit production model against full-precision official-API logprobs (a
@@ -119,14 +120,13 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 
 | Tensor group | Accepted formats |
 | --- | --- |
-| Attention projections, shared experts | MXFP8 (FP8 E4M3 + per-32 E8M0 scales) |
-| Routed experts gate/up/down | exactly `IQ2_XXS`/`IQ2_XXS`/`Q2_K`, or all three `MXFP4`; `IQ2_XXS_SOA` (42) is accepted anywhere `IQ2_XXS` (16) is |
-| Output head | `BF16` or MXFP8 |
-| Norms, embeddings, indexer, HC | `F32`/`F16` |
+| Attention projections, shared experts | MXFP8 (`FP8_E4M3` 38 or pre-stored `MXFP8_LT` 41) |
+| Routed experts gate/up/down | gate and up must match; each of gate/up and down is independently `IQ2_XXS_MMQ_K` (44) or `CUTLASS_MXFP4` (40), and the combo may differ per layer |
+| Output head | `BF16` (the shipped format) or MXFP8 |
+| Norms, embeddings, HC, misc | `F32`/`BF16`/`I32` |
 
 Legacy `Q4_K`/`Q8_0` weights are rejected at load with one clear error
-(`weights_reject_unsupported_types` in `src/engine/weights.cpp`). `Q8_K` exists
-only as *activation* quantization inside the routed-expert (MoE) kernels.
+(`weights_reject_unsupported_types` in `src/engine/weights.cpp`).
 
 ## Compute Paths
 
@@ -151,11 +151,12 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
   are no longer switches: the first names the format, the second is gone.
   Quantize EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
   misrounds ~33% of blocks, so every later move is a byte move.
-  Decode attention reads the packed cache natively. Prefill attention
-  consumes a per-chunk dequantized **f32 shadow**
-  (`gpu_graph_attn_comp_read_cache`) — deliberately: native packed prefill
-  reads were tried 2026-08-02 and measured slower at every depth through
-  131k (see the Deferred Work NO-GO entry below for why).
+  Decode attention reads the packed cache natively. Prefill attention reads
+  the same packed pool through the fp16 tensor-core tier (L166, `comp_kv`):
+  one arm for every entry, no shadow. A native packed read was once measured
+  slower than a per-chunk f32 shadow; the f32 kernels and that shadow were
+  deleted together, so do not reconstruct them (see the Deferred Work entry
+  below for the measured history).
 
 ## Environment Variables
 
@@ -181,14 +182,13 @@ flag fails silently, so check the grep above before relying on one.
 ## Deferred Work
 
 - ~~Native packed-KV reads in the prefill attention kernels~~ — **MEASURED
-  NO-GO 2026-08-02** (tried and reverted the same day; see the PR #9 trail).
-  Routing the packed comp cache into the indexed prefill kernel (its pack
-  branch is bit-exact; gate PASSED) measured −1.6% @8k, −1.9% @16k and
-  −2.7% @131k vs the f32 shadow. The bandwidth thesis fails because DSA's
-  top-k keeps the attention working set L2-hot at any depth (512 gathered
-  rows/token, heavy overlap between neighbors), so the 4x byte saving buys
-  nothing while the per-(token,row) e4m3 decode tax is unconditional. The
-  shadow (decode once per chunk, share across tokens) is the measured-optimal
-  amortization — do not retry without a design that decodes at most once per
-  (chunk, row).
-- Move MoE decode off Q8_K activation quantization.
+  NO-GO 2026-08-02** against the then-current per-(token,row) decode (tried and
+  reverted the same day; see the PR #9 trail). Routing the packed comp cache
+  into the indexed prefill kernel (its pack branch is bit-exact; gate PASSED)
+  measured −1.6% @8k, −1.9% @16k and −2.7% @131k vs the f32 chunk-shadow. The
+  bandwidth thesis fails because DSA's top-k keeps the attention working set
+  L2-hot at any depth (512 gathered rows/token, heavy overlap between
+  neighbors), so the 4x byte saving bought nothing while the per-(token,row)
+  e4m3 decode tax was unconditional. L166 later deleted the f32 kernels and the
+  shadow together; the packed pool is now the only prefill KV source. Do not
+  retry a design that decodes a row more than once per (chunk, row).
