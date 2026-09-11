@@ -48,6 +48,9 @@ enum {
     PULSAR_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
+/* The indexer scorer tier is tiled for exactly this many heads (V4.1: 32,
+ * L218; V4 was 64).  Both entry gates and the MXFP4 kernel read THIS. */
+#define PULSAR_IDX_MXFP4_HEADS 32u
 #define PULSAR_FP8_KV_BLOCK 64u
 #define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
 #define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))

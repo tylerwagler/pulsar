@@ -61,7 +61,8 @@
 #define PULSAR_IDX_MXFP4_MMA 0
 #endif
 
-#define IDX_HEADS     64u
+#define IDX_HEADS     PULSAR_IDX_MXFP4_HEADS
+#define IDX_MTILES    (IDX_HEADS / 16u)      /* m-tiles of 16 heads: 2 at 32 heads */
 #define IDX_HEAD_DIM  128u
 #define IDX_NTILE     128u         /* compressed rows per block */
 #define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
@@ -93,7 +94,13 @@
  * against our eight -- amortising the tile setup over far more math is the
  * structural difference their geometry points at. */
 #define IDX_TOKGROUP  8u
-#define IDX_THREADS   256u         /* 8 warps: 4 per token */
+#define IDX_THREADS   256u         /* 8 warps per token group */
+#define IDX_WARPS     (IDX_THREADS / 32u)
+#define IDX_NSPLITS   (IDX_WARPS / IDX_MTILES)              /* N splits across the warps: 4 at 32 heads */
+#define IDX_NT_PER_SPLIT ((IDX_NTILE / 8u) / IDX_NSPLITS)   /* 8-column n-tiles per split: 4 at 32 heads */
+static_assert(IDX_HEADS % 16u == 0u, "the scorer tiles heads by 16");
+static_assert(IDX_WARPS % IDX_MTILES == 0u, "warps must split evenly over the head tiles");
+static_assert((IDX_NTILE / 8u) % IDX_NSPLITS == 0u, "n-tiles must split evenly over the warps");
 
 /* (The E4M3 encode helpers idx_f32_to_e4m3 / idx_amax_shift lived here until
  * the e2m1 operand switch: Q staging is a nibble spread now and this TU
@@ -255,7 +262,7 @@ static void idx_scores_mxfp4_kernel(
     __shared__ __align__(16) uint8_t sB[IDX_NTILE * IDX_BPSTRIDE];   /* 8 KB packed nibbles */
     __shared__ uint8_t sSFA[IDX_TOKTILE * IDX_HEADS * IDX_KSLABS];   /* 512 B */
     __shared__ uint8_t sSFB[IDX_NTILE * IDX_KSLABS];        /* 512 B */
-    __shared__ float   sPart[4][IDX_NTILE];                /*  2 KB: 4 m-tiles */
+    __shared__ float   sPart[IDX_MTILES][IDX_NTILE];       /* one partial row per m-tile */
 
     /* ---- stage K ONCE for the whole token group -------------------------- */
     /* ---- stage K: raw copy; the nibble spread moves to the MMA load --------
@@ -327,10 +334,11 @@ static void idx_scores_mxfp4_kernel(
     __syncthreads();
 
     /* ---- GEMM + fused head reduction ------------------------------------ */
-    /* warp w owns m-tile w (heads 16w..16w+15) and sweeps every n-tile. */
-    /* 8 warps over a 64-row M (4 m-tiles) x 128-col N: warp = (n-half, m-tile). */
-    const uint32_t warp_m = warp & 3u;                  /* m-tile 0..3 */
-    const uint32_t warp_n = warp >> 2u;                 /* which half of N */
+    /* 8 warps over an IDX_HEADS-row M (IDX_MTILES m-tiles of 16 heads) x 128-col
+     * N: warp = (n-split, m-tile).  At 32 heads that is 2 m-tiles x 4 n-splits
+     * of 32 columns (V4's 64 heads were 4 x 2). */
+    const uint32_t warp_m = warp % IDX_MTILES;          /* m-tile */
+    const uint32_t warp_n = warp / IDX_MTILES;          /* which N split */
     const uint32_t m_base = warp_m * 16u;
     const float *wrow = weights + (uint64_t)tok0 * IDX_HEADS;
     const float wg0 = wrow[m_base + g];
@@ -349,8 +357,9 @@ static void idx_scores_mxfp4_kernel(
     #ifndef IDX_NB
     #define IDX_NB 4u
     #endif
-    const uint32_t nt_lo = warp_n * (IDX_NTILE / 16u);
-    for (uint32_t nt0 = nt_lo; nt0 < nt_lo + IDX_NTILE / 16u; nt0 += IDX_NB) {
+    static_assert(IDX_NT_PER_SPLIT % IDX_NB == 0u, "the register block must tile the split");
+    const uint32_t nt_lo = warp_n * IDX_NT_PER_SPLIT;
+    for (uint32_t nt0 = nt_lo; nt0 < nt_lo + IDX_NT_PER_SPLIT; nt0 += IDX_NB) {
         float d[IDX_NB][4];
         #pragma unroll
         for (uint32_t j = 0; j < IDX_NB; j++) { d[j][0] = d[j][1] = d[j][2] = d[j][3] = 0.f; }
@@ -437,7 +446,7 @@ static void idx_scores_mxfp4_kernel(
         if (comp_i >= n_comp) continue;
         float acc = 0.f;
         #pragma unroll
-        for (uint32_t w = 0; w < 4u; w++) acc += sPart[w][c];
+        for (uint32_t w = 0; w < IDX_MTILES; w++) acc += sPart[w][c];
         float out = acc * scale;
         if (causal && comp_i >= ((pos0 + tok0 + 1u) / ratio)) out = -INFINITY;
         scores[(uint64_t)tok0 * n_comp + comp_i] = out;

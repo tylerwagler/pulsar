@@ -223,7 +223,7 @@ enum {
     PULSAR_MAX_EXPERT_SHARED    = 1,
     PULSAR_MAX_FF_EXP           = 3072,
     PULSAR_MAX_SWA              = 128,
-    PULSAR_MAX_INDEXER_HEAD     = 64,
+    PULSAR_MAX_INDEXER_HEAD     = 32,
     PULSAR_MAX_INDEXER_HEAD_DIM = 128,
     PULSAR_MAX_INDEXER_TOP_K    = 1024,
     PULSAR_MAX_HC               = 4,

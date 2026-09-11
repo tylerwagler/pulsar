@@ -608,9 +608,9 @@ static int indexer_scores_launch(
         fprintf(stderr, "pulsar: indexer scores rejected: causal scan with compression ratio 0 -- refusing\n");
         return 0;
     }
-    if (n_head != 64u) {
-        fprintf(stderr, "pulsar: indexer scores: n_head %u has no kernel (the MXFP4 tier tiles 64 heads) -- refusing\n",
-                n_head);
+    if (n_head != PULSAR_IDX_MXFP4_HEADS) {
+        fprintf(stderr, "pulsar: indexer scores: n_head %u has no kernel (the MXFP4 tier tiles %u heads) -- refusing\n",
+                n_head, PULSAR_IDX_MXFP4_HEADS);
         return 0;
     }
     /* Say so once: this tier changes the numbers, so "did it engage" must be
@@ -683,7 +683,7 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
     const uint32_t vis_max = (run_pos0 + run_n) / ratio;
     if (!scores || !q || !weights || !bank_index_comp ||
         n_comp == 0 || run_n == 0 || ratio == 0 ||
-        n_head != 64u || head_dim != 128u ||
+        n_head != PULSAR_IDX_MXFP4_HEADS || head_dim != 128u ||
         q->bytes < (uint64_t)run_n * n_head * PULSAR_MXKV_FP4_ROWBYTES(128u) ||
         weights->bytes < (uint64_t)run_n * n_head * sizeof(float) ||
         scores->bytes < (uint64_t)run_n * n_comp * sizeof(float) ||
