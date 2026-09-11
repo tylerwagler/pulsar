@@ -168,9 +168,8 @@ static bool gpu_graph_csa2_emit_rows(
                                                      pos_first, ratio, (uint32_t)PULSAR_ROPE_ORIG_CTX,
                                                      freq_base, freq_scale, ext_factor, attn_factor,
                                                      PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage, comp_dst, cache_row0, n_rows,
-                                                            PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
-                                                            gpu_graph_f32_store_observed_any()) != 0;
+    if (ok) ok = pulsar_gpu_mainkv_pack_tensor(gpu_graph_f32_store_observed_any() ? latent : NULL, latent,
+                                               comp_dst, cache_row0, n_rows, PULSAR_N_HEAD_DIM) != 0;
     if (ok) gpu_graph_debug_dump_tensor("KVcompress", latent,
                                         (uint64_t)n_rows * PULSAR_N_HEAD_DIM, il, pos_first);
     if (banked) {
@@ -693,7 +692,7 @@ bool gpu_graph_encode_layer_attention_batch(
     /* Single-sequence prefill has been dequantising the packed comp
      * cache into an f32 shadow and reading that: 2048 B/row instead of 584, on
      * the rows that dominate the attention tile, plus a whole dequant pass.
-     * Every prefill attention consumer reads PULSAR_ATTN_PACK rows as of
+     * Every prefill attention consumer reads the packed rows as of
      * 2026-08-18, so there is nothing left to ask the backend about and no
      * shadow to choose: the packed pool goes straight to all of them.
      * Bit-exact by construction -- packed rows decode to exactly the values the
@@ -1012,25 +1011,21 @@ bool gpu_graph_encode_layer_attention_batch(
             gpu_graph_debug_dump_q_tensor("Qraw", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
-        /* WHERE the Q head-norm + tail rope runs, never WHICH attention kernel.
-         * Shipped: deferred into the fp16 attention kernel's Q-fragment build
-         * (q_prep), so batch_q stays RAW and the normed+roped Q exists only in
-         * the kernel's registers.  A "Qcur" dump needs that intermediate in
-         * memory, so it runs the standalone head_rms_norm_rope_tail kernel
-         * first and hands attention pre-normed Q (q_prep NULL).  The two are
-         * bit-exact (shared rope core, replicated reduction -- attn_f16.cu),
-         * and the attention launch is the same fp16 kernel either way (L166:
-         * there is no other attention kernel; a device without the tier is
-         * refused by the attention launch, not routed elsewhere).  Decode rows
-         * took the standalone arm for one L210 round, when the fused prologue
-         * cost a split-K block ~40 us; the prologue is a warp-level exact copy
-         * of the standalone reduction now and the extra launch is gone. */
+        /* WHERE the Q tail rope runs, never WHICH attention kernel.  Shipped:
+         * deferred into the fp16 attention kernel's Q-fragment build (q_prep),
+         * so batch_q stays RAW and the roped Q exists only in the kernel's
+         * registers.  A "Qcur" dump needs that intermediate in memory, so it
+         * runs the standalone rope kernel first and hands attention roped Q
+         * (q_prep NULL).  The two are bit-exact (shared rope core, and the
+         * bf16 store rounds where the prologue rounds), and the attention
+         * launch is the same fp16 kernel either way (L166).  L218: V4.1's
+         * q_norm is on the low-rank latent (qkv_rms_norm above, before wq_b);
+         * there is no per-head RMS, so this is rope only. */
         const bool prefill_q_defer = !gpu_graph_f32_store_observed("Qcur", il, pos0);
         g->q_prep_active = 0;
         bool prefill_q_norm_rope_fused = false;
         if (ok && prefill_q_defer) {
             memset(&g->q_prep, 0, sizeof g->q_prep);
-            g->q_prep.eps = PULSAR_RMS_EPS;
             g->q_prep.n_rot = PULSAR_N_ROT;
             g->q_prep.n_ctx_orig = compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0;
             g->q_prep.freq_base = freq_base;
@@ -1043,22 +1038,21 @@ bool gpu_graph_encode_layer_attention_batch(
             prefill_q_norm_rope_fused = true;  ///< deferred into attention
         } else if (ok) {
             prefill_q_norm_rope_fused =
-                pulsar_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
-                                                       n_tokens,
-                                                       PULSAR_N_HEAD,
-                                                       PULSAR_N_HEAD_DIM,
-                                                       PULSAR_N_ROT,
-                                                       pos0,
-                                                       compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                       false,
-                                                       freq_base,
-                                                       freq_scale,
-                                                       ext_factor,
-                                                       attn_factor,
-                                                       PULSAR_ROPE_YARN_BETA_FAST,
-                                                       PULSAR_ROPE_YARN_BETA_SLOW,
-                                                       PULSAR_RMS_EPS,
-                                                       mseq ? g->batch_positions : NULL) != 0;
+                pulsar_gpu_rope_tail_tensor(g->batch_q,
+                                            n_tokens,
+                                            PULSAR_N_HEAD,
+                                            PULSAR_N_HEAD_DIM,
+                                            PULSAR_N_ROT,
+                                            pos0,
+                                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
+                                            false,
+                                            freq_base,
+                                            freq_scale,
+                                            ext_factor,
+                                            attn_factor,
+                                            PULSAR_ROPE_YARN_BETA_FAST,
+                                            PULSAR_ROPE_YARN_BETA_SLOW,
+                                            mseq ? g->batch_positions : NULL) != 0;
         }
         /* The separate head-norm + rope-tail pair that used to live here was
          * reachable ONLY by asking for a "Qnorm" dump: the fused kernel never
@@ -1067,7 +1061,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * own warning, not the numbers production computes.  A debug
          * affordance that changes what it observes cannot diagnose what it
          * observes, so it is gone along with the "Qnorm" dump.  Prefill Q now
-         * has exactly two places to be normed: inside attention (shipped) or
+         * has exactly two places to be roped: inside attention (shipped) or
          * by the standalone kernel above (the "Qcur" dump); same numbers,
          * same attention kernel after it.  L045 stage 2.
          *
@@ -1075,8 +1069,8 @@ bool gpu_graph_encode_layer_attention_batch(
          * honest way to get it is an optional store from the SHIPPED kernel,
          * not a second code path that only debuggers take. */
         if (!prefill_q_norm_rope_fused && ok) {
-            fprintf(stderr, "pulsar: prefill Q reached neither the deferred nor the fused "
-                            "norm+rope path -- refusing rather than leaving Q unnormalised\n");
+            fprintf(stderr, "pulsar: prefill Q reached neither the deferred nor the standalone "
+                            "rope path -- refusing rather than leaving Q unrotated\n");
             ok = false;
         }
         if (ok) {
@@ -1126,13 +1120,9 @@ bool gpu_graph_encode_layer_attention_batch(
      * the ring; that now scatters the packed bytes instead, so after this pack
      * the only thing that ever looks at batch_kv is a dump or the range sweep
      * (L094 item 4).  ~8 MiB x 43 layers of stores per chunk. */
-    if (ok) ok = pulsar_gpu_attn_pack_quantize_store_tensor(g->batch_kv,
-                                                           g->batch_kv_pack,
-                                                           0u,
-                                                           n_tokens,
-                                                           PULSAR_N_HEAD_DIM,
-                                                           PULSAR_N_ROT,
-                                                           gpu_graph_f32_store_observed_any()) != 0;
+    if (ok) ok = pulsar_gpu_winkv_pack_tensor(gpu_graph_f32_store_observed_any() ? g->batch_kv : NULL,
+                                              g->batch_kv, g->batch_kv_pack, 0u, n_tokens, PULSAR_N_HEAD_DIM,
+                                              NULL, NULL, 1u, 0u) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * PULSAR_N_HEAD_DIM, il, pos0);
@@ -1402,7 +1392,7 @@ bool gpu_graph_encode_layer_attention_batch(
             const uint32_t zspan = (zslice != 0u && zslice < n_tokens) ? zslice : n_tokens;
             /* The packed cache straight in, like every other span site. This
              * branch built the f32 shadow unconditionally and was the ONLY
-             * source of attn_pack_dequant launches in production. */
+             * source of comp-row dequant launches in production. */
             pulsar_gpu_tensor *zspan_comp_src = g->layer_attn_comp_cache[src];
             const struct gpu_graph_span_ops zsop = {
                 /* comp_src   */ zspan_comp_src,
@@ -1455,7 +1445,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                         * shadow, on the SHIPPED path, because the
                                                                         * consumer could not read packed.  The launcher
                                                                         * has ONE arm now (L166): the fp16 tier reads
-                                                                        * the ATTN_PACK pool natively through comp_kv;
+                                                                        * the MAIN pool natively through comp_kv;
                                                                         * no shadow, no second kernel. */
                                                                        mseq ? gpu_graph_bank_attn_comp_pool(g, src)
                                                                             : g->layer_attn_comp_cache[src],
@@ -1599,13 +1589,13 @@ bool gpu_graph_encode_layer_attention_batch(
                  * what attention read by construction. */
                 pulsar_gpu_tensor *kv_pack_view = pulsar_gpu_tensor_view(
                         g->batch_kv_pack,
-                        (uint64_t)t * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
-                        PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
+                        (uint64_t)t * PULSAR_ENGINE_WINKV_ROWBYTES,
+                        PULSAR_ENGINE_WINKV_ROWBYTES);
                 pulsar_gpu_tensor *heads_view = gpu_graph_heads_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_pack_view && heads_view;
                 if (ok && !zero_prefix) {
                     /* n_tokens=1 with pos0=pos puts the row at pos % raw_cap --
-                     * the same slot the f32 store targeted (attn_pack_ring_slot). */
+                     * the same slot the f32 store targeted (pulsar_kv_ring_slot). */
                     ok = pulsar_gpu_store_raw_kv_batch_packed_tensor(g->layer_raw_cache[il],
                                                        kv_pack_view,
                                                        g->raw_cap,

@@ -94,11 +94,6 @@ uint32_t gpu_graph_prefill_slice(void) {
     return 512u;
 }
 
-uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
-    /* One row format for every KV buffer since the L111 unification; this
-     * asks the backend so the seam stays a question, not an assumption. */
-    return pulsar_gpu_attn_pack_rowbytes(PULSAR_N_HEAD_DIM);
-}
 
 
 
@@ -320,17 +315,16 @@ bool gpu_graph_dspark_seed_draft_kv(
                 break;
             }
             /* No fake-quantise before the store.  The TARGET path this seed has
-             * to agree with (gpu_graph_decode_kv_store -> attn_pack_store_kernel
-             * with x = kv) quantises the true f32 exactly ONCE, packing to the
-             * ring and writing back in the same pass.  Round-tripping here first
-             * made the seed quantise twice, which is the ~5%-misround pattern
-             * norm_kv warns about and would let a seeded row differ from the
-             * target's row for the same token -- the one thing this seed exists
-             * to make identical. */
+             * to agree with (the draft batch's pulsar_gpu_store_raw_kv_batch_tensor
+             * -> winkv_pack_kernel) quantises the true f32 exactly ONCE into the
+             * ring.  Round-tripping here first made the seed quantise twice,
+             * which is the ~5%-misround pattern norm_kv warns about and would
+             * let a seeded row differ from the target's row for the same token
+             * -- the one thing this seed exists to make identical. */
             /* Store through the ring's own writer, not a byte copy.  This was
              * pulsar_gpu_tensor_copy at row*kv_bytes -- an f32 row at a 2048 B
              * stride -- which stopped being the ring's layout when it became
-             * PULSAR_ATTN_PACK (584 B) in 157cd1d.  It then failed its bounds
+             * a packed row (584 B) in 157cd1d.  It then failed its bounds
              * check, the seed aborted, and acceptance collapsed far enough that
              * the yield-quench dropped the request to plain decode.  A writer
              * that bypasses the store API is a writer the next format change
@@ -610,13 +604,13 @@ bool gpu_graph_dspark_draft_forward_banks(
             layer->attn_q_b->abs_offset,
             q_rank, PULSAR_N_HEAD * PULSAR_N_HEAD_DIM,
             g->batch_qr_norm, n_draft) != 0;
-        /* Q head-norm + RoPE */
-        if (ok) ok = pulsar_gpu_head_rms_norm_rope_tail_tensor(
+        /* Q tail RoPE (V4.1: no per-head RMS; q_norm sits on the latent above) */
+        if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_q, n_draft,
             PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
+            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
             banked ? meta_rope[li] : NULL) != 0;
 
         /* --- KV projection --- */

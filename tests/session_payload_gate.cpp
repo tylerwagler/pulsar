@@ -2,7 +2,7 @@
  *
  * Nothing tested this before 2026-08-18, and the gap hid a real bug: the
  * raw-ring payload path still described the ring as "__half containers" long
- * after it became PULSAR_ATTN_PACK, so save indexed a 584 B/row buffer at a
+ * after it became a packed row, so save indexed a 584 B/row buffer at a
  * 1024 B stride and read past the end of the allocation.  It compiled, no gate
  * touched it, and both of its f16 converters were marked PULSAR_MAYBE_UNUSED --
  * which suppressed the one warning that would have fired when their last real
@@ -65,7 +65,7 @@ static char *read_file(const char *path, size_t *len_out) {
  * linear from 0 in both, unlike the raw ring, so a byte fold is well defined. */
 static uint64_t checksum_comp_caches(pulsar_session *s, const char *tag) {
     pulsar_gpu_graph *g = &s->graph;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint64_t attn_rows = 0, idx_rows = 0;

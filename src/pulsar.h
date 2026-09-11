@@ -742,10 +742,10 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 /** Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define PULSAR_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-/* v3 (2026-08-11): the ATTN_PACK comp row's rope tail narrowed f32 -> bf16,
+/* v3 (2026-08-11): the packed comp row's rope tail narrowed f32 -> bf16,
  * taking the row 712 -> 584 B.  A v2 payload's comp rows are laid out on the
  * old stride, so it MUST be rejected rather than reinterpreted. */
-/** v4 (2026-08-17): the attn comp cache is stored as PULSAR_ATTN_PACK rows
+/** v4 (2026-08-17): the attn comp cache is stored as packed rows
  * rather than dequantised f32. v3 files are refused by the header check --
  * deliberately, since the row stride changed and a v3 file read as v4 would
  * decode noise into a KV cache rather than fail.
@@ -772,11 +772,14 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * are carried per kv SOURCE layer (one frontier count per layer, non-zero on the
  * four sources only; each source's comp rows, then its index-K rows, then --
  * at ratio 2 -- its pending-group state), no separate indexer frontier, no
- * indexer compressor state, no warm-up window (raw_window + 127 rows).
- * Earlier files are refused. */
+ * indexer compressor state, no warm-up window (raw_window + 127 rows).  The
+ * KV rows are V4.1's two formats -- WINDOW rows (E4M3 x E8M0/32, 528 B) in the
+ * raw ring, MAIN rows (E2M1 x E4M3/16, 288 B) in the comp pools -- and the
+ * header carries both strides (fields 13 and 16) plus the indexer's.  Earlier
+ * files are refused. */
 #define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(10)
-/** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + the prefill frontier. */
-#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 16u
+/** 13 shape/counters + 2 row strides (main, indexer fp4) + the prefill frontier + the window row stride. */
+#define PULSAR_SESSION_PAYLOAD_U32_FIELDS 17u
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 /** stage_dir: directory for the transient staged file (the caller's disk

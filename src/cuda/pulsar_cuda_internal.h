@@ -51,9 +51,6 @@ enum {
 /* The indexer scorer tier is tiled for exactly this many heads (V4.1: 32,
  * L218; V4 was 64).  Both entry gates and the MXFP4 kernel read THIS. */
 #define PULSAR_IDX_MXFP4_HEADS 32u
-#define PULSAR_FP8_KV_BLOCK 64u
-#define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
-#define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
 
 /*
  * Microscaling (MX / OCP) compressed-KV storage.  One E8M0 (power-of-two)
@@ -68,25 +65,11 @@ enum {
  * reader decodes it in place, and the f32 arm had no caller left. */
 
 /*
- * PULSAR_ATTN_PACK: THE KV row -- one format for every KV buffer since the
- * L111 unification (raw ring, comp pool, drafter ring, MTP cache, current
- * chunk).  NVFP4:
- *   [n_nope/2 e2m1 nibbles, low nibble first][n_nope/16 E4M3 scale codes]
- *   [f32 row scale][n_rot bf16 rope]
- * head_dim 512 / n_rot 64 -> 224 + 28 + 4 + 128 = 384 B/row.  A multiple of
- * 16: cp.async stages 8 B chunks, the rope tail is 2-aligned, the f32 row
- * scale 4-aligned at +252.  Scale decode = e4m3(code) * row_scale via
- * attn_pack_e4m3.  The nope payload is a lossy re-quantization of the QAT
- * e4m3 values (L111 verdict: closer to source, accept >= the retired e4m3
- * row); rope is bf16 verbatim -- quantized rope is what killed ATTN_MX.
- *
- * ⚠ Quantize EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
- * misrounds ~33%% of blocks.  Every later move is a byte move.  There is no
- * other KV row format and no conversion path from the retired e4m3 row --
- * stale payloads refuse.  The geometry macros (PULSAR_ATTN_PACK_*,
- * PULSAR_KV4_NV_*, PULSAR_MXKV_*) live in src/pulsar_gpu.h, the one
- * definition both sides of the seam read (L159 inc 5).  Bumping this layout
- * MUST bump PULSAR_SESSION_PAYLOAD_VERSION (done for the unification: v7).
+ * The two KV rows (L218) -- WINDOW (the rings) and MAIN (the kv sources'
+ * pools) -- are laid out and documented in src/pulsar_gpu.h, the one
+ * definition both sides of the seam read.  Their decoders live below
+ * (winkv_row_ld4 / mainkv_row_ld4), the packers in pulsar_cuda_kvrows.cu.
+ * Quantise once, move bytes after; there is no other KV row format.
  */
 
 /* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
@@ -142,12 +125,12 @@ __device__ __forceinline__ void q_store<float>(float *p, uint64_t i, float v) { 
 template <>
 __device__ __forceinline__ void q_store<__half>(__half *p, uint64_t i, float v) { p[i] = __float2half(v); }
 
-/* e4m3 byte * scale by pure bit math — bit-identical to the textbook
+/* e4m3 byte * scale by pure bit math -- bit-identical to the textbook
  * decode (1 + mant/8)*2^(exp-7) * scale with the sign applied (normals become
  * that exact float built directly from its bit pattern;
  * subnormals use the same mant*2^-9 product; scale is an exact power of two,
  * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
-__device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
+__device__ static inline float pulsar_e4m3_times(uint32_t b, float scale) {
     const uint32_t e = (b >> 3) & 15u;
     const uint32_t m = b & 7u;
     const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20))
@@ -158,7 +141,7 @@ __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
 
 /* E2M1 magnitude decode: 3-bit code -> value, kept as bit math (not a memory
  * table) so the inner attention loops pay ALU, not LDC traffic. */
-__device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
+__device__ static inline float pulsar_e2m1_times(uint32_t nib, float scale) {
     const uint32_t c = nib & 7u;
     /* codes 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6.  Codes >= 2 are normals
      * (exponent 126 + c>>1, mantissa bit c&1); 0 and 0.5 are the format's
@@ -169,50 +152,108 @@ __device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
     return (nib & 8u) ? -sv : sv;
 }
 
-/* The opaque packed-row carriers (pulsar_attn_pack_t / pulsar_mxkv_pack_t)
- * are declared in pulsar_gpu.h (L092); the accessors below are the only
- * sanctioned element reads of THE row (every KV buffer -- see the layout
- * block above). */
-__device__ static inline float attn_comp_pack_ld(const pulsar_attn_pack_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
-    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    if (d < n_nope) {
-        const float row_scale = *(const float *)(r + nib_bytes + nblk);
-        const float scale = attn_pack_e4m3(r[nib_bytes + (d / PULSAR_KV4_NV_BLOCK)], row_scale);
-        const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
-        return attn_kv4_e2m1(nib, scale);
-    }
-    return __bfloat162float(((const __nv_bfloat16 *)(r + nib_bytes + nblk + 4u))[d - n_nope]);
+/* E8M0 scale byte -> 2^(b - 127) (b == 255 is the format's NaN; never stored). */
+__device__ static inline float pulsar_e8m0_scale(uint32_t b) {
+    return __uint_as_float(b << 23);
 }
 
-/* Four consecutive dims (dims [c4*4, c4*4+4)) decoded from a ROW POINTER --
- * global or the smem copy a cp.async stage filled; the byte offsets are
- * row-relative either way.  Scale hoisted: base%16 < 16 so the four dims
- * share one per-16 scale. */
-__device__ static inline float4 attn_comp_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t base = c4 << 2;
-    float4 v;
-    const uint8_t *psc = pr + nib_bytes;
-    if (base < n_nope) {
-        const float row_scale = *(const float *)(psc + n_nope / PULSAR_KV4_NV_BLOCK);
-        const float scale = attn_pack_e4m3(psc[base / PULSAR_KV4_NV_BLOCK], row_scale);
-        const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
-        v.x = attn_kv4_e2m1(b0 & 0xFu, scale);
-        v.y = attn_kv4_e2m1(b0 >> 4, scale);
-        v.z = attn_kv4_e2m1(b1 & 0xFu, scale);
-        v.w = attn_kv4_e2m1(b1 >> 4, scale);
-    } else {
-        const uint32_t rope_off = nib_bytes + n_nope / PULSAR_KV4_NV_BLOCK + 4u;
-        const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + rope_off);
-        v.x = __bfloat162float(rope[base - n_nope + 0u]);
-        v.y = __bfloat162float(rope[base - n_nope + 1u]);
-        v.z = __bfloat162float(rope[base - n_nope + 2u]);
-        v.w = __bfloat162float(rope[base - n_nope + 3u]);
+/* The reference's fast_round_scale (kernel.py): the E8M0 byte for scale
+ * 2^ceil(log2(y)), y = amax * fp_max_inv already formed in fp32, read off y's
+ * IEEE fields -- exponent field plus one when the mantissa is non-zero.  NOT
+ * log2f/ceilf, which round differently at the boundaries; every E8M0 scale
+ * the engine writes (window KV rows, indexer rows) comes from here. */
+__device__ static inline uint32_t pulsar_e8m0_round_up(float y) {
+    const uint32_t b = __float_as_uint(y);
+    const uint32_t e8 = ((b >> 23) & 0xFFu) + (((b & 0x7FFFFFu) != 0u) ? 1u : 0u);
+    return e8 > 254u ? 254u : e8;
+}
+
+/* The OCP E2M1 nibble codec: [sign:1][magnitude:3], magnitudes 0, 0.5, 1,
+ * 1.5, 2, 3, 4, 6 -- CUTLASS float_e2m1_t.  Encode is round-to-nearest with
+ * ties to the even code, i.e. hardware RNE. */
+__device__ static inline float dsv4_e2m1fn_value_dev(int i) {
+    switch (i & 7) {
+    case 0: return 0.0f;
+    case 1: return 0.5f;
+    case 2: return 1.0f;
+    case 3: return 1.5f;
+    case 4: return 2.0f;
+    case 5: return 3.0f;
+    case 6: return 4.0f;
+    default: return 6.0f;
     }
+}
+__device__ static inline uint8_t dsv4_e2m1fn_encode_dev(float x) {
+    float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return (uint8_t)((best & 7) | ((x < 0.0f) ? 0x8u : 0u));
+}
+__device__ static inline float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
+    return pulsar_e2m1_times(nib, scale);
+}
+
+/* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately: the
+ * window packer (quantise then store) and the scatter (copy packed bytes)
+ * write the same ring from the same batch, and a disagreement puts a token's
+ * KV in the wrong slot -- a position-dependent wrong answer, not a crash.
+ * raw_cap == 0: consecutive rows from out_row0 (a pack buffer, not a ring).
+ * Returns PULSAR_KV_RING_DEAD_ROW when seq_id puts the row outside the pool;
+ * the decision depends only on the row, so a block-uniform early-out. */
+#define PULSAR_KV_RING_DEAD_ROW (~0ull)
+__device__ __forceinline__ static uint64_t pulsar_kv_ring_slot(
+        uint32_t row, uint32_t out_row0, uint32_t raw_cap, uint32_t n_banks,
+        const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id) {
+    if (!raw_cap) return (uint64_t)(out_row0 + row);
+    if (seq_id && (uint32_t)seq_id[row] >= n_banks) return PULSAR_KV_RING_DEAD_ROW;
+    const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
+    return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
+}
+
+/* The sanctioned element reads of the two KV rows (every KV buffer -- see
+ * pulsar_gpu.h).  The opaque carriers pulsar_winkv_row_t / pulsar_mainkv_row_t
+ * are declared there. */
+__device__ static inline float winkv_ld(const pulsar_winkv_row_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_WINKV_ROWBYTES(head_dim);
+    return pulsar_e4m3_times(r[d], pulsar_e8m0_scale(r[head_dim + d / PULSAR_WINKV_BLOCK]));
+}
+__device__ static inline float mainkv_ld(const pulsar_mainkv_row_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_MAINKV_ROWBYTES(head_dim);
+    const float scale = pulsar_e4m3_times(r[head_dim / 2u + d / PULSAR_MAINKV_BLOCK], 1.0f);
+    const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
+    return pulsar_e2m1_times(nib, scale);
+}
+
+/* Four consecutive dims [c4*4, c4*4+4) from a ROW POINTER -- global or the
+ * smem copy a cp.async stage filled; byte offsets are row-relative either way.
+ * Four dims never straddle a scale block, so one scale each. */
+__device__ static inline float4 winkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t base = c4 << 2;
+    const float scale = pulsar_e8m0_scale(pr[head_dim + base / PULSAR_WINKV_BLOCK]);
+    const uint32_t w = *(const uint32_t *)(pr + base);
+    float4 v;
+    v.x = pulsar_e4m3_times(w & 0xFFu, scale);
+    v.y = pulsar_e4m3_times((w >> 8) & 0xFFu, scale);
+    v.z = pulsar_e4m3_times((w >> 16) & 0xFFu, scale);
+    v.w = pulsar_e4m3_times(w >> 24, scale);
+    return v;
+}
+__device__ static inline float4 mainkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t base = c4 << 2;
+    const float scale = pulsar_e4m3_times(pr[head_dim / 2u + base / PULSAR_MAINKV_BLOCK], 1.0f);
+    const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
+    float4 v;
+    v.x = pulsar_e2m1_times(b0 & 0xFu, scale);
+    v.y = pulsar_e2m1_times(b0 >> 4, scale);
+    v.z = pulsar_e2m1_times(b1 & 0xFu, scale);
+    v.w = pulsar_e2m1_times(b1 >> 4, scale);
     return v;
 }
 

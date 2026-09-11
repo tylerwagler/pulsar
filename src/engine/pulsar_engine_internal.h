@@ -158,18 +158,13 @@
 #define PULSAR_ENGINE_IDXFP4_ROWBYTES \
     ((uint64_t)PULSAR_MXKV_FP4_ROWBYTES((uint64_t)PULSAR_N_INDEXER_HEAD_DIM))
 
-/** THE packed KV row (NVFP4, L111 unification 2026-08-27): one row format for
- * every KV buffer -- raw ring, comp pool, drafter ring, MTP cache, current
- * chunk.  [n_nope/2 e2m1 nibbles][n_nope/16 e4m3 scale codes][f32 row scale]
- * [n_rot bf16 rope] = 384 B at head_dim 512 / n_rot 64.  The nope payload is
- * a lossy re-quantization of the QAT e4m3 values (measured verdict in
- * rows/L111.md); rope is bf16 verbatim.  The retired 584 B e4m3 row has no
- * decode path and no conversion loader -- stale payloads refuse by stride and
- * version.  The shared definition (src/pulsar_gpu.h) at this model's head_dim;
- * the graph alloc refuses a shape whose n_rot or nope width the row cannot
- * hold, which is the only check the geometry still needs (L159 inc 5). */
-#define PULSAR_ENGINE_ATTN_PACK_ROWBYTES \
-    ((uint64_t)PULSAR_ATTN_PACK_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM))
+/** The two KV rows (src/pulsar_gpu.h, L218) at this model's head_dim: WINDOW
+ * rows (528 B) fill every sliding-window ring -- raw, drafter, the current
+ * chunk's pack buffer; MAIN rows (288 B) fill a kv source's compressed pool.
+ * Neither has a conversion path from 0731's 384 B row -- stale payloads and
+ * bank snapshots refuse by version and stride. */
+#define PULSAR_ENGINE_WINKV_ROWBYTES  PULSAR_WINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
+#define PULSAR_ENGINE_MAINKV_ROWBYTES PULSAR_MAINKV_ROWBYTES((uint64_t)PULSAR_N_HEAD_DIM)
 
 
 /** =========================================================================
@@ -729,7 +724,7 @@ private:
 typedef struct {
     uint32_t n_banks;   ///< pool size; 0 = disabled and the graph owns plain single-session tensors
     uint32_t cur_bank;  ///< bank the installed views currently address (0 when the pool is disabled)
-    uint64_t raw_bank_bytes;                     ///< one bank's raw ring: raw_cap * PULSAR_ATTN_PACK row bytes
+    uint64_t raw_bank_bytes;                     ///< one bank's raw ring: raw_cap * WINDOW row bytes
     /** CSA2 (L218): the compressed pool, the index-K pool and the compressor
      * state lane exist only at a kv SOURCE layer's index; every other layer
      * reads its source's through pulsar_layer_attn_layout(il)->kv_source. */
@@ -770,7 +765,7 @@ typedef struct {
      * NULL when the pool is spec-less. */
     pulsar_gpu_tensor *spec_askv[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, compressor state KV; NULL when the pool is spec-less
     pulsar_gpu_tensor *spec_assc[PULSAR_MAX_LAYER];  ///< spec frontier snapshot, compressor state score
-    uint64_t dspark_raw_bank_bytes;      ///< one bank's drafter raw ring: DRAFT_WINDOW * PULSAR_ATTN_PACK row (384 B)
+    uint64_t dspark_raw_bank_bytes;      ///< one bank's drafter raw ring: DRAFT_WINDOW * WINDOW row (528 B)
     uint64_t dspark_prompt_bank_bytes;   ///< one bank's drafter prompt ring: DRAFT_WINDOW * n_embd * f32
     pulsar_gpu_tensor *dspark_raw[3];       ///< per draft layer, bank-major drafter raw ring; NULL without a pool or drafter
     pulsar_gpu_tensor *dspark_prompt[3];    ///< per draft layer, bank-major drafter prompt-hidden ring
@@ -1005,7 +1000,7 @@ typedef struct {
     int imatrix_f32_rows;
     pulsar_gpu_tensor *batch_kv_raw;                ///< batched twin: fused KV projection output, pre-norm
     pulsar_gpu_tensor *batch_kv;                    ///< batched twin: KV latent after its RMSNorm
-    /** The chunk's KV in PULSAR_ATTN_PACK rows -- what attention actually reads.
+    /** The chunk's KV in WINDOW rows -- what attention actually reads.
      * batch_kv above stays f32 because norm/rope/fp8-quantize are in-place
      * elementwise passes over it, which is f32-as-scratch and is what torch does
      * too (compute wide, store narrow). What was wrong until 2026-08-17 was f32
@@ -2296,7 +2291,7 @@ static inline uint32_t gpu_graph_comp_cap(uint32_t ctx_size, uint32_t ratio) {
  * (steering.cpp); the demand-paged term of the overcommit split. */
 uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size);
 /** One bank's raw SWA ring across every layer at raw_cap rows, in the stored
- * PULSAR_ATTN_PACK row format (steering.cpp): the eager term of the KV
+ * WINDOW / MAIN row formats (steering.cpp): the eager term of the KV
  * sizing, the same bytes gpu_graph_bank_slabs_alloc lays out per layer. */
 uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap);
 /** The deepest compressed pool any layer holds at ctx_size (the smallest
@@ -2446,7 +2441,6 @@ bool gpu_graph_env_flag(const char *name, int *cache);
  */
 uint32_t gpu_graph_prefill_slice(void);
 /** Comp-cache row stride in bytes for the active storage format (pack-aware). */
-uint64_t gpu_graph_attn_comp_cache_row_bytes(void);
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,

@@ -184,7 +184,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-quick cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv4-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-quick cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-fork-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate warm-fork-3way warm-partial-fork-3way sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -249,11 +249,12 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvstore.o src/l
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-# L111: the 4-bit comp-pool pack contract (layout+writeback exact; scale/code
-# deviations bounded by the fast-math budgets the test prints).  Needs a GPU,
-# no model.
-cuda-kv4-pack-gate: tests/kv4_pack_gate
-	./tests/kv4_pack_gate
+# L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
+# against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
+# Needs a GPU, no model.
+cuda-kv-rows-pack-gate: tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath
+	./tests/kv_rows_pack_gate
+	./tests/kv_rows_pack_gate_fastmath
 
 # L149: the device min-p prefilter must equal its host emulation bit-for-bit
 # (row max with the host's tie rule, candidate set and order, overflow report).
@@ -371,12 +372,23 @@ tests/candidate_kernel_test: tests/candidate_kernel_test.cu Makefile \
 # FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
 
 tests/attn_f16_kernel_test: tests/attn_f16_kernel_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
-                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/attn_pack_fixture.h
+                            src/cuda/pulsar_cuda_attn_f16.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+
+# The two KV row packers vs the host replica, byte for byte (L218).  Compiled
+# WITHOUT --use_fast_math on purpose: the packers must be exact under either
+# setting, and the engine builds them with it -- run both (the gate target
+# below builds the fast-math variant too).
+tests/kv_rows_pack_gate: tests/kv_rows_pack_gate.cu Makefile \
+                         src/cuda/pulsar_cuda_kvrows.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
+	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+tests/kv_rows_pack_gate_fastmath: tests/kv_rows_pack_gate.cu Makefile \
+                         src/cuda/pulsar_cuda_kvrows.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h tests/kv_row_fixture.h
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
 # attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
 # raw_cap] and its own header argues the compressed and indexed halves matter --
@@ -387,10 +399,10 @@ tests/attn_f16_banked_test: tests/attn_f16_banked_test.cu Makefile \
 # f32 kernel of the time, while the f16 kernel masks the row to -INF (row 0 substitution
 # double-counts row 0 whenever row 0 was also legitimately selected).  Every
 # top_k>0 shape disagreed by ~8e-1 and nothing was running to notice.
-# attn_f16_banked_test took a "p" argument selecting ATTN_PACK comp banks over
+# attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -1050,7 +1062,7 @@ render-gate: pulsar_test
 # instead of one per gate.  Their individual targets below remain for
 # iterating on one gate; the battery is the runner.
 GATE_TARGETS = unit-test-gate \
-	cuda-reap-router-audit cuda-regression cuda-kv4-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
+	cuda-reap-router-audit cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates \
 	cuda-runner-gate
 # Every gate target is phony, declared HERE where the list is defined (the
@@ -1151,9 +1163,6 @@ tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/p
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.cpp
 
-tests/kv4_pack_gate.o: tests/kv4_pack_gate.cpp src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/kv4_pack_gate.cpp
-
 tests/minp_prefilter_gate.o: tests/minp_prefilter_gate.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/minp_prefilter_gate.cpp
 
@@ -1248,9 +1257,6 @@ src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/kv4_pack_gate: tests/kv4_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/minp_prefilter_gate: tests/minp_prefilter_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
@@ -1472,7 +1478,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv4_pack_gate tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

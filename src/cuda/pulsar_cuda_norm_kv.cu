@@ -5,7 +5,6 @@
 #include <cuda_bf16.h>
 
 
-
 /* Plain (no-weight) RMSNorm. Input x is ALWAYS an HC residual carrier (the
  * hc_dim-wide flatten before each sublayer / the output head) — every caller
  * feeds cur_hc/after_attn_hc/batch_cur_hc etc. — so x loads through pulsar_hc_load
@@ -92,7 +91,6 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
 }
 
 
-
 /* out_q/out_sf, when non-NULL, additionally emit the E4M3 + ue8m0 encoding, so
  * a GEMM consuming this norm multiplies in the source's format instead of
  * against f32.  Same contract as pulsar_cuda_mx.cuh: every lane of a warp must
@@ -131,7 +129,6 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
         if (out_b) out_b[(uint64_t)row * n + i] = __float2bfloat16(v);
     }
 }
-
 
 
 /* q_out_q/q_out_sf, when non-NULL, receive the E4M3 + E8M0 encoding of the Q
@@ -194,81 +191,6 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-/* positions (both RoPE kernels): per-row absolute query positions for banked
- * multi-session batches; NULL degenerates to the classic consecutive pos0+t
- * rule bit-exactly (same arithmetic on the same value). */
-template <typename QT>
-__global__ static void head_rms_norm_rope_tail_kernel(
-        QT *x,
-        uint32_t n_tok,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t n_rot,
-        uint32_t pos0,
-        uint32_t n_ctx_orig,
-        int inverse,
-        float freq_base,
-        float freq_scale,
-        float ext_factor,
-        float attn_factor,
-        float beta_fast,
-        float beta_slow,
-        float eps,
-        const int32_t * __restrict__ positions) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_tok * n_head) return;
-    uint32_t t = row / n_head;
-    const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
-    QT *xr = x + (uint64_t)row * head_dim;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = q_load<QT>(xr, i);
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    const uint32_t n_nope = head_dim - n_rot;
-    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
-        q_store<QT>(xr, i, q_load<QT>(xr, i) * scale);
-    }
-
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f)
-        rope_corr_dims_dev(n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, &corr0, &corr1);
-    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
-        uint32_t i = pair * 2u;
-        /* The rotation itself stays in f32 for both instantiations; only the
-         * two stores narrow.  Rotating in f16 would compound the rounding
-         * across the pair and is not what the fp16-storage change is. */
-        QT *tail = xr + n_nope;
-        float x0 = q_load<QT>(tail, i) * scale;
-        float x1 = q_load<QT>(tail, i + 1) * scale;
-        float r0, r1;
-        rope_pair_rotate_core_dev(x0, x1, i, n_rot, rope_pos, inverse,
-                                  freq_base, freq_scale, ext_factor, attn_factor,
-                                  corr0, corr1, &r0, &r1);
-        q_store<QT>(tail, i,     r0);
-        q_store<QT>(tail, i + 1, r1);
-    }
-}
-
-
 
 
 /* One rope rotation pair, in place at tail[i], tail[i+1], for the callers that
@@ -393,288 +315,40 @@ __global__ static void rope_tail_kernel(
 }
 
 
-
-
-
-
-__device__ static float dsv4_e4m3fn_dequant_dev(float x) {
-    /* Native e4m3 round-trip (cvt.rn.satfinite). PROVEN bit-identical to the
-     * former 7-iteration binary search (each step an exp2f) by an exhaustive
-     * sweep of all 2^32 finite float bit patterns: 4278190080 checked, zero
-     * mismatches, including every RNE tie and the subnormal range
-     * (temp/fp8test.cu). NaN inputs differ (search clamped to 448, native
-     * propagates NaN) -- activations are finite, never hit. */
-    return (float)__nv_fp8_e4m3(x);
-}
-
-
-
-__device__ static float dsv4_e2m1fn_value_dev(int i) {
-    switch (i & 7) {
-    case 0: return 0.0f;
-    case 1: return 0.5f;
-    case 2: return 1.0f;
-    case 3: return 1.5f;
-    case 4: return 2.0f;
-    case 5: return 3.0f;
-    case 6: return 4.0f;
-    default: return 6.0f;
-    }
-}
-
-
-
-
-/* Encode to an OCP E2M1 (float_e2m1_t) 4-bit nibble: [sign:1][magnitude:3].
- * The magnitude table matches dsv4_e2m1fn_value_dev, i.e. CUTLASS float_e2m1_t. */
-__device__ static uint8_t dsv4_e2m1fn_encode_dev(float x) {
-    float ax = fminf(fabsf(x), 6.0f);
-    int best = 0;
-    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
-    for (int i = 1; i < 8; i++) {
-        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
-        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
-            best = i;
-            best_diff = diff;
-        }
-    }
-    return (uint8_t)((best & 7) | ((x < 0.0f) ? 0x8u : 0u));
-}
-
-__device__ static float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
-    float val = dsv4_e2m1fn_value_dev(nib & 7);
-    return (nib & 8u) ? (-val * scale) : (val * scale);
-}
-
-/* E8M0 microscale decode lived here (byte = exponent+127, 255 reserved NaN).
- * Its only caller in this TU was mxkv_dequant_kernel.  The readers that still
- * decode E8M0 -- attn_comp_pack_ld and the indexer scorer -- each derive the
- * scale inline from the stored byte, which is why nothing here needs it. */
-
-/* ===== INVARIANT: FRESH data -> fast path; RE-ENCODED data -> exact path =====
- * The `exp2f(ceilf(log2f(amax/K)))` form used by the quantize kernels below is
- * NOT safe on already-quantized input, and the split between the two forms in
- * this file is DELIBERATE. Do not "simplify" it to one path.
+/* ===== INVARIANT: QUANTISE ONCE; EVERY LATER MOVE IS A BYTE MOVE ============
+ * The three quantisers (winkv_pack, mainkv_pack in pulsar_cuda_kvrows.cu and
+ * indexer_fp4_pack_row_dev below) derive their E8M0 scales from the fp32
+ * product's bit fields (pulsar_e8m0_round_up -- the reference's
+ * fast_round_scale) and divide with __fdiv_rn, so they are exact at the
+ * boundaries whatever the TU's fast-math flags.  The invariant that matters is
+ * about their INPUT, not their arithmetic:
  *
- * VERIFIED on GB10 (2026-07-21, SASS + full-binade sweeps): under
- * --use_fast_math, `log2f` lowers to MUFU.LG2, whose error is one-sided HIGH.
- * `lg2.approx(2^k)` is wrong for EVERY k in [-126,-1] — i.e. the entire range
- * real block scales occupy — so at `amax == K*2^k` exactly, ceilf() rounds up
- * one extra step and the scale comes out 2x TOO LARGE. (`ex2.approx` and
- * `div.approx` were both verified EXACT here; MUFU.LG2 is the sole culprit.
- * Host `-ffast-math` is unaffected: glibc log2f stays exact at pow2.)
- *
- * WHY THE FAST FORM IS FINE HERE: these kernels see FRESH f32 activations, so
- * hitting `amax == K*2^k` is a 1-in-2^23 mantissa coincidence (~2.4e-7/block for
- * K=448, ~1.2e-7 for K=6) — well under the noise floor of the quantization
- * itself, and deterministic, so no bit-exactness gate destabilizes.
- *
- * WHY RE-ENCODING IS CATASTROPHIC: quantized values live on a dyadic LATTICE.
+ * RE-ENCODING IS CATASTROPHIC: quantised values live on a dyadic lattice.
  * After E2M1, block values are {0,.5,1,1.5,2,3,4,6}*scale, so a block whose max
- * sits on the top code has `amax == 6*scale` EXACTLY — a guaranteed hit, and
- * `v/scale` rounds to 6.0 for anything above 5.0, so ~1/3 of re-encoded FP4
- * blocks land on it (~5% for E4M3's 448). A competing GB10 fork shipped exactly
- * this bug and lost 10.5% of their fp4 indexer lanes to zero.
+ * sits on the top code has `amax == 6*scale` EXACTLY and its re-derived scale
+ * moves; ~1/3 of re-encoded FP4 blocks land on such a point (~5% for E4M3's
+ * 448).  A competing GB10 fork shipped exactly this bug and lost 10.5% of
+ * their fp4 indexer lanes to zero.
  *
- * **If you ever feed already-quantized data into `fp8_kv_quantize*`,
- * `attn_pack_store`, or `indexer_fp4_pack*`, the misround rate jumps from
- * 1e-7 to ~5% (E4M3) or ~33% (FP4) instantly.**  the old standalone
- * quantizer's `quantize_fp8` flag was hardcoded false at every call site for
- * exactly this reason -- and was deleted, with its kernel, in the L093 sweep:
- * the pack commit is the single fp8 quantizer.
- *
- * This is MEASURED, not theoretical.  On 2026-08-18 three KV paths were found
- * quantizing the same rows twice (prefill's ring store re-quantized the buffer
+ * MEASURED, not theoretical.  On 2026-08-18 three KV paths were found
+ * quantising the same rows twice (prefill's ring store re-quantised the buffer
  * the pack had just round-tripped; the draft batch and the drafter seed did the
- * same).  Removing the second pass CHANGED THE BYTES: an 18-token prompt is one
- * chunk and never reads the ring, and its logits were identical either way,
- * while a 5530-token prompt that does read the ring moved 27.788 -> 27.321.
- * So the fast-math bucket is NOT value-idempotent, and the call site that
- * claimed the two passes "agree byte for byte" was wrong.  It cost 2.9% of
- * decode acceptance to stop doing it, and it was still worth it -- the ring now
- * holds what attention actually read.
+ * same).  Removing the second pass CHANGED THE BYTES on a 5530-token prompt
+ * (27.788 -> 27.321) and cost 2.9% of decode acceptance, and it was still
+ * worth it -- the ring now holds what attention actually read.
  *
- * THE RULE IS THEREFORE: never re-encode.  MOVE PACKED BYTES.  Every KV path in
- * the engine now does -- prefill's ring scatter, session save/load (payload v5),
- * and the drafter seed.  The exact integer-math scale buckets that used to make
- * re-encoding survivable (`attn_pack_exact_e8_dev`,
- * `dsv4_e8m0_encode_scale_exact_dev`) are deleted, because nothing re-encodes
- * any more and an unreferenced safety net is just code that rots.  If a future
- * restore path genuinely cannot move bytes, recover one from git history rather
- * than reaching for the fresh quantizers above -- that is the whole point of
- * this comment.
- *
- * RESOLVED BY DELETION (2026-08-25, L106 K11): this note used to record that
- * the amax floor 7.052966104933725e-38f (= exactly 6.0f * 2^-126, ON a
- * misround point) made an empty block's stored E8M0 byte differ from what the
- * mxkv_pack RESTORE packer wrote for the same row — a latent flake for any
- * byte-comparing gate, deferred to the next golden re-baseline.  The restore
- * packer no longer exists: the v5 session payload moves packed bytes verbatim
- * both directions, so there is exactly ONE packer and no second path to agree
- * with.  The floor stays as-is — "folding" it now would change bytes for zero
- * benefit.  Value impact was always NIL (every lane encodes nibble 0 either
- * way).  (The E4M3 floor 1.0e-4f was checked and is NOT on a misround point.)
+ * THE RULE: never re-encode.  MOVE PACKED BYTES.  Every KV path in the engine
+ * does -- prefill's ring scatter (winkv_scatter_kernel), session save/load and
+ * bank snapshots (payload / KVB2 versions), fork and evict/restore, the
+ * drafter seed.  There is no exact-re-encode safety net and no conversion
+ * loader; if a future restore path genuinely cannot move bytes, it needs a
+ * design, not a call into the quantisers above.
  * ============================================================================ */
 
 
-
-
-
-
-
-
-
-
-__device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
-    /* Native e4m3 encode: the former (exp<<3)|mant index IS the e4m3fn bit
-     * pattern (sign in 0x80), so the hardware cvt byte is the same encoding.
-     * Bit-identity proven by the exhaustive round-trip sweep (see
-     * dsv4_e4m3fn_dequant_dev). */
-    __nv_fp8_e4m3 f(x);
-    return *(const uint8_t *)&f;
-}
-
-
-#define PULSAR_FP8_KV_BLOCK 64u
-#define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
-#define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
-
-
-
-/* fp8_kv_quantize_kernel (the standalone in-place quantizer) lived here until
- * the 2026-08-22 launched-vs-defined sweep (L093): every caller passed
- * quantize_fp8=false -- the pack-store below has been the single fp8 quantizer
- * since the 2026-08-18 double-quantize audit -- so the kernel, its wrapper
- * pulsar_gpu_dsv4_fp8_kv_quantize_tensor, and the flag were dead dispatch.
- * The recipe lives on in attn_pack_store. */
-
-/* PULSAR_ATTN_PACK store: quantize the nope dims of n_rows f32 rows of x with
- * the engine's ONE NVFP4 recipe (per-PULSAR_KV4_NV_BLOCK = 16 amax, one f32 row
- * scale keyed so every block scale fits E4M3, a per-block E4M3 scale code whose
- * DECODED value x row scale is what both the encode and every reader use, E2M1
- * nibbles by dsv4_e2m1fn_encode_dev -- L111), write the roundtripped f32 back
- * into x (so the stage/dumps show the same values the packed row decodes to),
- * and store the packed rows (see PULSAR_ATTN_PACK_* in pulsar_cuda_internal.h;
- * 384 B at head_dim 512) into `out` at rows [out_row0, out_row0+n_rows).  The rope tail
- * takes the same treatment one dtype up: bf16-roundtripped in place, then
- * stored.  Read-back is bit-identical to the f32 path. */
-/* `x` is the OPTIONAL f32 staging to round-trip in place; NULL when the source
- * must not be modified (the raw-ring writers take a const kv).  `src` is what is
- * read.  positions/seq_id/n_banks/raw_cap give the ring scatter the raw cache
- * needs -- destination row is bank*raw_cap + pos%raw_cap.  raw_cap == 0
- * degenerates to consecutive rows at out_row0, which is what the compressed pool
- * wants, so ONE kernel now writes both KV caches in the one 384 B format. */
-/* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately.
- *
- * attn_pack_store_kernel (quantise then store) and attn_pack_scatter_kernel
- * (copy already-packed bytes) must agree on this exactly: they write the same
- * ring from the same batch, and a disagreement puts a token's KV in the wrong
- * slot.  Nothing about that fails to compile, and it would surface as a
- * position-dependent wrong answer rather than a crash.  The mapping was copied
- * verbatim between the two when the scatter path was added (2026-08-18) with a
- * comment saying they must stay in step; this replaces the comment.
- *
- * Returns ATTN_PACK_DEAD_ROW when seq_id puts the row outside the pool.  A
- * helper cannot return on the caller's behalf, hence a sentinel -- and the
- * caller's early-out stays UNIFORM ACROSS THE BLOCK, which matters because the
- * store kernel __syncthreads() below: the decision depends only on blockIdx.x,
- * so either the whole block leaves or none of it does. */
-#define ATTN_PACK_DEAD_ROW (~0ull)
-
-__device__ __forceinline__ static uint64_t attn_pack_ring_slot(
-        uint32_t row, uint32_t out_row0, uint32_t raw_cap, uint32_t n_banks,
-        const int32_t *__restrict__ positions,
-        const int32_t *__restrict__ seq_id) {
-    if (!raw_cap) return (uint64_t)(out_row0 + row);
-    if (seq_id && (uint32_t)seq_id[row] >= n_banks) return ATTN_PACK_DEAD_ROW;
-    const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
-    return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
-}
-
-__global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
-                                              uint32_t out_row0, uint32_t n_rows,
-                                              uint32_t head_dim, uint32_t n_rot,
-                                              const int32_t * __restrict__ positions,
-                                              const int32_t * __restrict__ seq_id,
-                                              uint32_t n_banks, uint32_t raw_cap) {
-    const uint32_t row = blockIdx.x;
-    const uint32_t tid = threadIdx.x;      /* 64 threads */
-    if (row >= n_rows) return;
-    const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
-                                                positions, seq_id);
-    if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
-    const uint32_t n_nope = head_dim - n_rot;
-    const uint32_t nib_bytes = n_nope / 2u;
-    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    const float *sr = src + (uint64_t)row * head_dim;
-    float *xr = x ? (x + (uint64_t)row * head_dim) : NULL;
-    uint8_t *outr = out + dst_row * rowbytes;
-    uint8_t *sc = outr + nib_bytes;
-    __shared__ float samax[PULSAR_KV4_NV_NBLK(512u)];   /* 28 at head_dim 512 */
-    __shared__ float sscale[PULSAR_KV4_NV_NBLK(512u)];
-    __shared__ float srow;
-
-    for (uint32_t bk = tid; bk < nblk; bk += blockDim.x) samax[bk] = 0.0f;
-    __syncthreads();
-    /* Per-16 amax.  Non-negative floats order-match their bit patterns, so
-     * atomicMax on the int view is exact -- and max is order-independent, so
-     * the result is deterministic. */
-    for (uint32_t d = tid; d < n_nope; d += blockDim.x) {
-        atomicMax((int *)&samax[d / PULSAR_KV4_NV_BLOCK], __float_as_int(fabsf(sr[d])));
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float ra = 0.0f;
-        for (uint32_t bk = 0; bk < nblk; bk++) ra = fmaxf(ra, samax[bk]);
-        /* Row scale keyed so every block scale block_amax/(6*row_scale) fits
-         * E4M3's [0, 448]; the 1e-4 amax floor matches the retired fp8
-         * recipe's. */
-        const float rs = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
-        srow = rs;
-        *(float *)(sc + nblk) = rs;   /* 4-aligned: nib 224 + 28 codes */
-    }
-    __syncthreads();
-    for (uint32_t bk = tid; bk < nblk; bk += blockDim.x) {
-        /* The DECODED scale (e4m3 roundtrip x row scale) is what both the
-         * encode below and every reader use; a round-down clips the block's
-         * extremes into the top code -- the standard NVFP4 trade, measured
-         * in the L111 verdict. */
-        const float t = fminf(448.0f, samax[bk] * (1.0f / 6.0f) / srow);
-        sc[bk] = dsv4_e4m3fn_encode_dev(t);
-        sscale[bk] = dsv4_e4m3fn_dequant_dev(t) * srow;
-    }
-    __syncthreads();
-
-    /* Nibble pairs: thread t owns packed bytes t, t+64, ... (dims 2t, 2t+1).
-     * dsv4_e2m1fn_encode_dev is the tree's ONE reference E2M1 encoder
-     * (round-to-nearest, tie to the even code).  A zero block decodes zero
-     * whatever its code; guard the quotient so it encodes code 0, not NaN. */
-    for (uint32_t i = tid; i < nib_bytes; i += blockDim.x) {
-        const uint32_t d0 = i * 2u;
-        const float s0 = sscale[d0 / PULSAR_KV4_NV_BLOCK];
-        const float s1 = sscale[(d0 + 1u) / PULSAR_KV4_NV_BLOCK];
-        const uint32_t v0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
-        const uint32_t v1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
-        outr[i] = (uint8_t)(v0 | (v1 << 4));
-        if (xr) {
-            xr[d0]      = attn_kv4_e2m1(v0, s0);
-            xr[d0 + 1u] = attn_kv4_e2m1(v1, s1);
-        }
-    }
-    /* bf16 rope tail, roundtripped in place so the f32 staging keeps holding
-     * exactly what the packed row decodes to. */
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(outr + nib_bytes + nblk + 4u);
-    for (uint32_t d = tid; d < n_rot; d += blockDim.x) {
-        const __nv_bfloat16 hb = __float2bfloat16(sr[n_nope + d]);
-        rope[d] = hb;
-        if (xr) xr[n_nope + d] = __bfloat162float(hb);
-    }
-}
-
 /* The indexer's FP4 row (L218, DeepSeek-V4.1): the reference's
  * fp4_act_quant(x, 32, scale_dtype=e8m0) on a bf16 row -- per 32-element
- * block, amax floored at 6 * 2^-126, scale 2^ceil(log2(amax / 6)), values
+ * block, amax floored at 6 * 2^-126, scale 2^ceil(log2(amax * (1/6))), values
  * clamped to +-6 and rounded to E2M1, the scale stored as one E8M0 byte.  The
  * value is rounded to bf16 first: the reference quantises the bf16 tensor the
  * projection (fp8 GEMM, bf16 out) and RoPE (fp32 math, copied back to bf16)
@@ -713,10 +387,11 @@ __device__ static inline void indexer_fp4_pack_row_dev(const indexer_fp4_t &h, c
                                                        uint8_t *nib_sh, uint8_t *outr, uint32_t tid,
                                                        float *keep_f32_slot) {
     const float amax = fmaxf(absbuf[h.block_base], 7.052966104933725e-38f);   /* 6 * 2^-126 */
-    int e8 = (int)ceilf(log2f(amax / 6.0f)) + 127;
-    e8 = e8 < 0 ? 0 : (e8 > 254 ? 254 : e8);
-    const float scale = exp2f((float)(e8 - 127));
-    const uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, h.v / scale)));
+    /* fast_round_scale(amax, 1/6): the product in fp32, the exponent from its
+     * bit fields (pulsar_cuda_internal.h); IEEE division for the RNE ties */
+    const uint32_t e8 = pulsar_e8m0_round_up(amax * (1.0f / 6.0f));
+    const float scale = pulsar_e8m0_scale(e8);
+    const uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, __fdiv_rn(h.v, scale))));
     /* The dequantised writeback is for OBSERVERS only -- the packed rows are
      * what every consumer reads (L094). */
     if (keep_f32_slot) *keep_f32_slot = dsv4_e2m1fn_decode_dev(nib, scale);
@@ -775,18 +450,6 @@ __global__ static void indexer_fp4_pack_kernel(float *x, uint8_t *out,
     indexer_fp4_pack_row_dev(h, absbuf, nib_sh, out + (uint64_t)row * PULSAR_MXKV_FP4_ROWBYTES(128u), tid,
                              keep_f32 ? &xr[tid] : NULL);
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps,
@@ -985,73 +648,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
 }
 
 
-
-
-
-int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
-    if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
-    /* Derived from the buffer, never passed in.  Passing it was how decode
-     * came to hand an f16 Q to the f32 kernel. */
-    const size_t esz = pulsar_tensor_esz(x);
-    const int q_f16 = (esz == sizeof(__half));
-    if (!x || n_rot > head_dim || (n_rot & 1u) ||
-        x->bytes < (uint64_t)n_tok * n_head * head_dim * esz) return 0;
-    const int32_t *pos = positions ? (const int32_t *)positions->ptr : NULL;
-    if (q_f16)
-        head_rms_norm_rope_tail_kernel<__half><<<n_tok * n_head, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
-    else
-        head_rms_norm_rope_tail_kernel<float><<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps, pos);
-    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
-}
-
-
-
-
-
-
-/* PULSAR_ATTN_PACK quantize+store: fp8-roundtrip the nope dims of n_rows f32 rows
- * of x IN PLACE (the single pack-store fp8 recipe) and store
- * the packed rows into `packed` at rows [out_row0, out_row0+n_rows). */
-/* Row geometry, straight from the macros the kernels index with.  Deliberately
- * NOT a re-derivation: if these ever stop being the same expression the kernels
- * use, the check they exist for is worthless. */
-uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim) {
-    return PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-}
-
-uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim) {
-    return PULSAR_MXKV_FP4_ROWBYTES(head_dim);
-}
-
-
-int pulsar_gpu_attn_pack_quantize_store_tensor(pulsar_gpu_tensor *x,
-                                                       pulsar_gpu_tensor *packed,
-                                                       uint32_t out_row0,
-                                                       uint32_t n_rows,
-                                                       uint32_t head_dim,
-                                                       uint32_t n_rot,
-                                                       bool keep_f32) {
-    if (!x || !packed || n_rows == 0 ||
-        n_rot != PULSAR_ATTN_PACK_NROT || head_dim <= n_rot ||
-        head_dim != 512u ||   /* shared samax/sscale are sized for 28 blocks */
-        ((head_dim - n_rot) % PULSAR_KV4_NV_BLOCK) != 0 ||
-        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
-        packed->bytes < ((uint64_t)out_row0 + n_rows) *
-                        PULSAR_ATTN_PACK_ROWBYTES(head_dim)) {
-        return 0;
-    }
-    attn_pack_store_kernel<<<n_rows, 64>>>(keep_f32 ? (float *)x->ptr : NULL,
-                                          (const float *)x->ptr,
-                                          (uint8_t *)packed->ptr,
-                                           out_row0, n_rows, head_dim, n_rot,
-                                           NULL, NULL, 0u, 0u);
-    return cuda_ok(cudaGetLastError(), "attn_pack_store launch");
-}
-
-
-
-
-
 /* Rope the indexer Q rows' tails in place and store their FP4 rows into
  * `packed`.  There is no dequantized output: the packed rows are the ONLY Q
  * the scorers see, so the quantized values cannot fork from what a second
@@ -1104,7 +700,7 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups) {
     if (!x || n_rot > head_dim || (n_rot & 1)) return 0;
     /* Derived from the buffer, never passed in -- the same rule its f16-aware
-     * twin head_rms_norm_rope_tail states above, for the same reason: passing
+     * twin (0731's head_rms_norm_rope_tail) stated, for the same reason: passing
      * the width is how decode came to hand an f16 Q to the f32 kernel.
      *
      * This used to be `esz != sizeof(float) -> refuse`, guarding an untemplated
@@ -1167,133 +763,90 @@ int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, u
 }
 
 
-int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
-
-
-
+/* The raw-ring writers.  Every ring row is a WINDOW row (pulsar_gpu.h); the
+ * quantise happens in pulsar_gpu_winkv_pack_tensor exactly once, and rows
+ * already packed are moved as bytes.  Destination slot = the shared
+ * pulsar_kv_ring_slot rule. */
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
+    if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap ||
+        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_WINKV_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
-     * round-trip the decode store does. */
-    attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
-                                      (uint8_t *)raw_cache->ptr,
-                                      row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
-                                      NULL, NULL, 1u, raw_cap);
-    return cuda_ok(cudaGetLastError(), "raw pack store launch");
+    /* x = NULL: kv is const here; the ring slot is pos % raw_cap with pos = row */
+    return pulsar_gpu_winkv_pack_tensor(NULL, kv, raw_cache, row, 1u, head_dim, NULL, NULL, 1u, raw_cap);
 }
 
 
-/* Scatter ALREADY-PACKED rows into the ring.  Shares attn_pack_ring_slot with
- * attn_pack_store_kernel -- see the note there on why that is one function and
- * not two identical blocks; the only difference here is that this one moves
- * bytes instead of quantising.
- *
- * That difference is the point.  The prefill producer packs its chunk once
- * (attn_pack_quantize_store_tensor, which also round-trips the f32 in place),
- * and the ring store then re-quantised THAT ALREADY-ROUND-TRIPPED buffer --
- * which is the exact pattern the warning at the top of this file calls out:
- * feeding already-quantized data to a fresh quantizer takes the misround rate
- * from 1e-7 to ~5% at E4M3 scale boundaries.  The old call site argued the two
- * agree because both use the same fast-math scale; the warning says that bucket
- * is not bit-idempotent.  Copying the bytes makes the question moot -- the ring
- * gets exactly what attention read, by construction rather than by argument. */
-__global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
-                                                uint32_t out_row0, uint32_t n_rows,
-                                                uint32_t head_dim,
-                                                const int32_t *__restrict__ positions,
-                                                const int32_t *__restrict__ seq_id,
-                                                uint32_t n_banks, uint32_t raw_cap) {
-    uint32_t row = blockIdx.x;
+/* Scatter ALREADY-PACKED window rows into the ring: the prefill producer packs
+ * its chunk once (pulsar_gpu_winkv_pack_tensor into the pack buffer attention
+ * reads), and the ring then receives THOSE bytes -- never a second quantise of
+ * the same values (re-encoding a decoded row is not bit-idempotent at scale
+ * boundaries; the ring must hold exactly what attention read). */
+__global__ static void winkv_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
+                                            uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
+                                            const int32_t *__restrict__ positions,
+                                            const int32_t *__restrict__ seq_id,
+                                            uint32_t n_banks, uint32_t raw_cap) {
+    const uint32_t row = blockIdx.x;
     if (row >= n_rows) return;
-    const uint64_t dst_row = attn_pack_ring_slot(row, out_row0, raw_cap, n_banks,
-                                                positions, seq_id);
-    if (dst_row == ATTN_PACK_DEAD_ROW) return;   /* dead row stores nothing */
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
+    const uint64_t dst_row = pulsar_kv_ring_slot(row, out_row0, raw_cap, n_banks, positions, seq_id);
+    if (dst_row == PULSAR_KV_RING_DEAD_ROW) return;   /* dead row stores nothing */
+    const uint64_t rowbytes = PULSAR_WINKV_ROWBYTES(head_dim);
     const uint8_t *sr = src + (uint64_t)row * rowbytes;
     uint8_t *dr = out + dst_row * rowbytes;
     for (uint32_t b = threadIdx.x; b < (uint32_t)rowbytes; b += blockDim.x) dr[b] = sr[b];
+}
+
+/* Descriptor (banked) mode: both arrays or neither; the raw cache operand is
+ * the whole bank pool (byte bound scales by n_banks) and the uint32 row ABI
+ * (seq*raw_cap + slot) must not overflow.  pos0 is ignored when positions !=
+ * NULL.  Fail-loud, like the banked attention launchers. */
+static bool raw_store_descr_ok(const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
+                               uint32_t n_tokens, uint32_t n_banks, uint32_t raw_cap, const char *what) {
+    const bool descr = positions != NULL || seq_id != NULL;
+    if (descr &&
+        (!positions || !seq_id || n_banks == 0 ||
+         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+         (uint64_t)n_banks * raw_cap > 4294967296ull)) {
+        fprintf(stderr, "pulsar: %s rejected: bad descriptor args (n_tokens=%u n_banks=%u raw_cap=%u)\n",
+                what, n_tokens, n_banks, raw_cap);
+        return false;
+    }
+    return true;
 }
 
 int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
                                                 uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                 const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
                                                 uint32_t n_banks) {
-    const int descr = positions != NULL || seq_id != NULL;
-    if (descr &&
-        (!positions || !seq_id || n_banks == 0 ||
-         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         (uint64_t)n_banks * raw_cap > 4294967296ull)) {
-        fprintf(stderr,
-                "pulsar: banked packed raw store rejected: bad descriptor args "
-                "(n_tokens=%u n_banks=%u raw_cap=%u)\n",
-                n_tokens, n_banks, raw_cap);
-        return 0;
-    }
+    if (!raw_store_descr_ok(positions, seq_id, n_tokens, n_banks, raw_cap, "banked packed raw store")) return 0;
+    const bool descr = positions != NULL;
     const uint64_t kv_banks = descr ? n_banks : 1u;
-    const uint64_t rowbytes = PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    if (!raw_cache || !packed || raw_cap == 0 ||
-        head_dim <= PULSAR_ATTN_PACK_NROT ||
-        ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0 ||
+    const uint64_t rowbytes = PULSAR_WINKV_ROWBYTES(head_dim);
+    if (!raw_cache || !packed || raw_cap == 0 || (head_dim % PULSAR_WINKV_BLOCK) != 0u ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
         packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
     if (n_tokens == 0) return 1;
-    attn_pack_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr,
-                                               (uint8_t *)raw_cache->ptr,
-                                               pos0, n_tokens, head_dim,
-                                               descr ? (const int32_t *)positions->ptr : NULL,
-                                               descr ? (const int32_t *)seq_id->ptr : NULL,
-                                               descr ? n_banks : 1u, raw_cap);
-    return cuda_ok(cudaGetLastError(), "raw pack scatter launch");
+    winkv_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr, (uint8_t *)raw_cache->ptr,
+                                           pos0, n_tokens, head_dim,
+                                           descr ? (const int32_t *)positions->ptr : NULL,
+                                           descr ? (const int32_t *)seq_id->ptr : NULL,
+                                           descr ? n_banks : 1u, raw_cap);
+    return cuda_ok(cudaGetLastError(), "window row scatter launch");
 }
 
 int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
-                                                 const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
-    if (head_dim != 512u) {
-        /* attn_pack_store_kernel's shared samax/sscale are sized for 28
-         * per-16 blocks (head_dim 512) and the row macros hardcode NROT=64;
-         * no caller passes anything else -- refuse rather than trust that
-         * (the standard the quantize_store entry already applies). */
-        return 0;
-    }
-    /* Descriptor (banked) mode: both arrays or neither; the raw cache operand
-     * is the whole bank pool (byte bound scales by n_banks) and the uint32
-     * row ABI (seq*raw_cap + slot) must not overflow.  pos0 is ignored when
-     * positions != NULL.  Fail-loud, like the banked attention launchers. */
-    const int descr = positions != NULL || seq_id != NULL;
-    if (descr &&
-        (!positions || !seq_id || n_banks == 0 ||
-         positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
-         (uint64_t)n_banks * raw_cap > 4294967296ull)) {
-        fprintf(stderr,
-                "pulsar: banked raw store rejected: bad descriptor args "
-                "(n_tokens=%u n_banks=%u raw_cap=%u)\n",
-                n_tokens, n_banks, raw_cap);
-        return 0;
-    }
-    const uint64_t kv_banks = descr ? n_banks : 1u;
+                                         const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
+    if (!raw_store_descr_ok(positions, seq_id, n_tokens, n_banks, raw_cap, "banked raw store")) return 0;
+    const bool descr = positions != NULL;
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
+        raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * PULSAR_WINKV_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
-    {
-        /* One block per row, 64 threads -- the packed format needs a per-64-block
-         * amax, so this cannot be the flat one-thread-per-element scatter the f32
-         * ring uses.  x = NULL: kv is const on this entry. */
-        attn_pack_store_kernel<<<n_tokens, 64>>>(NULL, (const float *)kv->ptr,
-                                                 (uint8_t *)raw_cache->ptr,
-                                                 pos0, n_tokens, head_dim, PULSAR_ATTN_PACK_NROT,
-                                                 descr ? (const int32_t *)positions->ptr : NULL,
-                                                 descr ? (const int32_t *)seq_id->ptr : NULL,
-                                                 descr ? n_banks : 1u, raw_cap);
-        return cuda_ok(cudaGetLastError(), "raw pack store batch launch");
-    }
+    if (n_tokens == 0) return 1;
+    /* x = NULL: kv is const on this entry */
+    return pulsar_gpu_winkv_pack_tensor(NULL, kv, raw_cache, pos0, n_tokens, head_dim,
+                                        positions, seq_id, descr ? n_banks : 1u, raw_cap);
 }
-
-
-
 
 
 /* Read n_elems ELEMENTS of t, starting at elem_off, to the host as f32,

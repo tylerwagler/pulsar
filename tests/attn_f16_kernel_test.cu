@@ -57,14 +57,10 @@ int cuda_ok(cudaError_t err, const char *what) {
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
 
 
-#include "attn_pack_fixture.h"   /* host E4M3 encode/decode: see the note there
- * on why the fixture ENCODES a draw instead of drawing random bytes */
+#include "kv_row_fixture.h"   /* host replicas of the two row packers: see the note
+ * there on why the fixture ENCODES a draw instead of drawing random bytes */
 
 int main(int argc, char **argv) {
-    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
-     * environment would make the launch dispatch decode E4M3 rows as nibbles and
-     * fail confusingly.  Pin the format rather than inherit it. */
-
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
     const uint32_t window   = (argc > 2) ? (uint32_t)atoi(argv[2]) : 24u;
     const uint32_t n_head   = (argc > 3) ? (uint32_t)atoi(argv[3]) : 32u;
@@ -91,38 +87,27 @@ int main(int argc, char **argv) {
                        ckv((size_t)(n_comp ? n_comp : 1u) * D),
                        sinks(n_head), out((size_t)n_tokens * n_head * D, -12345.f);
     for (auto &v : q) v = (float)(nd(rng) * 0.5);
-    /* Raw KV: build PULSAR_ATTN_PACK rows first, then DECODE them into kv[] so
-     * the f64 oracle below and the kernel are looking at the same numbers. */
-    const uint32_t n_nope_h = D - PULSAR_ATTN_PACK_NROT;
-    const size_t pack_row_h = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
-    std::vector<uint8_t> rawp((size_t)n_tokens * pack_row_h);
-    {
-        for (uint32_t r = 0; r < n_tokens; r++) {
-            uint8_t *row = &rawp[(size_t)r * pack_row_h];
-            /* Draws with a per-16-block magnitude band (2^-1..2^1) so scale
-             * addressing is exercised without degenerating the softmax --
-             * same discipline as the e4m3-era fixture, scale now DERIVED
-             * from the data because NV packs whole rows. */
-            std::vector<float> vals(D);
-            for (uint32_t d = 0; d < n_nope_h; d++)
-                vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
-            for (uint32_t d = n_nope_h; d < D; d++) vals[d] = (float)(nd(rng) * 0.5);
-            host_nv_pack_row(vals.data(), row, &kv[(size_t)r * D], D);
-        }
-    }
-    /* Comp rows are PULSAR_ATTN_PACK too.  They were f32 until 2026-08-18 and the
-     * kernel chose between formats on a comp_pack flag; that flag is gone, so a
-     * comp row IS a packed row and the fixture has to build one.  Same
-     * encode-a-draw discipline as the raw rows above -- see attn_pack_fixture.h. */
-    const size_t n_ckv = (size_t)(n_comp ? n_comp : 1u);
-    std::vector<uint8_t> ckvp(n_ckv * pack_row_h);
-    for (size_t r = 0; r < n_ckv; r++) {
-        uint8_t *row = &ckvp[r * pack_row_h];
+    /* Raw KV: build WINDOW rows first, then DECODE them into kv[] so the f64
+     * oracle below and the kernel are looking at the same numbers.  Draws with
+     * a per-16-block magnitude band (2^-1..2^1) so scale addressing is
+     * exercised without degenerating the softmax. */
+    const size_t win_row_h = (size_t)PULSAR_WINKV_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_tokens * win_row_h);
+    for (uint32_t r = 0; r < n_tokens; r++) {
         std::vector<float> vals(D);
-        for (uint32_t d = 0; d < n_nope_h; d++)
+        for (uint32_t d = 0; d < D; d++)
             vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
-        for (uint32_t d = n_nope_h; d < D; d++) vals[d] = (float)(nd(rng) * 0.5);
-        host_nv_pack_row(vals.data(), row, &ckv[r * D], D);
+        host_winkv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
+    }
+    /* Comp rows are MAIN rows (the other format); same encode-a-draw discipline. */
+    const size_t main_row_h = (size_t)PULSAR_MAINKV_ROWBYTES(D);
+    const size_t n_ckv = (size_t)(n_comp ? n_comp : 1u);
+    std::vector<uint8_t> ckvp(n_ckv * main_row_h);
+    for (size_t r = 0; r < n_ckv; r++) {
+        std::vector<float> vals(D);
+        for (uint32_t d = 0; d < D; d++)
+            vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
+        host_mainkv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
     }
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
@@ -268,13 +253,13 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
     cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
     const int rc = indexed
-        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
-                                           (const pulsar_attn_pack_t *)dckv, use_topk ? dtk : NULL,
+        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                           (const pulsar_mainkv_row_t *)dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
                                            n_comp, top_k, window, ratio, n_head, D,
                                            NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL)
-        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv,
-                                           n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
+        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                           n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,
                                            n_head, D, NULL);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
@@ -289,12 +274,12 @@ int main(int argc, char **argv) {
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
         const int iters = 20;
         for (int i = 0; i < 3; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv, n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
                                              n_tokens, n_comp, window, ratio, n_head, D, NULL);
         cudaDeviceSynchronize();
         cudaEventRecord(e0);
         for (int i = 0; i < iters; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_attn_pack_t *)dkv, n_comp ? (const pulsar_attn_pack_t *)dckv : NULL,
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv, n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
                                              n_tokens, n_comp, window, ratio, n_head, D, NULL);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);

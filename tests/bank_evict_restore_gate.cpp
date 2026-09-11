@@ -69,7 +69,7 @@ static char *read_file(const char *path, size_t *len_out) {
  * a read failure (e.g. an evicted bank) — the caller only checksums resident banks. */
 static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     pulsar_gpu_graph *g = &s->graph;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);   /* per-layer row block scratch */

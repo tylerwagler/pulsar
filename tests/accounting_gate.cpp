@@ -113,7 +113,7 @@ int GATE_ENTRY(int argc, char **argv) {
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "accounting_gate: pool banks=%u ctx=%d peak=%d "
                     "attn_row=%" PRIu64 " idx_row=%" PRIu64 "\n",
-            pool, ctx, peak, gpu_graph_attn_comp_cache_row_bytes(),
+            pool, ctx, peak, PULSAR_ENGINE_MAINKV_ROWBYTES,
             PULSAR_ENGINE_IDXFP4_ROWBYTES);
     if (pool < 2) {
         fprintf(stderr, "accounting_gate: WARNING pool<2 — comp/index may be "

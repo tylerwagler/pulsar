@@ -24,14 +24,13 @@
  * 1 and the non-causal drafter window -- moved to the fp16 kernel; each had
  * been a second numerics for a shape the fp16 kernel also served.
  *
- * Every KV operand is PULSAR_ATTN_PACK rows -- 384 B NVFP4 at head_dim 512:
- * e2m1 nibbles under per-16 e4m3 scales and an f32 row scale, rope dims bf16
- * -- so ONE decoder (attn_comp_pack_ld / attn_comp_row_ld4 in
- * pulsar_cuda_internal.h) serves the sliding-window ring, the compressed pool,
- * the drafter's ring and the current chunk alike (L111).  The row is LOSSY vs
- * the f32 pipeline; what makes it shippable is the measured L111 verdict.  All
- * pack formats are pointer-compatible, so a wrong operand reads rows at the
- * wrong stride -- out of bounds, NaN, and a clean compile -- which is why the
+ * KV operands are the two V4.1 rows (L218, src/pulsar_gpu.h): WINDOW rows
+ * (E4M3 x E8M0/32, 528 B) in the sliding-window ring, the drafter's ring and
+ * the current chunk's pack buffer; MAIN rows (E2M1 x E4M3/16, 288 B) in a kv
+ * source's compressed pool.  Each is what the reference stores, so the fp16
+ * kernel's two decoders (winkv_row_ld4 / mainkv_row_ld4) reproduce its bf16
+ * values exactly.  The formats are byte buffers, so a wrong operand reads rows
+ * at the wrong stride -- out of bounds, NaN, and a clean compile -- which is why the
  * launchers below check byte bounds at the packed stride. */
 
 /* positions/seq_id/comp_cap -- the descriptor contract of the fp16 kernel's
@@ -112,9 +111,9 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim),
                      "raw_kv bytes=%llu need=%llu", (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim));
+                     (unsigned long long)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim));
         ATTN_REQUIRE(aw, window <= 256, "window=%u cap=256", window);
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
@@ -163,7 +162,7 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
      * answer. */
     if (pulsar_gpu_attention_f16_prefill_mx(
             (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-            (const pulsar_attn_pack_t *)raw_kv->ptr, NULL,
+            (const pulsar_winkv_row_t *)raw_kv->ptr, NULL,
             n_tokens, 0u, window, 1u, n_head, head_dim,
             gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
             0u, n_tokens,
@@ -258,18 +257,18 @@ static int attention_decode_batch_launch(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim),
                      "raw_kv bytes=%llu need=%llu (kv_banks=%llu raw_cap=%u)",
                      (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)(kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)),
+                     (unsigned long long)(kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim)),
                      (unsigned long long)kv_banks, raw_cap);
-        ATTN_REQUIRE(aw, head_dim > PULSAR_ATTN_PACK_NROT && ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) == 0,
-                     "head_dim=%u nrot=%u nv_block=%u", head_dim, (unsigned)PULSAR_ATTN_PACK_NROT,
-                     (unsigned)PULSAR_KV4_NV_BLOCK);
-        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= comp_rows_min * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
+                     "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
+                     (unsigned)PULSAR_MAINKV_BLOCK);
+        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim),
                      "comp_kv bytes=%llu need=%llu (comp_rows_min=%llu n_comp=%u)",
                      n_comp ? (unsigned long long)comp_kv->bytes : 0ull,
-                     (unsigned long long)(comp_rows_min * PULSAR_ATTN_PACK_ROWBYTES(head_dim)),
+                     (unsigned long long)(comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim)),
                      (unsigned long long)comp_rows_min, n_comp);
     }
     if (n_comp != 0 && ratio == 0) {
@@ -324,8 +323,8 @@ static int attention_decode_batch_launch(
     }
     if (pulsar_gpu_attention_f16_indexed(
             (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-            (const pulsar_attn_pack_t *)raw_kv->ptr,
-            n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : (const pulsar_attn_pack_t *)raw_kv->ptr,
+            (const pulsar_winkv_row_t *)raw_kv->ptr,
+            n_comp ? (const pulsar_mainkv_row_t *)comp_kv->ptr : NULL,
             NULL /* no topk: visible-prefix sweep */,
             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
             0u, window, ratio, n_head, head_dim,
@@ -480,18 +479,18 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim),
                      "raw_kv bytes=%llu need=%llu (kv_banks=%llu raw_cap=%u)",
                      (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)(kv_banks * raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim)),
+                     (unsigned long long)(kv_banks * raw_cap * PULSAR_WINKV_ROWBYTES(head_dim)),
                      (unsigned long long)kv_banks, raw_cap);
-        ATTN_REQUIRE(aw, head_dim > PULSAR_ATTN_PACK_NROT && ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) == 0,
-                     "head_dim=%u nrot=%u nv_block=%u", head_dim, (unsigned)PULSAR_ATTN_PACK_NROT,
-                     (unsigned)PULSAR_KV4_NV_BLOCK);
-        ATTN_REQUIRE(aw, comp_kv->bytes >= comp_rows_min * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
+                     "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
+                     (unsigned)PULSAR_MAINKV_BLOCK);
+        ATTN_REQUIRE(aw, comp_kv->bytes >= comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim),
                      "comp_kv bytes=%llu need=%llu (comp_rows_min=%llu n_comp=%u)",
                      (unsigned long long)comp_kv->bytes,
-                     (unsigned long long)(comp_rows_min * PULSAR_ATTN_PACK_ROWBYTES(head_dim)),
+                     (unsigned long long)(comp_rows_min * PULSAR_MAINKV_ROWBYTES(head_dim)),
                      (unsigned long long)comp_rows_min, n_comp);
         ATTN_REQUIRE(aw, topk->bytes >= (uint64_t)n_tokens * top_k * sizeof(int32_t),
                      "topk bytes=%llu need=%llu (n_tokens=%u top_k=%u)", (unsigned long long)topk->bytes,
@@ -543,12 +542,12 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
      * indexed arm at n_tokens == 1 too -- the per-token indexed prefill loop
      * and a 1-token indexed chunk used to take an f32 heads8-online kernel
      * (the L161 class of split: 1-row and N-row indexed attention were two
-     * numerics).  Banked descriptors and ATTN_PACK comp rows ride the tier,
-     * each behind its own gate: bank isolation is proven algebraically
+     * numerics).  Banked descriptors and MAIN comp rows ride the tier, each
+     * behind its own gate: bank isolation is proven algebraically
      * (tests/attn_f16_banked_test.cu -- a wrong-bank read is plausible
      * attention, not an error, so it needs a test that cannot be fooled), and
-     * packed rows decode through the one shared attn_comp_pack_ld.  Shapes the
-     * tier does not serve are refused by name. */
+     * packed rows decode through the shared row accessors.  Shapes the tier
+     * does not serve are refused by name. */
     if (head_dim != 512u) {
         fprintf(stderr, "pulsar: indexed attention: head_dim %u has no kernel (only 512 is built)\n", head_dim);
         return 0;
@@ -570,7 +569,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
     }
     if (pulsar_gpu_attention_f16_indexed(
             (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-            (const pulsar_attn_pack_t *)raw_kv->ptr, (const pulsar_attn_pack_t *)comp_kv->ptr,
+            (const pulsar_winkv_row_t *)raw_kv->ptr, (const pulsar_mainkv_row_t *)comp_kv->ptr,
             (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
             raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
             (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
@@ -621,21 +620,21 @@ static int attention_prefill_mixed_launch(
         ATTN_REQUIRE(aw, q->bytes >= (uint64_t)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE,
                      "q bytes=%llu need=%llu", (unsigned long long)q->bytes,
                      (unsigned long long)n_tokens * n_head * head_dim * PULSAR_Q_ELT_SIZE);
-        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+        ATTN_REQUIRE(aw, raw_kv->bytes >= (uint64_t)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim),
                      "raw_kv bytes=%llu need=%llu", (unsigned long long)raw_kv->bytes,
-                     (unsigned long long)n_tokens * PULSAR_ATTN_PACK_ROWBYTES(head_dim));
-        /* Pack-aware, like the three sibling launches.  A guard that hard-codes
-         * the f32 row stride demands 2048 B from a 384 B packed pool, fails,
-         * and returns 0 -- which is "did not encode", not an error, so the
-         * graph silently does not run.  ->bytes is just a number, so the
-         * mismatch is type-legal and compiles clean. */
-        ATTN_REQUIRE(aw, head_dim > PULSAR_ATTN_PACK_NROT && ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) == 0,
-                     "head_dim=%u nrot=%u nv_block=%u", head_dim, (unsigned)PULSAR_ATTN_PACK_NROT,
-                     (unsigned)PULSAR_KV4_NV_BLOCK);
-        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= (uint64_t)n_comp * PULSAR_ATTN_PACK_ROWBYTES(head_dim),
+                     (unsigned long long)n_tokens * PULSAR_WINKV_ROWBYTES(head_dim));
+        /* Row-format-aware, like the three sibling launches.  A guard that
+         * hard-codes a wrong stride demands the wrong byte count, fails, and
+         * returns 0 -- which is "did not encode", not an error, so the graph
+         * silently does not run.  ->bytes is just a number, so the mismatch is
+         * type-legal and compiles clean. */
+        ATTN_REQUIRE(aw, (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u,
+                     "head_dim=%u win_block=%u main_block=%u", head_dim, (unsigned)PULSAR_WINKV_BLOCK,
+                     (unsigned)PULSAR_MAINKV_BLOCK);
+        ATTN_REQUIRE(aw, n_comp == 0 || comp_kv->bytes >= (uint64_t)n_comp * PULSAR_MAINKV_ROWBYTES(head_dim),
                      "comp_kv bytes=%llu need=%llu (n_comp=%u)",
                      n_comp ? (unsigned long long)comp_kv->bytes : 0ull,
-                     (unsigned long long)n_comp * PULSAR_ATTN_PACK_ROWBYTES(head_dim), n_comp);
+                     (unsigned long long)n_comp * PULSAR_MAINKV_ROWBYTES(head_dim), n_comp);
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
@@ -672,8 +671,8 @@ static int attention_prefill_mixed_launch(
      * the launcher refuses rather than reading a half-written slab. */
     if (pulsar_gpu_attention_f16_prefill_mx(
             (pulsar_heads_t *)heads->ptr, sinks, (const pulsar_q_t *)q->ptr,
-            (const pulsar_attn_pack_t *)raw_kv->ptr,
-            n_comp ? (const pulsar_attn_pack_t *)comp_kv->ptr : NULL,
+            (const pulsar_winkv_row_t *)raw_kv->ptr,
+            n_comp ? (const pulsar_mainkv_row_t *)comp_kv->ptr : NULL,
             n_tokens, n_comp, window, ratio, n_head, head_dim,
             gact_data, gact_scale, gact_kbp,
             gact_slab, n_groups, n_nope,

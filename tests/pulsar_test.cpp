@@ -2748,7 +2748,7 @@ static void test_context_memory_shape(void) {
         pulsar_context_memory_estimate(PULSAR_BACKEND_CUDA, ctx, 0);
     TEST_ASSERT(m.prefill_cap > 0 && m.raw_cap > 0);
     TEST_ASSERT(m.raw_bytes ==
-                (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
+                (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_WINKV_ROWBYTES);
     /* CSA2: pools exist at the 4 kv sources only (3 at ratio 2, 1 at ratio 1),
      * each a comp row AND an index-K row per compressed position. */
     uint64_t comp_index = 0; uint32_t n_src = 0;
@@ -2756,7 +2756,7 @@ static void test_context_memory_shape(void) {
         if (pulsar_layer_attn_layout(il)->mode != PULSAR_ATTN_FULL) continue;
         n_src++;
         const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, pulsar_layer_compress_ratio(il));
-        comp_index += rows * (gpu_graph_attn_comp_cache_row_bytes() + PULSAR_ENGINE_IDXFP4_ROWBYTES);
+        comp_index += rows * (PULSAR_ENGINE_MAINKV_ROWBYTES + PULSAR_ENGINE_IDXFP4_ROWBYTES);
     }
     TEST_ASSERT(n_src == 4 && comp_index > 0 && m.comp_index_bytes == comp_index);
     /* the ratio-1 layers hold the deepest pool; that is the row count reported */

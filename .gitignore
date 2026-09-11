@@ -77,6 +77,8 @@ gguf-tools/libds4q_reflow.so
 /tmp-teb/
 *.progress
 /tests/attn_f16_kernel_test
+/tests/kv_rows_pack_gate
+/tests/kv_rows_pack_gate_fastmath
 /tests/attn_f16_banked_test
 /tests/attn_decode_split_test
 /tests/mxfp8_mma_probe

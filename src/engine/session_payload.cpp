@@ -150,18 +150,14 @@ static uint32_t session_raw_live_rows(const pulsar_gpu_graph *g, uint32_t checkp
 static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
-    /* v4 stores raw AND comp rows in the format the caches hold them in, so
-     * both are PULSAR_ATTN_PACK rows.  This sized them at the f32 stride --
-     * 2048 B against the real 584 B -- which over-reserved the disk cache by
-     * 3.5x on the KV bulk of every payload. */
-    /* L111: the comp pool's row size follows the active PULSAR_KV4 format;
-     * raw rows stay E4M3. */
-    const uint64_t comp_row = gpu_graph_attn_comp_cache_row_bytes();
+    /* Raw AND comp rows are sized in the format the caches hold them in --
+     * WINDOW rows in the ring, MAIN rows in a source's pool.  (v4 had sized
+     * them at the f32 stride, over-reserving the disk cache 3.5x.) */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
+        bytes += (uint64_t)raw_live * PULSAR_ENGINE_WINKV_ROWBYTES;
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint64_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
-        bytes += rows * (comp_row + PULSAR_ENGINE_IDXFP4_ROWBYTES);
+        bytes += rows * (PULSAR_ENGINE_MAINKV_ROWBYTES + PULSAR_ENGINE_IDXFP4_ROWBYTES);
         bytes += 2u * layer_attn_state_bytes(il);
     }
     return bytes;
@@ -250,7 +246,7 @@ static int payload_read_index_comp(FILE *fp, pulsar_gpu_graph *g, uint32_t il,
                                     buf, cap, remaining, err, errlen);
 }
 
-/* The comp cache is written in the format it is HELD in: PULSAR_ATTN_PACK rows.
+/* The comp cache is written in the format it is HELD in: MAIN rows.
  *
  * Payload v3 stored f32. Saving dequantised 584 B rows into 2048 B, wrote that,
  * and loading read it back and re-encoded -- a full round trip through a format
@@ -265,7 +261,7 @@ static int payload_write_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t 
                                         uint32_t n_rows, uint8_t *buf, size_t cap,
                                         char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_MAINKV_ROWBYTES;
     return payload_write_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
                                      buf, cap, err, errlen);
 }
@@ -274,11 +270,11 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
                                        uint32_t n_rows, uint8_t *buf, size_t cap,
                                        uint64_t *remaining, char *err, size_t errlen) {
     if (n_rows == 0) return 0;
-    const uint64_t bytes = (uint64_t)n_rows * gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t bytes = (uint64_t)n_rows * PULSAR_ENGINE_MAINKV_ROWBYTES;
     /* Straight into the packed cache: the file holds exactly what it holds, so
      * there is no staging buffer and no re-encode on either side.  Under KV4
      * this is what makes save/load safe at all -- an FP4 re-encode misrounds
-     * ~33% of blocks, so the bytes ARE the values.  The version (v7) plus the
+     * ~33% of blocks, so the bytes ARE the values.  The version plus the
      * h[13] stride refuse files from any earlier row format. */
     return payload_read_tensor_span(fp, g->layer_attn_comp_cache[il], 0, bytes,
                                     buf, cap, remaining, err, errlen);
@@ -287,9 +283,8 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
 
 
 
-/* Raw-ring row spans.  The ring is PULSAR_ATTN_PACK, like every other KV buffer
- * -- one row is PULSAR_ENGINE_ATTN_PACK_ROWBYTES, not PULSAR_N_HEAD_DIM __half
- * containers.  This path still said f16 long after the ring stopped being f16:
+/* Raw-ring row spans.  The ring is WINDOW rows -- one row is
+ * PULSAR_ENGINE_WINKV_ROWBYTES, not PULSAR_N_HEAD_DIM __half containers.  This path still said f16 long after the ring stopped being f16:
  * it read at a 1024 B stride from a 584 B/row buffer and reinterpreted packed
  * bytes as halves, so it walked the wrong rows AND past the end of the
  * allocation.  Nothing caught it because ->bytes is a number and __half is a
@@ -297,16 +292,16 @@ static int payload_read_attn_comp_pack(FILE *fp, pulsar_gpu_graph *g, uint32_t i
 static int payload_write_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
     return payload_write_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
-            (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, err, errlen);
+            (uint64_t)phys * PULSAR_ENGINE_WINKV_ROWBYTES,
+            (uint64_t)PULSAR_ENGINE_WINKV_ROWBYTES, buf, cap, err, errlen);
 }
 
 static int payload_read_raw_row(FILE *fp, pulsar_gpu_graph *g, uint32_t il, uint32_t phys,
                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                 char *err, size_t errlen) {
     return payload_read_tensor_span(fp, g->layer_raw_cache[il],
-            (uint64_t)phys * PULSAR_ENGINE_ATTN_PACK_ROWBYTES,
-            (uint64_t)PULSAR_ENGINE_ATTN_PACK_ROWBYTES, buf, cap, remaining, err, errlen);
+            (uint64_t)phys * PULSAR_ENGINE_WINKV_ROWBYTES,
+            (uint64_t)PULSAR_ENGINE_WINKV_ROWBYTES, buf, cap, remaining, err, errlen);
 }
 
 uint64_t pulsar_session::payload_bytes() {
@@ -458,10 +453,11 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
      *   5 raw window, 6 compressed cap, 7 token count,
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 live raw rows serialized below,
-     *   13 attn-pack row bytes, 14 indexer fp4 row bytes,
-     *   15 prefill frontier (L195: the last position a PREFILL wrote; the resume grid point derives from it).
+     *   13 main (comp pool) row bytes, 14 indexer fp4 row bytes,
+     *   15 prefill frontier (L195: the last position a PREFILL wrote; the resume grid point derives from it),
+     *   16 window (raw ring) row bytes.
      *
-     * 13/14 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
+     * 13/14/16 are the STORAGE FORMAT, not the shape.  Fields 9-11 already caught a
      * file written for a different model; these catch one written for a
      * different row LAYOUT at the same shape -- which is what a KV format change
      * produces, and which the version alone was guarding until 2026-08-18.
@@ -480,11 +476,12 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         PULSAR_N_INDEXER_HEAD_DIM,
         PULSAR_N_VOCAB,
         raw_live,
-        /* the row stride (one unified format; 384) -- with the payload
-         * version, refuses any earlier-format file */
-        (uint32_t)gpu_graph_attn_comp_cache_row_bytes(),
+        /* the row strides -- with the payload version, refuse any
+         * earlier-format file */
+        (uint32_t)PULSAR_ENGINE_MAINKV_ROWBYTES,
         (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES,
         (uint32_t)s->prefill_frontier,
+        (uint32_t)PULSAR_ENGINE_WINKV_ROWBYTES,
     };
     for (uint32_t i = 0; i < PULSAR_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -575,12 +572,13 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
      * head_dim and moves the row STRIDE, so the checks above would pass it.
      * Every row span below is addressed with these strides, so a mismatch here
      * is the difference between refusing a file and decoding noise into a cache. */
-    if (h[13] != (uint32_t)gpu_graph_attn_comp_cache_row_bytes() ||
-        h[14] != (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES)
+    if (h[13] != (uint32_t)PULSAR_ENGINE_MAINKV_ROWBYTES ||
+        h[14] != (uint32_t)PULSAR_ENGINE_IDXFP4_ROWBYTES ||
+        h[16] != (uint32_t)PULSAR_ENGINE_WINKV_ROWBYTES)
     {
         payload_set_err(err, errlen,
                         "KV checkpoint row strides differ from this build "
-                        "(attn/indexer storage format changed)");
+                        "(window/main/indexer storage format changed)");
         return 1;
     }
     /* prefill_cap is scratch scheduling capacity, not durable KV layout.

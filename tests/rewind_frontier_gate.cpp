@@ -110,7 +110,7 @@ static bool extend_one(pulsar_session *s, pulsar_tokens *toks, int upto) {
  * group). */
 static uint64_t comp_rows_hash(pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint8_t buf[8192];
@@ -191,7 +191,7 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
  * L124 aliasing contaminates. */
 static uint64_t r128_row0_hash(pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
+    const uint64_t attn_row = PULSAR_ENGINE_MAINKV_ROWBYTES;
     uint64_t h = 1469598103934665603ull;
     uint8_t buf[8192];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

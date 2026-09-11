@@ -201,7 +201,7 @@ static bool read_bank_rows(pulsar_gpu_graph *g, int index_cache, uint32_t il,
     return ok;
 }
 
-static uint64_t attn_row_bytes(void) { return gpu_graph_attn_comp_cache_row_bytes(); }
+static uint64_t attn_row_bytes(void) { return PULSAR_ENGINE_MAINKV_ROWBYTES; }
 static uint64_t index_row_bytes(void) {
     return PULSAR_ENGINE_IDXFP4_ROWBYTES;
 }

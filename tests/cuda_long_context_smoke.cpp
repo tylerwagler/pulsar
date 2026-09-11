@@ -1,17 +1,12 @@
 #include "pulsar_gpu.h"
 
-/* PULSAR_ATTN_PACK row bytes, computed locally on purpose.  The engine has
- * this arithmetic too, but its macro goes through the shape GLOBAL and this
- * smoke links only the CUDA layer -- no engine objects, no model.  Must match
- * PULSAR_ATTN_PACK_ROWBYTES in src/cuda/pulsar_cuda_internal.h:
- * [n_nope e4m3][n_nope/64 E8M0, padded to 4][n_rot bf16] = 584 B at 512/64.
- *
- * This used to be a THIRD hand-written copy of the row geometry, next to the
- * engine's and the backend's.  It now asks the backend, which is the same thing
- * gpu_graph_alloc does -- a test that computes the layout itself cannot catch a
- * layout change, it can only disagree with one. */
-#define SMOKE_ATTN_NROT 64u
-#define SMOKE_ATTN_ROWBYTES(HD) pulsar_gpu_attn_pack_rowbytes(HD)
+/* KV row bytes come from the two format macros in src/pulsar_gpu.h -- the
+ * ring holds WINDOW rows, a comp pool MAIN rows -- the same authority the
+ * engine sizes its buffers with.  This smoke links only the CUDA layer (no
+ * engine objects, no model); a test that computed the layout itself could
+ * not catch a layout change, it could only disagree with one. */
+#define SMOKE_WIN_ROWBYTES(HD)  PULSAR_WINKV_ROWBYTES(HD)
+#define SMOKE_MAIN_ROWBYTES(HD) PULSAR_MAINKV_ROWBYTES(HD)
 
 #include <float.h>
 #include <math.h>
@@ -196,7 +191,7 @@ cleanup:
  * row.  n_comp sits above that old cap on purpose.  Raw rows are zero and the
  * compressed rows carry 1.0 in dim 0 with q = 0, so every score is 0 and the
  * head's dim 0 is the compressed rows' share of a uniform softmax
- * (11500 / (11500 + 128 + sink)), scaled by whatever the ATTN_PACK encode made
+ * (11500 / (11500 + 128 + sink)), scaled by whatever the MAIN-row encode made
  * of 1.0 -- well above 0.90 unless the compressed rows were skipped. */
 static int check_decode_attention_one_row_long_comp(void) {
     const uint32_t n_head = 32;
@@ -229,11 +224,11 @@ static int check_decode_attention_one_row_long_comp(void) {
     /* Attention Q: stored element size, not f32 (L045). */
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt(q_count, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
-    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_ATTN_ROWBYTES(head_dim));
+    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)n_raw * SMOKE_WIN_ROWBYTES(head_dim));
     pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
     /* Packed comp rows, via the shipping encoder -- see the note in the
      * multibank case; an f32 comp buffer is read at the packed stride now. */
-    pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc((uint64_t)n_comp * SMOKE_ATTN_ROWBYTES(head_dim));
+    pulsar_gpu_tensor *comp = pulsar_gpu_tensor_alloc((uint64_t)n_comp * SMOKE_MAIN_ROWBYTES(head_dim));
     int rc = 1;
     if (heads && q && raw && raw_f32 && comp && comp_f32 &&
         pulsar_gpu_tensor_write_q_f32(q, 0, q_host, q_count) &&
@@ -241,9 +236,7 @@ static int check_decode_attention_one_row_long_comp(void) {
         pulsar_gpu_store_raw_kv_batch_tensor(raw, raw_f32, n_raw, 0, n_raw,
                                             head_dim, NULL, NULL, 1) &&
         pulsar_gpu_tensor_write(comp_f32, 0, comp_host, comp_count * sizeof(float)) &&
-        pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp, 0, n_comp,
-                                                   head_dim, SMOKE_ATTN_NROT,
-                                                   /*keep_f32=*/true) &&
+        pulsar_gpu_mainkv_pack_tensor(comp_f32, comp_f32, comp, 0, n_comp, head_dim) &&
         pulsar_gpu_attention_decode_mixed_batch_heads_tensor(heads, sinks, n_head * sizeof(float), 0,
                                                              q, raw, comp,
                                                              1, pos0, n_raw, n_raw, 0, n_comp,
@@ -331,7 +324,7 @@ static int check_dspark_non_causal_attention(void) {
     /* Attention Q: stored element size, not f32 (L045). */
     pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tokens * q_count, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
-    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim));
+    pulsar_gpu_tensor *raw = pulsar_gpu_tensor_alloc((uint64_t)raw_cap * SMOKE_WIN_ROWBYTES(head_dim));
     int rc = 1;
     if (heads_c && heads_nc && q && raw && raw_f32 &&
         pulsar_gpu_tensor_write_q_f32(q, 0, q_host, (uint64_t)n_tokens * q_count) &&
@@ -903,10 +896,9 @@ static int mb_run_case(const char *label,
     for (uint32_t r = 0; r < n_rows; r++) {
         const mb_row *row = &rows[r];
         const uint32_t ref_rows = 3;
-        /* raw and comp are both PULSAR_ATTN_PACK rows; the bank strides differ
-         * only by capacity. */
-        const uint64_t raw_bank_bytes = (uint64_t)raw_cap * SMOKE_ATTN_ROWBYTES(head_dim);
-        const uint64_t comp_bank_bytes = (uint64_t)comp_cap * SMOKE_ATTN_ROWBYTES(head_dim);
+        /* raw banks hold WINDOW rows, comp banks MAIN rows */
+        const uint64_t raw_bank_bytes = (uint64_t)raw_cap * SMOKE_WIN_ROWBYTES(head_dim);
+        const uint64_t comp_bank_bytes = (uint64_t)comp_cap * SMOKE_MAIN_ROWBYTES(head_dim);
         pulsar_gpu_tensor *raw_view = pulsar_gpu_tensor_view(
                 raw_slab, (uint64_t)row->bank * raw_bank_bytes, raw_bank_bytes);
         pulsar_gpu_tensor *comp_view = comp_slab
@@ -1021,24 +1013,20 @@ static int check_multibank_decode_attention(void) {
     for (uint64_t i = 0; i < raw_count; i++) raw_host[i] = mb_rand();
     for (uint64_t i = 0; i < comp_count; i++) comp_host[i] = mb_rand();
 
-    const uint64_t raw_row_b = SMOKE_ATTN_ROWBYTES(head_dim);
+    const uint64_t raw_row_b = SMOKE_WIN_ROWBYTES(head_dim);
     pulsar_gpu_tensor *raw_f32 = pulsar_gpu_tensor_alloc(raw_count * sizeof(float));
     pulsar_gpu_tensor *raw_slab = pulsar_gpu_tensor_alloc((uint64_t)n_banks * raw_cap * raw_row_b);
-    /* Comp rows are ATTN_PACK.  They were f32 here until 2026-08-18, when the
-     * comp format parameter was removed from the kernels -- an f32 comp slab now
-     * gets read at the packed stride.  Written through the SHIPPING encoder
-     * rather than hand-packed, so the test cannot disagree with the format. */
+    /* Comp rows are MAIN rows, written through the SHIPPING encoder rather
+     * than hand-packed, so the test cannot disagree with the format. */
     pulsar_gpu_tensor *comp_f32 = pulsar_gpu_tensor_alloc(comp_count * sizeof(float));
     pulsar_gpu_tensor *comp_slab =
-        pulsar_gpu_tensor_alloc((uint64_t)n_banks * comp_cap * SMOKE_ATTN_ROWBYTES(head_dim));
+        pulsar_gpu_tensor_alloc((uint64_t)n_banks * comp_cap * SMOKE_MAIN_ROWBYTES(head_dim));
     int rc = 1;
     if (!raw_slab || !raw_f32 || !comp_slab || !comp_f32 ||
         !pulsar_gpu_tensor_write(raw_f32, 0, raw_host, raw_count * sizeof(float)) ||
         !pulsar_gpu_tensor_write(comp_f32, 0, comp_host, comp_count * sizeof(float)) ||
-        !pulsar_gpu_attn_pack_quantize_store_tensor(comp_f32, comp_slab, 0,
-                                                   (uint32_t)(n_banks * comp_cap),
-                                                   head_dim, SMOKE_ATTN_NROT,
-                                                   /*keep_f32=*/true)) goto done;
+        !pulsar_gpu_mainkv_pack_tensor(comp_f32, comp_f32, comp_slab, 0,
+                                       (uint32_t)(n_banks * comp_cap), head_dim)) goto done;
     for (uint32_t b = 0; b < n_banks; b++) {
         pulsar_gpu_tensor *bv = pulsar_gpu_tensor_view(raw_slab, (uint64_t)b * raw_cap * raw_row_b,
                                                        (uint64_t)raw_cap * raw_row_b);
@@ -1102,7 +1090,7 @@ static int check_multibank_decode_attention(void) {
      * EMIT boundary (45999 ≡ 3 mod 4): its engine-true frontier is 46000/4 =
      * 11500 == the superset, while floor(45999/4) = 11499 — teeth for the
      * per-row rule at depth.  Bank 1 (qpos 20000) sees 5000 of the superset.
-     * The slab is encoded through the shipping ATTN_PACK encoder like the
+     * The slab is encoded through the shipping MAIN-row encoder like the
      * small one above; an f32 slab read at the packed stride would be a
      * deterministic-garbage fixture that proves only determinism. */
     {
@@ -1112,16 +1100,14 @@ static int check_multibank_decode_attention(void) {
         float *big_host = (float *)malloc(big_count * sizeof(float));
         pulsar_gpu_tensor *big_f32 = pulsar_gpu_tensor_alloc(big_count * sizeof(float));
         pulsar_gpu_tensor *big_slab = pulsar_gpu_tensor_alloc(
-                (uint64_t)n_banks * big_comp_cap * SMOKE_ATTN_ROWBYTES(head_dim));
+                (uint64_t)n_banks * big_comp_cap * SMOKE_MAIN_ROWBYTES(head_dim));
         int big_rc = 1;
         if (big_host && big_f32 && big_slab) {
             mb_rng_state = 0x5eed5u;
             for (uint64_t i = 0; i < big_count; i++) big_host[i] = mb_rand();
             if (pulsar_gpu_tensor_write(big_f32, 0, big_host, big_count * sizeof(float)) &&
-                pulsar_gpu_attn_pack_quantize_store_tensor(big_f32, big_slab, 0,
-                                                           (uint32_t)(n_banks * big_comp_cap),
-                                                           head_dim, SMOKE_ATTN_NROT,
-                                                           /*keep_f32=*/true)) {
+                pulsar_gpu_mainkv_pack_tensor(big_f32, big_f32, big_slab, 0,
+                                              (uint32_t)(n_banks * big_comp_cap), head_dim)) {
                 const mb_row rows[2] = { {0, 45999, big_n_comp}, {1, 20000, 5000} };
                 big_rc = mb_run_case("mixed-long-comp", rows, 2, raw_slab, raw_cap,
                                      big_slab, big_comp_cap, big_n_comp, window,
@@ -1329,14 +1315,14 @@ done:
  * Covers the f16 and f32 ring formats.
  * ------------------------------------------------------------------------- */
 static int check_multibank_raw_store(void) {
-    /* head_dim is the model's, not an arbitrary 32: PULSAR_ATTN_PACK needs
-     * head_dim > n_rot with the nope span divisible by the scale block, so the
-     * old 32-wide fixture cannot be expressed in the format the ring now holds.
-     * The f16/f32 loop is gone with it -- there is one ring format. */
+    /* head_dim is the model's, not an arbitrary 32: the window packer is
+     * specialised for the model's head_dim (one block of head_dim threads),
+     * so the old 32-wide fixture cannot be expressed in the format the ring
+     * holds.  The f16/f32 loop is gone with it -- there is one ring format. */
     const uint32_t n_banks = 2, raw_cap = 64, head_dim = 512, n_rows = 4;
     const int32_t pos_host[4] = {100, 5, 6, 7};    /* 100 % 64 = 36 (wrap) */
     const int32_t sid_host[4] = {0, 1, 1, -1};     /* row 3 dead */
-    const uint64_t row_bytes = SMOKE_ATTN_ROWBYTES(head_dim);
+    const uint64_t row_bytes = SMOKE_WIN_ROWBYTES(head_dim);
     const uint64_t bank_bytes = (uint64_t)raw_cap * row_bytes;
     const uint64_t total = (uint64_t)n_banks * bank_bytes;
     const uint64_t kv_count = (uint64_t)n_rows * head_dim;

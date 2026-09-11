@@ -63,44 +63,30 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cmath>
 #include <vector>
 #include <random>
-#include "attn_pack_fixture.h"
+#include "kv_row_fixture.h"
 
-/* Encode a CONSTANT row in ATTN_PACK layout.  0.25/0.5/0.75/1.0 are all exact
- * in E4M3 with a unit block scale, so the packed row decodes to exactly the
- * same constant and the isolation assertion below is unchanged -- it now also
- * exercises packed row ADDRESSING (row stride, scale offset, rope offset).
- * The FORMAT itself is not at risk here: the kernel decodes through the one
- * attn_comp_pack_ld / attn_comp_row_ld4 decoder (pulsar_cuda_internal.h), so
- * there is one implementation. */
-static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    /* Exact NV construction: row scale = v (f32, exact), every per-16 scale
-     * code = e4m3(1.0), every nibble = e2m1(1.0) -> each nope element decodes
-     * to exactly 1.0 * 1.0 * v = v.  The rope tail narrows v to bf16, exact
-     * whenever v is exact in e4m3 (3 mantissa bits <= bf16's 7). */
-    const uint32_t nib = n_nope / 2u, nblk = n_nope / 16u;
-    for (uint32_t i = 0; i < nib; i++) dst[i] = (uint8_t)(2u | (2u << 4)); /* e2m1 1.0 pairs */
-    for (uint32_t i = 0; i < nblk; i++) dst[nib + i] = (uint8_t)(7u << 3); /* e4m3 1.0 */
-    memcpy(dst + nib + nblk, &v, sizeof v);                               /* row scale = v */
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(dst + nib + nblk + 4u);
-    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(v);
+/* Encode a CONSTANT row in each layout.  0.25/0.5/0.75/1.0 are exact in E4M3,
+ * so the packed rows decode to exactly the constant and the isolation
+ * assertion below is unchanged -- it also exercises packed row ADDRESSING
+ * (row stride, scale offset) in both formats.  The FORMATS themselves are not
+ * at risk here: the kernel decodes through the shared row accessors
+ * (pulsar_cuda_internal.h), so there is one implementation of each. */
+static void pack_const_window_row(uint8_t *dst, float v, uint32_t head_dim) {
+    /* unit block scale (E8M0 byte 127), every code = e4m3(v) */
+    for (uint32_t d = 0; d < head_dim; d++) dst[d] = host_e4m3_encode(v);
+    for (uint32_t b = 0; b < head_dim / 32u; b++) dst[head_dim + b] = 127u;
+}
+static void pack_const_main_row(uint8_t *dst, float v, uint32_t head_dim) {
+    /* block scale = e4m3(v) exactly, every nibble = e2m1(1.0) -> 1.0 * v */
+    for (uint32_t i = 0; i < head_dim / 2u; i++) dst[i] = (uint8_t)(2u | (2u << 4));
+    for (uint32_t b = 0; b < head_dim / 16u; b++) dst[head_dim / 2u + b] = host_e4m3_encode(v);
 }
 
 int main(int argc, char **argv) {
-    /* These fixtures and CPU references are E4M3-only; a stray PULSAR_KV4 in the
-     * environment would make the launch dispatch decode E4M3 rows as nibbles and
-     * fail confusingly.  Pin the format rather than inherit it. */
-
-    /* Comp banks are ATTN_PACK, full stop.  This took a 'p' argument selecting
-     * between packed and f32 banks until 2026-08-18, when the format parameter
-     * was removed from the kernels -- there is one comp format, so there is one
-     * mode.  The argument is still accepted and ignored so old invocations do
-     * not fail. */
+    /* Comp banks are MAIN rows, the ring WINDOW rows -- the shipped formats,
+     * no mode argument (the old 'p' packed/f32 selector is gone with the f32
+     * arm; L106 K10). */
     (void)argc; (void)argv;
-    /* L106 K10: a `packed` flag pinned to 1 kept an f32 comp arm alive that
-     * built and uploaded a full slab and would MIS-STRIDE (2048 vs 584 B/row)
-     * against the packed reader if ever unpinned.  The arm is gone; this test
-     * exercises the shipped ATTN_PACK format only. */
     const uint32_t D = AF16_DIM, n_head = 32u;
     const uint32_t n_banks = 4u, raw_cap = 64u, comp_cap = 32u;
     const uint32_t n_tokens = 16u, top_k = 8u, window = 24u, ratio = 2u;
@@ -108,16 +94,16 @@ int main(int argc, char **argv) {
 
     printf("attn f16 BANK ISOLATION test: %u banks, raw_cap=%u comp_cap=%u,"
            " %u tokens x %u heads, comp=%s\n\n", n_banks, raw_cap, comp_cap,
-           n_tokens, n_head, "ATTN_PACK");
+           n_tokens, n_head, "MAIN (ring WINDOW)");
 
     /* bank b is the constant v_b, everywhere: raw ring slice AND comp slice */
     auto vb = [](uint32_t b) { return 0.25f * (float)(b + 1u); };
 
-    const size_t pack_row_b = (size_t)PULSAR_ATTN_PACK_ROWBYTES(D);
-    std::vector<uint8_t> rawp((size_t)n_banks * raw_cap * pack_row_b);
+    const size_t win_row_b = (size_t)PULSAR_WINKV_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_banks * raw_cap * win_row_b);
     for (uint32_t b = 0; b < n_banks; b++) {
         for (uint32_t r = 0; r < raw_cap; r++)
-            pack_const_row(&rawp[((size_t)b * raw_cap + r) * pack_row_b], vb(b), D);
+            pack_const_window_row(&rawp[((size_t)b * raw_cap + r) * win_row_b], vb(b), D);
     }
 
     std::mt19937_64 rng(20260808);
@@ -136,12 +122,12 @@ int main(int argc, char **argv) {
             tk[(size_t)t * top_k + i] = (int32_t)((t * 5u + i * 3u) % comp_cap);
     }
 
-    /* packed comp banks: same constants, ATTN_PACK layout */
-    const uint64_t prow = PULSAR_ATTN_PACK_ROWBYTES(D);
+    /* packed comp banks: same constants, MAIN layout */
+    const uint64_t prow = PULSAR_MAINKV_ROWBYTES(D);
     std::vector<uint8_t> pcomp((size_t)n_banks * comp_cap * prow, 0);
-        for (uint32_t b = 0; b < n_banks; b++)
-            for (uint32_t r = 0; r < comp_cap; r++)
-                pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
+    for (uint32_t b = 0; b < n_banks; b++)
+        for (uint32_t r = 0; r < comp_cap; r++)
+            pack_const_main_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
     pulsar_q_t *dq;
     float *draw, *ds; int32_t *dtk, *dpos, *dseq;
@@ -200,8 +186,8 @@ int main(int argc, char **argv) {
         cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
 
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, (const pulsar_attn_pack_t *)draw,
-        (const pulsar_attn_pack_t *)dpk, use_tk, n_tokens,
+        dout, ds, dq, (const pulsar_winkv_row_t *)draw,
+        (const pulsar_mainkv_row_t *)dpk, use_tk, n_tokens,
         /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
         n_head, D, dpos, dseq, dbp, comp_cap, n_banks, 0u /* causal */, NULL);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }

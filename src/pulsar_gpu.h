@@ -386,11 +386,11 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
         uint32_t                ratio,
         float                   scale);
 
-/** Does the backend's PREFILL attention read PULSAR_ATTN_PACK comp rows
- * natively?  When it does, the engine hands it the packed cache directly and
- * skips dequantising into the f32 shadow -- PULSAR_ATTN_PACK_ROWBYTES (384 B/row
- * at head_dim 512) instead of 2048, on the
- * rows that dominate the tile, plus one whole pass removed.  Bit-exact either
+/** Does the backend's PREFILL attention read MAIN comp rows natively?  When
+ * it does, the engine hands it the packed cache directly and skips
+ * dequantising into the f32 shadow -- PULSAR_MAINKV_ROWBYTES (288 B/row at
+ * head_dim 512) instead of 2048, on the rows that dominate the tile, plus one
+ * whole pass removed.  Bit-exact either
  * way: packed rows decode to exactly the values the f32 cache would hold.
  * Backend-neutral question; the answer is a property of the backend's kernels,
  * not of any particular one. */
@@ -405,16 +405,14 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void);
  * docs/engine-perf-map.md.  (It used to cite tests/attn_precision_fidelity.cc,
  * deleted in a71e346 -- L106 K8 -- when its dump-format producer left the
  * tree.) */
-/** Q-prep descriptor for the fused norm+rope Q load (L037 lever 3). Non-NULL
- * means `q` holds RAW projections: the consumer must apply the per-head RMS
- * norm and tail rope itself, bit-exactly matching head_rms_norm_rope_tail
- * (the fp16 kernel fuses it into its Q fragment build; a non-f16 path applies
- * the standalone kernel first and continues as if q_prep were NULL). NULL
- * means q is already normed+roped -- every decode caller, and the fallback.
- * Carries only the launch-invariant shape; pos0/positions stay the wrapper
- * params they already are. */
+/** Q-prep descriptor for the fused rope Q load (L037 lever 3). Non-NULL
+ * means `q` holds RAW projections: the fp16 kernel applies the tail rope
+ * itself at its Q fragment build (the same rotation pulsar_gpu_rope_tail_tensor
+ * applies, then the reference's bf16 rounding).  NULL means q is already
+ * roped -- the Qcur dump arm.  L218: V4.1 has no per-head RMS on Q, so the
+ * prologue is rope only.  Carries only the launch-invariant shape;
+ * pos0/positions stay the wrapper params they already are. */
 typedef struct {
-    float eps;             ///< RMS-norm epsilon
     uint32_t n_rot;        ///< rotary dimensions at the head's tail
     uint32_t n_ctx_orig;   ///< context length the RoPE settings were trained at
     float freq_base;       ///< RoPE base frequency
@@ -431,14 +429,15 @@ typedef struct {
  * standalone kernel as before. */
 int pulsar_gpu_attn_f16_tier_on(void);
 
-/** Opaque packed-row carriers (L092).  The packed caches (384-B NVFP4
- * ATTN_PACK rows, see pulsar_cuda_internal.h; MXKV-FP4 indexer rows) used to
+/** Opaque packed-row carriers (L092).  The packed caches (WINDOW / MAIN KV
+ * rows, see the format block below; MXKV-FP4 indexer rows) used to
  * travel as `const float *` -- a carrier type
  * that described nothing, so one direct raw_kv[i] anywhere was defect ten and
  * compiled clean.  Deliberately INCOMPLETE types: indexing or arithmetic is a
  * compile error, so every read goes through the format's accessor (or an
  * explicit byte-level cast at a row-granular copy).  Pass tensor->ptr. */
-typedef struct pulsar_attn_pack_s pulsar_attn_pack_t;
+typedef struct pulsar_winkv_row_s pulsar_winkv_row_t;    /* WINDOW rows (the ring) */
+typedef struct pulsar_mainkv_row_s pulsar_mainkv_row_t;  /* MAIN rows (a source's pool) */
 typedef struct pulsar_mxkv_pack_s pulsar_mxkv_pack_t;
 
 int pulsar_gpu_attention_f16_prefill_mx(
@@ -451,7 +450,7 @@ int pulsar_gpu_attention_f16_prefill_mx(
          * It was `float *` until L033; if you are adding a caller, pass
          * tensor->ptr and do NOT assume f32. */
         void *heads, const float *sinks, const void *q,
-        const pulsar_attn_pack_t *raw_kv, const pulsar_attn_pack_t *comp_kv,
+        const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim,
         void *gact_data, void *gact_scale, int gact_kbp,
@@ -480,8 +479,8 @@ int pulsar_gpu_attention_f16_prefill(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
         const void              *q,
-        const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv,
+        const pulsar_winkv_row_t *raw_kv,
+        const pulsar_mainkv_row_t *comp_kv,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -498,7 +497,7 @@ int pulsar_gpu_attention_f16_prefill(
  * as a PAIR (one without the other is refused); comp_bank_ptrs is an optional
  * per-bank base table -- NULL under descriptors means the scalar comp base +
  * seq_id*comp_cap, bit-identical to a contiguous pool.  Comp rows are
- * ATTN_PACK rows, always -- bank
+ * MAIN rows, always -- bank
  * isolation gated by tests/attn_f16_banked_test.cu.  Returns 0 on refusal or
  * failure. */
 int pulsar_gpu_attention_f16_indexed(
@@ -509,8 +508,8 @@ int pulsar_gpu_attention_f16_indexed(
         /* q: stored Q, PULSAR_Q_ELT_SIZE bytes/element; opaque here so this header
          * need not include cuda_fp16.h.  Pass tensor->ptr. */
         const void              *q,
-        const pulsar_attn_pack_t *raw_kv,
-        const pulsar_attn_pack_t *comp_kv,
+        const pulsar_winkv_row_t *raw_kv,
+        const pulsar_mainkv_row_t *comp_kv,
         const int               *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -973,86 +972,31 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * uint32 rotation positions: a negative entry rotates at a garbage angle
  * rather than faulting.  gpu_graph_multiseq_step_begin is the host-side
  * validator that every position is > 0 before any launch sees the array. */
-/** Per-head RMS norm followed by the tail rope rotation, in one launch.
- *
- * The Q element type is read from `x` itself rather than passed: the RMS
- * reduction and the rotation stay in f32 either way, and only the STORES
- * narrow.
- *
- * @param x           queries, normed and rotated in place
- * @param n_tok       rows
- * @param n_head      heads per row
- * @param head_dim    per-head width
- * @param n_rot       rotary dimensions at the head's tail
- * @param pos0        absolute position of row 0 (ignored when `positions` is given)
- * @param n_ctx_orig  context length the RoPE settings were trained at
- * @param inverse     rotate backwards (used when replaying a rewind)
- * @param freq_base   RoPE base frequency
- * @param freq_scale  linear frequency scaling
- * @param ext_factor  YaRN extrapolation mix; 0 disables
- * @param attn_factor YaRN attention temperature correction
- * @param beta_fast   YaRN ramp start
- * @param beta_slow   YaRN ramp end
- * @param eps         RMS epsilon
- * @param positions   optional per-row absolute positions; see the note above
- * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
- */
-int pulsar_gpu_head_rms_norm_rope_tail_tensor(
-        pulsar_gpu_tensor *x,
-        uint32_t          n_tok,
-        uint32_t          n_head,
-        uint32_t          head_dim,
-        uint32_t          n_rot,
-        uint32_t          pos0,
-        uint32_t          n_ctx_orig,
-        bool              inverse,
-        float             freq_base,
-        float             freq_scale,
-        float             ext_factor,
-        float             attn_factor,
-        float             beta_fast,
-        float             beta_slow,
-        float             eps,
-        const pulsar_gpu_tensor *positions);
 
-/* PULSAR_ATTN_PACK storage -- since the L111 unification (2026-08-27), ONE
- * row format serves EVERY KV buffer: the raw SWA ring, the compressed pool,
- * the drafter's ring, the MTP cache and prefill's current-chunk rows are all
- * the 384 B NVFP4 row
- *   [n_nope/2 e2m1 nibble bytes][n_nope/16 E4M3 scale codes][f32 row scale]
- *   [n_rot bf16 rope]
- * (224+28+4+128 at head_dim 512 / n_rot 64).  The nope dims are a LOSSY
- * re-quantization of the model's QAT e4m3 values, shipped on the measured
- * L111 verdict (net KL closer to the vLLM source than the retired e4m3 row,
- * drafter acceptance at/above it, -31%% KV reservation); the rope tail is
- * bf16 verbatim.  The e4m3 584 B row, its quantize recipe and every
- * backward-compat decode arm are GONE -- old session payloads and bank
- * snapshots refuse loudly and re-prefill; there is deliberately no
- * conversion loader (an FP4 re-encode misrounds ~33%% of blocks; bytes are
- * the values).  Requires n_rot == 64 and (head_dim - n_rot) %% 16 == 0. */
-/** THE KV ROW GEOMETRY -- one definition, used by the kernels that index the
- * rows and by the engine that sizes the caches and payload spans (L159 inc 5).
- * It was defined twice, once per side of this seam, kept in step by a comment
- * and a start-up check that asked the backend for its number; both sides now
- * read these macros, and the check is a tautology that no longer exists.
+/** THE TWO KV ROWS (L218, DeepSeek-V4.1).  Each holds, byte for byte, what
+ * the reference stores after its in-place quantise (dequantised bf16 values),
+ * so a reader multiplying code by scale in fp32 reproduces the reference's
+ * tensor exactly.
  *
- * Packed attention KV row (NVFP4, L111 unification): per row
- *   [n_nope/2 E2M1 nibbles][n_nope/16 E4M3 block scales][f32 row scale]
- *   [n_rot bf16 rope]  = 384 B at head_dim 512 / n_rot 64.
- * Requires n_rot == PULSAR_ATTN_PACK_NROT and (head_dim - n_rot) a multiple
- * of PULSAR_KV4_NV_BLOCK; the graph alloc refuses any other shape.  Quantise
- * EXACTLY ONCE (attn_pack_store_kernel); every later move is a byte move, and
- * there is no conversion path from any other row format.  Bumping this layout
- * MUST bump PULSAR_SESSION_PAYLOAD_VERSION and PULSAR_BANK_KV_VERSION. */
-#define PULSAR_ATTN_PACK_NROT 64u
-#define PULSAR_ATTN_PACK_NOPE_ALIGN 64u   /* the kernels walk the nope dims in 64-wide lanes */
-#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
-#define PULSAR_ATTN_PACK_NIB(HD)  (PULSAR_ATTN_PACK_NOPE(HD) / 2u)
-#define PULSAR_KV4_NV_BLOCK      16u
-#define PULSAR_KV4_NV_NBLK(HD)   (PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_KV4_NV_BLOCK)
-#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_ATTN_PACK_NIB(HD) + PULSAR_KV4_NV_NBLK(HD) + 4u + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
+ *   WINDOW row -- every layer's sliding-window ring (and the drafter's):
+ *     [head_dim E4M3][head_dim / 32 E8M0]              = 528 B at head_dim 512
+ *     act_quant(kv, 32): amax floored 1e-4, scale 2^ceil(log2(amax / 448)).
+ *   MAIN row -- a kv source's compressed pool:
+ *     [head_dim / 2 E2M1 nibbles, low nibble first][head_dim / 16 E4M3]
+ *                                                      = 288 B at head_dim 512
+ *     fp4_act_quant(latent, 16, e4m3 scales): amax floored 6 * 2^-9, scale
+ *     e4m3(amax / 6).  E2M1 x E4M3 products fit bf16, so the stored value is
+ *     the reference's bf16 exactly.
+ *
+ * Quantise EXACTLY ONCE (pulsar_cuda_kvrows.cu); every later move is a byte
+ * move, and there is no conversion path from any other row format (0731's
+ * unified 384 B NVFP4 row refuses through the payload / bank versions).
+ * Bumping either layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION and
+ * PULSAR_BANK_KV_VERSION. */
+#define PULSAR_WINKV_BLOCK  32u
+#define PULSAR_MAINKV_BLOCK 16u
+#define PULSAR_WINKV_ROWBYTES(HD)  ((uint64_t)(HD) + (HD) / PULSAR_WINKV_BLOCK)
+#define PULSAR_MAINKV_ROWBYTES(HD) ((uint64_t)(HD) / 2u + (HD) / PULSAR_MAINKV_BLOCK)
 /** Microscaling compressed-KV row (the indexer's FP4 cache): one E8M0 scale
  * byte per 32 elements, [HD/2 E2M1 nibble bytes][NBLK scale bytes]
  * (HD=128 -> 68 B/row).  CUTLASS-consumable layout; the GEMM re-tiles the
@@ -1060,36 +1004,23 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(
 #define PULSAR_MXKV_BLOCK 32u
 #define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
 #define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
-/** Accessors over the two macros for callers that hold head_dim as a runtime
- * value (tests, the engine's comp-row helper).  Same expression, one authority. */
-uint64_t pulsar_gpu_attn_pack_rowbytes(uint32_t head_dim);
-uint64_t pulsar_gpu_mxkv_fp4_rowbytes(uint32_t head_dim);
 
-/** Quantise `n_rows` KV rows to E2M1 and store them packed.
- *
- * THE single E2M1 quantize of KV in the engine. Re-encoding already-packed FP4
- * misrounds ~33% of blocks (norm_kv.cu), so every later move of these rows --
- * scatter, fork, evict/restore, session save/load -- must be a BYTE move.
- *
- * @param x         f32 staging rows to quantise; mutated in place when keep_f32
- * @param packed    destination for the packed rows
- * @param out_row0  first row of `packed` to write
- * @param n_rows    rows to quantise
- * @param head_dim  per-head width
- * @param n_rot     rotary dimensions at the head's tail
- * @param keep_f32  write the dequantised values back into the f32 staging.
- *                  OBSERVER-ONLY -- consumers read the packed rows. Pass
- *                  gpu_graph_f32_store_observed_any() (L094).
- * @return nonzero on success, 0 on a bad shape or a failed launch (every caller tests `!= 0`).
- */
-int pulsar_gpu_attn_pack_quantize_store_tensor(
-        pulsar_gpu_tensor *x,
-        pulsar_gpu_tensor *packed,
-        uint32_t          out_row0,
-        uint32_t          n_rows,
-        uint32_t          head_dim,
-        uint32_t          n_rot,
-        bool              keep_f32);
+/** The window-row packer: quantise `n_rows` f32 rows of `src` to WINDOW rows
+ * (see the format block) and store them.  raw_cap == 0: consecutive rows of
+ * `packed` from out_row0 (the batch pack buffer).  raw_cap != 0: a ring
+ * scatter, destination row = seq_id[r] * raw_cap + pos % raw_cap with pos =
+ * positions[r] or out_row0 + r; a row whose seq_id lies outside n_banks stores
+ * nothing.  `x` (optional) receives the dequantised values -- OBSERVER-ONLY,
+ * pass NULL unless gpu_graph_f32_store_observed_any().
+ * @return nonzero on success, 0 on a bad shape or a failed launch. */
+int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                 uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
+                                 const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
+                                 uint32_t n_banks, uint32_t raw_cap);
+/** The main-row packer: quantise `n_rows` f32 rows of `src` to MAIN rows and
+ * store them at `packed` rows [out_row0, out_row0 + n_rows).  `x` as above. */
+int pulsar_gpu_mainkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
+                                  uint32_t out_row0, uint32_t n_rows, uint32_t head_dim);
 
 /** Fused rope + FP4 pack for the indexer q projection (L218: the reference's
  * fp4_act_quant with E8M0 scales per 32 on the bf16-rounded row; 0731's
@@ -1124,16 +1055,6 @@ int pulsar_gpu_indexer_fp4_pack_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim,
         bool              keep_f32);
-
-/* Every KV buffer is PULSAR_ATTN_PACK rows -- PULSAR_ATTN_PACK_ROWBYTES(512) =
- * 384 B: 224 E2M1 nibble bytes + 28 E4M3 block scales + 4 B f32 row scale +
- * 128 B bf16 rope tail -- so the
- * attention readers and raw-KV writers below take NO format parameter.
- *
- * They carried one (`raw_f16`, later `raw_pack`) until 2026-08-17. Three storage
- * formats died with it: __half for the main ring, f32-holding-f16-values for the
- * drafter's, and the f32 batch buffer prefill handed attention for the current
- * chunk. None of the three is a format the source model uses. */
 
 /** As below, but also emits the grouped E4M3 encoding for the MX blocks this
  * kernel rewrites -- head dims [head_dim - n_rot, head_dim).  It is the second
@@ -1223,7 +1144,7 @@ int pulsar_gpu_store_raw_kv_batch_tensor(
         const pulsar_gpu_tensor *seq_id,
         uint32_t                n_banks);
 
-/** Same scatter, but the source rows are ALREADY PULSAR_ATTN_PACK.  Prefer this
+/** Same scatter, but the source rows are ALREADY WINDOW rows.  Prefer this
  * wherever the caller has already packed the batch: re-quantising a buffer that
  * has been round-tripped is the ~5%-misround pattern the norm_kv header warns
  * about, and a byte copy makes the ring agree with what attention read by
