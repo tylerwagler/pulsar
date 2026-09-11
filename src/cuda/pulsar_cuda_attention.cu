@@ -330,8 +330,7 @@ static int attention_decode_batch_launch(
             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
             0u, window, ratio, n_head, head_dim,
             (const int *)positions_ptr, (const int *)seq_id_ptr,
-            comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, non_causal,
-            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u, q_prep))
+            comp_bank_ptrs_ptr, comp_cap, kernel_n_banks, non_causal, q_prep))
         return 1;
     fprintf(stderr, "pulsar: fp16 decode attention FAILED (n_tokens=%u n_head=%u "
                     "n_comp=%u non_causal=%u); refusing to fall through\n",
@@ -433,14 +432,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        void                   *gact_data,
-        void                   *gact_scale,
-        int                     gact_kbp,
-        uint32_t                gact_slab,
-        uint32_t                n_groups,
-        uint32_t                n_nope,
-        uint32_t                gact_tok0,
-        uint32_t                gact_ntok,
         const pulsar_gpu_q_prep *q_prep) {
     /* Descriptor (banked) mode: same contract as attention_decode_batch_launch
      * (scalar n_raw/raw_start ignored and unvalidated, raw_cap must be the true
@@ -583,9 +574,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
             (const int *)topk_ptr, n_tokens, pos0, n_raw, raw_cap,
             raw_start, n_comp, top_k, window, ratio, n_head, head_dim, (const int *)positions_ptr,
             (const int *)seq_id_ptr, comp_bank_ptrs_ptr,
-            comp_cap, descr ? n_banks : 1u, 0u /* causal */,
-            gact_data, gact_scale, gact_kbp, gact_slab, n_groups, n_nope,
-            gact_tok0, gact_ntok, q_prep))
+            comp_cap, descr ? n_banks : 1u, 0u /* causal */, q_prep))
         return 1;
     fprintf(stderr, "pulsar: fp16 indexed attention FAILED (n_tokens=%u n_head=%u n_comp=%u "
                     "top_k=%u); refusing to fall through\n", n_tokens, n_head, n_comp, top_k);

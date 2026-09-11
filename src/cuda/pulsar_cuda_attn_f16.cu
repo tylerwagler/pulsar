@@ -1283,8 +1283,6 @@ int pulsar_gpu_attention_f16_indexed(
         uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
         uint32_t comp_cap, uint32_t n_banks, uint32_t non_causal,
-        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
-        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok,
         const pulsar_gpu_q_prep *q_prep) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
@@ -1330,27 +1328,6 @@ int pulsar_gpu_attention_f16_indexed(
      * check enforces on `window`). */
     AF16_REQUIRE("indexed", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
     AF16_REQUIRE("indexed", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
-    /* L219: optional grouped E4M3 emission for the attn-output "a" GEMM,
-     * exactly the dense arm's contract.  The epilogue owns dims [0, n_nope)
-     * and rope_tail owns the rest, so the split must fall on a whole MX block
-     * and every head must belong to a group.  Decode rows take the split-K
-     * combine, which has no epilogue, so an emit with decode rows present is a
-     * contradiction and is refused rather than half-written. */
-    if (gact_data && (n_groups == 0u || (n_head % n_groups) != 0u ||
-                      (n_nope % 32u) != 0u || n_nope > AF16_DIM)) {
-        fprintf(stderr, "pulsar: attn f16 indexed cannot emit MX for n_head=%u n_groups=%u n_nope=%u\n",
-                n_head, n_groups, n_nope);
-        return 0;
-    }
-    if (gact_data && pulsar_gpu_matmul_batch_decode_rows() > 0) {
-        fprintf(stderr, "pulsar: attn f16 indexed cannot emit MX with decode rows present\n");
-        return 0;
-    }
-    if (gact_data && (gact_tok0 + n_tokens > gact_ntok)) {
-        fprintf(stderr, "pulsar: attn f16 indexed MX emit window [%u,%u) outside batch %u\n",
-                gact_tok0, gact_tok0 + n_tokens, gact_ntok);
-        return 0;
-    }
     /* L210: the leading DECODE rows of this batch split their key walk
      * (L167's row-kind predicate, the same global the MoE dispatch reads: the
      * batched step sets it to its decode-row count, the classic verify and
@@ -1388,10 +1365,7 @@ int pulsar_gpu_attention_f16_indexed(
                                             comp_bank_ptrs, comp_cap,
                                             positions ? n_banks : 1u, 1,
                                             non_causal != 0u,
-                                            (__nv_fp8_e4m3 *)gact_data,
-                                            (unsigned char *)gact_scale,
-                                            gact_kbp, gact_slab, n_groups, n_nope,
-                                            gact_tok0, gact_ntok,
+                                            NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                             qp, q_prep != NULL,
                                             partials, n_dec);
     if (!cuda_ok(cudaGetLastError(), "attention f16 indexed launch")) return 0;

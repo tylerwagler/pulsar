@@ -540,21 +540,6 @@ int pulsar_gpu_attention_f16_indexed(
          * (the drafter's raw-window forward).  Only WHICH rows are visible
          * changes; compressed-row visibility and the fold are the same. */
         uint32_t                non_causal,
-        /* L219: grouped E4M3 emission for the attn-output "a" GEMM from this
-         * arm's epilogue, same contract as the dense _mx entry below.  NULL =
-         * no emission (the stage quantises afterwards); gact_tok0 is this
-         * launch's batch row offset and gact_ntok the batch total, because the
-         * span loop launches one row window at a time.  Refused with decode
-         * rows present (those rows take the split-K combine, which has no
-         * epilogue). */
-        void                    *gact_data,
-        void                    *gact_scale,
-        int                      gact_kbp,
-        uint32_t                 gact_slab,
-        uint32_t                 n_groups,
-        uint32_t                 n_nope,
-        uint32_t                 gact_tok0,
-        uint32_t                 gact_ntok,
         const pulsar_gpu_q_prep *q_prep);
 
 /** Block-scaled indexer scorer (SM120 mxf8f6f4 MMA over the stored MXFP4 rows).
@@ -1486,17 +1471,6 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         const pulsar_gpu_tensor *comp_bank_ptrs,
         uint32_t                comp_cap,
         uint32_t                n_banks,
-        /* L219: grouped E4M3 emit for the attn-output "a" GEMM, same contract
-         * as pulsar_gpu_attention_f16_indexed.  NULL/NULL/0/0/0/0 = no
-         * emission (the stage's gact_emit_heads quantises after the tail). */
-        void                    *gact_data,
-        void                    *gact_scale,
-        int                      gact_kbp,
-        uint32_t                 gact_slab,
-        uint32_t                 n_groups,
-        uint32_t                 n_nope,
-        uint32_t                 gact_tok0,
-        uint32_t                 gact_ntok,
         const pulsar_gpu_q_prep *q_prep);
 
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(

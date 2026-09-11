@@ -297,15 +297,6 @@ struct gpu_graph_span_ops {
     uint32_t                 comp_cap;  ///< per-bank stride, 0 when scalar
     uint32_t                 n_banks;  ///< 1 when scalar
     bool                     mseq;          ///< build per-span descriptor views for the banked path
-    /* L219: grouped E4M3 emission (see pulsar_gpu_attention_f16_indexed).
-     * Zero/NULL on every span site that does not own the whole batch; the
-     * stage then quantises the heads after the tail rope as before. */
-    void                    *gact_data;
-    void                    *gact_scale;
-    int                      gact_kbp;
-    uint32_t                 gact_slab;
-    uint32_t                 gact_groups;  ///< attention output groups
-    uint32_t                 gact_ntok;    ///< batch rows (data slab stride)
 };
 
 static bool gpu_graph_indexed_attention_span(
@@ -466,10 +457,6 @@ static bool gpu_graph_indexed_attention_span(
                                                                   op->comp_bases,
                                                                   op->comp_cap,
                                                                   op->n_banks,
-                                          op->gact_data, op->gact_scale, op->gact_kbp,
-                                          op->gact_slab, op->gact_groups,
-                                          PULSAR_N_HEAD_DIM - PULSAR_N_ROT,
-                                          s0, op->gact_ntok,
                                           g->q_prep_active ? &g->q_prep : NULL) != 0;
     }
     pulsar_gpu_tensor_free(ss_view);
@@ -1876,12 +1863,6 @@ bool gpu_graph_encode_layer_attention_batch(
                     /* comp_cap   */ mseq ? g->layer_comp_cap[il] : 0u,
                     /* n_banks    */ mseq ? nb : 1u,
                     /* mseq       */ mseq,
-                    /* gact_data  */ NULL,
-                    /* gact_scale */ NULL,
-                    /* gact_kbp   */ 0,
-                    /* gact_slab  */ 0u,
-                    /* gact_groups*/ 0u,
-                    /* gact_ntok  */ 0u,
                 };
                 /* The span hands n_comp -- the ATTENTION frontier -- to the indexer as
                  * its row count and score stride too.  The indexer keeps its own
@@ -1958,24 +1939,6 @@ bool gpu_graph_encode_layer_attention_batch(
              * branch built the f32 shadow unconditionally and was the ONLY
              * source of attn_pack_dequant launches in production. */
             pulsar_gpu_tensor *zspan_comp_src = g->layer_attn_comp_cache[il];
-            /* L219: the WHOLE batch rides these spans, so the fp16 tier can
-             * emit the grouped E4M3 for the "a" projection in its own
-             * epilogue -- the same encoding the dense arm emits and the same
-             * one gact_emit_heads would re-derive from the heads afterwards.
-             * A slot miss leaves the pointers NULL and the stage falls back to
-             * that pass; decode rows can never be in this branch (pos0 == 0),
-             * and the launcher refuses the combination anyway. */
-            void *zgact_data = NULL, *zgact_scale = NULL;
-            int zgact_kbp = 0;
-            uint64_t zgact_slab = 0;
-            if (ok && pulsar_gpu_matmul_batch_decode_rows() == 0 &&
-                pulsar_gpu_mxfp8_gact_slot(g->batch_heads, n_tokens, n_groups, group_dim,
-                                           &zgact_data, &zgact_scale, &zgact_kbp, &zgact_slab)) {
-                gact_data = zgact_data;
-                gact_scale = zgact_scale;
-                gact_kbp = zgact_kbp;
-                gact_slab = zgact_slab;
-            }
             const struct gpu_graph_span_ops zsop = {
                 /* comp_src   */ zspan_comp_src,
                 /* raw_src    */ g->layer_raw_cache[il],
@@ -1985,12 +1948,6 @@ bool gpu_graph_encode_layer_attention_batch(
                 /* comp_cap   */ 0u,
                 /* n_banks    */ 1u,
                 /* mseq       */ false,
-                /* gact_data  */ zgact_data,
-                /* gact_scale */ zgact_scale,
-                /* gact_kbp   */ zgact_kbp,
-                /* gact_slab  */ (uint32_t)zgact_slab,
-                /* gact_groups*/ n_groups,
-                /* gact_ntok  */ n_tokens,
             };
             for (uint32_t s0 = 0; ok && s0 < n_tokens; s0 += zspan) {
                 const uint32_t sn = n_tokens - s0 < zspan ? n_tokens - s0 : zspan;
@@ -2217,7 +2174,6 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                               PULSAR_N_HEAD,
                                                                               PULSAR_N_HEAD_DIM,
                                                                               NULL, NULL, NULL, 0, 1,
-                                          NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
                                           g->q_prep_active ? &g->q_prep : NULL) != 0;
                 } else if (ok) {
                     /* No selection this token: the same one-row step the
