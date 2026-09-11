@@ -75,8 +75,7 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);   /* per-layer row block scratch */
     if (!buf) return 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ncomp = g->ms_n_comp[bank][il];
         if (ncomp) {
             pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
@@ -84,8 +83,8 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
             pulsar_gpu_tensor_free(v);
             for (uint64_t i = 0; i < (uint64_t)ncomp * attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
-        if (ratio == 4) {
-            const uint32_t nidx = g->ms_n_index_comp[bank][il];
+        {   /* one emit writes the comp row AND the index-K row: one frontier */
+            const uint32_t nidx = ncomp;
             if (nidx) {
                 pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
                 if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }

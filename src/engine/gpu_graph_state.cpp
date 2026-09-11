@@ -82,8 +82,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     for (uint32_t il = 0; il < PULSAR_MAX_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_comp_kv_save[il]);
         pulsar_gpu_tensor_free(g->spec_comp_sc_save[il]);
-        pulsar_gpu_tensor_free(g->spec_icomp_kv_save[il]);
-        pulsar_gpu_tensor_free(g->spec_icomp_sc_save[il]);
     }
     pulsar_gpu_tensor_free(g->spec_comp_scratch_row);
     pulsar_gpu_tensor_free(g->dspark_concat);
@@ -125,24 +123,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
         pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
-        pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
-        pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        pulsar_gpu_tensor_free(g->layer_attn_proj_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_attn_proj_sc[il]);
-        pulsar_gpu_tensor_free(g->layer_index_proj_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_index_proj_sc[il]);
-        pulsar_gpu_tensor_free(g->layer_r128_undo_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_r128_undo_sc[il]);
     }
     /* Bank-pool slabs (the layer_* pointers freed above were views into
      * these when the pool was enabled; view frees release no memory). */
@@ -158,18 +140,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.index_bases[il]);
         pulsar_gpu_tensor_free(g->banks.askv[il]);
         pulsar_gpu_tensor_free(g->banks.assc[il]);
-        pulsar_gpu_tensor_free(g->banks.iskv[il]);
-        pulsar_gpu_tensor_free(g->banks.issc[il]);
         pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
         pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
-        pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
-        pulsar_gpu_tensor_free(g->banks.apkv[il]);
-        pulsar_gpu_tensor_free(g->banks.apsc[il]);
-        pulsar_gpu_tensor_free(g->banks.ipkv[il]);
-        pulsar_gpu_tensor_free(g->banks.ipsc[il]);
-        pulsar_gpu_tensor_free(g->banks.rukv[il]);
-        pulsar_gpu_tensor_free(g->banks.rusc[il]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
@@ -177,11 +149,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.dspark_raw[i]);
         pulsar_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
-    /* plan-33 inc C: partial-fork boundary-row stash. */
-    pulsar_gpu_tensor_free(g->emit_stash_comp);
-    pulsar_gpu_tensor_free(g->emit_stash_index);
-    g->emit_stash_comp = NULL;
-    g->emit_stash_index = NULL;
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     pulsar_gpu_batched_copy_free(g->spec_snap_copies);

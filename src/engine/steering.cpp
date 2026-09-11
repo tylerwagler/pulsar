@@ -61,12 +61,12 @@ uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     uint64_t bytes = 0;
+    /* CSA2 (L218): one comp pool + one index-K pool per kv SOURCE; the
+     * member layers read them and own nothing. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, ratio);
-        bytes += comp_cap * attn_row;
-        if (ratio == 4) bytes += comp_cap * idx_row;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il));
+        bytes += comp_cap * (attn_row + idx_row);
     }
     return bytes;
 }

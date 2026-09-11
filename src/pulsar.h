@@ -767,8 +767,14 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * snapshot.  v9 (L195, 2026-09-06): no snapshot -- a restored checkpoint resumes
  * from the grid point below its PREFILL frontier (header field 15) after a
  * 32-token state-only warm-up, so the raw window it carries reaches that far
- * below the checkpoint (raw_window + 127 + 32 rows).  Earlier files are refused. */
-#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(9)
+ * below the checkpoint (raw_window + 127 + 32 rows).
+ * v10 (L218, 2026-09-10, DeepSeek-V4.1 CSA2): compressed rows and index-K rows
+ * are carried per kv SOURCE layer (one frontier count per layer, non-zero on the
+ * four sources only; each source's comp rows, then its index-K rows, then --
+ * at ratio 2 -- its pending-group state), no separate indexer frontier, no
+ * indexer compressor state, no warm-up window (raw_window + 127 rows).
+ * Earlier files are refused. */
+#define PULSAR_SESSION_PAYLOAD_VERSION UINT32_C(10)
 /** 13 shape/counters + 2 row strides (attn pack, indexer fp4) + the prefill frontier. */
 #define PULSAR_SESSION_PAYLOAD_U32_FIELDS 16u
 

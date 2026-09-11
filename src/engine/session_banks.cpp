@@ -167,10 +167,8 @@ int pulsar_session::bank_fork(uint32_t src, uint32_t dst,
         pulsar_spec_drop_pendings(&s->spec);
         s->mseq_dirty = false;
     }
-    /* 7. Full fork has no ratio-4 boundary stash — keep the emit hook inactive.
-     * The drafter ring is NOT cloned: zero dst's ring counters so the spec path
-     * re-warms instead of reading another conversation's window. */
-    g->ms_emit_keep[dst] = 0u;
+    /* 7. The drafter ring is NOT cloned: zero dst's ring counters so the spec
+     * path re-warms instead of reading another conversation's window. */
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[dst][i] = 0u;
     g->ms_dspark_prompt_n[dst] = 0u;
     g->ms_dspark_prompt_lo[dst] = 0u;
@@ -338,7 +336,7 @@ int pulsar_session::bank_fork_partial(uint32_t src, uint32_t dst,
  * in the format they were written in (an FP4 re-encode misrounds ~33% of
  * blocks -- there is no conversion path, only refusal).  A refused load is a
  * cache miss, not a failure: the caller re-prefills. */
-#define PULSAR_BANK_KV_VERSION 3u  /* v3: unified NVFP4 rows (raw stride changed too) */
+#define PULSAR_BANK_KV_VERSION 4u  /* v4 (L218): one frontier per kv SOURCE, comp + index-K rows per source */
 
 int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
                              char *err, size_t errlen) {
@@ -355,33 +353,24 @@ int pulsar_session::bank_kv_save(uint32_t bank, FILE *fp,
                         (uint32_t)PULSAR_N_LAYER, (uint32_t)attn_row };
     if (fwrite(hdr, sizeof hdr, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: header write"); return 1; }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        uint32_t cnt[2] = { g->ms_n_comp[bank][il], g->ms_n_index_comp[bank][il] };
-        if (fwrite(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: count write"); return 1; }
+        const uint32_t cnt = g->ms_n_comp[bank][il];   /* 0 on every non-source layer */
+        if (fwrite(&cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv save: count write"); return 1; }
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t csz = (uint64_t)g->ms_n_comp[bank][il] * attn_row;
-        if (csz) {
-            uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
-            pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-            int ok = v && pulsar_gpu_tensor_read(v, 0, buf, csz) != 0;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint64_t rows = g->ms_n_comp[bank][il];
+        if (rows == 0) continue;
+        /* comp rows, then the index-K rows the same emits wrote */
+        for (int kind = 0; kind < 2; kind++) {
+            const uint64_t sz = rows * (kind ? idx_row : attn_row);
+            uint8_t *buf = (uint8_t *)xmalloc((size_t)sz);
+            pulsar_gpu_tensor *v = kind ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                        : gpu_graph_bank_attn_comp_view(g, il, bank);
+            int ok = v && pulsar_gpu_tensor_read(v, 0, buf, sz) != 0;
             pulsar_gpu_tensor_free(v);
-            if (ok) ok = fwrite(buf, 1, (size_t)csz, fp) == (size_t)csz;
+            if (ok) ok = fwrite(buf, 1, (size_t)sz, fp) == (size_t)sz;
             free(buf);   /* TRANSIENT: freed before free_physical so RAM is reclaimed */
-            if (!ok) { payload_set_err(err, errlen, "bank kv save: comp D2H/write"); return 1; }
-        }
-        if (ratio == 4) {
-            const uint64_t isz = (uint64_t)g->ms_n_index_comp[bank][il] * idx_row;
-            if (isz) {
-                uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
-                pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                int ok = v && pulsar_gpu_tensor_read(v, 0, buf, isz) != 0;
-                pulsar_gpu_tensor_free(v);
-                if (ok) ok = fwrite(buf, 1, (size_t)isz, fp) == (size_t)isz;
-                free(buf);
-                if (!ok) { payload_set_err(err, errlen, "bank kv save: index D2H/write"); return 1; }
-            }
+            if (!ok) { payload_set_err(err, errlen, kind ? "bank kv save: index D2H/write" : "bank kv save: comp D2H/write"); return 1; }
         }
     }
     return 0;
@@ -410,19 +399,17 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
                         "build's unified NVFP4 row; refusing (re-prefill)");
         return 1;
     }
-    uint32_t comp_cnt[PULSAR_MAX_LAYER] = {0}, idx_cnt[PULSAR_MAX_LAYER] = {0};
+    uint32_t comp_cnt[PULSAR_MAX_LAYER] = {0};
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        uint32_t cnt[2];
-        if (fread(cnt, sizeof cnt, 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
-        comp_cnt[il] = cnt[0]; idx_cnt[il] = cnt[1];
+        if (fread(&comp_cnt[il], sizeof comp_cnt[il], 1, fp) != 1) { payload_set_err(err, errlen, "bank kv load: count read"); return 1; }
     }
     /* Review finding 3 — TRANSACTIONAL restore. Validate every frontier count
-     * against the per-layer cap BEFORE any device change: a short read or corrupt
+     * against the per-source cap BEFORE any device change: a short read or corrupt
      * header must never leave the bank advertising row counts over unwritten KV
-     * (an OOB managed read on the next decode). */
+     * (an OOB managed read on the next decode).  A count on a non-source layer
+     * is corruption too. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (pulsar_layer_compress_ratio(il) == 0) continue;
-        if (comp_cnt[il] > g->layer_comp_cap[il] || idx_cnt[il] > g->layer_comp_cap[il]) {
+        if (comp_cnt[il] > g->layer_comp_cap[il]) {
             payload_set_err(err, errlen,
                             "bank kv load: frontier count exceeds cap (corrupt snapshot)");
             return 1;
@@ -436,29 +423,19 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
     const uint64_t idx_row = PULSAR_ENGINE_IDXFP4_ROWBYTES;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t csz = (uint64_t)comp_cnt[il] * attn_row;
-        if (csz) {
-            uint8_t *buf = (uint8_t *)xmalloc((size_t)csz);
-            int ok = fread(buf, 1, (size_t)csz, fp) == (size_t)csz;
-            if (ok) { pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
-                      ok = v && pulsar_gpu_tensor_write(v, 0, buf, csz) != 0;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint64_t rows = comp_cnt[il];
+        if (rows == 0) continue;
+        for (int kind = 0; kind < 2; kind++) {
+            const uint64_t sz = rows * (kind ? idx_row : attn_row);
+            uint8_t *buf = (uint8_t *)xmalloc((size_t)sz);
+            int ok = fread(buf, 1, (size_t)sz, fp) == (size_t)sz;
+            if (ok) { pulsar_gpu_tensor *v = kind ? gpu_graph_bank_index_comp_view(g, il, bank)
+                                                  : gpu_graph_bank_attn_comp_view(g, il, bank);
+                      ok = v && pulsar_gpu_tensor_write(v, 0, buf, sz) != 0;
                       pulsar_gpu_tensor_free(v); }
             free(buf);
-            if (!ok) { payload_set_err(err, errlen, "bank kv load: comp read/H2D"); return 1; }
-        }
-        if (ratio == 4) {
-            const uint64_t isz = (uint64_t)idx_cnt[il] * idx_row;
-            if (isz) {
-                uint8_t *buf = (uint8_t *)xmalloc((size_t)isz);
-                int ok = fread(buf, 1, (size_t)isz, fp) == (size_t)isz;
-                if (ok) { pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
-                          ok = v && pulsar_gpu_tensor_write(v, 0, buf, isz) != 0;
-                          pulsar_gpu_tensor_free(v); }
-                free(buf);
-                if (!ok) { payload_set_err(err, errlen, "bank kv load: index read/H2D"); return 1; }
-            }
+            if (!ok) { payload_set_err(err, errlen, kind ? "bank kv load: index read/H2D" : "bank kv load: comp read/H2D"); return 1; }
         }
     }
     /* Every row is now on-device — COMMIT: repoint (make bank live), then install
@@ -466,24 +443,8 @@ int pulsar_session::bank_kv_load(uint32_t bank, FILE *fp,
      * rows, and each is backed by written KV. If repoint fails the ms counters stay
      * 0 (empty, safe). */
     if (!gpu_graph_bank_repoint(g, bank)) { payload_set_err(err, errlen, "bank kv load: repoint"); return 1; }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = comp_cnt[il];
-        g->ms_n_index_comp[bank][il] = idx_cnt[il];
-    }
-    /* L120 value-half: the spill payload does not carry the projection
-     * ring; a restored bank runs degraded until it deposits fresh
-     * positions (no payload format change). */
-    g->ms_proj_ring_lo[bank] = 0u;
-    g->ms_proj_ring_hi[bank] = 0u;
-    /* L124: same reasoning, one line at the load site so the invariant is
-     * local rather than transitively true through free_physical (reviewer
-     * finding 5). */
-    g->ms_r128_undo_head[bank] = 0u;
-    g->ms_r128_undo_n[bank] = 0u;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) g->ms_n_comp[bank][il] = comp_cnt[il];
     gpu_graph_bank_counters_install(g, bank);   /* layer_n_* <- ms_n_*[bank] */
-    /* plan-33 inc C: a disk-restored bank carries full committed state — any
-     * stale fork boundary threshold must not fire on it. */
-    g->ms_emit_keep[bank] = 0u;
     return 0;
 }
 

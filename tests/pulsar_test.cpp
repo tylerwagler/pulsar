@@ -2749,15 +2749,16 @@ static void test_context_memory_shape(void) {
     TEST_ASSERT(m.prefill_cap > 0 && m.raw_cap > 0);
     TEST_ASSERT(m.raw_bytes ==
                 (uint64_t)PULSAR_N_LAYER * m.raw_cap * PULSAR_ENGINE_ATTN_PACK_ROWBYTES);
-    uint64_t comp_index = 0;
+    /* CSA2: pools exist at the 4 kv sources only (3 at ratio 2, 1 at ratio 1),
+     * each a comp row AND an index-K row per compressed position. */
+    uint64_t comp_index = 0; uint32_t n_src = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, ratio);
-        comp_index += rows * gpu_graph_attn_comp_cache_row_bytes();
-        if (ratio == 4) comp_index += rows * PULSAR_ENGINE_IDXFP4_ROWBYTES;
+        if (pulsar_layer_attn_layout(il)->mode != PULSAR_ATTN_FULL) continue;
+        n_src++;
+        const uint64_t rows = gpu_graph_comp_cap((uint32_t)ctx, pulsar_layer_compress_ratio(il));
+        comp_index += rows * (gpu_graph_attn_comp_cache_row_bytes() + PULSAR_ENGINE_IDXFP4_ROWBYTES);
     }
-    TEST_ASSERT(comp_index > 0 && m.comp_index_bytes == comp_index);
+    TEST_ASSERT(n_src == 4 && comp_index > 0 && m.comp_index_bytes == comp_index);
     /* the ratio-1 layers hold the deepest pool; that is the row count reported */
     TEST_ASSERT(m.comp_cap == gpu_graph_comp_cap((uint32_t)ctx, 1u));
     TEST_ASSERT(m.scratch_bytes > 0);

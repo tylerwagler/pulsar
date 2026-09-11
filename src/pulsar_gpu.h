@@ -313,18 +313,11 @@ enum {
     PULSAR_MARKOV_W2_MXFP8 = 2,   /* GGUF type 46: E8M0 scale plane [E][V/32], then E4M3 payload plane [E][V] -- the shipped table */
 };
 
-/** Compressor input-width multiplier for a layer's compress ratio: the
- * ratio-4 compressor consumes a [kv | score]-style 2 x head_dim row (its state
- * is 8 = 2 x ratio rows, two groups), every other ratio a plain head_dim row.
- * This sets comp_width -- the row stride of the projection scratch, the state
- * lanes and the payload -- and was spelled `ratio == 4 ? 2u : 1u` at fourteen
- * sites across the engine and the kernels (L178).  One definition, both sides. */
 #if defined(__CUDACC__)
 #define PULSAR_GPU_HD __host__ __device__   /* the helper is called from kernels too */
 #else
 #define PULSAR_GPU_HD
 #endif
-static inline PULSAR_GPU_HD uint32_t pulsar_compress_coff(uint32_t ratio) { return ratio == 4u ? 2u : 1u; }
 
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
@@ -1167,6 +1160,24 @@ int pulsar_gpu_rope_tail_tensor(
         float             beta_slow,
         const pulsar_gpu_tensor *positions);
 
+/** CSA2 (L218): rotate `n_rows` single-head f32 rows standing for positions
+ * pos0, pos0 + pos_stride, ... (a kv source's compressed rows, one per group
+ * of `ratio` tokens, each rotated at its group's first position). */
+int pulsar_gpu_rope_tail_strided_tensor(
+        pulsar_gpu_tensor *x,
+        uint32_t          n_rows,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          pos_stride,
+        uint32_t          n_ctx_orig,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 /** Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * pulsar_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
  * explicitly selected by the graph driver. */
@@ -1217,129 +1228,71 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(
  * and optional indexer masks.
  */
 
-int pulsar_gpu_compressor_update_tensor(
+/** CSA2 (L218) compressor, the reference's Compressor.forward as two entries.
+ *
+ * A kv source of ratio > 1 pools the `ratio` tokens of a group into ONE latent:
+ * softmax over the group's score projections (fp32, the reference's order --
+ * weights normalised first, then the weighted sum), rounded to bf16, RMS-normed
+ * against attn_compressor_norm (fp32 math, the weighted result rounded to
+ * bf16).  A source of ratio 1 is the projection rounded to bf16 then normed.
+ * Both write the latent PRE-RoPE as fp32 rows holding bf16-exact values: the
+ * index-key projection reads it unrotated, the attention row pack rotates it.
+ *
+ * The state lane (ratio > 1 only) holds the pending group's kv / score rows at
+ * slot pos %% ratio, empty = kv 0 / score -inf; a complete group is consumed at
+ * its emit and the next group's stores overwrite every slot before the next
+ * emit reads them, so at any position that is a multiple of `ratio` the state
+ * is canonically empty.
+ *
+ * prefill: kv/sc hold n_tokens rows starting at position pos0, which must be a
+ * multiple of ratio (an unaligned continuation takes the per-position entry
+ * until it aligns).  Emits n_tokens / ratio latent rows and leaves the trailing
+ * n_tokens %% ratio rows in the state; at ratio 1 the state tensors may be NULL.
+ * update: one position; stores its row and, when it completes a group, emits
+ * that group's latent (sets *emitted).  At ratio 1 every position emits. */
+int pulsar_gpu_csa2_compressor_prefill_tensor(
+        pulsar_gpu_tensor       *latent,       /* [n_tokens / ratio][head_dim] f32 out */
+        const pulsar_gpu_tensor *kv,
+        const pulsar_gpu_tensor *sc,           /* ignored at ratio 1 */
+        pulsar_gpu_tensor       *state_kv,     /* NULL at ratio 1 */
+        pulsar_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        float                   rms_eps);
+
+int pulsar_gpu_csa2_compressor_update_tensor(
+        pulsar_gpu_tensor       *latent,       /* [1][head_dim] f32 out, written only when *emitted */
         const pulsar_gpu_tensor *kv_cur,
         const pulsar_gpu_tensor *sc_cur,
         pulsar_gpu_tensor       *state_kv,
         pulsar_gpu_tensor       *state_score,
-        pulsar_gpu_tensor       *comp_cache,
         const void             *model_map,
         uint64_t                model_size,
-        uint64_t                ape_offset,
-        uint32_t                ape_type,
         uint64_t                norm_offset,
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos,
-        uint32_t                comp_row,
-        uint32_t                n_rot,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        int                    *emitted);
 
-int pulsar_gpu_compressor_store_batch_tensor(
-        const pulsar_gpu_tensor *kv,
-        const pulsar_gpu_tensor *sc,
+/** Store one position's kv / score projections into the state slot pos %% ratio
+ * without pooling (the rewind path rebuilding a pending group from the verify
+ * saves).  ratio > 1 only. */
+int pulsar_gpu_csa2_compressor_store_tensor(
+        const pulsar_gpu_tensor *kv_row,
+        const pulsar_gpu_tensor *sc_row,
         pulsar_gpu_tensor       *state_kv,
         pulsar_gpu_tensor       *state_score,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                ape_offset,
-        uint32_t                ape_type,
         uint32_t                head_dim,
         uint32_t                ratio,
-        uint32_t                pos0,
-        uint32_t                n_tokens);
-
-/** L120 value-half: the ratio-4 two-group window shift as a standalone entry
- * (the emit path runs it inside compressor_update).  The rewind-time window
- * replay re-runs store+shift over committed projections. */
-int pulsar_gpu_compressor_shift_ratio4_tensor(
-        pulsar_gpu_tensor *state_kv,
-        pulsar_gpu_tensor *state_score,
-        uint32_t           head_dim);
-
-int pulsar_gpu_compressor_prefill_tensor(
-        pulsar_gpu_tensor       *comp_cache,
-        pulsar_gpu_tensor       *state_kv,
-        pulsar_gpu_tensor       *state_score,
-        const pulsar_gpu_tensor *kv,
-        const pulsar_gpu_tensor *sc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                ape_offset,
-        uint32_t                ape_type,
-        uint64_t                norm_offset,
-        uint32_t                norm_type,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        uint32_t                pos0,
-        uint32_t                n_tokens,
-        uint32_t                n_rot,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   rms_eps);
-
-int pulsar_gpu_compressor_prefill_ratio4_replay_tensor(
-        pulsar_gpu_tensor       *comp_cache,
-        pulsar_gpu_tensor       *state_kv,
-        pulsar_gpu_tensor       *state_score,
-        const pulsar_gpu_tensor *kv,
-        const pulsar_gpu_tensor *sc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                ape_offset,
-        uint32_t                ape_type,
-        uint64_t                norm_offset,
-        uint32_t                norm_type,
-        uint32_t                head_dim,
-        uint32_t                pos0,
-        uint32_t                n_tokens,
-        uint32_t                n_rot,
-        uint32_t                n_ctx_orig,
-        float                   freq_base,
-        float                   freq_scale,
-        float                   ext_factor,
-        float                   attn_factor,
-        float                   beta_fast,
-        float                   beta_slow,
-        float                   rms_eps);
-
-/** Rebuild the 8-row ratio-4 compressor state from a chunk's tail -- the
- *  chunk's own kv / score projections (the prefill arm, M-neutral since L183):
- *  `kv_tail`/`sc_tail` hold the last complete group
- *  (`n_full` = 4 rows, or 0 when the chunk has none) followed by the partial
- *  group (`rem` = 0..3 rows), in position order; `pos0` is the position of tail
- *  row 0 and must be ratio-aligned.  Lays them out exactly as
- *  pulsar_gpu_compressor_prefill_tensor and the decode store do: the complete
- *  group at rows 0..3, partial row r at row 4 + r (its phase); the other rows
- *  are empty (kv 0, score -inf).  Refuses a malformed tail or an unaligned
- *  position (L168: the rebuild used to write the last four rows at 0..3 and
- *  drop the partial group for every prompt with n_tokens % 4 != 0). */
-int pulsar_gpu_compressor_prefill_state_ratio4_tensor(
-        pulsar_gpu_tensor       *state_kv,
-        pulsar_gpu_tensor       *state_score,
-        const pulsar_gpu_tensor *kv_tail,
-        const pulsar_gpu_tensor *sc_tail,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                ape_offset,
-        uint32_t                ape_type,
-        uint32_t                head_dim,
-        uint32_t                pos0,
-        uint32_t                n_full,
-        uint32_t                rem);
+        uint32_t                pos);
 
 /** As below, but the fp16 tier additionally emits the grouped E4M3 encoding of
  * batch_heads for the attn-output "a" projection.  *mx_out is set to 1 ONLY if

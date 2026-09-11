@@ -855,25 +855,24 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             const uint32_t bank = gpu_graph_cur_bank(&s->graph);
             bool ahead = false;
             for (uint32_t il = 0; il < PULSAR_N_LAYER && !ahead; il++) {
-                const uint32_t ratio = pulsar_layer_compress_ratio(il);
-                if (ratio == 0) continue;
-                if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / ratio)
+                if (!gpu_graph_layer_is_kv_source(il)) continue;
+                if (gpu_graph_n_comp(&s->graph, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
                     ahead = true;
             }
             if (ahead) s->rewind(s->checkpoint.len);
         }
-        /* L183/L194/L195: a resume is a COLD PREFILL FROM A GRID POINT.  A prefill
-         * chunk's bytes depend on the chunk's row count and on a row's offset
-         * within the call (L183), so a suffix evaluated from an off-grid
+        /* L183/L194/L195/L218: a resume is a COLD PREFILL FROM A GRID POINT.  A
+         * prefill chunk's bytes depend on the chunk's row count and on a row's
+         * offset within the call (L183), so a suffix evaluated from an off-grid
          * checkpoint is a different computation from the cold prefill of the same
          * tokens.  The rule: G = the last multiple of PULSAR_RESUME_GRID at or
          * below the PREFILL frontier (decode rows are the decode kernels'; the
-         * tokens generated since are recomputed), rewind to G, reset the
-         * ratio-128 windows, warm the ratio-4 window up by running the 32 tokens
-         * before G through the layers (nothing persisted), then evaluate [G, N)
-         * -- every chunk boundary and every kernel call is the cold prefill's.
-         * Cost: < 128 + generated tokens recomputed, ~30 ms of warm-up.  The raw
-         * window the warm-up attends over must still be in the ring: a
+         * tokens generated since are recomputed), rewind to G -- at an even
+         * position every compressor holds the empty group, so the rewind leaves
+         * the cold prefill's state and nothing needs warming up -- then evaluate
+         * [G, N): every chunk boundary and every kernel call is the cold
+         * prefill's.  Cost: < 128 + generated tokens recomputed.  The raw window
+         * the resumed prefill attends over must still be in the ring: a
          * generation longer than the ring's reach since the last prefill leaves
          * only the cold prefill from 0, said once. */
         if (prompt->len > s->checkpoint.len && s->prefill_cap != 0) {
@@ -882,8 +881,8 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
             uint32_t pf = s->prefill_frontier < 0 ? 0u : (uint32_t)s->prefill_frontier;
             if (pf > ck) pf = ck;
             uint32_t G = (pf / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;   /* may move to a reachable grid point below */
-            const uint32_t reach = s->graph.raw_cap > s->graph.raw_window + PULSAR_WARMUP_TOKENS
-                                 ? s->graph.raw_cap - s->graph.raw_window - PULSAR_WARMUP_TOKENS : 0u;
+            const uint32_t reach = s->graph.raw_cap > s->graph.raw_window
+                                 ? s->graph.raw_cap - s->graph.raw_window : 0u;
             /* When the prefill grid point is past the ring's reach (a generation
              * longer than ~4k tokens since the last prefill), resume from the
              * NEWEST grid point within reach instead of from 0.  The tokens below
@@ -894,7 +893,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
              * Said once per resume. */
             bool exact = true;
             if (G != 0 && ck - G > reach) {
-                const uint32_t lo = ck - reach;   /* oldest position whose warm-up window is still in the ring */
+                const uint32_t lo = ck - reach;   /* oldest position whose attention window is still in the ring */
                 const uint32_t G2 = ((lo + PULSAR_RESUME_GRID - 1u) / PULSAR_RESUME_GRID) * PULSAR_RESUME_GRID;
                 if (G2 >= PULSAR_RESUME_GRID && G2 < ck) { G = G2; exact = false; }
                 else G = 0;   /* nothing reachable: cold */
@@ -910,15 +909,13 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
                 s->resume_origin = 0;
             } else {
                 s->rewind((int)G);
-                if (!gpu_graph_r128_state_reset_canonical(&s->graph, bank) ||
-                    !gpu_graph_prefill_warmup_state(&s->graph, &e->model, &e->weights, prompt, G)) {
-                    snprintf(err, errlen, "resume warm-up at %u failed", G);
-                    s->checkpoint_valid = false;
+                if (!s->checkpoint_valid) {
+                    snprintf(err, errlen, "resume rewind to %u failed", G);
                     return 1;
                 }
                 s->resume_origin = (int)G;
-                fprintf(stderr, "pulsar: resume at %u from grid point %u on bank %u (%u tokens recomputed, %u warmed)%s\n",
-                        ck, G, bank, ck - G, (unsigned)PULSAR_WARMUP_TOKENS,
+                fprintf(stderr, "pulsar: resume at %u from grid point %u on bank %u (%u tokens recomputed)%s\n",
+                        ck, G, bank, ck - G,
                         exact ? "" : " -- past the prefill frontier's reach: the generated tokens below stay as decoded, "
                                      "not identical to a cold prefill");
             }
@@ -1018,7 +1015,7 @@ int pulsar_session::sync(const pulsar_tokens *prompt, char *err, size_t errlen) 
     }
     /* The rebuild path is the one place this session's per-bank truth is
      * legitimately re-established: reset_prefill_state zeroes
-     * ms_n_comp[cur_bank] / ms_n_index_comp[cur_bank] and the prefill below
+     * ms_n_comp[cur_bank] and the prefill below
      * refills them from zero against the installed bank.  Other banks hold
      * other slots' positions and a reset here says nothing about them.
      *
@@ -1455,19 +1452,12 @@ void pulsar_session::invalidate() {
     pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
     spec_quench_reset(s);
-    /* L124: the undo ring describes the DEAD conversation's stores; a rewind
-     * in the next one must never restore its lane bytes (unlike the L120
-     * projection span, the ring has no gap-restart to save it -- reviewer
-     * finding 2: a stale entry with pos >= a later rewind target copies a
-     * foreign row into a live state slot). */
-    s->graph.r128_undo_head = 0u;
-    s->graph.r128_undo_n = 0u;
-    s->graph.r128_perrow_chunk = false;
-    /* plan-33 inc C: an invalidated bank restarts from zero — a live keep
-     * threshold would make the fresh prefill's early emits restore a STALE
-     * boundary row over the new conversation's KV. Disarm it. */
-    if (s->graph.banks.n_banks) {
-        s->graph.ms_emit_keep[s->graph.banks.cur_bank] = 0u;
+    /* L218: a new conversation starts from the empty compressor group; the
+     * verify-save span described the dead one's positions. */
+    {
+        const uint32_t b = gpu_graph_cur_bank(&s->graph);
+        s->graph.ms_spec_save_rows[b] = 0u;
+        s->graph.ms_comp_state_stale[b] = false;
     }
     /* The drafter's context-KV ring must not survive into a new prompt: it was
      * never reset before, so in the server every request after the first
@@ -1478,13 +1468,6 @@ void pulsar_session::invalidate() {
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
     s->prefill_frontier = 0;   /* L195: the history is gone */
-    /* The projection-ring span describes the bank the views pointed at when
-     * it was deposited; after a repoint + invalidate it still advertised the
-     * OLD bank's positions over the NEW bank's lanes, and a rewind before the
-     * next deposit would have replayed them (L178).  Empty it: the next chunk
-     * or per-row store re-establishes the span. */
-    s->graph.proj_ring_lo = 0u;
-    s->graph.proj_ring_hi = 0u;
 }
 
 
@@ -1508,205 +1491,29 @@ void pulsar_session::rewind(int pos) {
     for (int i = 0; i < 3; i++) s->graph.dspark_n_raw[i] = 0;
     s->graph.dspark_prompt_n = 0;
     if (s->prefill_frontier > pos) s->prefill_frontier = pos;   /* L195: a prefill above the new frontier never happened */
-    /* L120: reconcile the compressor frontiers with the rewound position.
-     * Stage B's rollforward assigns layer_n_comp/layer_n_index_comp
-     * ABSOLUTELY at the round's committed frontier (gpu_prefill.cpp,
-     * gpu_graph_dspark_compressor_rollforward), and 6de76e3 replaced the
-     * full-session invalidate -- which rebuilt these -- with this rewind,
-     * which left them untouched.  Classic decode self-heals: the next
-     * boundary emit reassigns the counters before anything validates.  The
-     * batched lane does not: it captures the bank frontier (bank_state_save)
-     * and position-true-checks it at the next admission INSIDE the stale
-     * window, so a ghost tail that crossed a ratio boundary left n_comp one
-     * ahead -> hard bank reject (L120, first fired on production
-     * 2026-08-27).  Clamp DOWN only -- a counter can only be AHEAD of a
+    /* The compressed frontier of every kv source follows the position law on
+     * the bank this session's checkpoint describes (other banks hold other
+     * slots' positions).  Clamp DOWN only -- a counter can only be AHEAD of a
      * rewound position, and a lagging one (mid-admission prefill) must never
-     * be raised here.  Cache rows beyond the clamp are invisible (readers
-     * cap at n_comp) and are re-emitted on the next boundary cross.
-     * VALUE HALF (the residual the clamp left, now fixed below): ratio-4
-     * keeps a two-group window, and a ghost group that completed pre-rewind
-     * has already SHIFTED itself into the lower half
-     * (compressor_shift_ratio4_kernel); ghost stores may also have
-     * overwritten committed slots of the upper half across the boundary.
-     * The window replay below rebuilds both halves from the committed-
-     * projection ring: re-run store+shift over [4*(pos/4 - 1), pos) --
-     * at most 7 positions, always inside the 32-deep ring when the span is
-     * covered (depth 32 also keeps ghost-position deposits from clobbering
-     * the needed slots: ghost minus needed position is always under 32).  An uncovered span (fresh bank, spill-restore, fork, mseq
-     * candidate-only stretches) skips the replay: degraded = the exact
-     * pre-fix classic-parity behavior, counters still clamped. */
-    /* Clamp BOTH representations. The scalars alone are not enough: the served
-     * path validates the next multiseq step against the PER-BANK slots
-     * (gpu_graph_multiseq_step_begin reads ms_n_comp[bank] whenever capture_cur
-     * is false, which is every genuine multiseq step), and nothing else lowers
-     * them on a rewind -- bank_state_save only publishes the scalars on a
-     * hand-off, which does not happen when the rewound bank is decoded again
-     * with no switch-away in between (a single live slot).
-     *
-     * Reproduced deterministically by tests/mseq_rewind_probe:
-     *   after rewind   scalar_n_comp=150  ms_n_comp[0]=151   <-- diverged
-     *   next step      REJECTED: "bank 0 frontier not position-true at layer 2
-     *                  (pos 603 ratio 4: n_comp 151 want 150, n_index_comp 151)"
-     * which is L120's production signature -- same layer, same shape, same
-     * message as the 2026-08-27 incident (bank 3, n_comp 10995 want 10994).
-     * L120 clamped the scalars and closed; the per-bank half was never done. */
-    const uint32_t rw_bank = s->graph.banks.n_banks ? s->graph.banks.cur_bank : 0u;
-    bool any_ratio4_crossed = false;
+     * be raised here.  Rows beyond the clamp are invisible (readers cap at
+     * n_comp) and are rewritten by the next emit at that index.  L120's
+     * production signature ("frontier not position-true") was exactly this
+     * clamp missing on the per-bank row. */
+    const uint32_t rw_bank = gpu_graph_cur_bank(&s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t want = (uint32_t)pos / ratio;
-        /* ONE clamp, on the bank this session's checkpoint describes. Other
-         * banks hold other slots' positions and a rewind here says nothing
-         * about them.
-         *
-         * This was TWO clamps -- "clamp BOTH representations", the scalar and
-         * the per-bank row -- which was right when they were separate storage
-         * (L120 clamped one, L133 was the bill for missing the other). Stage 1b
-         * made them the same memory, so the pair became one value clamped
-         * twice; with the bank now named, that is visible rather than
-         * something you have to know. */
-        if (rw_bank < PULSAR_MSEQ_MAX) {
-            if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) {
-                if (ratio == 4) any_ratio4_crossed = true;
-                gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
-            }
-            if (ratio == 4 && gpu_graph_n_index_comp(&s->graph, rw_bank, il) > want)
-                gpu_graph_n_index_comp(&s->graph, rw_bank, il) = want;
-        }
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
+        if (gpu_graph_n_comp(&s->graph, rw_bank, il) > want) gpu_graph_n_comp(&s->graph, rw_bank, il) = want;
     }
-    /* ⚠ MEASURED LIMIT (2026-08-30): the replay below does NOT fire on the
-     * served path, and that is structural rather than incidental.
-     *
-     * The ring is deposited only for committed non-mseq, non-spec chunks
-     * (gpu_prefill.cpp:1312 deposit, :2818 note -- same guard), and
-     * gpu_graph_multiseq_step_begin sets batch_multiseq=true for EVERY
-     * multiseq step, 1 row or 16. The server decodes only that way, so between
-     * prefill chunks nothing is deposited, and a ghost rewind targeting the
-     * decode frontier lands outside the last chunk's tail-8 span. Traced on a
-     * real served workload: 0 replay TAKEN / 2 skipped, spans [18,22) and
-     * [39,43) against a rewind needing 12..17.
-     *
-     * So in production the counter clamp ABOVE is the live half of L120 (it is
-     * unconditional, and it is what fixed the observed
-     * "frontier not position-true" errors); the value restoration below runs
-     * only for classic/prefill-shaped callers. The consequence on the served
-     * path is silent, not an error: counters are correct, the step is
-     * accepted, and re-emitted comp rows keep ghost values.
-     *
-     * Covering decode would mean depositing under mseq and widening past
-     * tail-8 -- a fidelity improvement to be priced, not a bug fix. See
-     * pulsar-notes/plans/ONE-STATE-MODEL-STAGE0B.md. The served shape is
-     * pinned by cuda-mseq-rewind-gate (tests/mseq_rewind_probe.cpp): prefill,
-     * bank save, a 6-row mixed step, a ghost rewind, then per-layer frontier
-     * CHECKs against the wanted counts. (A "served-shape leg" of
-     * rewind_frontier_gate was written and mutation-killed twice -- it never
-     * landed; this comment used to point at it.) */
-    if (any_ratio4_crossed && pos >= 4) {
-        pulsar_gpu_graph *g = &s->graph;
-        const uint32_t want = (uint32_t)pos / 4u;
-        const uint32_t start = 4u * (want - 1u);
-        if (start >= g->proj_ring_lo && (uint32_t)pos <= g->proj_ring_hi) {
-            pulsar_engine *e = s->engine;
-            const pulsar_model *model = &e->model;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                if (pulsar_layer_compress_ratio(il) != 4u) continue;
-                const pulsar_layer_weights *layer = &e->weights.layer[il];
-                if (!g->layer_attn_proj_kv[il] || !g->layer_index_proj_kv[il]) continue;
-                bool ok = true;
-                for (uint32_t p = start; ok && p < (uint32_t)pos; p++) {
-                    const uint64_t attn_row_bytes = 2ull * PULSAR_N_HEAD_DIM * sizeof(float);
-                    const uint64_t idx_row_bytes = 2ull * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-                    const uint64_t aoff = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * attn_row_bytes;
-                    const uint64_t ioff = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * idx_row_bytes;
-                    pulsar_gpu_tensor *akv = pulsar_gpu_tensor_view(g->layer_attn_proj_kv[il], aoff, attn_row_bytes);
-                    pulsar_gpu_tensor *asc = pulsar_gpu_tensor_view(g->layer_attn_proj_sc[il], aoff, attn_row_bytes);
-                    pulsar_gpu_tensor *ikv = pulsar_gpu_tensor_view(g->layer_index_proj_kv[il], ioff, idx_row_bytes);
-                    pulsar_gpu_tensor *isc = pulsar_gpu_tensor_view(g->layer_index_proj_sc[il], ioff, idx_row_bytes);
-                    ok = akv && asc && ikv && isc;
-                    if (!ok) fprintf(stderr, "pulsar: L120 replay: view fail (p=%u)\n", p);
-                    if (ok) {
-                        ok = pulsar_gpu_compressor_store_batch_tensor(akv, asc,
-                                g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
-                                model->map, model->size,
-                                layer->attn_compressor_ape->abs_offset,
-                                layer->attn_compressor_ape->type,
-                                PULSAR_N_HEAD_DIM, 4u, p, 1u) != 0;
-                        if (!ok) fprintf(stderr, "pulsar: L120 replay: attn store fail (p=%u ape_t=%u)\n",
-                                         p, layer->attn_compressor_ape->type);
-                    }
-                    if (ok) {
-                        ok = pulsar_gpu_compressor_store_batch_tensor(ikv, isc,
-                                g->layer_index_state_kv[il], g->layer_index_state_score[il],
-                                model->map, model->size,
-                                layer->indexer_compressor_ape->abs_offset,
-                                layer->indexer_compressor_ape->type,
-                                PULSAR_N_INDEXER_HEAD_DIM, 4u, p, 1u) != 0;
-                        if (!ok) fprintf(stderr, "pulsar: L120 replay: idx store fail (p=%u ape_t=%u)\n",
-                                         p, layer->indexer_compressor_ape->type);
-                    }
-                    if (ok && (p + 1u) % 4u == 0u) {
-                        ok = pulsar_gpu_compressor_shift_ratio4_tensor(
-                                    g->layer_attn_state_kv[il],
-                                    g->layer_attn_state_score[il],
-                                    PULSAR_N_HEAD_DIM) != 0 &&
-                             pulsar_gpu_compressor_shift_ratio4_tensor(
-                                    g->layer_index_state_kv[il],
-                                    g->layer_index_state_score[il],
-                                    PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                    }
-                    pulsar_gpu_tensor_free(isc);
-                    pulsar_gpu_tensor_free(ikv);
-                    pulsar_gpu_tensor_free(asc);
-                    pulsar_gpu_tensor_free(akv);
-                }
-                if (!ok) {
-                    fprintf(stderr,
-                            "pulsar: rewind window replay failed at layer %u "
-                            "(state degrades to pre-restore behavior)\n", il);
-                    break;
-                }
-            }
-        }
-        /* The ring itself still holds ghost-position rows above pos; the
-         * span must not cover them for a future replay. */
-        if (g->proj_ring_hi > (uint32_t)pos) g->proj_ring_hi = (uint32_t)pos;
-        if (g->proj_ring_lo > g->proj_ring_hi) g->proj_ring_lo = g->proj_ring_hi;
-    }
-    /* L124: undo the ratio-128 ghost stores byte-exactly.  The 128-slot ring
-     * has no shift, so each ghost store's inverse is simply the slot's saved
-     * pre-store rows; walk the host ring newest-first restoring every entry
-     * with pos >= target (each lane row holds the NEWEST pre-store bytes for
-     * its position; a rewind pops entries before any position re-stores, so
-     * duplicates cannot coexist), stop at the first older entry (per-bank
-     * store order is
-     * monotone between rewinds).  Runs for crossing AND non-crossing ghost
-     * spans -- the non-crossing restore is redundant (continuation re-stores
-     * those slots before the next 128-emit) but harmless and uniform. */
-    {
-        pulsar_gpu_graph *g2 = &s->graph;
-        while (g2->r128_undo_n > 0u) {
-            const uint32_t idx = (g2->r128_undo_head + PULSAR_REWIND_RING_DEPTH - 1u) % PULSAR_REWIND_RING_DEPTH;
-            const uint32_t p = g2->r128_undo_pos[idx];
-            if (p < (uint32_t)pos) break;
-            const uint64_t row_bytes = (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
-            const uint64_t lane_off = (uint64_t)(p % PULSAR_REWIND_RING_DEPTH) * row_bytes;
-            for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-                const uint32_t ratio = pulsar_layer_compress_ratio(il);
-                if (ratio != 128u) continue;
-                if (!g2->layer_r128_undo_kv[il] || !g2->layer_r128_undo_sc[il]) continue;
-                /* the state ring is ratio rows; same expression as the capture (L178) */
-                const uint64_t state_off = (uint64_t)(p % ratio) * row_bytes;
-                if (pulsar_gpu_tensor_copy_async(g2->layer_attn_state_kv[il], state_off,
-                                                 g2->layer_r128_undo_kv[il], lane_off, row_bytes) == 0 ||
-                    pulsar_gpu_tensor_copy_async(g2->layer_attn_state_score[il], state_off,
-                                                 g2->layer_r128_undo_sc[il], lane_off, row_bytes) == 0) {
-                    fprintf(stderr, "pulsar: L124 undo restore FAILED (pos %u layer %u)\n", p, il);
-                }
-            }
-            g2->r128_undo_head = idx;
-            g2->r128_undo_n--;
-        }
+    /* Value half (L218): the ratio-2 sources' pending group.  At an even
+     * position it is the empty group; inside a group it is rebuilt from the
+     * last verify round's saved projections (the two callers that land here
+     * -- the spec trim and the server's ghost rewind -- stay inside that
+     * round), else the bank is marked stale and refuses a mid-group store. */
+    if (!gpu_graph_compressor_state_rewind(&s->graph, rw_bank, (uint32_t)pos)) {
+        fprintf(stderr, "pulsar: rewind to %u: compressor state could not be re-established -- checkpoint invalidated\n",
+                (unsigned)pos);
+        s->checkpoint_valid = false;
     }
 }
 

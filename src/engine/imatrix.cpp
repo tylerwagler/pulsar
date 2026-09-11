@@ -191,24 +191,8 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
     {
         const uint32_t b = gpu_graph_cur_bank(g);
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
-        memset(g->ms_n_index_comp[b], 0, sizeof(g->ms_n_index_comp[b]));
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t coff = pulsar_compress_coff(ratio);
-        const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
-        const uint64_t attn_rows = (uint64_t)coff * ratio;
-        if (!gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
-        if (!gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows)) return false;
-        if (ratio == 4) {
-            const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
-            const uint64_t index_rows = (uint64_t)coff * ratio;
-            if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows)) return false;
-            if (!gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, index_width * index_rows)) return false;
-        }
-    }
-    return true;
+    return gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g));
 }
 
 
@@ -420,7 +404,7 @@ static bool gpu_graph_prefill_layer_major_inner(
     /* Bulk anchor-hidden capture (drafter retraining): armed per chunk, after
      * warmup so warmup encodes don't pollute the buffers; drained (and cleared)
      * by gpu_graph_prefill_chunked_range after the chunk syncs. */
-    g->dspark_bulk_n = (g->dspark_bulk_h[0] && !g->state_only) ? n_tokens : 0;   /* L195: a warm-up captures nothing */
+    g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
 
     /*
      * A full long-prompt prefill can keep the GPU busy for a long time. Split
@@ -670,25 +654,6 @@ bool gpu_graph_prefill_raw_swa(
                                            display_progress,
                                            display_progress_ud);
 }
-
-/* L195: the resume warm-up.  The caller rewound the current bank to G (a
- * PULSAR_RESUME_GRID multiple) and reset its ratio-128 state; this runs the
- * PULSAR_WARMUP_TOKENS tokens before G through the layers with
- * pulsar_gpu_graph::state_only set, so the only thing that outlives the call is
- * the ratio-4 compressor state at G -- the previous group's projections, which
- * the resumed prefill folds into.  Same kernels, same absolute positions, a
- * call starting on a 32-multiple: the state is the cold prefill's. */
-bool gpu_graph_prefill_warmup_state(pulsar_gpu_graph *g, const pulsar_model *model,
-                                    const pulsar_weights *weights, const token_vec *prompt, uint32_t G) {
-    if (!g || !prompt || G < PULSAR_WARMUP_TOKENS || G % PULSAR_RESUME_GRID != 0 || G > (uint32_t)prompt->len) return false;
-    g->state_only = true;
-    const bool ok = gpu_graph_prefill_layer_major(g, model, weights, prompt, G - PULSAR_WARMUP_TOKENS,
-                                                  PULSAR_WARMUP_TOKENS, NULL, false, NULL, NULL, NULL);
-    g->state_only = false;
-    return ok;
-}
-
-
 
 /* Prefill a contiguous token range in fixed-size chunks.
  *

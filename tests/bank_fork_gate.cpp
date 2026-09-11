@@ -47,8 +47,7 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
     uint8_t *buf = (uint8_t *)malloc(64u * 1024u * 1024u);
     if (!buf) return 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ncomp = g->ms_n_comp[bank][il];
         if (ncomp) {
             pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, bank);
@@ -56,8 +55,8 @@ static uint64_t checksum_bank_kv(pulsar_session *s, uint32_t bank) {
             pulsar_gpu_tensor_free(v);
             for (uint64_t i = 0; i < (uint64_t)ncomp * attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
         }
-        if (ratio == 4) {
-            const uint32_t nidx = g->ms_n_index_comp[bank][il];
+        {   /* one emit writes the comp row AND the index-K row: one frontier */
+            const uint32_t nidx = ncomp;
             if (nidx) {
                 pulsar_gpu_tensor *v = gpu_graph_bank_index_comp_view(g, il, bank);
                 if (!v || pulsar_gpu_tensor_read(v, 0, buf, (uint64_t)nidx * idx_row) == 0) { pulsar_gpu_tensor_free(v); free(buf); return 0; }
@@ -257,23 +256,28 @@ int GATE_ENTRY(int argc, char **argv) {
         /* partial fork 0->1 and replay toks2 to L2 */
         const int prc = pulsar_session_bank_fork_partial(s, 0, 1, toks2, NC, NC);
         CHECK(prc == 0, "P2 partial fork refused rc=%d", prc);
-        /* TRIAGE memcmp: stash slot vs SRC row 1024 (capture correctness). */
+        /* L218: a multiple-of-LCM cut closes every compressor group, so the
+         * forked bank's rows below the cut are the trunk's, byte for byte, and
+         * there is no stashed boundary row to triage (CSA2 has no overlap). */
         {
             pulsar_gpu_graph *g = &s->graph;
             const uint64_t ar = gpu_graph_attn_comp_cache_row_bytes();
             uint8_t sa[4096], sb[4096];
             int bad = 0;
             for (uint32_t il = 0; il < PULSAR_N_LAYER && bad < 3; il++) {
-                if (pulsar_layer_compress_ratio(il) != 4u) continue;
-                pulsar_gpu_tensor *v = gpu_graph_bank_attn_comp_view(g, il, 0);
+                if (!gpu_graph_layer_is_kv_source(il)) continue;
+                const uint32_t last = (uint32_t)RCUT / pulsar_layer_compress_ratio(il) - 1u;   /* the last row below the cut */
+                pulsar_gpu_tensor *v0 = gpu_graph_bank_attn_comp_view(g, il, 0);
+                pulsar_gpu_tensor *v1 = gpu_graph_bank_attn_comp_view(g, il, 1);
                 pulsar_gpu_synchronize();
-                if (v && pulsar_gpu_tensor_read(g->emit_stash_comp, ((uint64_t)1 * PULSAR_N_LAYER + il) * ar, sa, ar) &&
-                    pulsar_gpu_tensor_read(v, (uint64_t)(RCUT/4) * ar, sb, ar) &&
+                if (v0 && v1 && pulsar_gpu_tensor_read(v0, (uint64_t)last * ar, sa, ar) &&
+                    pulsar_gpu_tensor_read(v1, (uint64_t)last * ar, sb, ar) &&
                     memcmp(sa, sb, (size_t)ar) != 0) bad++;
-                pulsar_gpu_tensor_free(v);
+                pulsar_gpu_tensor_free(v1);
+                pulsar_gpu_tensor_free(v0);
             }
-            CHECK(bad == 0, "TRIAGE: stash != src row %d on %d layer(s) (CAPTURE bug)", RCUT/4, bad);
-            fprintf(stderr, "fork_gate: TRIAGE stash==src row %d : %s\n", RCUT/4, bad ? "NO" : "YES");
+            CHECK(bad == 0, "TRIAGE: dst's last row below the cut != src's on %d kv source(s) (COPY bug)", bad);
+            fprintf(stderr, "fork_gate: TRIAGE dst==src last row below cut %d : %s\n", RCUT, bad ? "NO" : "YES");
         }
         CHECK(!pulsar_session_bank_fork_pinned(s, 0), "P2 src left pinned");
         CHECK(pulsar_session_bank_state_restore(s, 1), "P2 install fork dst");

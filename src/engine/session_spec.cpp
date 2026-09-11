@@ -306,27 +306,22 @@ static void spec_frontier_free(pulsar_spec_frontier *f) {
  * only builds descriptor tables, so retrying is cheap. */
 static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return true;
-    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
-    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
-    uint64_t bytes[PULSAR_MAX_LAYER * 4];
+    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 2];
+    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 2];
+    uint64_t bytes[PULSAR_MAX_LAYER * 2];
     uint32_t n = 0;
     uint64_t mx = 0;
+    /* CSA2 (L218): the only recurrent state is the ratio-2 kv sources' pending
+     * group (kv + score); ratio-1 sources and member layers carry none. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_has_comp_state(il)) continue;
         const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
         dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
         if (ab > mx) mx = ab;
-        if (ratio == 4) {
-            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            dst[n] = g->spec_index_state_kv[il];    src[n] = g->layer_index_state_kv[il];    bytes[n++] = ib;
-            dst[n] = g->spec_index_state_score[il]; src[n] = g->layer_index_state_score[il]; bytes[n++] = ib;
-            if (ib > mx) mx = ib;
-        }
     }
     if (n == 0) {
-        /* No compressed layers: there is genuinely nothing to copy (copy_n
+        /* No stateful compressor: there is genuinely nothing to copy (copy_n
          * stays 0 and the run is skipped). Done, not degraded. */
         g->spec_frontier_copy_init = 1;
         return true;
@@ -360,7 +355,6 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         f->n_comp[il] = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
-        f->n_index_comp[il] = gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il);
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
@@ -390,7 +384,6 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     bool ok = pulsar_gpu_begin_commands() != 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = f->n_comp[il];
-        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = f->n_index_comp[il];
     }
     if (ok && g->spec_frontier_copy_n)
         ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
@@ -1240,6 +1233,14 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     const uint32_t K = r->K;
     const uint32_t n_batch = r->n_batch;
     const int saved_len = r->saved_len;
+    {   /* L218: the span a rewind inside this round (the trim below, the
+         * server's ghost rewind after it) rebuilds ratio-2 pending slots from:
+         * positions [saved_len, saved_len + n_batch) at save rows row0.. */
+        const uint32_t b = gpu_graph_cur_bank(g);
+        g->ms_spec_save_pos0[b] = (uint32_t)saved_len;
+        g->ms_spec_save_row0[b] = row0;
+        g->ms_spec_save_rows[b] = n_batch;
+    }
     const bool pend_sampled = r->pend_sampled;
     int32_t (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;

@@ -69,17 +69,12 @@ static char *read_file(const char *path, size_t *len_out) {
 static void check_frontiers(pulsar_session *s, int pos, const char *what) {
     pulsar_gpu_graph *g = &s->graph;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
         const uint32_t want = (uint32_t)pos / ratio;
         CHECK(gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) == want,
-              "%s: layer %u n_comp %u want %u (pos %d ratio %u)",
+              "%s: kv source %u n_comp %u want %u (pos %d ratio %u)",
               what, il, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), want, pos, ratio);
-        if (ratio == 4) {
-            CHECK(gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) == want,
-                  "%s: layer %u n_index_comp %u want %u (pos %d)",
-                  what, il, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), want, pos);
-        }
     }
 }
 
@@ -109,10 +104,10 @@ static bool extend_one(pulsar_session *s, pulsar_tokens *toks, int upto) {
     return rc == 0;
 }
 
-/* FNV-1a over attn comp rows 34..36 and (ratio 4) index comp rows 34..36
- * of every compressing layer, read raw D2H off the classic single-session
- * caches (row 34 = pre-rewind sanity, 35 = the re-emitted group, 36 = the
- * first post-heal group). */
+/* FNV-1a over attn comp rows 34..36 and index-K rows 34..36 of every kv
+ * source, read raw D2H off the classic single-session caches (row 34 =
+ * pre-rewind sanity, 35 = the re-emitted group, 36 = the first post-heal
+ * group). */
 static uint64_t comp_rows_hash(pulsar_session *s) {
     pulsar_gpu_graph *g = &s->graph;
     const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
@@ -120,15 +115,13 @@ static uint64_t comp_rows_hash(pulsar_session *s) {
     uint64_t h = 1469598103934665603ull;
     uint8_t buf[8192];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio != 4) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         for (uint32_t row = 34; row <= 36; row++) {
             if (row >= gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il)) continue;
             if (pulsar_gpu_tensor_read(g->layer_attn_comp_cache[il],
                                       (uint64_t)row * attn_row, buf, attn_row) == 0)
                 return 0;
             for (uint64_t i = 0; i < attn_row; i++) { h ^= buf[i]; h *= 1099511628211ull; }
-            if (row >= gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il)) continue;
             if (pulsar_gpu_tensor_read(g->layer_index_comp_cache[il],
                                       (uint64_t)row * idx_row, buf, idx_row) == 0)
                 return 0;

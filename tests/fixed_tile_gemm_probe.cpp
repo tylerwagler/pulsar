@@ -133,14 +133,14 @@ int main(int argc, char **argv) {
     /* L183 prefill mode adds the plain-weight family the census found M-dependent:
      * the router and the compressor projections (F32 source, bf16 copy). */
     const pulsar_tensor *comp_kv = L->attn_compressor_kv, *comp_gate = L->attn_compressor_gate,
-                        *icomp_kv = L->indexer_compressor_kv;
+                        *idx_k = L->indexer_k;
     struct shape_t { const char *name; const pulsar_tensor *w; };
     shape_t shapes_all[] = {
         {"attn_q_b", L->attn_q_b}, {"attn_output_b", L->attn_output_b},
         {"ffn_gate_shexp", L->ffn_gate_shexp}, {"attn_q_a", L->attn_q_a},
         {"router (bf16)", L->ffn_gate_inp}, {"output head (bf16)", e->weights.output},
         {"attn_compressor_kv (plain)", comp_kv}, {"attn_compressor_gate (plain)", comp_gate},
-        {"indexer_compressor_kv (plain)", icomp_kv},
+        {"indexer.attn_k (plain)", idx_k},
         {"hc_attn_fn (bf16, the HC mix)", L->hc_attn_fn},
     };
     const size_t n_shapes = prefill ? sizeof(shapes_all) / sizeof(shapes_all[0])

@@ -448,16 +448,11 @@ static int emit_rows_equal(const emit_rows *a, const emit_rows *b, const char *w
 static void check_frontiers(pulsar_gpu_graph *g, uint32_t bank, uint32_t end_pos,
                             const char *what) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t want = (end_pos + 1u) / ratio;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint32_t want = (end_pos + 1u) / pulsar_layer_compress_ratio(il);
         CHECK(g->ms_n_comp[bank][il] == want,
-              "%s: bank %u layer %u ms_n_comp %u != %u", what, bank, il,
+              "%s: bank %u kv source %u ms_n_comp %u != %u", what, bank, il,
               g->ms_n_comp[bank][il], want);
-        if (ratio == 4)
-            CHECK(g->ms_n_index_comp[bank][il] == want,
-                  "%s: bank %u layer %u ms_n_index_comp %u != %u", what, bank, il,
-                  g->ms_n_index_comp[bank][il], want);
     }
 }
 
@@ -465,12 +460,10 @@ static void check_frontiers(pulsar_gpu_graph *g, uint32_t bank, uint32_t end_pos
  * a bank outside the batch must read back bit-identical after the step. */
 typedef struct {
     uint32_t n_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
-    uint32_t n_index_comp[PULSAR_MSEQ_MAX][PULSAR_MAX_LAYER];
 } frontier_snap;
 
 static void frontier_snap_take(const pulsar_gpu_graph *g, frontier_snap *s) {
     memcpy(s->n_comp, g->ms_n_comp, sizeof(s->n_comp));
-    memcpy(s->n_index_comp, g->ms_n_index_comp, sizeof(s->n_index_comp));
 }
 
 static void check_containment(const pulsar_gpu_graph *g, const frontier_snap *before,
@@ -482,9 +475,6 @@ static void check_containment(const pulsar_gpu_graph *g, const frontier_snap *be
             CHECK(g->ms_n_comp[b][il] == before->n_comp[b][il],
                   "%s: idle bank %u layer %u ms_n_comp %u != %u at step top%s",
                   what, b, il, g->ms_n_comp[b][il], before->n_comp[b][il], tag);
-            CHECK(g->ms_n_index_comp[b][il] == before->n_index_comp[b][il],
-                  "%s: idle bank %u layer %u ms_n_index_comp %u != %u at step top%s",
-                  what, b, il, g->ms_n_index_comp[b][il], before->n_index_comp[b][il], tag);
         }
     }
 }

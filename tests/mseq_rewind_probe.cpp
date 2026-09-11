@@ -118,8 +118,8 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_gpu_graph *g = &s->graph;
         const uint32_t b = g->banks.n_banks ? g->banks.cur_bank : 0u;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            if (!gpu_graph_layer_is_kv_source(il)) continue;
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
             const uint32_t want = (uint32_t)target / ratio;
             /* Since stage 1b there is ONE frontier, so the old "both copies
              * agree" assertion is tautological and has been dropped rather
@@ -127,13 +127,8 @@ int GATE_ENTRY(int argc, char **argv) {
              * CLAMPED it: that is the L120 half which is live on every path,
              * and the L133 divergence is now unrepresentable by construction. */
             CHECK(gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) == want,
-                  "layer %u n_comp %u want %u (bank %u)",
+                  "kv source %u n_comp %u want %u (bank %u)",
                   il, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), want, b);
-            if (ratio == 4) {
-                CHECK(gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) == want,
-                      "layer %u n_index_comp %u want %u (bank %u)",
-                      il, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), want, b);
-            }
         }
     }
 

@@ -110,16 +110,11 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
 
 
 
-static uint64_t layer_attn_state_bytes(uint32_t ratio) {
-    const uint32_t coff = pulsar_compress_coff(ratio);
-    return (uint64_t)coff * PULSAR_N_HEAD_DIM * coff * ratio * sizeof(float);
-}
-
-
-
-static uint64_t layer_index_state_bytes(uint32_t ratio) {
-    const uint32_t coff = pulsar_compress_coff(ratio);
-    return (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
+/* The compressor state a kv source carries: `ratio` rows of head_dim f32 at
+ * ratio > 1 (the pending group), none at ratio 1. */
+static uint64_t layer_attn_state_bytes(uint32_t il) {
+    return gpu_graph_layer_has_comp_state(il)
+        ? (uint64_t)PULSAR_N_HEAD_DIM * pulsar_layer_compress_ratio(il) * sizeof(float) : 0u;
 }
 
 
@@ -131,14 +126,13 @@ static uint64_t layer_index_state_bytes(uint32_t ratio) {
  * prefix, so those are persisted up to their live row counts. */
 /* ONE rule for how many raw rows a payload carries, written AND expected on
  * load from the header's own window/cap/token count -- the two sides cannot
- * disagree.  L195: a restored checkpoint resumes from the grid point G <= it
- * (at most PULSAR_RESUME_GRID - 1 below) after a warm-up over the
- * PULSAR_WARMUP_TOKENS tokens before G, whose attention reaches raw_window
- * further down: the window a fresh bank needs is
- * [G - warmup - raw_window, checkpoint). */
+ * disagree.  L195/L218: a restored checkpoint resumes from the grid point
+ * G <= it (at most PULSAR_RESUME_GRID - 1 below), and the resumed prefill's
+ * attention reaches raw_window further down: the window a fresh bank needs is
+ * [G - raw_window, checkpoint). */
 static uint32_t payload_raw_rows(uint32_t raw_window, uint32_t raw_cap, uint32_t checkpoint_len) {
     uint32_t rows = raw_window ? raw_window : PULSAR_N_SWA;
-    rows += PULSAR_RESUME_GRID - 1u + PULSAR_WARMUP_TOKENS;
+    rows += PULSAR_RESUME_GRID - 1u;
     if (rows > raw_cap) rows = raw_cap;
     if (rows > checkpoint_len) rows = checkpoint_len;
     return rows;
@@ -165,16 +159,10 @@ static uint64_t session_payload_live_tensor_bytes(const pulsar_gpu_graph *g, uin
     const uint64_t comp_row = gpu_graph_attn_comp_cache_row_bytes();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        bytes += (uint64_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) * comp_row;
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
-        if (ratio == 4) {
-            bytes += (uint64_t)gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) * PULSAR_ENGINE_IDXFP4_ROWBYTES;
-            bytes += layer_index_state_bytes(ratio);
-            bytes += layer_index_state_bytes(ratio);
-        }
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint64_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        bytes += rows * (comp_row + PULSAR_ENGINE_IDXFP4_ROWBYTES);
+        bytes += 2u * layer_attn_state_bytes(il);
     }
     return bytes;
 }
@@ -508,9 +496,6 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_write_u32(fp, gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
     }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_write_u32(fp, gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il), err, errlen) != 0) return 1;
-    }
 
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     int rc = 0;
@@ -524,56 +509,20 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
             rc = payload_write_raw_row(fp, g, il, phys,
                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (rc != 0 || ratio == 0) continue;
+        if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
-         * contiguous.  The two compressor state tensors hold the partial window
-         * that will become the next compressed row. */
-            rc = payload_write_attn_comp_pack(fp, g, il,
-                                              gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il),
-                                              buf,
-                                              PULSAR_SESSION_IO_CHUNK,
-                                              err,
-                                              errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                    g->layer_attn_state_kv[il],
-                                                    0,
-                                                    layer_attn_state_bytes(ratio),
-                                                    buf,
-                                                    PULSAR_SESSION_IO_CHUNK,
-                                                    err,
-                                                    errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                    g->layer_attn_state_score[il],
-                                                    0,
-                                                    layer_attn_state_bytes(ratio),
-                                                    buf,
-                                                    PULSAR_SESSION_IO_CHUNK,
-                                                    err,
-                                                    errlen);
-        if (rc == 0 && ratio == 4) {
-            rc = payload_write_index_comp(fp, g, il,
-                                          gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il),
-                                          buf,
-                                          PULSAR_SESSION_IO_CHUNK,
-                                          err,
-                                          errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                        g->layer_index_state_kv[il],
-                                                        0,
-                                                        layer_index_state_bytes(ratio),
-                                                        buf,
-                                                        PULSAR_SESSION_IO_CHUNK,
-                                                        err,
-                                                        errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp,
-                                                        g->layer_index_state_score[il],
-                                                        0,
-                                                        layer_index_state_bytes(ratio),
-                                                        buf,
-                                                        PULSAR_SESSION_IO_CHUNK,
-                                                        err,
-                                                        errlen);
+         * contiguous; the index-K rows the same emits wrote follow.  The two
+         * state tensors hold the pending group a ratio-2 source will fold into
+         * its next row (absent at ratio 1). */
+        const uint32_t rows = gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il);
+        rc = payload_write_attn_comp_pack(fp, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) rc = payload_write_index_comp(fp, g, il, rows, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+        const uint64_t state_bytes = layer_attn_state_bytes(il);
+        if (rc == 0 && state_bytes) {
+            rc = payload_write_tensor_span(fp, g->layer_attn_state_kv[il], 0, state_bytes,
+                                           buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_attn_state_score[il], 0, state_bytes,
+                                                        buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
         }
     }
     free(buf);
@@ -676,7 +625,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return 1;
     }
     uint32_t n_comp[PULSAR_MAX_LAYER];
-    uint32_t n_index_comp[PULSAR_MAX_LAYER];
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
             token_vec_free(&new_checkpoint);
@@ -685,17 +633,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         if (n_comp[il] > saved_comp_cap || n_comp[il] > g->layer_comp_cap[il]) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
-            return 1;
-        }
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
-            return 1;
-        }
-        if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > g->layer_comp_cap[il]) {
-            token_vec_free(&new_checkpoint);
-            payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
             return 1;
         }
     }
@@ -720,59 +657,15 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
             rc = payload_read_raw_row(fp, g, il, phys,
                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (rc != 0 || ratio == 0) continue;
-            rc = payload_read_attn_comp_pack(fp, g, il,
-                                             n_comp[il],
-                                             buf,
-                                             PULSAR_SESSION_IO_CHUNK,
-                                             &remaining,
-                                             err,
-                                             errlen);
-        if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                    g->layer_attn_state_kv[il],
-                                                   0,
-                                                   layer_attn_state_bytes(ratio),
-                                                   buf,
-                                                   PULSAR_SESSION_IO_CHUNK,
-                                                   &remaining,
-                                                   err,
-                                                   errlen);
-        if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                   g->layer_attn_state_score[il],
-                                                   0,
-                                                   layer_attn_state_bytes(ratio),
-                                                   buf,
-                                                   PULSAR_SESSION_IO_CHUNK,
-                                                   &remaining,
-                                                   err,
-                                                   errlen);
-        if (rc == 0 && ratio == 4) {
-            rc = payload_read_index_comp(fp, g, il,
-                                         n_index_comp[il],
-                                         buf,
-                                         PULSAR_SESSION_IO_CHUNK,
-                                         &remaining,
-                                         err,
-                                         errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                       g->layer_index_state_kv[il],
-                                                       0,
-                                                       layer_index_state_bytes(ratio),
-                                                       buf,
-                                                       PULSAR_SESSION_IO_CHUNK,
-                                                       &remaining,
-                                                       err,
-                                                       errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp,
-                                                       g->layer_index_state_score[il],
-                                                       0,
-                                                       layer_index_state_bytes(ratio),
-                                                       buf,
-                                                       PULSAR_SESSION_IO_CHUNK,
-                                                       &remaining,
-                                                       err,
-                                                       errlen);
+        if (rc != 0 || !gpu_graph_layer_is_kv_source(il)) continue;
+        rc = payload_read_attn_comp_pack(fp, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        if (rc == 0) rc = payload_read_index_comp(fp, g, il, n_comp[il], buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+        const uint64_t state_bytes = layer_attn_state_bytes(il);
+        if (rc == 0 && state_bytes) {
+            rc = payload_read_tensor_span(fp, g->layer_attn_state_kv[il], 0, state_bytes,
+                                          buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_attn_state_score[il], 0, state_bytes,
+                                                       buf, PULSAR_SESSION_IO_CHUNK, &remaining, err, errlen);
         }
     }
     free(buf);
@@ -795,14 +688,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->checkpoint = new_checkpoint;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         gpu_graph_n_comp(g, gpu_graph_cur_bank(g), il) = n_comp[il];
-        gpu_graph_n_index_comp(g, gpu_graph_cur_bank(g), il) = n_index_comp[il];
     }
-    /* L124: a loaded payload replaces the conversation; the undo ring's
-     * entries describe the previous one's stores.  Zero it (the L120
-     * projection span restarts itself on the first gap; this ring cannot). */
-    s->graph.r128_undo_head = 0u;
-    s->graph.r128_undo_n = 0u;
-    s->graph.r128_perrow_chunk = false;
     s->prefill_frontier = (int)saved_prefill_frontier;   /* L195: the next sync resumes from the grid point below it */
     s->checkpoint_valid = true;
     /* a restored state invalidates any in-flight speculative lookahead: the
