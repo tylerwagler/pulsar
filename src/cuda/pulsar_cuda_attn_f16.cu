@@ -85,6 +85,10 @@
 #define AF16_THREADS  (AF16_WARPS * 32u)
 #define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
 #define AF16_ROWB     (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))
+/* The tile stage copies whole 16-byte chunks (the cp.async maximum); a row that
+ * is not a 16-multiple would silently drop its tail.  One packed row at
+ * head_dim 512 is 384 B, so this holds, but say it rather than derive it. */
+static_assert(AF16_ROWB % 16u == 0u, "ATTN_PACK row must be a whole number of 16-byte chunks");
 /* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
 #define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
@@ -553,10 +557,11 @@ static void attn_f16_kernel(
 
     /* ---- L037 lever 1: double-buffered RAW-byte tile staging ------------
      * Each ATTN_PACK row is AF16_ROWB bytes = a whole number of aligned
-     * 8-byte chunks; the NEXT tile's rows stream into the other buffer via
-     * cp.async while the CURRENT tile runs its MMA/softmax phases, which is
-     * what finally overlaps the load/store unit with the tensor pipe (the
-     * serial version measured pipe_tensor 6-8% vs LSU ~33%). The decode
+     * 16-byte chunks (384 = 24 x 16; the 8-byte chunking was a leftover from
+     * the retired 584 B e4m3 row); the NEXT tile's rows stream into the other
+     * buffer via cp.async while the CURRENT tile runs its MMA/softmax phases,
+     * which is what finally overlaps the load/store unit with the tensor pipe
+     * (the serial version measured pipe_tensor 6-8% vs LSU ~33%). The decode
      * below reads the staged bytes with the SAME arithmetic the global-read
      * version used (attn_comp_pack_ld's math, one decoder for the one
      * format), so this stage is byte movement only -- bit-exact. The
@@ -603,13 +608,13 @@ static void attn_f16_kernel(
             sBadStage[BUF][_r] = _bad ? 1u : 0u;                              \
         }                                                                     \
         __syncthreads();                                                      \
-        for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 8u);            \
+        for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 16u);            \
              _c += AF16_THREADS) {                                            \
-            const uint32_t _r = _c / (AF16_ROWB / 8u);                        \
-            const uint32_t _off = (_c % (AF16_ROWB / 8u)) * 8u;               \
+            const uint32_t _r = _c / (AF16_ROWB / 16u);                       \
+            const uint32_t _off = (_c % (AF16_ROWB / 16u)) * 16u;             \
             if (sSrc[BUF][_r])                                                \
                 __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
-                                        sSrc[BUF][_r] + _off, 8);             \
+                                        sSrc[BUF][_r] + _off, 16);            \
         }                                                                     \
         __pipeline_commit();                                                  \
     } while (0)
