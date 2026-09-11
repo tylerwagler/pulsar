@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""build_main_template.py — P0 stage 2, derived purely from the HF checkpoint.
+"""build_main_template.py — the main-model template, derived purely from the HF checkpoint.
+
+DeepSeek-V4.1-Flash (L218).  The text stack lives under config.json["text_config"];
+compressor/indexer tensors exist only on CSA2 source layers (present-driven, never
+index lists); there are no hash-routed layers, no `ape`, no `hc_head_*`.  The
+builder is FAIL-CLOSED over the checkpoint: every source tensor must be either
+consumed into the manifest or named on the explicit text-only skip list
+(vision tower, aligner, image-span embeddings, the image-token router bias, the
+Engram tables and MTP/drafter tensors, which other builders own); an
+unrecognised tensor aborts the build.
 
 Earlier version of this script derived its tensor manifest by stripping the
 data out of one of our own already-quantized GGUFs (oracle-zeroq8-99gb.gguf).
@@ -59,9 +68,6 @@ TOP_MAP = {
     'token_embd.weight':      'embed.weight',
     'output_norm.weight':     'norm.weight',
     'output.weight':          'head.weight',
-    'output_hc_base.weight':  'hc_head_base',
-    'output_hc_fn.weight':    'hc_head_fn',
-    'output_hc_scale.weight': 'hc_head_scale',
 }
 
 LAYER_MAP = {
@@ -79,16 +85,13 @@ LAYER_MAP = {
     'attn_kv_a_norm.weight':          'attn.kv_norm.weight',
     'attn_output_a.weight':           'attn.wo_a.weight',
     'attn_output_b.weight':           'attn.wo_b.weight',
-    'attn_compressor_ape.weight':     'attn.compressor.ape',
     'attn_compressor_kv.weight':      'attn.compressor.wkv.weight',
     'attn_compressor_gate.weight':    'attn.compressor.wgate.weight',
     'attn_compressor_norm.weight':    'attn.compressor.norm.weight',
     'indexer.attn_q_b.weight':        'attn.indexer.wq_b.weight',
     'indexer.proj.weight':            'attn.indexer.weights_proj.weight',
-    'indexer_compressor_ape.weight':  'attn.indexer.compressor.ape',
-    'indexer_compressor_kv.weight':   'attn.indexer.compressor.wkv.weight',
-    'indexer_compressor_gate.weight': 'attn.indexer.compressor.wgate.weight',
-    'indexer_compressor_norm.weight': 'attn.indexer.compressor.norm.weight',
+    'indexer.attn_k.weight':          'attn.indexer.wk.weight',
+    'indexer.k_norm.weight':          'attn.indexer.k_norm.weight',
     'attn_norm.weight':               'attn_norm.weight',
     'ffn_norm.weight':                'ffn_norm.weight',
     'ffn_gate_shexp.weight':          'ffn.shared_experts.w1.weight',
@@ -96,7 +99,6 @@ LAYER_MAP = {
     'ffn_down_shexp.weight':          'ffn.shared_experts.w2.weight',
     'ffn_gate_inp.weight':            'ffn.gate.weight',
     'exp_probs_b.bias':               'ffn.gate.bias',
-    'ffn_gate_tid2eid.weight':        'ffn.gate.tid2eid',
 }
 
 # Suffixes present on every one of the num_hidden_layers main-model layers.
@@ -107,19 +109,34 @@ ALWAYS_LAYER_SUFFIXES = [
     'attn_sinks.weight', 'attn_q_a.weight', 'attn_q_a_norm.weight',
     'attn_q_b.weight', 'attn_kv.weight', 'attn_kv_a_norm.weight',
     'attn_output_a.weight', 'attn_output_b.weight',
-    'ffn_gate_inp.weight', 'ffn_gate_shexp.weight', 'ffn_up_shexp.weight',
-    'ffn_down_shexp.weight',
+    'ffn_gate_inp.weight', 'exp_probs_b.bias',
+    'ffn_gate_shexp.weight', 'ffn_up_shexp.weight', 'ffn_down_shexp.weight',
 ]
 
 # Suffixes present only on some layers -- presence is checked against the
 # real HF tensor list per layer, never hardcoded to specific layer indices.
+# CSA2 (L218): a KV-source layer carries the compressor (wgate only at ratio > 1)
+# and the index-K projection; an index-source layer carries the indexer query
+# and head weights.  Presence is the checkpoint's word, never an index list.
 CONDITIONAL_LAYER_SUFFIXES = [
-    'exp_probs_b.bias', 'ffn_gate_tid2eid.weight',
-    'attn_compressor_ape.weight', 'attn_compressor_kv.weight',
-    'attn_compressor_gate.weight', 'attn_compressor_norm.weight',
+    'attn_compressor_kv.weight', 'attn_compressor_gate.weight', 'attn_compressor_norm.weight',
+    'indexer.attn_k.weight', 'indexer.k_norm.weight',
     'indexer.attn_q_b.weight', 'indexer.proj.weight',
-    'indexer_compressor_ape.weight', 'indexer_compressor_kv.weight',
-    'indexer_compressor_gate.weight', 'indexer_compressor_norm.weight',
+]
+
+# Source tensors this text-only main-model template deliberately does not
+# consume.  Everything the checkpoint holds must match a consumed name or one
+# of these patterns, or the build aborts (fail closed).
+import re as _re
+SKIP_PATTERNS = [
+    _re.compile(r'^vision\.'),                        # DeepSeek-ViT (vision phase)
+    _re.compile(r'^aligner\.'),                       # vision projector
+    _re.compile(r'^image_(start|end|newline)$'),      # image-span embeddings
+    _re.compile(r'^layers\.\d+\.ffn\.gate\.bias_vl$'),  # image-token router bias
+    _re.compile(r'^layers\.\d+\.engram\.'),            # Engram tables + projections (own builder)
+    _re.compile(r'^mtp\.'),                           # DSpark drafter (build_dspark_template.py)
+    _re.compile(r'^layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$'),  # routed experts: stacked by the quantizer
+    _re.compile(r'\.scale$'),                         # fp8/fp4 block scales ride with their weight
 ]
 
 # Per-tensor-group template type policy (the default type used when the
@@ -153,8 +170,7 @@ DENSE_FP8 = {
 BF16_GROUP = {
     'ffn_gate_inp.weight',
     'attn_compressor_kv.weight', 'attn_compressor_gate.weight',
-    'indexer.proj.weight',
-    'indexer_compressor_kv.weight', 'indexer_compressor_gate.weight',
+    'indexer.proj.weight', 'indexer.attn_k.weight',
 }
 
 # F32 upstream -> F32 here. These were f16, which was actively destructive:
@@ -177,8 +193,7 @@ BF16_GROUP = {
 # validate ape_type as 0 (F32) or 1 (F16) and reject 30 outright, so a bf16 ape
 # fails at run time.
 F32_SOURCE = {
-    'attn_compressor_ape.weight', 'indexer_compressor_ape.weight',
-    'hc_attn_fn.weight', 'hc_ffn_fn.weight', 'output_hc_fn.weight',
+    'hc_attn_fn.weight', 'hc_ffn_fn.weight',
 }
 
 # NOT in the group: indexer.attn_q_b.weight is F8_E4M3 upstream (21 tensors).
@@ -202,7 +217,7 @@ F32_SOURCE = {
 NORM_BF16 = {
     'attn_norm.weight', 'ffn_norm.weight',
     'attn_q_a_norm.weight', 'attn_kv_a_norm.weight',
-    'attn_compressor_norm.weight', 'indexer_compressor_norm.weight',
+    'attn_compressor_norm.weight', 'indexer.k_norm.weight',
     'output_norm.weight',
 }
 
@@ -217,15 +232,13 @@ def suffix_type(ds4_name, ndim):
         return BF16
     if suffix in F32_SOURCE:
         return F32
-    if suffix == 'ffn_gate_tid2eid.weight':
-        return I32
     if suffix == 'indexer.attn_q_b.weight':
         # F8_E4M3 upstream. Held F16 until 2026-08-15, which was lossless (f16
         # represents every e4m3 code exactly) but cost 352 MB to store 181 MB of
         # information -- the single largest above-source item in the model.
         # ds4's FP8_E4M3 is MXFP8: E4M3 + a per-32 E8M0 scale. The source's
-        # scales are 128x128 blocks and 128 is a multiple of 32, so every per-32
-        # group lies wholly inside one source block and inherits its scale --
+        # scales are 32x32 blocks (V4.1; 128x128 on V4), so every per-32 group
+        # along K lies wholly inside one source block and inherits its scale --
         # the mantissas copy verbatim and the round trip is exact.
         return FP8_E4M3
     if ds4_name == 'token_embd.weight':
@@ -246,7 +259,13 @@ def suffix_type(ds4_name, ndim):
 class HFCheckpoint:
     def __init__(self, hf_dir):
         self.dir = hf_dir
-        self.config = json.load(open(os.path.join(hf_dir, 'config.json')))
+        top = json.load(open(os.path.join(hf_dir, 'config.json')))
+        # V4.1 nests the language model under text_config (the top level holds
+        # the vision config and the quantization recipe); the recipe stays reachable.
+        self.config = dict(top['text_config'])
+        self.config['quantization_config'] = top['quantization_config']
+        self.config['image_token_id'] = top.get('image_token_id')
+        self.config['top_level'] = top
         self.index = json.load(open(os.path.join(hf_dir, 'model.safetensors.index.json')))
         self.weight_map = self.index['weight_map']
         self._shard_hdr_cache = {}
@@ -322,11 +341,13 @@ def build_tensor_list(ckpt, keep=None):
         raise SystemExit(f'survivor map covers {len(keep)} layers, model has {L}')
     tensors = []  # (ds4_name, ne, type)
 
+    consumed = set()
     for ds4_name, hf_name in TOP_MAP.items():
         if not ckpt.has(hf_name):
             raise SystemExit(f'expected top-level HF tensor missing: {hf_name}')
         ne = ne_reversed(ckpt.shape(hf_name))
         tensors.append((ds4_name, ne, suffix_type(ds4_name, len(ne))))
+        consumed.add(hf_name)
 
     for layer in range(L):
         for suffix in ALWAYS_LAYER_SUFFIXES:
@@ -335,6 +356,7 @@ def build_tensor_list(ckpt, keep=None):
                 raise SystemExit(f'expected HF tensor missing: {hf_name}')
             ne = ne_reversed(ckpt.shape(hf_name))
             tensors.append((f'blk.{layer}.{suffix}', ne, suffix_type(suffix, len(ne))))
+            consumed.add(hf_name)
 
         for suffix in CONDITIONAL_LAYER_SUFFIXES:
             hf_name = f'layers.{layer}.{LAYER_MAP[suffix]}'
@@ -342,6 +364,7 @@ def build_tensor_list(ckpt, keep=None):
                 continue
             ne = ne_reversed(ckpt.shape(hf_name))
             tensors.append((f'blk.{layer}.{suffix}', ne, suffix_type(suffix, len(ne))))
+            consumed.add(hf_name)
 
         # Routed experts: combined [in,out,R] stack, shape from config (the
         # per-expert HF tensors are individually MXFP4-packed, not a single
@@ -351,6 +374,12 @@ def build_tensor_list(ckpt, keep=None):
         tensors.append((f'blk.{layer}.ffn_up_exps.weight',   [E, F, Rl], MXFP4))
         tensors.append((f'blk.{layer}.ffn_down_exps.weight', [F, E, Rl], MXFP4))
 
+    # Fail closed: every checkpoint tensor is consumed or explicitly skipped.
+    unknown = [n for n in ckpt.weight_map
+               if n not in consumed and not any(p.search(n) for p in SKIP_PATTERNS)]
+    if unknown:
+        raise SystemExit('checkpoint tensors neither consumed nor on the text-only skip list '
+                         f'({len(unknown)}), e.g. {unknown[:8]}')
     return tensors
 
 
@@ -366,7 +395,7 @@ def build_kvs(ckpt, reap=None, reap_sha=None):
     kvs = [
         ('general.architecture', VAL_STRING, 'deepseek4'),
         ('general.type', VAL_STRING, 'model'),
-        ('general.name', VAL_STRING, 'DeepSeek V4 Flash'),
+        ('general.name', VAL_STRING, 'DeepSeek V4.1 Flash'),
         ('general.file_type', VAL_UINT32, 19),
         ('general.quantization_version', VAL_UINT32, 2),
         ('deepseek4.block_count', VAL_UINT32, L),
@@ -374,7 +403,7 @@ def build_kvs(ckpt, reap=None, reap_sha=None):
         ('deepseek4.embedding_length', VAL_UINT32, cfg['hidden_size']),
         ('deepseek4.attention.head_count', VAL_UINT32, cfg['num_attention_heads']),
         ('deepseek4.attention.head_count_kv', VAL_UINT32, cfg['num_key_value_heads']),
-        ('deepseek4.rope.scaling.type', VAL_STRING, rope['type']),
+        ('deepseek4.rope.scaling.type', VAL_STRING, rope['rope_type']),
         ('deepseek4.rope.scaling.factor', VAL_FLOAT32, float(rope['factor'])),
         ('deepseek4.rope.scaling.original_context_length', VAL_UINT32, rope['original_max_position_embeddings']),
         ('deepseek4.rope.scaling.yarn_beta_fast', VAL_FLOAT32, float(rope['beta_fast'])),
@@ -400,7 +429,6 @@ def build_kvs(ckpt, reap=None, reap_sha=None):
         ('deepseek4.expert_count', VAL_UINT32, cfg['n_routed_experts']),
         ('deepseek4.expert_shared_count', VAL_UINT32, cfg['n_shared_experts']),
         ('deepseek4.expert_weights_scale', VAL_FLOAT32, float(cfg['routed_scaling_factor'])),
-        ('deepseek4.hash_layer_count', VAL_UINT32, cfg['num_hash_layers']),
         ('deepseek4.expert_weights_norm', VAL_BOOL, bool(cfg['norm_topk_prob'])),
         ('deepseek4.swiglu_clamp_exp', VAL_ARRAY, (VAL_FLOAT32, [float(cfg['swiglu_limit'])] * L)),
         ('deepseek4.attention.sliding_window', VAL_UINT32, cfg['sliding_window']),
@@ -408,6 +436,14 @@ def build_kvs(ckpt, reap=None, reap_sha=None):
         ('deepseek4.attention.indexer.key_length', VAL_UINT32, cfg['index_head_dim']),
         ('deepseek4.attention.indexer.top_k', VAL_UINT32, cfg['index_topk']),
         ('deepseek4.nextn_predict_layers', VAL_UINT32, cfg['num_nextn_predict_layers']),
+        # CSA2 sharing (L218): which layers write the shared caches and which
+        # write the shared top-k; the engine derives every layer's mode from
+        # its compress ratio and these lists.
+        ('deepseek4.attention.kv_source_layers', VAL_ARRAY, (VAL_UINT32, list(cfg['kv_source_layer_ids']))),
+        ('deepseek4.attention.index_source_layers', VAL_ARRAY, (VAL_UINT32, list(cfg['index_source_layer_ids']))),
+        ('deepseek4.attention.candidate_source_layer', VAL_UINT32, cfg['candidate_source_layer_id']),
+        ('deepseek4.attention.candidate_topk_blocks', VAL_UINT32, cfg['candidate_topk_blocks']),
+        ('deepseek4.attention.candidate_block_size', VAL_UINT32, cfg['candidate_block_size']),
         ('deepseek4.hyper_connection.count', VAL_UINT32, cfg['hc_mult']),
         ('deepseek4.hyper_connection.sinkhorn_iterations', VAL_UINT32, cfg['hc_sinkhorn_iters']),
         ('deepseek4.hyper_connection.epsilon', VAL_FLOAT32, float(cfg['hc_eps'])),
