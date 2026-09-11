@@ -19,7 +19,7 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         PULSAR_TOOL_CALLS_END "\n\n"
         "String parameters should be specified as raw text and set `string=\"true\"`. "
         "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
-        "Only if a string value itself contains the exact closing parameter tag `" PULSAR_PARAM_END "`, write that tag as `&lt;/" PULSAR_DSML "parameter>` inside the value. "
+        "Only if a string value itself contains the exact closing parameter tag `" PULSAR_PARAM_END "`, write that tag as `&lt;/" PULSAR_DSML PULSAR_DSML_PARAM_NAME ">` inside the value. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
         /* Do not ask the model to OPEN a <think> block the prompt already
          * opened — that wording provoked a second reasoning pass after the

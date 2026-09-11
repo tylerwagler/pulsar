@@ -41,7 +41,7 @@ static void agent_tool_calls_free(agent_tool_calls *calls) {
 
 
 /* A string parameter's bytes carry DSML entities (the model is told to write
- * the closing tag inside a value as "&lt;/｜DSML｜parameter>"); decode them
+ * the closing tag inside a value as "&lt;/｜DSML｜ parameter>"); decode them
  * with the ONE decoder the server's parser uses.  JSON-typed values are
  * taken verbatim, as the server does. */
 static void agent_tool_call_add_arg(agent_tool_call *c, const char *name,
@@ -172,7 +172,7 @@ static bool agent_dsml_open_tag_is(const char *tag, agent_dsml_tag kind) {
 
 
 /* The fullwidth bar of the DSML marker, which the model sometimes repeats
- * before a closing tag's '>' ("</｜DSML｜parameter｜>"). */
+ * before a closing tag's '>' ("</｜DSML｜ parameter｜>"). */
 static const char agent_dsml_bar[] = "｜";
 
 /* A closing tag of `kind` at s, in ANY syntax, accepting the few harmless
@@ -238,15 +238,17 @@ bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
 /* Bytes a partial closing tag must have before the sampler is forced to
  * argmax (param_close_prefix): the "</" plus the shortest DSML marker of any
  * marker-bearing syntax -- a bare "</" inside a value must force nothing.
- * Derived from the table; asserts its shape ("</" marker "parameter>"). */
+ * Derived from the table; asserts its shape ("</" marker name ">"), the
+ * name being the header's PULSAR_DSML_PARAM_NAME (leading space included, so
+ * the force arms once the DSML marker itself has closed, before the name). */
 static size_t agent_dsml_close_force_min(void) {
-    static const char name_gt[] = "parameter>";
+    static const char name_gt[] = PULSAR_DSML_PARAM_NAME ">";
     size_t min = (size_t)-1;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const char *lit = pulsar_dsml_syntaxes[i].param_end;
         const size_t n = strlen(lit);
         if (n <= sizeof(name_gt) - 1 || strcmp(lit + n - (sizeof(name_gt) - 1), name_gt) != 0) {
-            fprintf(stderr, "pulsar-agent: DSML table row %zu param_end is not \"</\"marker\"parameter>\": %s\n",
+            fprintf(stderr, "pulsar-agent: DSML table row %zu param_end is not \"</\"marker\"" PULSAR_DSML_PARAM_NAME ">\": %s\n",
                     i, lit);
             abort();
         }

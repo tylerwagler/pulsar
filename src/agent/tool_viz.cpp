@@ -727,7 +727,7 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
 
 /* Route ordinary assistant bytes either to normal markdown rendering or into
  * the DSML detector.  The detector must hold short prefixes because the model
- * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
+ * can split "<｜DSML｜ calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     const char *start = PULSAR_DSML_CANONICAL->tool_calls_start;
     const char *canonical_invoke = PULSAR_DSML_CANONICAL->invoke_start;
@@ -755,7 +755,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         {
             if (complete) {
                 /* Accept the common missing-leading-bar typo
-                 * "<DSML｜tool_calls>" here, but seed the parser with the
+                 * "<DSML｜ calls>" here, but seed the parser with the
                  * canonical marker so the rest of the DSML parser stays
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a

@@ -4,27 +4,36 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* DSML -- the tool-call markup DeepSeek V4 samples -- has ONE authority for
+/* DSML -- the tool-call markup DeepSeek V4.1 samples -- has ONE authority for
  * its spelling in this tree: this header.  The server's prompt renderer
  * writes these literals, the server's parser and both stream projections
- * match them, and the agent's parser and detector match them; none of them
- * carries a copy (L184).  Adding a syntax means adding a row to
- * pulsar_dsml_syntaxes; every consumer loops over the table. */
+ * match them, and the agent's prompts, parser and detector match them; none
+ * of them carries a copy (L184).  Adding a syntax means adding a row to
+ * pulsar_dsml_syntaxes; every consumer loops over the table.
+ *
+ * V4.1 (L218) renamed the three tag names and gave each a LEADING SPACE, so
+ * the byte after the "｜DSML｜" token is ' ' and the name tokenises on its
+ * own: "<｜DSML｜ calls>", "<｜DSML｜ invoke name=...>", "<｜DSML｜ parameter
+ * name=... string=...>".  V4's "tool_calls"/"invoke"/"parameter" spellings
+ * are gone with the model that sampled them. */
 
 #define PULSAR_DSML "｜DSML｜"
 #define PULSAR_DSML_SHORT "DSML｜"
-#define PULSAR_TOOL_CALLS_START "<" PULSAR_DSML "tool_calls>"
-#define PULSAR_TOOL_CALLS_END "</" PULSAR_DSML "tool_calls>"
-#define PULSAR_INVOKE_START "<" PULSAR_DSML "invoke"
-#define PULSAR_INVOKE_END "</" PULSAR_DSML "invoke>"
-#define PULSAR_PARAM_START "<" PULSAR_DSML "parameter"
-#define PULSAR_PARAM_END "</" PULSAR_DSML "parameter>"
-#define PULSAR_TOOL_CALLS_START_SHORT "<" PULSAR_DSML_SHORT "tool_calls>"
-#define PULSAR_TOOL_CALLS_END_SHORT "</" PULSAR_DSML_SHORT "tool_calls>"
-#define PULSAR_INVOKE_START_SHORT "<" PULSAR_DSML_SHORT "invoke"
-#define PULSAR_INVOKE_END_SHORT "</" PULSAR_DSML_SHORT "invoke>"
-#define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT "parameter"
-#define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT "parameter>"
+#define PULSAR_DSML_CALLS_NAME " calls"
+#define PULSAR_DSML_INVOKE_NAME " invoke"
+#define PULSAR_DSML_PARAM_NAME " parameter"
+#define PULSAR_TOOL_CALLS_START "<" PULSAR_DSML PULSAR_DSML_CALLS_NAME ">"
+#define PULSAR_TOOL_CALLS_END "</" PULSAR_DSML PULSAR_DSML_CALLS_NAME ">"
+#define PULSAR_INVOKE_START "<" PULSAR_DSML PULSAR_DSML_INVOKE_NAME
+#define PULSAR_INVOKE_END "</" PULSAR_DSML PULSAR_DSML_INVOKE_NAME ">"
+#define PULSAR_PARAM_START "<" PULSAR_DSML PULSAR_DSML_PARAM_NAME
+#define PULSAR_PARAM_END "</" PULSAR_DSML PULSAR_DSML_PARAM_NAME ">"
+#define PULSAR_TOOL_CALLS_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_CALLS_NAME ">"
+#define PULSAR_TOOL_CALLS_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_CALLS_NAME ">"
+#define PULSAR_INVOKE_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_INVOKE_NAME
+#define PULSAR_INVOKE_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_INVOKE_NAME ">"
+#define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME
+#define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME ">"
 
 /** The six marker literals of one DSML spelling. */
 typedef struct {
@@ -36,12 +45,13 @@ typedef struct {
     const char *param_end;         ///< closes it
 } pulsar_dsml_syntax;
 
-/** Rows: [0] canonical "<｜DSML｜...", [1] the model's frequent
- * first-bar-omitted "<DSML｜...", [2] plain XML "<tool_calls>".  Row 0 is the
- * spelling the renderer WRITES; rows 1-2 are spellings the model has been
- * observed to sample.  Order is the parser's preference when a text carries
- * more than one. */
-#define PULSAR_DSML_SYNTAXES 3
+/** Rows: [0] canonical "<｜DSML｜ ...", [1] the first-bar-omitted
+ * "<DSML｜ ..." V4 sampled often enough to earn a row.  Row 0 is the spelling
+ * the renderer WRITES; row 1 is a tolerance the parser extends to the model.
+ * V4's plain-XML "<tool_calls>" row was retired with V4 (L218): a V4.1
+ * spelling earns a row here only from observed samples, never in advance.
+ * Order is the parser's preference when a text carries more than one. */
+#define PULSAR_DSML_SYNTAXES 2
 extern const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES];
 
 /** The renderer-side spelling (row 0). */

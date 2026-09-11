@@ -423,11 +423,11 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 
 
 /* L184: the agent's parser and detector recognise every syntax in the shared
- * table (canonical, first-bar-omitted, plain XML), decode attribute values
+ * table (canonical, first-bar-omitted), decode attribute values
  * and string parameter values with the server's entity decoder, and still
  * accept the lenient closing-tag variants. */
 static void test_agent_dsml_parser_recognises_every_syntax(void) {
-    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 3);
+    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 2);
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
         char text[1024];
@@ -481,8 +481,8 @@ static void test_agent_dsml_parser_recognises_every_syntax(void) {
     agent_dsml_start(&p);
     const char *body =
         "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
-        PULSAR_PARAM_START " name=\"command\" string=\"true\">pwd</" PULSAR_DSML "parameter ｜ >\n"
-        "</" PULSAR_DSML "invoke\n>\n" PULSAR_TOOL_CALLS_END;
+        PULSAR_PARAM_START " name=\"command\" string=\"true\">pwd</" PULSAR_DSML " parameter ｜ >\n"
+        "</" PULSAR_DSML " invoke\n>\n" PULSAR_TOOL_CALLS_END;
     agent_dsml_feed(&p, body, strlen(body));
     AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
     AGENT_TEST_ASSERT(p.calls.len == 1 && !strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "pwd"));

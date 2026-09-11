@@ -13,11 +13,11 @@ static const char agent_tools_prompt_intro[] =
     "then summarize results briefly.\n\n"
     "## Tools\n\n"
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
-    "<｜DSML｜tool_calls>\n"
-    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
-    "</｜DSML｜invoke>\n"
-    "</｜DSML｜tool_calls>\n\n"
+    PULSAR_TOOL_CALLS_START "\n"
+    PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
+    PULSAR_PARAM_START " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" PULSAR_PARAM_END "\n"
+    PULSAR_INVOKE_END "\n"
+    PULSAR_TOOL_CALLS_END "\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
     "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
     "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
@@ -44,19 +44,19 @@ static const char agent_tools_prompt_edit_line[] =
     "because the closing brace may match many functions. Instead include final lines that are unique near that function, "
     "for example its last calculation and return line before the brace.\n"
     "Example anchored edit:\n"
-    "<｜DSML｜tool_calls>\n"
-    "<｜DSML｜invoke name=\"edit\">\n"
-    "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/example.c</｜DSML｜parameter>\n"
-    "<｜DSML｜parameter name=\"old\" string=\"true\">static int parse(void) {\n"
+    PULSAR_TOOL_CALLS_START "\n"
+    PULSAR_INVOKE_START " name=\"edit\">\n"
+    PULSAR_PARAM_START " name=\"path\" string=\"true\">/tmp/example.c" PULSAR_PARAM_END "\n"
+    PULSAR_PARAM_START " name=\"old\" string=\"true\">static int parse(void) {\n"
     "    int ok = 0;\n"
     "[upto]\n"
     "    return ok;\n"
-    "}</｜DSML｜parameter>\n"
-    "<｜DSML｜parameter name=\"new\" string=\"true\">static int parse(void) {\n"
+    "}" PULSAR_PARAM_END "\n"
+    PULSAR_PARAM_START " name=\"new\" string=\"true\">static int parse(void) {\n"
     "    return parse_impl();\n"
-    "}</｜DSML｜parameter>\n"
-    "</｜DSML｜invoke>\n"
-    "</｜DSML｜tool_calls>\n"
+    "}" PULSAR_PARAM_END "\n"
+    PULSAR_INVOKE_END "\n"
+    PULSAR_TOOL_CALLS_END "\n"
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
     "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
@@ -240,11 +240,11 @@ static char *agent_build_tools_prompt(void) {
 
 const char agent_dsml_syntax_reminder[] =
     "DSML syntax reminder:\n"
-    "<｜DSML｜tool_calls>\n"
-    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
-    "</｜DSML｜invoke>\n"
-    "</｜DSML｜tool_calls>\n";
+    PULSAR_TOOL_CALLS_START "\n"
+    PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
+    PULSAR_PARAM_START " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" PULSAR_PARAM_END "\n"
+    PULSAR_INVOKE_END "\n"
+    PULSAR_TOOL_CALLS_END "\n";
 
 
 static char *agent_build_system_prompt_reminder(void) {

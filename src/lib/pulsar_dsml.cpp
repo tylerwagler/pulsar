@@ -17,11 +17,6 @@ const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES] = {
         PULSAR_INVOKE_START_SHORT, PULSAR_INVOKE_END_SHORT,
         PULSAR_PARAM_START_SHORT, PULSAR_PARAM_END_SHORT,
     },
-    {
-        "<tool_calls>", "</tool_calls>",
-        "<invoke", "</invoke>",
-        "<parameter", "</parameter>",
-    },
 };
 
 

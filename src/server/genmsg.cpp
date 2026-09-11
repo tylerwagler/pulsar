@@ -712,23 +712,16 @@ bool try_repair_dsml(const char *s, size_t len, buf *out) {
     const char *scan_start = think_end ? (think_end + 8) : s;
     size_t scan_len = (size_t)((s + len) - scan_start);
 
-    /* Detect style from first <tool_calls> tag */
-    const char *ts, *te, *is, *ie, *ps, *pe;
-    if (strstr(scan_start, PULSAR_TOOL_CALLS_START)) {
-        ts = PULSAR_TOOL_CALLS_START;  te = PULSAR_TOOL_CALLS_END;
-        is = PULSAR_INVOKE_START;      ie = PULSAR_INVOKE_END;
-        ps = PULSAR_PARAM_START;       pe = PULSAR_PARAM_END;
-    } else if (strstr(scan_start, PULSAR_TOOL_CALLS_START_SHORT)) {
-        ts = PULSAR_TOOL_CALLS_START_SHORT;  te = PULSAR_TOOL_CALLS_END_SHORT;
-        is = PULSAR_INVOKE_START_SHORT;      ie = PULSAR_INVOKE_END_SHORT;
-        ps = PULSAR_PARAM_START_SHORT;       pe = PULSAR_PARAM_END_SHORT;
-    } else if (strstr(scan_start, "<tool_calls>")) {
-        ts = "<tool_calls>";   te = "</tool_calls>";
-        is = "<invoke";        ie = "</invoke>";
-        ps = "<parameter";     pe = "</parameter>";
-    } else {
-        return false; /* No recognizable DSML start tag */
+    /* Detect the spelling from the first tool-calls opener; the table is the
+     * one authority for spellings (L184), in the parser's preference order. */
+    const pulsar_dsml_syntax *syn = NULL;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES && !syn; i++) {
+        if (strstr(scan_start, pulsar_dsml_syntaxes[i].tool_calls_start)) syn = &pulsar_dsml_syntaxes[i];
     }
+    if (!syn) return false; /* No recognizable DSML start tag */
+    const char *ts = syn->tool_calls_start, *te = syn->tool_calls_end;
+    const char *is = syn->invoke_start,     *ie = syn->invoke_end;
+    const char *ps = syn->param_start,      *pe = syn->param_end;
 
     /* Single-pass: count all 6 tag types in one scan */
     size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
