@@ -717,7 +717,7 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
  * so at most two owners per expert per step.  Returns the owned count (0 = exit). */
 enum { GEMV_DEDUPE_MAX = 8 };
 enum { GEMV_DOWN_TILE_N = 64 };      /* down GEMV: outputs per CTA (8 warps x 8) */
-enum { GEMV_DOWN_MAX_K  = 2048 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim) */
+enum { GEMV_DOWN_MAX_K  = 2304 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim; V4.1 2304 = 9 x 256, L218) */
 __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
                                                         int e, bool valid, int owned[GEMV_DEDUPE_MAX]) {
   if (!valid) { owned[0] = slot; return 1; }   /* an invalid expert is its own slot's business */

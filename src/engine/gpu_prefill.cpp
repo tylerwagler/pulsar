@@ -2479,7 +2479,7 @@ bool gpu_graph_encode_layer_ffn_batch(
                                               model,
                                               layer->ffn_gate_inp,
                                              PULSAR_N_EMBD,
-                                             PULSAR_N_EXPERT,
+                                             layer->n_expert,
                                              g->batch_ffn_norm,
                                              n_tokens) != 0;
 
@@ -2490,27 +2490,21 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                       model->map,
                                                       model->size,
                                                       layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                      layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                                                      layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                                                      0,
-                                                      0,
                                                       layer->ffn_exp_probs_b != NULL,
-                                                      layer->ffn_gate_tid2eid != NULL,
                                                       g->batch_router_logits,
-                                                      g->prefill_tokens,
-                                                      PULSAR_N_EXPERT,
-                                                      PULSAR_N_EXPERT_USED,
+                                                      layer->n_expert,
+                                                      layer->n_expert_used,
                                                       PULSAR_EXPERT_WEIGHT_SCALE,
                                                       n_tokens) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
-                                      (uint64_t)n_tokens * PULSAR_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * layer->n_expert, il, pos0);
         gpu_graph_debug_dump_tensor("ffn_moe_probs", g->batch_router_probs,
-                                      (uint64_t)n_tokens * PULSAR_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * layer->n_expert, il, pos0);
         gpu_graph_debug_dump_i32_tensor("ffn_moe_topk", g->batch_router_selected,
-                                          (uint64_t)n_tokens * PULSAR_N_EXPERT_USED, il, pos0);
+                                          (uint64_t)n_tokens * layer->n_expert_used, il, pos0);
         gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
-                                      (uint64_t)n_tokens * PULSAR_N_EXPERT_USED, il, pos0);
+                                      (uint64_t)n_tokens * layer->n_expert_used, il, pos0);
     }
 
     const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos0);
@@ -2619,8 +2613,8 @@ bool gpu_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                g->batch_router_selected,
                                                g->batch_router_weights,
-                                               pulsar_layer_n_expert(il),
-                                               PULSAR_N_EXPERT_USED,
+                                               layer->n_expert_present,
+                                               layer->n_expert_used,
                                                PULSAR_SWIGLU_CLAMP_EXP,
                                                g->batch_ffn_norm,
                                                il,
@@ -2633,16 +2627,16 @@ bool gpu_graph_encode_layer_ffn_batch(
          * for ffn_moe_down: the grouped path sums straight from its padded
          * GEMM output and never touches batch_routed_down. */
         gpu_graph_debug_dump_tensor("ffn_moe_up_clamped", g->batch_routed_up,
-                                      (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim, il, pos0);
+                                      (uint64_t)n_tokens * layer->n_expert_used * down_in_dim, il, pos0);
     }
     if (ok) {
-        const uint64_t routed_mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim;
+        const uint64_t routed_mid_elems = (uint64_t)n_tokens * layer->n_expert_used * down_in_dim;
         gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
                                       routed_mid_elems, il, pos0);
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,
-                                      (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD, il, pos0);
+                                      (uint64_t)n_tokens * layer->n_expert_used * PULSAR_N_EMBD, il, pos0);
     }
     if (ok) {
         gpu_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,

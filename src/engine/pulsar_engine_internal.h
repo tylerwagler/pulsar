@@ -55,7 +55,7 @@
 #endif
 
 #define PULSAR_NEG_INF (-1.0e30f)
-#define PULSAR_DEFAULT_RMS_EPS ( 1.0e-6f)
+#define PULSAR_DEFAULT_RMS_EPS ( 1.0e-20f)   /* V4.1 (L218); 0731 was 1e-6 */
 #define PULSAR_DEFAULT_HC_EPS  ( 1.0e-6f)
 #define PULSAR_DEFAULT_SWIGLU_CLAMP_EXP    (10.0f)
 #define PULSAR_DEFAULT_ROPE_FREQ_BASE      (10000.0f)
@@ -99,9 +99,10 @@
 #define PULSAR_N_LORA_O                  (g_pulsar_shape.n_lora_o)
 #define PULSAR_N_EXPERT                  (g_pulsar_shape.n_expert)
 #define PULSAR_N_EXPERT_USED             (g_pulsar_shape.n_expert_used)
+#define PULSAR_N_DSPARK_EXPERT           (g_pulsar_shape.n_dspark_expert)
+#define PULSAR_N_DSPARK_EXPERT_USED      (g_pulsar_shape.n_dspark_expert_used)
 #define PULSAR_N_EXPERT_SHARED           (g_pulsar_shape.n_expert_shared)
 #define PULSAR_N_FF_EXP                  (g_pulsar_shape.n_ff_exp)
-#define PULSAR_N_HASH_LAYER              (g_pulsar_shape.n_hash_layer)
 #define PULSAR_N_SWA                     (g_pulsar_shape.n_swa)
 #define PULSAR_N_INDEXER_HEAD            (g_pulsar_shape.n_indexer_head)
 #define PULSAR_N_INDEXER_HEAD_DIM        (g_pulsar_shape.n_indexer_head_dim)
@@ -221,7 +222,6 @@ enum {
     PULSAR_MAX_EXPERT_USED      = 6,
     PULSAR_MAX_EXPERT_SHARED    = 1,
     PULSAR_MAX_FF_EXP           = 3072,
-    PULSAR_MAX_HASH_LAYER       = 3,
     PULSAR_MAX_SWA              = 128,
     PULSAR_MAX_INDEXER_HEAD     = 64,
     PULSAR_MAX_INDEXER_HEAD_DIM = 128,
@@ -259,9 +259,10 @@ typedef struct {
     uint32_t n_lora_o;         ///< rank of the low-rank attention-output path
     uint32_t n_expert;         ///< routed experts per MoE layer
     uint32_t n_expert_used;    ///< experts activated per token (top-k routing)
-    uint32_t n_expert_shared;  ///< always-on shared experts
+    uint32_t n_expert_shared;
+    uint32_t n_dspark_expert;      ///< routed experts per DSpark drafter layer (V4.1: 128)
+    uint32_t n_dspark_expert_used; ///< experts a drafter token activates (V4.1: 3)  ///< always-on shared experts
     uint32_t n_ff_exp;         ///< per-expert FFN hidden width
-    uint32_t n_hash_layer;     ///< layers using hash-based routing, if any
     uint32_t n_swa;            ///< sliding-window attention span
     uint32_t n_indexer_head;      ///< indexer tower heads
     uint32_t n_indexer_head_dim;  ///< indexer per-head dimension
@@ -558,9 +559,16 @@ typedef struct {
     pulsar_tensor *hc_ffn_scale;     ///< HC per-channel scale, FFN side
     pulsar_tensor *hc_ffn_base;      ///< HC per-channel base/offset, FFN side
     pulsar_tensor *ffn_norm;         ///< RMSNorm weight before the FFN
-    pulsar_tensor *ffn_gate_tid2eid; ///< token-id to expert-id routing table (when the artifact ships one)
     pulsar_tensor *ffn_gate_inp;     ///< router projection producing per-expert logits
     pulsar_tensor *ffn_exp_probs_b;  ///< router bias added to the expert probabilities
+    /** This layer's router width, the experts a token activates, and the experts
+     * physically present in its stacks (REAP keep count on the target; the
+     * full width on the drafter).  Set at bind; the FFN encoder reads THESE, so
+     * a drafter layer routes with its own 128 / top-3 and never with the
+     * target's 384 / top-6 (L218 audit risk #2). */
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_expert_present;
     pulsar_tensor *ffn_gate_exps;    ///< ROUTED experts, gate projection (expert-major)
     pulsar_tensor *ffn_up_exps;      ///< routed experts, up projection
     pulsar_tensor *ffn_down_exps;    ///< routed experts, down projection

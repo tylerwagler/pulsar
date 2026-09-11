@@ -433,7 +433,6 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
     {
         return false;
     }
-    if (il < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
     return true;
 }
 
@@ -557,9 +556,6 @@ static void weights_validate_layout(
         tensor_expect_mxfp8(l->ffn_gate_shexp, 2, PULSAR_N_EMBD, PULSAR_N_FF_EXP, 0);
         tensor_expect_mxfp8(l->ffn_up_shexp,   2, PULSAR_N_EMBD, PULSAR_N_FF_EXP, 0);
         tensor_expect_mxfp8(l->ffn_down_shexp, 2, PULSAR_N_FF_EXP, PULSAR_N_EMBD, 0);
-        if (il < PULSAR_N_HASH_LAYER) {
-            tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2, PULSAR_N_EXPERT_USED, PULSAR_N_VOCAB, 0);
-        }
     }
 }
 
@@ -582,7 +578,6 @@ static bool pulsar_shape_matches_metadata(
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
-        uint32_t n_hash_layer,
         uint32_t n_swa,
         uint32_t n_indexer_head,
         uint32_t n_indexer_head_dim,
@@ -604,7 +599,6 @@ static bool pulsar_shape_matches_metadata(
            s->n_expert_used == n_expert_used &&
            s->n_ff_exp == n_ff_exp &&
            s->n_expert_shared == n_expert_shared &&
-           s->n_hash_layer == n_hash_layer &&
            s->n_swa == n_swa &&
            s->n_indexer_head == n_indexer_head &&
            s->n_indexer_head_dim == n_indexer_head_dim &&
@@ -631,7 +625,6 @@ static void pulsar_select_shape_from_metadata(
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
-        uint32_t n_hash_layer,
         uint32_t n_swa,
         uint32_t n_indexer_head,
         uint32_t n_indexer_head_dim,
@@ -643,7 +636,7 @@ static void pulsar_select_shape_from_metadata(
                                    n_head_dim, n_value_dim, n_rot, n_lora_q,
                                    n_lora_o, n_out_group, n_expert,
                                    n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_swa, n_indexer_head,
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_pulsar_shape = PULSAR_SHAPE_FLASH;
@@ -789,9 +782,12 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
 
 
 
+/* Relative tolerance: the old absolute 1e-6 floor let an artifact's rms eps of
+ * 1e-20 pass against a 1e-6 profile (and vice versa) without a word -- every
+ * RMSNorm wrong, no message (L218 audit risk #1).  A value of 0 must match 0. */
 static void config_expect_f32(const char *name, float got, float expected) {
-    const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
-    if (fabsf(got - expected) <= scale * 1.0e-6f) return;
+    const float tol = fabsf(expected) * 1.0e-6f;
+    if (fabsf(got - expected) <= tol) return;
     fprintf(stderr, "pulsar: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, PULSAR_MODEL_SHAPE_NAME, (double)got);
     exit(1);
@@ -832,7 +828,6 @@ void config_validate_model(const pulsar_model *m) {
     const uint32_t n_expert_used = required_u32(m, "deepseek4.expert_used_count");
     const uint32_t n_ff_exp = required_u32(m, "deepseek4.expert_feed_forward_length");
     const uint32_t n_expert_shared = required_u32(m, "deepseek4.expert_shared_count");
-    const uint32_t n_hash_layer = required_u32(m, "deepseek4.hash_layer_count");
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
@@ -859,7 +854,6 @@ void config_validate_model(const pulsar_model *m) {
                                    n_expert_used,
                                    n_ff_exp,
                                    n_expert_shared,
-                                   n_hash_layer,
                                    n_swa,
                                    n_indexer_head,
                                    n_indexer_head_dim,
@@ -881,7 +875,6 @@ void config_validate_model(const pulsar_model *m) {
     config_expect_u32("expert_used_count",          n_expert_used,   PULSAR_N_EXPERT_USED);
     config_expect_u32("expert_feed_forward_length", n_ff_exp,        PULSAR_N_FF_EXP);
     config_expect_u32("expert_shared_count",         n_expert_shared, PULSAR_N_EXPERT_SHARED);
-    config_expect_u32("hash_layer_count",            n_hash_layer,    PULSAR_N_HASH_LAYER);
     config_expect_u32("expert_group_count",         n_expert_groups, 0);
     config_expect_u32("expert_group_used_count",    n_group_used,    0);
 
@@ -1025,6 +1018,9 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool r
 
 static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, uint32_t il) {
     const uint32_t compress_ratio = pulsar_layer_compress_ratio(il);
+    l->n_expert = PULSAR_N_EXPERT;
+    l->n_expert_used = PULSAR_N_EXPERT_USED;
+    l->n_expert_present = pulsar_layer_n_expert(il);
 
     l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
     l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
@@ -1064,10 +1060,6 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
-
-    if (il < PULSAR_N_HASH_LAYER) {
-        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
-    }
 }
 
 
@@ -1142,10 +1134,10 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_layout(l->hc_ffn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
         tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
-        tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_EXPERT, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_EXPERT);
+        tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
@@ -1198,6 +1190,9 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
 
     for (int li = 0; li < 3; li++) {
         pulsar_layer_weights *l = &w->layer[li];
+        l->n_expert = PULSAR_N_DSPARK_EXPERT;
+        l->n_expert_used = PULSAR_N_DSPARK_EXPERT_USED;
+        l->n_expert_present = PULSAR_N_DSPARK_EXPERT;
         l->hc_attn_fn      = required_tensorf(m, "dspark.%d.hc_attn_fn.weight", li);
         l->hc_attn_scale   = required_tensorf(m, "dspark.%d.hc_attn_scale.weight", li);
         l->hc_attn_base    = required_tensorf(m, "dspark.%d.hc_attn_base.weight", li);

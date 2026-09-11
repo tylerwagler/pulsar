@@ -2,11 +2,16 @@
 
 
 
+/* DeepSeek-V4.1-Flash (L218): 40 layers = 20-layer causal encoder + 20-layer
+ * decoder, hidden 5120, 384 routed experts of intermediate 2304, q_lora 1280,
+ * a 32-head indexer, no hash-routed layers, rms eps 1e-20.  Every V4-Flash
+ * (0731) number this struct used to carry is gone with the checkpoint the
+ * engine no longer serves; a 0731 artifact refuses at load on n_layer. */
 const pulsar_shape PULSAR_SHAPE_FLASH = {
-    .name = "DeepSeek V4 Flash",
+    .name = "DeepSeek V4.1 Flash",
     .variant = PULSAR_VARIANT_FLASH,
-    .n_layer = 43,
-    .n_embd = 4096,
+    .n_layer = 40,
+    .n_embd = 5120,
     .n_vocab = 129280,
     .n_head = 64,
     .n_head_kv = 1,
@@ -14,15 +19,16 @@ const pulsar_shape PULSAR_SHAPE_FLASH = {
     .n_value_dim = 512,
     .n_rot = 64,
     .n_out_group = 8,
-    .n_lora_q = 1024,
+    .n_lora_q = 1280,
     .n_lora_o = 1024,
-    .n_expert = 256,
+    .n_expert = 384,
     .n_expert_used = 6,
     .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_hash_layer = 3,
+    .n_dspark_expert = 128,
+    .n_dspark_expert_used = 3,
+    .n_ff_exp = 2304,
     .n_swa = 128,
-    .n_indexer_head = 64,
+    .n_indexer_head = 32,
     .n_indexer_head_dim = 128,
     .n_indexer_top_k = 512,
     .n_hc = 4,

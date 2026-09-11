@@ -43,9 +43,13 @@ bool pulsar_engine::is_pruned() const {
 
 
 
+/* V4.1 CSA2 (L218): layers 0-1 sliding window only; the encoder's 2-19 share
+ * ratio-2 compressed KV from sources 2/8/14; the decoder's 20-39 read one
+ * ratio-1 (one latent per token) cache from layer 20.  The 0731 4/128 pattern
+ * (CSA/HCA alternating) is gone with that checkpoint. */
 uint32_t pulsar_expected_layer_compress_ratio(uint32_t il) {
     if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
 
     if (il < 2) return 0;
-    return (il & 1u) == 0 ? 4u : 128u;
+    return il < 20 ? 2u : 1u;
 }

@@ -1098,7 +1098,7 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_exper
  * out[ids_dst[col] * M + row], f32. */
 constexpr int kDecodeGemvRows       = 32;    ///< rows per warp == lanes
 constexpr int kDecodeGemvWarps      = 8;     ///< K split
-constexpr int kDecodeGemvMaxK       = 4096;  ///< shared f32 activation slab
+constexpr int kDecodeGemvMaxK       = 5120;  ///< shared f32 activation slab (V4.1 n_embd, L218; 20 KB)
 
 __device__ __forceinline__ static float d2r_e4m3_to_f32(uint8_t bits) {
     return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
