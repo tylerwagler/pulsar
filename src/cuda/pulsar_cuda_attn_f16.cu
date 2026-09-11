@@ -754,9 +754,16 @@ static void attn_f16_kernel(
              * weights do not sum to one.  The sink term in the epilogue is
              * deliberately NOT rounded -- it has no V row, it is denominator
              * mass only.  Rows past nr / hidden rows are zero in sP and add
-             * exactly nothing. */
+             * exactly nothing.
+             *
+             * ⚠ `nr`, NOT `AF16_ROWS`.  With a compile-time bound the
+             * compiler unrolls this chain and --use_fast_math is then free to
+             * REASSOCIATE the adds; the serial version's runtime bound kept
+             * them sequential.  The first cut of this change used AF16_ROWS
+             * and the prefill gate caught the reassociation: every logit
+             * moved.  The loop bound is load-bearing for bit-exactness. */
             float l = sL[h] * corr;
-            for (uint32_t r = 0; r < AF16_ROWS; r++) l += __half2float(sP[h][r]);
+            for (uint32_t r = 0; r < nr; r++) l += __half2float(sP[h][r]);
             sM[h] = mx; sL[h] = l; sCorr[h] = corr;
         }
         __syncthreads();
