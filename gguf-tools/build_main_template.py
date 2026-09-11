@@ -96,6 +96,7 @@ LAYER_MAP = {
     'ffn_down_shexp.weight':          'ffn.shared_experts.w2.weight',
     'ffn_gate_inp.weight':            'ffn.gate.weight',
     'exp_probs_b.bias':               'ffn.gate.bias',
+    'exp_probs_b_vl.bias':            'ffn.gate.bias_vl',   # Vision-Exp: the router bias for IMAGE tokens (F32 [n_expert])
     'ffn_gate_tid2eid.weight':        'ffn.gate.tid2eid',
 }
 
@@ -114,7 +115,7 @@ ALWAYS_LAYER_SUFFIXES = [
 # Suffixes present only on some layers -- presence is checked against the
 # real HF tensor list per layer, never hardcoded to specific layer indices.
 CONDITIONAL_LAYER_SUFFIXES = [
-    'exp_probs_b.bias', 'ffn_gate_tid2eid.weight',
+    'exp_probs_b.bias', 'exp_probs_b_vl.bias', 'ffn_gate_tid2eid.weight',
     'attn_compressor_ape.weight', 'attn_compressor_kv.weight',
     'attn_compressor_gate.weight', 'attn_compressor_norm.weight',
     'indexer.attn_q_b.weight', 'indexer.proj.weight',
@@ -122,22 +123,28 @@ CONDITIONAL_LAYER_SUFFIXES = [
     'indexer_compressor_gate.weight', 'indexer_compressor_norm.weight',
 ]
 
-# Source tensors this TEXT-ONLY main-model template deliberately does not
-# consume.  Every tensor the checkpoint holds must either be consumed into the
-# manifest or match one of these patterns, or the build aborts (fail closed).
-# The 2026-09-10 Vision-Exp probe showed why: the explicit expected-name walk
-# above silently dropped 313 of the checkpoint's 316 new tensors (vision tower,
-# aligner, image-span embeddings, the image-token router bias) -- a fail-OPEN
+# Source tensors this main-model template deliberately does not consume.
+# Every tensor the checkpoint holds must either be consumed into the manifest
+# or match one of these patterns, or the build aborts (fail closed).  The
+# 2026-09-10 Vision-Exp probe showed why: the explicit expected-name walk above
+# silently dropped 313 of the checkpoint's 316 new tensors -- a fail-OPEN
 # builder.  Ported from the V4.1 builder (v41-flash bd73e371); shape-agnostic.
 import re as _re
 SKIP_PATTERNS = [
-    _re.compile(r'^vision\.'),                           # DeepSeek-ViT (vision phase, own builder later)
-    _re.compile(r'^aligner\.'),                          # vision projector
-    _re.compile(r'^image_(start|end|newline|pad)$'),     # image-span embeddings
-    _re.compile(r'^layers\.\d+\.ffn\.gate\.bias_vl$'),   # router bias used only for image tokens
-    _re.compile(r'^mtp\.'),                              # DSpark drafter: build_dspark_template.py
+    _re.compile(r'^mtp\.'),                              # DSpark drafter: build_dspark_template.py (its bias_vl too: drafts are text)
     _re.compile(r'^layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$'),  # routed experts: stacked by the quantizer
     _re.compile(r'\.scale$'),                            # fp8/fp4 block scales ride with their weight
+]
+
+# The vision side of Vision-Exp (Tyler 2026-09-11: "i want the vision part as well"): DeepSeek-ViT tower (32 blocks: fused qkv,
+# wo, fused gate/up, down, two norms; patch embed 3x14x14 -> 1024; final norm), the 3x3 pixel-unshuffle aligner (9216 -> 4096 -> 4096)
+# and the four image-span embeddings.  All bf16 in the checkpoint and carried LOSSLESSLY under their checkpoint names -- one authority,
+# no rename table to keep in sync; the engine's vision loader binds these exact names.  Shapes come from the shard headers, never from
+# config.  (The per-layer image-token router bias `ffn.gate.bias_vl` is a layer tensor: `exp_probs_b_vl.bias` in LAYER_MAP.)
+VISION_PATTERNS = [
+    _re.compile(r'^vision\.'),
+    _re.compile(r'^aligner\.'),
+    _re.compile(r'^image_(start|end|newline|pad)$'),
 ]
 
 # Per-tensor-group template type policy (the default type used when the
@@ -380,6 +387,21 @@ def build_tensor_list(ckpt, keep=None):
         tensors.append((f'blk.{layer}.ffn_gate_exps.weight', [E, F, Rl], MXFP4))
         tensors.append((f'blk.{layer}.ffn_up_exps.weight',   [E, F, Rl], MXFP4))
         tensors.append((f'blk.{layer}.ffn_down_exps.weight', [F, E, Rl], MXFP4))
+
+    # Vision side, verbatim names, lossless types (bf16 source -> BF16; anything F32 -> F32).
+    for hf_name in sorted(ckpt.weight_map):
+        if hf_name in consumed or not any(p.search(hf_name) for p in VISION_PATTERNS):
+            continue
+        ne = ne_reversed(ckpt.shape(hf_name))
+        src = ckpt.dtype(hf_name)
+        if src == 'BF16':
+            ttype = BF16
+        elif src == 'F32':
+            ttype = F32
+        else:
+            raise SystemExit(f'vision tensor {hf_name}: unexpected source dtype {src} (expected BF16/F32, carried losslessly)')
+        tensors.append((hf_name, ne, ttype))
+        consumed.add(hf_name)
 
     # Fail closed: every checkpoint tensor is consumed or explicitly skipped.
     unknown = [n for n in ckpt.weight_map

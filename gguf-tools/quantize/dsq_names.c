@@ -90,6 +90,7 @@ static const name_map layer_map[] = {
     { "ffn_down_shexp.weight",            "ffn.shared_experts.w2.weight" },
     { "ffn_gate_inp.weight",              "ffn.gate.weight" },
     { "exp_probs_b.bias",                 "ffn.gate.bias" },
+    { "exp_probs_b_vl.bias",              "ffn.gate.bias_vl" },   /* Vision-Exp: router bias for IMAGE tokens */
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
     { "hc_head_base.weight",              "hc_head_base" },
     { "hc_head_fn.weight",                "hc_head_fn" },
@@ -132,10 +133,19 @@ static bool dspark_hf_name(const char *gguf_name, char *hf_out, size_t hf_sz) {
     return false;
 }
 
+/* The vision side of Vision-Exp (ViT tower, aligner, image-span embeddings) is carried under its CHECKPOINT names -- one authority,
+ * no rename table to keep in sync (build_main_template.py VISION_PATTERNS). */
+static bool is_vision_side(const char *name) {
+    return str_starts(name, "vision.") || str_starts(name, "aligner.") ||
+           strcmp(name, "image_start") == 0 || strcmp(name, "image_end") == 0 ||
+           strcmp(name, "image_newline") == 0 || strcmp(name, "image_pad") == 0;
+}
+
 char *hf_name_for_regular(const char *gguf_name) {
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
     }
+    if (is_vision_side(gguf_name)) return xstrdup(gguf_name);
     char hf_buf[512];
     if (dspark_hf_name(gguf_name, hf_buf, sizeof(hf_buf))) {
         return xstrdup(hf_buf);
@@ -190,6 +200,9 @@ ds4q_type policy_type(const quant_policy *p, const char *name, const tensor_meta
             return p->overrides[i].type;
         }
     }
+    /* The vision side is carried losslessly at its template type; the class-wide --attention/--dense flags must not re-type
+     * `vision.blocks.N.attn.*` by substring (an explicit --tensor-type vision.=... override above still wins). */
+    if (is_vision_side(name)) return tmpl->type;
     expert_tensor e = parse_expert_tensor(name);
     if (e.is_expert) {
         if (e.part == EXP_W1 && p->routed_w1 != DS4Q_TYPE_COUNT) return p->routed_w1;
