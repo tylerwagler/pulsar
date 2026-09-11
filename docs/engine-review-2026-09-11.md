@@ -23,6 +23,11 @@ Landed, compile-verified, **none yet measured or gate-run** (no GPU on the
 review box). Every item below still owes its A/B or byte-baseline re-anchor on
 the GB10 before it can merge.
 
+Host-only verification actually run on the branch (in addition to the full
+build of all five binaries, clean): `./pulsar-eval --self-test-extractors`
+PASS, `./pulsar_agent_test` PASS, `make seam-check` PASS (83 host files
+CUDA-API clean). No GPU-backed gate has run.
+
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
 - A2 payload digest, format v10 (`117541f7`)
 - A3 sampler range clamps + warning (`bc9d70bb`)
