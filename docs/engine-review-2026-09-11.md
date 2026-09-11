@@ -36,7 +36,9 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 `v5mx4-0731-srcfmt-v1-reapfix-lt`):
 
 - `make cuda-regression` PASS; `make gates` 8/8 PASS; `gates_runner` 27/27
-  PASS; `cuda-prefill-gate` byte-identical at all 7 depths.
+  PASS (1000 s); `cuda-prefill-gate` byte-identical at all 7 depths;
+  `cuda-minp-prefilter-gate` and `cuda-spec-sampling-gate` PASS on the B2
+  sampler fast arm.
 - **Two bugs the GPU gates caught, fixed on the branch:** C7's parallel
   normaliser loop had a compile-time bound that let `--use_fast_math`
   reassociate the add chain (every prefill logit moved) -- fixed in `09228ff9`;
@@ -57,6 +59,7 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 - A5 quantizer pre-flight shapes (`b9745c7e`)
 - B1 IQ2 down decode GEMV, re-anchored and measured (`cf30211f`, anchor
   `01c1b9ca`)
+- B2 full-nucleus sampler skips the below-floor expf (`13501b89`)
 - B3 greedy spec argmax readback (`4fa5e0b6`)
 - B6 persistent plain/mixed lane logits (`e5b2979f`)
 - B7 bulk `pulsar_tokens_copy` (`f59043f7`)
