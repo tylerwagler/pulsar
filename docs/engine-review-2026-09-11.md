@@ -19,9 +19,9 @@ re-litigation of measured NO-GOs.
 
 ## Implementation status — branch `l219-review-fixes` (2026-09-11)
 
-Landed, compile-verified, **none yet measured or gate-run** (no GPU on the
-review box). Every item below still owes its A/B or byte-baseline re-anchor on
-the GB10 before it can merge.
+Landed, gate-verified on the GB10, and measured (see below). The list is the
+commit map; the verification and locked-clock deltas are the authority on what
+actually shipped.
 
 Host-only verification actually run on the branch (in addition to the full
 build of all five binaries, clean):
@@ -30,31 +30,49 @@ clamp warning), `./pulsar_test --sampler` PASS (169 shape x config combos,
 2496 fixed-seed trials), `./pulsar_test --sampler-prefilter` PASS,
 `./pulsar_test --spec-math --lib-utf8 --lib-think --ctxmem` PASS,
 `./pulsar-eval --self-test-extractors` PASS, `./pulsar_agent_test` PASS,
-`make seam-check` PASS (83 host files CUDA-API clean). No GPU-backed gate has
-run.
+`make seam-check` PASS (83 host files CUDA-API clean).
+
+GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
+`v5mx4-0731-srcfmt-v1-reapfix-lt`):
+
+- `make cuda-regression` PASS; `make gates` 8/8 PASS; `gates_runner` 27/27
+  PASS; `cuda-prefill-gate` byte-identical at all 7 depths.
+- **Two bugs the GPU gates caught, fixed on the branch:** C7's parallel
+  normaliser loop had a compile-time bound that let `--use_fast_math`
+  reassociate the add chain (every prefill logit moved) -- fixed in `09228ff9`;
+  and A2's digest exposed glibc `fmemopen` null-terminating over the last byte
+  of an exactly-full buffer, which had silently corrupted the last payload byte
+  since before this branch -- fixed in `1cd0f145`.
+- The decode byte baseline is re-anchored to `cf30211f` (B1): blob-to-blob KL
+  1.26e-9..1.23e-7, top-1 identical at all three depths, top-5 4-5/5
+  (`01c1b9ca`, provenance md next to the blob).
+- **Locked-clock deltas vs `d6d3feb`** (pulsar-bench, teacher_forced_corpus,
+  two stable rounds): prefill **+5.2% @4096** and **+5.4% @8192**; decode
+  **+1.8% @2048** and **+2.0% @8192**.
 
 - A1 E8M0 `0xFF` bind-time refusal (`a43ec0b6`)
-- A2 payload digest, format v10 (`117541f7`)
+- A2 payload digest, format v10 (`117541f7`; fmemopen terminator fix `1cd0f145`)
 - A3 sampler range clamps + warning (`bc9d70bb`)
 - A4 AGENTS.md truth (`d6b4e93c`)
 - A5 quantizer pre-flight shapes (`b9745c7e`)
-- B1 IQ2 down decode GEMV — **numerics change; decode byte baseline must be
-  re-anchored** (`cf30211f`)
+- B1 IQ2 down decode GEMV, re-anchored and measured (`cf30211f`, anchor
+  `01c1b9ca`)
 - B3 greedy spec argmax readback (`4fa5e0b6`)
 - B6 persistent plain/mixed lane logits (`e5b2979f`)
 - B7 bulk `pulsar_tokens_copy` (`f59043f7`)
 - B8 async drafter seed copies (`eb9b5a8b`)
-- C2 MMQ gate/up fold emits the mid E4M3 itself — both-43 and mixed case B;
-  case-A (type-40 gate/up) still does f32 + encode (`8a6986ea`)
+- C2 MMQ gate/up fold emits the mid E4M3 itself, both-43 and mixed case B
+  (`8a6986ea`); case A (type-40 gate/up) emits too, via the scatter kernel and
+  the GEMV epilogue (`8dd124f8`)
 - C3 `hc_expand` destination dedupe (bit-exact) (`ef576858`)
-- C7 block-parallel softmax (bit-exact) (`6a152fbd`)
+- C7 block-parallel softmax (bit-exact; runtime-bound fix `09228ff9`)
 - C8 16-byte `cp.async` staging (bit-exact) (`1dc537ed`)
 - C9 refuted — already covered at block granularity (`8c67aeb0`)
 
-Still open and writeable blind, in value order: B2 (sampler host fast path),
-B5 (lane grouping), B10 (sampled redraft), C2 case A, C4 (indexer f16 scores),
+Still open, in value order: B2 (sampler host fast path; needs its identity
+gate), B5 (lane grouping), B10 (sampled redraft), C4 (indexer f16 scores),
 C5 (`low` fusion), C6 (`mxf4nvf4`), C10 items and the `attn_pack_store` retile.
-B4, B9, C1, D1 and D2 need the rig.
+B4, B9, C1, D1 and D2 need dedicated campaigns.
 
 ---
 
