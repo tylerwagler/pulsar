@@ -68,7 +68,7 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
  * the model native DSML tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
-    pulsar_think_mode think_mode = effective_think_mode(cfg);
+    pulsar_think_mode think_mode = cfg->gen.think_mode;
     pthread_mutex_lock(&w->mu);
     w->interrupt = false;
     w->status.error[0] = '\0';
