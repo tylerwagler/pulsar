@@ -35,8 +35,9 @@ clamp warning), `./pulsar_test --sampler` PASS (169 shape x config combos,
 GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
 `v5mx4-0731-srcfmt-v1-reapfix-lt`):
 
-- `make cuda-regression` PASS; `make gates` 8/8 PASS; `gates_runner` 27/27
-  PASS (1000 s); `cuda-prefill-gate` byte-identical at all 7 depths;
+- `make cuda-regression` PASS; `make gates` 8/8 **ALL PASS** on the final tip
+  (`15bc79a`, after the C10a revert) including the runner's 27 sub-gates;
+  `cuda-prefill-gate` byte-identical at all 7 depths;
   `cuda-minp-prefilter-gate` and `cuda-spec-sampling-gate` PASS on the B2
   sampler fast arm.
 - **Two bugs the GPU gates caught, fixed on the branch:** C7's parallel
