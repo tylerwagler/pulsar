@@ -552,7 +552,7 @@ __global__ static void moe_swiglu_gathered_kernel(
 
 #ifdef PULSAR_HAVE_MMQ
 /* both defined below, next to each other */
-static int routed_moe_try_mmq_gate_up(float *mid_out, float *gate_scratch,
+static int routed_moe_try_mmq_gate_up(pulsar_gpu_tensor *mid, float *gate_scratch,
                                       const char *gate_w, const char *up_w,
                                       const float *x_f32, const int32_t *selected_ptr,
                                       const float *weights_ptr, uint32_t gate_type,
@@ -825,7 +825,7 @@ static int routed_moe_launch_mixed40(
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
             mmq_gu_done = routed_moe_try_mmq_gate_up(
-                mid_flat, (float *)up->ptr, gate_w, up_w,
+                mid, (float *)up->ptr, gate_w, up_w,
                 (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                 gate_type, expert_in_dim, expert_mid_dim,
                 n_total_expert, n_expert, n_tokens, clamp);
@@ -838,19 +838,12 @@ static int routed_moe_launch_mixed40(
             fprintf(stderr, "pulsar: mixed40 type-43 gate/up but MMQ declined and no fallback exists\n");
             ok = 0;
         }
-        /* L158 inc 5: the SwiGLU output is an activation like any other -- the
-         * MoE stage emits its E4M3 ONCE here (slot rows = (token, slot) pairs),
-         * and every down arm consumes that encoding.  Three consumers used to
-         * encode it for themselves (MMQ down, fp4 down GEMV, CUTLASS grouped
-         * down pack); those encoders are gone. */
+        /* L219: the gate/up fold emitted mid's E4M3 in its own epilogue (the
+         * standalone encode pass is deleted); the reader only has to check it
+         * landed. */
         const void *mq = NULL, *msf = NULL; int mkbp = 0;
-        if (ok && !pulsar_gpu_mxfp8_act_cache_encode_f32(mid, pair_count, expert_mid_dim)) {
-            fprintf(stderr, "pulsar: routed MoE: could not emit the mid E4M3 (pairs=%llu mid=%u) -- refusing\n",
-                    (unsigned long long)pair_count, expert_mid_dim);
-            ok = 0;
-        }
         if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, pair_count, expert_mid_dim, &mq, &msf, &mkbp)) {
-            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after emit -- refusing\n");
+            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after the fold emit -- refusing\n");
             ok = 0;
         }
         /* Phase 2: mid -> W4A8 down -> down_flat[pair]. */
@@ -924,6 +917,23 @@ static int routed_moe_launch_mixed40(
  * ledger L066 step 2, so the stub has no caller and no reason to exist. */
 
 
+/* EMIT=false writes the folded leaf as f32 (the historical contract).
+ * EMIT=true is the L219 producer epilogue: the same per-element SwiGLU lands
+ * as the activation's E4M3 + E8M0 plane, so the separate
+ * pulsar_gpu_mxfp8_act_cache_encode_f32 pass is deleted for this path.  The
+ * encoding is byte-identical to that pass by construction: the block amax is
+ * an fmaxf reduction over the same 32 elements (exact, order-independent) and
+ * pulsar_mx_shared_exp/_encode/_scale_byte are the same helpers the standalone
+ * quantiser calls.
+ *
+ * The EMIT arm must run in FULL WARPS: the max reduction is a shuffle over the
+ * elements a lane group owns.  For the scalar kernel one warp owns one 32-wide
+ * block (lane 0 owns col%32==0); for v4 the warp's 32 lanes cover 128 columns,
+ * i.e. four blocks, so the reduction is over 8-lane groups.  Dead lanes are
+ * predicated, never early-returned -- a lane that exits would corrupt the
+ * shuffle.  Both shapes are guarded by mid_dim % 32 == 0 at this file's door. */
+
+template <bool EMIT>
 __global__ static void moe_mmq_swiglu_fold_kernel(
         float *mid_out,
         const float *gate_raw,
@@ -931,11 +941,34 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
         const float *weights,
         uint64_t total,
         uint32_t expert_mid_dim,
-        float clamp) {
+        float clamp,
+        __nv_fp8_e4m3 *mid_q,
+        unsigned char *mid_sf,
+        int mid_kbp) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    mid_out[idx] = pulsar_swiglu_elem(gate_raw[idx], up_raw[idx],
-                                 weights[idx / (uint64_t)expert_mid_dim], clamp);
+    if constexpr (!EMIT) {
+        if (idx >= total) return;
+    }
+    const bool live = idx < total;
+    const uint64_t ii = live ? idx : (total ? total - 1u : 0u);
+    const float v = pulsar_swiglu_elem(gate_raw[ii], up_raw[ii],
+                                 weights[ii / (uint64_t)expert_mid_dim], clamp);
+    if constexpr (EMIT) {
+        float a = live ? fabsf(v) : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+        const int se = pulsar_mx_shared_exp(a);
+        if (live) {
+            const uint64_t row = ii / (uint64_t)expert_mid_dim;
+            const uint32_t col = (uint32_t)(ii - row * (uint64_t)expert_mid_dim);
+            mid_q[(size_t)row * expert_mid_dim + col] = pulsar_mx_encode(v, se);
+            if ((threadIdx.x & 31u) == 0u)
+                mid_sf[pulsar_mx_sfoff((int)row, (int)(col >> 5), mid_kbp)] =
+                        pulsar_mx_scale_byte(se);
+        }
+    } else {
+        mid_out[idx] = v;
+    }
 }
 
 /* Vector-4 twin (L128).  ncu on the decode path measured this kernel at 9.7%
@@ -944,7 +977,13 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
  * It is a pure streaming op (two loads, one store per output), so one
  * element per thread wastes three quarters of every transaction and pays a
  * 64-bit divide per element.  BIT-EXACT: identical per-element math, no
- * reduction, only the access granularity and thread mapping change. */
+ * reduction, only the access granularity and thread mapping change.
+ *
+ * EMIT=true (L219): the warp's 32 lanes each hold four consecutive columns, so
+ * one 32-element MX block is exactly an EIGHT-lane group; its amax is the
+ * fmaxf over those lanes' per-quad maxima.  `mid_dim` is the row pitch of the
+ * E4M3 plane (expert_mid_dim_q is the row pitch in quads). */
+template <bool EMIT>
 __global__ static void moe_mmq_swiglu_fold_v4_kernel(
         float4 *mid_out,
         const float4 *gate_raw,
@@ -952,23 +991,60 @@ __global__ static void moe_mmq_swiglu_fold_v4_kernel(
         const float *weights,
         uint64_t quads,
         uint32_t expert_mid_dim_q,
-        float clamp) {
+        float clamp,
+        __nv_fp8_e4m3 *mid_q,
+        unsigned char *mid_sf,
+        int mid_kbp,
+        uint32_t mid_dim) {
     const uint64_t q = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (q >= quads) return;
-    const float4 g = gate_raw[q], u = up_raw[q];
-    const float wv = weights[q / (uint64_t)expert_mid_dim_q];
+    if constexpr (!EMIT) {
+        if (q >= quads) return;
+    }
+    const bool live = q < quads;
+    const uint64_t qq = live ? q : (quads ? quads - 1u : 0u);
+    const float4 g = gate_raw[qq], u = up_raw[qq];
+    const float wv = weights[qq / (uint64_t)expert_mid_dim_q];
     float4 o;
     o.x = pulsar_swiglu_elem(g.x, u.x, wv, clamp);
     o.y = pulsar_swiglu_elem(g.y, u.y, wv, clamp);
     o.z = pulsar_swiglu_elem(g.z, u.z, wv, clamp);
     o.w = pulsar_swiglu_elem(g.w, u.w, wv, clamp);
-    mid_out[q] = o;
+    if constexpr (EMIT) {
+        float a = live ? fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)))
+                       : 0.0f;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const int se = pulsar_mx_shared_exp(a);
+        if (live) {
+            const uint64_t row = qq / (uint64_t)expert_mid_dim_q;
+            const uint32_t col = (uint32_t)(qq - row * (uint64_t)expert_mid_dim_q) * 4u;
+            __nv_fp8_e4m3 *dst = mid_q + (size_t)row * mid_dim + col;
+            dst[0] = pulsar_mx_encode(o.x, se);
+            dst[1] = pulsar_mx_encode(o.y, se);
+            dst[2] = pulsar_mx_encode(o.z, se);
+            dst[3] = pulsar_mx_encode(o.w, se);
+            if ((threadIdx.x & 7u) == 0u)
+                mid_sf[pulsar_mx_sfoff((int)row, (int)(col >> 5), mid_kbp)] =
+                        pulsar_mx_scale_byte(se);
+        }
+    } else {
+        mid_out[q] = o;
+    }
 }
 
-/* Returns 1 when MMQ produced `mid` (the IQ2 tier), 0 when this layer's gate/up
- * is not that tier and the caller's MXFP4 arms run instead. */
+/* Returns 1 when MMQ produced the fold (the IQ2 tier), 0 when this layer's
+ * gate/up is not that tier and the caller's MXFP4 arms run instead.
+ *
+ * L219: the SwiGLU leaf is emitted into `mid`'s E4M3 activation slot by the
+ * fold epilogue itself.  Before, the fold wrote pairs x mid_dim f32 to `mid`
+ * and a separate whole-tensor pass (pulsar_gpu_mxfp8_act_cache_encode_f32)
+ * read it back to encode; on the MMQ tiers that round trip was ~98 KB/token/
+ * layer of avoidable traffic.  The emitted bytes are identical by construction
+ * (same 32-element amax set, same pulsar_mx_shared_exp/_encode/_scale_byte), so
+ * the down arms and their gates see the same operand. */
 static int routed_moe_try_mmq_gate_up(
-        float *mid_out,
+        pulsar_gpu_tensor *mid,
         float *gate_scratch,
         const char *gate_w,
         const char *up_w,
@@ -988,6 +1064,7 @@ static int routed_moe_try_mmq_gate_up(
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
     if (gate_type != (uint32_t)PULSAR_GPU_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
+    if (!mid || !mid->ptr || (expert_mid_dim % 32u) != 0u) return 0;
     /* One-shot: ds4_mmq_init selects the device and populates the ggml
      * device-info singleton the MMQ launchers read. */
     static int mmq_ready = -1;
@@ -1003,6 +1080,20 @@ static int routed_moe_try_mmq_gate_up(
      * silently declined every pre-aligned layer. */
     if (!ds4_mmq_should_use(16, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    /* Reserve the producer slot BEFORE the gate/up GEMM: if the encoding has
+     * nowhere to land the arm is terminal, and failing first cannot leave a
+     * launched GEMM writing into a slot that was refused. */
+    void *mid_q = NULL, *mid_sf = NULL;
+    int mid_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pairs, expert_mid_dim,
+                                              &mid_q, &mid_sf, &mid_kbp)) {
+        fprintf(stderr, "pulsar: routed MoE MMQ gate/up: no E4M3 slot for the folded mid "
+                        "(mid_dim=%u pairs=%llu) -- refusing\n",
+                expert_mid_dim, (unsigned long long)pairs);
+        return 0;
+    }
+
     /* Why the artifact stores IQ2 pre-aligned, recorded because the code that
      * proved it is gone: block_iq2_xxs is 66 B with qs[] at offset 2, so a raw
      * stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
@@ -1014,8 +1105,8 @@ static int routed_moe_try_mmq_gate_up(
      * compiled. */
     /* Type 43 is stored aligned IN THE GGUF, so the weight pointer IS the SoA
      * entry.  There is no raw arm and no repack. */
-    float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
-    float *up_raw = mid_out;          /* folded in place below */
+    float *gate_raw = gate_scratch;   /* pairs*mid f32 */
+    float *up_raw = (float *)mid->ptr; /* MMQ writes raw up here; the fold reads it */
     /* x_f32 is ffn_norm, whose fused norm emitted its E4M3 + ue8m0 into the
      * activation cache; the input staging gathers those codes.  No encoding:
      * refuse (below). */
@@ -1037,27 +1128,31 @@ static int routed_moe_try_mmq_gate_up(
         (int)n_expert, cudaStreamPerThread,
         act_q, act_sf, act_kbp);
     if (rc != 0) return 0;
-    const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
+    const uint64_t total = pairs * expert_mid_dim;
     const uint32_t threads = 256u;
     /* L128: four elements per thread when the shape and alignment allow --
-     * see the v4 kernel's note.  mid_out and gate_scratch are whole
+     * see the v4 kernel's note.  gate_scratch and up_raw are whole
      * allocations here (256 B aligned), but the check is cheap and keeps the
      * fast path honest if a caller ever hands in an offset view. */
     const bool v4 = (expert_mid_dim % 4u) == 0u && (total % 4u) == 0u &&
-                    ((uintptr_t)mid_out % 16u) == 0u &&
                     ((uintptr_t)gate_raw % 16u) == 0u &&
                     ((uintptr_t)up_raw % 16u) == 0u;
     if (v4) {
         const uint64_t quads = total / 4u;
         const uint64_t blocks = (quads + threads - 1u) / threads;
-        moe_mmq_swiglu_fold_v4_kernel<<<(unsigned)blocks, threads>>>(
-            (float4 *)mid_out, (const float4 *)gate_raw, (const float4 *)up_raw,
-            weights_ptr, quads, expert_mid_dim / 4u, clamp);
+        moe_mmq_swiglu_fold_v4_kernel<true><<<(unsigned)blocks, threads>>>(
+            NULL, (const float4 *)gate_raw, (const float4 *)up_raw,
+            weights_ptr, quads, expert_mid_dim / 4u, clamp,
+            (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp, expert_mid_dim);
     } else {
         const uint64_t blocks = (total + threads - 1u) / threads;
-        moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
-            mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+        moe_mmq_swiglu_fold_kernel<true><<<(unsigned)blocks, threads>>>(
+            NULL, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp,
+            (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
     }
+    if (!cuda_ok(cudaGetLastError(), "routed_moe mmq swiglu fold (E4M3)")) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     return 1;
 }
 /* Routed DOWN through MMQ.  Upstream's down rode inside a Q2_K-specific fused
@@ -1234,7 +1329,7 @@ static int routed_moe_launch(
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
             mmq_done = routed_moe_try_mmq_gate_up(
-                (float *)mid->ptr, (float *)up->ptr,
+                mid, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
                 (const float *)weights->ptr, gate_type,
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
@@ -1254,16 +1349,12 @@ static int routed_moe_launch(
         (void)mmq_done;
         return 0;   /* no MMQ build -> type 43 is unreadable; rejected at the door */
 #endif
-        /* L158 inc 5: the MoE stage emits mid's E4M3 once; the MMQ down reads
-         * that encoding.  (Until today MMQ encoded mid from f32 for itself --
-         * and this comment still said "q8_1", a format that died weeks ago.) */
+        /* L219: the fold epilogue emitted mid's E4M3 itself; the reader only
+         * checks it landed.  (An earlier contract encoded mid from f32 here in
+         * a separate whole-tensor pass.) */
         const void *mq2 = NULL, *msf2 = NULL; int mkbp2 = 0;
-        if (ok && !pulsar_gpu_mxfp8_act_cache_encode_f32(mid, (uint64_t)n_tokens * n_expert, expert_mid_dim)) {
-            fprintf(stderr, "pulsar: routed MoE (type-43): could not emit the mid E4M3 -- refusing\n");
-            ok = 0;
-        }
         if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, (uint64_t)n_tokens * n_expert, expert_mid_dim, &mq2, &msf2, &mkbp2)) {
-            fprintf(stderr, "pulsar: routed MoE (type-43): mid E4M3 not readable after emit -- refusing\n");
+            fprintf(stderr, "pulsar: routed MoE (type-43): mid E4M3 not readable after the fold emit -- refusing\n");
             ok = 0;
         }
         int mmq_down_done = 0;

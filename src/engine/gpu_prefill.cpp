@@ -2636,8 +2636,13 @@ bool gpu_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim, il, pos0);
     }
     if (ok) {
+        /* ARM-DEPENDENT, like ffn_moe_up_clamped above: the MMQ tiers (both-43
+         * and mixed case B) fold SwiGLU straight into the mid E4M3 activation
+         * slot (L219), so this f32 scratch holds the RAW UP there.  The
+         * grouped/40-40 and mixed case-A arms still materialise the folded
+         * leaf as f32.  Read with the layer's gate/up type in hand. */
         const uint64_t routed_mid_elems = (uint64_t)n_tokens * PULSAR_N_EXPERT_USED * down_in_dim;
-        gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
+        gpu_graph_debug_dump_tensor("ffn_moe_mid_raw_or_swiglu", g->batch_routed_mid,
                                       routed_mid_elems, il, pos0);
     }
     if (ok) {
