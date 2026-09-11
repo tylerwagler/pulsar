@@ -1922,7 +1922,12 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
         g->batch_active = true;
     }
 
-    float *logits = (float *)server_xmalloc((size_t)n * (size_t)vocab * sizeof(float));
+    /* Persistent, like the spec lane's: a per-quantum malloc/free re-faults
+     * ~4 MB of demand-zero pages on every quantum (L219). */
+    if (!s->lane_logits)
+        s->lane_logits = (float *)server_xmalloc(
+                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    float *logits = s->lane_logits;
     pulsar_multiseq_req reqs[PULSAR_SESSION_POOL_CAP];
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
@@ -1999,7 +2004,6 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n) {
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
-    free(logits);
     const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
     for (int i = 0; i < n; i++) {
         dec[i]->last_serviced_us = now_us;
@@ -2628,7 +2632,11 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 
     const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
     pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
-    float *logits = (float *)server_xmalloc((size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    /* Persistent, like the spec lane's: see the lane_logits note in the header. */
+    if (!s->lane_logits)
+        s->lane_logits = (float *)server_xmalloc(
+                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
+    float *logits = s->lane_logits;
     /* last-position (len-1) logits captured from the final fused prefill run — the
      * decode seed for the prefill->decode handoff (byte-identical to classic per
      * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
@@ -2741,7 +2749,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
         }
     }
-    free(reqs); free(logits);
+    free(reqs);
 
     /* Reconcile the prefill bank (same recipe as a decode bank leaving the lane):
      * install its driver-maintained frontier (P0+pf_done) and advance the host

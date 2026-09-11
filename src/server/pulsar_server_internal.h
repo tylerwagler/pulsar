@@ -1358,6 +1358,13 @@ struct server {
      * demand-zero pages faulted back in on every touch cycle, a measured
      * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
     float   *spec_lane_logits;
+    /** L219: the plain and mixed batched lanes' logits landing buffer
+     * ((PULSAR_SESSION_POOL_CAP + 1) x vocab floats).  Same rationale as
+     * spec_lane_logits, one lane over: the per-quantum malloc/free re-faulted
+     * ~4 MB of demand-zero pages on every quantum of a
+     * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
+     * sequentially in one worker. */
+    float   *lane_logits;
     /** Which decode lane the scheduler is on: 0 idle, 1 spec, 2 batched. The
      * spec-decode counters cannot advance on the batched lane (it never enters
      * the fused loop), so a scraper needs this to tell "acceptance really is

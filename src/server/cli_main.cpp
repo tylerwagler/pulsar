@@ -253,6 +253,8 @@ void server::close_resources() {
     s->sess = NULL;
     free(s->spec_lane_logits);
     s->spec_lane_logits = NULL;
+    free(s->lane_logits);
+    s->lane_logits = NULL;
     /* Tier-2 guard spill files are per-bank snapshots (server_spill_bank in
      * generate.cpp writes <spill_dir>/spill-bank-<bank>.kv).  A bank that is
      * still spilled when the server exits would otherwise leave a stale
