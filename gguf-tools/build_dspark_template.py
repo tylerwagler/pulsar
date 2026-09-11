@@ -212,6 +212,13 @@ def main():
         ('attn_output_a.weight',    gguf(O*OG, E), MXFP8_LT),
         ('attn_output_b.weight',    gguf(E, O*OG), MXFP8_LT),
         ('ffn_gate_inp.weight',     gguf(R, E),    30),
+        # The router's correction bias (mtp.N.ffn.gate.bias, F32 [R]).  The
+        # checkpoint has always shipped it and this template never carried it,
+        # so every drafter we served routed WITHOUT the bias it was trained with
+        # (L216 "fallback fix on file"; L218 found it).  The quantizer's name map
+        # already carries exp_probs_b.bias <- ffn.gate.bias under the mtp.N.
+        # prefix; the engine binds it as REQUIRED in dspark_weights_bind.
+        ('exp_probs_b.bias',        gguf(R),        0),
         ('ffn_gate_shexp.weight',   gguf(F, E),    MXFP8_LT),
         ('ffn_up_shexp.weight',     gguf(F, E),    MXFP8_LT),
         ('ffn_down_shexp.weight',   gguf(E, F),    MXFP8_LT),

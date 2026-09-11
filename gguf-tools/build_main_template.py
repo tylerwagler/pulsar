@@ -122,6 +122,24 @@ CONDITIONAL_LAYER_SUFFIXES = [
     'indexer_compressor_gate.weight', 'indexer_compressor_norm.weight',
 ]
 
+# Source tensors this TEXT-ONLY main-model template deliberately does not
+# consume.  Every tensor the checkpoint holds must either be consumed into the
+# manifest or match one of these patterns, or the build aborts (fail closed).
+# The 2026-09-10 Vision-Exp probe showed why: the explicit expected-name walk
+# above silently dropped 313 of the checkpoint's 316 new tensors (vision tower,
+# aligner, image-span embeddings, the image-token router bias) -- a fail-OPEN
+# builder.  Ported from the V4.1 builder (v41-flash bd73e371); shape-agnostic.
+import re as _re
+SKIP_PATTERNS = [
+    _re.compile(r'^vision\.'),                           # DeepSeek-ViT (vision phase, own builder later)
+    _re.compile(r'^aligner\.'),                          # vision projector
+    _re.compile(r'^image_(start|end|newline|pad)$'),     # image-span embeddings
+    _re.compile(r'^layers\.\d+\.ffn\.gate\.bias_vl$'),   # router bias used only for image tokens
+    _re.compile(r'^mtp\.'),                              # DSpark drafter: build_dspark_template.py
+    _re.compile(r'^layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$'),  # routed experts: stacked by the quantizer
+    _re.compile(r'\.scale$'),                            # fp8/fp4 block scales ride with their weight
+]
+
 # Per-tensor-group template type policy (the default type used when the
 # quantizer isn't given an explicit --dense/--attention/--experts/etc
 # override; norms are additionally a hard ds4 requirement -- see
@@ -318,13 +336,16 @@ def build_tensor_list(ckpt, keep=None):
     R = cfg['n_routed_experts']
     if keep is not None and len(keep) < L:
         raise SystemExit(f'survivor map covers {len(keep)} layers, model has {L}')
+    n_hash = cfg['num_hash_layers']
     tensors = []  # (ds4_name, ne, type)
+    consumed = set()
 
     for ds4_name, hf_name in TOP_MAP.items():
         if not ckpt.has(hf_name):
             raise SystemExit(f'expected top-level HF tensor missing: {hf_name}')
         ne = ne_reversed(ckpt.shape(hf_name))
         tensors.append((ds4_name, ne, suffix_type(ds4_name, len(ne))))
+        consumed.add(hf_name)
 
     for layer in range(L):
         for suffix in ALWAYS_LAYER_SUFFIXES:
@@ -333,13 +354,24 @@ def build_tensor_list(ckpt, keep=None):
                 raise SystemExit(f'expected HF tensor missing: {hf_name}')
             ne = ne_reversed(ckpt.shape(hf_name))
             tensors.append((f'blk.{layer}.{suffix}', ne, suffix_type(suffix, len(ne))))
+            consumed.add(hf_name)
 
         for suffix in CONDITIONAL_LAYER_SUFFIXES:
             hf_name = f'layers.{layer}.{LAYER_MAP[suffix]}'
             if not ckpt.has(hf_name):
                 continue
+            if suffix == 'exp_probs_b.bias' and layer < n_hash:
+                # Vision-Exp allocates a router bias on the hash-routed layers
+                # too (Gate.__init__ when vision_n_layers > 0) but the forward
+                # never reads it there: text tokens route through tid2eid and
+                # image tokens through bias_vl.  Dead weight in a text-only
+                # artifact; consumed here so the fail-closed check below is
+                # satisfied, deliberately not emitted.
+                consumed.add(hf_name)
+                continue
             ne = ne_reversed(ckpt.shape(hf_name))
             tensors.append((f'blk.{layer}.{suffix}', ne, suffix_type(suffix, len(ne))))
+            consumed.add(hf_name)
 
         # Routed experts: combined [in,out,R] stack, shape from config (the
         # per-expert HF tensors are individually MXFP4-packed, not a single
@@ -349,6 +381,12 @@ def build_tensor_list(ckpt, keep=None):
         tensors.append((f'blk.{layer}.ffn_up_exps.weight',   [E, F, Rl], MXFP4))
         tensors.append((f'blk.{layer}.ffn_down_exps.weight', [F, E, Rl], MXFP4))
 
+    # Fail closed: every checkpoint tensor is consumed or explicitly skipped.
+    unknown = [n for n in ckpt.weight_map
+               if n not in consumed and not any(p.search(n) for p in SKIP_PATTERNS)]
+    if unknown:
+        raise SystemExit('checkpoint tensors neither consumed nor on the text-only skip list '
+                         f'({len(unknown)}), e.g. {unknown[:8]}')
     return tensors
 
 
