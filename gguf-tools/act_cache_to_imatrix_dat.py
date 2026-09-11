@@ -15,7 +15,8 @@ n_values == ncols * n_experts (that is how the 2026-07 `...-ds4-1p5m.dat` is lai
 Experts absent from the cache (never routed in the calibration) get the LAYER MEAN over the experts that were, and are counted in the
 sidecar; a layer with no expert at all is an error.  Dense projections are not written: the engine serves them MXFP8 (no codeword search).
 
-usage: act_cache_to_imatrix_dat.py --act DIR --out FILE.dat [--n-experts 256] [--layers 43] [--dataset LABEL] [--chunks N]
+usage: act_cache_to_imatrix_dat.py --act DIR [DIR ...] --out FILE.dat [--n-experts 256] [--layers 43] [--dataset LABEL] [--chunks N]
+(several DIRs = disjoint calibration slices of the same model, merged as the mean over all their rows)
 """
 import argparse, glob, json, os, re, struct, sys, time
 
@@ -28,7 +29,8 @@ RX = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--act", required=True, help="prisma --activation-cache-dir")
+    ap.add_argument("--act", required=True, nargs="+",
+                    help="prisma --activation-cache-dir(s); several slices of the same model merge as a row-weighted mean")
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-experts", type=int, default=256)
     ap.add_argument("--layers", type=int, default=43)
@@ -37,10 +39,14 @@ def main():
     ap.add_argument("--sidecar", default=None, help="coverage JSON (default: OUT.json)")
     a = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(a.act, "*.pt")))
-    if not files:
-        sys.exit(f"no .pt files under {a.act}")
-    # (layer, proj) -> {expert: importance[in]}
+    files = []
+    for d in a.act:
+        fs = sorted(glob.glob(os.path.join(d, "*.pt")))
+        if not fs:
+            sys.exit(f"no .pt files under {d}")
+        files += fs
+    # (layer, proj) -> {expert: importance[in]}; across several cache dirs (disjoint calibration slices of the same
+    # model) an expert's importance is the row-weighted mean of each slice's mean(x^2), i.e. the mean over all rows.
     imp = {}
     rows_seen = {}
     skipped = 0
@@ -58,11 +64,23 @@ def main():
         if x is None or x.ndim != 2 or x.shape[0] == 0:
             skipped += 1
             continue
-        v = x.float().pow(2).mean(dim=0).numpy().astype(np.float32)
+        n = int(x.shape[0])
+        v = x.float().pow(2).mean(dim=0).numpy().astype(np.float64)
+        key = (layer, proj, xid)
+        if key in rows_seen:
+            prev = imp[(layer, proj)][xid]
+            if len(prev) != len(v):
+                sys.exit(f"{name}: width {len(v)} != {len(prev)} across cache dirs")
+            m_prev = rows_seen[key]
+            v = (prev * m_prev + v * n) / (m_prev + n)
+            n += m_prev
         imp.setdefault((layer, proj), {})[xid] = v
-        rows_seen[(layer, proj, xid)] = int(x.shape[0])
+        rows_seen[key] = n
         if (i + 1) % 2000 == 0:
             print(f"  {i+1}/{len(files)} files, {time.time()-t0:.0f}s", flush=True)
+    for per in imp.values():
+        for xid in per:
+            per[xid] = per[xid].astype(np.float32)
 
     entries = []
     coverage = {}
@@ -100,7 +118,7 @@ def main():
         ds = a.dataset.encode()
         f.write(struct.pack("<ii", a.chunks, len(ds))); f.write(ds)
     total_missing = sum(c["filled_with_layer_mean"] for c in coverage.values())
-    side = {"act_dir": os.path.abspath(a.act), "files": len(files), "expert_files_used": len(rows_seen), "non_expert_files_skipped": skipped,
+    side = {"act_dirs": [os.path.abspath(d) for d in a.act], "files": len(files), "expert_files_used": len(rows_seen), "non_expert_files_skipped": skipped,
             "entries": len(entries), "n_experts": a.n_experts, "layers": a.layers, "experts_filled_with_layer_mean": total_missing,
             "dataset": a.dataset, "chunks": a.chunks, "coverage": coverage, "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     json.dump(side, open(a.sidecar or (a.out + ".json"), "w"), indent=1)
