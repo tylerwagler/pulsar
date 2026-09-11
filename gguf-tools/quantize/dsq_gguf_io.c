@@ -188,10 +188,17 @@ static uint8_t *gguf_take_kvs(const char *path, const char *const *want, int n_w
     return out;
 }
 
-/* KVs the engine needs to bind the drafter; mirrors MERGE_KEYS in the
- * merge_dspark_gguf.py this replaces. */
+/* KVs the engine needs to bind the drafter (dspark_weights_bind reads every
+ * one of them and refuses on a mismatch with what it was built to draft): the
+ * anchor layers, and the drafter's own shape -- experts, draft block, noise
+ * token, markov rank. */
 static const char *const DSPARK_MERGE_KEYS[] = {
     "deepseek_v4_dspark.embedding_length",
+    "deepseek_v4_dspark.expert_count",
+    "deepseek_v4_dspark.expert_used_count",
+    "deepseek_v4_dspark.block_size",
+    "deepseek_v4_dspark.noise_token_id",
+    "deepseek_v4_dspark.markov_rank",
     "dspark.target_layer_ids.0",
     "dspark.target_layer_ids.1",
     "dspark.target_layer_ids.2",

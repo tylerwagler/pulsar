@@ -398,10 +398,8 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 swapped, overlay_path, sep + 1);
     }
     weights_bind(&e->weights, &e->model);
-    if (opt->inspect_only) {
-        *out = e;
-        return 0;
-    }
+    /* the drafter binds before the inspect-only exit so --inspect proves the
+     * whole artifact binds, drafter included */
     if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
         /* Drafter merged into the main GGUF: bind from the main model and
          * alias dspark_model to it by value (same map/fd; every dspark call
@@ -413,6 +411,10 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->dspark_ready = true;
         fprintf(stderr, "pulsar: DSpark drafter found in model (draft=%d, markov_w2 %s)\n",
                 e->dspark_draft_tokens, tensor_type_name(e->dspark_weights.markov_w2->type));
+    }
+    if (opt->inspect_only) {
+        *out = e;
+        return 0;
     }
 
     if (graph_backend) {

@@ -1187,17 +1187,21 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
      * draft slots past the first (forward_embed), the markov rank is the
      * width the k-major markov kernels are written for. */
     {
+        const uint32_t n_expert = required_u32(m, "deepseek_v4_dspark.expert_count");
+        const uint32_t n_used = required_u32(m, "deepseek_v4_dspark.expert_used_count");
         const uint32_t block_size = required_u32(m, "deepseek_v4_dspark.block_size");
         const uint32_t noise_id = required_u32(m, "deepseek_v4_dspark.noise_token_id");
         const uint32_t markov_rank = required_u32(m, "deepseek_v4_dspark.markov_rank");
-        if (block_size < (uint32_t)PULSAR_SPEC_DEPTH_MAX || noise_id != (uint32_t)PULSAR_DSPARK_NOISE_TOKEN_ID ||
+        if (n_expert != (uint32_t)PULSAR_N_DSPARK_EXPERT || n_used != (uint32_t)PULSAR_N_DSPARK_EXPERT_USED ||
+            block_size < (uint32_t)PULSAR_SPEC_DEPTH_MAX || noise_id != (uint32_t)PULSAR_DSPARK_NOISE_TOKEN_ID ||
             markov_rank != 256u) {
-            char msg[256];
+            char msg[320];
             snprintf(msg, sizeof(msg),
-                     "dspark: artifact block_size %u / noise_token_id %u / markov_rank %u vs this engine's "
-                     "depth ceiling %d / noise token %d / markov rank 256 -- refusing",
-                     block_size, noise_id, markov_rank, (int)PULSAR_SPEC_DEPTH_MAX,
-                     (int)PULSAR_DSPARK_NOISE_TOKEN_ID);
+                     "dspark: artifact experts %u/%u, block_size %u, noise_token_id %u, markov_rank %u vs this "
+                     "engine's %u/%u, depth ceiling %d, noise token %d, markov rank 256 -- refusing",
+                     n_expert, n_used, block_size, noise_id, markov_rank,
+                     (unsigned)PULSAR_N_DSPARK_EXPERT, (unsigned)PULSAR_N_DSPARK_EXPERT_USED,
+                     (int)PULSAR_SPEC_DEPTH_MAX, (int)PULSAR_DSPARK_NOISE_TOKEN_ID);
             pulsar_die(msg);
         }
     }
